@@ -322,6 +322,13 @@ pub struct Chat {
     pub participants: HashMap<String, String>,
     /// Messages in this chat
     pub messages: Vec<ChatMessage>,
+    /// Whether the durable store has ever handed us this chat. Live-created
+    /// chats (incoming message before its store row commits — e.g. the
+    /// initial-pairing window) stay `false` until a history load adopts them,
+    /// so a complete-but-still-empty store load must not prune them; a chat
+    /// the store DID originate and no longer returns was deleted/archived
+    /// elsewhere and must go.
+    pub(crate) from_store: bool,
 }
 
 impl Chat {
@@ -344,6 +351,7 @@ impl Chat {
             is_group,
             participants: HashMap::new(),
             messages: Vec::new(),
+            from_store: false,
         }
     }
 
@@ -367,6 +375,7 @@ impl Chat {
             is_group,
             participants: HashMap::new(),
             messages: Vec::new(),
+            from_store: false,
         }
     }
 
@@ -452,6 +461,9 @@ impl Chat {
     /// the live one. Messages merge dedup-guarded without unread bumps; the
     /// store's counters are authoritative after a flush.
     pub fn merge_history(&mut self, hydrated: Chat) {
+        // A live-created chat adopted by a store load becomes prunable: the
+        // store owns it from here on.
+        self.from_store |= hydrated.from_store;
         self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
         for msg in hydrated.messages {
             self.insert_history_message(msg);
@@ -645,6 +657,23 @@ mod tests {
             1,
         ));
         assert_eq!(chat.name, "Renamed Fictitious Contact");
+    }
+
+    #[test]
+    fn store_provenance_sticks_after_history_merge() {
+        // Live-created chats are not store-originated...
+        let mut chat = Chat::new("12025550143@s.whatsapp.net".to_string());
+        assert!(!chat.from_store);
+
+        // ...until a history load adopts them; from there they stay prunable
+        // even when a later merge comes from a live-built Chat value.
+        let mut hydrated = Chat::new("12025550143@s.whatsapp.net".to_string());
+        hydrated.from_store = true;
+        chat.merge_history(hydrated);
+        assert!(chat.from_store);
+
+        chat.merge_history(Chat::new("12025550143@s.whatsapp.net".to_string()));
+        assert!(chat.from_store);
     }
 
     #[test]

@@ -1871,12 +1871,20 @@ impl WhatsAppApp {
                 // it must leave the UI too. A truncated load can't distinguish
                 // that from a chat that merely fell past the window, so it
                 // never prunes. The selected chat is spared either way so the
-                // open conversation isn't yanked mid-view.
+                // open conversation isn't yanked mid-view. Live-only chats
+                // (`!from_store`) are spared too: during initial pairing the
+                // store is still empty while live messages already populate
+                // the UI, and an early reload (e.g. a push-name commit) sends
+                // a complete-but-empty load that must not wipe them — whereas
+                // a store-originated chat missing from a complete load really
+                // was deleted/archived. (Skipping empty loads instead would
+                // break clearing the last chat deleted on another device.)
                 if complete {
                     let loaded: std::collections::HashSet<&str> =
                         chats.iter().map(|c| c.jid.as_str()).collect();
                     self.chats.retain(|c| {
-                        loaded.contains(c.jid.as_str())
+                        !c.from_store
+                            || loaded.contains(c.jid.as_str())
                             || self.selected_chat.as_deref() == Some(c.jid.as_str())
                     });
                 }

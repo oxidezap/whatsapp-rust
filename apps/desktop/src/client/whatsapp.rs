@@ -1626,6 +1626,9 @@ impl WhatsAppClient {
             }
             let mut chat =
                 crate::state::Chat::with_name_priority(jid_str.clone(), name, name_priority);
+            // Store-originated: the HistoryLoaded prune may drop it when a
+            // later complete load no longer returns it.
+            chat.from_store = true;
             chat.unread_count = entry.unread_count.max(0) as u32;
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.
