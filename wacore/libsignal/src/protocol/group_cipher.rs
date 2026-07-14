@@ -25,6 +25,12 @@ struct CryptoBuffer {
 
 impl CryptoBuffer {
     const INITIAL_CAPACITY: usize = 1024;
+    /// Reuse the buffer across sends, but do not let a one-off large message pin
+    /// an oversized allocation on this thread for the rest of the process. Small
+    /// messages (the common case) fit under this and reuse the buffer with no
+    /// reallocation; anything larger is released back after its result is copied
+    /// out. Sized well above a typical message so normal traffic never churns.
+    const MAX_RETAINED_CAPACITY: usize = 16 * 1024;
 
     fn new() -> Self {
         Self {
@@ -42,6 +48,18 @@ impl CryptoBuffer {
     /// More efficient than `mem::take` + `reserve` since we swap with an already-allocated buffer.
     fn take_buffer(&mut self) -> Vec<u8> {
         std::mem::replace(&mut self.buffer, Vec::with_capacity(Self::INITIAL_CAPACITY))
+    }
+
+    /// Copy the written bytes into a right-sized box, keeping the buffer for the
+    /// next (small) message instead of handing away its capacity. A one-off
+    /// large message's capacity is released here so it is not retained on this
+    /// thread-local for the process lifetime.
+    fn copy_out(&mut self) -> Box<[u8]> {
+        let out: Box<[u8]> = self.buffer.as_slice().into();
+        if self.buffer.capacity() > Self::MAX_RETAINED_CAPACITY {
+            self.buffer = Vec::with_capacity(Self::INITIAL_CAPACITY);
+        }
+        out
     }
 }
 
@@ -87,17 +105,21 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
 
     let ciphertext = ENCRYPTION_BUFFER.with(|buffer| {
         let mut buf_wrapper = buffer.borrow_mut();
-        let buf = buf_wrapper.get_buffer();
-        aes_256_cbc_encrypt_into(plaintext, message_keys.cipher_key(), message_keys.iv(), buf)
-            .map_err(|_| {
-                log::error!("outgoing sender key state corrupt for distribution");
-                SignalProtocolError::InvalidSenderKeySession
-            })?;
+        {
+            let buf = buf_wrapper.get_buffer();
+            aes_256_cbc_encrypt_into(plaintext, message_keys.cipher_key(), message_keys.iv(), buf)
+                .map_err(|_| {
+                    log::error!("outgoing sender key state corrupt for distribution");
+                    SignalProtocolError::InvalidSenderKeySession
+                })?;
+        }
         // Copy out a right-sized ciphertext and keep the reusable buffer, rather
         // than handing away its (1 KiB) capacity and re-allocating one per send.
         // A group skmsg is small, so `take_buffer` here otherwise cost a fresh
         // 1 KiB per send once the production path started sharing this primitive.
-        Ok::<Box<[u8]>, SignalProtocolError>(buf.as_slice().into())
+        // `copy_out` releases the capacity of a one-off large message so it is
+        // not pinned on this thread-local afterward.
+        Ok::<Box<[u8]>, SignalProtocolError>(buf_wrapper.copy_out())
     })?;
 
     let signing_key = sender_key_state
@@ -369,6 +391,28 @@ mod tests {
     use crate::protocol::IdentityKeyPair;
     use async_trait::async_trait;
     use std::collections::HashMap;
+
+    #[test]
+    fn crypto_buffer_reuses_small_and_releases_oversized() {
+        let mut b = CryptoBuffer::new();
+
+        // A small message keeps its (reusable) capacity: no release, no churn.
+        b.get_buffer().extend_from_slice(&[0u8; 512]);
+        let _ = b.copy_out();
+        assert!(b.buffer.capacity() <= CryptoBuffer::MAX_RETAINED_CAPACITY);
+        assert!(b.buffer.capacity() >= CryptoBuffer::INITIAL_CAPACITY);
+
+        // A one-off large message grows the buffer, but copy_out releases the
+        // excess so it is not pinned on the thread-local afterward.
+        b.get_buffer()
+            .extend_from_slice(&vec![0u8; CryptoBuffer::MAX_RETAINED_CAPACITY * 4]);
+        assert!(b.buffer.capacity() > CryptoBuffer::MAX_RETAINED_CAPACITY);
+        let _ = b.copy_out();
+        assert!(
+            b.buffer.capacity() <= CryptoBuffer::MAX_RETAINED_CAPACITY,
+            "oversized capacity must be released after copy_out"
+        );
+    }
 
     struct InMemorySenderKeyStore {
         keys: HashMap<SenderKeyName, SenderKeyRecord>,
