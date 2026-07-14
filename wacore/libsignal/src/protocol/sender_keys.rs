@@ -559,37 +559,12 @@ impl SenderKeyRecord {
 
     /// Scan the local-only reserved-iteration field out of the raw record bytes.
     /// The generated `SenderKeyRecordStructure` decoder skips unknown fields, so
-    /// the reservation is read here from the top-level stream.
-    ///
-    /// Fails closed: anything unreadable under our field number is an error, not
-    /// a skip. Skipping would silently yield reservation 0, disabling the
-    /// load-time fast-forward and re-enabling already-spent iterations, a
-    /// reused (key, IV) pair, the exact outcome this mechanism prevents. A load
-    /// error is recoverable (the sender key rebuilds); nonce reuse is not.
+    /// the reservation is read here from the top-level stream. Fails closed via
+    /// the shared `decode_local_only_u32_field` (see there for why).
     fn decode_reserved_iteration(bytes: &[u8]) -> Result<u32, SignalProtocolError> {
-        use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
-
-        let mut buf = bytes;
-        let mut reserved = None;
-        while !buf.is_empty() {
-            let tag =
-                Tag::decode(&mut buf).map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-            if tag.field_number() == RESERVED_ITERATION_FIELD {
-                if tag.wire_type() != WireType::Varint || reserved.is_some() {
-                    return Err(SignalProtocolError::InvalidProtobufEncoding);
-                }
-                let value = decode_varint(&mut buf)
-                    .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-                reserved = Some(
-                    u32::try_from(value)
-                        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
-                );
-            } else {
-                skip_field(tag, &mut buf)
-                    .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-            }
-        }
-        Ok(reserved.unwrap_or(0))
+        super::local_field::decode_local_only_u32_field(bytes, RESERVED_ITERATION_FIELD, || {
+            SignalProtocolError::InvalidProtobufEncoding
+        })
     }
 
     /// Flag an outbound chain advance; cleared by the store layer once it
@@ -672,9 +647,15 @@ impl SenderKeyRecord {
         }
 
         self.states.push_front(state);
-        // The current chain changed: any reservation belonged to the old current
-        // chain. Reset so the next send re-reserves and gates against the new
-        // one instead of treating stale-covered iterations as durable.
+        // Reset the reservation unconditionally. It is a record-level ceiling for
+        // whatever chain is current, and this call may have replaced or reordered
+        // the current chain. Resetting is always safe (the next send re-reserves
+        // and re-gates); keeping a stale ceiling across a chain change is not,
+        // since a lower-iteration chain would treat already-covered iterations as
+        // durable and re-derive a spent (key, IV). In practice this is a no-op:
+        // the sending record only reaches here on first creation (reservation
+        // already 0, warm sends reuse the record without re-adding), and receiver
+        // records never carry a reservation.
         self.reserved_iteration = 0;
         Ok(())
     }

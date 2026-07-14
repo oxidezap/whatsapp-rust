@@ -780,37 +780,15 @@ impl SessionRecord {
     /// Extract the record-level reservation field from the serialized bytes.
     /// The generated `RecordStructureView` skips fields it does not know, so
     /// the local-only field is scanned out of the raw top-level stream here.
-    ///
-    /// Fails closed: anything unreadable under our own field number is an
-    /// error rather than a skip. Skipping would silently yield reservation 0,
-    /// which disables the load-time fast-forward and re-enables already-spent
-    /// counters — the one outcome this whole mechanism exists to prevent. A
-    /// load error is recoverable (the session rebuilds); a reused (key, IV)
-    /// pair is not.
+    /// Fails closed via the shared `decode_local_only_u32_field` (see there
+    /// for why).
     fn decode_reserved_index(bytes: &[u8]) -> Result<u32, SignalProtocolError> {
-        use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
-
-        let mut buf = bytes;
-        let mut reserved = None;
-        while !buf.is_empty() {
-            let tag = Tag::decode(&mut buf)
-                .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
-            if tag.field_number() == RESERVED_SENDER_CHAIN_INDEX_FIELD {
-                if tag.wire_type() != WireType::Varint || reserved.is_some() {
-                    return Err(InvalidSessionError("invalid reserved sender chain index").into());
-                }
-                let value = decode_varint(&mut buf)
-                    .map_err(|_| InvalidSessionError("invalid reserved sender chain index"))?;
-                reserved = Some(
-                    u32::try_from(value)
-                        .map_err(|_| InvalidSessionError("invalid reserved sender chain index"))?,
-                );
-            } else {
-                skip_field(tag, &mut buf)
-                    .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
-            }
-        }
-        Ok(reserved.unwrap_or(0))
+        crate::protocol::local_field::decode_local_only_u32_field(
+            bytes,
+            RESERVED_SENDER_CHAIN_INDEX_FIELD,
+            || InvalidSessionError("invalid reserved sender chain index"),
+        )
+        .map_err(Into::into)
     }
 
     /// If there's a session with a matching version and `alice_base_key`, ensures that it is the
