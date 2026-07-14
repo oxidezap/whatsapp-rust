@@ -20,15 +20,16 @@ where
     R: Rng + CryptoRng,
 {
     // Delegate to the libsignal primitive so the sender-key advance, the wire
-    // gate, and the iteration lease live in exactly one place (shared with the
-    // library API and the benchmarks). Before this the production path had its
-    // own copy that advanced and stored the chain without ever gating the
-    // advance, so a warm group send's ciphertext could reach the wire before the
-    // advance was durable (a reload would re-derive the same iteration; nonce
-    // reuse toward every group member).
-    crate::libsignal::protocol::group_encrypt(sender_key_store, sender_key_name, plaintext, csprng)
-        .await
-        .map_err(|e| anyhow!("group encrypt failed: {e:?}"))
+    // gate, and the iteration lease live in exactly one place. Propagate the
+    // error unwrapped (not string-formatted) so callers can still downcast
+    // NoSenderKeyState to clear stale tracking and retry with SKDM redistribution.
+    Ok(crate::libsignal::protocol::group_encrypt(
+        sender_key_store,
+        sender_key_name,
+        plaintext,
+        csprng,
+    )
+    .await?)
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The
