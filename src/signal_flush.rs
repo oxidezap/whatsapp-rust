@@ -7,13 +7,16 @@
 //! window.
 //!
 //! Scope and durability model (deliberate, bounded):
-//! - Only the receive path coalesces. A lost receive-side advance re-derives
+//! - The receive path coalesces: a lost receive-side advance re-derives
 //!   forward (the Double Ratchet receiving chain derives `CK_n → CK_n+1`), and
 //!   a consumed one-time prekey stays buffered until its session is durable, so
-//!   a crash inside the window is recoverable. The SEND path flushes
-//!   synchronously before returning: reusing an outbound counter would reuse
-//!   its message key + IV, so that advance must be durable before `send_message`
-//!   reports success.
+//!   a crash inside the window is recoverable. The SEND path coalesces too
+//!   whenever its advance is covered by a durable counter lease (see
+//!   `SessionRecord::reserve_sender_chain_counters` and
+//!   `Client::persist_signal_state_pre_wire`); only a send that raises the
+//!   lease — or advances a group sender-key chain — still flushes
+//!   synchronously before the wire, because reusing an outbound counter would
+//!   reuse its message key + IV.
 //! - The offline drain, retry recovery, identity-change recovery and teardown
 //!   keep their own synchronous flushes: those gate acks, receipts or
 //!   follow-up reads on durability and are not routed here.
@@ -282,6 +285,36 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// The send-path gate: a raised counter lease flushes synchronously
+    /// before returning; lease-covered dirty state only schedules the
+    /// coalesced worker and still lands within its window.
+    #[tokio::test]
+    async fn pre_wire_gate_flushes_leases_synchronously_and_coalesces_the_rest() {
+        let client = crate::test_utils::create_test_client().await;
+
+        // Lease-covered advance (no raised reservation): no synchronous write —
+        // the session is still absent from the backend when the gate returns.
+        let covered = dirty_session(&client, "15550003001");
+        client.persist_signal_state_pre_wire().await.unwrap();
+        assert!(
+            backend_session(&client, &covered).await.is_none(),
+            "a covered advance must not flush synchronously"
+        );
+        // ...but it rides the coalescer and still becomes durable.
+        wait_for_backend_session(&client, &covered).await;
+
+        // A raised lease must be durable when the call returns.
+        let addr = ProtocolAddress::new("15550003002".to_string(), 1.into());
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        assert!(client.signal_cache.try_put_session(&addr, record).is_ok());
+        client.persist_signal_state_pre_wire().await.unwrap();
+        assert!(
+            backend_session(&client, &addr).await.is_some(),
+            "the leased session must be durable when the gate returns"
+        );
     }
 
     /// A burst of requests rides one armed worker and persists every dirty

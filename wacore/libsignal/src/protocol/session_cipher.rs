@@ -242,6 +242,13 @@ async fn message_encrypt_inner(
 
     session_state.set_sender_chain_key(&next_chain_key)?;
 
+    // Counters are leased in batches so the send path only needs a durable
+    // flush when the lease runs out; a reload fast-forwards past the whole
+    // lease, so this counter can never be re-derived after a crash.
+    if chain_key.index() >= session_record.reserved_sender_chain_index() {
+        session_record.reserve_sender_chain_counters(chain_key.index());
+    }
+
     Ok(message)
 }
 

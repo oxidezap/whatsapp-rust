@@ -111,6 +111,11 @@ pub async fn group_encrypt<R: Rng + CryptoRng>(
 
     sender_key_state.set_sender_chain_key(next_sender_chain_key);
 
+    // Outbound advance: this iteration's (key, IV) must never be re-derivable,
+    // so the store must gate the ciphertext on durability. Decrypt-side
+    // advances stay ungated (they re-derive forward).
+    record.mark_wire_gated();
+
     sender_key_store
         .store_sender_key(sender_key_name, record)
         .await?;

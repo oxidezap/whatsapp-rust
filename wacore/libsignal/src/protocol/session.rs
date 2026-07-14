@@ -136,7 +136,9 @@ async fn process_prekey_impl(
     new_session.set_local_registration_id(identity_store.get_local_registration_id().await?);
     new_session.set_remote_registration_id(message.registration_id());
 
-    session_record.promote_state(new_session);
+    // Fresh random ratchet: no counter on this chain can have been spent, so
+    // the record's inherited lease must not be burned into it.
+    session_record.promote_fresh_state(new_session);
 
     let pre_keys_used = PreKeysUsed {
         pre_key_id: message.pre_key_id(),
@@ -244,7 +246,8 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
         .save_identity(remote_address, their_identity_key)
         .await?;
 
-    session_record.promote_state(session);
+    // Fresh random ratchet: see promote_fresh_state.
+    session_record.promote_fresh_state(session);
 
     Ok(identity_change)
 }

@@ -61,25 +61,31 @@ async fn durable_sender_chain_index(
     Ok(None)
 }
 
-/// The outbound ratchet advance must be durable by the time `send_message`
-/// returns: reusing an outbound counter reuses its message key + IV, so a crash
-/// after a successful send must never leave the advance only in memory. This
-/// reads the backend IMMEDIATELY after `send_message` (no wait for delivery, no
-/// explicit settle): a coalesced send would still be inside its window and the
-/// counter would be stale, so only the synchronous outbound flush passes.
+/// The durable snapshot must always be able to resume PAST every counter that
+/// may have hit the wire: reusing an outbound counter reuses its message key +
+/// IV. Counters are leased in batches (`SENDER_CHAIN_RESERVATION_BATCH`): the
+/// send that raises the lease flushes synchronously before the wire, and every
+/// lease-covered send may defer its advance to the coalesced write-behind
+/// because `SessionRecord::deserialize` fast-forwards the reloaded chain past
+/// the whole lease. This reads the backend IMMEDIATELY after `send_message`
+/// (no delivery wait, no settle): the resume position — what a crash restore
+/// would actually use — must already cover every counter spent so far.
 #[tokio::test]
-async fn test_outbound_ratchet_is_durable_when_send_returns() -> anyhow::Result<()> {
+async fn test_durable_resume_position_always_covers_spent_counters() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut client_a = TestClient::connect("e2e_sig_durable_a").await?;
-    let mut client_b = TestClient::connect("e2e_sig_durable_b").await?;
-    let jid_a = client_a.jid().await;
+    let client_a = TestClient::connect("e2e_sig_durable_a").await?;
+    let client_b = TestClient::connect("e2e_sig_durable_b").await?;
     let jid_b = client_b.jid().await;
     let lid_b = client_b.client.get_lid();
 
-    // Establish the outbound session A→B.
-    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
-    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+    // The first send raises the lease, so its flush is synchronous: the
+    // durable resume position must already be past counter 0 the moment
+    // send_message returns, with no settle.
+    client_a
+        .client
+        .send_message(jid_b.clone(), e2e_tests::text_msg("establish"))
+        .await?;
 
     let backend_a = client_a.client.persistence_manager().backend();
     let read_index = async |user: &str, server: &str| {
@@ -92,26 +98,35 @@ async fn test_outbound_ratchet_is_durable_when_send_returns() -> anyhow::Result<
         _ => (jid_b.user.clone(), "c.us"),
     };
 
+    // `durable_sender_chain_index` deserializes the stored record, which
+    // applies the crash-restore fast-forward: this IS the resume position.
     let mut last = read_index(&user, server)
         .await?
-        .expect("an outbound session must exist after the roundtrip");
+        .expect("the lease raise must persist the session before the wire");
+    let mut spent = 1u32; // counter 0 went out with "establish"
+    assert!(
+        last >= spent,
+        "resume position {last} must cover the {spent} spent counter(s)"
+    );
 
-    // send_message returns only after the synchronous pre-wire flush, so the
-    // advanced counter is already durable — read it with no delivery wait and
-    // no settle. A coalesced (window-deferred) flush would leave it unchanged.
+    // Lease-covered sends may leave the durable snapshot trailing (that is
+    // the optimization), but the resume position must never fall behind the
+    // wire and never regress.
     for i in 0..3 {
         client_a
             .client
             .send_message(jid_b.clone(), e2e_tests::text_msg(&format!("m{i}")))
             .await?;
+        spent += 1;
         let now = read_index(&user, server)
             .await?
             .expect("session persists across sends");
         assert!(
-            now > last,
-            "send #{i} must persist the advanced sender-chain counter before returning \
-             (durable {last} -> {now}); a coalesced send would leave it stale"
+            now >= spent,
+            "send #{i}: resume position {now} fell behind the {spent} spent counter(s); \
+             a crash here would re-derive a (key, IV) pair"
         );
+        assert!(now >= last, "resume position must never regress");
         last = now;
     }
 
@@ -120,26 +135,21 @@ async fn test_outbound_ratchet_is_durable_when_send_returns() -> anyhow::Result<
     Ok(())
 }
 
-/// A send whose outbound-ratchet persistence fails must abort BEFORE the stanza
-/// reaches the wire: the flush precedes the send on the send path, so if the
-/// advance cannot be stored, `send_message` returns `Err` and the peer receives
+/// A send that RAISES the counter lease gates the wire on persisting it: if
+/// the flush fails, `send_message` returns `Err` and the peer receives
 /// nothing. Otherwise a crash after a wire-committed send would leave the
-/// advance only in memory and the next send would reuse that counter's key + IV.
+/// lease only in memory and a reload would re-derive that counter's key + IV.
+/// The first send on a fresh session always raises the lease, so the failure
+/// is injected before it.
 #[tokio::test]
-async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()> {
+async fn test_send_aborts_before_wire_when_lease_persist_fails() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut client_a = TestClient::connect("e2e_sig_abort_a").await?;
+    let client_a = TestClient::connect("e2e_sig_abort_a").await?;
     let mut client_b = TestClient::connect("e2e_sig_abort_b").await?;
-    let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
 
-    // Establish the session both ways so the next A→B send is a steady-state
-    // encrypt (its only new durable write is the ratchet advance we fail).
-    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
-    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
-
-    // Persisting the outbound advance now fails.
+    // Persisting the outbound lease now fails.
     client_a.backend.set_fail_session_writes(true);
     let writes_before = client_a.backend.session_batch_write_count();
     // `send_node` resolves this before marshaling the node, so a still-pending
@@ -154,13 +164,13 @@ async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()>
         .await;
     assert!(
         result.is_err(),
-        "send must fail when the ratchet advance cannot be persisted, got {result:?}"
+        "send must fail when the raised lease cannot be persisted, got {result:?}"
     );
-    // The send reached the (failing) persistence step, proving the flush runs on
-    // the send path before the wire rather than being skipped or deferred.
+    // The send reached the (failing) persistence step, proving the lease flush
+    // runs on the send path before the wire rather than being skipped or deferred.
     assert!(
         client_a.backend.session_batch_write_count() > writes_before,
-        "the send path must attempt to persist the ratchet advance before the wire"
+        "the send path must attempt to persist the raised lease before the wire"
     );
     // Deterministic: no `message` node was ever marshaled, so `send_node` (and
     // thus the wire) was never reached. `Ok(None)` == pending, sender still alive.
@@ -193,6 +203,43 @@ async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()>
     )
     .await?;
 
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
+/// The counterpart of the abort test: a send COVERED by an already-durable
+/// lease does not depend on this flush for safety — a crash would reload the
+/// durable snapshot and fast-forward past the whole lease, so its counter can
+/// never be re-derived. Such a send must therefore succeed even while the
+/// backend is refusing session writes (the advance lands later via the
+/// coalescer's retry), instead of turning a storage hiccup into message loss.
+#[tokio::test]
+async fn test_lease_covered_send_survives_persist_failure() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_sig_covered_a").await?;
+    let mut client_b = TestClient::connect("e2e_sig_covered_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+
+    // Establish both ways: the lease raise happens (and is persisted) here.
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+
+    // Storage starts refusing session writes; the next send is lease-covered,
+    // so it must still deliver.
+    client_a.backend.set_fail_session_writes(true);
+    send_and_expect_text(
+        &client_a.client,
+        &mut client_b,
+        &jid_b,
+        "covered by the lease",
+        30,
+    )
+    .await?;
+
+    client_a.backend.set_fail_session_writes(false);
     client_a.disconnect().await;
     client_b.disconnect().await;
     Ok(())

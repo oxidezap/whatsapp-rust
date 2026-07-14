@@ -103,6 +103,13 @@ struct SessionStoreState {
     cache: HashMap<Arc<str>, SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
+    /// Sessions whose raised counter reservation has not reached the backend
+    /// yet. While any address is here, an outbound ciphertext may be relying
+    /// on a lease that only exists in memory, so the send path must flush
+    /// before the wire. Entries leave only when a flush actually persists
+    /// them (or the session is deleted/cleared). Always a subset of `dirty`,
+    /// so eviction can never drop a pending entry.
+    reservation_pending: HashSet<Arc<str>>,
 }
 
 impl SessionStoreState {
@@ -111,6 +118,7 @@ impl SessionStoreState {
             cache: HashMap::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
+            reservation_pending: HashSet::new(),
         }
     }
 
@@ -123,8 +131,14 @@ impl SessionStoreState {
         }
     }
 
-    fn put(&mut self, address: &str, record: SessionRecord) {
+    fn put(&mut self, address: &str, mut record: SessionRecord) {
         let addr = self.key_for(address);
+        // Take over the record's wire gate: the address stays pending until a
+        // flush persists it, regardless of later checkout/put round trips.
+        if record.has_pending_reservation() {
+            record.clear_pending_reservation();
+            self.reservation_pending.insert(addr.clone());
+        }
         self.cache
             .insert(addr.clone(), SessionEntry::Present(Arc::new(record)));
         self.dirty.insert(addr.clone());
@@ -136,12 +150,16 @@ impl SessionStoreState {
         self.cache.insert(addr.clone(), SessionEntry::Absent);
         self.deleted.insert(addr.clone());
         self.dirty.remove(&addr);
+        self.reservation_pending.remove(&addr);
     }
 
     fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();
         self.deleted.clear();
+        // Cleared sessions reload from the backend, whose snapshot still
+        // carries its own (older) lease; the first send re-reserves.
+        self.reservation_pending.clear();
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
@@ -175,6 +193,11 @@ struct SenderKeyStoreState {
     // `VecDeque<SenderKeyState>` with up to `MAX_MESSAGE_KEYS` message keys each.
     cache: HashMap<Arc<str>, Option<Arc<SenderKeyRecord>>>,
     dirty: HashSet<Arc<str>>,
+    /// Chains advanced by an outbound encrypt and not yet persisted; the send
+    /// path must flush before the wire while any entry is here. Decrypt-side
+    /// dirtiness deliberately does NOT enter this set (it re-derives forward),
+    /// so unrelated group receives never force a sync flush onto a DM send.
+    wire_gate_pending: HashSet<Arc<str>>,
 }
 
 impl SenderKeyStoreState {
@@ -182,6 +205,7 @@ impl SenderKeyStoreState {
         Self {
             cache: HashMap::new(),
             dirty: HashSet::new(),
+            wire_gate_pending: HashSet::new(),
         }
     }
 
@@ -192,8 +216,12 @@ impl SenderKeyStoreState {
         }
     }
 
-    fn put(&mut self, address: &str, record: SenderKeyRecord) {
+    fn put(&mut self, address: &str, mut record: SenderKeyRecord) {
         let addr = self.key_for(address);
+        if record.is_wire_gated() {
+            record.clear_wire_gated();
+            self.wire_gate_pending.insert(addr.clone());
+        }
         self.cache.insert(addr.clone(), Some(Arc::new(record)));
         self.dirty.insert(addr.clone());
     }
@@ -201,12 +229,14 @@ impl SenderKeyStoreState {
     fn delete(&mut self, address: &str) {
         let addr = self.key_for(address);
         self.cache.insert(addr.clone(), None);
-        self.dirty.insert(addr);
+        self.dirty.insert(addr.clone());
+        self.wire_gate_pending.remove(&addr);
     }
 
     fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();
+        self.wire_gate_pending.clear();
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
@@ -677,6 +707,11 @@ impl SignalStoreCache {
             }
             if !batch.is_empty() {
                 backend.put_sessions_batch(&batch).await?;
+                // These leases are durable now; only the written addresses
+                // leave the pending set (a CheckedOut session stays gated).
+                for (address, _) in &batch {
+                    state.reservation_pending.remove(address);
+                }
             }
             for address in &deleted_keys {
                 backend.delete_session(address).await?;
@@ -797,6 +832,9 @@ impl SignalStoreCache {
             }
             if !batch.is_empty() {
                 backend.put_sender_keys_batch(&batch).await?;
+                for (name, _) in &batch {
+                    state.wire_gate_pending.remove(name);
+                }
             }
 
             for key in &dirty_keys {
@@ -806,6 +844,19 @@ impl SignalStoreCache {
         }
 
         Ok(())
+    }
+
+    /// Whether an outbound ciphertext produced since the last flush is still
+    /// gated on durability: a session counter lease was raised, or a
+    /// sender-key chain advanced via encrypt, and neither has reached the
+    /// backend. The send path flushes synchronously only while this holds;
+    /// everything else (decrypt advances, identities) safely rides the
+    /// coalesced write-behind.
+    pub async fn needs_pre_wire_flush(&self) -> bool {
+        if !self.sessions.lock().await.reservation_pending.is_empty() {
+            return true;
+        }
+        !self.sender_keys.lock().await.wire_gate_pending.is_empty()
     }
 
     /// Entry counts and estimated retained bytes for each store
@@ -1898,5 +1949,136 @@ mod eviction_tests {
                 state.cache.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pre_wire_gate_tests {
+    use super::*;
+    use crate::libsignal::store::sender_key_name::SenderKeyName;
+    use crate::store::in_memory::InMemoryBackend;
+
+    fn addr(user: &str) -> ProtocolAddress {
+        ProtocolAddress::new(user.to_string(), 1.into())
+    }
+
+    fn leased_record() -> SessionRecord {
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        record
+    }
+
+    /// A raised lease gates the wire until a flush actually persists it; a
+    /// plain (decrypt-style) session write never does.
+    #[tokio::test]
+    async fn session_lease_gates_until_a_successful_flush() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+
+        cache
+            .put_session(&addr("15550000001"), SessionRecord::new_fresh())
+            .await;
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a dirty session without a raised lease must not gate the wire"
+        );
+
+        cache
+            .put_session(&addr("15550000002"), leased_record())
+            .await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a persisted lease releases the gate"
+        );
+    }
+
+    /// A failed flush must keep the gate closed — the lease never reached
+    /// storage, so the ciphertext must keep waiting.
+    #[tokio::test]
+    async fn failed_flush_keeps_the_gate_closed() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+
+        cache
+            .put_session(&addr("15550000003"), leased_record())
+            .await;
+        backend.set_fail_session_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "an unpersisted lease must keep gating the wire"
+        );
+
+        backend.set_fail_session_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// A checked-out session cannot be persisted by a flush, so its pending
+    /// lease must survive that flush and release only once the returned
+    /// record is actually written.
+    #[tokio::test]
+    async fn checked_out_session_keeps_its_lease_pending_across_a_flush() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let a = addr("15550000004");
+
+        cache.put_session(&a, leased_record()).await;
+        let taken = cache.get_session(&a, &backend).await.unwrap().unwrap();
+
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "a checked-out lease was not persisted and must keep the gate closed"
+        );
+
+        cache.put_session(&a, taken).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// Outbound sender-key advances gate the wire; decrypt-side dirtiness
+    /// (no wire gate mark) must not, so group receives never force a sync
+    /// flush onto an unrelated DM send.
+    #[tokio::test]
+    async fn only_encrypt_marked_sender_keys_gate_the_wire() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a decrypt-side sender-key write must not gate the wire"
+        );
+
+        let mut outbound = SenderKeyRecord::new_empty();
+        outbound.mark_wire_gated();
+        cache.put_sender_key(&name, outbound).await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// Deleting or clearing drops the pending gate together with the state it
+    /// guarded (the reloaded snapshot re-reserves on its first send).
+    #[tokio::test]
+    async fn delete_and_clear_drop_the_pending_gate() {
+        let cache = SignalStoreCache::new();
+        let a = addr("15550000005");
+
+        cache.put_session(&a, leased_record()).await;
+        cache.delete_session(&a).await;
+        assert!(!cache.needs_pre_wire_flush().await);
+
+        cache.put_session(&a, leased_record()).await;
+        cache.clear().await;
+        assert!(!cache.needs_pre_wire_flush().await);
     }
 }

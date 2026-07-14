@@ -72,7 +72,8 @@ impl Client {
     /// returning once the flush completes (or fails).
     ///
     /// The live receive path schedules a coalesced flush (see `signal_flush.rs`)
-    /// instead of writing through (sends flush synchronously). On success the
+    /// instead of writing through, and lease-covered sends do the same (only a
+    /// send that raises its counter lease flushes synchronously). On success the
     /// backend normally trails the cache by about the coalescing window, but
     /// that is not a hard wall-clock bound — the timer can slip under runtime
     /// starvation and the flush can wait on locks or slow/failing storage (a
@@ -158,6 +159,26 @@ impl Client {
             ));
         }
         self.flush_signal_cache().await
+    }
+
+    /// Pre-wire durability gate for the send path. Flushes synchronously only
+    /// when an outbound crypto advance actually demands it — a raised session
+    /// counter lease or a sender-key chain advance not yet persisted (see
+    /// `SignalStoreCache::needs_pre_wire_flush`). Otherwise the dirty state is
+    /// covered by an existing durable lease, so it only needs to land
+    /// eventually: it rides the same coalesced write-behind as the receive
+    /// path instead of paying a serialize + storage transaction per message.
+    /// A failure must abort the send — transmitting a ciphertext whose lease
+    /// could not be persisted reintroduces the counter-reuse window.
+    pub(crate) async fn persist_signal_state_pre_wire(&self) -> Result<(), anyhow::Error> {
+        if self.signal_cache.needs_pre_wire_flush().await {
+            return self.flush_signal_cache_batch_safe().await;
+        }
+        self.schedule_signal_flush(
+            self.connection_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        Ok(())
     }
 
     /// [`flush_signal_cache_batch_safe`](Self::flush_signal_cache_batch_safe)

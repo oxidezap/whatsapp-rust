@@ -70,7 +70,9 @@ impl<'a> Signal<'a> {
         .await?;
 
         drop(_guard);
-        self.client.flush_signal_cache_batch_safe().await?;
+        // Same pre-wire gate as the send path: the caller transmits these
+        // bytes, so a raised lease must be durable before they leave here.
+        self.client.persist_signal_state_pre_wire().await?;
 
         let (_, is_prekey, bytes) = wacore::send::extract_ciphertext(encrypted)
             .ok_or_else(|| SignalError::Unsupported("unexpected ciphertext variant".into()))?;

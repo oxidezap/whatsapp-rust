@@ -962,9 +962,9 @@ impl Client {
             .ensure_status_participants(prepared.node, &group_info)
             .await?;
 
-        // Persist the sender-key ratchet advance before the stanza hits the
-        // wire (same rule as the DM/group send path); a failure aborts the send.
-        self.flush_signal_cache_batch_safe().await?;
+        // Gate the stanza on the sender-key ratchet advance being durable
+        // (same rule as the DM/group send path); a failure aborts the send.
+        self.persist_signal_state_pre_wire().await?;
 
         let ack = if let Some(phash) = stanza
             .attrs()
@@ -1482,14 +1482,15 @@ impl Client {
             .await?
         };
 
-        // Persist the outbound ratchet advance BEFORE the stanza hits the wire
-        // (WA Web flushes the Signal store ahead of send). Reusing an outbound
-        // counter reuses its message key + IV, so the advance must be durable
-        // before anyone can act on the ciphertext — and a persistence failure
-        // must abort the send rather than transmit an advance we couldn't save.
-        // Only the receive path, where a lost advance re-derives forward,
-        // coalesces.
-        self.flush_signal_cache_batch_safe().await?;
+        // The outbound advance must be durable BEFORE the stanza hits the wire:
+        // reusing an outbound counter reuses its message key + IV. Counters are
+        // leased in batches (see `SessionRecord::reserve_sender_chain_counters`),
+        // so most sends are already covered by a durable lease and only
+        // schedule the coalesced write-behind; a send that raised the lease (or
+        // advanced a sender-key chain) flushes synchronously, and a persistence
+        // failure must abort the send rather than transmit an advance we
+        // couldn't save.
+        self.persist_signal_state_pre_wire().await?;
 
         let ack = if let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
