@@ -2871,6 +2871,44 @@ mod mark_full_distribution_list {
         }
     }
 
+    /// Regression guard (Codex P1 on #1027): the production group encrypt path
+    /// must delegate to the leasing primitive. A prior copy advanced and stored
+    /// the sender chain without reserving, so a warm group send reached the wire
+    /// before its advance was durable (a reload would re-derive the same
+    /// iteration; nonce reuse toward every group member). The first send must
+    /// reserve a batch.
+    #[tokio::test]
+    async fn encrypt_group_message_leases_the_sender_chain() {
+        use crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+        use crate::libsignal::protocol::{KeyPair, SenderKeyRecord};
+
+        let name = SenderKeyName::new("g@g.us".to_string(), "me.0".to_string());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(3, 1, 0, &[7u8; 32], kp.public_key, Some(kp.private_key))
+            .expect("valid sender key state");
+
+        let mut sks = MemSenderKeyStore::default();
+        sks.records.insert(name.clone(), record);
+
+        crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+            .await
+            .expect("group encrypt");
+
+        let stored = sks
+            .load_sender_key(&name)
+            .await
+            .expect("load")
+            .expect("record present");
+        assert_eq!(
+            stored.reserved_iteration(),
+            SENDER_CHAIN_RESERVATION_BATCH,
+            "encrypt_group_message must lease the sender chain"
+        );
+    }
+
     // Outgoing group encryption never consumes our own prekeys, and device B
     // has no bundle (so no session is established for it) — these are never
     // called; present only to satisfy the generic bounds.

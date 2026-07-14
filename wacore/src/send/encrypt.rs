@@ -19,62 +19,16 @@ where
     S: SenderKeyStore + ?Sized,
     R: Rng + CryptoRng,
 {
-    log::debug!(
-        "Attempting to load sender key for group {} sender {}",
-        sender_key_name.group_id(),
-        sender_key_name.sender_id()
-    );
-
-    let mut record = sender_key_store
-        .load_sender_key(sender_key_name)
-        .await?
-        .ok_or_else(|| {
-            SignalProtocolError::NoSenderKeyState(format!(
-                "no sender key record for group {} sender {}",
-                sender_key_name.group_id(),
-                sender_key_name.sender_id()
-            ))
-        })?;
-
-    let sender_key_state = record
-        .sender_key_state_mut()
-        .map_err(|e| anyhow!("Invalid SenderKey session: {:?}", e))?;
-
-    let sender_chain_key = sender_key_state
-        .sender_chain_key()
-        .ok_or_else(|| anyhow!("Invalid SenderKey session: missing chain key"))?;
-
-    let message_keys = sender_chain_key.sender_message_key();
-
-    let mut ciphertext = Vec::new();
-    aes_256_cbc_encrypt_into(
-        plaintext,
-        message_keys.cipher_key(),
-        message_keys.iv(),
-        &mut ciphertext,
-    )
-    .map_err(|_| anyhow!("AES encryption failed"))?;
-
-    let signing_key = sender_key_state
-        .signing_key_private()
-        .map_err(|e| anyhow!("Invalid SenderKey session: missing signing key: {:?}", e))?;
-
-    let skm = SenderKeyMessage::new(
-        SENDERKEY_MESSAGE_CURRENT_VERSION,
-        sender_key_state.chain_id(),
-        message_keys.iteration(),
-        ciphertext.into_boxed_slice(),
-        csprng,
-        &signing_key,
-    )?;
-
-    sender_key_state.set_sender_chain_key(sender_chain_key.next()?);
-
-    sender_key_store
-        .store_sender_key(sender_key_name, record)
-        .await?;
-
-    Ok(skm)
+    // Delegate to the libsignal primitive so the sender-key advance, the wire
+    // gate, and the iteration lease live in exactly one place (shared with the
+    // library API and the benchmarks). Before this the production path had its
+    // own copy that advanced and stored the chain without ever gating the
+    // advance, so a warm group send's ciphertext could reach the wire before the
+    // advance was durable (a reload would re-derive the same iteration; nonce
+    // reuse toward every group member).
+    crate::libsignal::protocol::group_encrypt(sender_key_store, sender_key_name, plaintext, csprng)
+        .await
+        .map_err(|e| anyhow!("group encrypt failed: {e:?}"))
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The

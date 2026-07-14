@@ -53,8 +53,8 @@ thread_local! {
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across this call (and any paired SKDM creation) so the load/advance/store
 /// of the chain is atomic against concurrent encrypts.
-pub async fn group_encrypt<R: Rng + CryptoRng>(
-    sender_key_store: &mut dyn SenderKeyStore,
+pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
+    sender_key_store: &mut S,
     sender_key_name: &SenderKeyName,
     plaintext: &[u8],
     csprng: &mut R,
@@ -111,10 +111,17 @@ pub async fn group_encrypt<R: Rng + CryptoRng>(
 
     sender_key_state.set_sender_chain_key(next_sender_chain_key);
 
-    // Outbound advance: this iteration's (key, IV) must never be re-derivable,
-    // so the store must gate the ciphertext on durability. Decrypt-side
-    // advances stay ungated (they re-derive forward).
-    record.mark_wire_gated();
+    // Outbound advance: this iteration's (key, IV) must never be re-derivable.
+    // Iterations below the durable reservation are already covered, so their
+    // sends ride the coalesced write-behind; only the send that reaches the
+    // ceiling re-reserves and gates the ciphertext on a synchronous flush (which
+    // fast-forwards past the reservation after any reload). Decrypt-side advances
+    // stay ungated (they re-derive forward). Mirrors the DM counter lease in
+    // SessionRecord.
+    let spent_iteration = message_keys.iteration();
+    if spent_iteration >= record.reserved_iteration() {
+        record.reserve_iterations(spent_iteration);
+    }
 
     sender_key_store
         .store_sender_key(sender_key_name, record)
@@ -424,5 +431,129 @@ mod tests {
             }
             other => panic!("expected NoSenderKeyState, got {other:?}"),
         }
+    }
+
+    use crate::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+    use futures::executor::block_on;
+
+    /// THE crash-safety invariant: a reload mid-lease must never re-derive an
+    /// iteration that a lost send may already have put on the wire, and a peer
+    /// must still decrypt across the resulting gap. Bob sends iteration 0
+    /// (reserving a batch), his record is snapshotted, a further send is lost in
+    /// the crash, and the reload fast-forwards past the whole reservation.
+    #[test]
+    fn crash_mid_lease_skips_spent_iterations_and_peer_decrypts() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        let skdm = block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("test");
+        let mut alice = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(process_sender_key_distribution_message(
+            &name, &skdm, &mut alice,
+        ))
+        .expect("test");
+
+        // Bob's first send: iteration 0, reserves the first batch.
+        let m0 = block_on(group_encrypt(&mut bob, &name, b"m0", &mut rng)).expect("test");
+        assert_eq!(m0.iteration(), 0);
+        assert_eq!(
+            block_on(group_decrypt(m0.serialized(), &mut alice, &name)).expect("test"),
+            b"m0"
+        );
+
+        // Snapshot Bob's durable state (chain at iteration 1, reservation persisted).
+        let snapshot = bob
+            .keys
+            .get(&name)
+            .expect("test")
+            .serialize()
+            .expect("test");
+
+        // A send whose advance never becomes durable (crash before flush).
+        let lost = block_on(group_encrypt(&mut bob, &name, b"lost", &mut rng)).expect("test");
+        assert_eq!(lost.iteration(), 1);
+
+        // Reload from the snapshot: the current chain fast-forwards past the lease.
+        let reloaded = SenderKeyRecord::deserialize(&snapshot).expect("test");
+        bob.keys.insert(name.clone(), reloaded);
+
+        // The next send must NOT reuse iterations 1..batch-1 (the lost one included).
+        let after = block_on(group_encrypt(&mut bob, &name, b"after", &mut rng)).expect("test");
+        assert!(
+            after.iteration() >= SENDER_CHAIN_RESERVATION_BATCH,
+            "reload reused a possibly-spent iteration: {} < {}",
+            after.iteration(),
+            SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        // Alice, who last saw iteration 0, still decrypts across the gap
+        // (a forward jump well under MAX_FORWARD_JUMPS).
+        assert_eq!(
+            block_on(group_decrypt(after.serialized(), &mut alice, &name)).expect("test"),
+            b"after"
+        );
+    }
+
+    /// A store that emulates the real signal-cache gate: it records whether each
+    /// stored advance was wire-gated and clears the transient flag, so a run of
+    /// sends can be counted for gate frequency.
+    struct GateCountingStore {
+        keys: HashMap<SenderKeyName, SenderKeyRecord>,
+        gated: usize,
+    }
+    #[async_trait]
+    impl SenderKeyStore for GateCountingStore {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            mut record: SenderKeyRecord,
+        ) -> Result<()> {
+            if record.is_wire_gated() {
+                self.gated += 1;
+                record.clear_wire_gated();
+            }
+            self.keys.insert(name.clone(), record);
+            Ok(())
+        }
+        async fn load_sender_key(&self, name: &SenderKeyName) -> Result<Option<SenderKeyRecord>> {
+            Ok(self.keys.get(name).cloned())
+        }
+    }
+
+    /// The lease must amortize the synchronous flush to one per batch: over
+    /// `2*batch + 2` sends, exactly the sends at iterations 0, batch and 2*batch
+    /// gate; the rest ride the coalesced write-behind.
+    #[test]
+    fn lease_amortizes_the_wire_gate() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = GateCountingStore {
+            keys: HashMap::new(),
+            gated: 0,
+        };
+        block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("test");
+
+        let sends = 2 * SENDER_CHAIN_RESERVATION_BATCH + 2;
+        for _ in 0..sends {
+            block_on(group_encrypt(&mut bob, &name, b"x", &mut rng)).expect("test");
+        }
+        assert_eq!(
+            bob.gated,
+            3,
+            "expected one gate per batch (iterations 0, {batch}, {two_batch}), got {got}",
+            batch = SENDER_CHAIN_RESERVATION_BATCH,
+            two_batch = 2 * SENDER_CHAIN_RESERVATION_BATCH,
+            got = bob.gated
+        );
     }
 }

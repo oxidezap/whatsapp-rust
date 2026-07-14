@@ -326,6 +326,34 @@ impl SenderKeyState {
         self.state.sender_chain_key = MessageField::some(chain_key.as_protobuf());
     }
 
+    /// Advance the sender chain up to a reload's reserved iteration ceiling so no
+    /// possibly-spent iteration below it stays derivable. Bounded by
+    /// `MAX_RESERVATION_FAST_FORWARD`; a target past that is a corrupt
+    /// reservation and errors rather than looping the KDF unboundedly. Mirrors
+    /// `SessionRecord::fast_forward_sender_chain`.
+    pub(crate) fn fast_forward_sender_chain(
+        &mut self,
+        target: u32,
+    ) -> Result<(), SignalProtocolError> {
+        let Some(mut chain_key) = self.sender_chain_key() else {
+            return Ok(());
+        };
+        if target.saturating_sub(chain_key.iteration()) > consts::MAX_RESERVATION_FAST_FORWARD {
+            return Err(SignalProtocolError::InvalidState(
+                "fast_forward_sender_chain",
+                "reserved sender-key iteration implausibly far ahead".into(),
+            ));
+        }
+        if chain_key.iteration() >= target {
+            return Ok(());
+        }
+        while chain_key.iteration() < target {
+            chain_key = chain_key.next()?;
+        }
+        self.set_sender_chain_key(chain_key);
+        Ok(())
+    }
+
     pub fn signing_key_public(&self) -> Result<PublicKey, InvalidSenderKeySessionError> {
         if let Some(signing_key) = self.state.sender_signing_key.as_option() {
             let public = signing_key
@@ -434,7 +462,22 @@ pub struct SenderKeyRecord {
     /// decrypt advances, which re-derive forward). Transient — never
     /// serialized; the store layer converts it into flush gating.
     wire_gated: bool,
+    /// Durably-reserved iteration ceiling for the current state's sender chain,
+    /// mirroring `SessionRecord::reserved_sender_chain_index` for DM. Iterations
+    /// below this ceiling are covered by a persisted reservation, so their sends
+    /// skip the synchronous pre-wire flush and ride the coalesced write-behind;
+    /// only the send that raises the ceiling gates. A reload fast-forwards the
+    /// current chain past this ceiling so no possibly-spent iteration is
+    /// re-derivable. Reset to 0 on any state change (rotation/promotion), which
+    /// forces the next send to re-reserve and gate; never reuses an iteration.
+    reserved_iteration: u32,
 }
+
+/// Local-only field appended to the serialized record for `reserved_iteration`.
+/// The vendored `SenderKeyRecordStructure` proto is untouched; the generated
+/// decoder skips this unknown top-level field and `deserialize` scans it out.
+/// Matches the field-number scheme `SessionRecord` uses for its DM counterpart.
+const RESERVED_ITERATION_FIELD: u32 = 100;
 
 impl SenderKeyRecord {
     /// Replaces the states wholesale, so the wire gate — which belongs to the
@@ -442,13 +485,31 @@ impl SenderKeyRecord {
     pub fn set_states_for_testing(&mut self, states: std::collections::VecDeque<SenderKeyState>) {
         self.states = states;
         self.wire_gated = false;
+        self.reserved_iteration = 0;
     }
 
     pub fn new_empty() -> Self {
         Self {
             states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),
             wire_gated: false,
+            reserved_iteration: 0,
         }
+    }
+
+    /// Iterations strictly below this ceiling are covered by a durable
+    /// reservation and their sends need no synchronous flush.
+    pub fn reserved_iteration(&self) -> u32 {
+        self.reserved_iteration
+    }
+
+    /// Lease a fresh batch of iterations after `spent_iteration` reached the
+    /// current ceiling. Marks the record wire-gated: the caller's ciphertext
+    /// must not hit the wire until a flush persists the raised ceiling. Mirrors
+    /// `SessionRecord::reserve_sender_chain_counters`.
+    pub fn reserve_iterations(&mut self, spent_iteration: u32) {
+        self.reserved_iteration =
+            spent_iteration.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
+        self.wire_gated = true;
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<SenderKeyRecord, SignalProtocolError> {
@@ -466,10 +527,57 @@ impl SenderKeyRecord {
             }
             states.push_back(SenderKeyState::from_protobuf(state));
         }
+
+        let reserved_iteration = Self::decode_reserved_iteration(buf)?;
+        // Fast-forward the current chain past the reserved ceiling so no
+        // possibly-spent iteration is re-derivable after this reload (crash OR
+        // reconnect). Only the current state (index 0) is ever encrypt-advanced.
+        if reserved_iteration > 0
+            && let Some(state) = states.front_mut()
+        {
+            state.fast_forward_sender_chain(reserved_iteration)?;
+        }
+
         Ok(Self {
             states,
             wire_gated: false,
+            reserved_iteration,
         })
+    }
+
+    /// Scan the local-only reserved-iteration field out of the raw record bytes.
+    /// The generated `SenderKeyRecordStructure` decoder skips unknown fields, so
+    /// the reservation is read here from the top-level stream.
+    ///
+    /// Fails closed: anything unreadable under our field number is an error, not
+    /// a skip. Skipping would silently yield reservation 0, disabling the
+    /// load-time fast-forward and re-enabling already-spent iterations, a
+    /// reused (key, IV) pair, the exact outcome this mechanism prevents. A load
+    /// error is recoverable (the sender key rebuilds); nonce reuse is not.
+    fn decode_reserved_iteration(bytes: &[u8]) -> Result<u32, SignalProtocolError> {
+        use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
+
+        let mut buf = bytes;
+        let mut reserved = None;
+        while !buf.is_empty() {
+            let tag =
+                Tag::decode(&mut buf).map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+            if tag.field_number() == RESERVED_ITERATION_FIELD {
+                if tag.wire_type() != WireType::Varint || reserved.is_some() {
+                    return Err(SignalProtocolError::InvalidProtobufEncoding);
+                }
+                let value = decode_varint(&mut buf)
+                    .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+                reserved = Some(
+                    u32::try_from(value)
+                        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
+                );
+            } else {
+                skip_field(tag, &mut buf)
+                    .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+            }
+        }
+        Ok(reserved.unwrap_or(0))
     }
 
     /// Flag an outbound chain advance; cleared by the store layer once it
@@ -552,6 +660,10 @@ impl SenderKeyRecord {
         }
 
         self.states.push_front(state);
+        // The current chain changed: any reservation belonged to the old current
+        // chain. Reset so the next send re-reserves and gates against the new
+        // one instead of treating stale-covered iterations as durable.
+        self.reserved_iteration = 0;
         Ok(())
     }
 
@@ -587,7 +699,17 @@ impl SenderKeyRecord {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, SignalProtocolError> {
-        Ok(self.as_protobuf().encode_to_vec())
+        use buffa::encoding::{Tag, WireType, encode_varint};
+
+        let mut buf = self.as_protobuf().encode_to_vec();
+        // Append the local-only reservation as a top-level field the generated
+        // decoder skips. Emitted only when non-zero, so legacy/unreserved records
+        // stay byte-identical. Mirrors SessionRecord::serialize_into.
+        if self.reserved_iteration > 0 {
+            Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut buf);
+            encode_varint(self.reserved_iteration as u64, &mut buf);
+        }
+        Ok(buf)
     }
 
     /// Estimated in-memory footprint proxy: encoded size of each state's
@@ -1018,6 +1140,131 @@ mod tests {
             .sender_key_state()
             .expect("sender key state should exist");
         assert_eq!(state.chain_id(), 12345);
+    }
+
+    fn record_with_state(chain_id: u32, seed: u8) -> SenderKeyRecord {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let keypair = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(
+                3,
+                chain_id,
+                0,
+                &[seed; 32],
+                keypair.public_key,
+                Some(keypair.private_key),
+            )
+            .expect("state should be valid");
+        record
+    }
+
+    fn current_iteration(record: &SenderKeyRecord) -> u32 {
+        record
+            .sender_key_state()
+            .expect("test")
+            .sender_chain_key()
+            .expect("test")
+            .iteration()
+    }
+
+    /// A reservation survives a serialize/deserialize round-trip, and the reload
+    /// fast-forwards the current chain past the reserved ceiling so no
+    /// possibly-spent iteration below it stays derivable.
+    #[test]
+    fn reservation_survives_roundtrip_and_reload_fast_forwards() {
+        let mut record = record_with_state(12345, 0x42);
+        record.reserve_iterations(0);
+        assert_eq!(
+            record.reserved_iteration(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+        assert_eq!(
+            current_iteration(&record),
+            0,
+            "reserving does not advance the chain"
+        );
+
+        let reloaded =
+            SenderKeyRecord::deserialize(&record.serialize().expect("test")).expect("test");
+        assert_eq!(
+            reloaded.reserved_iteration(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+        assert_eq!(
+            current_iteration(&reloaded),
+            consts::SENDER_CHAIN_RESERVATION_BATCH,
+            "reload must burn the reserved iterations"
+        );
+    }
+
+    /// Rotating the current sender-key state (a fresh chain) resets the lease so
+    /// the next send re-reserves against the new chain instead of treating stale
+    /// iterations as durable.
+    #[test]
+    fn rotation_resets_the_lease() {
+        let mut record = record_with_state(111, 0x42);
+        record.reserve_iterations(0);
+        assert_eq!(
+            record.reserved_iteration(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        record
+            .add_sender_key_state(
+                3,
+                222,
+                0,
+                &[0x43u8; 32],
+                kp.public_key,
+                Some(kp.private_key),
+            )
+            .expect("test");
+        assert_eq!(
+            record.reserved_iteration(),
+            0,
+            "rotation must reset the lease"
+        );
+    }
+
+    /// A record written without the local-only field (an older lib, or an
+    /// unreserved record) is byte-identical to the plain generated encoding and
+    /// loads with reservation 0; the first send re-reserves.
+    #[test]
+    fn legacy_record_without_field_loads_with_zero() {
+        let record = record_with_state(12345, 0x42);
+        let bytes = record.serialize().expect("test");
+        assert_eq!(
+            bytes,
+            record.as_protobuf().encode_to_vec(),
+            "an unreserved record appends no field"
+        );
+        let loaded = SenderKeyRecord::deserialize(&bytes).expect("test");
+        assert_eq!(loaded.reserved_iteration(), 0);
+        assert_eq!(
+            current_iteration(&loaded),
+            0,
+            "no reservation, no fast-forward"
+        );
+    }
+
+    /// A reservation implausibly far past the current chain is a corrupt record
+    /// and must fail closed at load rather than looping the KDF unboundedly.
+    #[test]
+    fn corrupt_reservation_is_rejected() {
+        use buffa::encoding::{Tag, WireType, encode_varint};
+
+        let record = record_with_state(12345, 0x42);
+        let mut bytes = record.serialize().expect("test");
+        let corrupt = consts::MAX_RESERVATION_FAST_FORWARD + 1000;
+        Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut bytes);
+        encode_varint(corrupt as u64, &mut bytes);
+        assert!(
+            SenderKeyRecord::deserialize(&bytes).is_err(),
+            "an implausibly-far reservation must fail closed"
+        );
     }
 
     /// Test SenderKeyRecord state limit
