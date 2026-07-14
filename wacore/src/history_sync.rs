@@ -1513,10 +1513,16 @@ fn extract_conversation_fields(
                 pos += vl;
             }
             (tags::conversation::PN_JID, wire_type::LENGTH_DELIMITED) => {
-                pn_jid = Some(read_str_field(data, &mut pos)?);
+                let Some(value) = read_str_field(data, &mut pos) else {
+                    break;
+                };
+                pn_jid = Some(value);
             }
             (tags::conversation::LID_JID, wire_type::LENGTH_DELIMITED) => {
-                lid_jid = Some(read_str_field(data, &mut pos)?);
+                let Some(value) = read_str_field(data, &mut pos) else {
+                    break;
+                };
+                lid_jid = Some(value);
             }
             _ => match skip_field(wt, data, pos) {
                 Ok(np) => pos = np,
@@ -1865,6 +1871,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn malformed_optional_mapping_does_not_drop_tc_token() {
+        let chat = "12025550143@s.whatsapp.net";
+        let tc_token = vec![0xAB; 16];
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        emit_len_field(&mut conv, tags::conversation::TC_TOKEN, &tc_token);
+        emit_varint(
+            &mut conv,
+            ((tags::conversation::TC_TOKEN_TIMESTAMP << 3) | wire_type::VARINT) as u64,
+        );
+        emit_varint(&mut conv, 1_700_000_000);
+        emit_len_field(&mut conv, tags::conversation::PN_JID, &[0xFF, 0xFE]);
+
+        let mut raw = Vec::new();
+        emit_len_field(&mut raw, tags::history_sync::CONVERSATIONS, &conv);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = process_history_sync(compressed, None, false).unwrap();
+        assert!(result.lid_mappings.is_empty());
+        assert_eq!(result.tc_token_candidates.len(), 1);
+        assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
     }
 
     /// Prost-only oracle: what the pre-fast-path pipeline produced for one

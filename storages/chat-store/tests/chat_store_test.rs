@@ -373,7 +373,7 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
                 mute_end_time: Some(1_800_000_000),
                 pinned: Some(1_700_000_800),
                 username: Some("alice_example".to_string()),
-                unread_count: Some(0),
+                unread_count: Some(7),
                 marked_as_unread: Some(true),
                 ..Default::default()
             },

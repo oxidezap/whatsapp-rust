@@ -1467,8 +1467,8 @@ fn apply_history_conversation(
             .or(conv.display_name.as_deref())
             .or(conv.username.as_deref());
         let unread_count = match conv.unread_count {
-            Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
             _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
+            Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
             _ => 0,
         };
         diesel::insert_into(dsl::chats)
