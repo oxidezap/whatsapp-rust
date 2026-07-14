@@ -57,6 +57,7 @@ fn main() {
                 },
             ) {
                 log::error!("Failed to open main window: {error}");
+                cx.quit();
             }
         });
 }

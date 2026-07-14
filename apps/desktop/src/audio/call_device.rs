@@ -72,8 +72,8 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     // the OS default. We only enumerate `input_devices()` when a name is requested: enumerating on
     // Linux/ALSA probes the legacy OSS plugin and prints harmless "Cannot open /dev/dsp" noise to
     // stderr (from libasound, not our logger), so the default path -- `default_input_device()`, which
-    // does not enumerate -- avoids it entirely. When a name IS requested, a no-match error lists the
-    // available inputs so the right substring can be found.
+    // does not enumerate -- avoids it entirely. A no-match error stays generic so device names do
+    // not leak through logs.
     let want = std::env::var("WA_INPUT_DEVICE")
         .ok()
         .filter(|s| !s.is_empty());

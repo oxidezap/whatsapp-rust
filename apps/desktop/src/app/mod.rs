@@ -2135,7 +2135,7 @@ impl WhatsAppApp {
                 if let Some(ref name) = sender_name
                     && !message.is_from_me
                 {
-                    chat.set_name_if_better(name.clone(), 2);
+                    chat.set_name_if_not_worse(name.clone(), 2);
                 }
             }
             // Status broadcasts: don't update any names

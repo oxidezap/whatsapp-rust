@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::jid::{Jid, JidExt, Server};
 
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
@@ -21,7 +21,9 @@ pub(crate) fn fallback_chat_name(jid: &Jid) -> String {
         "Channel".to_string()
     } else if jid.server.is_lid_family() {
         "Unknown contact".to_string()
-    } else if jid.server.is_pn_family() && jid.user_base().chars().all(|c| c.is_ascii_digit()) {
+    } else if (jid.server.is_pn_family() || jid.server == Server::Legacy)
+        && jid.user_base().chars().all(|c| c.is_ascii_digit())
+    {
         format!("+{}", jid.user_base())
     } else {
         "Unknown chat".to_string()
@@ -375,6 +377,13 @@ impl Chat {
         }
     }
 
+    pub(crate) fn set_name_if_not_worse(&mut self, name: String, priority: u8) {
+        if priority >= self.name_priority {
+            self.name = name;
+            self.name_priority = priority;
+        }
+    }
+
     /// Update a participant's display name (for group chats)
     pub fn update_participant(&mut self, jid: String, name: String) {
         self.participants.insert(jid, name);
@@ -443,7 +452,7 @@ impl Chat {
     /// the live one. Messages merge dedup-guarded without unread bumps; the
     /// store's counters are authoritative after a flush.
     pub fn merge_history(&mut self, hydrated: Chat) {
-        self.set_name_if_better(hydrated.name, hydrated.name_priority);
+        self.set_name_if_not_worse(hydrated.name, hydrated.name_priority);
         for msg in hydrated.messages {
             self.insert_history_message(msg);
         }
@@ -601,9 +610,11 @@ mod tests {
     fn chat_fallback_hides_internal_lid() {
         let lid = Chat::new("111222333444555@lid".to_string());
         let pn = Chat::new("12025550143@s.whatsapp.net".to_string());
+        let legacy = Chat::new("12025550144@c.us".to_string());
 
         assert_eq!(lid.name, "Unknown contact");
         assert_eq!(pn.name, "+12025550143");
+        assert_eq!(legacy.name, "+12025550144");
     }
 
     #[test]
@@ -624,11 +635,16 @@ mod tests {
             3,
         ));
         chat.merge_history(Chat::with_name_priority(
+            jid.clone(),
+            "Renamed Fictitious Contact".to_string(),
+            3,
+        ));
+        chat.merge_history(Chat::with_name_priority(
             jid,
             "Older history label".to_string(),
             1,
         ));
-        assert_eq!(chat.name, "Fictitious Contact");
+        assert_eq!(chat.name, "Renamed Fictitious Contact");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! WhatsApp client wrapper for UI integration
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
@@ -19,7 +19,7 @@ use whatsapp_rust_chat_store::ChatStore;
 
 use crate::audio::{spawn_mic, spawn_speaker};
 use crate::state::{
-    ChatMessage, DownloadableMedia, IncomingCall, MediaContent, MediaType, UiEvent,
+    Chat, ChatMessage, DownloadableMedia, IncomingCall, MediaContent, MediaType, UiEvent,
     fallback_chat_name,
 };
 use wacore::download::MediaType as DownloadMediaType;
@@ -1458,6 +1458,47 @@ fn read_message_range(
     message_range(ts_secs, None, messages)
 }
 
+fn merge_alias_history_messages(
+    chat: &mut Chat,
+    mut messages: Vec<ChatMessage>,
+    alias_unread: u32,
+) {
+    // Alias rows may be disjoint or repeated; only loaded message IDs prove
+    // that two unread counters overlap.
+    let existing_unread_ids: HashSet<String> = chat
+        .messages
+        .iter()
+        .filter(|message| !message.is_from_me && !message.is_read)
+        .map(|message| message.id.clone())
+        .collect();
+    let duplicate_unread = messages
+        .iter()
+        .filter(|message| {
+            !message.is_from_me && !message.is_read && existing_unread_ids.contains(&message.id)
+        })
+        .count() as u32;
+
+    for message in &mut messages {
+        if !message.is_from_me && existing_unread_ids.contains(&message.id) {
+            message.is_read = false;
+        }
+    }
+    for message in messages {
+        chat.insert_history_message(message);
+    }
+
+    let visible_unread = chat
+        .messages
+        .iter()
+        .filter(|message| !message.is_from_me && !message.is_read)
+        .count() as u32;
+    chat.unread_count = chat
+        .unread_count
+        .saturating_add(alias_unread)
+        .saturating_sub(duplicate_unread)
+        .max(visible_unread);
+}
+
 impl WhatsAppClient {
     const HISTORY_CHAT_LIMIT: i64 = 100;
     const HISTORY_MESSAGES_PER_CHAT: i64 = 50;
@@ -1578,10 +1619,7 @@ impl WhatsAppClient {
                         remaining -= 1;
                     }
                 }
-                for msg in msgs {
-                    existing.insert_history_message(msg);
-                }
-                existing.unread_count = existing.unread_count.max(entry.unread_count.max(0) as u32);
+                merge_alias_history_messages(existing, msgs, entry.unread_count.max(0) as u32);
                 existing.manually_unread |= entry.unread_count < 0;
                 existing.set_name_if_better(name, name_priority);
                 continue;
@@ -2093,8 +2131,13 @@ impl Drop for WhatsAppClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadBoundary, is_masked_phone_label, media_metadata, read_message_range};
-    use crate::state::fallback_chat_name;
+    use std::collections::HashMap;
+
+    use super::{
+        ReadBoundary, is_masked_phone_label, media_metadata, merge_alias_history_messages,
+        read_message_range,
+    };
+    use crate::state::{Chat, ChatMessage, fallback_chat_name};
     use buffa::MessageField;
     use wacore_binary::Jid;
     use waproto::whatsapp as wa;
@@ -2116,6 +2159,40 @@ mod tests {
         assert!(is_masked_phone_label("+234\u{2022}\u{2022}\u{2022}64"));
         assert!(!is_masked_phone_label("+12025550143"));
         assert!(!is_masked_phone_label("Fictitious Contact"));
+    }
+
+    #[test]
+    fn alias_history_unread_deduplicates_only_matching_messages() {
+        let message = |id: &str| ChatMessage {
+            id: id.to_string(),
+            sender: "12025550143@s.whatsapp.net".to_string(),
+            sender_name: None,
+            content: id.to_string(),
+            timestamp: wacore::time::now_utc(),
+            is_from_me: false,
+            is_read: false,
+            media: None,
+            reactions: HashMap::new(),
+            failed: false,
+        };
+        let mut chat = Chat::new("111222333444555@lid".to_string());
+        chat.messages = vec![message("MSG-A"), message("MSG-B")];
+        chat.unread_count = 2;
+
+        merge_alias_history_messages(
+            &mut chat,
+            vec![message("MSG-B"), message("MSG-C"), message("MSG-D")],
+            3,
+        );
+        assert_eq!(chat.unread_count, 4);
+        assert_eq!(chat.messages.len(), 4);
+
+        merge_alias_history_messages(
+            &mut chat,
+            vec![message("MSG-B"), message("MSG-C"), message("MSG-D")],
+            3,
+        );
+        assert_eq!(chat.unread_count, 4);
     }
 
     #[test]
