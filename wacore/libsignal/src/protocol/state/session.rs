@@ -666,6 +666,13 @@ impl From<&SessionState> for SessionStructure {
 /// [`SessionRecord::serialize_into`] — writes it directly; the number sits far
 /// above RecordStructure's fields (1, 2) so a future upstream addition cannot
 /// collide. Standard unknown-field skipping keeps old readers compatible.
+///
+/// That compatibility is one-way: a build without lease support silently
+/// ignores this field, so downgrading the library across a crash can resume a
+/// leased chain from its stale snapshot and reuse a counter. Nothing here can
+/// prevent that — already-released readers skip unknown fields by definition —
+/// so it is a release-note constraint, not a code one. Never lower this
+/// number into a range an older reader might interpret.
 const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 = 100;
 
 #[derive(Clone)]
@@ -773,27 +780,37 @@ impl SessionRecord {
     /// Extract the record-level reservation field from the serialized bytes.
     /// The generated `RecordStructureView` skips fields it does not know, so
     /// the local-only field is scanned out of the raw top-level stream here.
+    ///
+    /// Fails closed: anything unreadable under our own field number is an
+    /// error rather than a skip. Skipping would silently yield reservation 0,
+    /// which disables the load-time fast-forward and re-enables already-spent
+    /// counters — the one outcome this whole mechanism exists to prevent. A
+    /// load error is recoverable (the session rebuilds); a reused (key, IV)
+    /// pair is not.
     fn decode_reserved_index(bytes: &[u8]) -> Result<u32, SignalProtocolError> {
         use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
 
         let mut buf = bytes;
-        let mut reserved = 0u32;
+        let mut reserved = None;
         while !buf.is_empty() {
             let tag = Tag::decode(&mut buf)
                 .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
-            if tag.field_number() == RESERVED_SENDER_CHAIN_INDEX_FIELD
-                && tag.wire_type() == WireType::Varint
-            {
+            if tag.field_number() == RESERVED_SENDER_CHAIN_INDEX_FIELD {
+                if tag.wire_type() != WireType::Varint || reserved.is_some() {
+                    return Err(InvalidSessionError("invalid reserved sender chain index").into());
+                }
                 let value = decode_varint(&mut buf)
                     .map_err(|_| InvalidSessionError("invalid reserved sender chain index"))?;
-                reserved = u32::try_from(value)
-                    .map_err(|_| InvalidSessionError("invalid reserved sender chain index"))?;
+                reserved = Some(
+                    u32::try_from(value)
+                        .map_err(|_| InvalidSessionError("invalid reserved sender chain index"))?,
+                );
             } else {
                 skip_field(tag, &mut buf)
                     .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
             }
         }
-        Ok(reserved)
+        Ok(reserved.unwrap_or(0))
     }
 
     /// If there's a session with a matching version and `alice_base_key`, ensures that it is the
@@ -1293,6 +1310,45 @@ mod tests {
         assert!(
             SessionRecord::deserialize(&bytes).is_err(),
             "an implausible lease must fail the load, not fast-forward"
+        );
+    }
+
+    /// A lease field that is unreadable — wrong wire type, or duplicated so
+    /// "last one wins" could pick a lower ceiling — must fail the load. Were
+    /// it skipped, the record would load with reservation 0, silently
+    /// re-enabling every counter the real lease had already spent.
+    #[test]
+    fn deserialize_rejects_a_malformed_or_duplicated_lease_field() {
+        use buffa::encoding::{Tag, WireType, encode_varint};
+
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut record = SessionRecord::new(create_test_session_state(3, &base_key));
+        record.reserve_sender_chain_counters(0);
+        let good = record.serialize().unwrap();
+        assert!(
+            SessionRecord::deserialize(&good).is_ok(),
+            "the well-formed record must still load"
+        );
+
+        // Same field number, non-varint wire type.
+        let mut wrong_type = record.serialize().unwrap();
+        Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::LengthDelimited)
+            .encode(&mut wrong_type);
+        encode_varint(0, &mut wrong_type); // zero-length payload
+        assert!(
+            SessionRecord::deserialize(&wrong_type).is_err(),
+            "a non-varint lease field must fail the load, not be skipped"
+        );
+
+        // Duplicated field: a trailing 0 would win under last-one-wins and
+        // wipe the ceiling.
+        let mut duplicated = record.serialize().unwrap();
+        Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(&mut duplicated);
+        encode_varint(0, &mut duplicated);
+        assert!(
+            SessionRecord::deserialize(&duplicated).is_err(),
+            "a duplicated lease field must fail the load rather than lower the ceiling"
         );
     }
 

@@ -157,8 +157,16 @@ impl SessionStoreState {
         self.cache.clear();
         self.dirty.clear();
         self.deleted.clear();
-        // Cleared sessions reload from the backend, whose snapshot still
-        // carries its own (older) lease; the first send re-reserves.
+        // Dropping a pending gate here is only safe because a clear can never
+        // race a live wire: every caller runs either before the transport
+        // exists (connect) or after `cleanup_connection_state` has already
+        // taken the noise socket, and a send resolves that socket AFTER its
+        // pre-wire gate. So a send that observes this cleared set cannot reach
+        // send_node — it fails NotConnected — and its unpersisted lease dies
+        // with the ciphertext instead of reaching a peer. Moving a clear ahead
+        // of the socket teardown would silently reintroduce counter reuse for
+        // lease-raising sends. The reloaded snapshot carries its own older
+        // lease, and the first send re-reserves from there.
         self.reservation_pending.clear();
     }
 

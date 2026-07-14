@@ -325,6 +325,45 @@ fn crash_reload(peer: &mut Peer, remote: &ProtocolAddress, snapshot: &[u8]) {
 
 // ---- scenarios --------------------------------------------------------------
 
+/// Guard for the fixture itself: `make_rng` seeds a StdRng from the OS/thread
+/// entropy source, so each peer must get independent key material. Were it
+/// deterministic, both peers would agree on keys by accident and every
+/// assertion below would pass for the wrong reason.
+#[test]
+fn peers_generate_independent_keys() {
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
+
+    assert_ne!(
+        alice
+            .identity_store
+            .identity_key_pair
+            .identity_key()
+            .serialize(),
+        bob.identity_store
+            .identity_key_pair
+            .identity_key()
+            .serialize(),
+        "peers must not share an identity key"
+    );
+    let key_of = |p: &Peer| {
+        BUNDLES.with(|b| {
+            b.borrow()
+                .get(&p.address)
+                .expect("bundle")
+                .pre_key_public()
+                .expect("bundle read")
+                .expect("one-time prekey")
+                .serialize()
+        })
+    };
+    assert_ne!(
+        key_of(&alice),
+        key_of(&bob),
+        "peers must not share a one-time prekey"
+    );
+}
+
 /// The very first send on a fresh session must raise a lease and gate the
 /// wire on its durability.
 #[test]
