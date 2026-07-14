@@ -104,6 +104,11 @@ pub struct InMemoryBackend {
     /// ratchet advance cannot be persisted.
     #[cfg(any(test, feature = "test-util"))]
     fail_session_writes: AtomicBool,
+    /// When set, `put_sender_keys_batch` fails. Test hook: the sender-key
+    /// counterpart of `fail_session_writes` (wire gate must survive a failed
+    /// flush).
+    #[cfg(any(test, feature = "test-util"))]
+    fail_sender_key_writes: AtomicBool,
 }
 
 impl InMemoryBackend {
@@ -116,6 +121,8 @@ impl InMemoryBackend {
             session_batch_writes: AtomicU32::new(0),
             #[cfg(any(test, feature = "test-util"))]
             fail_session_writes: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_sender_key_writes: AtomicBool::new(false),
         }
     }
 
@@ -129,6 +136,12 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_session_writes(&self, fail: bool) {
         self.fail_session_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Make every subsequent `put_sender_keys_batch` fail (or stop failing).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_sender_key_writes(&self, fail: bool) {
+        self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
     }
 }
 
@@ -315,6 +328,12 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_sender_key_writes.load(Ordering::Relaxed) {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "put_sender_key failing (test hook)",
+            )));
+        }
         self.state
             .lock()
             .await

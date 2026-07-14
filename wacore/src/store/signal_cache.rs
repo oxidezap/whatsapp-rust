@@ -2066,6 +2066,30 @@ mod pre_wire_gate_tests {
         assert!(!cache.needs_pre_wire_flush().await);
     }
 
+    /// The sender-key counterpart of `failed_flush_keeps_the_gate_closed`: a
+    /// flush that fails writing the chain advance must keep the wire gated.
+    #[tokio::test]
+    async fn failed_flush_keeps_the_sender_key_gate_closed() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        let mut outbound = SenderKeyRecord::new_empty();
+        outbound.mark_wire_gated();
+        cache.put_sender_key(&name, outbound).await;
+
+        backend.set_fail_sender_key_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "an unpersisted sender-key advance must keep gating the wire"
+        );
+
+        backend.set_fail_sender_key_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
     /// Deleting or clearing drops the pending gate together with the state it
     /// guarded (the reloaded snapshot re-reserves on its first send).
     #[tokio::test]
