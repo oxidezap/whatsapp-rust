@@ -93,7 +93,11 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
                 log::error!("outgoing sender key state corrupt for distribution");
                 SignalProtocolError::InvalidSenderKeySession
             })?;
-        Ok::<Vec<u8>, SignalProtocolError>(buf_wrapper.take_buffer())
+        // Copy out a right-sized ciphertext and keep the reusable buffer, rather
+        // than handing away its (1 KiB) capacity and re-allocating one per send.
+        // A group skmsg is small, so `take_buffer` here otherwise cost a fresh
+        // 1 KiB per send once the production path started sharing this primitive.
+        Ok::<Box<[u8]>, SignalProtocolError>(buf.as_slice().into())
     })?;
 
     let signing_key = sender_key_state
@@ -104,7 +108,7 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
         message_version,
         sender_key_state.chain_id(),
         message_keys.iteration(),
-        ciphertext.into_boxed_slice(),
+        ciphertext,
         csprng,
         &signing_key,
     )?;
