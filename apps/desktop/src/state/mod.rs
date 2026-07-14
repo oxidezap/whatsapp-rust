@@ -13,5 +13,6 @@ mod events;
 
 pub use app_state::{AppState, CachedQrCode};
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
+pub(crate) use chat::fallback_chat_name;
 pub use chat::{Chat, ChatMessage, DownloadableMedia, MediaContent, MediaType};
 pub use events::{ReceiptType, UiEvent};

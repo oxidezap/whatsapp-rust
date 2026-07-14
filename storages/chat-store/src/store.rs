@@ -1461,14 +1461,23 @@ fn apply_history_conversation(
 
     {
         use schema::chats::dsl;
-        let name = conv.name.as_deref().or(conv.display_name.as_deref());
+        let name = conv
+            .name
+            .as_deref()
+            .or(conv.display_name.as_deref())
+            .or(conv.username.as_deref());
+        let unread_count = match conv.unread_count {
+            Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
+            _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
+            _ => 0,
+        };
         diesel::insert_into(dsl::chats)
             .values((
                 dsl::device_id.eq(device_id),
                 dsl::jid.eq(chat),
                 dsl::name.eq(name),
                 dsl::last_message_ts.eq(last_ts_ms),
-                dsl::unread_count.eq(conv.unread_count.unwrap_or(0) as i32),
+                dsl::unread_count.eq(unread_count),
                 // Wire values are unix SECONDS; the columns (and the live
                 // app-state paths) are milliseconds.
                 dsl::pinned_at.eq(conv

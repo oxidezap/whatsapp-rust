@@ -42,7 +42,7 @@ fn main() {
 
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
 
-            cx.open_window(
+            if let Err(error) = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
@@ -55,7 +55,8 @@ fn main() {
                     let view = cx.new(WhatsAppApp::new);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
-            )
-            .expect("failed to open main window");
+            ) {
+                log::error!("Failed to open main window: {error}");
+            }
         });
 }

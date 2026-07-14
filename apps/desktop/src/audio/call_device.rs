@@ -83,18 +83,13 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
                 .input_devices()
                 .map(|i| i.collect())
                 .unwrap_or_default();
-            let names: Vec<String> = devices
-                .iter()
-                .filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
-                .collect();
             devices
                 .into_iter()
-                .find(|d| d.description().is_ok_and(|x| x.name().contains(want.as_str())))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no input device name contains WA_INPUT_DEVICE={want:?}; available inputs: {names:?}"
-                    )
-                })?
+                .find(|d| {
+                    d.description()
+                        .is_ok_and(|x| x.name().contains(want.as_str()))
+                })
+                .ok_or_else(|| anyhow!("WA_INPUT_DEVICE did not match an input device"))?
         }
         None => host
             .default_input_device()
@@ -103,13 +98,7 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     let (config, format) = default_config(&device, true)?;
     let src_rate = config.sample_rate;
     let channels = config.channels as usize;
-    info!(
-        "🎤 cpal input: {} @ {src_rate} Hz, {channels} ch, {format:?}",
-        device
-            .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "?".into())
-    );
+    info!("🎤 cpal input: {src_rate} Hz, {channels} ch, {format:?}");
 
     let (tx, rx) = async_channel::bounded::<Vec<i16>>(8);
 
@@ -323,13 +312,7 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
     let (config, format) = default_config(&device, false)?;
     let dst_rate = config.sample_rate;
     let channels = config.channels as usize;
-    info!(
-        "🔈 cpal output: {} @ {dst_rate} Hz, {channels} ch, {format:?}",
-        device
-            .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "?".into())
-    );
+    info!("🔈 cpal output: {dst_rate} Hz, {channels} ch, {format:?}");
 
     // ~1 s of native-rate mono headroom: rides out DTX gaps and scheduling jitter.
     let ring = HeapRb::<i16>::new(dst_rate as usize);

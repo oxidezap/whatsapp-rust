@@ -513,7 +513,11 @@ fn render_document_placeholder(
         .gap_2()
         .child(
             div()
+                .min_w_0()
+                .flex_1()
                 .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
                 .text_color(rgb(colors::TEXT_SECONDARY))
                 .child(label),
         );

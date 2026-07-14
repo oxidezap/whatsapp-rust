@@ -213,10 +213,10 @@ We use the [gpui-component](https://longbridge.github.io/gpui-component/) librar
 
 ```bash
 # Development build
-cargo run -p whatsapp-desktop
+cargo run --manifest-path apps/desktop/Cargo.toml
 
 # Release build (optimized)
-cargo run --release -p whatsapp-desktop
+cargo run --release --manifest-path apps/desktop/Cargo.toml
 ```
 
 ## Dependencies
@@ -250,7 +250,7 @@ cargo run --release -p whatsapp-desktop
 
 ## Future Improvements
 
-- [ ] Contact name resolution from address book
+- [x] Contact name resolution from address book
 - [ ] Group chat features (participants, admin actions)
 - [ ] Settings/preferences screen
 - [ ] Notification system

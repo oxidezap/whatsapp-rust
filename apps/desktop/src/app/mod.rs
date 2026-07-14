@@ -35,10 +35,10 @@ actions!(chat_list, [SelectUp, SelectDown]);
 
 use crate::components::{InputAreaEvent, InputAreaView};
 use log::{error, info, warn};
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::jid::{Jid, JidExt, observe_str};
 
 use crate::audio::{AudioPlayer, AudioRecorder, encode_to_opus_ogg, generate_waveform};
-use crate::client::WhatsAppClient;
+use crate::client::{ReadBoundary, WhatsAppClient};
 use crate::responsive::{MobilePanel, ResponsiveLayout};
 use crate::state::{
     AppState, CachedQrCode, Chat, ChatMessage, DownloadableMedia, IncomingCall, MediaContent,
@@ -235,7 +235,7 @@ pub struct WhatsAppApp {
     /// Currently selected chat JID
     selected_chat: Option<String>,
     /// WhatsApp client wrapper
-    client: WhatsAppClient,
+    client: Option<WhatsAppClient>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
     /// Focus handle for chat list keyboard navigation
@@ -259,7 +259,7 @@ pub struct WhatsAppApp {
     drafts: HashMap<String, String>,
     /// Background task for event polling (must be retained)
     #[allow(dead_code)]
-    event_task: Task<()>,
+    event_task: Option<Task<()>>,
     /// Audio recorder for PTT messages
     audio_recorder: AudioRecorder,
     /// Current recording state
@@ -321,17 +321,25 @@ impl WhatsAppApp {
 
     /// Create a new WhatsApp application
     pub fn new(cx: &mut Context<Self>) -> Self {
-        // Process bootstrap: with no runtime there is no client to hang the
-        // UI off, so failing to boot is fatal here (retries route to the
-        // error screen instead — see retry_connection).
-        let mut client = WhatsAppClient::new().expect("Failed to create tokio runtime at startup");
-        let ui_rx = client
-            .start()
-            .expect("Fresh client should start successfully");
-        let event_task = Self::spawn_event_task(ui_rx, cx);
+        let bootstrap = WhatsAppClient::new().and_then(|mut client| {
+            let ui_rx = client.start().map_err(std::io::Error::other)?;
+            Ok((client, ui_rx))
+        });
+        let (app_state, client, event_task) = match bootstrap {
+            Ok((client, ui_rx)) => (
+                AppState::Loading,
+                Some(client),
+                Some(Self::spawn_event_task(ui_rx, cx)),
+            ),
+            Err(e) => (
+                AppState::Error(format!("Failed to start client: {e}")),
+                None,
+                None,
+            ),
+        };
 
         Self {
-            app_state: AppState::Loading,
+            app_state,
             chats: Vec::new(),
             selected_chat: None,
             client,
@@ -496,6 +504,25 @@ impl WhatsAppApp {
     /// Find a chat by JID (mutable)
     fn find_chat_mut(&mut self, jid: &str) -> Option<&mut Chat> {
         self.chats.iter_mut().find(|c| c.jid == jid)
+    }
+
+    fn read_boundary(chat: &Chat) -> Option<ReadBoundary> {
+        let last = chat.messages.last()?;
+        let ts_secs = last.timestamp.timestamp();
+        let ids = chat
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.timestamp.timestamp() == ts_secs)
+            .map(|message| {
+                (
+                    message.id.clone(),
+                    message.is_from_me,
+                    (!message.is_from_me).then(|| message.sender.clone()),
+                )
+            })
+            .collect();
+        Some((ts_secs, ids))
     }
 
     /// Update a message's media data (used to cache downloaded media)
@@ -703,7 +730,9 @@ impl WhatsAppApp {
         if self.composing_chat.as_deref() != Some(jid.as_str())
             && let Some(prev) = self.composing_chat.take()
         {
-            self.client.send_paused(&prev);
+            if let Some(client) = &self.client {
+                client.send_paused(&prev);
+            }
             if let Some(ref input_area) = self.input_area {
                 input_area.update(cx, |view, _| view.reset_typing());
             }
@@ -742,31 +771,23 @@ impl WhatsAppApp {
             info!(
                 "Sending read receipts for {} messages in {}",
                 unread_messages.len(),
-                jid
+                observe_str(&jid)
             );
-            self.client.send_read_receipts(&jid, unread_messages);
+            if let Some(client) = &self.client {
+                client.send_read_receipts(&jid, unread_messages);
+            }
         }
 
-        // A manual-unread badge is the store's -1 sentinel, cleared only by a
-        // MarkChatAsRead action; receipts alone would let it come back on the
-        // next history reload. Bounded to the newest visible bubble so a
-        // message racing the echo isn't marked read sight-unseen.
-        if let Some(chat) = self.find_chat(&jid).filter(|c| c.manually_unread) {
-            // Every bubble in the newest second rides along: the keyed range
-            // stops the watermark short of that second, so a same-second
-            // sibling left out would stay unread and re-badge on hydration.
-            let last_displayed = chat.messages.last().map(|last| {
-                let ts_secs = last.timestamp.timestamp();
-                let ids = chat
-                    .messages
-                    .iter()
-                    .rev()
-                    .take_while(|m| m.timestamp.timestamp() == ts_secs)
-                    .map(|m| (m.id.clone(), m.is_from_me))
-                    .collect();
-                (ts_secs, ids)
-            });
-            self.client.mark_chat_read(&jid, last_displayed);
+        // The bounded action also covers unread rows not loaded by the UI.
+        if let Some(chat) = self
+            .find_chat(&jid)
+            .filter(|c| c.unread_count > 0 || c.manually_unread)
+        {
+            // Include same-second siblings so none can re-badge on hydration.
+            let last_displayed = Self::read_boundary(chat);
+            if let Some(client) = &self.client {
+                client.mark_chat_read(&jid, last_displayed);
+            }
         }
 
         // Mark as read locally
@@ -789,15 +810,18 @@ impl WhatsAppApp {
 
         // Tear down the old client's background thread first; otherwise every
         // retry stacks another live runtime + DB pool on the same file.
-        self.client.shutdown();
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+        self.event_task.take();
 
         // A failed rebuild routes back to the error screen (retry stays
         // available) instead of panicking the UI thread.
         match WhatsAppClient::new() {
             Ok(mut client) => match client.start() {
                 Ok(ui_rx) => {
-                    self.event_task = Self::spawn_event_task(ui_rx, cx);
-                    self.client = client;
+                    self.event_task = Some(Self::spawn_event_task(ui_rx, cx));
+                    self.client = Some(client);
                 }
                 Err(e) => {
                     self.app_state = AppState::Error(format!("Failed to restart client: {e}"));
@@ -861,7 +885,9 @@ impl WhatsAppApp {
                 // Send "composing" presence
                 if let Some(jid) = &self.selected_chat {
                     self.composing_chat = Some(jid.clone());
-                    self.client.send_composing(jid);
+                    if let Some(client) = &self.client {
+                        client.send_composing(jid);
+                    }
                 }
             }
             InputAreaEvent::StoppedTyping => {
@@ -871,8 +897,10 @@ impl WhatsAppApp {
                     .composing_chat
                     .take()
                     .or_else(|| self.selected_chat.clone());
-                if let Some(jid) = target {
-                    self.client.send_paused(&jid);
+                if let Some(jid) = target
+                    && let Some(client) = &self.client
+                {
+                    client.send_paused(&jid);
                 }
             }
         }
@@ -905,7 +933,11 @@ impl WhatsAppApp {
         };
 
         let local_id = Self::next_local_id("local");
-        self.client.send_message(&jid, text, local_id.clone());
+        let Some(client) = &self.client else {
+            warn!("Cannot send message: client is unavailable");
+            return;
+        };
+        client.send_message(&jid, text, local_id.clone());
 
         // Add to local chat immediately for responsiveness; the client renames
         // it to the real id via MessageIdAssigned.
@@ -931,8 +963,8 @@ impl WhatsAppApp {
             return;
         }
 
-        if self.is_recording() {
-            warn!("Already recording");
+        if self.recording_state != RecordingState::Idle {
+            warn!("Audio recording is already active");
             return;
         }
 
@@ -980,6 +1012,7 @@ impl WhatsAppApp {
         };
 
         self.recording_state = RecordingState::Processing;
+        self.update_input_recording(cx);
         cx.notify();
 
         // Stop recording and get audio data
@@ -1011,14 +1044,40 @@ impl WhatsAppApp {
             recorded.duration_secs
         );
 
-        // Generate waveform from samples (before encoding)
-        let waveform = generate_waveform(&recorded.samples);
+        let Some(runtime) = self.client.as_ref().map(WhatsAppClient::runtime) else {
+            warn!("Cannot send audio: client is unavailable");
+            self.recording_state = RecordingState::Idle;
+            self.update_input_recording(cx);
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let encoded = runtime
+                .spawn_blocking(move || {
+                    let waveform = generate_waveform(&recorded.samples);
+                    encode_to_opus_ogg(&recorded)
+                        .map(|ogg| (ogg, waveform, recorded.duration_secs))
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("encoder task failed: {error}")));
+            let _ = entity.update(cx, |app, cx| {
+                app.finish_recording_send(jid, encoded, cx);
+            });
+        })
+        .detach();
+    }
 
-        // Encode to Opus/OGG
-        let ogg_data = match encode_to_opus_ogg(&recorded) {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to encode audio: {}", e);
+    fn finish_recording_send(
+        &mut self,
+        jid: String,
+        encoded: Result<(Vec<u8>, Vec<u8>, u32), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (ogg_data, waveform, duration_secs) = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                error!("Failed to encode audio: {error}");
                 self.recording_state = RecordingState::Idle;
                 self.update_input_recording(cx);
                 cx.notify();
@@ -1026,25 +1085,28 @@ impl WhatsAppApp {
             }
         };
 
-        let duration_secs = recorded.duration_secs;
-
+        let Some(client) = &self.client else {
+            warn!("Cannot send audio: client is unavailable");
+            self.recording_state = RecordingState::Idle;
+            self.update_input_recording(cx);
+            cx.notify();
+            return;
+        };
         let local_id = Self::next_local_id("local_audio");
-        self.client.send_audio_message(
+        client.send_audio_message(
             &jid,
             ogg_data.clone(),
             duration_secs,
-            waveform.clone(),
+            waveform,
             local_id.clone(),
         );
 
-        // Add to local chat immediately for responsiveness; the client renames
-        // it to the real id via MessageIdAssigned.
         let msg = ChatMessage::new_outgoing_with_media(
             local_id,
-            String::new(), // No text for PTT
+            String::new(),
             MediaContent {
                 media_type: MediaType::Audio,
-                data: std::sync::Arc::new(ogg_data),
+                data: Arc::new(ogg_data),
                 mime_type: "audio/ogg; codecs=opus".to_string(),
                 width: None,
                 height: None,
@@ -1060,7 +1122,6 @@ impl WhatsAppApp {
         if self.add_message_to_chat(&jid, msg) {
             self.scroll_to_last_message();
         }
-
         self.recording_state = RecordingState::Idle;
         self.update_input_recording(cx);
         info!("PTT audio sent successfully");
@@ -1091,24 +1152,45 @@ impl WhatsAppApp {
 
     /// Accept the incoming call
     pub fn accept_call(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            warn!("Cannot accept call: client is unavailable");
+            return;
+        };
         if let Some(call) = self.call_state.take_incoming() {
-            info!("Accepting call {} from {}", call.call_id, call.caller_jid);
-            self.client.accept_call(call.call_id.as_str());
+            info!(
+                "Accepting call {} from {}",
+                call.call_id,
+                observe_str(&call.caller_jid)
+            );
+            client.accept_call(call.call_id.as_str());
             cx.notify();
         }
     }
 
     /// Decline the incoming call
     pub fn decline_call(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            warn!("Cannot decline call: client is unavailable");
+            return;
+        };
         if let Some(call) = self.call_state.take_incoming() {
-            info!("Declining call {} from {}", call.call_id, call.caller_jid);
-            self.client.decline_call(call.call_id.as_str());
+            info!(
+                "Declining call {} from {}",
+                call.call_id,
+                observe_str(&call.caller_jid)
+            );
+            client.decline_call(call.call_id.as_str());
             cx.notify();
         }
     }
 
     /// Start a call to the specified JID
     pub fn start_call(&mut self, recipient_jid: String, is_video: bool, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else {
+            warn!("Cannot start call: client is unavailable");
+            return;
+        };
+
         // Don't start a call if we already have an outgoing call
         if self.call_state.has_outgoing() {
             warn!("Already have an outgoing call in progress");
@@ -1125,13 +1207,12 @@ impl WhatsAppApp {
         let recipient_name = self
             .find_chat(&recipient_jid)
             .map(|chat| chat.name.clone())
-            .unwrap_or_else(|| recipient_jid.clone());
+            .unwrap_or_else(|| "Unknown contact".to_string());
 
         info!(
-            "Starting {} call to {} ({})",
+            "Starting {} call to {}",
             if is_video { "video" } else { "audio" },
-            recipient_name,
-            recipient_jid
+            observe_str(&recipient_jid)
         );
 
         // Create the outgoing call state
@@ -1145,8 +1226,7 @@ impl WhatsAppApp {
         self.call_state.set_outgoing(call);
 
         // Initiate the call through the client
-        self.client
-            .start_call(&recipient_jid, is_video, placeholder_call_id);
+        client.start_call(&recipient_jid, is_video, placeholder_call_id);
 
         cx.notify();
     }
@@ -1155,7 +1235,9 @@ impl WhatsAppApp {
     pub fn cancel_outgoing_call(&mut self, cx: &mut Context<Self>) {
         if let Some(call) = self.call_state.take_outgoing() {
             info!("Cancelling outgoing call {}", call.call_id);
-            self.client.cancel_call(call.call_id.as_str());
+            if let Some(client) = &self.client {
+                client.cancel_call(call.call_id.as_str());
+            }
             cx.notify();
         }
     }
@@ -1287,13 +1369,17 @@ impl WhatsAppApp {
             return;
         }
 
+        let Some(client) = &self.client else {
+            warn!("Cannot download audio: client is unavailable");
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
+
         // Stop any current playback, video included: a playing video must not
         // keep running underneath the download.
         self.stop_current_media();
         self.pending_media_request = Some(message_id.clone());
 
-        // Start async download
-        let download_rx = self.client.download_downloadable_media(downloadable);
         let msg_id = message_id.clone();
 
         info!("Starting audio download for message {}", msg_id);
@@ -1336,7 +1422,11 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        let download_rx = self.client.download_downloadable_media(downloadable);
+        let Some(client) = &self.client else {
+            warn!("Cannot download image: client is unavailable");
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
 
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             match download_with_timeout(download_rx).await {
@@ -1364,17 +1454,23 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
-        let download_rx = self.client.download_downloadable_media(downloadable);
+        let Some(client) = &self.client else {
+            warn!("Cannot download document: client is unavailable");
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
+        let runtime = client.runtime();
 
         cx.spawn(async move |_entity: WeakEntity<Self>, _cx| {
             match download_with_timeout(download_rx).await {
                 Ok(data) => {
-                    // unblock: a large write must not stall the UI executor.
-                    let saved = smol::unblock(move || save_to_downloads(&file_name, &data)).await;
+                    let saved = runtime
+                        .spawn_blocking(move || save_to_downloads(&file_name, &data))
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                        .and_then(|result| result);
                     match saved {
-                        Ok(path) => {
-                            info!("Document {} saved to {}", message_id, path.display())
-                        }
+                        Ok(_) => info!("Document {} saved", message_id),
                         Err(e) => warn!("Failed to save document {}: {}", message_id, e),
                     }
                 }
@@ -1529,6 +1625,13 @@ impl WhatsAppApp {
         downloadable: DownloadableMedia,
         cx: &mut Context<Self>,
     ) {
+        let Some(client) = &self.client else {
+            warn!("Cannot download video: client is unavailable");
+            return;
+        };
+        let download_rx = client.download_downloadable_media(downloadable);
+        let runtime = client.runtime();
+
         // Stop any currently playing media (mutual exclusion)
         self.stop_current_media();
         self.pending_media_request = Some(message_id.clone());
@@ -1553,8 +1656,6 @@ impl WhatsAppApp {
         let player = self.video_players.entry(message_id.clone()).or_default();
         player.set_downloading();
 
-        // Start async download - get oneshot receiver
-        let download_rx = self.client.download_downloadable_media(downloadable);
         let msg_id = message_id.clone();
 
         // Spawn a GPUI task to await the download result with timeout
@@ -1571,12 +1672,13 @@ impl WhatsAppApp {
                         cx.notify();
                     });
 
-                    // Decode video in background thread to avoid UI freeze
-                    // smol::unblock moves the CPU-intensive work off the main thread
-                    // Using StreamingVideoDecoder for memory-efficient on-demand frame decoding
-                    // Only 1 frame is kept in memory at a time (~3MB vs ~48MB for 30-frame video)
-                    let decode_result =
-                        smol::unblock(move || StreamingVideoDecoder::new(&data)).await;
+                    let decode_result = match runtime
+                        .spawn_blocking(move || StreamingVideoDecoder::new(&data))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!("video decoder task failed: {error}")),
+                    };
 
                     // Update UI with decode results
                     let _ = entity.update(cx, |app, cx| {
@@ -1874,7 +1976,12 @@ impl WhatsAppApp {
                 message_id,
                 reason,
             } => {
-                warn!("Send failed for {} in {}: {}", message_id, chat_jid, reason);
+                warn!(
+                    "Send failed for {} in {}: {}",
+                    message_id,
+                    observe_str(&chat_jid),
+                    reason
+                );
                 if let Some(chat) = self.find_chat_mut(&chat_jid)
                     && let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id)
                 {
@@ -1900,11 +2007,17 @@ impl WhatsAppApp {
                 self.handle_reaction_received(chat_jid, message_id, sender, emoji);
                 cx.notify();
             }
-            UiEvent::IncomingCall(call) => {
+            UiEvent::IncomingCall(mut call) => {
+                if let Some(name) = self
+                    .find_chat(&call.caller_jid)
+                    .map(|chat| chat.name.clone())
+                {
+                    call.caller_name = name;
+                }
                 info!(
                     "Incoming {} call from {}",
                     if call.is_video { "video" } else { "audio" },
-                    call.caller_name
+                    observe_str(&call.caller_jid)
                 );
                 self.call_state.set_incoming(call);
                 cx.notify();
@@ -1936,7 +2049,11 @@ impl WhatsAppApp {
                 call_id,
                 recipient_jid,
             } => {
-                info!("Outgoing call started: {} to {}", call_id, recipient_jid);
+                info!(
+                    "Outgoing call started: {} to {}",
+                    call_id,
+                    observe_str(&recipient_jid)
+                );
                 // Update the outgoing call with the actual call ID from CallManager
                 if self
                     .call_state
@@ -1946,14 +2063,20 @@ impl WhatsAppApp {
                 } else {
                     // Popup already dismissed: the user cancelled while the
                     // call was connecting; hang up the now-real call.
-                    self.client.cancel_call(&call_id);
+                    if let Some(client) = &self.client {
+                        client.cancel_call(&call_id);
+                    }
                 }
             }
             UiEvent::OutgoingCallFailed {
                 recipient_jid,
                 error,
             } => {
-                warn!("Outgoing call to {} failed: {}", recipient_jid, error);
+                warn!(
+                    "Outgoing call to {} failed: {}",
+                    observe_str(&recipient_jid),
+                    error
+                );
                 // Dismiss the outgoing call popup
                 if self
                     .call_state
@@ -2011,9 +2134,8 @@ impl WhatsAppApp {
                 // For DMs only: update chat name if we have a better one
                 if let Some(ref name) = sender_name
                     && !message.is_from_me
-                    && Self::is_jid_number(&chat.name)
                 {
-                    chat.name = name.clone();
+                    chat.set_name_if_better(name.clone(), 2);
                 }
             }
             // Status broadcasts: don't update any names
@@ -2058,20 +2180,18 @@ impl WhatsAppApp {
         }
 
         if let Some(receipt) = read_now {
-            self.client.send_read_receipts(&chat_jid, vec![receipt]);
+            let boundary = self.find_chat(&chat_jid).and_then(Self::read_boundary);
+            if let Some(client) = &self.client {
+                client.send_read_receipts(&chat_jid, vec![receipt]);
+                // Persist this immediate read so hydration cannot re-badge it.
+                client.mark_chat_read(&chat_jid, boundary);
+            }
             if let Some(chat) = self.find_chat_mut(&chat_jid) {
                 chat.mark_as_read();
             }
             self.invalidate_chat_cache();
             self.invalidate_message_cache(&chat_jid);
         }
-    }
-
-    /// Check if a string looks like just a JID number (no actual name)
-    fn is_jid_number(name: &str) -> bool {
-        // A JID number is typically all digits, possibly with a leading '+'
-        name.chars()
-            .all(|c| c.is_ascii_digit() || c == '+' || c == ' ')
     }
 
     /// Handle a receipt event (read/played status update)
@@ -2086,7 +2206,9 @@ impl WhatsAppApp {
             if count > 0 {
                 info!(
                     "Marked {} message(s) as {:?} in {}",
-                    count, receipt_type, chat_jid
+                    count,
+                    receipt_type,
+                    observe_str(&chat_jid)
                 );
                 // Ticks and the unread badge changed; count-based cache
                 // guards can't see either.
@@ -2110,12 +2232,16 @@ impl WhatsAppApp {
                 self.invalidate_message_cache(&chat_jid);
                 info!(
                     "Added reaction '{}' from {} to message {} in {}",
-                    emoji, sender, message_id, chat_jid
+                    emoji,
+                    observe_str(&sender),
+                    message_id,
+                    observe_str(&chat_jid)
                 );
             } else {
                 info!(
                     "Message {} not found for reaction in chat {}",
-                    message_id, chat_jid
+                    message_id,
+                    observe_str(&chat_jid)
                 );
             }
         }

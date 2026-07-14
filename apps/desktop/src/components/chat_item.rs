@@ -9,6 +9,10 @@ use crate::theme::colors;
 
 use super::Avatar;
 
+fn single_line(text: String) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn render_chat_item(
     chat: Chat,
     is_selected: bool,
@@ -16,9 +20,10 @@ pub fn render_chat_item(
     entity: Entity<WhatsAppApp>,
     layout: ResponsiveLayout,
 ) -> impl IntoElement {
-    let name: SharedString = chat.name.into();
+    let name: SharedString = single_line(chat.name).into();
     let last_message: SharedString = chat
         .last_message
+        .map(single_line)
         .unwrap_or_else(|| "No messages".to_string())
         .into();
     let unread = chat.unread_count;
@@ -49,13 +54,16 @@ pub fn render_chat_item(
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .overflow_hidden()
                 .child(
-                    div().flex().justify_between().child(
+                    div().flex().min_w_0().justify_between().child(
                         div()
+                            .min_w_0()
+                            .flex_1()
                             .text_color(rgb(colors::TEXT_PRIMARY))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .overflow_hidden()
@@ -67,10 +75,13 @@ pub fn render_chat_item(
                 .child(
                     div()
                         .flex()
+                        .min_w_0()
                         .justify_between()
                         .items_center()
+                        .gap_2()
                         .child(
                             div()
+                                .min_w_0()
                                 .text_color(rgb(colors::TEXT_SECONDARY))
                                 .text_sm()
                                 .overflow_hidden()
@@ -88,6 +99,7 @@ pub fn render_chat_item(
                             };
                             el.child(
                                 div()
+                                    .flex_shrink_0()
                                     .px_2()
                                     .py_0p5()
                                     .rounded_full()
@@ -100,4 +112,17 @@ pub fn render_chat_item(
                         }),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_line;
+
+    #[test]
+    fn preview_whitespace_cannot_escape_the_row() {
+        assert_eq!(
+            single_line("Line one\nLine two\tLine three".to_string()),
+            "Line one Line two Line three"
+        );
+    }
 }

@@ -5,4 +5,4 @@
 
 mod whatsapp;
 
-pub use whatsapp::WhatsAppClient;
+pub use whatsapp::{ReadBoundary, WhatsAppClient};

@@ -372,6 +372,9 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
                 conversation_timestamp: Some(1_700_000_500),
                 mute_end_time: Some(1_800_000_000),
                 pinned: Some(1_700_000_800),
+                username: Some("alice_example".to_string()),
+                unread_count: Some(0),
+                marked_as_unread: Some(true),
                 ..Default::default()
             },
             wa::Conversation {
@@ -446,6 +449,8 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
         .iter()
         .find(|c| c.jid == jid("559900000004@s.whatsapp.net"))
         .expect("muted chat");
+    assert_eq!(muted.name.as_deref(), Some("alice_example"));
+    assert_eq!(muted.unread_count, -1);
     assert!(muted.muted_until.unwrap().year() > 2020);
     assert!(muted.pinned_at.unwrap().year() > 2020);
 

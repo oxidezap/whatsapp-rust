@@ -88,13 +88,7 @@ impl AudioPlayer {
             .default_output_device()
             .ok_or(PlayerError::NoOutputDevice)?;
 
-        info!(
-            "Using output device: {}",
-            device
-                .description()
-                .map(|d| d.name().to_string())
-                .unwrap_or_default()
-        );
+        info!("Using default output device");
 
         // Prefer F32 (native to our samples), but i16/u16-only devices still
         // play: the callback converts per sample. Formats build_stream can't
@@ -296,10 +290,18 @@ fn decode_ogg(ogg_data: &[u8]) -> Result<Vec<f32>, PlayerError> {
             continue;
         }
 
-        // Create default decoder if header wasn't parsed
-        let dec = decoder.get_or_insert_with(|| {
-            OpusDecoder::new(48000, Channels::Mono).expect("default decoder")
-        });
+        // Some malformed-but-playable streams omit OpusHead.
+        if decoder.is_none() {
+            decoder = Some(
+                OpusDecoder::new(48000, Channels::Mono)
+                    .map_err(|e| PlayerError::DecodeError(format!("Opus decoder init: {e}")))?,
+            );
+        }
+        let Some(dec) = decoder.as_mut() else {
+            return Err(PlayerError::DecodeError(
+                "Opus decoder was not initialized".to_string(),
+            ));
+        };
 
         let mut output = vec![0.0f32; 5760 * 2];
         match dec.decode_float(&packet.data, &mut output, false) {

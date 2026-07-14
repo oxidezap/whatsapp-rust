@@ -46,6 +46,7 @@ pub fn render_chat_header(
             div()
                 .flex()
                 .flex_1()
+                .min_w_0()
                 .items_center()
                 .gap(px(layout.gap()))
                 .overflow_hidden()
@@ -74,6 +75,7 @@ pub fn render_chat_header(
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .text_color(rgb(colors::TEXT_PRIMARY))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .overflow_hidden()
@@ -90,7 +92,7 @@ pub fn render_chat_header(
             layout.show_call_buttons() && is_callable_user(&chat.jid),
             |el| {
                 el.child(
-                    div().flex().items_center().gap_2().child(
+                    div().flex().flex_shrink_0().items_center().gap_2().child(
                         Button::new("audio-call")
                             .label("Call")
                             .outline()

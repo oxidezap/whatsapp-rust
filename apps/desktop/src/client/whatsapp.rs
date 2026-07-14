@@ -9,7 +9,7 @@ use wacore::proto_helpers::MessageExt;
 use wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use wacore::types::events::Event;
 use wacore::types::presence::ReceiptType;
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::jid::{Jid, JidExt, observe_str};
 use waproto::whatsapp as wa;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
@@ -20,6 +20,7 @@ use whatsapp_rust_chat_store::ChatStore;
 use crate::audio::{spawn_mic, spawn_speaker};
 use crate::state::{
     ChatMessage, DownloadableMedia, IncomingCall, MediaContent, MediaType, UiEvent,
+    fallback_chat_name,
 };
 use wacore::download::MediaType as DownloadMediaType;
 
@@ -59,10 +60,7 @@ fn resolve_database_path() -> String {
     };
     // SQLite won't create missing parent directories itself.
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(
-            "Failed to create data dir {}: {e}; using CWD-relative {DB_FILE}",
-            dir.display()
-        );
+        warn!("Failed to create desktop data dir: {e}; using CWD-relative {DB_FILE}");
         return DB_FILE.to_string();
     }
 
@@ -108,6 +106,27 @@ pub type UiEventSender = Arc<Mutex<Option<mpsc::UnboundedSender<UiEvent>>>>;
 
 /// Shared chat-store handle (durable message history in the same SQLite file)
 pub type ChatStoreHandle = Arc<Mutex<Option<Arc<ChatStore>>>>;
+
+pub type ReadBoundary = (i64, Vec<(String, bool, Option<String>)>);
+
+type CallAudio = (
+    async_channel::Receiver<Vec<i16>>,
+    async_channel::Sender<Vec<i16>>,
+);
+
+async fn open_call_audio() -> Result<CallAudio, String> {
+    tokio::task::spawn_blocking(|| {
+        let mic = spawn_mic().map_err(|e| e.to_string())?;
+        let speaker = spawn_speaker().map_err(|e| e.to_string())?;
+        Ok((mic, speaker))
+    })
+    .await
+    .map_err(|e| format!("audio setup task failed: {e}"))?
+}
+
+fn participant_keyed_chat(jid: &Jid) -> bool {
+    jid.is_group() || jid.is_broadcast_list() || jid.is_status_broadcast()
+}
 
 /// Live call state shared between the event pump and the UI action methods.
 #[derive(Clone, Default)]
@@ -206,24 +225,29 @@ impl WhatsAppClient {
         let runtime = self.runtime.clone();
         let shutdown = self.shutdown.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                // Also store sender in the async context
-                {
-                    let mut guard = ui_sender.lock().await;
-                    *guard = Some(ui_tx.clone());
-                }
-                Self::run_client(
-                    ui_tx,
-                    client_handle,
-                    calls,
-                    chat_store,
-                    ui_sender.clone(),
-                    shutdown,
-                )
-                .await;
+        let spawned = std::thread::Builder::new()
+            .name("whatsapp-desktop-client".to_string())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    {
+                        let mut guard = ui_sender.lock().await;
+                        *guard = Some(ui_tx.clone());
+                    }
+                    Self::run_client(
+                        ui_tx,
+                        client_handle,
+                        calls,
+                        chat_store,
+                        ui_sender.clone(),
+                        shutdown,
+                    )
+                    .await;
+                });
             });
-        });
+        if spawned.is_err() {
+            self.started = false;
+            return Err("failed to spawn WhatsApp client thread");
+        }
 
         Ok(ui_rx)
     }
@@ -239,8 +263,15 @@ impl WhatsAppClient {
     ) {
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
-        let db_path = resolve_database_path();
-        info!("Using database at {}", db_path);
+        let db_path = match tokio::task::spawn_blocking(resolve_database_path).await {
+            Ok(path) => path,
+            Err(e) => {
+                error!("Failed to resolve database path: {e}");
+                let _ = ui_tx.send(UiEvent::Error("Database initialization failed".to_string()));
+                return;
+            }
+        };
+        info!("Opening desktop data database");
         let backend = match SqliteStore::new(&db_path).await {
             Ok(store) => store,
             Err(e) => {
@@ -353,7 +384,7 @@ impl WhatsAppClient {
                 });
             }
             Event::PairingCode(pair) => {
-                info!("Pair code received: {}", pair.code);
+                info!("Pair code received");
                 let _ = ui_tx.send(UiEvent::PairCode {
                     code: pair.code.clone(),
                     timeout_secs: pair.timeout.as_secs(),
@@ -379,17 +410,24 @@ impl WhatsAppClient {
                         info!("Ignoring offline call {} (stale)", call_id);
                         return;
                     }
-                    info!("Incoming call from {}", call.from);
+                    info!("Incoming call from {}", call.from.observe());
                     let offer = Arc::new(call.clone());
                     calls
                         .pending
                         .lock()
                         .await
                         .insert(call_id.clone(), offer.clone());
+                    let caller_jid = normalize_chat_jid(&client, &call.from.to_string()).await;
+                    let caller_name = call
+                        .notify
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| fallback_chat_name(&call.from));
                     let ui_call = IncomingCall::new(
                         call_id.clone(),
-                        call.from.to_string(),
-                        call.from.to_string(),
+                        caller_name,
+                        caller_jid,
                         *is_video,
                         offer,
                     );
@@ -415,7 +453,11 @@ impl WhatsAppClient {
                 _ => {}
             },
             Event::MissedCall(missed) => {
-                info!("Missed call {} from {}", missed.call_id, missed.from);
+                info!(
+                    "Missed call {} from {}",
+                    missed.call_id,
+                    missed.from.observe()
+                );
                 calls.pending.lock().await.remove(&missed.call_id);
                 let _ = ui_tx.send(UiEvent::CallEnded(missed.call_id.clone()));
             }
@@ -443,7 +485,7 @@ impl WhatsAppClient {
                     "Receipt {:?} for {} message(s) in {}",
                     dominated_type,
                     receipt.message_ids.len(),
-                    receipt.source.chat
+                    receipt.source.chat.observe()
                 );
 
                 // Normalize the chat JID
@@ -480,7 +522,9 @@ impl WhatsAppClient {
                 let emoji = reaction.text.clone().unwrap_or_default();
                 debug!(
                     "Reaction '{}' from {} on message {}",
-                    emoji, info.source.sender, target_id
+                    emoji,
+                    info.source.sender.observe(),
+                    target_id
                 );
 
                 // Use remote_jid from key if available, otherwise use chat from info
@@ -813,66 +857,63 @@ impl WhatsAppClient {
         let content = content.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                // Parse JID string
-                let jid: Jid = match jid_str.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        error!("Invalid JID '{}': {}", jid_str, e);
-                        // The optimistic bubble still carries its local id;
-                        // without this it would sit unsent with no indicator.
-                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
-                        return;
-                    }
+        runtime.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    // The optimistic bubble still carries its local id;
+                    // without this it would sit unsent with no indicator.
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    return;
+                }
+            };
+
+            // Clone the Arc and release the mutex: a slow network call
+            // here must not queue every other client action behind it.
+            let client = client_handle.lock().await.clone();
+            if let Some(client) = client {
+                let message = wa::Message {
+                    conversation: Some(content.clone()),
+                    ..Default::default()
                 };
 
-                // Clone the Arc and release the mutex: a slow network call
-                // here must not queue every other client action behind it.
-                let client = client_handle.lock().await.clone();
-                if let Some(client) = client {
-                    let message = wa::Message {
-                        conversation: Some(content.clone()),
-                        ..Default::default()
-                    };
-
-                    // Record BEFORE sending: the server ack event fires during
-                    // send_message, so a row recorded after it would stay
-                    // Pending forever (the ack precedes it in writer order).
-                    let msg_id = client.generate_message_id();
-                    // Receipts/reactions arrive keyed by this id; rename the
-                    // optimistic bubble before they can race it.
-                    notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
-                    record_outgoing(&chat_store, &jid, &msg_id, &message).await;
-                    let options = whatsapp_rust::SendOptions {
-                        message_id: Some(msg_id.clone()),
-                        ..Default::default()
-                    };
-                    match client
-                        .send_message_with_options(jid.clone(), message, options)
-                        .await
-                    {
-                        Ok(result) => {
-                            info!("Message sent successfully: {}", result.message_id);
-                        }
-                        Err(e) => {
-                            error!("Failed to send message {}: {}", msg_id, e);
-                            mark_send_failed(&chat_store, &jid, &msg_id).await;
-                            notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
-                        }
+                // Record BEFORE sending: the server ack event fires during
+                // send_message, so a row recorded after it would stay
+                // Pending forever (the ack precedes it in writer order).
+                let msg_id = client.generate_message_id();
+                // Receipts/reactions arrive keyed by this id; rename the
+                // optimistic bubble before they can race it.
+                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
+                record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+                let options = whatsapp_rust::SendOptions {
+                    message_id: Some(msg_id.clone()),
+                    ..Default::default()
+                };
+                match client
+                    .send_message_with_options(jid.clone(), message, options)
+                    .await
+                {
+                    Ok(result) => {
+                        info!("Message sent successfully: {}", result.message_id);
                     }
-                } else {
-                    error!("Client not available for sending message");
-                    // The bubble still carries its local id (no rename ran)
-                    notify_send_failed(
-                        &ui_sender,
-                        &jid_str,
-                        &local_id,
-                        "client not available".to_string(),
-                    )
-                    .await;
+                    Err(e) => {
+                        error!("Failed to send message {}: {}", msg_id, e);
+                        mark_send_failed(&chat_store, &jid, &msg_id).await;
+                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
+                    }
                 }
-            });
+            } else {
+                error!("Client not available for sending message");
+                // The bubble still carries its local id (no rename ran)
+                notify_send_failed(
+                    &ui_sender,
+                    &jid_str,
+                    &local_id,
+                    "client not available".to_string(),
+                )
+                .await;
+            }
         });
     }
 
@@ -886,30 +927,28 @@ impl WhatsAppClient {
         let client_handle = self.client_handle.clone();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                // Clone the Arc and release the mutex: a slow network call
-                // here must not queue every other client action behind it.
-                let client = client_handle.lock().await.clone();
-                if let Some(client) = client {
-                    info!(
-                        "Downloading media: {} bytes expected",
-                        downloadable.file_length
-                    );
-                    match client.download(&downloadable).await {
-                        Ok(data) => {
-                            info!("Media downloaded successfully: {} bytes", data.len());
-                            let _ = tx.send(Ok(data));
-                        }
-                        Err(e) => {
-                            error!("Failed to download media: {}", e);
-                            let _ = tx.send(Err(e.to_string()));
-                        }
+        runtime.spawn(async move {
+            // Clone the Arc and release the mutex: a slow network call
+            // here must not queue every other client action behind it.
+            let client = client_handle.lock().await.clone();
+            if let Some(client) = client {
+                info!(
+                    "Downloading media: {} bytes expected",
+                    downloadable.file_length
+                );
+                match client.download(&downloadable).await {
+                    Ok(data) => {
+                        info!("Media downloaded successfully: {} bytes", data.len());
+                        let _ = tx.send(Ok(data));
                     }
-                } else {
-                    let _ = tx.send(Err("Client not available".to_string()));
+                    Err(e) => {
+                        error!("Failed to download media: {}", e);
+                        let _ = tx.send(Err(e.to_string()));
+                    }
                 }
-            });
+            } else {
+                let _ = tx.send(Err("Client not available".to_string()));
+            }
         });
 
         rx
@@ -930,95 +969,89 @@ impl WhatsAppClient {
         let jid_str = jid_str.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                // Parse JID string
-                let jid: Jid = match jid_str.parse() {
-                    Ok(j) => j,
+        runtime.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    // The optimistic bubble still carries its local id;
+                    // without this it would sit unsent with no indicator.
+                    notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
+                    return;
+                }
+            };
+
+            // Clone the Arc and release the mutex: a slow network call
+            // here must not queue every other client action behind it.
+            let client = client_handle.lock().await.clone();
+            if let Some(client) = client {
+                let upload_result = match client
+                    .upload(audio_data, DownloadMediaType::Audio, Default::default())
+                    .await
+                {
+                    Ok(resp) => resp,
                     Err(e) => {
-                        error!("Invalid JID '{}': {}", jid_str, e);
-                        // The optimistic bubble still carries its local id;
-                        // without this it would sit unsent with no indicator.
+                        error!("Failed to upload audio: {}", e);
+                        // Bubble still carries the local id at this point.
                         notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
                         return;
                     }
                 };
 
-                // Clone the Arc and release the mutex: a slow network call
-                // here must not queue every other client action behind it.
-                let client = client_handle.lock().await.clone();
-                if let Some(client) = client {
-                    // Upload the audio file
-                    let upload_result = match client
-                        .upload(audio_data, DownloadMediaType::Audio, Default::default())
-                        .await
-                    {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            error!("Failed to upload audio: {}", e);
-                            // Bubble still carries the local id at this point.
-                            notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string())
-                                .await;
-                            return;
-                        }
-                    };
+                info!("Audio uploaded successfully");
 
-                    info!("Audio uploaded successfully: {}", upload_result.url);
+                let audio_message = wa::message::AudioMessage {
+                    url: Some(upload_result.url),
+                    direct_path: Some(upload_result.direct_path),
+                    media_key: Some(upload_result.media_key.to_vec()),
+                    file_sha256: Some(upload_result.file_sha256.to_vec()),
+                    file_enc_sha256: Some(upload_result.file_enc_sha256.to_vec()),
+                    file_length: Some(upload_result.file_length),
+                    mimetype: Some("audio/ogg; codecs=opus".to_string()),
+                    seconds: Some(duration_secs),
+                    ptt: Some(true), // This marks it as a voice message
+                    waveform: Some(waveform),
+                    ..Default::default()
+                };
 
-                    // Build the AudioMessage
-                    let audio_message = wa::message::AudioMessage {
-                        url: Some(upload_result.url),
-                        direct_path: Some(upload_result.direct_path),
-                        media_key: Some(upload_result.media_key.to_vec()),
-                        file_sha256: Some(upload_result.file_sha256.to_vec()),
-                        file_enc_sha256: Some(upload_result.file_enc_sha256.to_vec()),
-                        file_length: Some(upload_result.file_length),
-                        mimetype: Some("audio/ogg; codecs=opus".to_string()),
-                        seconds: Some(duration_secs),
-                        ptt: Some(true), // This marks it as a voice message
-                        waveform: Some(waveform),
-                        ..Default::default()
-                    };
+                let message = wa::Message {
+                    audio_message: buffa::MessageField::some(audio_message),
+                    ..Default::default()
+                };
 
-                    let message = wa::Message {
-                        audio_message: buffa::MessageField::some(audio_message),
-                        ..Default::default()
-                    };
-
-                    // Same ordering as the text path: record before sending so
-                    // the ack can't precede the row in the writer queue.
-                    let msg_id = client.generate_message_id();
-                    notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
-                    record_outgoing(&chat_store, &jid, &msg_id, &message).await;
-                    let options = whatsapp_rust::SendOptions {
-                        message_id: Some(msg_id.clone()),
-                        ..Default::default()
-                    };
-                    match client
-                        .send_message_with_options(jid.clone(), message, options)
-                        .await
-                    {
-                        Ok(result) => {
-                            info!("Audio message sent successfully: {}", result.message_id);
-                        }
-                        Err(e) => {
-                            error!("Failed to send audio message {}: {}", msg_id, e);
-                            mark_send_failed(&chat_store, &jid, &msg_id).await;
-                            notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
-                        }
+                // Same ordering as the text path: record before sending so
+                // the ack can't precede the row in the writer queue.
+                let msg_id = client.generate_message_id();
+                notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
+                record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+                let options = whatsapp_rust::SendOptions {
+                    message_id: Some(msg_id.clone()),
+                    ..Default::default()
+                };
+                match client
+                    .send_message_with_options(jid.clone(), message, options)
+                    .await
+                {
+                    Ok(result) => {
+                        info!("Audio message sent successfully: {}", result.message_id);
                     }
-                } else {
-                    error!("Client not available for sending audio message");
-                    // The bubble still carries its local id (no rename ran)
-                    notify_send_failed(
-                        &ui_sender,
-                        &jid_str,
-                        &local_id,
-                        "client not available".to_string(),
-                    )
-                    .await;
+                    Err(e) => {
+                        error!("Failed to send audio message {}: {}", msg_id, e);
+                        mark_send_failed(&chat_store, &jid, &msg_id).await;
+                        notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
+                    }
                 }
-            });
+            } else {
+                error!("Client not available for sending audio message");
+                // The bubble still carries its local id (no rename ran)
+                notify_send_failed(
+                    &ui_sender,
+                    &jid_str,
+                    &local_id,
+                    "client not available".to_string(),
+                )
+                .await;
+            }
         });
     }
 
@@ -1028,23 +1061,21 @@ impl WhatsAppClient {
         let jid_str = jid_str.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let jid: Jid = match jid_str.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        error!("Invalid JID '{}': {}", jid_str, e);
-                        return;
-                    }
-                };
-
-                let client = client_handle.lock().await.clone();
-                if let Some(client) = client
-                    && let Err(e) = client.chatstate().send_composing(&jid).await
-                {
-                    warn!("Failed to send composing state: {}", e);
+        runtime.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    return;
                 }
-            });
+            };
+
+            let client = client_handle.lock().await.clone();
+            if let Some(client) = client
+                && let Err(e) = client.chatstate().send_composing(&jid).await
+            {
+                warn!("Failed to send composing state: {}", e);
+            }
         });
     }
 
@@ -1054,23 +1085,21 @@ impl WhatsAppClient {
         let jid_str = jid_str.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let jid: Jid = match jid_str.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        error!("Invalid JID '{}': {}", jid_str, e);
-                        return;
-                    }
-                };
-
-                let client = client_handle.lock().await.clone();
-                if let Some(client) = client
-                    && let Err(e) = client.chatstate().send_paused(&jid).await
-                {
-                    warn!("Failed to send paused state: {}", e);
+        runtime.spawn(async move {
+            let jid: Jid = match jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid JID {}: {}", observe_str(&jid_str), e);
+                    return;
                 }
-            });
+            };
+
+            let client = client_handle.lock().await.clone();
+            if let Some(client) = client
+                && let Err(e) = client.chatstate().send_paused(&jid).await
+            {
+                warn!("Failed to send paused state: {}", e);
+            }
         });
     }
 
@@ -1088,118 +1117,85 @@ impl WhatsAppClient {
         let chat_jid_str = chat_jid_str.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                // Parse chat JID
-                let chat_jid: Jid = match chat_jid_str.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        error!("Invalid chat JID '{}': {}", chat_jid_str, e);
-                        return;
-                    }
-                };
-
-                // Parse message sender JIDs, skipping invalid ones
-                let parsed_messages: Vec<(String, Jid)> = messages
-                    .into_iter()
-                    .filter_map(|(msg_id, sender_str)| {
-                        sender_str
-                            .parse::<Jid>()
-                            .inspect_err(|e| warn!("Invalid sender JID '{}': {}", sender_str, e))
-                            .ok()
-                            .map(|jid| (msg_id, jid))
-                    })
-                    .collect();
-
-                if parsed_messages.is_empty() {
+        runtime.spawn(async move {
+            let chat_jid: Jid = match chat_jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid chat JID {}: {}", observe_str(&chat_jid_str), e);
                     return;
                 }
+            };
 
-                // Only group/broadcast receipts carry a participant (matches
-                // whatsmeow/WA Web); a plain DM receipt must not.
-                let needs_participant = chat_jid.is_group()
-                    || chat_jid.is_broadcast_list()
-                    || chat_jid.is_status_broadcast();
+            let parsed_messages: Vec<(String, Jid)> = messages
+                .into_iter()
+                .filter_map(|(msg_id, sender_str)| {
+                    sender_str
+                        .parse::<Jid>()
+                        .inspect_err(|e| {
+                            warn!("Invalid sender JID {}: {}", observe_str(&sender_str), e)
+                        })
+                        .ok()
+                        .map(|jid| (msg_id, jid))
+                })
+                .collect();
 
-                // Clone the Arc and release the mutex: a slow network call
-                // here must not queue every other client action behind it.
-                let client = client_handle.lock().await.clone();
-                if let Some(client) = client {
-                    // Group messages by sender, then send read receipts per sender
-                    let mut by_sender: HashMap<Jid, Vec<String>> = HashMap::new();
-                    for (msg_id, sender) in parsed_messages {
-                        by_sender.entry(sender).or_default().push(msg_id);
-                    }
-                    for (sender, msg_ids) in by_sender {
-                        let id_refs: Vec<&str> = msg_ids.iter().map(String::as_str).collect();
-                        if let Err(e) = client
-                            .mark_as_read(&chat_jid, needs_participant.then_some(&sender), &id_refs)
-                            .await
-                        {
-                            warn!("Failed to mark messages as read: {}", e);
-                        }
-                    }
-                } else {
-                    error!("Client not available for sending read receipts");
+            if parsed_messages.is_empty() {
+                return;
+            }
+
+            // Only group/broadcast receipts carry a participant (matches
+            // whatsmeow/WA Web); a plain DM receipt must not.
+            let needs_participant = participant_keyed_chat(&chat_jid);
+
+            // Clone the Arc and release the mutex: a slow network call
+            // here must not queue every other client action behind it.
+            let client = client_handle.lock().await.clone();
+            if let Some(client) = client {
+                let mut by_sender: HashMap<Jid, Vec<String>> = HashMap::new();
+                for (msg_id, sender) in parsed_messages {
+                    by_sender.entry(sender).or_default().push(msg_id);
                 }
-            });
+                for (sender, msg_ids) in by_sender {
+                    let id_refs: Vec<&str> = msg_ids.iter().map(String::as_str).collect();
+                    if let Err(e) = client
+                        .mark_as_read(&chat_jid, needs_participant.then_some(&sender), &id_refs)
+                        .await
+                    {
+                        warn!("Failed to mark messages as read: {}", e);
+                    }
+                }
+            } else {
+                error!("Client not available for sending read receipts");
+            }
         });
     }
 
-    /// Durably clear a manual-unread mark. The store's `-1` sentinel is only
-    /// cleared by a MarkChatAsRead app-state action (echoed back through the
-    /// event stream), never by message receipts — without this the badge
-    /// would come back on the next history reload.
-    ///
-    /// `last_displayed` is the newest visible second — `(timestamp in
-    /// seconds, ids-in-that-second)` with each id's `from_me` flag. It bounds
-    /// the action so a message that lands before the echo is processed is not
-    /// counted as read without being viewed. All the boundary second's ids
-    /// ride along: a keyed range stops the watermark short of that second, so
-    /// any sibling left out would stay unread.
-    pub fn mark_chat_read(
-        &self,
-        chat_jid_str: &str,
-        last_displayed: Option<(i64, Vec<(String, bool)>)>,
-    ) {
-        use whatsapp_rust::features::{message_key, message_range};
-
+    /// Synchronize a bounded read action so newer messages remain unread.
+    pub fn mark_chat_read(&self, chat_jid_str: &str, last_displayed: Option<ReadBoundary>) {
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let chat_jid: Jid = match chat_jid_str.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        error!("Invalid chat JID '{}': {}", chat_jid_str, e);
-                        return;
-                    }
-                };
-                let Some(client) = client_handle.lock().await.clone() else {
-                    error!("Client not available for marking chat read");
+        runtime.spawn(async move {
+            let chat_jid: Jid = match chat_jid_str.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Invalid chat JID {}: {}", observe_str(&chat_jid_str), e);
                     return;
-                };
-                let range = last_displayed.map(|(ts_secs, ids)| {
-                    message_range(
-                        ts_secs,
-                        None,
-                        ids.into_iter()
-                            .map(|(id, from_me)| {
-                                (message_key(id, &chat_jid, from_me, None), ts_secs)
-                            })
-                            .collect(),
-                    )
-                });
-                if let Err(e) = client
-                    .chat_actions()
-                    .mark_chat_as_read(&chat_jid, true, range)
-                    .await
-                {
-                    warn!("Failed to mark chat {} as read: {}", chat_jid, e);
                 }
-            });
+            };
+            let Some(client) = client_handle.lock().await.clone() else {
+                error!("Client not available for marking chat read");
+                return;
+            };
+            let range = last_displayed.map(|boundary| read_message_range(&chat_jid, boundary));
+            if let Err(e) = client
+                .chat_actions()
+                .mark_chat_as_read(&chat_jid, true, range)
+                .await
+            {
+                warn!("Failed to mark chat {} as read: {}", chat_jid.observe(), e);
+            }
         });
     }
 
@@ -1213,57 +1209,54 @@ impl WhatsAppClient {
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let Some(client) = client_handle.lock().await.clone() else {
-                    error!("Client not available for accepting call");
+        runtime.spawn(async move {
+            let Some(client) = client_handle.lock().await.clone() else {
+                error!("Client not available for accepting call");
+                return;
+            };
+            let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
+                warn!("No pending offer for call {}", call_id);
+                return;
+            };
+            let (mic, speaker) = match open_call_audio().await {
+                Ok(audio) => audio,
+                Err(err) => {
+                    error!("Audio device setup failed: {err}");
+                    // The offer is consumed and no accept went out: reject
+                    // so the caller stops ringing instead of waiting out
+                    // the timeout.
+                    if let Err(e) = client.voip().reject(&offer).await {
+                        error!(
+                            "Failed to reject call {} after audio failure: {}",
+                            call_id, e
+                        );
+                    }
+                    Self::notify_call_ended(&ui_sender, &call_id).await;
                     return;
-                };
-                let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
-                    warn!("No pending offer for call {}", call_id);
-                    return;
-                };
-                let (mic, speaker) = match (spawn_mic(), spawn_speaker()) {
-                    (Ok(mic), Ok(speaker)) => (mic, speaker),
-                    (mic, speaker) => {
-                        let err = mic.err().or(speaker.err()).map(|e| e.to_string());
-                        error!("Audio device setup failed: {:?}", err);
-                        // The offer is consumed and no accept went out: reject
-                        // so the caller stops ringing instead of waiting out
-                        // the timeout.
-                        if let Err(e) = client.voip().reject(&offer).await {
-                            error!(
-                                "Failed to reject call {} after audio failure: {}",
-                                call_id, e
-                            );
-                        }
-                        Self::notify_call_ended(&ui_sender, &call_id).await;
-                        return;
-                    }
-                };
-                match client
-                    .voip()
-                    .accept(&offer)
-                    .audio(mic, speaker)
-                    .start()
-                    .await
-                {
-                    Ok(handle) => {
-                        info!("Call {} media live", handle.call_id());
-                        let handle = Arc::new(handle);
-                        calls
-                            .active
-                            .lock()
-                            .await
-                            .insert(call_id.clone(), handle.clone());
-                        Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
-                    }
-                    Err(e) => {
-                        error!("Failed to start call media for {}: {}", call_id, e);
-                        Self::notify_call_ended(&ui_sender, &call_id).await;
-                    }
                 }
-            });
+            };
+            match client
+                .voip()
+                .accept(&offer)
+                .audio(mic, speaker)
+                .start()
+                .await
+            {
+                Ok(handle) => {
+                    info!("Call {} media live", handle.call_id());
+                    let handle = Arc::new(handle);
+                    calls
+                        .active
+                        .lock()
+                        .await
+                        .insert(call_id.clone(), handle.clone());
+                    Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
+                }
+                Err(e) => {
+                    error!("Failed to start call media for {}: {}", call_id, e);
+                    Self::notify_call_ended(&ui_sender, &call_id).await;
+                }
+            }
         });
     }
 
@@ -1274,21 +1267,19 @@ impl WhatsAppClient {
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let Some(client) = client_handle.lock().await.clone() else {
-                    error!("Client not available for declining call");
-                    return;
-                };
-                let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
-                    warn!("No pending offer for call {}", call_id);
-                    return;
-                };
-                match client.voip().reject(&offer).await {
-                    Ok(()) => info!("Call {} declined", call_id),
-                    Err(e) => error!("Failed to decline call {}: {}", call_id, e),
-                }
-            });
+        runtime.spawn(async move {
+            let Some(client) = client_handle.lock().await.clone() else {
+                error!("Client not available for declining call");
+                return;
+            };
+            let Some(offer) = calls.pending.lock().await.remove(&call_id) else {
+                warn!("No pending offer for call {}", call_id);
+                return;
+            };
+            match client.voip().reject(&offer).await {
+                Ok(()) => info!("Call {} declined", call_id),
+                Err(e) => error!("Failed to decline call {}: {}", call_id, e),
+            }
         });
     }
 
@@ -1307,79 +1298,80 @@ impl WhatsAppClient {
             warn!("Video calls are not supported yet; placing a voice call");
         }
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let notify_failure = |error: String| {
-                    let ui_sender = ui_sender.clone();
-                    let recipient_jid = recipient_jid.clone();
-                    // A cancel may have landed for a call that will never
-                    // start; consume the marker so the set doesn't grow.
-                    let calls = calls.clone();
-                    let placeholder_id = placeholder_id.clone();
-                    async move {
-                        calls.cancelled.lock().await.remove(&placeholder_id);
-                        error!("Failed to start call to {}: {}", recipient_jid, error);
-                        if let Some(tx) = ui_sender.lock().await.as_ref() {
-                            let _ = tx.send(UiEvent::OutgoingCallFailed {
-                                recipient_jid,
-                                error,
-                            });
-                        }
+        runtime.spawn(async move {
+            let notify_failure = |error: String| {
+                let ui_sender = ui_sender.clone();
+                let recipient_jid = recipient_jid.clone();
+                // A cancel may have landed for a call that will never
+                // start; consume the marker so the set doesn't grow.
+                let calls = calls.clone();
+                let placeholder_id = placeholder_id.clone();
+                async move {
+                    calls.cancelled.lock().await.remove(&placeholder_id);
+                    error!(
+                        "Failed to start call to {}: {}",
+                        observe_str(&recipient_jid),
+                        error
+                    );
+                    if let Some(tx) = ui_sender.lock().await.as_ref() {
+                        let _ = tx.send(UiEvent::OutgoingCallFailed {
+                            recipient_jid,
+                            error,
+                        });
                     }
-                };
-
-                let jid: Jid = match recipient_jid.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        notify_failure(format!("invalid JID: {e}")).await;
-                        return;
-                    }
-                };
-                let Some(client) = client_handle.lock().await.clone() else {
-                    notify_failure("client not available".to_string()).await;
-                    return;
-                };
-                let (mic, speaker) = match (spawn_mic(), spawn_speaker()) {
-                    (Ok(mic), Ok(speaker)) => (mic, speaker),
-                    (mic, speaker) => {
-                        let err = mic
-                            .err()
-                            .or(speaker.err())
-                            .map(|e| e.to_string())
-                            .unwrap_or_default();
-                        notify_failure(format!("audio device setup failed: {err}")).await;
-                        return;
-                    }
-                };
-
-                match client.voip().call(&jid).audio(mic, speaker).start().await {
-                    Ok(handle) => {
-                        let call_id = handle.call_id().to_string();
-                        // Cancelled while still connecting: the UI only knew
-                        // the placeholder id, so honor it here.
-                        if calls.cancelled.lock().await.remove(&placeholder_id) {
-                            info!("Outgoing call {} cancelled before start", call_id);
-                            handle.hangup().await;
-                            return;
-                        }
-                        info!("Outgoing call {} to {} offered", call_id, recipient_jid);
-                        let handle = Arc::new(handle);
-                        calls
-                            .active
-                            .lock()
-                            .await
-                            .insert(call_id.clone(), handle.clone());
-                        Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
-                        if let Some(tx) = ui_sender.lock().await.as_ref() {
-                            let _ = tx.send(UiEvent::OutgoingCallStarted {
-                                call_id,
-                                recipient_jid,
-                            });
-                        }
-                    }
-                    Err(e) => notify_failure(e.to_string()).await,
                 }
-            });
+            };
+
+            let jid: Jid = match recipient_jid.parse() {
+                Ok(j) => j,
+                Err(e) => {
+                    notify_failure(format!("invalid JID: {e}")).await;
+                    return;
+                }
+            };
+            let Some(client) = client_handle.lock().await.clone() else {
+                notify_failure("client not available".to_string()).await;
+                return;
+            };
+            let (mic, speaker) = match open_call_audio().await {
+                Ok(audio) => audio,
+                Err(err) => {
+                    notify_failure(format!("audio device setup failed: {err}")).await;
+                    return;
+                }
+            };
+
+            match client.voip().call(&jid).audio(mic, speaker).start().await {
+                Ok(handle) => {
+                    let call_id = handle.call_id().to_string();
+                    // Cancelled while still connecting: the UI only knew
+                    // the placeholder id, so honor it here.
+                    if calls.cancelled.lock().await.remove(&placeholder_id) {
+                        info!("Outgoing call {} cancelled before start", call_id);
+                        handle.hangup().await;
+                        return;
+                    }
+                    info!(
+                        "Outgoing call {} to {} offered",
+                        call_id,
+                        observe_str(&recipient_jid)
+                    );
+                    let handle = Arc::new(handle);
+                    calls
+                        .active
+                        .lock()
+                        .await
+                        .insert(call_id.clone(), handle.clone());
+                    Self::watch_call_end(handle, calls.clone(), ui_sender.clone());
+                    if let Some(tx) = ui_sender.lock().await.as_ref() {
+                        let _ = tx.send(UiEvent::OutgoingCallStarted {
+                            call_id,
+                            recipient_jid,
+                        });
+                    }
+                }
+                Err(e) => notify_failure(e.to_string()).await,
+            }
         });
     }
 
@@ -1389,20 +1381,18 @@ impl WhatsAppClient {
         let call_id = call_id.to_string();
         let runtime = self.runtime.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async move {
-                // Still ringing and never answered: nothing live to hang up.
-                calls.pending.lock().await.remove(&call_id);
-                if let Some(handle) = calls.active.lock().await.remove(&call_id) {
-                    handle.hangup().await;
-                    info!("Call {} hung up", call_id);
-                } else {
-                    // No handle yet (start_call still connecting under a UI
-                    // placeholder id): remember the cancel so it lands.
-                    debug!("cancel_call: no live handle for {}, deferring", call_id);
-                    calls.cancelled.lock().await.insert(call_id);
-                }
-            });
+        runtime.spawn(async move {
+            // Still ringing and never answered: nothing live to hang up.
+            calls.pending.lock().await.remove(&call_id);
+            if let Some(handle) = calls.active.lock().await.remove(&call_id) {
+                handle.hangup().await;
+                info!("Call {} hung up", call_id);
+            } else {
+                // No handle yet (start_call still connecting under a UI
+                // placeholder id): remember the cancel so it lands.
+                debug!("cancel_call: no live handle for {}, deferring", call_id);
+                calls.cancelled.lock().await.insert(call_id);
+            }
         });
     }
 
@@ -1435,6 +1425,37 @@ impl WhatsAppClient {
             let _ = tx.send(UiEvent::CallEnded(call_id.to_string()));
         }
     }
+}
+
+fn read_message_range(
+    chat_jid: &Jid,
+    (ts_secs, ids): ReadBoundary,
+) -> wa::sync_action_value::SyncActionMessageRange {
+    use whatsapp_rust::features::{message_key, message_range};
+
+    let messages = ids
+        .into_iter()
+        .filter_map(|(id, from_me, sender)| {
+            let participant = if participant_keyed_chat(chat_jid) && !from_me {
+                let sender = sender?;
+                match sender.parse::<Jid>() {
+                    Ok(jid) => Some(jid),
+                    Err(e) => {
+                        warn!("Invalid chat participant {}: {e}", observe_str(&sender));
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            Some((
+                message_key(id, chat_jid, from_me, participant.as_ref()),
+                ts_secs,
+            ))
+        })
+        .collect();
+
+    message_range(ts_secs, None, messages)
 }
 
 impl WhatsAppClient {
@@ -1513,6 +1534,7 @@ impl WhatsAppClient {
         let entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
         let complete = (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
         let mut chats: Vec<crate::state::Chat> = Vec::with_capacity(entries.len());
+        let mut contact_names: HashMap<String, Option<String>> = HashMap::new();
         // Sender-name lookups memoized across the whole load: group pages
         // repeat the same handful of senders many times over.
         let mut sender_names: HashMap<String, Option<String>> = HashMap::new();
@@ -1522,7 +1544,16 @@ impl WhatsAppClient {
             // A PN/LID pair of stored rows collapses into one chat: the most
             // recently active row (entries arrive in display order) keeps the
             // metadata, the older row's messages merge in.
-            let jid_str = normalize_chat_jid(client, &entry.jid.to_string()).await;
+            let identity = history_chat_identity(client, &entry.jid).await;
+            let (name, name_priority) = resolve_history_chat_name(
+                chat_store,
+                &entry.jid,
+                entry.name.as_deref(),
+                &identity,
+                &mut contact_names,
+            )
+            .await;
+            let jid_str = identity.canonical_jid;
             if let Some(existing) = chats.iter_mut().find(|c| c.jid == jid_str) {
                 let mut page = chat_store
                     .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
@@ -1532,11 +1563,11 @@ impl WhatsAppClient {
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await;
                 if existing.is_group {
-                    Self::hydrate_sender_names(chat_store, &mut msgs, &mut sender_names).await;
+                    Self::hydrate_sender_names(chat_store, client, &mut msgs, &mut sender_names)
+                        .await;
                 }
-                // The rows are distinct messages, so this side's unread state
-                // adds to the merged chat: fold the counter in and un-read its
-                // tail so opening the chat still sends those receipts.
+                // Each alias still needs its unread tail marked for receipts,
+                // but PN/LID counters describe the same logical chat.
                 let mut remaining = entry.unread_count.max(0) as u32;
                 for msg in msgs.iter_mut().rev() {
                     if remaining == 0 {
@@ -1550,34 +1581,13 @@ impl WhatsAppClient {
                 for msg in msgs {
                     existing.insert_history_message(msg);
                 }
-                existing.unread_count += entry.unread_count.max(0) as u32;
+                existing.unread_count = existing.unread_count.max(entry.unread_count.max(0) as u32);
                 existing.manually_unread |= entry.unread_count < 0;
-                // The kept row can still wear the JID placeholder while this
-                // older row (or its contact) knows the display name.
-                let placeholder = existing.jid.split('@').next().unwrap_or(&existing.jid);
-                if existing.name == placeholder {
-                    let mut name = entry.name.clone();
-                    if name.is_none()
-                        && let Ok(Some(contact)) = chat_store.contact(&entry.jid).await
-                    {
-                        name = contact.display_name().map(str::to_owned);
-                    }
-                    if let Some(name) = name.filter(|n| n != placeholder) {
-                        existing.name = name;
-                    }
-                }
+                existing.set_name_if_better(name, name_priority);
                 continue;
             }
-            let mut name = entry.name.clone();
-            if name.is_none()
-                && let Ok(Some(contact)) = chat_store.contact(&entry.jid).await
-            {
-                name = contact.display_name().map(str::to_owned);
-            }
-            let mut chat = match name {
-                Some(name) => crate::state::Chat::with_name(jid_str, name),
-                None => crate::state::Chat::new(jid_str),
-            };
+            let mut chat =
+                crate::state::Chat::with_name_priority(jid_str.clone(), name, name_priority);
             chat.unread_count = entry.unread_count.max(0) as u32;
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.
@@ -1592,7 +1602,13 @@ impl WhatsAppClient {
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
             if chat.is_group {
-                Self::hydrate_sender_names(chat_store, &mut chat.messages, &mut sender_names).await;
+                Self::hydrate_sender_names(
+                    chat_store,
+                    client,
+                    &mut chat.messages,
+                    &mut sender_names,
+                )
+                .await;
             }
             // The newest `unread_count` incoming messages are the unread ones;
             // select_chat only sends read receipts for !is_read, so hydrated
@@ -1647,6 +1663,7 @@ impl WhatsAppClient {
     /// failed lookup logs and the bubble falls back to the JID label.
     async fn hydrate_sender_names(
         chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
         msgs: &mut [ChatMessage],
         cache: &mut HashMap<String, Option<String>>,
     ) {
@@ -1656,13 +1673,14 @@ impl WhatsAppClient {
             }
             if !cache.contains_key(&msg.sender) {
                 let name = match msg.sender.parse::<Jid>() {
-                    Ok(jid) => match chat_store.contact(&jid).await {
-                        Ok(contact) => contact.and_then(|c| c.display_name().map(str::to_owned)),
-                        Err(e) => {
-                            warn!("failed to hydrate sender name for {}: {e}", msg.sender);
-                            None
-                        }
-                    },
+                    Ok(jid) => {
+                        let identity = history_chat_identity(client, &jid).await;
+                        Some(
+                            resolve_history_chat_name(chat_store, &jid, None, &identity, cache)
+                                .await
+                                .0,
+                        )
+                    }
                     Err(_) => None,
                 };
                 cache.insert(msg.sender.clone(), name);
@@ -1692,19 +1710,33 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             duration_secs: None,
             download_type: DownloadMediaType::Sticker,
         }
-        .build()?;
+        .build();
+        let thumbnail = sticker
+            .png_thumbnail
+            .as_ref()
+            .filter(|thumbnail| !thumbnail.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        if thumbnail.is_empty() && downloadable.is_none() {
+            return None;
+        }
+        let has_preview = !thumbnail.is_empty();
         return Some(MediaContent {
             media_type: MediaType::Sticker,
-            data: Arc::new(vec![]),
-            mime_type: mime.clone(),
+            data: Arc::new(thumbnail),
+            mime_type: if has_preview {
+                "image/png".to_string()
+            } else {
+                mime
+            },
             width: sticker.width,
             height: sticker.height,
             caption: None,
             file_name: None,
-            downloadable: Some(downloadable),
-            is_animated: sticker.is_animated.unwrap_or(false),
+            data_is_preview: has_preview && downloadable.is_some(),
+            downloadable,
+            is_animated: !has_preview && sticker.is_animated.unwrap_or(false),
             duration_secs: None,
-            data_is_preview: false,
         });
     }
     if let Some(image) = msg.image_message.as_option() {
@@ -1952,6 +1984,90 @@ async fn mark_send_failed(chat_store: &ChatStoreHandle, jid: &Jid, message_id: &
     }
 }
 
+struct HistoryChatIdentity {
+    canonical_jid: String,
+    contact_jids: Vec<Jid>,
+    fallback_name: String,
+    has_phone: bool,
+}
+
+async fn history_chat_identity(client: &Client, jid: &Jid) -> HistoryChatIdentity {
+    let source = jid.to_non_ad();
+    let mut canonical = source.clone();
+    let mut contact_jids = vec![source.clone()];
+    let mut fallback_jid = source.clone();
+    let mut has_phone = source.is_pn();
+
+    if let Ok(Some(mapping)) = client.get_lid_pn_entry(&source).await {
+        let pn = Jid::pn(mapping.phone_number.as_ref());
+        let lid = Jid::lid(mapping.lid.as_ref());
+        canonical = lid.clone();
+        fallback_jid = pn.clone();
+        has_phone = true;
+        // Address-book names are normally PN-keyed; push names may be LID-keyed.
+        contact_jids = vec![pn, lid];
+    }
+
+    HistoryChatIdentity {
+        canonical_jid: canonical.to_string(),
+        contact_jids,
+        fallback_name: fallback_chat_name(&fallback_jid),
+        has_phone,
+    }
+}
+
+fn is_masked_phone_label(name: &str) -> bool {
+    name.starts_with('+')
+        && name
+            .chars()
+            .filter(|c| matches!(c, '\u{00b7}' | '\u{2022}' | '\u{2219}'))
+            .count()
+            >= 2
+}
+
+async fn resolve_history_chat_name(
+    chat_store: &ChatStore,
+    source_jid: &Jid,
+    history_name: Option<&str>,
+    identity: &HistoryChatIdentity,
+    cache: &mut HashMap<String, Option<String>>,
+) -> (String, u8) {
+    let usable_name = |name: &&str| {
+        !name.trim().is_empty() && !(identity.has_phone && is_masked_phone_label(name))
+    };
+    let history_name = history_name.filter(usable_name);
+
+    if source_jid.is_pn() || source_jid.is_lid() {
+        for candidate in &identity.contact_jids {
+            let key = candidate.to_string();
+            let cached = if let Some(name) = cache.get(&key) {
+                name.clone()
+            } else {
+                let name = chat_store
+                    .contact(candidate)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|contact| contact.display_name().map(str::to_owned));
+                cache.insert(key, name.clone());
+                name
+            };
+            if let Some(name) = cached
+                .filter(|name| !name.trim().is_empty())
+                .filter(|name| !(identity.has_phone && is_masked_phone_label(name)))
+            {
+                return (name, 3);
+            }
+        }
+    }
+
+    if let Some(name) = history_name {
+        return (name.to_string(), 1);
+    }
+
+    (identity.fallback_name.clone(), 0)
+}
+
 /// Map a PN chat JID to its LID form when a mapping is known, so the same user
 /// doesn't split into two chats (PN vs LID addressing).
 async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
@@ -1972,5 +2088,98 @@ impl Drop for WhatsAppClient {
         // A dropped wrapper can never be shut down explicitly anymore; free
         // its background thread instead of leaking the runtime + DB pool.
         self.shutdown.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadBoundary, is_masked_phone_label, media_metadata, read_message_range};
+    use crate::state::fallback_chat_name;
+    use buffa::MessageField;
+    use wacore_binary::Jid;
+    use waproto::whatsapp as wa;
+
+    #[test]
+    fn history_fallbacks_do_not_expose_internal_lids() {
+        let lid: Jid = "111222333444555@lid".parse().expect("test LID");
+        let pn: Jid = "12025550143@s.whatsapp.net".parse().expect("test PN");
+        let group: Jid = "120363000000000001@g.us".parse().expect("test group");
+
+        assert_eq!(fallback_chat_name(&lid), "Unknown contact");
+        assert_eq!(fallback_chat_name(&pn), "+12025550143");
+        assert_eq!(fallback_chat_name(&group), "Unnamed group");
+    }
+
+    #[test]
+    fn detects_server_masked_phone_labels() {
+        assert!(is_masked_phone_label("+55\u{2219}\u{2219}\u{2219}00"));
+        assert!(is_masked_phone_label("+234\u{2022}\u{2022}\u{2022}64"));
+        assert!(!is_masked_phone_label("+12025550143"));
+        assert!(!is_masked_phone_label("Fictitious Contact"));
+    }
+
+    #[test]
+    fn historical_sticker_keeps_thumbnail_without_download_metadata() {
+        let message = wa::Message {
+            sticker_message: MessageField::some(wa::message::StickerMessage {
+                png_thumbnail: Some(vec![1, 2, 3]),
+                width: Some(64),
+                height: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let media = media_metadata(&message).expect("sticker metadata");
+        assert_eq!(media.data.as_slice(), [1, 2, 3]);
+        assert_eq!(media.mime_type, "image/png");
+        assert!(media.downloadable.is_none());
+        assert!(!media.data_is_preview);
+    }
+
+    #[test]
+    fn participant_keyed_read_ranges_include_incoming_participants() {
+        let group: Jid = "120363000000000001@g.us".parse().expect("test group");
+        let boundary: ReadBoundary = (
+            1_700_000_000,
+            vec![
+                (
+                    "incoming".to_string(),
+                    false,
+                    Some("12025550143@s.whatsapp.net".to_string()),
+                ),
+                ("outgoing".to_string(), true, None),
+            ],
+        );
+
+        let range = read_message_range(&group, boundary);
+        let incoming = range.messages[0].key.as_option().expect("incoming key");
+        let outgoing = range.messages[1].key.as_option().expect("outgoing key");
+
+        assert_eq!(
+            incoming.participant.as_deref(),
+            Some("12025550143@s.whatsapp.net")
+        );
+        assert_eq!(outgoing.participant, None);
+
+        let status: Jid = "status@broadcast".parse().expect("test status");
+        let boundary = (
+            1_700_000_000,
+            vec![(
+                "status".to_string(),
+                false,
+                Some("12025550144@s.whatsapp.net".to_string()),
+            )],
+        );
+        let range = read_message_range(&status, boundary);
+        assert_eq!(
+            range.messages[0]
+                .key
+                .as_option()
+                .expect("status key")
+                .participant
+                .as_deref(),
+            Some("12025550144@s.whatsapp.net")
+        );
     }
 }

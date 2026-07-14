@@ -136,13 +136,7 @@ impl AudioRecorder {
             .default_input_device()
             .ok_or(RecorderError::NoInputDevice)?;
 
-        info!(
-            "Using input device: {}",
-            device
-                .description()
-                .map(|d| d.name().to_string())
-                .unwrap_or_default()
-        );
+        info!("Using default input device");
 
         let supported = device
             .supported_input_configs()

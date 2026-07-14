@@ -5,9 +5,28 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType as DownloadMediaType};
+use wacore_binary::jid::{Jid, JidExt};
 
 /// Maximum number of unique emoji reactions per message to prevent spam
 const MAX_REACTIONS_PER_MESSAGE: usize = 50;
+
+pub(crate) fn fallback_chat_name(jid: &Jid) -> String {
+    if jid.is_status_broadcast() {
+        "Status".to_string()
+    } else if jid.is_group() {
+        "Unnamed group".to_string()
+    } else if jid.is_broadcast_list() {
+        "Broadcast list".to_string()
+    } else if jid.is_newsletter() {
+        "Channel".to_string()
+    } else if jid.server.is_lid_family() {
+        "Unknown contact".to_string()
+    } else if jid.server.is_pn_family() && jid.user_base().chars().all(|c| c.is_ascii_digit()) {
+        format!("+{}", jid.user_base())
+    } else {
+        "Unknown chat".to_string()
+    }
+}
 
 /// Type of media content
 #[derive(Debug, Clone)]
@@ -285,6 +304,8 @@ pub struct Chat {
     pub jid: String,
     /// Display name
     pub name: String,
+    /// Fallback < history < live push name < address-book contact.
+    pub(crate) name_priority: u8,
     /// Last message preview
     pub last_message: Option<String>,
     /// Time of last message
@@ -304,12 +325,16 @@ pub struct Chat {
 impl Chat {
     /// Create a new chat from a JID
     pub fn new(jid: String) -> Self {
-        let name = jid.split('@').next().unwrap_or(&jid).to_string();
+        let name = jid
+            .parse::<Jid>()
+            .map(|jid| fallback_chat_name(&jid))
+            .unwrap_or_else(|_| "Unknown chat".to_string());
         let is_group = jid.contains("@g.us");
 
         Self {
             jid,
             name,
+            name_priority: 0,
             last_message: None,
             last_message_time: None,
             unread_count: 0,
@@ -323,11 +348,16 @@ impl Chat {
     /// Create a new chat with a custom name
     #[allow(dead_code)]
     pub fn with_name(jid: String, name: String) -> Self {
+        Self::with_name_priority(jid, name, 2)
+    }
+
+    pub(crate) fn with_name_priority(jid: String, name: String, name_priority: u8) -> Self {
         let is_group = jid.contains("@g.us");
 
         Self {
             jid,
             name,
+            name_priority,
             last_message: None,
             last_message_time: None,
             unread_count: 0,
@@ -335,6 +365,13 @@ impl Chat {
             is_group,
             participants: HashMap::new(),
             messages: Vec::new(),
+        }
+    }
+
+    pub(crate) fn set_name_if_better(&mut self, name: String, priority: u8) {
+        if priority > self.name_priority {
+            self.name = name;
+            self.name_priority = priority;
         }
     }
 
@@ -346,10 +383,11 @@ impl Chat {
     /// Get a participant's display name, with fallback to JID prefix
     #[allow(dead_code)]
     pub fn get_participant_name(&self, jid: &str) -> String {
-        self.participants
-            .get(jid)
-            .cloned()
-            .unwrap_or_else(|| jid.split('@').next().unwrap_or(jid).to_string())
+        self.participants.get(jid).cloned().unwrap_or_else(|| {
+            jid.parse::<Jid>()
+                .map(|jid| fallback_chat_name(&jid))
+                .unwrap_or_else(|_| "Unknown contact".to_string())
+        })
     }
 
     /// Add a message to the chat, maintaining chronological order by timestamp.
@@ -405,13 +443,7 @@ impl Chat {
     /// the live one. Messages merge dedup-guarded without unread bumps; the
     /// store's counters are authoritative after a flush.
     pub fn merge_history(&mut self, hydrated: Chat) {
-        // A live-created chat starts with the JID prefix as its name; the
-        // hydrated row may be the first source carrying the real subject or
-        // contact name. Never downgrade a real name back to the placeholder.
-        let placeholder = self.jid.split('@').next().unwrap_or(&self.jid);
-        if self.name == placeholder && hydrated.name != placeholder {
-            self.name = hydrated.name;
-        }
+        self.set_name_if_better(hydrated.name, hydrated.name_priority);
         for msg in hydrated.messages {
             self.insert_history_message(msg);
         }
@@ -563,6 +595,40 @@ mod tests {
             duration_secs: None,
             data_is_preview,
         }
+    }
+
+    #[test]
+    fn chat_fallback_hides_internal_lid() {
+        let lid = Chat::new("111222333444555@lid".to_string());
+        let pn = Chat::new("12025550143@s.whatsapp.net".to_string());
+
+        assert_eq!(lid.name, "Unknown contact");
+        assert_eq!(pn.name, "+12025550143");
+    }
+
+    #[test]
+    fn better_name_survives_history_merges() {
+        let jid = "111222333444555@lid".to_string();
+        let mut chat = Chat::new(jid.clone());
+
+        chat.merge_history(Chat::with_name_priority(
+            jid.clone(),
+            "Masked label".to_string(),
+            1,
+        ));
+        assert_eq!(chat.name, "Masked label");
+
+        chat.merge_history(Chat::with_name_priority(
+            jid.clone(),
+            "Fictitious Contact".to_string(),
+            3,
+        ));
+        chat.merge_history(Chat::with_name_priority(
+            jid,
+            "Older history label".to_string(),
+            1,
+        ));
+        assert_eq!(chat.name, "Fictitious Contact");
     }
 
     #[test]
