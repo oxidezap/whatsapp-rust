@@ -21,22 +21,21 @@ use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
 /// `on_err` is generic so each record type keeps its own error type; the caller
 /// closes over a single fail-closed error for the whole scan.
 pub(crate) fn decode_local_only_u32_field<E>(
-    bytes: &[u8],
+    mut bytes: &[u8],
     field_number: u32,
     on_err: impl Fn() -> E,
 ) -> Result<u32, E> {
-    let mut buf = bytes;
     let mut value = None;
-    while !buf.is_empty() {
-        let tag = Tag::decode(&mut buf).map_err(|_| on_err())?;
+    while !bytes.is_empty() {
+        let tag = Tag::decode(&mut bytes).map_err(|_| on_err())?;
         if tag.field_number() == field_number {
             if tag.wire_type() != WireType::Varint || value.is_some() {
                 return Err(on_err());
             }
-            let raw = decode_varint(&mut buf).map_err(|_| on_err())?;
+            let raw = decode_varint(&mut bytes).map_err(|_| on_err())?;
             value = Some(u32::try_from(raw).map_err(|_| on_err())?);
         } else {
-            skip_field(tag, &mut buf).map_err(|_| on_err())?;
+            skip_field(tag, &mut bytes).map_err(|_| on_err())?;
         }
     }
     Ok(value.unwrap_or(0))
