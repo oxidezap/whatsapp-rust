@@ -2909,6 +2909,33 @@ mod mark_full_distribution_list {
         );
     }
 
+    /// Regression guard (CodeRabbit/Codex review on #1027): the delegation must
+    /// keep the concrete SignalProtocolError as the error source, not
+    /// string-format it. The warm-send recovery in `src/send/mod.rs` downcasts
+    /// NoSenderKeyState to clear stale device tracking and retry with SKDM
+    /// redistribution; erasing the type (e.g. `anyhow!("{e:?}")`) breaks the
+    /// self-heal. `.context` preserves the source, so the downcast still fires.
+    #[tokio::test]
+    async fn encrypt_group_message_preserves_no_sender_key_state() {
+        use crate::libsignal::protocol::SignalProtocolError;
+
+        let name = SenderKeyName::new("g@g.us".to_string(), "me.0".to_string());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        // Empty store: no local SenderKeyRecord for `name`.
+        let mut sks = MemSenderKeyStore::default();
+
+        let err = crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+            .await
+            .expect_err("a missing sender key must error");
+        assert!(
+            matches!(
+                err.downcast_ref::<SignalProtocolError>(),
+                Some(SignalProtocolError::NoSenderKeyState(_))
+            ),
+            "NoSenderKeyState must survive the delegation for the SKDM-redistribution retry, got: {err:#}"
+        );
+    }
+
     // Outgoing group encryption never consumes our own prekeys, and device B
     // has no bundle (so no session is established for it) — these are never
     // called; present only to satisfy the generic bounds.

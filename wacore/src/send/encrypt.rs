@@ -1,6 +1,7 @@
 //! Per-device Signal encryption fanout and the bounded spawn helper.
 
 use super::*;
+use anyhow::Context;
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across the surrounding SKDM creation + this encrypt, so a concurrent send
@@ -20,16 +21,13 @@ where
     R: Rng + CryptoRng,
 {
     // Delegate to the libsignal primitive so the sender-key advance, the wire
-    // gate, and the iteration lease live in exactly one place. Propagate the
-    // error unwrapped (not string-formatted) so callers can still downcast
-    // NoSenderKeyState to clear stale tracking and retry with SKDM redistribution.
-    Ok(crate::libsignal::protocol::group_encrypt(
-        sender_key_store,
-        sender_key_name,
-        plaintext,
-        csprng,
-    )
-    .await?)
+    // gate, and the iteration lease live in exactly one place. `.context` keeps
+    // the concrete SignalProtocolError as the source, so callers can still
+    // downcast NoSenderKeyState to clear stale tracking and retry with SKDM
+    // redistribution.
+    crate::libsignal::protocol::group_encrypt(sender_key_store, sender_key_name, plaintext, csprng)
+        .await
+        .context("group encrypt failed")
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The
