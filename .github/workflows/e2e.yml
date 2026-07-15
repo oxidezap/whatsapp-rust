@@ -15,6 +15,11 @@ env:
   PROTOC_VERSION: '3.25.3'
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
+  # The target dir is restored fresh each run (Swatinem cache), so incremental
+  # state is always cold and only bloats artifacts; worse, sccache refuses to
+  # cache incremental compilations, so leaving it on excludes the workspace
+  # crates from caching entirely.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   e2e:
@@ -45,11 +50,14 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache Rust registry
+        uses: mozilla-actions/sccache-action@v0.0.10
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Wait for mock server
         run: |
           for i in $(seq 1 30); do
