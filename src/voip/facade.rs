@@ -12,7 +12,8 @@ use log::warn;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
-    CAPABILITY_OFFER, OfferDeviceKey, OfferParams, VideoStateParams, build_offer, build_video_state,
+    CAPABILITY_OFFER, CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams,
+    build_offer, build_video_state,
 };
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::voip::relay_parse::RelayData;
@@ -442,6 +443,14 @@ fn keep_non_pkmsg_devices(devices: Vec<Jid>, would_pkmsg: &[bool]) -> Result<Vec
     Ok(kept)
 }
 
+fn offer_capability(video: bool) -> &'static [u8] {
+    if video {
+        &CAPABILITY_VIDEO_OFFER
+    } else {
+        &CAPABILITY_OFFER
+    }
+}
+
 /// Drain every dormant outgoing call (relay never arrived) and notify each one's `ended` so any
 /// parked `wait_ended()` resolves. The relay socket and signaling are connection-scoped, so a dormant
 /// outgoing call can't survive a disconnect; the registry's `abort_all` already covers attached calls,
@@ -594,7 +603,7 @@ async fn place_call(
         call_creator,
         device_keys: &device_keys,
         privacy_token: privacy_token.as_deref(),
-        capability: Some(&CAPABILITY_OFFER),
+        capability: Some(offer_capability(video.is_some())),
         device_identity: device_identity.as_deref(),
         id: Some(&offer_stanza_id),
         // Keep the addressed `<destination>` shape for a multi-device callee even if encryption
@@ -1139,7 +1148,7 @@ async fn attach_engine(
         video_shared.attach_endpoints(client, &v.source, &v.sink, ended.clone());
         // From-start video: the engine was built with enable_video, but a same-path Enable is
         // idempotent and keeps one code path for both entries.
-        let _ = video_shared.ctl_tx.try_send(VideoControl::Enable);
+        video_shared.send_control(VideoControl::Enable);
     }
 
     let channels = CallChannels {
@@ -1182,6 +1191,8 @@ async fn attach_engine(
 const VIDEO_IN_CHANNEL_CAP: usize = 4;
 /// Inbound video AU backlog between the drive loop and the sink forwarder.
 const VIDEO_OUT_CHANNEL_CAP: usize = 8;
+/// Keeps hostile signaling bursts bounded while retaining the newest control intent.
+const VIDEO_CONTROL_CHANNEL_CAP: usize = 16;
 
 /// `dec` we advertise on an upgrade request (what we can decode).
 const VIDEO_DEC_REQUEST: &str = "H264";
@@ -1213,9 +1224,7 @@ type VideoReceivers = (
 
 impl VideoShared {
     fn new() -> Self {
-        // Control is unbounded: commands are rare, tiny, and must never be dropped (a lost Enable
-        // strands the upgrade). Media (in_tx) is bounded and back-pressures the feed.
-        let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (ctl_tx, ctl_rx) = async_channel::bounded::<VideoControl>(VIDEO_CONTROL_CHANNEL_CAP);
         let (in_tx, in_rx) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
         Self {
             ctl_tx,
@@ -1236,6 +1245,10 @@ impl VideoShared {
             .unwrap_or_else(|| (async_channel::bounded(1).1, async_channel::bounded(1).1))
     }
 
+    fn send_control(&self, control: VideoControl) {
+        let _ = self.ctl_tx.force_send(control);
+    }
+
     /// Attach (or replace) the consumer's endpoints: the sink becomes the forwarder's target and a
     /// fresh `VideoFeed` pumps the source; a previous feed is aborted (its source is released).
     fn attach_endpoints(
@@ -1247,7 +1260,7 @@ impl VideoShared {
     ) {
         // Queue timing before the feed can make an AU ready. The driver's control arm is biased
         // ahead of media, so the first RTP timestamp already uses the source's cadence.
-        let _ = self.ctl_tx.try_send(VideoControl::SetTimestampStride(
+        self.send_control(VideoControl::SetTimestampStride(
             source.rtp_timestamp_stride(),
         ));
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
@@ -1274,7 +1287,7 @@ impl VideoShared {
         if let Some(feed) = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take() {
             feed.abort();
         }
-        let _ = self.ctl_tx.try_send(VideoControl::Disable);
+        self.send_control(VideoControl::Disable);
     }
 }
 
@@ -1512,6 +1525,17 @@ impl CallHandle {
     /// disables the drive-loop plane) and clear the session flag. Shared by `stop_video` and the
     /// `begin_video` rollback.
     fn teardown_local_video(&self) {
+        let pending_video = {
+            let mut pending = self
+                .pending_outgoing_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .get_mut(&self.call_id)
+                .filter(|entry| entry.generation == self.generation)
+                .and_then(|entry| entry.video.take())
+        };
+        drop(pending_video);
         self.video.detach_endpoints();
         self.client_registry.set_is_video(&self.call_id, false);
     }
@@ -1545,7 +1569,7 @@ impl CallHandle {
         } else {
             VideoControl::Enable
         };
-        let _ = self.video.ctl_tx.try_send(ctl);
+        self.video.send_control(ctl);
         self.client_registry.set_is_video(&self.call_id, true);
 
         let peer = self.peer_jid();
@@ -2572,6 +2596,13 @@ mod tests {
     /// Place a dormant outgoing call (offer sent, relay not yet arrived) and return its handle. Shares
     /// the place_call machinery the offer-send test uses; the call lands in pending_outgoing_calls.
     async fn place_dormant_outgoing(client: &Arc<Client>) -> (CallHandle, String) {
+        place_dormant_outgoing_with_video(client, None).await
+    }
+
+    async fn place_dormant_outgoing_with_video(
+        client: &Arc<Client>,
+        video: Option<VideoEndpoints>,
+    ) -> (CallHandle, String) {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(client, &device).await;
@@ -2589,7 +2620,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
-            None,
+            video,
         )
         .await
         .expect("place_call");
@@ -3368,6 +3399,13 @@ mod tests {
         assert!(matches!(err, Err(CallError::MissingDeviceIdentity)));
     }
 
+    #[test]
+    fn outgoing_video_offer_uses_video_capability() {
+        assert_eq!(offer_capability(false), CAPABILITY_OFFER);
+        assert_eq!(offer_capability(true), CAPABILITY_VIDEO_OFFER);
+        assert_ne!(offer_capability(false), offer_capability(true));
+    }
+
     /// A live handle over a mock relay + a sending client, for the video handshake tests. The
     /// returned relay sender is a keepalive: dropping it disconnects the relay and ends the call.
     async fn sending_handle() -> (
@@ -3611,6 +3649,36 @@ mod tests {
         handle.hangup().await;
     }
 
+    #[tokio::test]
+    async fn dormant_stop_video_clears_pending_endpoints() {
+        let (client, _sent) = make_sending_client().await;
+        let (source, sink) = video_endpoints();
+        let (handle, call_id) =
+            place_dormant_outgoing_with_video(&client, Some(VideoEndpoints::new(source, sink)))
+                .await;
+        assert!(
+            client
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .get(&call_id)
+                .is_some_and(|pending| pending.video.is_some())
+        );
+
+        handle.stop_video().await.expect("dormant downgrade");
+        assert!(
+            client
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .get(&call_id)
+                .is_some_and(|pending| pending.video.is_none()),
+            "relay attach must not resurrect endpoints removed before its ack"
+        );
+        assert!(!client.call_registry().snapshot(&call_id).unwrap().is_video);
+        handle.hangup().await;
+    }
+
     // The VideoFeed pumps the consumer's source into the drive loop's channel and dies on the
     // call's ended flag (not only on channel closure), so a silent source can't park it forever.
     #[tokio::test]
@@ -3665,5 +3733,21 @@ mod tests {
         let (in_rx, ctl_rx) = shared.take_receivers();
         assert!(in_rx.is_closed());
         assert!(ctl_rx.is_closed());
+    }
+
+    #[test]
+    fn video_control_queue_is_bounded_and_retains_latest_intent() {
+        let shared = VideoShared::new();
+        let (_in_rx, ctl_rx) = shared.take_receivers();
+        for orientation in 0..100u8 {
+            shared.send_control(VideoControl::SetOrientation(orientation % 4));
+        }
+        assert_eq!(ctl_rx.len(), VIDEO_CONTROL_CHANNEL_CAP);
+
+        let mut last = None;
+        while let Ok(control) = ctl_rx.try_recv() {
+            last = Some(control);
+        }
+        assert_eq!(last, Some(VideoControl::SetOrientation(3)));
     }
 }

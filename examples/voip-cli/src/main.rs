@@ -28,7 +28,7 @@
 //! socket, the sans-IO engine, and the task lifetime. This example only supplies the cpal audio
 //! device / ffmpeg pipes and reacts to engine events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -709,8 +709,13 @@ struct CallObserver {
 struct CallState {
     /// Live calls' handles by call-id.
     handles: HashMap<String, Arc<CallHandle>>,
+    /// Registration order; the last live entry is the stdin UI target.
+    call_order: Vec<String>,
     /// The stdin `v` toggle's view of each call's video: pending peer request vs our video live.
     video_ui: HashMap<String, VideoUi>,
+    starting: HashSet<String>,
+    /// Prevents a late startup from resurrecting media after the peer ended the call.
+    terminated_during_startup: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -732,13 +737,46 @@ impl CallObserver {
     }
 }
 
+fn begin_call_startup(state: &Arc<Mutex<CallState>>, call_id: &str) {
+    let mut st = state.lock().unwrap();
+    st.starting.insert(call_id.to_string());
+    st.terminated_during_startup.remove(call_id);
+}
+
+fn complete_call_startup(state: &Arc<Mutex<CallState>>, call_id: &str) -> bool {
+    let mut st = state.lock().unwrap();
+    st.starting.remove(call_id);
+    st.terminated_during_startup.remove(call_id)
+}
+
+fn record_peer_terminate(state: &Arc<Mutex<CallState>>, call_id: &str) {
+    let mut st = state.lock().unwrap();
+    if st.starting.contains(call_id) {
+        st.terminated_during_startup.insert(call_id.to_string());
+    }
+    st.handles.remove(call_id);
+    st.video_ui.remove(call_id);
+    st.call_order.retain(|id| id != call_id);
+}
+
+fn mark_call_most_recent(order: &mut Vec<String>, call_id: &str) {
+    order.retain(|id| id != call_id);
+    order.push(call_id.to_string());
+}
+
 /// Register a handle for UI control and remove it when the library-owned call ends.
-fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) {
-    state
-        .lock()
-        .unwrap()
-        .handles
-        .insert(cid.clone(), handle.clone());
+async fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) {
+    if complete_call_startup(state, &cid) {
+        // The library also sees the terminate, but this closes a handle created after that teardown.
+        handle.hangup().await;
+        info!("◾ discarded media startup for already-ended call {cid}");
+        return;
+    }
+    {
+        let mut st = state.lock().unwrap();
+        st.handles.insert(cid.clone(), handle.clone());
+        mark_call_most_recent(&mut st.call_order, &cid);
+    }
     let state = state.clone();
     tokio::spawn(async move {
         handle.wait_ended().await;
@@ -753,6 +791,7 @@ fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallH
             {
                 st.handles.remove(&cid);
                 st.video_ui.remove(&cid);
+                st.call_order.retain(|id| id != &cid);
             }
         }
         info!("◾ call {cid} media ended");
@@ -774,25 +813,29 @@ impl EventHandler for CallObserver {
                     let video = self.video && *is_video;
                     let state = self.state.clone();
                     let cid = call_id.clone();
+                    begin_call_startup(&state, &cid);
                     tokio::spawn(async move {
                         if let Err(e) = respond_to_offer(&client, &call, accept, video).await {
                             error!("call signaling failed: {e}");
+                            complete_call_startup(&state, &cid);
                             return;
                         }
                         if !accept {
+                            complete_call_startup(&state, &cid);
                             return;
                         }
                         match start_media(&client, &call, video, &state).await {
-                            Ok(handle) => register_handle(&state, cid.clone(), handle),
-                            Err(e) => warn!("inbound media failed: {e}"),
+                            Ok(handle) => register_handle(&state, cid.clone(), handle).await,
+                            Err(e) => {
+                                complete_call_startup(&state, &cid);
+                                warn!("inbound media failed: {e}");
+                            }
                         }
                     });
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("◀ peer ended call {call_id}");
-                    let mut st = self.state.lock().unwrap();
-                    st.handles.remove(call_id);
-                    st.video_ui.remove(call_id);
+                    record_peer_terminate(&self.state, call_id);
                 }
                 _ => {}
             }
@@ -909,6 +952,7 @@ fn spawn_call_event_listener(
     let events = handle.events();
     tokio::spawn(async move {
         let mut opus = WaOpusDecoder::new().ok();
+        let mut peer_video_receiver_confirmed = false;
         while let Ok(ev) = events.recv().await {
             match ev {
                 CallEvent::RelayAllocated => {
@@ -936,6 +980,9 @@ fn spawn_call_event_listener(
                     report_blocks,
                     feedback,
                 } => {
+                    let requests_keyframe = feedback
+                        .iter()
+                        .any(|item| item.packet_type == 206 && matches!(item.fmt, 1 | 4));
                     let blocks = report_blocks
                         .iter()
                         .map(|report| {
@@ -973,6 +1020,15 @@ fn spawn_call_event_listener(
                         })
                         .collect::<Vec<_>>()
                         .join(",");
+                    if reports_video && !peer_video_receiver_confirmed {
+                        info!(
+                            "🎥 peer RTCP confirms receipt of our outbound video stream: blocks=[{blocks}] feedback=[{feedback}]"
+                        );
+                        peer_video_receiver_confirmed = true;
+                    }
+                    if requests_keyframe {
+                        info!("🎥 peer requests an outbound keyframe: [{feedback}]");
+                    }
                     debug!(
                         "📊 peer RTCP PT={packet_types:?} sender={sender_ssrc:#010x} refs={referenced_ssrcs:x?} reports_audio={reports_audio} reports_video={reports_video} blocks=[{blocks}] feedback=[{feedback}]"
                     );
@@ -1122,10 +1178,11 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
             // The most recent live call is the toggle's target (this demo runs one call at a time).
             let picked = {
                 let st = state.lock().unwrap();
-                st.handles
-                    .iter()
-                    .next()
-                    .map(|(cid, h)| (cid.clone(), h.clone(), st.video_ui.get(cid).copied()))
+                st.call_order.iter().rev().find_map(|cid| {
+                    st.handles
+                        .get(cid)
+                        .map(|h| (cid.clone(), h.clone(), st.video_ui.get(cid).copied()))
+                })
             };
             let Some((cid, handle, ui)) = picked else {
                 info!("⌨  no live call");
@@ -1233,7 +1290,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
             match place_outgoing_call(&client2, &peer, video, &state).await {
                 Ok(handle) => {
                     let cid = handle.call_id().to_string();
-                    register_handle(&state, cid, handle);
+                    register_handle(&state, cid, handle).await;
                 }
                 Err(e) => error!("call failed: {e}"),
             }
@@ -1260,7 +1317,12 @@ async fn run_bot(mode: Mode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliCommand, parse_cli, video_source_is_ignored};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
+        parse_cli, record_peer_terminate, video_source_is_ignored,
+    };
 
     fn argv(parts: &[&str]) -> Vec<String> {
         std::iter::once("voip")
@@ -1347,5 +1409,26 @@ mod tests {
         assert!(!video_source_is_ignored(&audio_only, false));
         assert!(!video_source_is_ignored(&video, true));
         assert!(!video_source_is_ignored(&CliCommand::Usage, true));
+    }
+
+    #[test]
+    fn peer_terminate_tombstones_in_progress_media_startup() {
+        let state = Arc::new(Mutex::new(CallState::default()));
+        begin_call_startup(&state, "CALL-ID-STARTING");
+        record_peer_terminate(&state, "CALL-ID-STARTING");
+        assert!(complete_call_startup(&state, "CALL-ID-STARTING"));
+
+        let st = state.lock().unwrap();
+        assert!(st.starting.is_empty());
+        assert!(st.terminated_during_startup.is_empty());
+    }
+
+    #[test]
+    fn stdin_ui_order_tracks_the_most_recent_call() {
+        let mut order = Vec::new();
+        mark_call_most_recent(&mut order, "CALL-A");
+        mark_call_most_recent(&mut order, "CALL-B");
+        mark_call_most_recent(&mut order, "CALL-A");
+        assert_eq!(order, ["CALL-B", "CALL-A"]);
     }
 }

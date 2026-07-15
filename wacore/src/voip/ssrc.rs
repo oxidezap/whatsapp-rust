@@ -13,10 +13,7 @@ pub fn derive_wasm_participant_ssrc(call_id: &str, lid: &str, slot_word: u32) ->
     u32::from_le_bytes(okm)
 }
 
-/// Relay stream slot used to derive the VIDEO SSRC. Taken from the
-/// WaCalls/meowcaller reference (audio is slot 0); our KATs only pin slots 0/1,
-/// so this value is unvalidated against a live capture — if interop shows the
-/// peer deriving a different video SSRC, this single constant is the fix.
+/// Relay stream slot used to derive the VIDEO SSRC, pinned to the WhatsApp WASM slot grid.
 pub const VIDEO_SSRC_SLOT_WORD: u32 = 2;
 
 /// Video-stream SSRC for a participant: same HKDF as audio, video slot word.
@@ -59,11 +56,7 @@ mod tests {
         let audio = derive_wasm_participant_ssrc("CALL-ID-0001", "12345:0@lid", 0);
         let video = derive_video_participant_ssrc("CALL-ID-0001", "12345:0@lid");
         assert_ne!(audio, video);
-        assert_eq!(
-            video,
-            derive_wasm_participant_ssrc("CALL-ID-0001", "12345:0@lid", VIDEO_SSRC_SLOT_WORD),
-            "helper must be the slot-word derivation, nothing extra"
-        );
+        assert_eq!(video, 0xf8d7_0484, "WhatsApp WASM video-slot KAT");
     }
 
     #[test]

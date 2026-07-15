@@ -316,7 +316,8 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 .ok_or_else(|| anyhow!("<video> missing or non-numeric 'state'"))?;
             let orientation = attrs
                 .optional_string("device_orientation")
-                .and_then(|s| s.parse::<u8>().ok());
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|orientation| *orientation <= 3);
             let dec = attrs.optional_string("dec").map(|s| s.into_owned());
             // The upgrade-request marker attr and the server-enriched knobs; consumed (their
             // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
@@ -1967,6 +1968,16 @@ mod tests {
             }
             other => panic!("expected VideoState, got {other:?}"),
         }
+
+        let malformed = video_call_node(&[("state", "1"), ("device_orientation", "255")]);
+        let call = parse_call_stanza(&as_ref(&malformed)).unwrap().unwrap();
+        assert!(matches!(
+            call.action,
+            CallAction::VideoState {
+                orientation: None,
+                ..
+            }
+        ));
 
         // A future state number parses to Unknown rather than failing the stanza.
         let future = video_call_node(&[("state", "42")]);

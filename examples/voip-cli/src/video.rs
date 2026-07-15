@@ -3,11 +3,11 @@
 //! pre-encoded H.264 Annex-B access units).
 //!
 //!   source: webcam (per-OS ffmpeg input) | any file/URL | `testsrc2` synthetic pattern
-//!           -> libx264 (baseline, 1280x720@20, ~1980kbps, AUD-delimited) -> stdout pipe
+//!           -> normalize -> libx264 (baseline, 1280x720@20, ~1980kbps, AUD-delimited) -> stdout
 //!           -> `AnnexBAuSplitter` -> one AU per channel item
 //!   sink:   received AUs -> ffplay window (low-latency flags) | raw `.h264` file | discard
 //!
-//! Env knobs: `WA_VIDEO_INPUT` = `testsrc` | existing path/URL | webcam device override;
+//! Env knobs: `WA_VIDEO_INPUT` = `testsrc` | existing path/URL | `annexb:<path>` | webcam device;
 //! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`; `WA_VIDEO_SIZE`, `WA_VIDEO_FPS`,
 //! `WA_VIDEO_BITRATE_KBPS`, and `WA_VIDEO_SINK_FPS` override the captured WhatsApp defaults.
 
@@ -52,6 +52,8 @@ const DEFAULT_VIDEO_WIDTH: u32 = 1280;
 const DEFAULT_VIDEO_HEIGHT: u32 = 720;
 const DEFAULT_VIDEO_FPS: u32 = 20;
 const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 1980;
+/// Bound complex camera keyframes without adding encoder lookahead.
+const VIDEO_VBV_WINDOW_MS: u32 = 250;
 /// Raw-H.264 fallback when the bitstream carries no timing; preview timestamps follow arrival time.
 const DEFAULT_SINK_FPS: u32 = 15;
 const GOP_SECONDS: u32 = 3;
@@ -65,6 +67,9 @@ const SINK_CHANNEL_CAP: usize = 2;
 const READ_CHUNK: usize = 32 * 1024;
 /// A sink write slower than this sheds frames instead of stalling the call's forwarder.
 const SINK_WRITE_TIMEOUT: Duration = Duration::from_millis(75);
+const CAMERA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A video accept must not outrun a cold camera that has not produced a decodable frame yet.
+const SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct VideoOpts {
     pub input: VideoInput,
@@ -79,6 +84,20 @@ struct VideoQuality {
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CameraMode {
+    input_format: String,
+    width: u32,
+    height: u32,
+    compressed: bool,
+}
+
+impl CameraMode {
+    fn size(&self) -> String {
+        format!("{}x{}", self.width, self.height)
+    }
 }
 
 impl VideoQuality {
@@ -122,6 +141,12 @@ impl VideoQuality {
     fn timestamp_stride(self) -> u32 {
         VIDEO_CLOCK_RATE / self.fps
     }
+
+    fn vbv_buffer_kbits(self) -> u32 {
+        self.bitrate_kbps
+            .saturating_mul(VIDEO_VBV_WINDOW_MS)
+            .div_ceil(1000)
+    }
 }
 
 fn parse_video_size(value: &str) -> Result<(u32, u32)> {
@@ -154,6 +179,8 @@ pub enum VideoInput {
     Webcam(Option<String>),
     /// Any file or URL ffmpeg can open; looped and rate-limited to realtime.
     Media(String),
+    /// Pre-encoded H.264 Annex-B, paced without changing its encoded access units.
+    AnnexB(String),
     /// `lavfi testsrc2` synthetic pattern — no camera needed (CI / second instance).
     TestSrc,
 }
@@ -171,6 +198,9 @@ impl VideoOpts {
     pub fn from_env() -> Result<Self> {
         let input = match std::env::var("WA_VIDEO_INPUT") {
             Ok(v) if v == "testsrc" => VideoInput::TestSrc,
+            Ok(v) if v.starts_with("annexb:") => {
+                VideoInput::AnnexB(v.trim_start_matches("annexb:").to_string())
+            }
             // A `/dev/*` node is a webcam override (v4l2 on Linux), NOT a media file — it exists on
             // disk but must not be opened with `-stream_loop`.
             Ok(v) if v.starts_with("/dev/") => VideoInput::Webcam(Some(v)),
@@ -227,8 +257,129 @@ async fn ensure_tool(tool: &str) -> Result<()> {
     }
 }
 
+fn parse_camera_modes(output: &str) -> Vec<CameraMode> {
+    let mut modes = Vec::new();
+    for line in output.lines() {
+        let Some((kind, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let compressed = kind.contains("Compressed");
+        if !compressed && !kind.contains("Raw") {
+            continue;
+        }
+        let Some((input_format, rest)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some((_, sizes)) = rest.split_once(':') else {
+            continue;
+        };
+        for size in sizes.split_ascii_whitespace() {
+            let Ok((width, height)) = parse_video_size(size) else {
+                continue;
+            };
+            modes.push(CameraMode {
+                input_format: input_format.trim().to_string(),
+                width,
+                height,
+                compressed,
+            });
+        }
+    }
+    modes
+}
+
+fn camera_mode_score(mode: &CameraMode, quality: VideoQuality) -> (u8, u64, u8, u64, u8) {
+    let exact = u8::from(mode.width != quality.width || mode.height != quality.height);
+    let aspect_error = (u64::from(mode.width) * u64::from(quality.height))
+        .abs_diff(u64::from(quality.width) * u64::from(mode.height));
+    let mode_area = u64::from(mode.width) * u64::from(mode.height);
+    let target_area = u64::from(quality.width) * u64::from(quality.height);
+    let needs_upscale = u8::from(mode_area < target_area);
+    let format_rank = match (mode.input_format.as_str(), mode.compressed) {
+        ("mjpeg", _) => 0,
+        ("h264", _) => 1,
+        (_, true) => 2,
+        (_, false) => 3,
+    };
+    (
+        exact,
+        aspect_error,
+        needs_upscale,
+        mode_area.abs_diff(target_area),
+        format_rank,
+    )
+}
+
+fn choose_camera_mode(modes: &[CameraMode], quality: VideoQuality) -> Option<CameraMode> {
+    modes
+        .iter()
+        .min_by_key(|mode| camera_mode_score(mode, quality))
+        .cloned()
+}
+
+async fn probe_linux_camera_mode(device: &str, quality: VideoQuality) -> Option<CameraMode> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-f",
+        "v4l2",
+        "-list_formats",
+        "all",
+        "-i",
+        device,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    let output = match tokio::time::timeout(CAMERA_PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            warn!("🎥 cannot inspect camera {device} ({e}); using driver negotiation");
+            return None;
+        }
+        Err(_) => {
+            warn!("🎥 camera probe timed out for {device}; using driver negotiation");
+            return None;
+        }
+    };
+    let modes = parse_camera_modes(&String::from_utf8_lossy(&output.stderr));
+    let selected = choose_camera_mode(&modes, quality);
+    if let Some(mode) = &selected {
+        info!(
+            "🎥 camera capture: {} {} -> normalized to {} @ {} fps",
+            mode.input_format,
+            mode.size(),
+            quality.size(),
+            quality.fps,
+        );
+    } else {
+        warn!(
+            "🎥 camera {device} reported no usable modes; ffmpeg will negotiate before normalization"
+        );
+    }
+    selected
+}
+
+fn normalization_filter(quality: VideoQuality) -> String {
+    format!(
+        "scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2:out_range=tv,\
+         pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS},format=yuv420p,\
+         setparams=range=limited:color_primaries=unknown:color_trc=unknown:colorspace=unknown",
+        W = quality.width,
+        H = quality.height,
+        FPS = quality.fps,
+    )
+}
+
 /// The per-input head of the ffmpeg command line.
-fn input_args(input: &VideoInput, quality: VideoQuality) -> Result<Vec<String>> {
+fn input_args(
+    input: &VideoInput,
+    quality: VideoQuality,
+    camera_mode: Option<&CameraMode>,
+) -> Result<Vec<String>> {
     let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let fps = quality.fps.to_string();
     let size = quality.size();
@@ -242,34 +393,25 @@ fn input_args(input: &VideoInput, quality: VideoQuality) -> Result<Vec<String>> 
             "-i",
             &format!("testsrc2=size={size}:rate={fps}"),
         ]),
-        VideoInput::Media(path) => {
-            let mut v = s(&["-re", "-stream_loop", "-1", "-i", path]);
-            // Normalize any input to the call's fixed geometry/rate.
-            v.extend(s(&[
-                "-vf",
-                &format!(
-                    "scale={W}:{H}:force_original_aspect_ratio=decrease,\
-                     pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={FPS}",
-                    W = quality.width,
-                    H = quality.height,
-                    FPS = quality.fps,
-                ),
-            ]));
-            v
-        }
+        VideoInput::Media(path) => s(&["-re", "-stream_loop", "-1", "-i", path]),
+        VideoInput::AnnexB(path) => s(&["-re", "-framerate", &fps, "-f", "h264", "-i", path]),
         VideoInput::Webcam(dev) => {
             if cfg!(target_os = "linux") {
                 let dev = dev.clone().unwrap_or_else(|| "/dev/video0".into());
-                s(&[
-                    "-f",
-                    "v4l2",
+                let mut args = s(&["-f", "v4l2"]);
+                if let Some(mode) = camera_mode {
+                    args.extend(s(&["-input_format", &mode.input_format]));
+                }
+                let capture_size = camera_mode.map(CameraMode::size).unwrap_or(size);
+                args.extend(s(&[
                     "-framerate",
                     &fps,
                     "-video_size",
-                    &size,
+                    &capture_size,
                     "-i",
                     &dev,
-                ])
+                ]));
+                args
             } else if cfg!(target_os = "macos") {
                 let dev = dev.clone().unwrap_or_else(|| "0".into());
                 s(&[
@@ -312,7 +454,11 @@ fn encoder_args(quality: VideoQuality) -> Vec<String> {
     let gop = quality.fps.saturating_mul(GOP_SECONDS).to_string();
     let fps = quality.fps.to_string();
     let bitrate = format!("{}k", quality.bitrate_kbps);
+    let vbv_buffer = format!("{}k", quality.vbv_buffer_kbits());
+    let filter = normalization_filter(quality);
     [
+        "-vf",
+        &filter,
         "-r",
         &fps,
         "-fps_mode",
@@ -337,8 +483,12 @@ fn encoder_args(quality: VideoQuality) -> Vec<String> {
         "0",
         "-b:v",
         &bitrate,
+        "-maxrate",
+        &bitrate,
+        "-bufsize",
+        &vbv_buffer,
         "-x264-params",
-        "repeat-headers=1",
+        "repeat-headers=1:sliced-threads=0:threads=1",
         "-bsf:v",
         "h264_metadata=aud=insert",
         "-an",
@@ -351,13 +501,22 @@ fn encoder_args(quality: VideoQuality) -> Vec<String> {
     .collect()
 }
 
-fn spawn_ffmpeg_encoder(input: &VideoInput, quality: VideoQuality) -> Result<Child> {
+fn spawn_ffmpeg_encoder(
+    input: &VideoInput,
+    quality: VideoQuality,
+    camera_mode: Option<&CameraMode>,
+) -> Result<Child> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error"]);
-    cmd.args(input_args(input, quality)?);
-    // repeat-headers=1: SPS/PPS ride every IDR, so a peer joining mid-stream (upgrade) or
-    // recovering from a drop can always re-sync. aud=insert: the AU delimiter the splitter cuts on.
-    cmd.args(encoder_args(quality));
+    cmd.args(input_args(input, quality, camera_mode)?);
+    if matches!(input, VideoInput::AnnexB(_)) {
+        // Copy mode isolates transport behavior without changing already encoded frames.
+        cmd.args(["-c:v", "copy", "-an", "-f", "h264", "pipe:1"]);
+    } else {
+        // Normalize camera metadata so every encoded source presents one decoder contract.
+        // One slice per frame avoids content-dependent RTP layouts.
+        cmd.args(encoder_args(quality));
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // stderr inherited: encoder errors (missing camera, busy device) reach the user directly.
@@ -369,6 +528,22 @@ fn spawn_ffmpeg_encoder(input: &VideoInput, quality: VideoQuality) -> Result<Chi
 pub struct FfmpegVideoSource {
     frames: async_channel::Receiver<Vec<u8>>,
     timestamp_stride: u32,
+}
+
+#[derive(Default)]
+struct FirstIdrGate {
+    open: bool,
+}
+
+impl FirstIdrGate {
+    fn admit(&mut self, au: &[u8]) -> bool {
+        self.open |= au_has_idr(au);
+        self.open
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
+    }
 }
 
 impl FfmpegVideoSource {
@@ -390,13 +565,26 @@ impl VideoSource for FfmpegVideoSource {
 /// Spawn the ffmpeg encoder and return complete H.264 AUs with their RTP cadence.
 pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
     ensure_tool("ffmpeg").await?;
+    let camera_mode = if cfg!(target_os = "linux")
+        && let VideoInput::Webcam(dev) = &opts.input
+    {
+        let device = dev.as_deref().unwrap_or("/dev/video0");
+        probe_linux_camera_mode(device, opts.quality).await
+    } else {
+        None
+    };
     info!(
-        "🎥 encoder: {}x{} @ {} fps, {} kbps average target, H.264 baseline level 3.1",
-        opts.quality.width, opts.quality.height, opts.quality.fps, opts.quality.bitrate_kbps,
+        "🎥 encoder output: {}x{} @ {} fps, {} kbps capped, {} ms VBV, H.264 baseline level 3.1",
+        opts.quality.width,
+        opts.quality.height,
+        opts.quality.fps,
+        opts.quality.bitrate_kbps,
+        VIDEO_VBV_WINDOW_MS,
     );
-    let mut child = spawn_ffmpeg_encoder(&opts.input, opts.quality)?;
+    let mut child = spawn_ffmpeg_encoder(&opts.input, opts.quality, camera_mode.as_ref())?;
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(SOURCE_CHANNEL_CAP);
+    let (ready_tx, ready_rx) = async_channel::bounded::<std::result::Result<(), String>>(1);
 
     tokio::spawn(async move {
         // Owning the child keeps kill_on_drop armed for the whole read loop.
@@ -404,6 +592,8 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
         let mut splitter = AnnexBAuSplitter::default();
         let mut buf = vec![0u8; READ_CHUNK];
         let mut aus: Vec<Vec<u8>> = Vec::new();
+        let mut startup = FirstIdrGate::default();
+        let mut ready_tx = Some(ready_tx);
         // When the channel backs up we drop AUs — but only from a keyframe boundary, because an
         // arbitrary dropped AU corrupts the peer's decode until the next IDR anyway. Dropping
         // *deliberately until* the next IDR turns backpressure into one clean skip.
@@ -417,6 +607,12 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
                     splitter.push(&buf[..n], &mut aus);
                     for au in aus.drain(..) {
                         made += 1;
+                        let was_ready = startup.is_open();
+                        if !startup.admit(&au) {
+                            dropped += 1;
+                            continue;
+                        }
+                        let first_idr = !was_ready;
                         if !logged_parameter_sets && let Some(summary) = parameter_set_summary(&au)
                         {
                             info!("🎥 OUT H.264: {summary} NALs={:?}", au_nal_types(&au),);
@@ -442,8 +638,20 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
                                 au_has_idr(&au)
                             );
                         }
+                        let is_idr = au_has_idr(&au);
+                        let au_bytes = au.len();
                         match tx.try_send(au) {
-                            Ok(()) => sent += 1,
+                            Ok(()) => {
+                                if is_idr {
+                                    info!(
+                                        "🎥 OUT IDR queued: source AU #{made}, wire AU #{sent}, {au_bytes} bytes"
+                                    );
+                                }
+                                sent += 1;
+                                if first_idr && let Some(ready) = ready_tx.take() {
+                                    let _ = ready.try_send(Ok(()));
+                                }
+                            }
                             Err(async_channel::TrySendError::Full(_)) => {
                                 dropped += 1;
                                 dropping = true;
@@ -455,16 +663,48 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
                 }
                 Err(e) => {
                     warn!("🎥 video source read failed: {e}");
+                    if let Some(ready) = ready_tx.take() {
+                        let _ = ready.try_send(Err(e.to_string()));
+                    }
                     break;
                 }
             }
         }
         if let Some(last) = splitter.finish() {
-            let _ = tx.try_send(last);
+            made += 1;
+            let was_ready = startup.is_open();
+            if startup.admit(&last) {
+                let first_idr = !was_ready;
+                match tx.try_send(last) {
+                    Ok(()) => {
+                        if first_idr && let Some(ready) = ready_tx.take() {
+                            let _ = ready.try_send(Ok(()));
+                        }
+                    }
+                    Err(async_channel::TrySendError::Full(_)) => dropped += 1,
+                    Err(async_channel::TrySendError::Closed(_)) => return,
+                }
+            } else {
+                dropped += 1;
+            }
+        }
+        if let Some(ready) = ready_tx.take() {
+            let _ = ready.try_send(Err("encoder ended before its first IDR".to_string()));
         }
         // The call survives a dead source (audio keeps running), same as a muted mic.
         warn!("🎥 video source ended ({made} AUs, {dropped} dropped)");
     });
+    match tokio::time::timeout(SOURCE_READY_TIMEOUT, ready_rx.recv()).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(reason))) => return Err(anyhow!("video source failed before ready: {reason}")),
+        Ok(Err(_)) => return Err(anyhow!("video source ended before its first IDR")),
+        Err(_) => {
+            return Err(anyhow!(
+                "video source produced no IDR within {}s",
+                SOURCE_READY_TIMEOUT.as_secs()
+            ));
+        }
+    }
     Ok(FfmpegVideoSource {
         frames: rx,
         timestamp_stride: opts.quality.timestamp_stride(),
@@ -749,6 +989,19 @@ mod tests {
     }
 
     #[test]
+    fn video_source_opens_only_on_a_decodable_idr() {
+        let delta = [0, 0, 0, 1, 0x41, 1, 2, 3];
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        let mut gate = FirstIdrGate::default();
+
+        assert!(!gate.admit(&delta));
+        assert!(!gate.is_open());
+        assert!(gate.admit(&idr));
+        assert!(gate.is_open());
+        assert!(gate.admit(&delta));
+    }
+
+    #[test]
     fn whatsapp_hd_quality_matches_reference_capture() {
         let quality = VideoQuality::whatsapp_hd();
         assert_eq!(
@@ -768,8 +1021,17 @@ mod tests {
     }
 
     #[test]
-    fn encoder_uses_unbuffered_average_bitrate_with_whatsapp_hd_cadence() {
+    fn encoder_bounds_camera_bursts_with_whatsapp_hd_cadence() {
         let args = encoder_args(VideoQuality::whatsapp_hd());
+        let filter = value_after(&args, "-vf");
+        assert!(filter.contains("scale=1280:720"));
+        assert!(filter.contains("pad=1280:720"));
+        assert!(filter.contains("setsar=1"));
+        assert!(filter.contains("fps=20"));
+        assert!(filter.contains("format=yuv420p"));
+        assert!(filter.contains("out_range=tv"));
+        assert!(filter.contains("setparams=range=limited"));
+        assert!(filter.contains("color_primaries=unknown"));
         assert_eq!(value_after(&args, "-profile:v"), "baseline");
         assert_eq!(value_after(&args, "-level:v"), "3.1");
         assert_eq!(value_after(&args, "-preset"), "veryfast");
@@ -777,20 +1039,76 @@ mod tests {
         assert_eq!(value_after(&args, "-r"), "20");
         assert_eq!(value_after(&args, "-g"), "60");
         assert_eq!(value_after(&args, "-b:v"), "1980k");
-        assert!(!args.iter().any(|arg| arg == "-maxrate"));
-        assert!(!args.iter().any(|arg| arg == "-bufsize"));
+        assert_eq!(value_after(&args, "-maxrate"), "1980k");
+        assert_eq!(value_after(&args, "-bufsize"), "495k");
+        assert_eq!(
+            value_after(&args, "-x264-params"),
+            "repeat-headers=1:sliced-threads=0:threads=1"
+        );
     }
 
     #[test]
     fn input_geometry_follows_quality() {
         let quality = VideoQuality::new(640, 360, 20, 750).unwrap();
-        let testsrc = input_args(&VideoInput::TestSrc, quality).unwrap();
+        let testsrc = input_args(&VideoInput::TestSrc, quality, None).unwrap();
         assert_eq!(value_after(&testsrc, "-i"), "testsrc2=size=640x360:rate=20");
 
-        let media = input_args(&VideoInput::Media("clip.mp4".into()), quality).unwrap();
-        let filter = value_after(&media, "-vf");
-        assert!(filter.contains("scale=640:360"));
-        assert!(filter.contains("fps=20"));
+        let media = input_args(&VideoInput::Media("clip.mp4".into()), quality, None).unwrap();
+        assert_eq!(value_after(&media, "-i"), "clip.mp4");
+        assert!(!media.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn parses_and_selects_exact_compressed_camera_mode() {
+        let output = "\
+[in#0] Compressed:       mjpeg :          Motion-JPEG : 1920x1080 1280x720 640x480\n\
+[in#0] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 640x360\n";
+        let modes = parse_camera_modes(output);
+        assert_eq!(modes.len(), 5);
+
+        let quality = VideoQuality::whatsapp_hd();
+        let mode = choose_camera_mode(&modes, quality).expect("camera mode");
+        assert_eq!(
+            mode,
+            CameraMode {
+                input_format: "mjpeg".into(),
+                width: 1280,
+                height: 720,
+                compressed: true,
+            }
+        );
+
+        let args = input_args(
+            &VideoInput::Webcam(Some("/dev/video9".into())),
+            quality,
+            Some(&mode),
+        )
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(value_after(&args, "-input_format"), "mjpeg");
+            assert_eq!(value_after(&args, "-video_size"), "1280x720");
+            assert_eq!(value_after(&args, "-i"), "/dev/video9");
+        }
+    }
+
+    #[test]
+    fn camera_mode_selection_prefers_same_aspect_before_upscaling() {
+        let modes = [
+            CameraMode {
+                input_format: "mjpeg".into(),
+                width: 1920,
+                height: 1080,
+                compressed: true,
+            },
+            CameraMode {
+                input_format: "yuyv422".into(),
+                width: 640,
+                height: 480,
+                compressed: false,
+            },
+        ];
+        let mode = choose_camera_mode(&modes, VideoQuality::whatsapp_hd()).expect("camera mode");
+        assert_eq!((mode.width, mode.height), (1920, 1080));
     }
 
     #[test]

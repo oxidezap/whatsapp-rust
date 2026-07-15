@@ -8,8 +8,8 @@
 //! the portable core to a specific executor.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use portable_atomic::AtomicU64;
 
@@ -52,7 +52,7 @@ struct CallEntry {
     /// negotiation the caller started is refused (`<video state=UpgradeReject|UpgradeCancel>`), so a
     /// dead upgrade doesn't leave the source encoding into a disabled plane. Built in the root crate
     /// (it owns the endpoints), stored here so the wacore-side signaling handler can invoke it.
-    video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    video_teardown: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -192,38 +192,37 @@ impl CallRegistry {
         {
             entry.event_tx = Some(event_tx);
             entry.video_ctl_tx = Some(video_ctl_tx);
-            entry.video_teardown = Some(video_teardown);
+            entry.video_teardown = Some(video_teardown.into());
         }
     }
 
     /// Release the local video endpoints for `call_id` (a refused upgrade). Best-effort: a no-op if
     /// the call is unknown or has no teardown hook registered.
     pub fn run_video_teardown(&self, call_id: &str) {
-        let map = self.inner.lock().expect("registry lock poisoned");
-        // Invoke under the lock: the boxed Fn stays owned by the live entry. It only flips the
-        // root-crate VideoShared flags / aborts a feed — no re-entry into the registry — so this
-        // is safe.
-        if let Some(hook) = map.get(call_id).and_then(|e| e.video_teardown.as_ref()) {
+        let hook = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|entry| entry.video_teardown.clone());
+        if let Some(hook) = hook {
             hook();
         }
     }
 
-    /// Surface a call event on the consumer's event queue (best-effort: dropped when the queue is
-    /// full or the call is unknown, same loss policy as the driver's event posts).
-    pub fn send_call_event(&self, call_id: &str, event: CallEvent) {
+    /// Surface signaling on the consumer's event queue. The result lets the handler withhold its
+    /// protocol acknowledgement instead of accepting a transition the application never received.
+    pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
         let tx = self
             .inner
             .lock()
             .expect("registry lock poisoned")
             .get(call_id)
             .and_then(|e| e.event_tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.try_send(event);
-        }
+        tx.is_some_and(|tx| tx.try_send(event).is_ok())
     }
 
-    /// Send a mid-call video-plane command to the drive loop. Best-effort like
-    /// [`send_call_event`](Self::send_call_event).
+    /// Send a mid-call video-plane command to the drive loop (best-effort).
     pub fn send_video_ctl(&self, call_id: &str, ctl: VideoControl) {
         let tx = self
             .inner
@@ -232,7 +231,7 @@ impl CallRegistry {
             .get(call_id)
             .and_then(|e| e.video_ctl_tx.clone());
         if let Some(tx) = tx {
-            let _ = tx.try_send(ctl);
+            let _ = tx.force_send(ctl);
         }
     }
 
@@ -455,6 +454,49 @@ mod tests {
             "a stale generation must not read the replacement's device"
         );
         assert_eq!(reg.answering_device_if_current("CID", g2), None);
+    }
+
+    #[test]
+    fn signaling_event_reports_queue_backpressure() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let (event_tx, event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = async_channel::unbounded();
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
+
+        let event = || CallEvent::VideoStateChanged {
+            state: crate::types::call::VideoState::Enabled,
+            orientation: None,
+        };
+        assert!(reg.send_call_event("CID", event()));
+        assert!(
+            !reg.send_call_event("CID", event()),
+            "a full queue must be visible to the signaling handler"
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::VideoStateChanged { .. })
+        ));
+        assert!(!reg.send_call_event("UNKNOWN", event()));
+    }
+
+    #[test]
+    fn video_teardown_runs_after_registry_unlock() {
+        let reg = Arc::new(CallRegistry::new());
+        let generation = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = async_channel::bounded(1);
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, {
+            let reg = reg.clone();
+            let lock_was_free = lock_was_free.clone();
+            Box::new(move || {
+                lock_was_free.store(reg.inner.try_lock().is_ok(), Ordering::SeqCst);
+            })
+        });
+
+        reg.run_video_teardown("CID");
+        assert!(lock_was_free.load(Ordering::SeqCst));
     }
 
     #[test]

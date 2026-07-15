@@ -482,8 +482,8 @@ async fn run_call_with_clock_and_wallclock(
                     Ok(VideoControl::SetOrientation(o)) => eng.set_peer_video_orientation(o),
                     Err(_) => video_ctl_open = false,
                 }
-                // Fire an overdue timer like the other ready arms: video_ctl is unbounded, so a
-                // stream of control messages must not keep this arm hot and defer the keepalive.
+                // Fire an overdue timer like the other ready arms so a stream of control messages
+                // cannot keep this arm hot and defer the keepalive.
                 let now = now_ms();
                 if let Some(at) = eng.poll_timeout()
                     && at != engine::NEVER

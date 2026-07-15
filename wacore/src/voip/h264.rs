@@ -191,6 +191,8 @@ pub struct H264Depacketizer {
     /// it (RFC 3550), so a change marks a new AU even if the previous marker was
     /// lost.
     au_timestamp: Option<u32>,
+    /// Keeps a marker-completed AU closed when one of its packets arrives late.
+    last_completed_timestamp: Option<u32>,
     /// AUs completed this or a prior push but not yet handed back (drained one per
     /// `push`), so a timestamp boundary coinciding with a marker never drops one.
     ready: std::collections::VecDeque<Vec<u8>>,
@@ -202,6 +204,7 @@ impl H264Depacketizer {
         self.fu_buf.clear();
         self.fu_active = false;
         self.au_timestamp = None;
+        self.last_completed_timestamp = None;
         self.ready.clear();
     }
 
@@ -246,12 +249,18 @@ impl H264Depacketizer {
                         let au = std::mem::take(&mut self.au_buf);
                         self.queue_ready(au);
                     }
+                    self.last_completed_timestamp = Some(cur);
                     self.au_timestamp = Some(timestamp);
                 } else {
                     return self.ready.pop_front();
                 }
             }
         } else {
+            if let Some(completed) = self.last_completed_timestamp
+                && (timestamp.wrapping_sub(completed) as i32) <= 0
+            {
+                return self.ready.pop_front();
+            }
             self.au_timestamp = Some(timestamp);
         }
         match nal_unit_type(payload) {
@@ -321,9 +330,7 @@ impl H264Depacketizer {
             return None;
         }
         self.drop_partial_fu();
-        // The next packet after a marker begins a fresh AU; forget this AU's timestamp so an
-        // identical-timestamp reuse (wrap or a stale value) doesn't suppress the boundary check.
-        self.au_timestamp = None;
+        self.last_completed_timestamp = self.au_timestamp.take();
         if self.au_buf.is_empty() {
             return None;
         }
@@ -691,6 +698,25 @@ mod tests {
             d.push(3, 2000, &b2, true),
             Some(au_from_nals(&[b1, b2])),
             "the in-progress AU survives the reordered packet and completes on its marker"
+        );
+    }
+
+    #[test]
+    fn late_packet_after_marker_cannot_seed_a_stale_au() {
+        let mut d = H264Depacketizer::default();
+        let completed = nal(5, 20);
+        assert_eq!(
+            d.push(10, 1000, &completed, true),
+            Some(au_from_nals(std::slice::from_ref(&completed)))
+        );
+
+        let late = nal(1, 15);
+        assert_eq!(d.push(9, 1000, &late, false), None);
+        let next = nal(1, 25);
+        assert_eq!(
+            d.push(11, 2000, &next, true),
+            Some(au_from_nals(std::slice::from_ref(&next))),
+            "a late packet from the completed timestamp must not leak into the next AU"
         );
     }
 

@@ -174,35 +174,50 @@ impl StanzaHandler for CallHandler {
                         state, orientation, ..
                     } = &call.action
                     {
-                        *cancelled = true;
-                        // The typed ack is what tells the peer we received its state; only COMMIT
-                        // the local plane transition once it is sent. If we can't ack (no stanza id,
-                        // or a send failure — usually a dying socket), the peer will time out and
-                        // revert, so mirroring that here (skip the plane change) keeps the two sides
-                        // consistent instead of driving our plane into a state the peer never
-                        // confirmed. The event is still surfaced for observability.
-                        let acked = match build_call_video_ack(&call) {
-                            Some(ack) => match client.send_node(ack).await {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    warn!("call: failed to send typed video ack: {e}");
-                                    false
-                                }
-                            },
-                            None => {
-                                warn!("call: video stanza has no id; cannot send the typed ack");
-                                false
-                            }
-                        };
                         let call_id = call.action.call_id();
                         let registry = client.call_registry();
-                        registry.send_call_event(
+                        let event_delivered = registry.send_call_event(
                             call_id,
                             CallEvent::VideoStateChanged {
                                 state: *state,
                                 orientation: *orientation,
                             },
                         );
+                        if !event_delivered {
+                            warn!(
+                                "call: video state event queue is unavailable; leaving the transition unacknowledged"
+                            );
+                        }
+                        // A typed ack commits the received transition. If the application cannot
+                        // observe it, leave the generic ack in place so the peer reverts instead.
+                        let acked = if event_delivered {
+                            match build_call_video_ack(&call) {
+                                Some(ack) => {
+                                    *cancelled = true;
+                                    match client.send_node(ack).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            warn!("call: failed to send typed video ack: {e}");
+                                            false
+                                        }
+                                    }
+                                }
+                                None => {
+                                    warn!(
+                                        "call: video stanza has no id; cannot send the typed ack"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        // Rejection ends our attempted upgrade locally even when its ack cannot get
+                        // out; retaining the camera cannot help a negotiation the peer already ended.
+                        if matches!(state, VideoState::UpgradeReject | VideoState::UpgradeCancel) {
+                            registry.run_video_teardown(call_id);
+                            registry.set_is_video(call_id, false);
+                        }
                         // Only drive our local plane once the peer has been acked; see above.
                         if acked {
                             if let Some(o) = orientation {
@@ -215,14 +230,6 @@ impl StanzaHandler for CallHandler {
                                 VideoState::UpgradeAccept | VideoState::Enabled => {
                                     registry.set_is_video(call_id, true);
                                     registry.send_video_ctl(call_id, VideoControl::Enable);
-                                }
-                                // The peer refused an upgrade WE started: our source is already feeding
-                                // a now-dead negotiation, so fully release the local video endpoints
-                                // (stops the camera feed, disables the plane) instead of leaking an
-                                // encode.
-                                VideoState::UpgradeReject | VideoState::UpgradeCancel => {
-                                    registry.run_video_teardown(call_id);
-                                    registry.set_is_video(call_id, false);
                                 }
                                 // The peer stopped ITS video; our outbound is the consumer's call
                                 // (stop_video), so only the flag is updated here.
@@ -409,7 +416,24 @@ mod tests {
     #[cfg(feature = "voip")]
     #[tokio::test]
     async fn video_state_sends_typed_ack_and_cancels_generic() {
+        use wacore::voip::{CallEvent, VideoControl};
+
         let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (event_tx, _event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, _control_rx) = async_channel::unbounded::<VideoControl>();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("ack"));
 
         let node = node_to_owned_ref(&video_stanza("11"));
@@ -545,6 +569,78 @@ mod tests {
                 "state {state}: a refused upgrade must clear the video flag"
             );
         }
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn refused_upgrade_tears_down_when_typed_ack_send_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let client = make_client().await;
+        let registry = client.call_registry();
+        let session = wacore::voip::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        );
+        let generation = registry.insert(session);
+        registry.set_is_video("CALL-ID-0001", true);
+        let torn = Arc::new(AtomicUsize::new(0));
+        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
+        let (ctl_tx, _ctl_rx) = async_channel::unbounded::<VideoControl>();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, {
+            let torn = torn.clone();
+            Box::new(move || {
+                torn.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("5")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(cancelled, "a built typed ack suppresses the generic ack");
+        assert_eq!(torn.load(Ordering::SeqCst), 1);
+        assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn full_event_queue_leaves_video_transition_uncommitted() {
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (ev_tx, _ev_rx) = async_channel::bounded::<CallEvent>(1);
+        ev_tx.try_send(CallEvent::RelayAllocated).expect("prefill");
+        let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("4")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(!cancelled, "the router must retain its fallback ack");
+        assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
+        assert!(ctl_rx.try_recv().is_err(), "the plane must not transition");
     }
 
     #[tokio::test]

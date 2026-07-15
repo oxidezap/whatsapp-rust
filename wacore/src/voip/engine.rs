@@ -17,9 +17,9 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 
 use super::demux::{RelayPacketKind, classify_relay_packet};
-use super::h264::{VideoFrame, au_is_keyframe};
+use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 use super::rtcp::{
-    RtcpFeedback, RtcpReportBlock, RtpReceptionStats, build_whatsapp_rtcp_cname,
+    RTCP_PT_PSFB, RtcpFeedback, RtcpReportBlock, RtpReceptionStats, build_whatsapp_rtcp_cname,
     parse_sender_report_timing, summarize_rtcp,
 };
 use super::rtp::{
@@ -424,6 +424,28 @@ struct VideoPlaneState {
     /// upgrade holds its camera off the wire until the peer accepts (a `<video>` request the peer
     /// ignores must not leak our video). Cleared on the peer's UpgradeAccept/Enabled.
     send_gated: bool,
+    /// PLI/FIR means dependent frames only prolong the peer's undecodable jitter-buffer state.
+    keyframe_required: bool,
+}
+
+fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
+    let target = video_ssrc.to_be_bytes();
+    feedback.iter().any(|item| {
+        if item.packet_type != RTCP_PT_PSFB {
+            return false;
+        }
+        match item.fmt {
+            1 => item.media_ssrc == video_ssrc,
+            4 => {
+                item.media_ssrc == video_ssrc
+                    || item
+                        .fci
+                        .chunks_exact(8)
+                        .any(|row| row.get(..4) == Some(target.as_slice()))
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Build the video pipeline for `self_lid` sending / `recv_peer_lid` receiving. `None` on a
@@ -457,6 +479,7 @@ fn make_video_plane(
         reception: RtpReceptionStats::default(),
         active: true,
         send_gated: false,
+        keyframe_required: false,
     })
 }
 
@@ -891,6 +914,12 @@ impl CallEngine {
             let Some(summary) = summarize_rtcp(&plain) else {
                 return;
             };
+            if let Some(video_ssrc) = video_ssrc
+                && requests_keyframe(&summary.feedback, video_ssrc)
+                && let Some(video) = m.video.as_mut()
+            {
+                video.keyframe_required = true;
+            }
             if let Some((sender, ntp_seconds, ntp_fraction)) = parse_sender_report_timing(&plain) {
                 m.audio_reception
                     .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
@@ -1070,6 +1099,12 @@ impl CallEngine {
         else {
             return;
         };
+        if v.keyframe_required {
+            if !au_has_idr(au) {
+                return;
+            }
+            v.keyframe_required = false;
+        }
         for packet in v.pipe.protect_video(au) {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
         }
@@ -2120,9 +2155,22 @@ mod tests {
                     && item.fci.is_empty())
         )));
 
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "PLI must suppress dependent AUs until recovery"
+        );
+        eng.handle_input(3, Input::VideoFrame(&video_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "the next IDR must recover transmission"
+        );
+
         let mut forged = protected;
         *forged.last_mut().unwrap() ^= 1;
-        eng.handle_input(2, Input::RelayPacket(&forged));
+        eng.handle_input(4, Input::RelayPacket(&forged));
         let (outs, _) = drain(&mut eng);
         assert!(
             !outs
@@ -2130,6 +2178,49 @@ mod tests {
                 .any(|output| matches!(output, Output::Event(CallEvent::RtcpReceived { .. }))),
             "forged SRTCP must be dropped"
         );
+        eng.handle_input(5, Input::VideoFrame(&video_delta_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "forged feedback must not re-arm keyframe recovery"
+        );
+    }
+
+    #[test]
+    fn keyframe_feedback_must_target_the_local_video_ssrc() {
+        let video_ssrc = 0x1122_3344;
+        let other_ssrc = 0x5566_7788;
+        let feedback = |packet_type, fmt, media_ssrc, fci| RtcpFeedback {
+            packet_type,
+            fmt,
+            sender_ssrc: 0x99aa_bbcc,
+            media_ssrc,
+            fci,
+        };
+
+        assert!(requests_keyframe(
+            &[feedback(RTCP_PT_PSFB, 1, video_ssrc, Vec::new())],
+            video_ssrc
+        ));
+        assert!(!requests_keyframe(
+            &[feedback(RTCP_PT_PSFB, 1, other_ssrc, Vec::new())],
+            video_ssrc
+        ));
+        assert!(!requests_keyframe(
+            &[feedback(205, 1, video_ssrc, Vec::new())],
+            video_ssrc
+        ));
+
+        let fir = [video_ssrc.to_be_bytes().as_slice(), &[7, 0, 0, 0]].concat();
+        assert!(requests_keyframe(
+            &[feedback(RTCP_PT_PSFB, 4, 0, fir)],
+            video_ssrc
+        ));
+        let other_fir = [other_ssrc.to_be_bytes().as_slice(), &[8, 0, 0, 0]].concat();
+        assert!(!requests_keyframe(
+            &[feedback(RTCP_PT_PSFB, 4, 0, other_fir)],
+            video_ssrc
+        ));
     }
 
     #[test]
@@ -2359,6 +2450,12 @@ mod tests {
     /// A synthetic Annex-B AU with one large IDR NAL (forces FU-A fragmentation).
     fn video_au(nal_len: usize) -> Vec<u8> {
         let mut au = vec![0, 0, 0, 1, 0x65];
+        au.extend((0..nal_len).map(|i| (i % 251) as u8));
+        au
+    }
+
+    fn video_delta_au(nal_len: usize) -> Vec<u8> {
+        let mut au = vec![0, 0, 0, 1, 0x41];
         au.extend((0..nal_len).map(|i| (i % 251) as u8));
         au
     }

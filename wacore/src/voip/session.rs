@@ -6,7 +6,7 @@ use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
     derive_srtcp_keys, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
 };
-use super::h264::{H264Depacketizer, au_has_idr, packetize_au};
+use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, au_has_idr, packetize_au};
 use super::rtcp::{
     RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_whatsapp_rtcp_cname,
     build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
@@ -508,6 +508,9 @@ impl VideoPipeline {
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
+        if au.len() > H264_MAX_AU_BYTES {
+            return Vec::new();
+        }
         let mut payloads = std::mem::take(&mut self.pkt_scratch);
         packetize_au(au, &mut payloads);
         let media_frame_info = if au_has_idr(au) {
@@ -1108,6 +1111,22 @@ mod tests {
         let packets2 = tx.protect_video(&au2);
         assert_eq!(packets2.len(), 1);
         assert_eq!(rx.unprotect_video(&packets2[0]), Some(au2));
+    }
+
+    #[test]
+    fn video_pipeline_rejects_oversized_au_before_packetization() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut pipe = VideoPipeline::new(&video_params(
+            &call_key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+        ))
+        .unwrap();
+        let oversized = vec![0u8; H264_MAX_AU_BYTES + 1];
+        assert!(pipe.protect_video(&oversized).is_empty());
+
+        let packet = pipe.protect_video(&video_au(10)).pop().unwrap();
+        assert_eq!(parse_rtp_header(&packet).unwrap().sequence_number, 0);
     }
 
     #[test]
