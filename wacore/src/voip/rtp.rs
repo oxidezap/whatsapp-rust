@@ -10,6 +10,8 @@ pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
 pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// Timestamp stride per access unit at the reference 15 fps (90000 / 15).
 pub const VIDEO_TS_STRIDE_15FPS: u32 = VIDEO_CLOCK_RATE / 15;
+/// Timestamp stride used by WhatsApp's 720p / 20 fps mode.
+pub const VIDEO_TS_STRIDE_20FPS: u32 = VIDEO_CLOCK_RATE / 20;
 pub const WHATSAPP_RTP_EXTENSION_PROFILE: u16 = 0xdebe;
 
 /// RFC 3550 fixed RTP header length, before any CSRC list or extension block.
@@ -418,6 +420,16 @@ impl VideoRtpStream {
         self.last_sent_timestamp.unwrap_or(self.timestamp)
     }
 
+    /// Change the cadence used after the current access unit. This keeps sequence numbers and the
+    /// RTP clock continuous when an encoder changes frame rate.
+    pub fn set_timestamp_stride(&mut self, ts_stride: u32) -> bool {
+        if ts_stride == 0 {
+            return false;
+        }
+        self.ts_stride = ts_stride;
+        true
+    }
+
     /// Header for the next packet of the current AU; `last_in_au` sets the
     /// marker and moves the timestamp to the next AU. `media_frame_info` is an
     /// encoded-frame property and must be identical on every fragment of the AU.
@@ -571,6 +583,23 @@ mod tests {
             assert_eq!(p.extension_word, None);
             assert_eq!(p.byte_size(), WHATSAPP_VIDEO_RTP_HEADER_SIZE);
         }
+    }
+
+    #[test]
+    fn video_stream_changes_cadence_without_resetting_timestamp() {
+        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
+        let first = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
+        assert_eq!(first.timestamp, 0);
+
+        assert!(stream.set_timestamp_stride(VIDEO_TS_STRIDE_20FPS));
+        let second = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
+        let third = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
+        assert_eq!(second.timestamp, VIDEO_TS_STRIDE_15FPS);
+        assert_eq!(
+            third.timestamp,
+            VIDEO_TS_STRIDE_15FPS + VIDEO_TS_STRIDE_20FPS
+        );
+        assert!(!stream.set_timestamp_stride(0));
     }
 
     #[test]

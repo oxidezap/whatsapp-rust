@@ -1,9 +1,9 @@
 //! Video endpoints for WhatsApp calls. The library transports pre-encoded H.264 — it never touches
 //! pixels — so a source hands us complete Annex-B access units (start codes included) and a sink
 //! receives reassembled peer AUs. The codec lives with the consumer (ffmpeg, WebCodecs, a hardware
-//! encoder); reference parameters: H.264 Constrained Baseline (avc1.42E01F), 640x480 @ 15 fps,
-//! ~500 kbps, a keyframe every ~30 frames, SPS/PPS repeated on each IDR (the peer can join
-//! mid-stream on an upgrade).
+//! encoder). WhatsApp uses H.264 Constrained Baseline (avc1.42E01F), repeated SPS/PPS, and adapts
+//! from a low-bandwidth 15 fps mode up to 1280x720 @ 20 fps / ~2 Mbps. A bare channel keeps the
+//! compatibility cadence of 15 fps; custom sources report their RTP stride explicitly.
 
 pub use wacore::voip::VideoFrame;
 
@@ -13,6 +13,12 @@ pub use wacore::voip::VideoFrame;
 pub trait VideoSource: Send + Sync + 'static {
     /// The channel the facade reads encoded AUs from. Called once when video starts.
     fn frames(&self) -> async_channel::Receiver<Vec<u8>>;
+
+    /// RTP clock increment between access units. It must match the source's pacing
+    /// (`90_000 / frames_per_second`) and remain non-zero.
+    fn rtp_timestamp_stride(&self) -> u32 {
+        wacore::voip::rtp::VIDEO_TS_STRIDE_15FPS
+    }
 }
 
 /// A video sink for a call: reassembled peer access units, with keyframe/orientation metadata.

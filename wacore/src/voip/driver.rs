@@ -30,6 +30,9 @@ use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VideoControl {
+    /// RTP clock increment for each access unit. Sent before attaching a source whose cadence is
+    /// different from the 15 fps compatibility default.
+    SetTimestampStride(u32),
     /// Bring the video plane up with outbound video ALLOWED (a from-start call, an accept, or the
     /// initiator once the peer accepted the upgrade).
     Enable,
@@ -62,7 +65,7 @@ pub struct CallChannels {
     pub video_ctl: async_channel::Receiver<VideoControl>,
 }
 
-/// About two seconds of mixed audio/video at the example's 15 fps, bounded by bytes as well.
+/// Bound slow relay writes without truncating a complete video access unit.
 const SEND_QUEUE_BATCH_CAP: usize = 64;
 const SEND_QUEUE_BYTE_CAP: usize = 2 * 1024 * 1024;
 
@@ -457,6 +460,9 @@ async fn run_call_with_clock_and_wallclock(
             // a Disable stops decoding queued inbound PT-97 right away.
             ctl = video_ctl_fut => {
                 match ctl {
+                    Ok(VideoControl::SetTimestampStride(ts_stride)) => {
+                        let _ = eng.set_video_timestamp_stride(ts_stride);
+                    }
                     Ok(VideoControl::Enable) => {
                         // False only for a control-only engine or a malformed stored callKey; the
                         // audio plane already validated the key, so treat it as a no-op not fatal.
@@ -1276,10 +1282,14 @@ mod tests {
         let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
         let (vctl_tx, vctl_rx) = async_channel::unbounded::<VideoControl>();
 
-        // Control drains first (bias), so Enable + orientation land before any packet or AU.
+        // Control drains first (bias), so cadence, Enable, and orientation land before any AU.
+        vctl_tx
+            .try_send(VideoControl::SetTimestampStride(4500))
+            .unwrap();
         vctl_tx.try_send(VideoControl::Enable).unwrap();
         vctl_tx.try_send(VideoControl::SetOrientation(1)).unwrap();
         let our_au = make_au(3000);
+        vin_tx.try_send(our_au.clone()).unwrap();
         vin_tx.try_send(our_au).unwrap();
 
         let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
@@ -1309,15 +1319,23 @@ mod tests {
             "SetOrientation must apply before the inbound AU reassembles"
         );
 
-        // Outbound: the 3KB AU fans out to ceil(3000/798) = 4 FU-A packets, all PT 97.
+        // Outbound: each 3KB AU fans out to four PT-97 packets and the 20 fps stride applies.
         let sent = transport.sent.lock().unwrap();
-        let pt97 = sent
+        let video_headers = sent
             .iter()
-            .filter(|b| {
-                parse_rtp_header(b).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+            .filter_map(|packet| {
+                parse_rtp_header(packet).filter(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
             })
-            .count();
-        assert_eq!(pt97, 4, "one 3KB AU must fan out to 4 PT-97 packets");
+            .collect::<Vec<_>>();
+        assert_eq!(video_headers.len(), 8);
+        assert_eq!(
+            video_headers
+                .iter()
+                .filter(|header| header.marker)
+                .map(|header| header.timestamp)
+                .collect::<Vec<_>>(),
+            [0, 4500]
+        );
     }
 
     // A relay stall backs the queue up past cap: the overflow policy must shed media, never the STUN

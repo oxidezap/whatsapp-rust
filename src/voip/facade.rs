@@ -69,10 +69,7 @@ impl<'a> AcceptCall<'a> {
         S: VideoSource,
         K: VideoSink,
     {
-        self.video = Some(VideoEndpoints {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
+        self.video = Some(VideoEndpoints::new(source, sink));
         self
     }
 
@@ -96,6 +93,11 @@ impl<'a> AcceptCall<'a> {
         let source = self.source.take().ok_or(CallError::MissingAudio)?;
         let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
         let video = self.video.take();
+        if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
         // Answering consumes the ringing flag now, BEFORE the media-setup awaits (callKey decrypt /
         // relay connect): a peer <terminate> racing this window must not record a missed call for a
         // call we are answering. A failed start() leaves it cleared -- an attempted answer reads as
@@ -241,10 +243,7 @@ impl<'a> OutgoingCall<'a> {
         S: VideoSource,
         K: VideoSink,
     {
-        self.video = Some(VideoEndpoints {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
+        self.video = Some(VideoEndpoints::new(source, sink));
         self
     }
 
@@ -294,6 +293,11 @@ impl<'a> OutgoingCall<'a> {
         let source = self.source.take().ok_or(CallError::MissingAudio)?;
         let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
         let video = self.video.take();
+        if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
 
         // WA Web `_e()`: call-id is "00" + 15 random bytes as lowercase hex (32 hex chars total).
         let call_id = gen_call_id();
@@ -399,6 +403,19 @@ impl<'a> OutgoingCall<'a> {
 struct VideoEndpoints {
     source: Arc<dyn VideoSource>,
     sink: Arc<dyn VideoSink>,
+}
+
+impl VideoEndpoints {
+    fn new<S: VideoSource, K: VideoSink>(source: S, sink: K) -> Self {
+        Self {
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+        }
+    }
+
+    fn has_valid_timing(&self) -> bool {
+        self.source.rtp_timestamp_stride() != 0
+    }
 }
 
 /// Drop hosted (Cloud-API) companions from the offer's device set: the client never establishes
@@ -1228,6 +1245,11 @@ impl VideoShared {
         sink: &Arc<dyn VideoSink>,
         ended: Arc<EndedFlag>,
     ) {
+        // Queue timing before the feed can make an AU ready. The driver's control arm is biased
+        // ahead of media, so the first RTP timestamp already uses the source's cadence.
+        let _ = self.ctl_tx.try_send(VideoControl::SetTimestampStride(
+            source.rtp_timestamp_stride(),
+        ));
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
         let feed = VideoFeed {
             src: source.frames(),
@@ -1507,6 +1529,11 @@ impl CallHandle {
         // A stale handle (superseded by a same-call-id glare/retry) must not attach endpoints or
         // send `<video>` for a call it no longer owns — that would mutate the replacement's state.
         self.ensure_current()?;
+        if source.rtp_timestamp_stride() == 0 {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
         let client = self.upgrade_client()?;
         self.video
             .attach_endpoints(&client, &source, &sink, self.ended.clone());
@@ -3386,6 +3413,21 @@ mod tests {
         (vin_rx, vout_tx)
     }
 
+    struct TimedVideoSource {
+        frames: async_channel::Receiver<Vec<u8>>,
+        timestamp_stride: u32,
+    }
+
+    impl VideoSource for TimedVideoSource {
+        fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+            self.frames.clone()
+        }
+
+        fn rtp_timestamp_stride(&self) -> u32 {
+            self.timestamp_stride
+        }
+    }
+
     /// The action child of a sent `<call>` node.
     fn call_action_of(node: &wacore_binary::Node) -> wacore_binary::Node {
         node.as_node_ref().children().unwrap()[0].to_owned()
@@ -3425,6 +3467,28 @@ mod tests {
                 .expect("session")
                 .is_video,
             "start_video must mark the session as video"
+        );
+        handle.hangup().await;
+    }
+
+    #[tokio::test]
+    async fn start_video_rejects_zero_timestamp_stride() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (frames, sink) = video_endpoints();
+        let source = TimedVideoSource {
+            frames,
+            timestamp_stride: 0,
+        };
+
+        assert!(matches!(
+            handle.start_video(source, sink).await,
+            Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero"
+            ))
+        ));
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "invalid timing must not attach endpoints"
         );
         handle.hangup().await;
     }
@@ -3553,16 +3617,24 @@ mod tests {
     async fn video_feed_forwards_and_stops_on_ended() {
         let client = make_client().await;
         let shared = VideoShared::new();
-        let (in_rx, _ctl_rx) = shared.take_receivers();
+        let (in_rx, ctl_rx) = shared.take_receivers();
         let (src_tx, src_rx) = async_channel::unbounded::<Vec<u8>>();
         let sink: Arc<dyn VideoSink> = {
             let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
             std::mem::forget(_vout_rx);
             Arc::new(vout_tx)
         };
-        let source: Arc<dyn VideoSource> = Arc::new(src_rx);
+        let source: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: src_rx,
+            timestamp_stride: 4500,
+        });
         let ended = Arc::new(EndedFlag::default());
         shared.attach_endpoints(&client, &source, &sink, ended.clone());
+
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(4500)
+        );
 
         src_tx.send(vec![1, 2, 3]).await.expect("feed source");
         let got = tokio::time::timeout(std::time::Duration::from_secs(2), in_rx.recv())

@@ -485,6 +485,10 @@ impl VideoPipeline {
         self.rtp.ssrc
     }
 
+    pub(crate) fn set_timestamp_stride(&mut self, ts_stride: u32) -> bool {
+        self.rtp.set_timestamp_stride(ts_stride)
+    }
+
     /// Same answering-device rekey as [`MediaPipeline::rekey_recv`]; the video
     /// recv keys are derived from the identical participant id, so they go
     /// stale together with the audio ones. The in-flight reassembly state is

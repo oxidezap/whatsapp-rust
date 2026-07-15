@@ -20,14 +20,15 @@
 //! During a live call, single-key commands on stdin (terminal only): `v` toggles video
 //! (upgrade / accept a pending peer request / downgrade), `q` hangs up.
 //! Env: `WA_VIDEO_INPUT` = `testsrc` | file/URL | webcam device (default: OS webcam);
-//! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`.
+//! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`; optional quality overrides:
+//! `WA_VIDEO_SIZE`, `WA_VIDEO_FPS`, `WA_VIDEO_BITRATE_KBPS`, `WA_VIDEO_SINK_FPS`.
 //!
 //! The inbound MEDIA path is the library facade: `client.voip().accept(&call).audio(mic,
 //! speaker).start()` returns a `CallHandle` and the library owns the callKey decrypt, the relay
 //! socket, the sans-IO engine, and the task lifetime. This example only supplies the cpal audio
 //! device / ffmpeg pipes and reacts to engine events.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -107,7 +108,7 @@ async fn main() -> Result<()> {
     }
     match command {
         CliCommand::Loopback { video: true } => {
-            video::run_video_loopback(&VideoOpts::from_env()).await
+            video::run_video_loopback(&VideoOpts::from_env()?).await
         }
         CliCommand::Loopback { video: false } => run_loopback().await,
         CliCommand::Listen { accept, video } => run_bot(Mode::Listen { accept, video }).await,
@@ -693,21 +694,14 @@ enum Mode {
 
 /// Drives calls off the typed `Event::IncomingCall` (no raw-node forwarding needed): on an offer it
 /// answers signaling then hands the MEDIA plane to the library facade
-/// (`client.voip().accept(..).audio(..).start()`), on a terminate it hangs the matching call up. The
-/// facade owns the relay socket, the callKey decrypt, the engine, and the task lifetime; this only
-/// supplies the PipeWire mic/speaker and remembers the `CallHandle` so a `<terminate>` can stop it.
+/// (`client.voip().accept(..).audio(..).start()`). The facade owns the relay socket, callKey decrypt,
+/// engine, and termination; this example supplies the mic/speaker and keeps handles for its UI.
 struct CallObserver {
     client: Arc<Client>,
     accept: bool,
     /// `--video`: start/answer calls with video media and auto-accept peer upgrade requests.
     video: bool,
-    /// Whether this run ever starts a media call (auto-accept inbound OR an outbound `call`), so a
-    /// `<terminate>` racing media startup is worth recording. A pure-reject run starts no media, so it
-    /// must NOT record (the set would grow unbounded with nothing to consume it).
-    manages_media: bool,
-    /// Per-call bookkeeping for the example's terminate-driven hangup. The client's own
-    /// `CallRegistry` already tears every call down on disconnect; this is only so a `<terminate>`
-    /// can stop a specific live call (and so a terminate that races media startup isn't lost).
+    /// Per-call UI bookkeeping. The client's `CallRegistry` owns media termination.
     state: Arc<Mutex<CallState>>,
 }
 
@@ -715,9 +709,6 @@ struct CallObserver {
 struct CallState {
     /// Live calls' handles by call-id.
     handles: HashMap<String, Arc<CallHandle>>,
-    /// Call-ids that were terminated BEFORE their media handle finished starting, so a late
-    /// `start_media()` hangs the call up instead of leaving an orphaned live call.
-    terminated: HashSet<String>,
     /// The stdin `v` toggle's view of each call's video: pending peer request vs our video live.
     video_ui: HashMap<String, VideoUi>,
 }
@@ -731,35 +722,23 @@ enum VideoUi {
 }
 
 impl CallObserver {
-    fn new(client: Arc<Client>, accept: bool, video: bool, manages_media: bool) -> Self {
+    fn new(client: Arc<Client>, accept: bool, video: bool) -> Self {
         Self {
             client,
             accept,
             video,
-            manages_media,
             state: Arc::new(Mutex::new(CallState::default())),
         }
     }
 }
 
-/// Register a freshly-started `CallHandle` for terminate-driven hangup. Returns false (and the caller
-/// should hang up) if a `<terminate>` for this call-id already arrived while media was starting. On
-/// success, spawns the wait_ended cleanup that drops the map entry when the call ends on its own.
-/// Shared by the inbound (accept) and outbound (call) paths.
-fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) -> bool {
-    let registered = {
-        let mut st = state.lock().unwrap();
-        if st.terminated.remove(&cid) {
-            false
-        } else {
-            st.handles.insert(cid.clone(), handle.clone());
-            true
-        }
-    };
-    if !registered {
-        return false;
-    }
-    // Drop our map entry once the call ends on its own (no terminate).
+/// Register a handle for UI control and remove it when the library-owned call ends.
+fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) {
+    state
+        .lock()
+        .unwrap()
+        .handles
+        .insert(cid.clone(), handle.clone());
     let state = state.clone();
     tokio::spawn(async move {
         handle.wait_ended().await;
@@ -773,11 +752,11 @@ fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallH
                 .is_some_and(|h| Arc::ptr_eq(h, &handle))
             {
                 st.handles.remove(&cid);
+                st.video_ui.remove(&cid);
             }
         }
         info!("◾ call {cid} media ended");
     });
-    true
 }
 
 impl EventHandler for CallObserver {
@@ -804,40 +783,16 @@ impl EventHandler for CallObserver {
                             return;
                         }
                         match start_media(&client, &call, video, &state).await {
-                            Ok(handle) => {
-                                // A <terminate> may have arrived while media was starting; if so, hang
-                                // up now instead of registering an orphaned live call.
-                                if !register_handle(&state, cid.clone(), handle.clone()) {
-                                    handle.hangup().await;
-                                    info!("◾ call {cid} terminated during media startup");
-                                }
-                            }
+                            Ok(handle) => register_handle(&state, cid.clone(), handle),
                             Err(e) => warn!("inbound media failed: {e}"),
                         }
                     });
                 }
                 CallAction::Terminate { call_id, .. } => {
-                    info!("◀ terminate for {call_id} — hanging up");
-                    // If the handle is registered, hang it up. If not, the offer is still starting
-                    // media: record the call-id so that path hangs up on completion (no orphan).
-                    let handle = {
-                        let mut st = self.state.lock().unwrap();
-                        match st.handles.remove(call_id) {
-                            Some(h) => Some(h),
-                            // Only track a pre-registration terminate when this run starts media
-                            // (inbound accept OR an outbound call); otherwise there is no call to
-                            // orphan and the set would grow unbounded.
-                            None => {
-                                if self.manages_media {
-                                    st.terminated.insert(call_id.clone());
-                                }
-                                None
-                            }
-                        }
-                    };
-                    if let Some(handle) = handle {
-                        tokio::spawn(async move { handle.hangup().await });
-                    }
+                    info!("◀ peer ended call {call_id}");
+                    let mut st = self.state.lock().unwrap();
+                    st.handles.remove(call_id);
+                    st.video_ui.remove(call_id);
                 }
                 _ => {}
             }
@@ -865,7 +820,7 @@ async fn start_media(
     let voip = client.voip();
     let mut builder = voip.accept(call).audio(mic, speaker.clone());
     if video {
-        let opts = VideoOpts::from_env();
+        let opts = VideoOpts::from_env()?;
         let cid = call.action.call_id();
         builder = builder.video(
             video::spawn_video_source(&opts).await?,
@@ -905,7 +860,7 @@ async fn place_outgoing_call(
     let voip = client.voip();
     let mut builder = voip.call(peer).audio(mic, speaker.clone());
     if video {
-        let opts = VideoOpts::from_env();
+        let opts = VideoOpts::from_env()?;
         builder = builder.video(
             video::spawn_video_source(&opts).await?,
             video::spawn_video_sink(&opts, "outgoing").await?,
@@ -978,14 +933,8 @@ fn spawn_call_event_listener(
                     referenced_ssrcs,
                     reports_audio,
                     reports_video,
-                    protection,
-                    srtcp_index,
-                    encrypted,
-                    plain_len,
-                    sdes_cname_lengths,
                     report_blocks,
                     feedback,
-                    uses_whatsapp_profile_extension,
                 } => {
                     let blocks = report_blocks
                         .iter()
@@ -1024,71 +973,8 @@ fn spawn_call_event_listener(
                         })
                         .collect::<Vec<_>>()
                         .join(",");
-                    info!(
-                        "📊 peer RTCP mode={protection:?} PT={packet_types:?} sender={sender_ssrc:#010x} refs={referenced_ssrcs:x?} reports_audio={reports_audio} reports_video={reports_video} index={srtcp_index:?} encrypted={encrypted} plain_bytes={plain_len} wa_profile={uses_whatsapp_profile_extension} blocks=[{blocks}] feedback=[{feedback}] sdes_cname_lens={sdes_cname_lengths:?}"
-                    );
-                }
-                CallEvent::RtcpRejected {
-                    stage,
-                    packet_type,
-                    sender_ssrc,
-                    packet_len,
-                    first_rtcp_len,
-                    plain_len,
-                    candidate_srtcp_index,
-                    candidate_encrypted,
-                    first_header_byte,
-                    plain_sample,
-                } => {
-                    if let Some(sample) = plain_sample {
-                        warn!(
-                            "📊 peer transport RTCP rejected at {stage:?}: PT={packet_type} sender={sender_ssrc:#010x} bytes={packet_len} plain_bytes={plain_len:?} first_header={first_header_byte:#04x} first_rtcp_bytes={first_rtcp_len} candidate_index={candidate_srtcp_index:?} candidate_encrypted={candidate_encrypted} plain_hex={} ",
-                            hex::encode(sample),
-                        );
-                    } else if stage == wacore::voip::RtcpRejectStage::Authentication {
-                        warn!(
-                            "📊 peer transport RTCP rejected at {stage:?}: PT={packet_type} sender={sender_ssrc:#010x} bytes={packet_len} plain_bytes={plain_len:?} first_header={first_header_byte:#04x} first_rtcp_bytes={first_rtcp_len} candidate_index={candidate_srtcp_index:?} candidate_encrypted={candidate_encrypted}"
-                        );
-                    } else {
-                        debug!(
-                            "peer transport RTCP rejected at {stage:?}: PT={packet_type} sender={sender_ssrc:#010x} bytes={packet_len} plain_bytes={plain_len:?} first_header={first_header_byte:#04x} first_rtcp_bytes={first_rtcp_len} candidate_index={candidate_srtcp_index:?} candidate_encrypted={candidate_encrypted}"
-                        );
-                    }
-                }
-                CallEvent::VideoRtpLayoutObserved {
-                    ssrc,
-                    sequence_number,
-                    timestamp,
-                    marker,
-                    header_len,
-                    packet_len,
-                    extension_profile,
-                    extension_data,
-                } => {
-                    let profile = extension_profile
-                        .map(|value| format!("{value:#06x}"))
-                        .unwrap_or_else(|| "none".to_owned());
-                    info!(
-                        "🎥 peer RTP layout: ssrc={ssrc:#010x} seq={sequence_number} ts={timestamp} marker={marker} header_bytes={header_len} packet_bytes={packet_len} ext_profile={profile} ext_data={} ",
-                        hex::encode(extension_data)
-                    );
-                }
-                CallEvent::VideoRtpLayoutSent {
-                    ssrc,
-                    sequence_number,
-                    timestamp,
-                    marker,
-                    header_len,
-                    packet_len,
-                    extension_profile,
-                    extension_data,
-                } => {
-                    let profile = extension_profile
-                        .map(|value| format!("{value:#06x}"))
-                        .unwrap_or_else(|| "none".to_owned());
-                    info!(
-                        "🎥 local RTP layout: ssrc={ssrc:#010x} seq={sequence_number} ts={timestamp} marker={marker} header_bytes={header_len} packet_bytes={packet_len} ext_profile={profile} ext_data={}",
-                        hex::encode(extension_data)
+                    debug!(
+                        "📊 peer RTCP PT={packet_types:?} sender={sender_ssrc:#010x} refs={referenced_ssrcs:x?} reports_audio={reports_audio} reports_video={reports_video} blocks=[{blocks}] feedback=[{feedback}]"
                     );
                 }
                 CallEvent::OutboundMediaDropped {
@@ -1130,7 +1016,7 @@ fn spawn_call_event_listener(
 
 /// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
 async fn accept_peer_video(handle: &CallHandle) -> Result<()> {
-    let opts = VideoOpts::from_env();
+    let opts = VideoOpts::from_env()?;
     let src = video::spawn_video_source(&opts).await?;
     let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
     handle
@@ -1165,16 +1051,8 @@ async fn respond_to_offer(
             .map_err(|e| anyhow!("send reject: {e}"))?;
         return Ok(());
     }
-    // Callee flow: preaccept immediately, then accept (signaling). Relay/media follow once
-    // the live transport orchestration lands.
-    // Codec-steering experiment: VOIP_FORCE_RFC_8K=1 advertises only 8 kHz, trying to push the
-    // caller off Meta's 16 kHz mlow onto plain RFC Opus NB (which our stock libopus can decode).
-    // Default keeps 16 kHz (mlow, garbled inbound until a real mlow decoder lands).
-    let force_rfc_8k = std::env::var_os("VOIP_FORCE_RFC_8K").is_some();
-    let audio_rates: &[&str] = if force_rfc_8k { &["8000"] } else { &["16000"] };
-    if force_rfc_8k {
-        info!("🧪 VOIP_FORCE_RFC_8K set — advertising only <audio rate=8000> to dodge mlow");
-    }
+    // Callee flow: preaccept immediately, then accept (signaling).
+    let audio_rates = &["16000"];
     let pre_id = hex::encode(rand::random::<[u8; 8]>());
     client
         .send_node(stanza::build_preaccept(
@@ -1274,7 +1152,7 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
                     None => {
                         info!("🎥 requesting video upgrade");
                         let started = async {
-                            let opts = VideoOpts::from_env();
+                            let opts = VideoOpts::from_env()?;
                             let src = video::spawn_video_source(&opts).await?;
                             let sink = video::spawn_video_sink(&opts, &cid).await?;
                             handle
@@ -1336,18 +1214,12 @@ async fn run_bot(mode: Mode) -> Result<()> {
     // The structured `Event::IncomingCall` (which now carries the offer's <enc>/<relay>) drives the
     // accept flow, so the raw-node-forwarding crutch the old hand-rolled inbound path needed is gone.
     let manages_media = accept || target.is_some();
-    let observer = Arc::new(CallObserver::new(
-        client.clone(),
-        accept,
-        video,
-        manages_media,
-    ));
+    let observer = Arc::new(CallObserver::new(client.clone(), accept, video));
     client.register_handler(observer.clone());
 
     if let Some(peer) = target {
         let client2 = client.clone();
-        // Share the observer's call state so a peer `<terminate>` for our outgoing call can hang it up
-        // (the same bookkeeping the inbound path uses).
+        // Share UI state with the inbound path.
         let state = observer.state.clone();
         tokio::spawn(async move {
             // Wait until the socket is up before placing the call; if it never connects, don't dial.
@@ -1361,10 +1233,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
             match place_outgoing_call(&client2, &peer, video, &state).await {
                 Ok(handle) => {
                     let cid = handle.call_id().to_string();
-                    if !register_handle(&state, cid.clone(), handle.clone()) {
-                        handle.hangup().await;
-                        info!("◾ call {cid} terminated during startup");
-                    }
+                    register_handle(&state, cid, handle);
                 }
                 Err(e) => error!("call failed: {e}"),
             }

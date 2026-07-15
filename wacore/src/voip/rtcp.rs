@@ -191,10 +191,16 @@ pub fn summarize_rtcp(data: &[u8]) -> Option<RtcpSummary> {
         }
 
         if matches!(packet_type, RTCP_PT_RTPFB | RTCP_PT_PSFB) && packet.len() >= 12 {
+            let fmt = if raw_count & 0x10 != 0 {
+                uses_whatsapp_profile_extension = true;
+                raw_count & 0x0f
+            } else {
+                raw_count
+            };
             let media_ssrc = u32::from_be_bytes(packet[8..12].try_into().ok()?);
             feedback.push(RtcpFeedback {
                 packet_type,
-                fmt: raw_count as u8,
+                fmt: fmt as u8,
                 sender_ssrc: this_sender,
                 media_ssrc,
                 fci: packet[12..].to_vec(),
@@ -203,7 +209,7 @@ pub fn summarize_rtcp(data: &[u8]) -> Option<RtcpSummary> {
                 referenced_ssrcs.push(media_ssrc);
             }
             // FIR commonly leaves the media-source field zero and names targets in 8-byte FCI rows.
-            if packet_type == RTCP_PT_PSFB && raw_count == 4 {
+            if packet_type == RTCP_PT_PSFB && fmt == 4 {
                 for fci in packet[12..].chunks_exact(8) {
                     referenced_ssrcs.push(u32::from_be_bytes(fci[..4].try_into().ok()?));
                 }
@@ -878,6 +884,20 @@ mod tests {
             }]
         );
         assert!(summary.sdes_cname_lengths.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_feedback_profile_bit_is_not_part_of_fmt() {
+        let sender = 0x1111_2222u32;
+        let video = 0x5555_6666u32;
+        let mut pli = vec![0x91, RTCP_PT_PSFB, 0, 2];
+        pli.extend_from_slice(&sender.to_be_bytes());
+        pli.extend_from_slice(&video.to_be_bytes());
+
+        let summary = summarize_rtcp(&pli).expect("WhatsApp-profile PLI");
+        assert!(summary.uses_whatsapp_profile_extension);
+        assert_eq!(summary.feedback[0].fmt, 1);
+        assert_eq!(summary.referenced_ssrcs, [video]);
     }
 
     #[test]

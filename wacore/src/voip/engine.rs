@@ -20,11 +20,10 @@ use super::demux::{RelayPacketKind, classify_relay_packet};
 use super::h264::{VideoFrame, au_is_keyframe};
 use super::rtcp::{
     RtcpFeedback, RtcpReportBlock, RtpReceptionStats, build_whatsapp_rtcp_cname,
-    parse_rtcp_sender_ssrc, parse_sender_report_timing, rtcp_payload_type, summarize_rtcp,
+    parse_sender_report_timing, summarize_rtcp,
 };
 use super::rtp::{
     RTP_PAYLOAD_TYPE_H264, VIDEO_CLOCK_RATE, VIDEO_TS_STRIDE_15FPS, parse_rtp_header,
-    rtp_extension_profile_and_data, rtp_header_byte_length,
 };
 use super::session::{
     CallDirection, MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
@@ -335,18 +334,6 @@ pub enum Output {
     Timeout(Millis),
 }
 
-/// Lifecycle / diagnostic events the shell may act on or surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RtcpProtection {
-    Transport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RtcpRejectStage {
-    Authentication,
-    Parsing,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CallEvent {
@@ -375,51 +362,8 @@ pub enum CallEvent {
         referenced_ssrcs: Vec<u32>,
         reports_audio: bool,
         reports_video: bool,
-        protection: RtcpProtection,
-        srtcp_index: Option<u32>,
-        encrypted: bool,
-        plain_len: usize,
-        sdes_cname_lengths: Vec<usize>,
         report_blocks: Vec<RtcpReportBlock>,
         feedback: Vec<RtcpFeedback>,
-        uses_whatsapp_profile_extension: bool,
-    },
-    /// An RTCP-shaped datagram failed SRTCP authentication or plaintext parsing.
-    RtcpRejected {
-        stage: RtcpRejectStage,
-        packet_type: u8,
-        sender_ssrc: u32,
-        packet_len: usize,
-        first_rtcp_len: usize,
-        plain_len: Option<usize>,
-        /// Standard SRTCP index inferred from the word before the 10-byte auth tag.
-        candidate_srtcp_index: Option<u32>,
-        candidate_encrypted: bool,
-        first_header_byte: u8,
-        /// First authenticated sample for this sender/layout, capped at 256 bytes.
-        plain_sample: Option<Vec<u8>>,
-    },
-    /// First authenticated inbound video packet's RTP extension layout.
-    VideoRtpLayoutObserved {
-        ssrc: u32,
-        sequence_number: u16,
-        timestamp: u32,
-        marker: bool,
-        header_len: usize,
-        packet_len: usize,
-        extension_profile: Option<u16>,
-        extension_data: Vec<u8>,
-    },
-    /// First outbound video packet's RTP extension layout, before relay transmission.
-    VideoRtpLayoutSent {
-        ssrc: u32,
-        sequence_number: u16,
-        timestamp: u32,
-        marker: bool,
-        header_len: usize,
-        packet_len: usize,
-        extension_profile: Option<u16>,
-        extension_data: Vec<u8>,
     },
     /// Relay-send backpressure discarded complete media units before transmission.
     OutboundMediaDropped {
@@ -445,10 +389,10 @@ struct MediaState {
     /// that rekey must key its recv path from this, not the stale config LID.
     recv_peer_lid: String,
     warp_mi_tag_len: usize,
+    video_ts_stride: u32,
     /// The video plane, present while video is enabled (from the start or via upgrade).
     video: Option<VideoPlaneState>,
     audio_rtcp_announced: bool,
-    rtcp_parse_samples: Vec<(u32, usize, u8)>,
     sframe: Option<SframeSession>,
     encoder: mlow::MlowEncoder,
     decoder: mlow::MlowDecoder,
@@ -476,8 +420,6 @@ struct VideoPlaneState {
     pipe: VideoPipeline,
     reception: RtpReceptionStats,
     active: bool,
-    peer_layout_reported: bool,
-    local_layout_reported: bool,
     /// When set, inbound video still decodes but OUTBOUND AUs are dropped: the initiator of an
     /// upgrade holds its camera off the wire until the peer accepts (a `<video>` request the peer
     /// ignores must not leak our video). Cleared on the peer's UpgradeAccept/Enabled.
@@ -492,6 +434,7 @@ fn make_video_plane(
     self_lid: &str,
     recv_peer_lid: &str,
     warp_mi_tag_len: usize,
+    ts_stride: u32,
     rtcp_cname: [u8; super::rtcp::WHATSAPP_RTCP_CNAME_LEN],
 ) -> Option<VideoPlaneState> {
     let video_ssrc = ssrc::derive_video_participant_ssrc(
@@ -504,7 +447,7 @@ fn make_video_plane(
             self_lid,
             peer_lid: recv_peer_lid,
             ssrc: video_ssrc,
-            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            ts_stride,
             warp_mi_tag_len,
         },
         rtcp_cname,
@@ -513,8 +456,6 @@ fn make_video_plane(
         pipe,
         reception: RtpReceptionStats::default(),
         active: true,
-        peer_layout_reported: false,
-        local_layout_reported: false,
         send_gated: false,
     })
 }
@@ -602,6 +543,7 @@ impl CallEngine {
                         &config.self_lid,
                         &config.peer_lid,
                         config.warp_mi_tag_len,
+                        VIDEO_TS_STRIDE_15FPS,
                         video_rtcp_cname,
                     )
                     .ok_or(EngineError::BadCallKey)?,
@@ -616,9 +558,9 @@ impl CallEngine {
                 self_lid: config.self_lid.clone(),
                 recv_peer_lid: config.peer_lid.clone(),
                 warp_mi_tag_len: config.warp_mi_tag_len,
+                video_ts_stride: VIDEO_TS_STRIDE_15FPS,
                 video,
                 audio_rtcp_announced: false,
-                rtcp_parse_samples: Vec::new(),
                 sframe,
                 encoder: mlow::MlowEncoder::new(),
                 decoder: mlow::MlowDecoder::new(),
@@ -702,6 +644,22 @@ impl CallEngine {
             .is_some_and(|v| v.active)
     }
 
+    /// Set the nominal RTP cadence for subsequent video access units. The source must pace access
+    /// units at the same rate; changing this never resets the SRTP or RTP sequence state.
+    pub fn set_video_timestamp_stride(&mut self, ts_stride: u32) -> bool {
+        if ts_stride == 0 {
+            return false;
+        }
+        let Some(media) = self.media.as_mut() else {
+            return false;
+        };
+        media.video_ts_stride = ts_stride;
+        if let Some(video) = media.video.as_mut() {
+            video.pipe.set_timestamp_stride(ts_stride);
+        }
+        true
+    }
+
     /// Bring the video plane up (from-start call, or an accepted upgrade) with OUTBOUND allowed.
     /// Idempotent; also ungates a previously send-gated plane. See [`enable_video_gated`].
     pub fn enable_video(&mut self) -> bool {
@@ -734,6 +692,7 @@ impl CallEngine {
             &m.self_lid,
             &m.recv_peer_lid,
             m.warp_mi_tag_len,
+            m.video_ts_stride,
             rtcp_cname,
         ) {
             Some(mut v) => {
@@ -920,30 +879,6 @@ impl CallEngine {
     }
 
     fn on_rtcp(&mut self, now: Millis, pkt: &[u8]) {
-        let (Some(packet_type), Some(sender_ssrc)) =
-            (rtcp_payload_type(pkt), parse_rtcp_sender_ssrc(pkt))
-        else {
-            return;
-        };
-        let trailer_word = pkt
-            .len()
-            .checked_sub(14)
-            .and_then(|offset| pkt.get(offset..offset + 4));
-        let candidate_srtcp_index = trailer_word
-            .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]) & 0x7fff_ffff);
-        let candidate_encrypted = trailer_word.is_some_and(|word| word[0] & 0x80 != 0);
-        let rejected = |stage, plain_len, plain_sample| CallEvent::RtcpRejected {
-            stage,
-            packet_type,
-            sender_ssrc,
-            packet_len: pkt.len(),
-            first_rtcp_len: u16::from_be_bytes([pkt[2], pkt[3]]) as usize * 4 + 4,
-            plain_len,
-            candidate_srtcp_index,
-            candidate_encrypted,
-            first_header_byte: pkt[0],
-            plain_sample,
-        };
         let event = {
             let Some(m) = self.media.as_mut() else {
                 return;
@@ -951,61 +886,28 @@ impl CallEngine {
             let audio_ssrc = m.pipe.send_ssrc();
             let video_ssrc = m.video.as_ref().map(|v| v.pipe.send_ssrc());
             let Some(plain) = m.pipe.unprotect_rtcp(pkt) else {
-                self.outbox.push_back(Output::Event(rejected(
-                    RtcpRejectStage::Authentication,
-                    None,
-                    None,
-                )));
                 return;
             };
-            let plain_len = plain.len();
-            match summarize_rtcp(&plain) {
-                Some(summary) => {
-                    if let Some((sender, ntp_seconds, ntp_fraction)) =
-                        parse_sender_report_timing(&plain)
-                    {
-                        m.audio_reception.observe_sender_report(
-                            sender,
-                            ntp_seconds,
-                            ntp_fraction,
-                            now,
-                        );
-                        if let Some(v) = m.video.as_mut() {
-                            v.reception.observe_sender_report(
-                                sender,
-                                ntp_seconds,
-                                ntp_fraction,
-                                now,
-                            );
-                        }
-                    }
-                    CallEvent::RtcpReceived {
-                        reports_audio: summary.referenced_ssrcs.contains(&audio_ssrc),
-                        reports_video: video_ssrc
-                            .is_some_and(|ssrc| summary.referenced_ssrcs.contains(&ssrc)),
-                        packet_types: summary.packet_types,
-                        sender_ssrc: summary.sender_ssrc,
-                        referenced_ssrcs: summary.referenced_ssrcs,
-                        protection: RtcpProtection::Transport,
-                        srtcp_index: candidate_srtcp_index,
-                        encrypted: candidate_encrypted,
-                        plain_len,
-                        sdes_cname_lengths: summary.sdes_cname_lengths,
-                        report_blocks: summary.report_blocks,
-                        feedback: summary.feedback,
-                        uses_whatsapp_profile_extension: summary.uses_whatsapp_profile_extension,
-                    }
+            let Some(summary) = summarize_rtcp(&plain) else {
+                return;
+            };
+            if let Some((sender, ntp_seconds, ntp_fraction)) = parse_sender_report_timing(&plain) {
+                m.audio_reception
+                    .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
+                if let Some(v) = m.video.as_mut() {
+                    v.reception
+                        .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
                 }
-                None => {
-                    let layout = (sender_ssrc, plain_len, plain[0]);
-                    let plain_sample = if m.rtcp_parse_samples.contains(&layout) {
-                        None
-                    } else {
-                        m.rtcp_parse_samples.push(layout);
-                        Some(plain.into_iter().take(256).collect())
-                    };
-                    rejected(RtcpRejectStage::Parsing, Some(plain_len), plain_sample)
-                }
+            }
+            CallEvent::RtcpReceived {
+                reports_audio: summary.referenced_ssrcs.contains(&audio_ssrc),
+                reports_video: video_ssrc
+                    .is_some_and(|ssrc| summary.referenced_ssrcs.contains(&ssrc)),
+                packet_types: summary.packet_types,
+                sender_ssrc: summary.sender_ssrc,
+                referenced_ssrcs: summary.referenced_ssrcs,
+                report_blocks: summary.report_blocks,
+                feedback: summary.feedback,
             }
         };
         self.outbox.push_back(Output::Event(event));
@@ -1079,23 +981,6 @@ impl CallEngine {
                     now,
                     VIDEO_CLOCK_RATE,
                 );
-                if !v.peer_layout_reported
-                    && let Some((extension_profile, extension_data)) =
-                        rtp_extension_profile_and_data(pkt)
-                {
-                    v.peer_layout_reported = true;
-                    self.outbox
-                        .push_back(Output::Event(CallEvent::VideoRtpLayoutObserved {
-                            ssrc: header.ssrc,
-                            sequence_number: header.sequence_number,
-                            timestamp: header.timestamp,
-                            marker: header.marker,
-                            header_len: rtp_header_byte_length(pkt).unwrap_or_default(),
-                            packet_len: pkt.len(),
-                            extension_profile,
-                            extension_data: extension_data.to_vec(),
-                        }));
-                }
                 if let Some(au) = au {
                     let keyframe = au_is_keyframe(&au);
                     self.outbox.push_back(Output::VideoPlayout(VideoFrame {
@@ -1185,30 +1070,7 @@ impl CallEngine {
         else {
             return;
         };
-        let packets = v.pipe.protect_video(au);
-        let report_layout = !v.local_layout_reported && !packets.is_empty();
-        if report_layout {
-            v.local_layout_reported = true;
-        }
-        for (index, packet) in packets.into_iter().enumerate() {
-            if report_layout
-                && index == 0
-                && let Some(header) = parse_rtp_header(&packet)
-                && let Some((extension_profile, extension_data)) =
-                    rtp_extension_profile_and_data(&packet)
-            {
-                self.outbox
-                    .push_back(Output::Event(CallEvent::VideoRtpLayoutSent {
-                        ssrc: header.ssrc,
-                        sequence_number: header.sequence_number,
-                        timestamp: header.timestamp,
-                        marker: header.marker,
-                        header_len: rtp_header_byte_length(&packet).unwrap_or_default(),
-                        packet_len: packet.len(),
-                        extension_profile,
-                        extension_data: extension_data.to_vec(),
-                    }));
-            }
+        for packet in v.pipe.protect_video(au) {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
         }
     }
@@ -1275,6 +1137,7 @@ mod tests {
     use super::*;
     use crate::voip::e2e_srtp::SRTCP_AUTH_TAG_LEN;
     use crate::voip::mlow::MlowEncoder;
+    use crate::voip::rtcp::parse_rtcp_sender_ssrc;
     use crate::voip::warp::WARP_MI_TAG_LEN;
 
     const SELF_LID: &str = "111111111111111:0@lid";
@@ -2246,7 +2109,6 @@ mod tests {
                 feedback,
                 reports_audio: true,
                 reports_video: true,
-                protection: RtcpProtection::Transport,
                 ..
             }) if packet_types == &[RTCP_PT_RR, crate::voip::rtcp::RTCP_PT_PSFB]
                 && *sender_ssrc == peer_ssrc
@@ -2262,21 +2124,16 @@ mod tests {
         *forged.last_mut().unwrap() ^= 1;
         eng.handle_input(2, Input::RelayPacket(&forged));
         let (outs, _) = drain(&mut eng);
-        assert!(outs.iter().any(|output| matches!(
-            output,
-            Output::Event(CallEvent::RtcpRejected {
-                stage: RtcpRejectStage::Authentication,
-                packet_type: RTCP_PT_RR,
-                sender_ssrc,
-                candidate_srtcp_index: Some(0),
-                candidate_encrypted: true,
-                ..
-            }) if *sender_ssrc == peer_ssrc
-        )));
+        assert!(
+            !outs
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RtcpReceived { .. }))),
+            "forged SRTCP must be dropped"
+        );
     }
 
     #[test]
-    fn authenticated_malformed_rtcp_is_reported_as_a_parse_rejection() {
+    fn authenticated_malformed_rtcp_is_dropped() {
         use crate::voip::e2e_srtp::{derive_srtcp_keys, protect_srtcp};
         use crate::voip::rtcp::RTCP_PT_SDES;
 
@@ -2298,23 +2155,12 @@ mod tests {
         let _ = drain(&mut eng);
         eng.handle_input(1, Input::RelayPacket(&protected));
         let (outs, _) = drain(&mut eng);
-        assert!(outs.iter().any(|output| matches!(
-            output,
-            Output::Event(CallEvent::RtcpRejected {
-                stage: RtcpRejectStage::Parsing,
-                packet_type: RTCP_PT_SDES,
-                sender_ssrc,
-                packet_len,
-                first_rtcp_len: 12,
-                plain_len: Some(12),
-                candidate_srtcp_index: Some(3),
-                candidate_encrypted: true,
-                first_header_byte: 0x81,
-                plain_sample: Some(sample),
-            }) if *sender_ssrc == peer_ssrc
-                && *packet_len == protected.len()
-                && sample == &malformed
-        )));
+        assert!(
+            !outs
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RtcpReceived { .. }))),
+            "malformed RTCP must not surface as authenticated feedback"
+        );
     }
 
     #[test]
@@ -2613,17 +2459,6 @@ mod tests {
         let (outputs, _) = drain(&mut eng);
         let first = seq_of(&outputs);
         assert_eq!(first, vec![0]);
-        assert!(outputs.iter().any(|output| matches!(
-            output,
-            Output::Event(CallEvent::VideoRtpLayoutSent {
-                sequence_number: 0,
-                marker: true,
-                header_len: 28,
-                extension_profile: Some(0xdebe),
-                extension_data,
-                ..
-            }) if extension_data == &[0x30, 0x09, 0x51, 0, 0, 0x61, 0, 0, 0x91, 0, 0, 0]
-        )));
 
         // Downgrade then re-upgrade: the plane is preserved, so the next packet's seq CONTINUES.
         eng.disable_video();
@@ -2720,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_video_reports_authenticated_rtp_layout_once() {
+    fn inbound_video_rejects_forged_warp_tag() {
         let mut eng = engine(true);
         assert!(eng.enable_video());
         eng.start(0, 0);
@@ -2731,71 +2566,25 @@ mod tests {
             .protect_video(&video_au(100))
             .pop()
             .expect("single-packet video AU");
-        let expected = parse_rtp_header(&packet).expect("valid peer RTP");
 
         let mut forged = packet.clone();
         *forged.last_mut().expect("WARP tag") ^= 1;
         eng.handle_input(1, Input::RelayPacket(&forged));
         assert!(
-            !drain(&mut eng).0.iter().any(|output| matches!(
-                output,
-                Output::Event(CallEvent::VideoRtpLayoutObserved { .. })
-            )),
-            "unauthenticated RTP must not surface diagnostic bytes"
+            !drain(&mut eng)
+                .0
+                .iter()
+                .any(|output| matches!(output, Output::VideoPlayout(_))),
+            "unauthenticated RTP must not reach playout"
         );
 
         eng.handle_input(2, Input::RelayPacket(&packet));
-        let (outputs, _) = drain(&mut eng);
-        let layouts: Vec<_> = outputs
-            .iter()
-            .filter_map(|output| match output {
-                Output::Event(CallEvent::VideoRtpLayoutObserved {
-                    ssrc,
-                    sequence_number,
-                    timestamp,
-                    marker,
-                    header_len,
-                    packet_len,
-                    extension_profile,
-                    extension_data,
-                }) => Some((
-                    *ssrc,
-                    *sequence_number,
-                    *timestamp,
-                    *marker,
-                    *header_len,
-                    *packet_len,
-                    *extension_profile,
-                    extension_data.as_slice(),
-                )),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            layouts,
-            vec![(
-                expected.ssrc,
-                expected.sequence_number,
-                expected.timestamp,
-                expected.marker,
-                28,
-                packet.len(),
-                Some(0xdebe),
-                &[0x30, 0x09, 0x51, 0, 0, 0x61, 0, 0, 0x91, 0, 0, 0][..],
-            )]
-        );
-
-        let next = peer
-            .protect_video(&video_au(100))
-            .pop()
-            .expect("second single-packet video AU");
-        eng.handle_input(3, Input::RelayPacket(&next));
         assert!(
-            !drain(&mut eng).0.iter().any(|output| matches!(
-                output,
-                Output::Event(CallEvent::VideoRtpLayoutObserved { .. })
-            )),
-            "the stable RTP layout only needs one event"
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|output| matches!(output, Output::VideoPlayout(_))),
+            "authenticated RTP must reach playout"
         );
     }
 
