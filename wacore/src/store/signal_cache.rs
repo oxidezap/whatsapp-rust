@@ -117,8 +117,8 @@ struct SessionStoreState {
     /// yet. While any address is here, an outbound ciphertext may be relying
     /// on a lease that only exists in memory, so the send path must flush
     /// before the wire. Entries leave only when a flush actually persists
-    /// them (or the session is deleted/cleared). Always a subset of `dirty`,
-    /// so eviction can never drop a pending entry.
+    /// them or their tombstone. Always a subset of `dirty` + `deleted`, so
+    /// eviction can never drop a pending entry.
     reservation_pending: HashSet<Arc<str>>,
 }
 
@@ -161,7 +161,6 @@ impl SessionStoreState {
         self.cache.insert(addr.clone(), SessionEntry::Absent);
         self.deleted.insert(addr.clone());
         self.dirty.remove(&addr);
-        self.reservation_pending.remove(&addr);
     }
 
     fn clear(&mut self) {
@@ -248,7 +247,6 @@ impl SenderKeyStoreState {
         let addr = self.key_for(address);
         self.cache.insert(addr.clone(), None);
         self.dirty.insert(addr.clone());
-        self.wire_gate_pending.remove(&addr);
     }
 
     fn clear(&mut self) {
@@ -752,6 +750,7 @@ impl SignalStoreCache {
             }
             for address in &deleted_keys {
                 backend.delete_session(address).await?;
+                state.reservation_pending.remove(address);
             }
 
             for key in &dirty_keys {
@@ -864,6 +863,7 @@ impl SignalStoreCache {
                     }
                     Some(None) => {
                         backend.delete_sender_key(name).await?;
+                        state.wire_gate_pending.remove(name);
                     }
                     None => {}
                 }
@@ -2333,8 +2333,11 @@ mod lease_reload_tests {
 #[cfg(test)]
 mod pre_wire_gate_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use crate::libsignal::store::sender_key_name::SenderKeyName;
     use crate::store::in_memory::InMemoryBackend;
+    use async_lock::Barrier;
 
     fn addr(user: &str) -> ProtocolAddress {
         ProtocolAddress::new(user.to_string(), 1.into())
@@ -2344,6 +2347,172 @@ mod pre_wire_gate_tests {
         let mut record = SessionRecord::new_fresh();
         record.reserve_sender_chain_counters(0);
         record
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DeleteTarget {
+        Session,
+        SenderKey,
+    }
+
+    struct DeleteBarrierBackend {
+        inner: InMemoryBackend,
+        target: DeleteTarget,
+        entered: Barrier,
+        release: Barrier,
+        fail_delete: AtomicBool,
+    }
+
+    impl DeleteBarrierBackend {
+        fn new(target: DeleteTarget) -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+                target,
+                entered: Barrier::new(2),
+                release: Barrier::new(2),
+                fail_delete: AtomicBool::new(true),
+            }
+        }
+
+        async fn gate_delete(&self, target: DeleteTarget) -> crate::store::error::Result<()> {
+            if self.target != target {
+                return Ok(());
+            }
+            self.entered.wait().await;
+            self.release.wait().await;
+            if self.fail_delete.load(Ordering::Acquire) {
+                return Err(crate::store::error::StoreError::Validation(
+                    "simulated delete failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl SignalStore for DeleteBarrierBackend {
+        async fn put_identity(
+            &self,
+            address: &str,
+            key: [u8; 32],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_identity(address, key).await
+        }
+
+        async fn load_identity(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<[u8; 32]>> {
+            self.inner.load_identity(address).await
+        }
+
+        async fn delete_identity(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_identity(address).await
+        }
+
+        async fn get_session(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.inner.get_session(address).await
+        }
+
+        async fn put_session(
+            &self,
+            address: &str,
+            session: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_session(address, session).await
+        }
+
+        async fn delete_session(&self, address: &str) -> crate::store::error::Result<()> {
+            self.gate_delete(DeleteTarget::Session).await?;
+            self.inner.delete_session(address).await
+        }
+
+        async fn store_prekey(
+            &self,
+            id: u32,
+            record: &[u8],
+            uploaded: bool,
+        ) -> crate::store::error::Result<()> {
+            self.inner.store_prekey(id, record, uploaded).await
+        }
+
+        async fn load_prekey(&self, id: u32) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.inner.load_prekey(id).await
+        }
+
+        async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+            self.inner.mark_prekeys_uploaded(ids).await
+        }
+
+        async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+            self.inner.remove_prekey(id).await
+        }
+
+        async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
+            self.inner.get_max_prekey_id().await
+        }
+
+        async fn store_signed_prekey(
+            &self,
+            id: u32,
+            record: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.store_signed_prekey(id, record).await
+        }
+
+        async fn load_signed_prekey(
+            &self,
+            id: u32,
+        ) -> crate::store::error::Result<Option<Vec<u8>>> {
+            self.inner.load_signed_prekey(id).await
+        }
+
+        async fn load_all_signed_prekeys(
+            &self,
+        ) -> crate::store::error::Result<Vec<(u32, Vec<u8>)>> {
+            self.inner.load_all_signed_prekeys().await
+        }
+
+        async fn remove_signed_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+            self.inner.remove_signed_prekey(id).await
+        }
+
+        async fn put_sender_key(
+            &self,
+            address: &str,
+            record: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_sender_key(address, record).await
+        }
+
+        async fn get_sender_key(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<Vec<u8>>> {
+            self.inner.get_sender_key(address).await
+        }
+
+        async fn delete_sender_key(&self, address: &str) -> crate::store::error::Result<()> {
+            self.gate_delete(DeleteTarget::SenderKey).await?;
+            self.inner.delete_sender_key(address).await
+        }
+    }
+
+    async fn run_gated_flush(
+        cache: Arc<SignalStoreCache>,
+        backend: Arc<DeleteBarrierBackend>,
+    ) -> Result<()> {
+        let flush_cache = cache.clone();
+        let flush_backend = backend.clone();
+        let task = tokio::spawn(async move { flush_cache.flush(flush_backend.as_ref()).await });
+
+        backend.entered.wait().await;
+        backend.release.wait().await;
+        task.await.expect("flush task")
     }
 
     /// A raised lease gates the wire until a flush actually persists it; a
@@ -2468,6 +2637,98 @@ mod pre_wire_gate_tests {
         assert!(!cache.needs_pre_wire_flush().await);
     }
 
+    #[tokio::test]
+    async fn session_tombstone_keeps_gate_until_delete_is_durable() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(DeleteBarrierBackend::new(DeleteTarget::Session));
+        let address = addr("15550000007");
+
+        backend
+            .inner
+            .put_session(address.as_str(), b"durable session")
+            .await
+            .unwrap();
+        cache.put_session(&address, leased_record()).await;
+        cache.delete_session(&address).await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        assert!(
+            run_gated_flush(cache.clone(), backend.clone())
+                .await
+                .is_err()
+        );
+        assert!(cache.needs_pre_wire_flush().await);
+        assert!(
+            backend
+                .inner
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        backend.fail_delete.store(false, Ordering::Release);
+        run_gated_flush(cache.clone(), backend.clone())
+            .await
+            .unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(
+            backend
+                .inner
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_key_tombstone_keeps_gate_until_delete_is_durable() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(DeleteBarrierBackend::new(DeleteTarget::SenderKey));
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        backend
+            .inner
+            .put_sender_key(name.cache_key(), b"durable sender key")
+            .await
+            .unwrap();
+        let mut outbound = SenderKeyRecord::new_empty();
+        outbound.mark_wire_gated();
+        cache.put_sender_key(&name, outbound).await;
+        cache.delete_sender_key(name.cache_key()).await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        assert!(
+            run_gated_flush(cache.clone(), backend.clone())
+                .await
+                .is_err()
+        );
+        assert!(cache.needs_pre_wire_flush().await);
+        assert!(
+            backend
+                .inner
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        backend.fail_delete.store(false, Ordering::Release);
+        run_gated_flush(cache.clone(), backend.clone())
+            .await
+            .unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(
+            backend
+                .inner
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Cleanup racing a post-flush write must not release its durability gate.
     #[tokio::test]
     async fn clear_after_flush_retains_every_post_flush_write_and_wire_gate() {
@@ -2538,18 +2799,16 @@ mod pre_wire_gate_tests {
         assert!(backend.load_prekey(PREKEY_ID).await.unwrap().is_none());
     }
 
-    /// Deleting or clearing drops the pending gate together with the state it
-    /// guarded (the reloaded snapshot re-reserves on its first send).
+    /// A lossy clear can drop the gate because the transport is already gone.
     #[tokio::test]
-    async fn delete_and_clear_drop_the_pending_gate() {
+    async fn clear_drops_a_pending_tombstone_gate() {
         let cache = SignalStoreCache::new();
         let a = addr("15550000006");
 
         cache.put_session(&a, leased_record()).await;
         cache.delete_session(&a).await;
-        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(cache.needs_pre_wire_flush().await);
 
-        cache.put_session(&a, leased_record()).await;
         cache.clear().await;
         assert!(!cache.needs_pre_wire_flush().await);
     }
