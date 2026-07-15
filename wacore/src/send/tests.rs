@@ -2871,12 +2871,9 @@ mod mark_full_distribution_list {
         }
     }
 
-    /// Regression guard (Codex P1 on #1027): the production group encrypt path
-    /// must delegate to the leasing primitive. A prior copy advanced and stored
-    /// the sender chain without reserving, so a warm group send reached the wire
-    /// before its advance was durable (a reload would re-derive the same
-    /// iteration; nonce reuse toward every group member). The first send must
-    /// reserve a batch.
+    /// An ungated sender-chain advance puts group ciphertext on the wire before
+    /// the advance is durable, so a reload re-derives the same iteration: one
+    /// (key, IV) reused toward every member.
     #[tokio::test]
     async fn encrypt_group_message_leases_the_sender_chain() {
         use crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
@@ -2909,12 +2906,9 @@ mod mark_full_distribution_list {
         );
     }
 
-    /// Regression guard (CodeRabbit/Codex review on #1027): the delegation must
-    /// keep the concrete SignalProtocolError as the error source, not
-    /// string-format it. The warm-send recovery in `src/send/mod.rs` downcasts
-    /// NoSenderKeyState to clear stale device tracking and retry with SKDM
-    /// redistribution; erasing the type (e.g. `anyhow!("{e:?}")`) breaks the
-    /// self-heal. `.context` preserves the source, so the downcast still fires.
+    /// The warm-send recovery downcasts NoSenderKeyState to clear stale device
+    /// tracking and retry with SKDM redistribution, so erasing the concrete
+    /// error type here would silently cost the self-heal.
     #[tokio::test]
     async fn encrypt_group_message_preserves_no_sender_key_state() {
         use crate::libsignal::protocol::SignalProtocolError;
