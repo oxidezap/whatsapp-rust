@@ -508,6 +508,10 @@ impl SenderKeyRecord {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
     /// Iterations strictly below this ceiling are covered by a durable
     /// reservation and their sends need no synchronous flush.
     pub fn reserved_iteration(&self) -> u32 {
