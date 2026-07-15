@@ -586,7 +586,7 @@ impl<'a> Groups<'a> {
                 self.client.invalidate_persisted_group_metadata(jid).await;
             }
             self.client
-                .rotate_sender_key_on_participant_remove(&jid.to_string(), &accepted)
+                .rotate_sender_key_on_participant_remove(jid, &accepted)
                 .await;
         }
         Ok(result)

@@ -22,6 +22,10 @@ pub struct PersistenceManager {
     save_notify: Arc<Event>,
     /// Set to true when the background saver halts due to repeated flush failures.
     saver_halted: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_sender_key_device_clears: AtomicBool,
+    #[cfg(test)]
+    fail_sender_key_device_status_writes: AtomicBool,
 }
 
 impl PersistenceManager {
@@ -63,6 +67,10 @@ impl PersistenceManager {
             dirty: Arc::new(AtomicBool::new(false)),
             save_notify: Arc::new(Event::new()),
             saver_halted: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_sender_key_device_clears: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_sender_key_device_status_writes: AtomicBool::new(false),
         })
     }
 
@@ -274,11 +282,38 @@ impl PersistenceManager {
         group_jid: &str,
         entries: &[(&str, bool)],
     ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_sender_key_device_status_writes
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected sender-key tracker status-write failure",
+            )));
+        }
         self.backend.set_sender_key_status(group_jid, entries).await
     }
 
     pub async fn clear_sender_key_devices(&self, group_jid: &str) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self.fail_sender_key_device_clears.load(Ordering::Acquire) {
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected sender-key tracker clear failure",
+            )));
+        }
         self.backend.clear_sender_key_devices(group_jid).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_sender_key_device_clears_for_tests(&self, fail: bool) {
+        self.fail_sender_key_device_clears
+            .store(fail, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_sender_key_device_status_writes_for_tests(&self, fail: bool) {
+        self.fail_sender_key_device_status_writes
+            .store(fail, Ordering::Release);
     }
 
     pub async fn delete_sender_key_device_rows(

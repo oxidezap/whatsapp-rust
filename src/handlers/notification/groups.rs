@@ -195,10 +195,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                         .await;
                 }
                 client
-                    .rotate_sender_key_on_participant_remove(
-                        &notification.group_jid.to_string(),
-                        &users,
-                    )
+                    .rotate_sender_key_on_participant_remove(&notification.group_jid, &users)
                     .await;
             }
             GroupNotificationAction::Modify { .. } => {
@@ -229,7 +226,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                     .invalidate(&notification.group_jid)
                     .await;
                 client
-                    .force_rotate_own_sender_key(&notification.group_jid.to_string())
+                    .force_rotate_own_sender_key(&notification.group_jid)
                     .await;
             }
             _ => {}

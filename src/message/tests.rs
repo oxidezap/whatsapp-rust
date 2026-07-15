@@ -3,7 +3,7 @@
 use super::*;
 use crate::store::SqliteStore;
 use crate::store::persistence_manager::PersistenceManager;
-use crate::test_utils::MockHttpClient;
+use crate::test_utils::{MockHttpClient, wait_for_lock_waiter};
 use crate::types::message::EditAttribute;
 use std::sync::Arc;
 use wacore_binary::builder::NodeBuilder;
@@ -6682,6 +6682,144 @@ async fn group_skmsg_decrypts_under_sender_key_lock() {
         texts,
         vec!["hello group".to_string()],
         "group skmsg content must surface after decrypt under the chain lock"
+    );
+}
+
+#[tokio::test]
+async fn skdm_processing_waits_for_sender_key_lock() {
+    let client = crate::test_utils::create_test_client_with_name("skdm_chain_lock").await;
+    let mut alice = AlicePeer::new("146824178450542@lid").await;
+    let group: Jid = "120363408782575462@g.us".parse().expect("group");
+    let skdm = alice.create_group_skdm(&group).await;
+    let bytes = skdm
+        .axolotl_sender_key_distribution_message
+        .expect("SKDM bytes");
+    let sender = alice.jid.clone();
+    let sender_key_name = make_sender_key_name(&group, &sender.to_non_ad().to_protocol_address());
+
+    let lock = client.signal_cache.sender_key_lock(&sender_key_name).await;
+    let held = lock.lock().await;
+    let lock_refs = Arc::strong_count(&lock);
+    let started = Arc::new(tokio::sync::Barrier::new(2));
+    let task = tokio::spawn({
+        let client = client.clone();
+        let group = group.clone();
+        let sender = sender.clone();
+        let started = started.clone();
+        async move {
+            started.wait().await;
+            client
+                .handle_sender_key_distribution_message(&group, &sender, &bytes)
+                .await;
+        }
+    });
+
+    started.wait().await;
+    wait_for_lock_waiter(&lock, lock_refs).await;
+    let snapshot = client.persistence_manager.get_device_snapshot();
+    assert!(
+        client
+            .signal_cache
+            .get_sender_key(&sender_key_name, &*snapshot.backend)
+            .await
+            .unwrap()
+            .is_none(),
+        "SKDM must not mutate a checked-out chain"
+    );
+
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("SKDM processing must resume")
+        .expect("SKDM task");
+    assert!(
+        client
+            .signal_cache
+            .get_sender_key(&sender_key_name, &*snapshot.backend)
+            .await
+            .unwrap()
+            .is_some(),
+        "SKDM must install after the chain is released"
+    );
+}
+
+#[tokio::test]
+async fn public_group_decrypt_waits_for_sender_key_lock() {
+    let client = crate::test_utils::create_test_client_with_name("public_group_decrypt_lock").await;
+    let mut alice = AlicePeer::new("146824178450543@lid").await;
+    let group: Jid = "120363408782575463@g.us".parse().expect("group");
+    let skdm = alice.create_group_skdm(&group).await;
+    let skdm_bytes = skdm
+        .axolotl_sender_key_distribution_message
+        .expect("SKDM bytes");
+    client
+        .handle_sender_key_distribution_message(&group, &alice.jid, &skdm_bytes)
+        .await;
+
+    let plaintext = b"serialized group decrypt".to_vec();
+    let ciphertext = alice.encrypt_group_message(&group, &plaintext).await;
+    let sender = alice.jid.clone();
+    let sender_key_name = make_sender_key_name(&group, &sender.to_non_ad().to_protocol_address());
+    let lock = client.signal_cache.sender_key_lock(&sender_key_name).await;
+    let held = lock.lock().await;
+    let lock_refs = Arc::strong_count(&lock);
+    let started = Arc::new(tokio::sync::Barrier::new(2));
+    let task = tokio::spawn({
+        let client = client.clone();
+        let group = group.clone();
+        let sender = sender.clone();
+        let started = started.clone();
+        async move {
+            started.wait().await;
+            client
+                .signal()
+                .decrypt_group_message(&group, &sender, &ciphertext)
+                .await
+        }
+    });
+
+    started.wait().await;
+    wait_for_lock_waiter(&lock, lock_refs).await;
+    let snapshot = client.persistence_manager.get_device_snapshot();
+    let before = client
+        .signal_cache
+        .get_sender_key(&sender_key_name, &*snapshot.backend)
+        .await
+        .unwrap()
+        .expect("installed sender key");
+    assert_eq!(
+        before
+            .sender_key_state()
+            .unwrap()
+            .sender_chain_key()
+            .unwrap()
+            .iteration(),
+        0,
+        "decrypt must not advance while another mutation owns the chain"
+    );
+
+    drop(held);
+    let decrypted = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("group decrypt must resume")
+        .expect("group decrypt task")
+        .expect("group decrypt");
+    assert_eq!(decrypted, plaintext);
+
+    let after = client
+        .signal_cache
+        .get_sender_key(&sender_key_name, &*snapshot.backend)
+        .await
+        .unwrap()
+        .expect("advanced sender key");
+    assert_eq!(
+        after
+            .sender_key_state()
+            .unwrap()
+            .sender_chain_key()
+            .unwrap()
+            .iteration(),
+        1
     );
 }
 

@@ -225,6 +225,11 @@ pub struct MemoryReport {
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     pub chat_lanes: u64,
+    pub group_distribution_locks: u64,
+    /// Cumulative capacity evictions; poll successive reports to derive a rate.
+    pub group_distribution_lock_evictions: u64,
+    /// Cumulative attempts that kept a live lane and temporarily exceeded capacity.
+    pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
@@ -295,6 +300,13 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
+        writeln!(
+            f,
+            "  group_dist_locks:       {} (evicted: {}, blocked: {})",
+            self.group_distribution_locks,
+            self.group_distribution_lock_evictions,
+            self.group_distribution_lock_eviction_blocks
+        )?;
         writeln!(
             f,
             "  resend_rl_chats:        {}",

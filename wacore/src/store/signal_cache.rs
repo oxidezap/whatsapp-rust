@@ -686,7 +686,10 @@ impl SignalStoreCache {
         lock
     }
 
+    /// Prevent an in-flight mutation from storing the retired chain again.
     pub async fn delete_sender_key(&self, cache_key: &str) {
+        let lock = self.shared_named_lock(cache_key).await;
+        let _guard = lock.lock().await;
         let mut state = self.sender_keys.lock().await;
         state.delete(cache_key);
     }
@@ -1018,6 +1021,16 @@ mod sender_key_lock_tests {
     use super::*;
     use crate::libsignal::store::sender_key_name::SenderKeyName;
 
+    async fn wait_for_lock_waiter(lock: &Arc<Mutex<()>>, baseline: usize) {
+        for _ in 0..10_000 {
+            if Arc::strong_count(lock) > baseline {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("task did not reach the contested lock");
+    }
+
     #[tokio::test]
     async fn same_name_shares_one_lock() {
         let cache = SignalStoreCache::new();
@@ -1045,6 +1058,52 @@ mod sender_key_lock_tests {
         );
         drop(guard);
         assert!(lock.try_lock().is_some(), "released lock must reacquire");
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_the_chain_lock() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+
+        let lock = cache.sender_key_lock(&name).await;
+        let held = lock.lock().await;
+        let lock_refs = Arc::strong_count(&lock);
+        let started = Arc::new(async_lock::Barrier::new(2));
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            let started = started.clone();
+            let cache_key = name.cache_key().to_string();
+            async move {
+                started.wait().await;
+                cache.delete_sender_key(&cache_key).await;
+            }
+        });
+
+        started.wait().await;
+        wait_for_lock_waiter(&lock, lock_refs).await;
+        assert!(
+            cache
+                .get_sender_key(&name, &backend)
+                .await
+                .unwrap()
+                .is_some(),
+            "delete must wait for the in-flight chain mutation"
+        );
+
+        drop(held);
+        task.await.expect("delete task");
+        assert!(
+            cache
+                .get_sender_key(&name, &backend)
+                .await
+                .unwrap()
+                .is_none(),
+            "delete must run after the mutation releases the chain"
+        );
     }
 
     #[tokio::test]

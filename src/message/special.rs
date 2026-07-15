@@ -217,6 +217,8 @@ impl Client {
         // Only the sender-key store is needed here, so build it standalone instead of
         // the full five-store adapter.
         let mut sender_key_store = self.sender_key_adapter().await;
+        let chain_lock = sender_key_store.sender_key_lock(&sender_key_name).await;
+        let _chain_guard = chain_lock.lock().await;
 
         if let Err(e) =
             process_sender_key_distribution_message(&sender_key_name, &skdm, &mut sender_key_store)

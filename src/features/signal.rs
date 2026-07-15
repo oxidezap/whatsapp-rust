@@ -4,8 +4,8 @@
 
 use thiserror::Error;
 use wacore::libsignal::protocol::{
-    CiphertextMessage, PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet,
-    message_decrypt, message_encrypt,
+    CiphertextMessage, PreKeySignalMessage, SenderKeyStore, SignalMessage, SignalProtocolError,
+    UsePQRatchet, message_decrypt, message_encrypt,
 };
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
@@ -224,8 +224,7 @@ impl<'a> Signal<'a> {
     /// Returns raw padded plaintext. Use [`MessageUtils::unpad_message_ref`]
     /// with the stanza's `v` attribute if WhatsApp message unpadding is needed.
     ///
-    /// Not safe to call concurrently with `encrypt_group_message` for the
-    /// same group — sender key state is not internally locked.
+    /// Concurrent mutations of the same sender-key chain are serialized.
     pub async fn decrypt_group_message(
         &self,
         group_jid: &Jid,
@@ -236,6 +235,11 @@ impl<'a> Signal<'a> {
             make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
 
         let mut adapter = self.client.signal_adapter().await;
+        let chain_lock = adapter
+            .sender_key_store
+            .sender_key_lock(&sender_key_name)
+            .await;
+        let _chain_guard = chain_lock.lock().await;
 
         let plaintext = wacore::libsignal::protocol::group_decrypt(
             ciphertext,
@@ -244,6 +248,7 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
+        drop(_chain_guard);
         self.client.flush_signal_cache_batch_safe().await?;
 
         Ok(plaintext.to_vec())
