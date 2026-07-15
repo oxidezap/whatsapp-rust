@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
 use crate::voip::driver::VideoControl;
@@ -51,9 +51,29 @@ struct CallEntry {
     /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
     /// same teardown without keeping codec resources alive through lingering handles.
     video_teardown: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Serializes the signaling event slot across an async typed-ack send.
+    event_slot_reserved: Arc<AtomicBool>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
+}
+
+/// Capacity reserved for one actionable signaling event while its typed ack is in flight.
+pub struct CallEventPermit {
+    tx: async_channel::Sender<CallEvent>,
+    reserved: Arc<AtomicBool>,
+}
+
+impl CallEventPermit {
+    pub fn send(self, event: CallEvent) -> bool {
+        self.tx.try_send(event).is_ok()
+    }
+}
+
+impl Drop for CallEventPermit {
+    fn drop(&mut self) {
+        self.reserved.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for CallEntry {
@@ -104,6 +124,7 @@ impl CallRegistry {
                     event_tx: None,
                     video_ctl_tx: None,
                     video_teardown: None,
+                    event_slot_reserved: Arc::new(AtomicBool::new(false)),
                     on_terminal: None,
                 },
             )
@@ -216,16 +237,26 @@ impl CallRegistry {
         }
     }
 
-    /// Surface signaling on the consumer's event queue. The result lets the handler withhold its
-    /// protocol acknowledgement instead of accepting a transition the application never received.
-    pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
-        let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .and_then(|e| e.event_tx.clone());
-        tx.is_some_and(|tx| tx.try_send(event).is_ok())
+    /// Reserve the queue's signaling slot before sending the typed ack. Engine diagnostics leave
+    /// this last slot unused, so the event can only become visible after the ack succeeds.
+    pub fn reserve_call_event(&self, call_id: &str) -> Option<CallEventPermit> {
+        let (tx, reserved) = {
+            let map = self.inner.lock().expect("registry lock poisoned");
+            let entry = map.get(call_id)?;
+            (entry.event_tx.clone()?, entry.event_slot_reserved.clone())
+        };
+        if tx.is_closed()
+            || reserved
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        if tx.is_full() {
+            reserved.store(false, Ordering::Release);
+            return None;
+        }
+        Some(CallEventPermit { tx, reserved })
     }
 
     /// Send a mid-call video-plane command to the drive loop (best-effort).
@@ -463,10 +494,10 @@ mod tests {
     }
 
     #[test]
-    fn signaling_event_reports_queue_backpressure() {
+    fn signaling_event_reserves_capacity_until_commit() {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("CID"));
-        let (event_tx, event_rx) = async_channel::bounded(1);
+        let (event_tx, event_rx) = async_channel::bounded(2);
         let (ctl_tx, _ctl_rx) = async_channel::unbounded();
         reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
 
@@ -474,16 +505,36 @@ mod tests {
             state: crate::types::call::VideoState::Enabled,
             orientation: None,
         };
-        assert!(reg.send_call_event("CID", event()));
+        let permit = reg.reserve_call_event("CID").expect("first reservation");
         assert!(
-            !reg.send_call_event("CID", event()),
-            "a full queue must be visible to the signaling handler"
+            reg.reserve_call_event("CID").is_none(),
+            "only one typed ack may own the signaling slot"
         );
+        assert!(
+            event_rx.is_empty(),
+            "reservation must not publish the event"
+        );
+        assert!(permit.send(event()));
         assert!(matches!(
             event_rx.try_recv(),
             Ok(CallEvent::VideoStateChanged { .. })
         ));
-        assert!(!reg.send_call_event("UNKNOWN", event()));
+        assert!(reg.reserve_call_event("CID").is_some());
+        assert!(reg.reserve_call_event("UNKNOWN").is_none());
+
+        let (full_tx, _full_rx) = async_channel::bounded(1);
+        full_tx.try_send(CallEvent::RelayAllocated).unwrap();
+        reg.set_video_channels(
+            "CID",
+            generation,
+            full_tx,
+            async_channel::unbounded().0,
+            Box::new(|| {}),
+        );
+        assert!(
+            reg.reserve_call_event("CID").is_none(),
+            "a pre-existing full queue cannot reserve the ack-ordered slot"
+        );
     }
 
     #[test]

@@ -167,8 +167,8 @@ impl StanzaHandler for CallHandler {
                     }
                     // In-call <video state> signaling: send the TYPED ack (`type="video"`) and
                     // suppress the router's generic one — an untyped ack makes the upgrade
-                    // requester assume failure and revert after ~5s. Then surface the state on the
-                    // call's event stream and steer the live video plane.
+                    // requester assume failure and revert after ~5s. Reserve event capacity first,
+                    // then publish the state only after that ack commits it.
                     #[cfg(feature = "voip")]
                     if let CallAction::VideoState {
                         state, orientation, ..
@@ -176,21 +176,15 @@ impl StanzaHandler for CallHandler {
                     {
                         let call_id = call.action.call_id();
                         let registry = client.call_registry();
-                        let event_delivered = registry.send_call_event(
-                            call_id,
-                            CallEvent::VideoStateChanged {
-                                state: *state,
-                                orientation: *orientation,
-                            },
-                        );
-                        if !event_delivered {
+                        let mut event_permit = registry.reserve_call_event(call_id);
+                        if event_permit.is_none() {
                             warn!(
                                 "call: video state event queue is unavailable; leaving the transition unacknowledged"
                             );
                         }
-                        // A typed ack commits the received transition. If the application cannot
-                        // observe it, leave the generic ack in place so the peer reverts instead.
-                        let acked = if event_delivered {
+                        // A typed ack commits the received transition. Without a reserved event slot,
+                        // leave the generic ack in place so the peer reverts instead.
+                        let acked = if event_permit.is_some() {
                             match build_call_video_ack(&call) {
                                 Some(ack) => {
                                     *cancelled = true;
@@ -220,6 +214,15 @@ impl StanzaHandler for CallHandler {
                         }
                         // Only drive our local plane once the peer has been acked; see above.
                         if acked {
+                            let event_delivered = event_permit.take().is_some_and(|permit| {
+                                permit.send(CallEvent::VideoStateChanged {
+                                    state: *state,
+                                    orientation: *orientation,
+                                })
+                            });
+                            if !event_delivered {
+                                warn!("call: video state event receiver closed after typed ack");
+                            }
                             if let Some(o) = orientation {
                                 registry.send_video_ctl(call_id, VideoControl::SetOrientation(*o));
                             }
@@ -411,6 +414,46 @@ mod tests {
     }
 
     #[cfg(feature = "voip")]
+    async fn make_blocking_sending_client() -> (
+        Arc<Client>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        use wacore::handshake::NoiseCipher;
+
+        struct BlockingTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+        }
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl crate::transport::Transport for BlockingTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+                let _ = self.started.try_send(());
+                let _ = self.release.recv().await;
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let client = make_client().await;
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(BlockingTransport {
+                started: started_tx,
+                release: release_rx,
+            }) as Arc<dyn crate::transport::Transport>,
+            NoiseCipher::new(&key).expect("valid key"),
+            NoiseCipher::new(&key).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        (client, started_rx, release_tx)
+    }
+
+    #[cfg(feature = "voip")]
     fn video_stanza(state: &str) -> wacore_binary::Node {
         NodeBuilder::new("call")
             .attr("from", fake_caller_lid())
@@ -466,6 +509,53 @@ mod tests {
             r.attrs().optional_string("id").as_deref(),
             Some("STANZA-ID-0002")
         );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn video_state_is_not_visible_before_typed_ack_completes() {
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let (client, send_started, release_send) = make_blocking_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(2);
+        let (control_tx, _control_rx) = async_channel::unbounded::<VideoControl>();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+
+        let node = node_to_owned_ref(&video_stanza("11"));
+        let mut cancelled = false;
+        let handled = {
+            let handling = CallHandler.handle(client, node, &mut cancelled);
+            tokio::pin!(handling);
+            tokio::select! {
+                started = send_started.recv() => started.expect("typed ack send started"),
+                _ = &mut handling => panic!("handler completed before the blocked ack send"),
+            }
+            assert!(
+                event_rx.try_recv().is_err(),
+                "the application must not observe an uncommitted video state"
+            );
+
+            release_send.send(()).await.expect("release ack send");
+            handling.await
+        };
+        assert!(handled);
+        assert!(cancelled);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::VideoStateChanged { .. })
+        ));
     }
 
     // Non-video call actions keep the generic ack: `cancelled` must stay false.
