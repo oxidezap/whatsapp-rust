@@ -22,7 +22,7 @@ use crate::time::Instant;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::h264::VideoFrame;
-use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, parse_rtp_header};
+use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 
 /// Mid-call video-plane commands from the shell (upgrade / downgrade / peer orientation). Kept out
@@ -81,6 +81,7 @@ struct SendBatch {
     bytes: usize,
     kind: SendBatchKind,
     started: bool,
+    video_keyframe: bool,
 }
 
 impl SendBatch {
@@ -95,15 +96,22 @@ impl SendBatch {
             packets: VecDeque::from([data]),
             kind,
             started: false,
+            video_keyframe: false,
         }
     }
 
     fn video(packets: Vec<Bytes>) -> Self {
+        let video_keyframe = packets
+            .first()
+            .and_then(|packet| parse_rtp_header(packet))
+            .and_then(|header| header.video_extension)
+            .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR);
         Self {
             bytes: packets.iter().map(Bytes::len).sum(),
             packets: packets.into(),
             kind: SendBatchKind::Video,
             started: false,
+            video_keyframe,
         }
     }
 }
@@ -114,7 +122,39 @@ struct DroppedMedia {
     packets: u32,
 }
 
-fn shed_to_cap(queue: &mut VecDeque<SendBatch>) -> DroppedMedia {
+fn record_drop(dropped: &mut DroppedMedia, batch: &SendBatch) {
+    dropped.packets = dropped
+        .packets
+        .saturating_add(batch.packets.len().try_into().unwrap_or(u32::MAX));
+    if batch.kind == SendBatchKind::Video {
+        dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+    }
+}
+
+fn discard_video_until_keyframe(
+    queue: &mut VecDeque<SendBatch>,
+    dropped: &mut DroppedMedia,
+) -> bool {
+    loop {
+        let Some(index) = queue
+            .iter()
+            .position(|batch| !batch.started && batch.kind == SendBatchKind::Video)
+        else {
+            return true;
+        };
+        if queue[index].video_keyframe {
+            return false;
+        }
+        if let Some(batch) = queue.remove(index) {
+            record_drop(dropped, &batch);
+        }
+    }
+}
+
+fn shed_to_cap(
+    queue: &mut VecDeque<SendBatch>,
+    awaiting_video_keyframe: &mut bool,
+) -> DroppedMedia {
     let mut dropped = DroppedMedia::default();
     loop {
         let bytes: usize = queue.iter().map(|batch| batch.bytes).sum();
@@ -137,19 +177,30 @@ fn shed_to_cap(queue: &mut VecDeque<SendBatch>) -> DroppedMedia {
         let Some(batch) = queue.remove(victim) else {
             break;
         };
-        dropped.packets = dropped
-            .packets
-            .saturating_add(batch.packets.len().try_into().unwrap_or(u32::MAX));
-        if batch.kind == SendBatchKind::Video {
-            dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+        let dropped_video = batch.kind == SendBatchKind::Video;
+        record_drop(&mut dropped, &batch);
+        if dropped_video {
+            *awaiting_video_keyframe = discard_video_until_keyframe(queue, &mut dropped);
         }
     }
     dropped
 }
 
-fn enqueue_batch(queue: &mut VecDeque<SendBatch>, batch: SendBatch) -> DroppedMedia {
+fn enqueue_batch(
+    queue: &mut VecDeque<SendBatch>,
+    awaiting_video_keyframe: &mut bool,
+    batch: SendBatch,
+) -> DroppedMedia {
+    if batch.kind == SendBatchKind::Video && *awaiting_video_keyframe {
+        if !batch.video_keyframe {
+            let mut dropped = DroppedMedia::default();
+            record_drop(&mut dropped, &batch);
+            return dropped;
+        }
+        *awaiting_video_keyframe = false;
+    }
     queue.push_back(batch);
-    shed_to_cap(queue)
+    shed_to_cap(queue, awaiting_video_keyframe)
 }
 
 /// Coalesce every PT-97 packet through the marker into one queue unit, so backpressure keeps or
@@ -157,6 +208,7 @@ fn enqueue_batch(queue: &mut VecDeque<SendBatch>, batch: SendBatch) -> DroppedMe
 fn queue_transmit(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
     data: Bytes,
 ) -> DroppedMedia {
     if let Some(header) = parse_rtp_header(&data)
@@ -164,15 +216,23 @@ fn queue_transmit(
     {
         pending_video.push(data);
         if header.marker {
-            return enqueue_batch(queue, SendBatch::video(std::mem::take(pending_video)));
+            return enqueue_batch(
+                queue,
+                awaiting_video_keyframe,
+                SendBatch::video(std::mem::take(pending_video)),
+            );
         }
         return DroppedMedia::default();
     }
     let mut dropped = DroppedMedia::default();
     if !pending_video.is_empty() {
-        dropped = enqueue_batch(queue, SendBatch::video(std::mem::take(pending_video)));
+        dropped = enqueue_batch(
+            queue,
+            awaiting_video_keyframe,
+            SendBatch::video(std::mem::take(pending_video)),
+        );
     }
-    let more = enqueue_batch(queue, SendBatch::packet(data));
+    let more = enqueue_batch(queue, awaiting_video_keyframe, SendBatch::packet(data));
     dropped.video_access_units = dropped
         .video_access_units
         .saturating_add(more.video_access_units);
@@ -296,6 +356,7 @@ async fn run_call_with_clock_and_wallclock(
     // worst whatsapp-rust<->whatsapp-rust where both ends stalled; the official client decouples them).
     // Video is queued per access unit so overload never leaves half an IDR on the wire.
     let mut send_queue: VecDeque<SendBatch> = VecDeque::new();
+    let mut awaiting_video_keyframe = false;
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
@@ -308,7 +369,12 @@ async fn run_call_with_clock_and_wallclock(
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
                 Output::Transmit(data) => {
-                    let dropped = queue_transmit(&mut send_queue, &mut pending_video, data);
+                    let dropped = queue_transmit(
+                        &mut send_queue,
+                        &mut pending_video,
+                        &mut awaiting_video_keyframe,
+                        data,
+                    );
                     if dropped.packets != 0 {
                         let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
                             video_access_units: dropped.video_access_units,
@@ -331,6 +397,7 @@ async fn run_call_with_clock_and_wallclock(
                     if !pending_video.is_empty() {
                         let dropped = enqueue_batch(
                             &mut send_queue,
+                            &mut awaiting_video_keyframe,
                             SendBatch::video(std::mem::take(&mut pending_video)),
                         );
                         if dropped.packets != 0 {
@@ -345,8 +412,7 @@ async fn run_call_with_clock_and_wallclock(
             }
         }
 
-        // A terminal relay-allocate failure went out via the drain above; tear the call down rather
-        // than keepalive a dead relay (transport.disconnect runs on the exit path below).
+        // The terminal event above must reach the consumer before transport teardown.
         if eng.is_terminated() {
             break 'drive;
         }
@@ -1348,10 +1414,11 @@ mod tests {
         let control = || Bytes::from(vec![0x00, 0x01]);
 
         let mut q: VecDeque<SendBatch> = VecDeque::new();
+        let mut awaiting_keyframe = false;
         q.push_back(SendBatch::packet(control())); // oldest, must survive
         for n in 0..SEND_QUEUE_BATCH_CAP as u8 {
             q.push_back(SendBatch::packet(media(n)));
-            let _ = shed_to_cap(&mut q);
+            let _ = shed_to_cap(&mut q, &mut awaiting_keyframe);
         }
 
         assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
@@ -1371,7 +1438,8 @@ mod tests {
         let mut q: VecDeque<SendBatch> = (0..=SEND_QUEUE_BATCH_CAP as u8)
             .map(|n| SendBatch::packet(Bytes::from(vec![0x00, n])))
             .collect();
-        let _ = shed_to_cap(&mut q);
+        let mut awaiting_keyframe = false;
+        let _ = shed_to_cap(&mut q, &mut awaiting_keyframe);
         assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
         assert_eq!(
             &q[0].packets[0][..],
@@ -1394,8 +1462,14 @@ mod tests {
         // The old 32-datagram queue truncated this AU before its marker.
         let mut queue = VecDeque::new();
         let mut pending = Vec::new();
+        let mut awaiting_keyframe = false;
         for seq in 0..40u16 {
-            let dropped = queue_transmit(&mut queue, &mut pending, video_packet(seq, seq == 39));
+            let dropped = queue_transmit(
+                &mut queue,
+                &mut pending,
+                &mut awaiting_keyframe,
+                video_packet(seq, seq == 39),
+            );
             assert_eq!(dropped.packets, 0);
         }
         assert!(pending.is_empty());
@@ -1415,9 +1489,82 @@ mod tests {
             .map(|_| Bytes::from(vec![0x90; 64 * 1024]))
             .collect();
         let mut queue = VecDeque::new();
-        let dropped = enqueue_batch(&mut queue, SendBatch::video(packets));
+        let mut awaiting_keyframe = false;
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(packets),
+        );
         assert_eq!(dropped.video_access_units, 1);
         assert_eq!(dropped.packets, 40);
         assert!(queue.is_empty(), "no partial AU may remain queued");
+        assert!(awaiting_keyframe);
+    }
+
+    #[test]
+    fn video_backpressure_recovers_at_the_next_keyframe() {
+        fn video_packet(seq: u16, keyframe: bool) -> Bytes {
+            let mut packet = Vec::new();
+            crate::voip::rtp::encode_rtp_header_into(
+                &crate::voip::rtp::RtpHeader {
+                    marker: true,
+                    payload_type: RTP_PAYLOAD_TYPE_H264,
+                    sequence_number: seq,
+                    timestamp: u32::from(seq) * 4500,
+                    ssrc: 0x1122_3344,
+                    extension_word: None,
+                    video_extension: Some(crate::voip::rtp::VideoRtpExtension {
+                        media_frame_info: if keyframe {
+                            VIDEO_MEDIA_FRAME_INFO_IDR
+                        } else {
+                            crate::voip::rtp::VIDEO_MEDIA_FRAME_INFO_DELTA
+                        },
+                        initial_bandwidth: 20_000,
+                        short_offset: 0,
+                        transport_sequence: seq,
+                    }),
+                },
+                &mut packet,
+            );
+            Bytes::from(packet)
+        }
+
+        let mut queue = VecDeque::new();
+        let mut awaiting_keyframe = true;
+
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(vec![video_packet(1, false)]),
+        );
+        assert_eq!(dropped.video_access_units, 1);
+        assert!(queue.is_empty());
+
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(vec![video_packet(2, true)]),
+        );
+        assert_eq!(dropped.video_access_units, 0);
+        assert!(!awaiting_keyframe);
+
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(vec![video_packet(3, false)]),
+        );
+        assert_eq!(dropped.video_access_units, 0);
+        assert_eq!(queue.len(), 2);
+        assert!(queue[0].video_keyframe);
+        assert!(!queue[1].video_keyframe);
+
+        let mut queued: VecDeque<_> = (0..=SEND_QUEUE_BATCH_CAP as u16)
+            .map(|seq| SendBatch::video(vec![video_packet(seq, seq == 10)]))
+            .collect();
+        let mut awaiting_keyframe = false;
+        let dropped = shed_to_cap(&mut queued, &mut awaiting_keyframe);
+        assert_eq!(dropped.video_access_units, 10);
+        assert!(queued.front().is_some_and(|batch| batch.video_keyframe));
+        assert!(!awaiting_keyframe, "a queued IDR is a valid recovery point");
     }
 }

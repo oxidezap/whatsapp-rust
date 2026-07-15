@@ -953,6 +953,7 @@ fn spawn_call_event_listener(
     tokio::spawn(async move {
         let mut opus = WaOpusDecoder::new().ok();
         let mut peer_video_receiver_confirmed = false;
+        let mut peer_keyframe_request_logged = false;
         while let Ok(ev) = events.recv().await {
             match ev {
                 CallEvent::RelayAllocated => {
@@ -1026,8 +1027,9 @@ fn spawn_call_event_listener(
                         );
                         peer_video_receiver_confirmed = true;
                     }
-                    if requests_keyframe {
+                    if requests_keyframe && !peer_keyframe_request_logged {
                         info!("🎥 peer requests an outbound keyframe: [{feedback}]");
+                        peer_keyframe_request_logged = true;
                     }
                     debug!(
                         "📊 peer RTCP PT={packet_types:?} sender={sender_ssrc:#010x} refs={referenced_ssrcs:x?} reports_audio={reports_audio} reports_video={reports_video} blocks=[{blocks}] feedback=[{feedback}]"

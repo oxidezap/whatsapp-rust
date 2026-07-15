@@ -6,7 +6,7 @@
 //! Annex-B access units and receive reassembled ones. Pure, no-Tokio, wasm-safe.
 
 /// Largest RTP payload we emit before fragmenting a NAL into FU-A units.
-/// Mirrors the reference implementation's relay MTU budget; unvalidated live.
+/// Matches the reference relay MTU budget used by live WhatsApp interop.
 pub const H264_SINGLE_NAL_MAX: usize = 800;
 /// FU-A fragment body size: `H264_SINGLE_NAL_MAX` minus indicator + FU header.
 const H264_FUA_FRAG_SIZE: usize = H264_SINGLE_NAL_MAX - 2;

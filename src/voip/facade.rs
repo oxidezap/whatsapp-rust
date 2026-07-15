@@ -1541,9 +1541,6 @@ impl CallHandle {
     }
 
     /// Shared upgrade/accept body: attach endpoints, enable the plane, send the handshake stanzas.
-    /// On a signaling send failure the local video setup is rolled back (endpoints detached, plane
-    /// disabled, flag cleared) so a failed upgrade doesn't leave the camera encoding into a call
-    /// the peer never transitioned.
     async fn begin_video(
         &self,
         source: Arc<dyn VideoSource>,
@@ -1588,23 +1585,25 @@ impl CallHandle {
             let client = client.clone();
             async move { client.send_node(stanza).await }
         };
-        let result = match role {
+        match role {
             VideoState::UpgradeRequestV2 => {
-                // The marker attr is what the server keys the upgrade enrichment on.
-                send_state(VideoState::UpgradeRequestV2, Some(VIDEO_DEC_REQUEST), true).await
-            }
-            _ => {
-                // Acceptor: answer the request, then declare our video enabled (the WA Web order).
-                match send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT), false).await {
-                    Ok(()) => send_state(VideoState::Enabled, None, false).await,
-                    Err(e) => Err(e),
+                if let Err(e) =
+                    send_state(VideoState::UpgradeRequestV2, Some(VIDEO_DEC_REQUEST), true).await
+                {
+                    self.teardown_local_video();
+                    return Err(e.into());
                 }
             }
-        };
-        if let Err(e) = result {
-            // The peer never learned of the transition; don't leave the source encoding into it.
-            self.teardown_local_video();
-            return Err(e.into());
+            _ => {
+                if let Err(e) =
+                    send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT), false).await
+                {
+                    self.teardown_local_video();
+                    return Err(e.into());
+                }
+                // The accept already committed the peer; a failed follow-up cannot be rolled back.
+                send_state(VideoState::Enabled, None, false).await?;
+            }
         }
         Ok(())
     }
@@ -2196,6 +2195,12 @@ mod tests {
     /// A test client with a real NoiseSocket over a counting transport, so the offer send path
     /// (`send_node`) is exercised, plus the own LID set so `place_call` can derive call_creator.
     async fn make_sending_client() -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+        make_sending_client_with_failure_after(None).await
+    }
+
+    async fn make_sending_client_with_failure_after(
+        failure_after: Option<usize>,
+    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
         use wacore::handshake::NoiseCipher;
         let backend = create_test_backend().await;
         let pm = PersistenceManager::new(backend).await.expect("pm");
@@ -2227,17 +2232,22 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         struct CountingTransport {
             count: Arc<AtomicUsize>,
+            failure_after: Option<usize>,
         }
         #[async_trait]
         impl crate::transport::Transport for CountingTransport {
             async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
-                self.count.fetch_add(1, Ordering::SeqCst);
+                let attempt = self.count.fetch_add(1, Ordering::SeqCst);
+                if self.failure_after.is_some_and(|limit| attempt >= limit) {
+                    return Err(anyhow::anyhow!("injected transport send failure"));
+                }
                 Ok(())
             }
             async fn disconnect(&self) {}
         }
         let socket_transport: Arc<dyn crate::transport::Transport> = Arc::new(CountingTransport {
             count: count.clone(),
+            failure_after,
         });
         let key = [0u8; 32];
         let noise_socket = crate::socket::NoiseSocket::new(
@@ -3607,6 +3617,43 @@ mod tests {
             "an accept must not carry the upgrade marker"
         );
         handle.hangup().await;
+    }
+
+    #[tokio::test]
+    async fn accept_video_keeps_local_plane_after_accept_reaches_peer() {
+        let (client, sent) = make_sending_client_with_failure_after(Some(1)).await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+        };
+
+        let (source, sink) = video_endpoints();
+        assert!(handle.accept_video(source, sink).await.is_err());
+        assert_eq!(sent.load(Ordering::SeqCst), 2);
+        assert!(video.sink_slot.lock().unwrap().is_some());
+        assert!(registry.snapshot("CID-FACADE").unwrap().is_video);
+
+        handle.teardown_local_video();
     }
 
     #[tokio::test]

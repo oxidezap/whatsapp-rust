@@ -7,7 +7,7 @@
 //!           -> `AnnexBAuSplitter` -> one AU per channel item
 //!   sink:   received AUs -> ffplay window (low-latency flags) | raw `.h264` file | discard
 //!
-//! Env knobs: `WA_VIDEO_INPUT` = `testsrc` | existing path/URL | `annexb:<path>` | webcam device;
+//! Env knobs: `WA_VIDEO_INPUT` = `testsrc` | existing path/URL | webcam device;
 //! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`; `WA_VIDEO_SIZE`, `WA_VIDEO_FPS`,
 //! `WA_VIDEO_BITRATE_KBPS`, and `WA_VIDEO_SINK_FPS` override the captured WhatsApp defaults.
 
@@ -179,8 +179,6 @@ pub enum VideoInput {
     Webcam(Option<String>),
     /// Any file or URL ffmpeg can open; looped and rate-limited to realtime.
     Media(String),
-    /// Pre-encoded H.264 Annex-B, paced without changing its encoded access units.
-    AnnexB(String),
     /// `lavfi testsrc2` synthetic pattern — no camera needed (CI / second instance).
     TestSrc,
 }
@@ -198,9 +196,6 @@ impl VideoOpts {
     pub fn from_env() -> Result<Self> {
         let input = match std::env::var("WA_VIDEO_INPUT") {
             Ok(v) if v == "testsrc" => VideoInput::TestSrc,
-            Ok(v) if v.starts_with("annexb:") => {
-                VideoInput::AnnexB(v.trim_start_matches("annexb:").to_string())
-            }
             // A `/dev/*` node is a webcam override (v4l2 on Linux), NOT a media file — it exists on
             // disk but must not be opened with `-stream_loop`.
             Ok(v) if v.starts_with("/dev/") => VideoInput::Webcam(Some(v)),
@@ -394,7 +389,6 @@ fn input_args(
             &format!("testsrc2=size={size}:rate={fps}"),
         ]),
         VideoInput::Media(path) => s(&["-re", "-stream_loop", "-1", "-i", path]),
-        VideoInput::AnnexB(path) => s(&["-re", "-framerate", &fps, "-f", "h264", "-i", path]),
         VideoInput::Webcam(dev) => {
             if cfg!(target_os = "linux") {
                 let dev = dev.clone().unwrap_or_else(|| "/dev/video0".into());
@@ -509,14 +503,8 @@ fn spawn_ffmpeg_encoder(
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     cmd.args(input_args(input, quality, camera_mode)?);
-    if matches!(input, VideoInput::AnnexB(_)) {
-        // Copy mode isolates transport behavior without changing already encoded frames.
-        cmd.args(["-c:v", "copy", "-an", "-f", "h264", "pipe:1"]);
-    } else {
-        // Normalize camera metadata so every encoded source presents one decoder contract.
-        // One slice per frame avoids content-dependent RTP layouts.
-        cmd.args(encoder_args(quality));
-    }
+    // One slice per frame avoids content-dependent RTP layouts.
+    cmd.args(encoder_args(quality));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // stderr inherited: encoder errors (missing camera, busy device) reach the user directly.
@@ -643,7 +631,7 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
                         match tx.try_send(au) {
                             Ok(()) => {
                                 if is_idr {
-                                    info!(
+                                    debug!(
                                         "🎥 OUT IDR queued: source AU #{made}, wire AU #{sent}, {au_bytes} bytes"
                                     );
                                 }
