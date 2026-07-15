@@ -55,7 +55,7 @@ jobs:
           cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
@@ -193,7 +193,7 @@ jobs:
           cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.

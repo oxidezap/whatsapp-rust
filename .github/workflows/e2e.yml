@@ -50,7 +50,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.

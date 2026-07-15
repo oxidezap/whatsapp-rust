@@ -43,7 +43,7 @@ jobs:
           tool: cargo-release@0.25.20
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "false"
