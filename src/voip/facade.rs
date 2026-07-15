@@ -1265,6 +1265,7 @@ impl VideoShared {
         ));
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
         let feed = VideoFeed {
+            source: source.clone(),
             src: source.frames(),
             out: self.in_tx.clone(),
             ended,
@@ -1291,9 +1292,7 @@ impl VideoShared {
     }
 }
 
-/// A registry teardown hook that fully releases the call's local video endpoints. Invoked when a
-/// caller-initiated upgrade is refused (`<video state=UpgradeReject|UpgradeCancel>`), so the camera
-/// feed doesn't keep encoding into a disabled plane.
+/// A registry teardown hook that releases codec endpoints on refusal or call termination.
 fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> {
     let video = video.clone();
     Box::new(move || video.detach_endpoints())
@@ -1303,6 +1302,7 @@ fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> 
 /// `ended` flag as well as the channels, so a source that stops producing after the call ends
 /// can't park this task on `recv()` forever.
 struct VideoFeed {
+    source: Arc<dyn VideoSource>,
     src: async_channel::Receiver<Vec<u8>>,
     out: async_channel::Sender<Vec<u8>>,
     ended: Arc<EndedFlag>,
@@ -1311,6 +1311,7 @@ struct VideoFeed {
 impl VideoFeed {
     async fn run(self) {
         use futures::FutureExt;
+        let _source = self.source;
         loop {
             let ended = self.ended.wait().fuse();
             let recv = self.src.recv().fuse();
@@ -1490,9 +1491,8 @@ impl CallHandle {
             id: &client.generate_request_id(),
             call_creator: &self.call_creator,
             state: VideoState::Enabled,
-            dec: Some(VIDEO_DEC_REQUEST),
-            upgrade_marker: false,
-            device_orientation: Some(0),
+            dec: None,
+            device_orientation: None,
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -1514,7 +1514,6 @@ impl CallHandle {
             call_creator: &self.call_creator,
             state: VideoState::Stopped,
             dec: None,
-            upgrade_marker: false,
             device_orientation: Some(0),
         });
         client.send_node(stanza).await?;
@@ -1570,7 +1569,7 @@ impl CallHandle {
         self.client_registry.set_is_video(&self.call_id, true);
 
         let peer = self.peer_jid();
-        let send_state = |state: VideoState, dec: Option<&'static str>, marker: bool| {
+        let send_state = |state: VideoState, dec: Option<&'static str>| {
             // Each call stanza gets its own wrapper id so the peer's typed ack correlates.
             let stanza = build_video_state(&VideoStateParams {
                 call_id: &self.call_id,
@@ -1579,7 +1578,6 @@ impl CallHandle {
                 call_creator: &self.call_creator,
                 state,
                 dec,
-                upgrade_marker: marker,
                 device_orientation: None,
             });
             let client = client.clone();
@@ -1588,21 +1586,20 @@ impl CallHandle {
         match role {
             VideoState::UpgradeRequestV2 => {
                 if let Err(e) =
-                    send_state(VideoState::UpgradeRequestV2, Some(VIDEO_DEC_REQUEST), true).await
+                    send_state(VideoState::UpgradeRequestV2, Some(VIDEO_DEC_REQUEST)).await
                 {
                     self.teardown_local_video();
                     return Err(e.into());
                 }
             }
             _ => {
-                if let Err(e) =
-                    send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT), false).await
+                if let Err(e) = send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT)).await
                 {
                     self.teardown_local_video();
                     return Err(e.into());
                 }
                 // The accept already committed the peer; a failed follow-up cannot be rolled back.
-                send_state(VideoState::Enabled, None, false).await?;
+                send_state(VideoState::Enabled, None).await?;
             }
         }
         Ok(())

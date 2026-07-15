@@ -404,15 +404,18 @@ pub struct VideoRtpStream {
 }
 
 impl VideoRtpStream {
-    pub fn new(ssrc: u32, ts_stride: u32) -> Self {
-        Self {
+    pub fn new(ssrc: u32, ts_stride: u32) -> Option<Self> {
+        if ts_stride == 0 {
+            return None;
+        }
+        Some(Self {
             ssrc,
             seq: 0,
             timestamp: 0,
             last_sent_timestamp: None,
             ts_stride,
             transport_sequence: 0,
-        }
+        })
     }
 
     /// The current send timestamp (last emitted), for an RTCP Sender Report.
@@ -548,7 +551,7 @@ mod tests {
 
     #[test]
     fn video_stream_marker_and_timestamp_advance_per_au() {
-        let mut s = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
+        let mut s = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS).unwrap();
         // 3-packet AU: ts shared, marker only on the last.
         let p0 = s.next_video_packet(false, VIDEO_MEDIA_FRAME_INFO_IDR);
         let p1 = s.next_video_packet(false, VIDEO_MEDIA_FRAME_INFO_IDR);
@@ -587,7 +590,7 @@ mod tests {
 
     #[test]
     fn video_stream_changes_cadence_without_resetting_timestamp() {
-        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
+        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS).unwrap();
         let first = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
         assert_eq!(first.timestamp, 0);
 
@@ -600,11 +603,12 @@ mod tests {
             VIDEO_TS_STRIDE_15FPS + VIDEO_TS_STRIDE_20FPS
         );
         assert!(!stream.set_timestamp_stride(0));
+        assert!(VideoRtpStream::new(0x1122_3344, 0).is_none());
     }
 
     #[test]
     fn video_header_round_trips_through_parse() {
-        let mut s = VideoRtpStream::new(0xdead_beef, VIDEO_TS_STRIDE_15FPS);
+        let mut s = VideoRtpStream::new(0xdead_beef, VIDEO_TS_STRIDE_15FPS).unwrap();
         s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);
         let h = s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
         let bytes = encode_rtp_header(&h);
@@ -614,7 +618,7 @@ mod tests {
 
     #[test]
     fn video_header_uses_wasm_extension_layout() {
-        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
+        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS).unwrap();
         let header = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);
         assert_eq!(
             encode_rtp_header(&header),
@@ -717,7 +721,7 @@ mod tests {
 
     #[test]
     fn video_stream_wraps_seq_and_timestamp() {
-        let mut s = VideoRtpStream::new(1, u32::MAX);
+        let mut s = VideoRtpStream::new(1, u32::MAX).unwrap();
         s.seq = u16::MAX;
         s.timestamp = u32::MAX;
         let p = s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);

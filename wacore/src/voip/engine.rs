@@ -703,8 +703,10 @@ impl CallEngine {
             return false;
         };
         if let Some(v) = m.video.as_mut() {
+            let resuming_after_gate = v.send_gated && !send_gated;
             v.active = true;
             v.send_gated = send_gated;
+            v.keyframe_required |= resuming_after_gate;
             return true;
         }
         let rtcp_cname = build_whatsapp_rtcp_cname(&self.tx_ids.next_tx_id());
@@ -1001,7 +1003,7 @@ impl CallEngine {
             // dropped. The pipe still advances its recv ROC on drop-free packets it never sees, but
             // an inactive plane simply ignores them.
             if let Some(v) = m.video.as_mut().filter(|v| v.active)
-                && let Some((header, au)) = v.pipe.unprotect_video_packet(pkt)
+                && let Some((header, completed)) = v.pipe.unprotect_video_packet(pkt)
             {
                 v.reception.observe(
                     header.ssrc,
@@ -1010,7 +1012,7 @@ impl CallEngine {
                     now,
                     VIDEO_CLOCK_RATE,
                 );
-                if let Some(au) = au {
+                for au in completed {
                     let keyframe = au_is_keyframe(&au);
                     self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                         data: au,
@@ -1946,7 +1948,7 @@ mod tests {
         assert_eq!(parse_rtcp_sender_ssrc(rtcp[0]), Some(audio_ssrc));
         assert_eq!(rtcp[0].len(), 32 + 4 + SRTCP_AUTH_TAG_LEN);
         let transport = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
-        let plain = unprotect_srtcp(&transport, audio_ssrc, rtcp[0]).unwrap();
+        let (plain, _) = unprotect_srtcp(&transport, audio_ssrc, rtcp[0]).unwrap();
         let summary = summarize_rtcp(&plain).unwrap();
         assert_eq!(summary.packet_types, [RTCP_PT_SDES]);
         assert_eq!(summary.sdes_cname_lengths, [WHATSAPP_RTCP_CNAME_LEN]);
@@ -1976,7 +1978,7 @@ mod tests {
             let index = u32::from_be_bytes(packet[index_at..index_at + 4].try_into().unwrap())
                 & 0x7fff_ffff;
             assert_eq!(index, expected_index);
-            let plain = unprotect_srtcp(&transport, ssrc, packet).unwrap();
+            let (plain, _) = unprotect_srtcp(&transport, ssrc, packet).unwrap();
             let summary = summarize_rtcp(&plain).unwrap();
             assert_eq!(summary.packet_types, [RTCP_PT_SR, RTCP_PT_SDES]);
             assert_eq!(summary.sdes_cname_lengths, [WHATSAPP_RTCP_CNAME_LEN]);
@@ -2049,7 +2051,7 @@ mod tests {
 
         assert_eq!(protected.len(), 76 + 32 + 4 + SRTCP_AUTH_TAG_LEN);
         let transport = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
-        let plain = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
+        let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
         assert_eq!(&plain[..4], &[0x91, RTCP_PT_SR, 0, 18]);
         assert_eq!(&plain[28..32], &peer_video_ssrc.to_be_bytes());
         assert_eq!(&plain[52..76], &[0; 24]);
@@ -2090,7 +2092,7 @@ mod tests {
             .expect("RTCP tick emits an audio Sender Report");
         let sender_ssrc = parse_rtcp_sender_ssrc(protected).unwrap();
         let keys = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
-        let plain = unprotect_srtcp(&keys, sender_ssrc, protected).unwrap();
+        let (plain, _) = unprotect_srtcp(&keys, sender_ssrc, protected).unwrap();
         let ntp_seconds = u32::from_be_bytes(plain[8..12].try_into().unwrap());
         assert_eq!(
             ntp_seconds,
@@ -2602,13 +2604,19 @@ mod tests {
             "a gated plane must still decode inbound video"
         );
 
-        // Peer accepted -> ungate -> our video flows.
+        // Peer accepted -> deltas remain withheld until a decoder-safe IDR.
         assert!(eng.enable_video());
-        eng.handle_input(2, Input::VideoFrame(&video_au(200)));
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "ungating must not start with a delta whose references were gated"
+        );
+        eng.handle_input(3, Input::VideoFrame(&video_au(200)));
         assert_eq!(
             count_transmits(&drain(&mut eng).0),
             1,
-            "ungating must let our video onto the wire"
+            "the next IDR resumes outbound video"
         );
     }
 

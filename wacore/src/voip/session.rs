@@ -139,6 +139,75 @@ fn phase_rank(p: CallPhase) -> u8 {
     }
 }
 
+const SRTCP_INDEX_MASK: u32 = 0x7fff_ffff;
+const SRTCP_INDEX_HALF_RANGE: u32 = 1 << 30;
+const SRTCP_REPLAY_WINDOW_BITS: u32 = 64;
+const SRTCP_REPLAY_STREAM_CAP: usize = 16;
+
+#[derive(Default)]
+struct SrtcpReplayWindow {
+    highest: Option<u32>,
+    seen: u64,
+}
+
+impl SrtcpReplayWindow {
+    fn accept(&mut self, index: u32) -> bool {
+        let index = index & SRTCP_INDEX_MASK;
+        let Some(highest) = self.highest else {
+            self.highest = Some(index);
+            self.seen = 1;
+            return true;
+        };
+        let forward = index.wrapping_sub(highest) & SRTCP_INDEX_MASK;
+        if forward == 0 {
+            return false;
+        }
+        if forward < SRTCP_INDEX_HALF_RANGE {
+            self.seen = if forward >= SRTCP_REPLAY_WINDOW_BITS {
+                1
+            } else {
+                (self.seen << forward) | 1
+            };
+            self.highest = Some(index);
+            return true;
+        }
+        let behind = highest.wrapping_sub(index) & SRTCP_INDEX_MASK;
+        if behind >= SRTCP_REPLAY_WINDOW_BITS {
+            return false;
+        }
+        let bit = 1u64 << behind;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+}
+
+#[derive(Default)]
+struct SrtcpReplayState {
+    streams: Vec<(u32, SrtcpReplayWindow)>,
+}
+
+impl SrtcpReplayState {
+    fn accept(&mut self, sender_ssrc: u32, index: u32) -> bool {
+        if let Some((_, window)) = self
+            .streams
+            .iter_mut()
+            .find(|(ssrc, _)| *ssrc == sender_ssrc)
+        {
+            return window.accept(index);
+        }
+        if self.streams.len() >= SRTCP_REPLAY_STREAM_CAP {
+            return false;
+        }
+        let mut window = SrtcpReplayWindow::default();
+        let accepted = window.accept(index);
+        self.streams.push((sender_ssrc, window));
+        accepted
+    }
+}
+
 /// Per-stream RTCP Sender-Report state.
 struct SrtcpSender {
     keys: E2eSrtpKeys,
@@ -233,6 +302,7 @@ pub struct MediaPipeline {
     recv_roc: RecvRocTracker,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
+    recv_srtcp_replay: SrtcpReplayState,
 }
 
 /// Borrowed inputs for [`MediaPipeline::new`]. `self_lid`/`peer_lid` are the E2E-SRTP
@@ -284,6 +354,7 @@ impl MediaPipeline {
                 p.call_key,
                 &format_e2e_srtp_participant_id(p.peer_lid),
             )?,
+            recv_srtcp_replay: SrtcpReplayState::default(),
         })
     }
 
@@ -324,6 +395,7 @@ impl MediaPipeline {
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_roc = RecvRocTracker::default();
+        self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
 
@@ -366,9 +438,12 @@ impl MediaPipeline {
     }
 
     /// Authenticate and decrypt peer SRTCP using the sender SSRC left clear on the wire.
-    pub fn unprotect_rtcp(&self, packet: &[u8]) -> Option<Vec<u8>> {
+    pub fn unprotect_rtcp(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         let sender_ssrc = parse_rtcp_sender_ssrc(packet)?;
-        unprotect_srtcp(&self.recv_srtcp_keys, sender_ssrc, packet)
+        let (plain, index) = unprotect_srtcp(&self.recv_srtcp_keys, sender_ssrc, packet)?;
+        self.recv_srtcp_replay
+            .accept(sender_ssrc, index)
+            .then_some(plain)
     }
 }
 
@@ -462,7 +537,7 @@ impl VideoPipeline {
             send_keys: derive_e2e_keys(p.call_key, &format_e2e_srtp_participant_id(p.self_lid))?,
             recv_keys: derive_e2e_keys(p.call_key, &format_e2e_srtp_participant_id(p.peer_lid))?,
             warp_mi_tag_len: p.warp_mi_tag_len,
-            rtp: VideoRtpStream::new(p.ssrc, p.ts_stride),
+            rtp: VideoRtpStream::new(p.ssrc, p.ts_stride)?,
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
             depacketizer: H264Depacketizer::default(),
@@ -547,27 +622,35 @@ impl VideoPipeline {
 
     /// Inbound: authenticate+decrypt one RTP packet and feed the depacketizer;
     /// the reassembled access unit is returned on the AU's marker packet.
-    pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
-        self.unprotect_video_packet(packet)?.1
+    pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let completed = self.unprotect_video_packet(packet)?.1;
+        (!completed.is_empty()).then_some(completed)
     }
 
     pub(crate) fn unprotect_video_packet(
         &mut self,
         packet: &[u8],
-    ) -> Option<(RtpHeader, Option<Vec<u8>>)> {
+    ) -> Option<(RtpHeader, Vec<Vec<u8>>)> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
             self.warp_mi_tag_len,
             packet,
         )?;
-        let au = self.depacketizer.push(
+        let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
             &payload,
             header.marker,
         );
-        Some((header, au))
+        let mut completed = Vec::with_capacity(if first.is_some() { 2 } else { 0 });
+        if let Some(au) = first {
+            completed.push(au);
+        }
+        while let Some(au) = self.depacketizer.pop_ready() {
+            completed.push(au);
+        }
+        Some((header, completed))
     }
 }
 
@@ -1062,6 +1145,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn srtcp_replay_window_handles_reorder_and_index_wrap() {
+        let mut window = SrtcpReplayWindow::default();
+        assert!(window.accept(100));
+        assert!(window.accept(102));
+        assert!(window.accept(101));
+        assert!(
+            !window.accept(101),
+            "a reordered packet is accepted only once"
+        );
+        assert!(window.accept(40), "the oldest in-window packet is accepted");
+        assert!(
+            !window.accept(38),
+            "packets outside the 64-index window are stale"
+        );
+
+        let mut wrapping = SrtcpReplayWindow::default();
+        assert!(wrapping.accept(0x7fff_fffe));
+        assert!(wrapping.accept(0x7fff_ffff));
+        assert!(wrapping.accept(0));
+        assert!(wrapping.accept(1));
+        assert!(!wrapping.accept(0x7fff_ffff));
+    }
+
+    #[test]
+    fn srtcp_replay_is_rejected_only_after_authentication() {
+        use crate::voip::rtcp::build_compact_rtcp_208;
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let caller = "111111111111111:0@lid";
+        let peer = "222222222222222:0@lid";
+        let params = MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: caller,
+            peer_lid: peer,
+            ssrc: 0x0102_0304,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        };
+        let mut receiver = MediaPipeline::new(&params).unwrap();
+        let peer_keys = derive_srtcp_keys(&call_key, peer).unwrap();
+        let sender = 0x1122_3344;
+        let plain = build_compact_rtcp_208(sender, params.ssrc);
+        let packet = |index| protect_srtcp(&peer_keys, sender, index, &plain);
+
+        assert_eq!(
+            receiver.unprotect_rtcp(&packet(5)).as_deref(),
+            Some(&plain[..])
+        );
+        assert!(receiver.unprotect_rtcp(&packet(5)).is_none());
+
+        let mut forged = packet(6);
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(receiver.unprotect_rtcp(&forged).is_none());
+        assert_eq!(
+            receiver.unprotect_rtcp(&packet(6)).as_deref(),
+            Some(&plain[..]),
+            "a forged packet must not consume the authenticated index"
+        );
+
+        assert_eq!(
+            receiver.unprotect_rtcp(&packet(8)).as_deref(),
+            Some(&plain[..])
+        );
+        assert_eq!(
+            receiver.unprotect_rtcp(&packet(7)).as_deref(),
+            Some(&plain[..])
+        );
+        assert!(receiver.unprotect_rtcp(&packet(7)).is_none());
+        assert_eq!(
+            receiver.unprotect_rtcp(&packet(80)).as_deref(),
+            Some(&plain[..])
+        );
+        assert!(receiver.unprotect_rtcp(&packet(10)).is_none());
+
+        let other_sender = 0x5566_7788;
+        let other_plain = build_compact_rtcp_208(other_sender, params.ssrc);
+        let other = protect_srtcp(&peer_keys, other_sender, 5, &other_plain);
+        assert_eq!(
+            receiver.unprotect_rtcp(&other).as_deref(),
+            Some(&other_plain[..]),
+            "replay state is independent per sender SSRC"
+        );
+    }
+
     fn video_params<'a>(
         call_key: &'a [u8],
         self_lid: &'a str,
@@ -1104,13 +1272,13 @@ mod tests {
                 got = out;
             }
         }
-        assert_eq!(got, Some(au), "AU must reassemble byte-identical");
+        assert_eq!(got, Some(vec![au]), "AU must reassemble byte-identical");
 
         // Second AU keeps flowing (sequencer + ROC state stay consistent).
         let au2 = video_au(100);
         let packets2 = tx.protect_video(&au2);
         assert_eq!(packets2.len(), 1);
-        assert_eq!(rx.unprotect_video(&packets2[0]), Some(au2));
+        assert_eq!(rx.unprotect_video(&packets2[0]), Some(vec![au2]));
     }
 
     #[test]
@@ -1152,7 +1320,9 @@ mod tests {
             }
         }
 
-        let received = received.expect("marker packet completes the access unit");
+        let mut received = received.expect("marker packet completes the access unit");
+        assert_eq!(received.len(), 1);
+        let received = received.remove(0);
         assert_eq!(
             crate::voip::h264::split_annexb(&received)
                 .map(crate::voip::h264::nal_unit_type)
@@ -1245,7 +1415,7 @@ mod tests {
         );
         assert_eq!(
             rx.unprotect_video(&packets[0]),
-            Some(au),
+            Some(vec![au]),
             "legit packet still decrypts after the forgery"
         );
         // Garbage never panics.
@@ -1273,7 +1443,7 @@ mod tests {
         );
         assert!(caller_rx.rekey_recv(&call_key, callee_answering));
         let f2 = answerer_tx.protect_video(&au);
-        assert_eq!(caller_rx.unprotect_video(&f2[0]), Some(au));
+        assert_eq!(caller_rx.unprotect_video(&f2[0]), Some(vec![au]));
         // Malformed key refuses without clobbering state.
         assert!(!caller_rx.rekey_recv(&[0u8; 4], callee_answering));
     }

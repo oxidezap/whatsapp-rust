@@ -48,14 +48,20 @@ struct CallEntry {
     event_tx: Option<async_channel::Sender<CallEvent>>,
     /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
     video_ctl_tx: Option<async_channel::Sender<VideoControl>>,
-    /// Fully release the local video endpoints (stop the camera feed, drop the sink). Runs when a
-    /// negotiation the caller started is refused (`<video state=UpgradeReject|UpgradeCancel>`), so a
-    /// dead upgrade doesn't leave the source encoding into a disabled plane. Built in the root crate
-    /// (it owns the endpoints), stored here so the wacore-side signaling handler can invoke it.
+    /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
+    /// same teardown without keeping codec resources alive through lingering handles.
     video_teardown: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
+}
+
+impl Drop for CallEntry {
+    fn drop(&mut self) {
+        if let Some(teardown) = self.video_teardown.take() {
+            teardown();
+        }
+    }
 }
 
 /// Thread-safe map of active calls keyed by call-id.
@@ -497,6 +503,26 @@ mod tests {
 
         reg.run_video_teardown("CID");
         assert!(lock_was_free.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn removal_releases_video_endpoints_after_registry_unlock() {
+        let reg = Arc::new(CallRegistry::new());
+        let generation = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = async_channel::bounded(1);
+        let calls = Arc::new(AtomicU64::new(0));
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, {
+            let reg = reg.clone();
+            let calls = calls.clone();
+            Box::new(move || {
+                assert!(reg.inner.try_lock().is_ok());
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(reg.remove_if_current("CID", generation));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

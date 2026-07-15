@@ -420,10 +420,9 @@ mod tests {
             1_718_000_000_000,
         );
         let protected = protect_srtcp(&uplink, ssrc, 7, &plain);
-        assert_eq!(
-            unprotect_srtcp(&uplink, ssrc, &protected).as_deref(),
-            Some(plain.as_slice())
-        );
+        let (unprotected, index) = unprotect_srtcp(&uplink, ssrc, &protected).unwrap();
+        assert_eq!(unprotected, plain);
+        assert_eq!(index, 7);
         assert!(unprotect_srtcp(&downlink, ssrc, &protected).is_none());
 
         for mode in HBH_SRTCP_MODES {

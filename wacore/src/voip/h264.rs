@@ -215,6 +215,11 @@ impl H264Depacketizer {
         self.ready.push_back(au);
     }
 
+    /// Take another AU completed by the previous [`push`](Self::push).
+    pub fn pop_ready(&mut self) -> Option<Vec<u8>> {
+        self.ready.pop_front()
+    }
+
     /// A lost end-fragment leaves a stale partial NAL; drop it rather than
     /// splice its bytes into the next NAL.
     fn drop_partial_fu(&mut self) {
@@ -320,8 +325,8 @@ impl H264Depacketizer {
         if let Some(au) = self.flush_on(marker) {
             self.queue_ready(au);
         }
-        // Drain one completed AU per push; any second (a timestamp boundary that coincided with a
-        // marker) surfaces on the next call, adding at most one packet of latency.
+        // The caller must drain `pop_ready` immediately: a timestamp boundary and marker can finish
+        // two access units in one push.
         self.ready.pop_front()
     }
 
@@ -721,7 +726,7 @@ mod tests {
     }
 
     // The rare case where a timestamp boundary AND a marker fire for the same push: both AUs must
-    // surface (the second one push later), not be dropped.
+    // surface immediately, even if no later packet arrives.
     #[test]
     fn boundary_and_marker_in_one_push_surface_both_aus() {
         let mut d = H264Depacketizer::default();
@@ -734,12 +739,11 @@ mod tests {
             .push(1, 2000, &b1, true)
             .expect("boundary flush returns AU1");
         assert_eq!(first, au_from_nals(&[a1]));
-        // AU2 surfaces on the next push (drained one-per-call). Use a fresh AU3 packet to pump it.
-        let c1 = nal(1, 15);
         let second = d
-            .push(2, 3000, &c1, false)
-            .expect("the second completed AU surfaces on the next push");
+            .pop_ready()
+            .expect("the second completed AU is ready without another packet");
         assert_eq!(second, au_from_nals(&[b1]));
+        assert_eq!(d.pop_ready(), None);
     }
 
     #[test]

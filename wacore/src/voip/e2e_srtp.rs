@@ -173,9 +173,13 @@ pub fn protect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, index: u32, rtcp: &[u
     out
 }
 
-/// Inverse of [`protect_srtcp`]: verify the tag, then decrypt the body. `None` on a bad tag or a
-/// too-short packet. Used by the round-trip test and any future inbound-RTCP handling.
-pub fn unprotect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, packet: &[u8]) -> Option<Vec<u8>> {
+/// Inverse of [`protect_srtcp`]: verify the tag, then decrypt the body and return its authenticated
+/// 31-bit index. `None` on a bad tag or a too-short packet.
+pub fn unprotect_srtcp(
+    keys: &E2eSrtpKeys,
+    sender_ssrc: u32,
+    packet: &[u8],
+) -> Option<(Vec<u8>, u32)> {
     if packet.len() < RTCP_HEADER_LEN + 4 + SRTCP_AUTH_TAG_LEN {
         return None;
     }
@@ -200,7 +204,7 @@ pub fn unprotect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, packet: &[u8]) -> O
     let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
     cipher.apply_keystream(&mut body);
     out.extend_from_slice(&body);
-    Some(out)
+    Some((out, index))
 }
 
 /// Send-side ROC tracker for monotonic 16-bit sequence numbers.
@@ -341,10 +345,9 @@ mod tests {
             0x80
         );
 
-        assert_eq!(
-            unprotect_srtcp(&srtcp, ssrc, &protected).as_deref(),
-            Some(&sr[..])
-        );
+        let (plain, index) = unprotect_srtcp(&srtcp, ssrc, &protected).unwrap();
+        assert_eq!(plain, sr);
+        assert_eq!(index, 0);
         // A flipped tag byte must fail authentication.
         let mut forged = protected.clone();
         *forged.last_mut().unwrap() ^= 1;
@@ -356,7 +359,9 @@ mod tests {
             p1[8..28],
             "a new index must change the ciphertext"
         );
-        assert_eq!(unprotect_srtcp(&srtcp, ssrc, &p1).as_deref(), Some(&sr[..]));
+        let (plain, index) = unprotect_srtcp(&srtcp, ssrc, &p1).unwrap();
+        assert_eq!(plain, sr);
+        assert_eq!(index, 1);
     }
 
     #[test]

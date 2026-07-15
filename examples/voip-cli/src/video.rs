@@ -193,14 +193,20 @@ pub enum VideoSinkMode {
 }
 
 impl VideoOpts {
-    pub fn from_env() -> Result<Self> {
+    pub async fn from_env() -> Result<Self> {
         let input = match std::env::var("WA_VIDEO_INPUT") {
             Ok(v) if v == "testsrc" => VideoInput::TestSrc,
             // A `/dev/*` node is a webcam override (v4l2 on Linux), NOT a media file — it exists on
             // disk but must not be opened with `-stream_loop`.
             Ok(v) if v.starts_with("/dev/") => VideoInput::Webcam(Some(v)),
-            Ok(v) if std::path::Path::new(&v).exists() || v.contains("://") => VideoInput::Media(v),
-            Ok(v) => VideoInput::Webcam(Some(v)),
+            Ok(v) if v.contains("://") => VideoInput::Media(v),
+            Ok(v) => {
+                if tokio::fs::try_exists(&v).await.unwrap_or(false) {
+                    VideoInput::Media(v)
+                } else {
+                    VideoInput::Webcam(Some(v))
+                }
+            }
             Err(_) => VideoInput::Webcam(None),
         };
         let sink = match std::env::var("WA_VIDEO_SINK").as_deref() {
@@ -516,6 +522,13 @@ fn spawn_ffmpeg_encoder(
 pub struct FfmpegVideoSource {
     frames: async_channel::Receiver<Vec<u8>>,
     timestamp_stride: u32,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for FfmpegVideoSource {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 #[derive(Default)]
@@ -574,7 +587,7 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(SOURCE_CHANNEL_CAP);
     let (ready_tx, ready_rx) = async_channel::bounded::<std::result::Result<(), String>>(1);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Owning the child keeps kill_on_drop armed for the whole read loop.
         let _child = &mut child;
         let mut splitter = AnnexBAuSplitter::default();
@@ -682,20 +695,25 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<FfmpegVideoSource> {
         // The call survives a dead source (audio keeps running), same as a muted mic.
         warn!("🎥 video source ended ({made} AUs, {dropped} dropped)");
     });
-    match tokio::time::timeout(SOURCE_READY_TIMEOUT, ready_rx.recv()).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(reason))) => return Err(anyhow!("video source failed before ready: {reason}")),
-        Ok(Err(_)) => return Err(anyhow!("video source ended before its first IDR")),
-        Err(_) => {
-            return Err(anyhow!(
-                "video source produced no IDR within {}s",
-                SOURCE_READY_TIMEOUT.as_secs()
-            ));
-        }
+    let readiness = match tokio::time::timeout(SOURCE_READY_TIMEOUT, ready_rx.recv()).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(reason))) => Err(anyhow!("video source failed before ready: {reason}")),
+        Ok(Err(_)) => Err(anyhow!("video source ended before its first IDR")),
+        Err(_) => Err(anyhow!(
+            "video source produced no IDR within {}s",
+            SOURCE_READY_TIMEOUT.as_secs()
+        )),
+    };
+    if let Err(error) = readiness {
+        task.abort();
+        let _ = task.await;
+        return Err(error);
     }
+    let task = task.abort_handle();
     Ok(FfmpegVideoSource {
         frames: rx,
         timestamp_stride: opts.quality.timestamp_stride(),
+        task,
     })
 }
 

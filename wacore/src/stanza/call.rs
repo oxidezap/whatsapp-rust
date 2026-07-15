@@ -784,10 +784,6 @@ pub struct VideoStateParams<'a> {
     pub state: VideoState,
     /// `dec` attr: codecs we can decode (`"H264"` on the upgrade request, `"H264,AV1"` on accept).
     pub dec: Option<&'a str>,
-    /// Emit the `voip_settings="video"` marker attr. ONLY the upgrade request carries it: the mock
-    /// server keys its enrichment (and its non-bare ack) on marker+state=11, and stamping it on a
-    /// downgrade re-arms the peer's video (the zombie-stream bug).
-    pub upgrade_marker: bool,
     pub device_orientation: Option<u8>,
 }
 
@@ -801,7 +797,7 @@ pub fn build_video_state(p: &VideoStateParams<'_>) -> Node {
     if let Some(dec) = p.dec {
         action = action.attr("dec", dec.to_string());
     }
-    if p.upgrade_marker {
+    if p.state == VideoState::UpgradeRequestV2 {
         action = action.attr("voip_settings", "video");
     }
     if let Some(o) = p.device_orientation {
@@ -2010,7 +2006,6 @@ mod tests {
             call_creator: &creator,
             state: VideoState::UpgradeRequestV2,
             dec: Some("H264"),
-            upgrade_marker: true,
             device_orientation: None,
         });
         let r = upgrade.as_node_ref();
@@ -2046,7 +2041,6 @@ mod tests {
             call_creator: &creator,
             state: VideoState::Stopped,
             dec: None,
-            upgrade_marker: false,
             device_orientation: Some(0),
         });
         let action = downgrade.as_node_ref().children().unwrap()[0].to_owned();

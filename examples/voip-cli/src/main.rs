@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use log::{debug, error, info, warn};
 use portable_atomic::AtomicU64;
 use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER};
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     }
     match command {
         CliCommand::Loopback { video: true } => {
-            video::run_video_loopback(&VideoOpts::from_env()?).await
+            video::run_video_loopback(&VideoOpts::from_env().await?).await
         }
         CliCommand::Loopback { video: false } => run_loopback().await,
         CliCommand::Listen { accept, video } => run_bot(Mode::Listen { accept, video }).await,
@@ -167,8 +167,10 @@ fn video_source_is_ignored(command: &CliCommand, video_input_is_set: bool) -> bo
         && matches!(
             command,
             CliCommand::Loopback { video: false }
-                | CliCommand::Listen { video: false, .. }
-                | CliCommand::Call { video: false, .. }
+                | CliCommand::Listen {
+                    accept: false,
+                    video: false,
+                }
         )
 }
 
@@ -737,26 +739,38 @@ impl CallObserver {
     }
 }
 
+fn lock_call_state(state: &Mutex<CallState>) -> std::sync::MutexGuard<'_, CallState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn begin_call_startup(state: &Arc<Mutex<CallState>>, call_id: &str) {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_call_state(state);
     st.starting.insert(call_id.to_string());
     st.terminated_during_startup.remove(call_id);
 }
 
 fn complete_call_startup(state: &Arc<Mutex<CallState>>, call_id: &str) -> bool {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_call_state(state);
     st.starting.remove(call_id);
     st.terminated_during_startup.remove(call_id)
 }
 
 fn record_peer_terminate(state: &Arc<Mutex<CallState>>, call_id: &str) {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_call_state(state);
     if st.starting.contains(call_id) {
         st.terminated_during_startup.insert(call_id.to_string());
     }
     st.handles.remove(call_id);
     st.video_ui.remove(call_id);
     st.call_order.retain(|id| id != call_id);
+}
+
+fn peer_terminated_during_startup(state: &Arc<Mutex<CallState>>, call_id: &str) -> bool {
+    lock_call_state(state)
+        .terminated_during_startup
+        .contains(call_id)
 }
 
 fn mark_call_most_recent(order: &mut Vec<String>, call_id: &str) {
@@ -773,7 +787,7 @@ async fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc
         return;
     }
     {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_call_state(state);
         st.handles.insert(cid.clone(), handle.clone());
         mark_call_most_recent(&mut st.call_order, &cid);
     }
@@ -781,7 +795,7 @@ async fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc
     tokio::spawn(async move {
         handle.wait_ended().await;
         {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_call_state(&state);
             // Remove only if it is still OUR handle: a same-call-id replacement may now own this slot
             // (its own cleanup will remove it), so we must not delete the live call.
             if st
@@ -827,7 +841,23 @@ impl EventHandler for CallObserver {
                         match start_media(&client, &call, video, &state).await {
                             Ok(handle) => register_handle(&state, cid.clone(), handle).await,
                             Err(e) => {
+                                let peer_ended = peer_terminated_during_startup(&state, &cid);
                                 complete_call_startup(&state, &cid);
+                                if !peer_ended
+                                    && let CallAction::Offer {
+                                        call_id,
+                                        call_creator,
+                                        ..
+                                    } = &call.action
+                                    && let Err(terminate_error) = client
+                                        .voip()
+                                        .terminate(call_id, &call.from, call_creator)
+                                        .await
+                                {
+                                    warn!(
+                                        "failed to terminate incomplete inbound call: {terminate_error}"
+                                    );
+                                }
                                 warn!("inbound media failed: {e}");
                             }
                         }
@@ -860,15 +890,24 @@ async fn start_media(
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
     info!("🔌 connecting media via client.voip().accept(..)…");
-    let voip = client.voip();
-    let mut builder = voip.accept(call).audio(mic, speaker.clone());
-    if video {
-        let opts = VideoOpts::from_env()?;
+    let video_endpoints = if video {
+        let opts = VideoOpts::from_env().await?;
         let cid = call.action.call_id();
-        builder = builder.video(
+        Some((
             video::spawn_video_source(&opts).await?,
             video::spawn_video_sink(&opts, cid).await?,
-        );
+        ))
+    } else {
+        None
+    };
+    if peer_terminated_during_startup(state, call.action.call_id()) {
+        bail!("peer ended the call during media preparation");
+    }
+    send_final_accept(client, call, video).await?;
+    let voip = client.voip();
+    let mut builder = voip.accept(call).audio(mic, speaker.clone());
+    if let Some((source, sink)) = video_endpoints {
+        builder = builder.video(source, sink);
     }
     let handle = builder
         .start()
@@ -903,7 +942,7 @@ async fn place_outgoing_call(
     let voip = client.voip();
     let mut builder = voip.call(peer).audio(mic, speaker.clone());
     if video {
-        let opts = VideoOpts::from_env()?;
+        let opts = VideoOpts::from_env().await?;
         builder = builder.video(
             video::spawn_video_source(&opts).await?,
             video::spawn_video_sink(&opts, "outgoing").await?,
@@ -928,7 +967,7 @@ async fn place_outgoing_call(
 
 /// Update (or clear) the stdin toggle's view of a call's video state.
 fn mark_video(state: &Arc<Mutex<CallState>>, call_id: &str, ui: Option<VideoUi>) {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_call_state(state);
     match ui {
         Some(ui) => {
             st.video_ui.insert(call_id.to_string(), ui);
@@ -1074,7 +1113,7 @@ fn spawn_call_event_listener(
 
 /// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
 async fn accept_peer_video(handle: &CallHandle) -> Result<()> {
-    let opts = VideoOpts::from_env()?;
+    let opts = VideoOpts::from_env().await?;
     let src = video::spawn_video_source(&opts).await?;
     let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
     handle
@@ -1109,7 +1148,7 @@ async fn respond_to_offer(
             .map_err(|e| anyhow!("send reject: {e}"))?;
         return Ok(());
     }
-    // Callee flow: preaccept immediately, then accept (signaling).
+    // Callee flow: preaccept immediately; final accept waits for ready media.
     let audio_rates = &["16000"];
     let pre_id = hex::encode(rand::random::<[u8; 8]>());
     client
@@ -1125,6 +1164,19 @@ async fn respond_to_offer(
         ))
         .await
         .map_err(|e| anyhow!("send preaccept: {e}"))?;
+    Ok(())
+}
+
+async fn send_final_accept(client: &Arc<Client>, call: &IncomingCall, video: bool) -> Result<()> {
+    let CallAction::Offer {
+        call_id,
+        call_creator,
+        ..
+    } = &call.action
+    else {
+        return Ok(());
+    };
+    let audio_rates = &["16000"];
     let accept_id = hex::encode(rand::random::<[u8; 8]>());
     let metadata = if video { call.media.as_deref() } else { None };
     let accept_node = stanza::build_accept(&stanza::AcceptParams {
@@ -1179,7 +1231,7 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
         while let Ok(line) = line_rx.recv().await {
             // The most recent live call is the toggle's target (this demo runs one call at a time).
             let picked = {
-                let st = state.lock().unwrap();
+                let st = lock_call_state(&state);
                 st.call_order.iter().rev().find_map(|cid| {
                     st.handles
                         .get(cid)
@@ -1211,7 +1263,7 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
                     None => {
                         info!("🎥 requesting video upgrade");
                         let started = async {
-                            let opts = VideoOpts::from_env()?;
+                            let opts = VideoOpts::from_env().await?;
                             let src = video::spawn_video_source(&opts).await?;
                             let sink = video::spawn_video_sink(&opts, &cid).await?;
                             handle
@@ -1323,7 +1375,7 @@ mod tests {
 
     use super::{
         CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
-        parse_cli, record_peer_terminate, video_source_is_ignored,
+        parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
     };
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -1404,11 +1456,17 @@ mod tests {
 
     #[test]
     fn warns_when_video_input_cannot_be_used() {
-        let audio_only = parse_cli(&argv(&["listen", "accept"]));
+        let loopback = parse_cli(&argv(&["loopback"]));
+        let rejecting = parse_cli(&argv(&["listen"]));
+        let accepting = parse_cli(&argv(&["listen", "accept"]));
+        let calling = parse_cli(&argv(&["call", "15550001111@lid"]));
         let video = parse_cli(&argv(&["listen", "accept", "--video"]));
 
-        assert!(video_source_is_ignored(&audio_only, true));
-        assert!(!video_source_is_ignored(&audio_only, false));
+        assert!(video_source_is_ignored(&loopback, true));
+        assert!(video_source_is_ignored(&rejecting, true));
+        assert!(!video_source_is_ignored(&accepting, true));
+        assert!(!video_source_is_ignored(&calling, true));
+        assert!(!video_source_is_ignored(&loopback, false));
         assert!(!video_source_is_ignored(&video, true));
         assert!(!video_source_is_ignored(&CliCommand::Usage, true));
     }
@@ -1418,6 +1476,7 @@ mod tests {
         let state = Arc::new(Mutex::new(CallState::default()));
         begin_call_startup(&state, "CALL-ID-STARTING");
         record_peer_terminate(&state, "CALL-ID-STARTING");
+        assert!(peer_terminated_during_startup(&state, "CALL-ID-STARTING"));
         assert!(complete_call_startup(&state, "CALL-ID-STARTING"));
 
         let st = state.lock().unwrap();

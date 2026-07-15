@@ -6,7 +6,7 @@ use log::{debug, warn};
 use wacore::stanza::call::{
     TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
-    build_call_video_ack, build_terminate,
+    VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
 };
 use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::types::call::{CallAction, IncomingCall, MissedCall, MissedReason};
@@ -237,6 +237,20 @@ impl StanzaHandler for CallHandler {
                                     registry.set_is_video(call_id, false);
                                 }
                                 _ => {}
+                            }
+                            if *state == VideoState::UpgradeAccept {
+                                let enabled = build_video_state(&VideoStateParams {
+                                    call_id,
+                                    to: &call.from,
+                                    id: &client.generate_request_id(),
+                                    call_creator: call.action.call_creator(),
+                                    state: VideoState::Enabled,
+                                    dec: None,
+                                    device_orientation: None,
+                                });
+                                if let Err(e) = client.send_node(enabled).await {
+                                    warn!("call: failed to announce accepted video upgrade: {e}");
+                                }
                             }
                         }
                     }
@@ -484,6 +498,7 @@ mod tests {
         let (ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
         let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
         registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
+        let enabled_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
 
         let node = node_to_owned_ref(&video_stanza("4")); // UpgradeAccept
         let mut cancelled = false;
@@ -511,6 +526,15 @@ mod tests {
             registry.snapshot("CALL-ID-0001").expect("session").is_video,
             "UpgradeAccept marks the call as video"
         );
+        let enabled = tokio::time::timeout(std::time::Duration::from_secs(2), enabled_waiter)
+            .await
+            .expect("Enabled stanza must be sent")
+            .expect("waiter");
+        let enabled_ref = enabled.as_node_ref();
+        let children = enabled_ref.children().expect("video child");
+        let video = &children[0];
+        assert_eq!(video.tag, "video");
+        assert_eq!(video.attrs().optional_string("state").as_deref(), Some("1"));
 
         // The peer stopping its video clears the flag but does NOT disable our plane.
         let node = node_to_owned_ref(&video_stanza("6"));
