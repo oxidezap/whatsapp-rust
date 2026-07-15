@@ -405,7 +405,7 @@ mod tests {
         // A one-off large message grows the buffer, but copy_out releases the
         // excess so it is not pinned on the thread-local afterward.
         b.get_buffer()
-            .extend_from_slice(&vec![0u8; CryptoBuffer::MAX_RETAINED_CAPACITY * 4]);
+            .resize(CryptoBuffer::MAX_RETAINED_CAPACITY * 4, 0);
         assert!(b.buffer.capacity() > CryptoBuffer::MAX_RETAINED_CAPACITY);
         let _ = b.copy_out();
         assert!(
@@ -499,20 +499,22 @@ mod tests {
         let skdm = block_on(create_sender_key_distribution_message(
             &name, &mut bob, &mut rng,
         ))
-        .expect("test");
+        .expect("bob creates his sender key distribution message");
         let mut alice = InMemorySenderKeyStore {
             keys: HashMap::new(),
         };
         block_on(process_sender_key_distribution_message(
             &name, &skdm, &mut alice,
         ))
-        .expect("test");
+        .expect("alice processes bob's distribution message");
 
         // Bob's first send: iteration 0, reserves the first batch.
-        let m0 = block_on(group_encrypt(&mut bob, &name, b"m0", &mut rng)).expect("test");
+        let m0 = block_on(group_encrypt(&mut bob, &name, b"m0", &mut rng))
+            .expect("bob encrypts m0 at iteration 0");
         assert_eq!(m0.iteration(), 0);
         assert_eq!(
-            block_on(group_decrypt(m0.serialized(), &mut alice, &name)).expect("test"),
+            block_on(group_decrypt(m0.serialized(), &mut alice, &name))
+                .expect("alice decrypts m0 at iteration 0"),
             b"m0"
         );
 
@@ -520,20 +522,23 @@ mod tests {
         let snapshot = bob
             .keys
             .get(&name)
-            .expect("test")
+            .expect("bob's record is stored after his first send")
             .serialize()
-            .expect("test");
+            .expect("bob's record serializes for the durable snapshot");
 
         // A send whose advance never becomes durable (crash before flush).
-        let lost = block_on(group_encrypt(&mut bob, &name, b"lost", &mut rng)).expect("test");
+        let lost = block_on(group_encrypt(&mut bob, &name, b"lost", &mut rng))
+            .expect("bob encrypts the send that the crash loses");
         assert_eq!(lost.iteration(), 1);
 
         // Reload from the snapshot: the current chain fast-forwards past the lease.
-        let reloaded = SenderKeyRecord::deserialize(&snapshot).expect("test");
+        let reloaded = SenderKeyRecord::deserialize(&snapshot)
+            .expect("the durable snapshot deserializes on reload");
         bob.keys.insert(name.clone(), reloaded);
 
         // The next send must NOT reuse iterations 1..batch-1 (the lost one included).
-        let after = block_on(group_encrypt(&mut bob, &name, b"after", &mut rng)).expect("test");
+        let after = block_on(group_encrypt(&mut bob, &name, b"after", &mut rng))
+            .expect("bob encrypts the first send after the reload");
         assert!(
             after.iteration() >= SENDER_CHAIN_RESERVATION_BATCH,
             "reload reused a possibly-spent iteration: {} < {}",
@@ -544,7 +549,8 @@ mod tests {
         // Alice, who last saw iteration 0, still decrypts across the gap
         // (a forward jump well under MAX_FORWARD_JUMPS).
         assert_eq!(
-            block_on(group_decrypt(after.serialized(), &mut alice, &name)).expect("test"),
+            block_on(group_decrypt(after.serialized(), &mut alice, &name))
+                .expect("alice decrypts across the fast-forwarded iteration gap"),
             b"after"
         );
     }
@@ -589,11 +595,13 @@ mod tests {
         block_on(create_sender_key_distribution_message(
             &name, &mut bob, &mut rng,
         ))
-        .expect("test");
+        .expect("bob creates his sender key distribution message");
 
         let sends = 2 * SENDER_CHAIN_RESERVATION_BATCH + 2;
-        for _ in 0..sends {
-            block_on(group_encrypt(&mut bob, &name, b"x", &mut rng)).expect("test");
+        for i in 0..sends {
+            block_on(group_encrypt(&mut bob, &name, b"x", &mut rng)).unwrap_or_else(|e| {
+                panic!("bob's send {i} of {sends} under the lease failed: {e}")
+            });
         }
         assert_eq!(
             bob.gated,
