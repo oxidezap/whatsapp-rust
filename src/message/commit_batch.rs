@@ -477,7 +477,7 @@ impl Client {
             // drop with them instead of persisting rowless.
             if durable && !self.inbound_commit_batch.has_entries() {
                 match self.flush_signal_cache().await {
-                    Ok(()) => self.signal_cache.clear().await,
+                    Ok(()) => self.signal_cache.clear_after_flush().await,
                     // Committed/acked state the server never redelivers: keep
                     // it resident so the next successful flush persists it.
                     // Safe to carry across the reconnect — the teardown

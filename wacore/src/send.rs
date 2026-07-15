@@ -1,8 +1,7 @@
 use crate::client::context::{GroupInfo, SendContextResolver};
 use crate::libsignal::protocol::{
-    CiphertextMessage, IdentityChange, ProtocolAddress, SENDERKEY_MESSAGE_CURRENT_VERSION,
-    SenderKeyMessage, SenderKeyStore, SignalProtocolError, UsePQRatchet, message_encrypt,
-    process_prekey_bundle,
+    CiphertextMessage, IdentityChange, ProtocolAddress, SenderKeyMessage, SenderKeyStore,
+    UsePQRatchet, message_encrypt, process_prekey_bundle,
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::messages::MessageUtils;
@@ -23,7 +22,6 @@ use std::future::Future;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, JidExt as _};
-use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
 use waproto::whatsapp as wa;
 
 /// Wire-format constants (MsgCreateDeviceStanza.js).

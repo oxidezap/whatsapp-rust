@@ -22,6 +22,7 @@ mod crypto;
 pub mod error;
 mod group_cipher;
 mod identity_key;
+mod local_field;
 #[allow(clippy::module_inception)]
 mod protocol;
 mod ratchet;

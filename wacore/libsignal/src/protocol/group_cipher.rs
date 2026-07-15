@@ -25,6 +25,12 @@ struct CryptoBuffer {
 
 impl CryptoBuffer {
     const INITIAL_CAPACITY: usize = 1024;
+    /// Reuse the buffer across sends, but do not let a one-off large message pin
+    /// an oversized allocation on this thread for the rest of the process. Small
+    /// messages (the common case) fit under this and reuse the buffer with no
+    /// reallocation; anything larger is released back after its result is copied
+    /// out. Sized well above a typical message so normal traffic never churns.
+    const MAX_RETAINED_CAPACITY: usize = 16 * 1024;
 
     fn new() -> Self {
         Self {
@@ -43,6 +49,18 @@ impl CryptoBuffer {
     fn take_buffer(&mut self) -> Vec<u8> {
         std::mem::replace(&mut self.buffer, Vec::with_capacity(Self::INITIAL_CAPACITY))
     }
+
+    /// Copy the written bytes into a right-sized box, keeping the buffer for the
+    /// next (small) message instead of handing away its capacity. A one-off
+    /// large message's capacity is released here so it is not retained on this
+    /// thread-local for the process lifetime.
+    fn copy_out(&mut self) -> Box<[u8]> {
+        let out: Box<[u8]> = self.buffer.as_slice().into();
+        if self.buffer.capacity() > Self::MAX_RETAINED_CAPACITY {
+            self.buffer = Vec::with_capacity(Self::INITIAL_CAPACITY);
+        }
+        out
+    }
 }
 
 thread_local! {
@@ -53,8 +71,8 @@ thread_local! {
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across this call (and any paired SKDM creation) so the load/advance/store
 /// of the chain is atomic against concurrent encrypts.
-pub async fn group_encrypt<R: Rng + CryptoRng>(
-    sender_key_store: &mut dyn SenderKeyStore,
+pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
+    sender_key_store: &mut S,
     sender_key_name: &SenderKeyName,
     plaintext: &[u8],
     csprng: &mut R,
@@ -87,13 +105,21 @@ pub async fn group_encrypt<R: Rng + CryptoRng>(
 
     let ciphertext = ENCRYPTION_BUFFER.with(|buffer| {
         let mut buf_wrapper = buffer.borrow_mut();
-        let buf = buf_wrapper.get_buffer();
-        aes_256_cbc_encrypt_into(plaintext, message_keys.cipher_key(), message_keys.iv(), buf)
-            .map_err(|_| {
-                log::error!("outgoing sender key state corrupt for distribution");
-                SignalProtocolError::InvalidSenderKeySession
-            })?;
-        Ok::<Vec<u8>, SignalProtocolError>(buf_wrapper.take_buffer())
+        {
+            let buf = buf_wrapper.get_buffer();
+            aes_256_cbc_encrypt_into(plaintext, message_keys.cipher_key(), message_keys.iv(), buf)
+                .map_err(|_| {
+                    log::error!("outgoing sender key state corrupt for distribution");
+                    SignalProtocolError::InvalidSenderKeySession
+                })?;
+        }
+        // Copy out a right-sized ciphertext and keep the reusable buffer, rather
+        // than handing away its (1 KiB) capacity and re-allocating one per send.
+        // A group skmsg is small, so `take_buffer` here otherwise cost a fresh
+        // 1 KiB per send once the production path started sharing this primitive.
+        // `copy_out` releases the capacity of a one-off large message so it is
+        // not pinned on this thread-local afterward.
+        Ok::<Box<[u8]>, SignalProtocolError>(buf_wrapper.copy_out())
     })?;
 
     let signing_key = sender_key_state
@@ -104,17 +130,24 @@ pub async fn group_encrypt<R: Rng + CryptoRng>(
         message_version,
         sender_key_state.chain_id(),
         message_keys.iteration(),
-        ciphertext.into_boxed_slice(),
+        ciphertext,
         csprng,
         &signing_key,
     )?;
 
     sender_key_state.set_sender_chain_key(next_sender_chain_key);
 
-    // Outbound advance: this iteration's (key, IV) must never be re-derivable,
-    // so the store must gate the ciphertext on durability. Decrypt-side
-    // advances stay ungated (they re-derive forward).
-    record.mark_wire_gated();
+    // Outbound advance: this iteration's (key, IV) must never be re-derivable.
+    // Iterations below the durable reservation are already covered, so their
+    // sends ride the coalesced write-behind; only the send that reaches the
+    // ceiling re-reserves and gates the ciphertext on a synchronous flush (which
+    // fast-forwards past the reservation after any reload). Decrypt-side advances
+    // stay ungated (they re-derive forward). Mirrors the DM counter lease in
+    // SessionRecord.
+    let spent_iteration = message_keys.iteration();
+    if spent_iteration >= record.reserved_iteration() {
+        record.reserve_iterations(spent_iteration);
+    }
 
     sender_key_store
         .store_sender_key(sender_key_name, record)
@@ -359,6 +392,28 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
 
+    #[test]
+    fn crypto_buffer_reuses_small_and_releases_oversized() {
+        let mut b = CryptoBuffer::new();
+
+        // A small message keeps its (reusable) capacity: no release, no churn.
+        b.get_buffer().extend_from_slice(&[0u8; 512]);
+        let _ = b.copy_out();
+        assert!(b.buffer.capacity() <= CryptoBuffer::MAX_RETAINED_CAPACITY);
+        assert!(b.buffer.capacity() >= CryptoBuffer::INITIAL_CAPACITY);
+
+        // A one-off large message grows the buffer, but copy_out releases the
+        // excess so it is not pinned on the thread-local afterward.
+        b.get_buffer()
+            .resize(CryptoBuffer::MAX_RETAINED_CAPACITY * 4, 0);
+        assert!(b.buffer.capacity() > CryptoBuffer::MAX_RETAINED_CAPACITY);
+        let _ = b.copy_out();
+        assert!(
+            b.buffer.capacity() <= CryptoBuffer::MAX_RETAINED_CAPACITY,
+            "oversized capacity must be released after copy_out"
+        );
+    }
+
     struct InMemorySenderKeyStore {
         keys: HashMap<SenderKeyName, SenderKeyRecord>,
     }
@@ -424,5 +479,137 @@ mod tests {
             }
             other => panic!("expected NoSenderKeyState, got {other:?}"),
         }
+    }
+
+    use crate::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+    use futures::executor::block_on;
+
+    /// THE crash-safety invariant: a reload mid-lease must never re-derive an
+    /// iteration that a lost send may already have put on the wire, and a peer
+    /// must still decrypt across the resulting gap. Bob sends iteration 0
+    /// (reserving a batch), his record is snapshotted, a further send is lost in
+    /// the crash, and the reload fast-forwards past the whole reservation.
+    #[test]
+    fn crash_mid_lease_skips_spent_iterations_and_peer_decrypts() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        let skdm = block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("bob creates his sender key distribution message");
+        let mut alice = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(process_sender_key_distribution_message(
+            &name, &skdm, &mut alice,
+        ))
+        .expect("alice processes bob's distribution message");
+
+        // Bob's first send: iteration 0, reserves the first batch.
+        let m0 = block_on(group_encrypt(&mut bob, &name, b"m0", &mut rng))
+            .expect("bob encrypts m0 at iteration 0");
+        assert_eq!(m0.iteration(), 0);
+        assert_eq!(
+            block_on(group_decrypt(m0.serialized(), &mut alice, &name))
+                .expect("alice decrypts m0 at iteration 0"),
+            b"m0"
+        );
+
+        // Snapshot Bob's durable state (chain at iteration 1, reservation persisted).
+        let snapshot = bob
+            .keys
+            .get(&name)
+            .expect("bob's record is stored after his first send")
+            .serialize()
+            .expect("bob's record serializes for the durable snapshot");
+
+        // A send whose advance never becomes durable (crash before flush).
+        let lost = block_on(group_encrypt(&mut bob, &name, b"lost", &mut rng))
+            .expect("bob encrypts the send that the crash loses");
+        assert_eq!(lost.iteration(), 1);
+
+        // Reload from the snapshot: the current chain fast-forwards past the lease.
+        let reloaded = SenderKeyRecord::deserialize(&snapshot)
+            .expect("the durable snapshot deserializes on reload");
+        bob.keys.insert(name.clone(), reloaded);
+
+        // The next send must NOT reuse iterations 1..batch-1 (the lost one included).
+        let after = block_on(group_encrypt(&mut bob, &name, b"after", &mut rng))
+            .expect("bob encrypts the first send after the reload");
+        assert!(
+            after.iteration() >= SENDER_CHAIN_RESERVATION_BATCH,
+            "reload reused a possibly-spent iteration: {} < {}",
+            after.iteration(),
+            SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        // Alice, who last saw iteration 0, still decrypts across the gap
+        // (a forward jump well under MAX_FORWARD_JUMPS).
+        assert_eq!(
+            block_on(group_decrypt(after.serialized(), &mut alice, &name))
+                .expect("alice decrypts across the fast-forwarded iteration gap"),
+            b"after"
+        );
+    }
+
+    /// A store that emulates the real signal-cache gate: it records whether each
+    /// stored advance was wire-gated and clears the transient flag, so a run of
+    /// sends can be counted for gate frequency.
+    struct GateCountingStore {
+        keys: HashMap<SenderKeyName, SenderKeyRecord>,
+        gated: usize,
+    }
+    #[async_trait]
+    impl SenderKeyStore for GateCountingStore {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            mut record: SenderKeyRecord,
+        ) -> Result<()> {
+            if record.is_wire_gated() {
+                self.gated += 1;
+                record.clear_wire_gated();
+            }
+            self.keys.insert(name.clone(), record);
+            Ok(())
+        }
+        async fn load_sender_key(&self, name: &SenderKeyName) -> Result<Option<SenderKeyRecord>> {
+            Ok(self.keys.get(name).cloned())
+        }
+    }
+
+    /// The lease must amortize the synchronous flush to one per batch: over
+    /// `2*batch + 2` sends, exactly the sends at iterations 0, batch and 2*batch
+    /// gate; the rest ride the coalesced write-behind.
+    #[test]
+    fn lease_amortizes_the_wire_gate() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = GateCountingStore {
+            keys: HashMap::new(),
+            gated: 0,
+        };
+        block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("bob creates his sender key distribution message");
+
+        let sends = 2 * SENDER_CHAIN_RESERVATION_BATCH + 2;
+        for i in 0..sends {
+            block_on(group_encrypt(&mut bob, &name, b"x", &mut rng)).unwrap_or_else(|e| {
+                panic!("bob's send {i} of {sends} under the lease failed: {e}")
+            });
+        }
+        assert_eq!(
+            bob.gated,
+            3,
+            "expected one gate per batch (iterations 0, {batch}, {two_batch}), got {got}",
+            batch = SENDER_CHAIN_RESERVATION_BATCH,
+            two_batch = 2 * SENDER_CHAIN_RESERVATION_BATCH,
+            got = bob.gated
+        );
     }
 }

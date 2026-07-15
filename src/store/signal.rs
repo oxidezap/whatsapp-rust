@@ -1,7 +1,8 @@
 use crate::store::Device;
 use async_lock::Mutex;
 use async_trait::async_trait;
-use std::sync::Arc;
+use rand::RngExt;
+use std::sync::{Arc, OnceLock};
 use wacore::libsignal::protocol::error::Result as SignalResult;
 use wacore::libsignal::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, PrivateKey,
@@ -13,6 +14,18 @@ use wacore::libsignal::store::*;
 use waproto::whatsapp::{PreKeyRecordStructure, SignedPreKeyRecordStructure};
 
 type StoreError = Box<dyn std::error::Error + Send + Sync>;
+
+type DirectStoreIncarnation = [u8; 16];
+
+// Synchronous direct writes make process restart the only unsafe reload boundary.
+fn direct_store_incarnation() -> &'static DirectStoreIncarnation {
+    static INCARNATION: OnceLock<DirectStoreIncarnation> = OnceLock::new();
+    INCARNATION.get_or_init(|| {
+        let mut incarnation = [0; 16];
+        rand::make_rng::<rand::rngs::StdRng>().fill(&mut incarnation);
+        incarnation
+    })
+}
 
 macro_rules! impl_store_wrapper {
     ($wrapper_ty:ty, $read_lock:ident, $write_lock:ident) => {
@@ -407,7 +420,8 @@ impl SessionStore for Device {
         let address_str = address.as_str();
         match self.backend.get_session(address_str).await {
             Ok(Some(session_data)) => {
-                SessionRecord::deserialize(&session_data).map_err(|e| Box::new(e) as StoreError)
+                SessionRecord::deserialize_for_store(&session_data, direct_store_incarnation())
+                    .map_err(|e| Box::new(e) as StoreError)
             }
             Ok(None) => Ok(SessionRecord::new_fresh()),
             Err(e) => Err(Box::new(e) as StoreError),
@@ -425,7 +439,8 @@ impl SessionStore for Device {
         record: &SessionRecord,
     ) -> Result<(), StoreError> {
         let address_str = address.as_str();
-        let session_data = record.serialize().map_err(|e| Box::new(e) as StoreError)?;
+        let mut session_data = Vec::new();
+        record.serialize_into_for_store(&mut session_data, direct_store_incarnation());
 
         self.backend
             .put_session(address_str, &session_data)
@@ -497,7 +512,7 @@ impl SenderKeyStore for Device {
         sender_key_name: &SenderKeyName,
         record: SenderKeyRecord,
     ) -> SignalResult<()> {
-        let serialized_record = record.serialize()?;
+        let serialized_record = record.serialize_for_store(direct_store_incarnation())?;
         self.backend
             .put_sender_key(sender_key_name.cache_key(), &serialized_record)
             .await
@@ -515,8 +530,9 @@ impl SenderKeyStore for Device {
             .map_err(|e| SignalProtocolError::BackendError("load_sender_key", Box::new(e)))?
         {
             Some(data) => {
-                let record = SenderKeyRecord::deserialize(&data)?;
-                if record.serialize()?.is_empty() {
+                let record =
+                    SenderKeyRecord::deserialize_for_store(&data, direct_store_incarnation())?;
+                if record.is_empty() {
                     Ok(None)
                 } else {
                     Ok(Some(record))
@@ -530,6 +546,121 @@ impl SenderKeyStore for Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leased_session() -> SessionRecord {
+        use wacore::libsignal::protocol::{ChainKey, KeyPair, RootKey, SessionState};
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let base_key = KeyPair::generate(&mut rng).public_key;
+        let mut state = SessionState::new(3, &local, &remote, &RootKey::new([0; 32]), &base_key);
+        state.set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([1; 32], 0));
+        let mut record = SessionRecord::new(state);
+        record.reserve_sender_chain_counters(0);
+        record
+    }
+
+    fn session_chain_index(record: &SessionRecord) -> u32 {
+        record
+            .session_state()
+            .expect("session")
+            .get_sender_chain_key()
+            .expect("sender chain")
+            .index()
+    }
+
+    #[tokio::test]
+    async fn direct_session_store_preserves_clean_reload_and_recovery_ceiling() {
+        let backend = crate::test_utils::create_test_backend().await;
+        let device = Device::new(backend.clone());
+        let address = ProtocolAddress::new("15550001001".to_string(), 1.into());
+
+        SessionStore::store_session(&device, &address, &leased_session())
+            .await
+            .expect("store session");
+        let clean = SessionStore::load_session(&device, &address)
+            .await
+            .expect("clean reload");
+        assert_eq!(session_chain_index(&clean), 0);
+
+        let replacement = Device::new(backend.clone());
+        let same_process = SessionStore::load_session(&replacement, &address)
+            .await
+            .expect("same-process reload");
+        assert_eq!(session_chain_index(&same_process), 0);
+
+        let durable = backend
+            .get_session(address.as_str())
+            .await
+            .expect("read durable session")
+            .expect("durable session");
+        let recovered = SessionRecord::deserialize(&durable).expect("recovery reload");
+        assert_eq!(
+            session_chain_index(&recovered),
+            wacore::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_sender_key_store_preserves_clean_reloads_and_recovery_ceiling() {
+        use wacore::libsignal::protocol::{
+            create_sender_key_distribution_message, group_decrypt, group_encrypt,
+            process_sender_key_distribution_message,
+        };
+
+        let sender_backend = crate::test_utils::create_test_backend().await;
+        let mut sender = Device::new(sender_backend.clone());
+        let mut receiver = Device::new(crate::test_utils::create_test_backend().await);
+        let name = SenderKeyName::from_parts("1234567890@g.us", "15550001000@s.whatsapp.net:0");
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let distribution = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .expect("sender setup");
+        process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+            .await
+            .expect("receiver setup");
+
+        let mut last = None;
+        for expected_iteration in 0..=32 {
+            let message = group_encrypt(&mut sender, &name, b"payload", &mut rng)
+                .await
+                .expect("group encrypt");
+            assert_eq!(message.iteration(), expected_iteration);
+            last = Some(message);
+        }
+
+        let plaintext = group_decrypt(
+            last.expect("last message").serialized(),
+            &mut receiver,
+            &name,
+        )
+        .await
+        .expect("receiver decrypts after missed messages");
+        assert_eq!(plaintext, b"payload");
+
+        let mut replacement = Device::new(sender_backend.clone());
+        let same_process = group_encrypt(&mut replacement, &name, b"same-process", &mut rng)
+            .await
+            .expect("encrypt after same-process replacement");
+        assert_eq!(same_process.iteration(), 33);
+
+        let durable = sender_backend
+            .get_sender_key(name.cache_key())
+            .await
+            .expect("read durable sender key")
+            .expect("durable sender key");
+        let recovered = SenderKeyRecord::deserialize(&durable).expect("recovery reload");
+        assert_eq!(
+            recovered
+                .sender_key_state()
+                .expect("sender-key state")
+                .sender_chain_key()
+                .expect("sender chain")
+                .iteration(),
+            wacore::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
 
     // A rotated-out signed pre-key (id != current field) must load from the
     // backend table so delayed prekey messages naming the old id still decrypt.
