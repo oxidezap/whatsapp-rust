@@ -1032,7 +1032,7 @@ impl Client {
 mod tests {
     use super::*;
     use crate::lid_pn_cache::LearningSource;
-    use crate::test_utils::create_test_client_with_failing_http;
+    use crate::test_utils::{create_test_client_with_failing_http, wait_for_lock_waiter};
     use std::sync::Arc;
 
     async fn create_test_client() -> Arc<Client> {
@@ -2700,7 +2700,8 @@ mod tests {
         use wacore::types::jid::JidExt;
 
         let client = create_test_client().await;
-        let group = "120363000000000001@g.us";
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group_id = group.to_string();
         let own_lid = Jid::from_str("193832511623409:13@lid").unwrap();
         client
             .persistence_manager
@@ -2709,7 +2710,7 @@ mod tests {
             )))
             .await;
 
-        let sk_name = SenderKeyName::from_parts(group, own_lid.to_protocol_address().as_str());
+        let sk_name = SenderKeyName::from_parts(&group_id, own_lid.to_protocol_address().as_str());
         client
             .signal_cache
             .put_sender_key(&sk_name, SenderKeyRecord::new_empty())
@@ -2718,7 +2719,7 @@ mod tests {
         client
             .persistence_manager
             .set_sender_key_status(
-                group,
+                &group_id,
                 &[
                     ("271060335329480:0@lid", true),
                     ("77610646245392:0@lid", true),
@@ -2728,7 +2729,7 @@ mod tests {
             .unwrap();
 
         client
-            .rotate_sender_key_on_participant_remove(group, &["271060335329480"])
+            .rotate_sender_key_on_participant_remove(&group, &["271060335329480"])
             .await;
 
         let device_snapshot = client.persistence_manager.get_device_snapshot();
@@ -2744,7 +2745,7 @@ mod tests {
 
         let rows = client
             .persistence_manager
-            .get_sender_key_devices(group)
+            .get_sender_key_devices(&group_id)
             .await
             .unwrap();
         assert!(rows.is_empty(), "sender_key_devices must be cleared");
@@ -2760,7 +2761,8 @@ mod tests {
         use wacore::types::jid::JidExt;
 
         let client = create_test_client().await;
-        let group = "120363000000000001@g.us";
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group_id = group.to_string();
         let own_lid = Jid::from_str("193832511623409:13@lid").unwrap();
         client
             .persistence_manager
@@ -2769,7 +2771,7 @@ mod tests {
             )))
             .await;
 
-        let sk_name = SenderKeyName::from_parts(group, own_lid.to_protocol_address().as_str());
+        let sk_name = SenderKeyName::from_parts(&group_id, own_lid.to_protocol_address().as_str());
         client
             .signal_cache
             .put_sender_key(&sk_name, SenderKeyRecord::new_empty())
@@ -2777,12 +2779,12 @@ mod tests {
 
         client
             .persistence_manager
-            .set_sender_key_status(group, &[("271060335329480:0@lid", false)])
+            .set_sender_key_status(&group_id, &[("271060335329480:0@lid", false)])
             .await
             .unwrap();
 
         client
-            .rotate_sender_key_on_participant_remove(group, &["271060335329480"])
+            .rotate_sender_key_on_participant_remove(&group, &["271060335329480"])
             .await;
 
         let device_snapshot = client.persistence_manager.get_device_snapshot();
@@ -2794,6 +2796,188 @@ mod tests {
         assert!(
             key.is_some(),
             "sender key must survive when removed had no key"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_waits_for_in_flight_sender_key_advance() {
+        use wacore::libsignal::protocol::{
+            KeyPair, SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyRecord, group_encrypt,
+        };
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore::types::jid::JidExt;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let group_id = group.to_string();
+        let own_lid: Jid = "193832511623410:13@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let name = SenderKeyName::from_parts(&group_id, own_lid.to_protocol_address().as_str());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let key_pair = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(
+                SENDERKEY_MESSAGE_CURRENT_VERSION,
+                7,
+                0,
+                &[9; 32],
+                key_pair.public_key,
+                Some(key_pair.private_key),
+            )
+            .unwrap();
+        client.signal_cache.put_sender_key(&name, record).await;
+
+        let chain_lock = client.signal_cache.sender_key_lock(&name).await;
+        let held = chain_lock.lock().await;
+        let lock_refs = Arc::strong_count(&chain_lock);
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let rotation = tokio::spawn({
+            let client = client.clone();
+            let group = group.clone();
+            let started = started.clone();
+            async move {
+                started.wait().await;
+                client.force_rotate_own_sender_key(&group).await;
+            }
+        });
+
+        started.wait().await;
+        wait_for_lock_waiter(&chain_lock, lock_refs).await;
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&name, &*snapshot.backend)
+                .await
+                .unwrap()
+                .is_some(),
+            "rotation must wait for the in-flight advance"
+        );
+
+        let mut sender_key_store = client.sender_key_adapter().await;
+        group_encrypt(
+            &mut sender_key_store,
+            &name,
+            b"in-flight ciphertext",
+            &mut rng,
+        )
+        .await
+        .expect("advance under the held chain lock");
+        drop(held);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), rotation)
+            .await
+            .expect("rotation must resume")
+            .expect("rotation task");
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&name, &*snapshot.backend)
+                .await
+                .unwrap()
+                .is_none(),
+            "rotation must retire the state written by the in-flight advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn participant_rotation_audit_waits_for_group_distribution_guard() {
+        use wacore::libsignal::protocol::SenderKeyRecord;
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore::types::jid::JidExt;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000004@g.us".parse().unwrap();
+        let group_id = group.to_string();
+        let own_lid: Jid = "193832511623411:13@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let name = SenderKeyName::from_parts(&group_id, own_lid.to_protocol_address().as_str());
+        client
+            .signal_cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        client
+            .persistence_manager
+            .set_sender_key_status(&group_id, &[("271060335329481:0@lid", true)])
+            .await
+            .unwrap();
+
+        let held = client.group_distribution_lock(&group).await;
+        let lock = client
+            .group_distribution_locks
+            .get(&group)
+            .await
+            .expect("cached distribution lock");
+        let lock_refs = Arc::strong_count(&lock);
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let rotation = tokio::spawn({
+            let client = client.clone();
+            let group = group.clone();
+            let started = started.clone();
+            async move {
+                started.wait().await;
+                client
+                    .rotate_sender_key_on_participant_remove(&group, &["271060335329481"])
+                    .await;
+            }
+        });
+
+        started.wait().await;
+        wait_for_lock_waiter(&lock, lock_refs).await;
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&name, &*snapshot.backend)
+                .await
+                .unwrap()
+                .is_some(),
+            "rotation must not delete before the active distribution ends"
+        );
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(&group_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "rotation must not clear tracking before it owns the distribution lane"
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), rotation)
+            .await
+            .expect("rotation must resume")
+            .expect("rotation task");
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&name, &*snapshot.backend)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(&group_id)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

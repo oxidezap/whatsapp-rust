@@ -267,6 +267,8 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
             client.signal_cache.delete_identity(cand).await;
         }
 
+        let status_jid = Jid::status_broadcast();
+        let distribution_guard = client.group_distribution_lock(&status_jid).await;
         let status_group = "status@broadcast";
         for own_jid in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
             let sk_name =
@@ -276,6 +278,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
                 .delete_sender_key(sk_name.cache_key())
                 .await;
         }
+        drop(distribution_guard);
 
         client
             .flush_signal_cache_batch_safe_logged("identity change", None)

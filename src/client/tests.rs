@@ -2786,6 +2786,44 @@ async fn test_custom_cache_config_is_respected() {
     assert!(!client.is_logged_in());
 }
 
+#[tokio::test]
+async fn held_group_distribution_lane_survives_capacity_pressure() {
+    let config = crate::cache_config::CacheConfig {
+        group_distribution_locks_capacity: 1,
+        ..Default::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "group_distribution_eviction",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    let first: Jid = "120363000000000011@g.us".parse().unwrap();
+    let second: Jid = "120363000000000012@g.us".parse().unwrap();
+    let third: Jid = "120363000000000013@g.us".parse().unwrap();
+    let held = client.group_distribution_lock(&first).await;
+
+    drop(client.group_distribution_lock(&second).await);
+    drop(client.group_distribution_lock(&third).await);
+
+    let first_again = client
+        .group_distribution_locks
+        .get(&first)
+        .await
+        .expect("held lane must remain cached");
+    assert!(
+        first_again.try_lock().is_none(),
+        "capacity pressure must not mint a second live lane"
+    );
+    let report = client.memory_report().await;
+    assert_eq!(report.group_distribution_locks, 2);
+    assert_eq!(report.group_distribution_lock_evictions, 1);
+    assert_eq!(report.group_distribution_lock_eviction_blocks, 2);
+    drop(held);
+    assert!(first_again.try_lock().is_some());
+}
+
 /// Proves that `is_connected()` no longer gives false negatives under mutex
 /// contention. Before the fix, `try_lock()` would fail when another task held
 /// the noise_socket mutex, causing `is_connected()` to return `false` even
@@ -3383,6 +3421,9 @@ async fn memory_report_on_fresh_client() {
     let report = client.memory_report().await;
     assert_eq!(report.recent_messages.entries, 0);
     assert_eq!(report.recent_messages.bytes, 0);
+    assert_eq!(report.group_distribution_locks, 0);
+    assert_eq!(report.group_distribution_lock_evictions, 0);
+    assert_eq!(report.group_distribution_lock_eviction_blocks, 0);
     assert_eq!(report.signal_sessions.entries, 0);
     assert_eq!(report.response_waiters, 0);
 

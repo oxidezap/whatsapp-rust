@@ -204,10 +204,9 @@ pub struct CacheConfig {
     pub session_locks_capacity: u64,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
     pub chat_lanes_capacity: u64,
-    /// Per-group cold sender-key distribution lock capacity. Default: 512
-    /// (far above any realistic number of groups distributing at once; an
-    /// evicted live lock only lets one extra send repeat that group's
-    /// fan-out, the ratchet stays correct under the chain lock).
+    /// Per-group cold sender-key distribution lock capacity. Default: 512.
+    /// Soft cap: a live lane is never evicted, so the map may briefly exceed
+    /// this under concurrent fan-out instead of breaking tracker ordering.
     pub group_distribution_locks_capacity: u64,
     /// Per-chat resend rate-limiter capacity: one token-bucket entry per group
     /// recently driving retry resends. Keep above the count of concurrently

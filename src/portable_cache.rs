@@ -26,6 +26,13 @@ struct CacheEntry<V> {
     seq: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CapacityStats {
+    pub entries: u64,
+    pub evictions: u64,
+    pub eviction_blocks: u64,
+}
+
 /// Portable, runtime-agnostic in-process cache.
 ///
 /// - Max capacity with FIFO eviction
@@ -53,6 +60,8 @@ struct CacheInner<K, V> {
     order: BTreeMap<u64, K>,
     /// Next FIFO sequence to assign.
     next_seq: u64,
+    capacity_evictions: u64,
+    capacity_eviction_blocks: u64,
 }
 
 impl<K, V> CacheInner<K, V>
@@ -64,6 +73,8 @@ where
             map: HashMap::new(),
             order: BTreeMap::new(),
             next_seq: 0,
+            capacity_evictions: 0,
+            capacity_eviction_blocks: 0,
         }
     }
 
@@ -83,7 +94,9 @@ where
                 // Unguarded caches keep the single-pass pop_first() fast path.
                 None => match self.order.pop_first() {
                     Some((_, oldest_key)) => {
-                        self.map.remove(&oldest_key);
+                        if self.map.remove(&oldest_key).is_some() {
+                            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+                        }
                     }
                     None => break,
                 },
@@ -101,11 +114,17 @@ where
                     }
                     match victim_seq {
                         Some(seq) => {
-                            if let Some(oldest_key) = self.order.remove(&seq) {
-                                self.map.remove(&oldest_key);
+                            if let Some(oldest_key) = self.order.remove(&seq)
+                                && self.map.remove(&oldest_key).is_some()
+                            {
+                                self.capacity_evictions = self.capacity_evictions.saturating_add(1);
                             }
                         }
-                        None => break,
+                        None => {
+                            self.capacity_eviction_blocks =
+                                self.capacity_eviction_blocks.saturating_add(1);
+                            break;
+                        }
                     }
                 }
             }
@@ -372,6 +391,15 @@ where
             .unwrap_or(0)
     }
 
+    pub(crate) async fn capacity_stats(&self) -> CapacityStats {
+        let guard = self.inner.read().await;
+        CapacityStats {
+            entries: guard.map.len() as u64,
+            evictions: guard.capacity_evictions,
+            eviction_blocks: guard.capacity_eviction_blocks,
+        }
+    }
+
     /// Reliable awaited snapshot of `(Arc<K>, V)` pairs. Prefer this over
     /// [`iter`](Self::iter) in async contexts: `iter` is best-effort (a
     /// `try_read` spin that yields an empty snapshot under write contention),
@@ -594,6 +622,14 @@ mod tests {
         assert!(cache.get("a").await.is_none());
         assert_eq!(cache.get("b").await, Some(2));
         assert_eq!(cache.get("d").await, Some(4));
+        assert_eq!(
+            cache.capacity_stats().await,
+            CapacityStats {
+                entries: 3,
+                evictions: 1,
+                eviction_blocks: 0,
+            }
+        );
     }
 
     #[tokio::test]
@@ -659,6 +695,14 @@ mod tests {
             3,
             "all entries held -> cache exceeds capacity instead of evicting a live lock"
         );
+        assert_eq!(
+            cache.capacity_stats().await,
+            CapacityStats {
+                entries: 3,
+                evictions: 0,
+                eviction_blocks: 1,
+            }
+        );
 
         // Drop the external refs; the next insert now evicts back down to capacity.
         drop(held);
@@ -669,6 +713,14 @@ mod tests {
             cache.entry_count(),
             2,
             "once entries are released, eviction resumes down to capacity"
+        );
+        assert_eq!(
+            cache.capacity_stats().await,
+            CapacityStats {
+                entries: 2,
+                evictions: 2,
+                eviction_blocks: 1,
+            }
         );
     }
 

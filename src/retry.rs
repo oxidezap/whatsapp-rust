@@ -379,6 +379,7 @@ impl Client {
         // WA Web rotateKey: unknown device (not in participant list, not LID) →
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
+        let mut rotated_sender_key = false;
         if is_group_or_status && !info.requester.is_lid() && !info.chat.is_status_broadcast() {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
@@ -392,6 +393,7 @@ impl Client {
                     info.requester.observe(),
                     group_jid
                 );
+                let _distribution_guard = self.group_distribution_lock(&info.chat).await;
 
                 // WA Web: deleteGroupSenderKeyInfo(groupWid, ownWid) — delete our own
                 // sender key for forward secrecy. When addressing mode is known,
@@ -425,15 +427,15 @@ impl Client {
 
                 // DB first, then cache invalidate — prevents a concurrent
                 // resolve_skdm_targets from reviving stale cache entries.
-                if let Err(e) = self
-                    .persistence_manager
-                    .clear_sender_key_devices(&group_jid)
-                    .await
-                {
+                if let Err(e) = self.reset_sender_key_device_tracking(&group_jid).await {
                     log::warn!("Failed to clear sender key devices for rotation: {}", e);
                 }
-                self.sender_key_device_cache.invalidate(&group_jid).await;
+                rotated_sender_key = true;
             }
+        }
+        if rotated_sender_key {
+            self.flush_signal_cache_batch_safe_logged("unknown-participant rotation", None)
+                .await;
         }
 
         // Mirror WAWebUpdateLocalSignalSession for all chat types: markForgetSenderKey
@@ -2534,6 +2536,114 @@ mod tests {
             client.pending_retries.lock().unwrap().len(),
             0,
             "the in-progress marker is cleared after the throttled return"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_participant_rotation_is_durable_before_throttled_return() {
+        use wacore::libsignal::protocol::{SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyRecord};
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore_binary::builder::NodeBuilder;
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let own_lid: Jid = "100000000001040:13@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+        let group: Jid = "120363021033254950@g.us".parse().unwrap();
+        let group_id = group.to_string();
+        let sender_key_name =
+            SenderKeyName::from_parts(&group_id, own_lid.to_protocol_address().as_str());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let key_pair = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(
+                SENDERKEY_MESSAGE_CURRENT_VERSION,
+                9,
+                0,
+                &[7; 32],
+                key_pair.public_key,
+                Some(key_pair.private_key),
+            )
+            .unwrap();
+        client
+            .signal_cache
+            .put_sender_key(&sender_key_name, record)
+            .await;
+        client.flush_signal_cache().await.unwrap();
+        assert!(
+            backend
+                .get_sender_key(sender_key_name.cache_key())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let msg_id = "ROTATEFLUSH001";
+        client
+            .add_recent_message(
+                &group,
+                msg_id,
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        client.set_resend_rate_limit(1, 0);
+        assert!(client.resend_rate_limiter.try_acquire(&group).await);
+
+        let requester: Jid = "15551234002@s.whatsapp.net".parse().unwrap();
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", &requester)
+            .children([NodeBuilder::new("retry")
+                .attr("id", msg_id)
+                .attr("count", "1")
+                .build()])
+            .build();
+        let node_ref = crate::test_utils::node_to_owned_ref(&node);
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
+                chat: group.clone(),
+                sender: requester,
+                is_group: true,
+                ..Default::default()
+            })
+            .message_ids(vec![msg_id.to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
+
+        client
+            .handle_retry_receipt(&receipt, &node_ref)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .get_sender_key(sender_key_name.cache_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "early retry return must not leave the retired key durable"
         );
     }
 

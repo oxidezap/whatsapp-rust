@@ -163,9 +163,9 @@ pub trait SenderKeyStore: ThreadSafe {
         sender_key_name: &SenderKeyName,
     ) -> Result<Option<SenderKeyRecord>>;
 
-    /// Serializes the load/advance/store of one sender-key chain so concurrent
-    /// encrypts to the same `(group, sender)` can't reuse a chain iteration.
-    /// Default is uncontended; stores over shared state override it.
+    /// Serializes every load/mutate/store of one sender-key chain so concurrent
+    /// encrypt, decrypt, distribution and rotation operations cannot overwrite
+    /// each other. Default is uncontended; stores over shared state override it.
     async fn sender_key_lock(
         &self,
         _sender_key_name: &SenderKeyName,

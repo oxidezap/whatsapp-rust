@@ -200,6 +200,8 @@ fn get_sender_key(state: &mut SenderKeyState, iteration: u32) -> Result<SenderMe
     Ok(result_message_key)
 }
 
+/// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name` so
+/// a concurrent SKDM cannot overwrite the ratchet advance and skipped keys.
 pub async fn group_decrypt(
     skm_bytes: &[u8],
     sender_key_store: &mut dyn SenderKeyStore,
@@ -294,6 +296,8 @@ pub async fn group_decrypt(
     Ok(plaintext)
 }
 
+/// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name` so
+/// the new distribution state cannot overwrite a concurrent chain advance.
 pub async fn process_sender_key_distribution_message(
     sender_key_name: &SenderKeyName,
     skdm: &SenderKeyDistributionMessage,
@@ -349,6 +353,8 @@ fn build_skdm_from_record(record: &SenderKeyRecord) -> Result<SenderKeyDistribut
     )
 }
 
+/// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
+/// across this call and the matching encrypt so both use the same key.
 pub async fn create_sender_key_distribution_message<R: Rng + CryptoRng>(
     sender_key_name: &SenderKeyName,
     sender_key_store: &mut dyn SenderKeyStore,

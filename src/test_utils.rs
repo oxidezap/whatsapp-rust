@@ -13,6 +13,17 @@ pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
         Arc::new(OwnedNodeRef::new(bytes).expect("OwnedNodeRef::new should succeed"))
     }
 }
+
+pub async fn wait_for_lock_waiter(lock: &Arc<async_lock::Mutex<()>>, baseline: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::strong_count(lock) <= baseline {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task must reach the contested lock");
+}
+
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::runtime_impl::TokioRuntime;
 use crate::store::SqliteStore;
