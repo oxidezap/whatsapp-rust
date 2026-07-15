@@ -14,6 +14,11 @@ env:
   PROTOC_VERSION: '3.25.3'
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
+  # The target dir is restored fresh each run (Swatinem cache), so incremental
+  # state is always cold and only bloats artifacts; worse, sccache refuses to
+  # cache incremental compilations, so leaving it on excludes the workspace
+  # crates from caching entirely.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   format:
@@ -45,10 +50,13 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache Rust registry
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -69,10 +77,13 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache Rust registry
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Build project
         run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
       - name: Run tests
@@ -106,10 +117,13 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache Rust registry
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Build (all features)
         run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
       - name: Clippy (all features)
@@ -135,10 +149,13 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache Rust registry
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Build wacore-binary (stable, no SIMD)
         run: cargo build -p wacore-binary --no-default-features --verbose
       - name: Test wacore-binary (stable, no SIMD)
