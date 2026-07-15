@@ -525,6 +525,22 @@ impl SenderKeyRecord {
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<SenderKeyRecord, SignalProtocolError> {
+        Self::deserialize_inner(buf, None)
+    }
+
+    /// A matching live cache proves this snapshot was not recovered after a crash.
+    #[doc(hidden)]
+    pub fn deserialize_for_store(
+        buf: &[u8],
+        incarnation: &[u8; 16],
+    ) -> Result<SenderKeyRecord, SignalProtocolError> {
+        Self::deserialize_inner(buf, Some(incarnation))
+    }
+
+    fn deserialize_inner(
+        buf: &[u8],
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<SenderKeyRecord, SignalProtocolError> {
         let skr = SenderKeyRecordStructure::decode_from_slice(buf)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
@@ -540,11 +556,17 @@ impl SenderKeyRecord {
             states.push_back(SenderKeyState::from_protobuf(state));
         }
 
-        let reserved_iteration = Self::decode_reserved_iteration(buf)?;
-        // Fast-forward the current chain past the reserved ceiling so no
-        // possibly-spent iteration is re-derivable after this reload (crash OR
-        // reconnect). Only the current state (index 0) is ever encrypt-advanced.
-        if reserved_iteration > 0
+        let local_fields =
+            super::local_field::decode_local_record_fields(buf, RESERVED_ITERATION_FIELD, || {
+                SignalProtocolError::InvalidProtobufEncoding
+            })?;
+        let reserved_iteration = local_fields.reservation;
+        let trusted_reload =
+            incarnation.is_some_and(|current| local_fields.incarnation == Some(*current));
+
+        // Only an untrusted snapshot may have spent its still-reserved range.
+        if !trusted_reload
+            && reserved_iteration > 0
             && let Some(state) = states.front_mut()
         {
             state.fast_forward_sender_chain(reserved_iteration)?;
@@ -554,16 +576,6 @@ impl SenderKeyRecord {
             states,
             wire_gated: false,
             reserved_iteration,
-        })
-    }
-
-    /// Scan the local-only reserved-iteration field out of the raw record bytes.
-    /// The generated `SenderKeyRecordStructure` decoder skips unknown fields, so
-    /// the reservation is read here from the top-level stream. Fails closed via
-    /// the shared `decode_local_only_u32_field` (see there for why).
-    fn decode_reserved_iteration(bytes: &[u8]) -> Result<u32, SignalProtocolError> {
-        super::local_field::decode_local_only_u32_field(bytes, RESERVED_ITERATION_FIELD, || {
-            SignalProtocolError::InvalidProtobufEncoding
         })
     }
 
@@ -692,15 +704,44 @@ impl SenderKeyRecord {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, SignalProtocolError> {
-        use buffa::encoding::{Tag, WireType, encode_varint};
+        self.serialize_inner(None)
+    }
+
+    /// The incarnation prevents clean reloads from looking like crashes.
+    #[doc(hidden)]
+    pub fn serialize_for_store(
+        &self,
+        incarnation: &[u8; 16],
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        self.serialize_inner(Some(incarnation))
+    }
+
+    fn serialize_inner(
+        &self,
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
         let mut buf = self.as_protobuf().encode_to_vec();
+        let incarnation = incarnation.filter(|_| self.reserved_iteration > 0);
+        let reservation_len = if self.reserved_iteration > 0 {
+            2 + varint_len(self.reserved_iteration as u64)
+        } else {
+            0
+        };
+        let incarnation_len = incarnation
+            .map(|_| super::local_field::STORE_INCARNATION_ENCODED_LEN)
+            .unwrap_or(0);
+        buf.reserve(reservation_len + incarnation_len);
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
         // stay byte-identical. Mirrors SessionRecord::serialize_into.
         if self.reserved_iteration > 0 {
             Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut buf);
             encode_varint(self.reserved_iteration as u64, &mut buf);
+        }
+        if let Some(incarnation) = incarnation {
+            super::local_field::encode_store_incarnation(&mut buf, incarnation);
         }
         Ok(buf)
     }
@@ -1190,6 +1231,46 @@ mod tests {
             current_iteration(&reloaded),
             consts::SENDER_CHAIN_RESERVATION_BATCH,
             "reload must burn the reserved iterations"
+        );
+    }
+
+    #[test]
+    fn cache_incarnation_separates_clean_reload_from_recovery() {
+        let mut record = record_with_state(12345, 0x42);
+        record.reserve_iterations(0);
+        let incarnation = [0xA1; 16];
+        let replacement = [0xB2; 16];
+        let bytes = record.serialize_for_store(&incarnation).expect("test");
+
+        let clean = SenderKeyRecord::deserialize_for_store(&bytes, &incarnation).expect("test");
+        assert_eq!(current_iteration(&clean), 0);
+
+        let recovered = SenderKeyRecord::deserialize_for_store(&bytes, &replacement).expect("test");
+        assert_eq!(
+            current_iteration(&recovered),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let conservative = SenderKeyRecord::deserialize(&bytes).expect("test");
+        assert_eq!(
+            current_iteration(&conservative),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let legacy = record.serialize().expect("test");
+        let migrated = SenderKeyRecord::deserialize_for_store(&legacy, &incarnation).expect("test");
+        assert_eq!(
+            current_iteration(&migrated),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let mut duplicated = bytes;
+        crate::protocol::local_field::encode_store_incarnation(&mut duplicated, &incarnation);
+        let duplicate_recovery =
+            SenderKeyRecord::deserialize_for_store(&duplicated, &incarnation).expect("test");
+        assert_eq!(
+            current_iteration(&duplicate_recovery),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
         );
     }
 

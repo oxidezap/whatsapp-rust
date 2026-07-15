@@ -736,6 +736,22 @@ impl SessionRecord {
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
+        Self::deserialize_inner(bytes, None)
+    }
+
+    /// A matching live cache proves this snapshot was not recovered after a crash.
+    #[doc(hidden)]
+    pub fn deserialize_for_store(
+        bytes: &[u8],
+        incarnation: &[u8; 16],
+    ) -> Result<Self, SignalProtocolError> {
+        Self::deserialize_inner(bytes, Some(incarnation))
+    }
+
+    fn deserialize_inner(
+        bytes: &[u8],
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<Self, SignalProtocolError> {
         use waproto::whatsapp::RecordStructureView;
 
         // Decode to a zero-copy view first, then only convert sessions we
@@ -753,6 +769,12 @@ impl SessionRecord {
             .collect::<Result<_, _>>()
             .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))?;
 
+        let local_fields = crate::protocol::local_field::decode_local_record_fields(
+            bytes,
+            RESERVED_SENDER_CHAIN_INDEX_FIELD,
+            || InvalidSessionError("invalid local session metadata"),
+        )?;
+
         let mut record = Self {
             current_session: view
                 .current_session
@@ -762,33 +784,22 @@ impl SessionRecord {
                 .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
                 .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
-            reserved_sender_chain_index: Self::decode_reserved_index(bytes)?,
+            reserved_sender_chain_index: local_fields.reservation,
             pending_reservation: false,
         };
 
-        // This snapshot may predate sends its lease already covered; burn the
-        // leased counters before the chain can issue keys again.
-        if record.reserved_sender_chain_index > 0
+        let trusted_reload =
+            incarnation.is_some_and(|current| local_fields.incarnation == Some(*current));
+
+        // An untrusted snapshot may predate sends covered by its lease.
+        if !trusted_reload
+            && record.reserved_sender_chain_index > 0
             && let Some(state) = record.current_session.as_mut()
         {
             state.fast_forward_sender_chain(record.reserved_sender_chain_index)?;
         }
 
         Ok(record)
-    }
-
-    /// Extract the record-level reservation field from the serialized bytes.
-    /// The generated `RecordStructureView` skips fields it does not know, so
-    /// the local-only field is scanned out of the raw top-level stream here.
-    /// Fails closed via the shared `decode_local_only_u32_field` (see there
-    /// for why).
-    fn decode_reserved_index(bytes: &[u8]) -> Result<u32, SignalProtocolError> {
-        crate::protocol::local_field::decode_local_only_u32_field(
-            bytes,
-            RESERVED_SENDER_CHAIN_INDEX_FIELD,
-            || InvalidSessionError("invalid reserved sender chain index"),
-        )
-        .map_err(Into::into)
     }
 
     /// If there's a session with a matching version and `alice_base_key`, ensures that it is the
@@ -982,6 +993,16 @@ impl SessionRecord {
 
     /// Encode into a caller-supplied buffer (allows reuse across flushes).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+        self.serialize_into_inner(buf, None);
+    }
+
+    /// The incarnation prevents clean reloads from looking like crashes.
+    #[doc(hidden)]
+    pub fn serialize_into_for_store(&self, buf: &mut Vec<u8>, incarnation: &[u8; 16]) {
+        self.serialize_into_inner(buf, Some(incarnation));
+    }
+
+    fn serialize_into_inner(&self, buf: &mut Vec<u8>, incarnation: Option<&[u8; 16]>) {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
         fn write_len_delimited(
@@ -1017,14 +1038,18 @@ impl SessionRecord {
             .sum();
 
         let reserved = self.reserved_sender_chain_index;
+        let incarnation = incarnation.filter(|_| reserved > 0);
         let reserved_len = if reserved > 0 {
             2 + varint_len(reserved as u64)
         } else {
             0
         };
+        let incarnation_len = incarnation
+            .map(|_| crate::protocol::local_field::STORE_INCARNATION_ENCODED_LEN)
+            .unwrap_or(0);
 
         buf.clear();
-        buf.reserve(current_len + previous_len + reserved_len);
+        buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
 
         if let Some(state) = &self.current_session
             && let Some(msg_len) = current_msg_len
@@ -1037,6 +1062,9 @@ impl SessionRecord {
         if reserved > 0 {
             Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(buf);
             encode_varint(reserved as u64, buf);
+        }
+        if let Some(incarnation) = incarnation {
+            crate::protocol::local_field::encode_store_incarnation(buf, incarnation);
         }
     }
 
@@ -1288,6 +1316,63 @@ mod tests {
         assert!(
             SessionRecord::deserialize(&bytes).is_err(),
             "an implausible lease must fail the load, not fast-forward"
+        );
+    }
+
+    #[test]
+    fn cache_incarnation_separates_clean_reload_from_recovery() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut record = SessionRecord::new(create_test_session_state(3, &base_key));
+        record.reserve_sender_chain_counters(0);
+        let incarnation = [0xA1; 16];
+        let replacement = [0xB2; 16];
+        let mut bytes = Vec::new();
+        record.serialize_into_for_store(&mut bytes, &incarnation);
+
+        let clean = SessionRecord::deserialize_for_store(&bytes, &incarnation).unwrap();
+        assert_eq!(
+            clean
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            0
+        );
+
+        let recovered = SessionRecord::deserialize_for_store(&bytes, &replacement).unwrap();
+        assert_eq!(
+            recovered
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let conservative = SessionRecord::deserialize(&bytes).unwrap();
+        assert_eq!(
+            conservative
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let legacy = record.serialize().unwrap();
+        let migrated = SessionRecord::deserialize_for_store(&legacy, &incarnation).unwrap();
+        assert_eq!(
+            migrated
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
         );
     }
 

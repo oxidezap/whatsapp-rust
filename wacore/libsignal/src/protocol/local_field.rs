@@ -1,42 +1,67 @@
-//! Shared decoder for the local-only reservation fields.
-//!
-//! Both the DM session record and the group sender-key record durably reserve
-//! a batch of counters/iterations by appending a `u32` as a top-level protobuf
-//! field the generated structures do not know about. The generated views skip
-//! unknown fields, so the value is recovered by scanning the raw top-level
-//! stream. Keeping that scan in one place stops the DM and group paths from
-//! drifting into different validation rules for the same class of bug.
+//! Local record metadata fails closed so a corrupt lease cannot re-enable spent
+//! counters.
 
-use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
+use buffa::encoding::{Tag, WireType, decode_varint, encode_varint, skip_field};
 
-/// Scan a local-only `u32` varint field out of a raw protobuf byte stream.
-///
-/// Fails closed via `on_err`: anything unreadable (a bad tag, a non-varint wire
-/// type under `field_number`, a duplicate, or an out-of-range value) is an error
-/// rather than a skip. Skipping would silently yield 0, disabling the load-time
-/// fast-forward and re-enabling already-spent counters/iterations, a reused
-/// (key, IV) pair, the exact outcome the reservation exists to prevent. A load
-/// error is recoverable (the record rebuilds); nonce reuse is not.
-///
-/// `on_err` is generic so each record type keeps its own error type; the caller
-/// closes over a single fail-closed error for the whole scan.
-pub(crate) fn decode_local_only_u32_field<E>(
+const STORE_INCARNATION_FIELD: u32 = 101;
+const STORE_INCARNATION_LEN: usize = 16;
+pub(crate) const STORE_INCARNATION_ENCODED_LEN: usize = 19;
+
+pub(crate) struct LocalRecordFields {
+    pub(crate) reservation: u32,
+    pub(crate) incarnation: Option<[u8; STORE_INCARNATION_LEN]>,
+}
+
+/// Malformed or duplicate metadata cannot be trusted to preserve a lease.
+pub(crate) fn decode_local_record_fields<E>(
     mut bytes: &[u8],
-    field_number: u32,
+    reservation_field: u32,
     on_err: impl Fn() -> E,
-) -> Result<u32, E> {
-    let mut value = None;
+) -> Result<LocalRecordFields, E> {
+    let mut reservation = None;
+    let mut incarnation = None;
+    let mut incarnation_valid = true;
     while !bytes.is_empty() {
         let tag = Tag::decode(&mut bytes).map_err(|_| on_err())?;
-        if tag.field_number() == field_number {
-            if tag.wire_type() != WireType::Varint || value.is_some() {
+        if tag.field_number() == reservation_field {
+            if tag.wire_type() != WireType::Varint || reservation.is_some() {
                 return Err(on_err());
             }
             let raw = decode_varint(&mut bytes).map_err(|_| on_err())?;
-            value = Some(u32::try_from(raw).map_err(|_| on_err())?);
+            reservation = Some(u32::try_from(raw).map_err(|_| on_err())?);
+        } else if tag.field_number() == STORE_INCARNATION_FIELD {
+            if tag.wire_type() == WireType::LengthDelimited {
+                let len = usize::try_from(decode_varint(&mut bytes).map_err(|_| on_err())?)
+                    .map_err(|_| on_err())?;
+                if bytes.len() < len {
+                    return Err(on_err());
+                }
+                if len == STORE_INCARNATION_LEN && incarnation.is_none() && incarnation_valid {
+                    let mut value = [0; STORE_INCARNATION_LEN];
+                    value.copy_from_slice(&bytes[..len]);
+                    incarnation = Some(value);
+                } else {
+                    incarnation = None;
+                    incarnation_valid = false;
+                }
+                bytes = &bytes[len..];
+            } else {
+                skip_field(tag, &mut bytes).map_err(|_| on_err())?;
+                incarnation = None;
+                incarnation_valid = false;
+            }
         } else {
             skip_field(tag, &mut bytes).map_err(|_| on_err())?;
         }
     }
-    Ok(value.unwrap_or(0))
+    Ok(LocalRecordFields {
+        reservation: reservation.unwrap_or(0),
+        incarnation: if incarnation_valid { incarnation } else { None },
+    })
+}
+
+pub(crate) fn encode_store_incarnation(bytes: &mut Vec<u8>, incarnation: &[u8; 16]) {
+    Tag::new(STORE_INCARNATION_FIELD, WireType::LengthDelimited).encode(bytes);
+    encode_varint(STORE_INCARNATION_LEN as u64, bytes);
+    bytes.extend_from_slice(incarnation);
 }
