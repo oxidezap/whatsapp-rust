@@ -167,8 +167,8 @@ impl StanzaHandler for CallHandler {
                     }
                     // In-call <video state> signaling: send the TYPED ack (`type="video"`) and
                     // suppress the router's generic one — an untyped ack makes the upgrade
-                    // requester assume failure and revert after ~5s. Reserve event capacity first,
-                    // then publish the state only after that ack commits it.
+                    // requester assume failure and revert after ~5s. Serialize event publication,
+                    // then expose the state only after that ack commits it.
                     #[cfg(feature = "voip")]
                     if let CallAction::VideoState {
                         state, orientation, ..
@@ -182,7 +182,7 @@ impl StanzaHandler for CallHandler {
                                 "call: video state event queue is unavailable; leaving the transition unacknowledged"
                             );
                         }
-                        // A typed ack commits the received transition. Without a reserved event slot,
+                        // A typed ack commits the received transition. Without an event permit,
                         // leave the generic ack in place so the peer reverts instead.
                         let acked = if event_permit.is_some() {
                             match build_call_video_ack(&call) {
@@ -523,12 +523,12 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         ));
-        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(2);
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
         let (control_tx, _control_rx) = async_channel::unbounded::<VideoControl>();
         registry.set_video_channels(
             "CALL-ID-0001",
             generation,
-            event_tx,
+            event_tx.clone(),
             control_tx,
             Box::new(|| {}),
         );
@@ -543,9 +543,12 @@ mod tests {
                 _ = &mut handling => panic!("handler completed before the blocked ack send"),
             }
             assert!(
-                event_rx.try_recv().is_err(),
+                event_rx.is_empty(),
                 "the application must not observe an uncommitted video state"
             );
+            event_tx
+                .try_send(CallEvent::RelayAllocated)
+                .expect("fill the queue while the typed ack is in flight");
 
             release_send.send(()).await.expect("release ack send");
             handling.await
@@ -727,7 +730,7 @@ mod tests {
 
     #[cfg(feature = "voip")]
     #[tokio::test]
-    async fn full_event_queue_leaves_video_transition_uncommitted() {
+    async fn committed_video_state_supersedes_diagnostics_when_event_queue_is_full() {
         use wacore::voip::{CallEvent, VideoControl};
 
         let client = make_sending_client().await;
@@ -737,7 +740,7 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         ));
-        let (ev_tx, _ev_rx) = async_channel::bounded::<CallEvent>(1);
+        let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(1);
         ev_tx.try_send(CallEvent::RelayAllocated).expect("prefill");
         let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
         registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
@@ -752,9 +755,17 @@ mod tests {
                 )
                 .await
         );
-        assert!(!cancelled, "the router must retain its fallback ack");
-        assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
-        assert!(ctl_rx.try_recv().is_err(), "the plane must not transition");
+        assert!(cancelled, "the typed ack must suppress the generic ack");
+        assert!(registry.snapshot("CALL-ID-0001").expect("session").is_video);
+        assert!(matches!(
+            ev_rx.try_recv(),
+            Ok(CallEvent::VideoStateChanged { .. })
+        ));
+        assert!(
+            std::iter::from_fn(|| ctl_rx.try_recv().ok())
+                .any(|ctl| matches!(ctl, VideoControl::Enable)),
+            "the committed transition must steer the local plane"
+        );
     }
 
     #[tokio::test]

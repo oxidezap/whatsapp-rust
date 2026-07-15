@@ -69,17 +69,6 @@ pub struct CallChannels {
 const SEND_QUEUE_BATCH_CAP: usize = 64;
 const SEND_QUEUE_BYTE_CAP: usize = 2 * 1024 * 1024;
 
-fn try_send_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
-    // The last bounded slot belongs to ack-ordered signaling, which cannot be dropped.
-    if events
-        .capacity()
-        .is_some_and(|capacity| events.len() >= capacity.saturating_sub(1))
-    {
-        return;
-    }
-    let _ = events.try_send(event);
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendBatchKind {
     Control,
@@ -387,13 +376,10 @@ async fn run_call_with_clock_and_wallclock(
                         data,
                     );
                     if dropped.packets != 0 {
-                        try_send_engine_event(
-                            &channels.events,
-                            CallEvent::OutboundMediaDropped {
-                                video_access_units: dropped.video_access_units,
-                                packets: dropped.packets,
-                            },
-                        );
+                        let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                            video_access_units: dropped.video_access_units,
+                            packets: dropped.packets,
+                        });
                     }
                 }
                 // Loss tolerant: drop the frame if the speaker can't keep up.
@@ -405,7 +391,7 @@ async fn run_call_with_clock_and_wallclock(
                     let _ = channels.video_out.try_send(frame);
                 }
                 Output::Event(ev) => {
-                    try_send_engine_event(&channels.events, ev);
+                    let _ = channels.events.try_send(ev);
                 }
                 Output::Timeout(_) => {
                     if !pending_video.is_empty() {
@@ -415,13 +401,10 @@ async fn run_call_with_clock_and_wallclock(
                             SendBatch::video(std::mem::take(&mut pending_video)),
                         );
                         if dropped.packets != 0 {
-                            try_send_engine_event(
-                                &channels.events,
-                                CallEvent::OutboundMediaDropped {
-                                    video_access_units: dropped.video_access_units,
-                                    packets: dropped.packets,
-                                },
-                            );
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
                         }
                     }
                     break;
@@ -711,16 +694,6 @@ mod tests {
             video_out: vout_tx,
             video_ctl: vctl_rx,
         }
-    }
-
-    #[test]
-    fn engine_events_leave_one_slot_for_signaling() {
-        let (events, rx) = async_channel::bounded(2);
-        try_send_engine_event(&events, CallEvent::RelayAllocated);
-        try_send_engine_event(&events, CallEvent::RelayAllocateTimedOut);
-
-        assert!(matches!(rx.try_recv(), Ok(CallEvent::RelayAllocated)));
-        assert!(rx.try_recv().is_err(), "the signaling slot stays free");
     }
 
     fn config() -> CallConfig {
