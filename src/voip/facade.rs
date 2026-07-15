@@ -1444,6 +1444,25 @@ impl CallHandle {
             .await
     }
 
+    /// Send the standalone `<video state=1>` used after a mid-call video upgrade. Captured
+    /// video-from-start callees do not need this extra stanza.
+    pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Enabled,
+            dec: Some(VIDEO_DEC_REQUEST),
+            upgrade_marker: false,
+            device_orientation: Some(0),
+        });
+        client.send_node(stanza).await?;
+        Ok(())
+    }
+
     /// DOWNGRADE to audio: sends `<video state=6>` (Stopped, no marker), tears the local video
     /// plane down, and releases the source/sink. The audio plane is untouched. Idempotent.
     pub async fn stop_video(&self) -> Result<(), CallError> {

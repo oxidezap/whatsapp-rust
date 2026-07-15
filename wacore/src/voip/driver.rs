@@ -22,6 +22,7 @@ use crate::time::Instant;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::h264::VideoFrame;
+use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 
 /// Mid-call video-plane commands from the shell (upgrade / downgrade / peer orientation). Kept out
@@ -61,24 +62,134 @@ pub struct CallChannels {
     pub video_ctl: async_channel::Receiver<VideoControl>,
 }
 
-/// Depth of the outbound send queue between the drive loop and the concurrent send task. ~2s of RTP
-/// at one 60ms frame per slot; on overflow the oldest is dropped (loss-tolerant), bounding latency.
-const SEND_QUEUE_CAP: usize = 32;
+/// About two seconds of mixed audio/video at the example's 15 fps, bounded by bytes as well.
+const SEND_QUEUE_BATCH_CAP: usize = 64;
+const SEND_QUEUE_BYTE_CAP: usize = 2 * 1024 * 1024;
 
-/// Enforce [`SEND_QUEUE_CAP`] on the outbound queue when a relay write stalls. Media is loss
-/// tolerant, but relay control is not: STUN keepalives and the consent Binding Success replies
-/// share this queue, and shedding one under media backpressure fails relay consent (RFC 7675) and
-/// tears down a still recoverable call. So evict the oldest *media* packet, sparing control; only
-/// if the queue is somehow all control do we drop the oldest to keep the bound.
-fn shed_to_cap(queue: &mut VecDeque<Bytes>) {
-    if queue.len() <= SEND_QUEUE_CAP {
-        return;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBatchKind {
+    Control,
+    Media,
+    Video,
+}
+
+struct SendBatch {
+    packets: VecDeque<Bytes>,
+    bytes: usize,
+    kind: SendBatchKind,
+    started: bool,
+}
+
+impl SendBatch {
+    fn packet(data: Bytes) -> Self {
+        let kind = if classify_relay_packet(&data) == RelayPacketKind::Stun {
+            SendBatchKind::Control
+        } else {
+            SendBatchKind::Media
+        };
+        Self {
+            bytes: data.len(),
+            packets: VecDeque::from([data]),
+            kind,
+            started: false,
+        }
     }
-    let victim = queue
+
+    fn video(packets: Vec<Bytes>) -> Self {
+        Self {
+            bytes: packets.iter().map(Bytes::len).sum(),
+            packets: packets.into(),
+            kind: SendBatchKind::Video,
+            started: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DroppedMedia {
+    video_access_units: u32,
+    packets: u32,
+}
+
+fn shed_to_cap(queue: &mut VecDeque<SendBatch>) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    loop {
+        let bytes: usize = queue.iter().map(|batch| batch.bytes).sum();
+        if queue.len() <= SEND_QUEUE_BATCH_CAP && bytes <= SEND_QUEUE_BYTE_CAP {
+            break;
+        }
+        // Never cut an AU after one of its fragments has entered the transport.
+        let victim = queue
+            .iter()
+            .position(|batch| !batch.started && batch.kind == SendBatchKind::Video)
+            .or_else(|| {
+                queue
+                    .iter()
+                    .position(|batch| !batch.started && batch.kind == SendBatchKind::Media)
+            })
+            .or_else(|| queue.iter().position(|batch| !batch.started));
+        let Some(victim) = victim else {
+            break;
+        };
+        let Some(batch) = queue.remove(victim) else {
+            break;
+        };
+        dropped.packets = dropped
+            .packets
+            .saturating_add(batch.packets.len().try_into().unwrap_or(u32::MAX));
+        if batch.kind == SendBatchKind::Video {
+            dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+        }
+    }
+    dropped
+}
+
+fn enqueue_batch(queue: &mut VecDeque<SendBatch>, batch: SendBatch) -> DroppedMedia {
+    queue.push_back(batch);
+    shed_to_cap(queue)
+}
+
+/// Coalesce every PT-97 packet through the marker into one queue unit, so backpressure keeps or
+/// drops a complete H.264 access unit instead of silently truncating an IDR.
+fn queue_transmit(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    data: Bytes,
+) -> DroppedMedia {
+    if let Some(header) = parse_rtp_header(&data)
+        && header.payload_type == RTP_PAYLOAD_TYPE_H264
+    {
+        pending_video.push(data);
+        if header.marker {
+            return enqueue_batch(queue, SendBatch::video(std::mem::take(pending_video)));
+        }
+        return DroppedMedia::default();
+    }
+    let mut dropped = DroppedMedia::default();
+    if !pending_video.is_empty() {
+        dropped = enqueue_batch(queue, SendBatch::video(std::mem::take(pending_video)));
+    }
+    let more = enqueue_batch(queue, SendBatch::packet(data));
+    dropped.video_access_units = dropped
+        .video_access_units
+        .saturating_add(more.video_access_units);
+    dropped.packets = dropped.packets.saturating_add(more.packets);
+    dropped
+}
+
+fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<Bytes> {
+    let index = queue
         .iter()
-        .position(|p| classify_relay_packet(p) != RelayPacketKind::Stun)
+        .position(|batch| batch.kind == SendBatchKind::Control)
         .unwrap_or(0);
-    queue.remove(victim);
+    let batch = queue.get_mut(index)?;
+    batch.started = true;
+    let packet = batch.packets.pop_front()?;
+    batch.bytes = batch.bytes.saturating_sub(packet.len());
+    if batch.packets.is_empty() {
+        queue.remove(index);
+    }
+    Some(packet)
 }
 
 /// Drive one call to completion: returns when the relay channel disconnects, a send fails, or the
@@ -95,9 +206,16 @@ pub async fn run_call(
     eng: CallEngine,
 ) {
     let epoch = Instant::now();
-    run_call_with_clock(rt, transport, relay_events, channels, eng, move || {
-        epoch.elapsed().as_millis() as u64
-    })
+    let wallclock_ms = crate::time::now_millis().max(0) as u64;
+    run_call_with_clock_and_wallclock(
+        rt,
+        transport,
+        relay_events,
+        channels,
+        eng,
+        move || epoch.elapsed().as_millis() as u64,
+        wallclock_ms,
+    )
     .await;
 }
 
@@ -114,15 +232,37 @@ pub async fn run_call(
         fields(call_id = %eng.call_id())
     )
 )]
+#[cfg(test)]
 async fn run_call_with_clock(
+    rt: Arc<dyn Runtime>,
+    transport: Arc<dyn RelayTransport>,
+    relay_events: async_channel::Receiver<RelayTransportEvent>,
+    channels: CallChannels,
+    eng: CallEngine,
+    now_ms: impl Fn() -> engine::Millis,
+) {
+    run_call_with_clock_and_wallclock(
+        rt,
+        transport,
+        relay_events,
+        channels,
+        eng,
+        now_ms,
+        1_700_000_000_000,
+    )
+    .await;
+}
+
+async fn run_call_with_clock_and_wallclock(
     rt: Arc<dyn Runtime>,
     transport: Arc<dyn RelayTransport>,
     relay_events: async_channel::Receiver<RelayTransportEvent>,
     channels: CallChannels,
     mut eng: CallEngine,
     now_ms: impl Fn() -> engine::Millis,
+    wallclock_ms: u64,
 ) {
-    eng.start(now_ms());
+    eng.start(now_ms(), wallclock_ms);
 
     #[cfg(feature = "tracing")]
     let call_id = eng.call_id().to_string();
@@ -151,9 +291,8 @@ async fn run_call_with_clock(
     // the two: a slow send parked the loop, inbound packets queued then arrived in a burst, and the
     // playout tick fired late -- so the jitter buffer overflowed then underran (audible glitching,
     // worst whatsapp-rust<->whatsapp-rust where both ends stalled; the official client decouples them).
-    // The queue is bounded and drops the OLDEST packet on overflow: outbound media is loss tolerant, so
-    // when the link can't keep up, shedding the stalest frame (lowest latency) is correct.
-    let mut send_queue: VecDeque<Bytes> = VecDeque::new();
+    // Video is queued per access unit so overload never leaves half an IDR on the wire.
+    let mut send_queue: VecDeque<SendBatch> = VecDeque::new();
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
@@ -161,12 +300,18 @@ async fn run_call_with_clock(
 
     'drive: loop {
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
+        let mut pending_video = Vec::new();
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
                 Output::Transmit(data) => {
-                    send_queue.push_back(data);
-                    shed_to_cap(&mut send_queue);
+                    let dropped = queue_transmit(&mut send_queue, &mut pending_video, data);
+                    if dropped.packets != 0 {
+                        let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                            video_access_units: dropped.video_access_units,
+                            packets: dropped.packets,
+                        });
+                    }
                 }
                 // Loss tolerant: drop the frame if the speaker can't keep up.
                 Output::Playout(pcm) => {
@@ -179,7 +324,21 @@ async fn run_call_with_clock(
                 Output::Event(ev) => {
                     let _ = channels.events.try_send(ev);
                 }
-                Output::Timeout(_) => break,
+                Output::Timeout(_) => {
+                    if !pending_video.is_empty() {
+                        let dropped = enqueue_batch(
+                            &mut send_queue,
+                            SendBatch::video(std::mem::take(&mut pending_video)),
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -192,7 +351,7 @@ async fn run_call_with_clock(
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
         // `'static` (no borrow of the loop's `transport`).
         if sending.is_terminated()
-            && let Some(data) = send_queue.pop_front()
+            && let Some(data) = pop_next_packet(&mut send_queue)
         {
             let t = transport.clone();
             let fut: BoxFuture<'static, anyhow::Result<()>> =
@@ -1170,36 +1329,77 @@ mod tests {
         // Top two bits zero -> STUN control.
         let control = || Bytes::from(vec![0x00, 0x01]);
 
-        let mut q: VecDeque<Bytes> = VecDeque::new();
-        q.push_back(control()); // oldest, must survive
-        for n in 0..SEND_QUEUE_CAP as u8 {
-            q.push_back(media(n));
-            shed_to_cap(&mut q);
+        let mut q: VecDeque<SendBatch> = VecDeque::new();
+        q.push_back(SendBatch::packet(control())); // oldest, must survive
+        for n in 0..SEND_QUEUE_BATCH_CAP as u8 {
+            q.push_back(SendBatch::packet(media(n)));
+            let _ = shed_to_cap(&mut q);
         }
 
-        assert_eq!(q.len(), SEND_QUEUE_CAP);
+        assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
         assert_eq!(
-            classify_relay_packet(&q[0]),
-            RelayPacketKind::Stun,
+            q[0].kind,
+            SendBatchKind::Control,
             "the queued control packet must not be evicted by media backpressure"
         );
         // The oldest media (seq 0) is the one shed, not the control at the front.
-        assert_eq!(&q[1][..], &[0x90, 1]);
+        assert_eq!(&q[1].packets[0][..], &[0x90, 1]);
     }
 
     // Pathological: an all-control queue still has to honor the bound, so it falls back to dropping
     // the oldest.
     #[test]
     fn overflow_all_control_drops_oldest() {
-        let mut q: VecDeque<Bytes> = (0..=SEND_QUEUE_CAP as u8)
-            .map(|n| Bytes::from(vec![0x00, n]))
+        let mut q: VecDeque<SendBatch> = (0..=SEND_QUEUE_BATCH_CAP as u8)
+            .map(|n| SendBatch::packet(Bytes::from(vec![0x00, n])))
             .collect();
-        shed_to_cap(&mut q);
-        assert_eq!(q.len(), SEND_QUEUE_CAP);
+        let _ = shed_to_cap(&mut q);
+        assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
         assert_eq!(
-            &q[0][..],
+            &q[0].packets[0][..],
             &[0x00, 1],
             "oldest control dropped to keep bound"
         );
+    }
+
+    #[test]
+    fn large_video_au_is_queued_atomically() {
+        fn video_packet(seq: u16, marker: bool) -> Bytes {
+            let mut packet = vec![0u8; 16];
+            packet[0] = 0x90; // V=2, X=1
+            packet[1] = ((marker as u8) << 7) | RTP_PAYLOAD_TYPE_H264;
+            packet[2..4].copy_from_slice(&seq.to_be_bytes());
+            packet[12..14].copy_from_slice(&0xdebeu16.to_be_bytes());
+            Bytes::from(packet)
+        }
+
+        // The old 32-datagram queue truncated this AU before its marker.
+        let mut queue = VecDeque::new();
+        let mut pending = Vec::new();
+        for seq in 0..40u16 {
+            let dropped = queue_transmit(&mut queue, &mut pending, video_packet(seq, seq == 39));
+            assert_eq!(dropped.packets, 0);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].kind, SendBatchKind::Video);
+        assert_eq!(queue[0].packets.len(), 40);
+
+        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
+            .map(|packet| parse_rtp_header(&packet).unwrap().sequence_number)
+            .collect();
+        assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn oversized_video_is_dropped_as_a_whole_au() {
+        let packets = (0..40)
+            .map(|_| Bytes::from(vec![0x90; 64 * 1024]))
+            .collect();
+        let mut queue = VecDeque::new();
+        let dropped = enqueue_batch(&mut queue, SendBatch::video(packets));
+        assert_eq!(dropped.video_access_units, 1);
+        assert_eq!(dropped.packets, 40);
+        assert!(queue.is_empty(), "no partial AU may remain queued");
     }
 }

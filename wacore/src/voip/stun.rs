@@ -34,16 +34,6 @@ pub const MSG_ALLOCATE_ERROR: u16 = 0x0113;
 pub const MSG_WHATSAPP_PING: u16 = 0x0801;
 pub const MSG_WHATSAPP_PONG: u16 = 0x0802;
 
-/// WASM/Web StreamDescriptors template (attr 0x4024): auxiliary stream SSRCs.
-const WASM_STREAM_DESCRIPTORS_TEMPLATE: &[u8] = &[
-    0x0a, 0x06, 0x18, 0xca, 0xbc, 0x85, 0xae, 0x04, 0x0a, 0x08, 0x10, 0x01, 0x18, 0xa5, 0xac, 0xaf,
-    0xae, 0x0a, 0x0a, 0x08, 0x10, 0x02, 0x18, 0xd6, 0xa4, 0xe6, 0xf9, 0x0f, 0x0a, 0x08, 0x08, 0x01,
-    0x18, 0xf7, 0xdd, 0x9e, 0xb6, 0x0a, 0x0a, 0x0a, 0x08, 0x01, 0x10, 0x01, 0x18, 0xab, 0xcc, 0xb1,
-    0xf3, 0x0d, 0x0a, 0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xda, 0xda, 0xef, 0x8a, 0x05, 0x0a, 0x08,
-    0x08, 0x02, 0x18, 0xc5, 0xe9, 0xec, 0x8e, 0x0b, 0x0a, 0x0a, 0x08, 0x02, 0x10, 0x01, 0x18, 0xfd,
-    0xc2, 0xb1, 0xb6, 0x0f, 0x0a, 0x0a, 0x08, 0x02, 0x10, 0x02, 0x18, 0xb0, 0x97, 0xf7, 0xb2, 0x09,
-];
-
 fn pad4(n: usize) -> usize {
     (4 - (n % 4)) % 4
 }
@@ -154,17 +144,56 @@ fn create_wasm_relay_endpoint_attr(endpoint_xor: &[u8; 6]) -> [u8; 8] {
     buf
 }
 
+/// `(stream_index, sub_type, slot_word)` in WASM wire order. Stream indices are audio/video0/video1;
+/// sub-types are media/FEC/NACK.
+const WASM_STREAM_SLOTS: [(u32, u32, u32); 9] = [
+    (0, 0, 0),
+    (0, 1, 1),
+    (0, 2, 4),
+    (1, 0, 2),
+    (1, 1, 3),
+    (1, 2, 5),
+    (2, 0, 7),
+    (2, 1, 8),
+    (2, 2, 6),
+];
+
+/// Build call-specific WASM `StreamDescriptors` (0x4024).
+pub fn create_wasm_stream_descriptors(call_id: &str, self_participant_id: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &(stream_index, sub_type, slot) in &WASM_STREAM_SLOTS {
+        let ssrc =
+            crate::voip::ssrc::derive_wasm_participant_ssrc(call_id, self_participant_id, slot);
+        let mut d = Vec::new();
+        if stream_index != 0 {
+            pb_tag(&mut d, 1, 0);
+            pb_varint(&mut d, stream_index as u64);
+        }
+        if sub_type != 0 {
+            pb_tag(&mut d, 2, 0);
+            pb_varint(&mut d, sub_type as u64);
+        }
+        pb_tag(&mut d, 3, 0);
+        pb_varint(&mut d, ssrc as u64);
+        pb_len_delim(&mut out, 1, &d);
+    }
+    out
+}
+
 /// WASM/Web DataChannel Allocate: 0x4000 token + 0x4024 stream desc + 0x0016 endpoint + MI, no FP.
+/// Descriptors must carry this call's derived SSRCs rather than values captured from another call.
 pub fn build_wasm_stun_allocate_request(
     transaction_id: &[u8; 12],
     relay_token: &[u8],
     endpoint_xor: &[u8; 6],
     integrity_key: &[u8],
+    call_id: &str,
+    self_participant_id: &str,
 ) -> Vec<u8> {
     let mut attrs = stun_attr(ATTR_RELAY_TOKEN, relay_token);
     attrs.extend_from_slice(&stun_attr(
         STUN_ATTR_STREAM_DESCRIPTORS,
-        WASM_STREAM_DESCRIPTORS_TEMPLATE,
+        &create_wasm_stream_descriptors(call_id, self_participant_id),
     ));
     attrs.extend_from_slice(&stun_attr(
         STUN_ATTR_WASM_RELAY_ENDPOINT,
@@ -507,22 +536,105 @@ mod tests {
         assert!(!is_allocate_or_binding_success(&pkt));
     }
 
+    fn dv(b: &[u8], i: &mut usize) -> u64 {
+        let (mut val, mut shift) = (0u64, 0u32);
+        loop {
+            let byte = b[*i];
+            *i += 1;
+            val |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                return val;
+            }
+            shift += 7;
+        }
+    }
+
+    /// Decode the WASM StreamDescriptors protobuf into `(stream_index, sub_type) -> ssrc`.
+    fn decode_stream_descriptors(buf: &[u8]) -> std::collections::HashMap<(u32, u32), u32> {
+        let mut out = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < buf.len() {
+            assert_eq!(dv(buf, &mut i), (1 << 3) | 2, "top-level repeated field 1");
+            let end = i + dv(buf, &mut i) as usize;
+            let (mut sidx, mut sub, mut ssrc) = (0u32, 0u32, None);
+            while i < end {
+                let field = dv(buf, &mut i) >> 3;
+                match field {
+                    1 => sidx = dv(buf, &mut i) as u32,
+                    2 => sub = dv(buf, &mut i) as u32,
+                    3 => ssrc = Some(dv(buf, &mut i) as u32),
+                    other => panic!("unexpected descriptor field {other}"),
+                }
+            }
+            out.insert((sidx, sub), ssrc.expect("descriptor carries an ssrc"));
+        }
+        out
+    }
+
     #[test]
-    fn wasm_allocate_and_ping_match_kat() {
+    fn wasm_allocate_carries_dynamic_stream_descriptors() {
         let k = kats();
         let tx = tx12(&k);
         let token = hexd(&k, &["stun", "relayToken"]);
         let mi_key = hexd(&k, &["stun", "miKey"]);
         let ep = encode_xor_relay_endpoint("157.240.226.133", 3478).unwrap();
-        let alloc = build_wasm_stun_allocate_request(&tx, &token, &ep, &mi_key);
+        let call_id = "CALL-ID-0001";
+        let participant = crate::voip::ssrc::format_e2e_srtp_participant_id("12345:0@lid");
+        let alloc =
+            build_wasm_stun_allocate_request(&tx, &token, &ep, &mi_key, call_id, &participant);
+
+        let attrs = parse_stun_attributes(&alloc);
+        assert_eq!(attrs[0].attr_type, ATTR_RELAY_TOKEN);
+        let sd = attrs
+            .iter()
+            .find(|a| a.attr_type == STUN_ATTR_STREAM_DESCRIPTORS)
+            .expect("stream descriptors attr present");
         assert_eq!(
-            hex::encode(&alloc),
-            k["stun"]["wasmAllocate"].as_str().unwrap()
+            sd.value,
+            create_wasm_stream_descriptors(call_id, &participant)
         );
+        assert!(
+            attrs
+                .iter()
+                .any(|a| a.attr_type == STUN_ATTR_WASM_RELAY_ENDPOINT)
+        );
+        let mi = attrs
+            .iter()
+            .find(|a| a.attr_type == ATTR_MESSAGE_INTEGRITY)
+            .expect("message integrity present");
+        assert_eq!(mi.value.len(), 20);
+
         assert_eq!(
             hex::encode(build_whatsapp_ping(&tx)),
             k["stun"]["ping"].as_str().unwrap()
         );
+    }
+
+    #[test]
+    fn stream_descriptors_announce_the_live_media_ssrcs() {
+        let call_id = "CALL-ID-0001";
+        let participant = crate::voip::ssrc::format_e2e_srtp_participant_id("12345:0@lid");
+        let entries =
+            decode_stream_descriptors(&create_wasm_stream_descriptors(call_id, &participant));
+
+        // The video0 media descriptor must name the VideoPipeline SSRC.
+        assert_eq!(
+            entries.get(&(1, 0)).copied(),
+            Some(crate::voip::ssrc::derive_video_participant_ssrc(
+                call_id,
+                &participant
+            ))
+        );
+        assert_eq!(
+            entries.get(&(0, 0)).copied(),
+            Some(crate::voip::ssrc::derive_wasm_participant_ssrc(
+                call_id,
+                &participant,
+                0
+            ))
+        );
+        // audio + video0 + video1, each with media/FEC/NACK.
+        assert_eq!(entries.len(), 9);
     }
 
     #[test]

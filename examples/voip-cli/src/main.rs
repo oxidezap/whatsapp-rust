@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use portable_atomic::AtomicU64;
 use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER};
 use wacore::types::call::{CallAction, IncomingCall};
@@ -98,7 +98,14 @@ async fn main() -> Result<()> {
     );
 
     let args: Vec<String> = std::env::args().collect();
-    match parse_cli(&args) {
+    let command = parse_cli(&args);
+    if video_source_is_ignored(&command, std::env::var_os("WA_VIDEO_INPUT").is_some()) {
+        warn!(
+            "WA_VIDEO_INPUT is set, but --video is missing; outbound video is disabled. Keep \
+             --video on the same shell command line."
+        );
+    }
+    match command {
         CliCommand::Loopback { video: true } => {
             video::run_video_loopback(&VideoOpts::from_env()).await
         }
@@ -152,6 +159,16 @@ fn parse_cli(argv: &[String]) -> CliCommand {
         },
         _ => CliCommand::Usage,
     }
+}
+
+fn video_source_is_ignored(command: &CliCommand, video_input_is_set: bool) -> bool {
+    video_input_is_set
+        && matches!(
+            command,
+            CliCommand::Loopback { video: false }
+                | CliCommand::Listen { video: false, .. }
+                | CliCommand::Call { video: false, .. }
+        )
 }
 
 // ===================== cpal audio bridge =====================
@@ -955,6 +972,133 @@ fn spawn_call_event_listener(
                         let _ = speaker.try_send(pcm);
                     }
                 }
+                CallEvent::RtcpReceived {
+                    packet_types,
+                    sender_ssrc,
+                    referenced_ssrcs,
+                    reports_audio,
+                    reports_video,
+                    protection,
+                    srtcp_index,
+                    encrypted,
+                    plain_len,
+                    sdes_cname_lengths,
+                    report_blocks,
+                    feedback,
+                    uses_whatsapp_profile_extension,
+                } => {
+                    let blocks = report_blocks
+                        .iter()
+                        .map(|report| {
+                            format!(
+                                "{:#010x}:loss={}/{} highest={} jitter={} lsr={:#010x} dlsr={} ext={}B",
+                                report.ssrc,
+                                report.fraction_lost,
+                                report.cumulative_lost,
+                                report.extended_highest_sequence,
+                                report.jitter,
+                                report.last_sender_report,
+                                report.delay_since_last_sender_report,
+                                report.profile_extension.len(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let feedback = feedback
+                        .iter()
+                        .map(|item| {
+                            let kind = match (item.packet_type, item.fmt) {
+                                (205, 1) => "NACK",
+                                (206, 1) => "PLI",
+                                (206, 4) => "FIR",
+                                (206, 15) => "AFB",
+                                _ => "unknown",
+                            };
+                            format!(
+                                "{kind}:sender={:#010x}/media={:#010x}/fci={}B:{}",
+                                item.sender_ssrc,
+                                item.media_ssrc,
+                                item.fci.len(),
+                                hex::encode(&item.fci),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    info!(
+                        "📊 peer RTCP mode={protection:?} PT={packet_types:?} sender={sender_ssrc:#010x} refs={referenced_ssrcs:x?} reports_audio={reports_audio} reports_video={reports_video} index={srtcp_index:?} encrypted={encrypted} plain_bytes={plain_len} wa_profile={uses_whatsapp_profile_extension} blocks=[{blocks}] feedback=[{feedback}] sdes_cname_lens={sdes_cname_lengths:?}"
+                    );
+                }
+                CallEvent::RtcpRejected {
+                    stage,
+                    packet_type,
+                    sender_ssrc,
+                    packet_len,
+                    first_rtcp_len,
+                    plain_len,
+                    candidate_srtcp_index,
+                    candidate_encrypted,
+                    first_header_byte,
+                    plain_sample,
+                } => {
+                    if let Some(sample) = plain_sample {
+                        warn!(
+                            "📊 peer transport RTCP rejected at {stage:?}: PT={packet_type} sender={sender_ssrc:#010x} bytes={packet_len} plain_bytes={plain_len:?} first_header={first_header_byte:#04x} first_rtcp_bytes={first_rtcp_len} candidate_index={candidate_srtcp_index:?} candidate_encrypted={candidate_encrypted} plain_hex={} ",
+                            hex::encode(sample),
+                        );
+                    } else if stage == wacore::voip::RtcpRejectStage::Authentication {
+                        warn!(
+                            "📊 peer transport RTCP rejected at {stage:?}: PT={packet_type} sender={sender_ssrc:#010x} bytes={packet_len} plain_bytes={plain_len:?} first_header={first_header_byte:#04x} first_rtcp_bytes={first_rtcp_len} candidate_index={candidate_srtcp_index:?} candidate_encrypted={candidate_encrypted}"
+                        );
+                    } else {
+                        debug!(
+                            "peer transport RTCP rejected at {stage:?}: PT={packet_type} sender={sender_ssrc:#010x} bytes={packet_len} plain_bytes={plain_len:?} first_header={first_header_byte:#04x} first_rtcp_bytes={first_rtcp_len} candidate_index={candidate_srtcp_index:?} candidate_encrypted={candidate_encrypted}"
+                        );
+                    }
+                }
+                CallEvent::VideoRtpLayoutObserved {
+                    ssrc,
+                    sequence_number,
+                    timestamp,
+                    marker,
+                    header_len,
+                    packet_len,
+                    extension_profile,
+                    extension_data,
+                } => {
+                    let profile = extension_profile
+                        .map(|value| format!("{value:#06x}"))
+                        .unwrap_or_else(|| "none".to_owned());
+                    info!(
+                        "🎥 peer RTP layout: ssrc={ssrc:#010x} seq={sequence_number} ts={timestamp} marker={marker} header_bytes={header_len} packet_bytes={packet_len} ext_profile={profile} ext_data={} ",
+                        hex::encode(extension_data)
+                    );
+                }
+                CallEvent::VideoRtpLayoutSent {
+                    ssrc,
+                    sequence_number,
+                    timestamp,
+                    marker,
+                    header_len,
+                    packet_len,
+                    extension_profile,
+                    extension_data,
+                } => {
+                    let profile = extension_profile
+                        .map(|value| format!("{value:#06x}"))
+                        .unwrap_or_else(|| "none".to_owned());
+                    info!(
+                        "🎥 local RTP layout: ssrc={ssrc:#010x} seq={sequence_number} ts={timestamp} marker={marker} header_bytes={header_len} packet_bytes={packet_len} ext_profile={profile} ext_data={}",
+                        hex::encode(extension_data)
+                    );
+                }
+                CallEvent::OutboundMediaDropped {
+                    video_access_units,
+                    packets,
+                } => {
+                    warn!(
+                        "🎥 relay-send backpressure: dropped {video_access_units} complete video AUs / {packets} packets"
+                    );
+                }
                 CallEvent::VideoStateChanged { state: vs, .. } => match vs {
                     VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
                         if auto_video {
@@ -1039,10 +1183,14 @@ async fn respond_to_offer(
             call_creator,
             &pre_id,
             audio_rates,
+            // Byte-matched to a real from-start video callee: <video dec=H264 screen 0x0> in the
+            // preaccept, with the 0xbb capability (the caller offers 0xfa; the callee preaccepts 0xbb).
+            video,
         ))
         .await
         .map_err(|e| anyhow!("send preaccept: {e}"))?;
     let accept_id = hex::encode(rand::random::<[u8; 8]>());
+    let metadata = if video { call.media.as_deref() } else { None };
     let accept_node = stanza::build_accept(&stanza::AcceptParams {
         call_id,
         to: &call.from,
@@ -1052,9 +1200,13 @@ async fn respond_to_offer(
         relay_te: None,
         rte: None,
         voip_settings: None,
-        capability: Some(&CAPABILITY_OFFER),
-        // Advertise video media in the accept when we're answering with video.
+        // A real from-start video accept carries NO <capability> (just audio/video/net/encopt); the
+        // audio path keeps advertising it.
+        capability: if video { None } else { Some(&CAPABILITY_OFFER) },
         video,
+        peer_abtest_bucket: metadata.and_then(|media| media.peer_abtest_bucket.as_deref()),
+        peer_abtest_bucket_id_list: metadata
+            .and_then(|media| media.peer_abtest_bucket_id_list.as_deref()),
     });
     client
         .send_node(accept_node)
@@ -1239,7 +1391,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliCommand, parse_cli};
+    use super::{CliCommand, parse_cli, video_source_is_ignored};
 
     fn argv(parts: &[&str]) -> Vec<String> {
         std::iter::once("voip")
@@ -1315,5 +1467,16 @@ mod tests {
         assert_eq!(parse_cli(&argv(&["call"])), CliCommand::Usage);
         assert_eq!(parse_cli(&argv(&["bogus"])), CliCommand::Usage);
         assert_eq!(parse_cli(&argv(&[])), CliCommand::Usage);
+    }
+
+    #[test]
+    fn warns_when_video_input_cannot_be_used() {
+        let audio_only = parse_cli(&argv(&["listen", "accept"]));
+        let video = parse_cli(&argv(&["listen", "accept", "--video"]));
+
+        assert!(video_source_is_ignored(&audio_only, true));
+        assert!(!video_source_is_ignored(&audio_only, false));
+        assert!(!video_source_is_ignored(&video, true));
+        assert!(!video_source_is_ignored(&CliCommand::Usage, true));
     }
 }

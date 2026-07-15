@@ -17,10 +17,42 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use wacore::voip::h264::{AnnexBAuSplitter, au_has_idr};
+use wacore::voip::h264::{AnnexBAuSplitter, au_has_idr, nal_unit_type, split_annexb};
 use whatsapp_rust::voip::VideoFrame;
 
-/// Reference encode parameters (H.264 Constrained Baseline, WebCodecs `avc1.42E01F` equivalent).
+/// The NAL-unit type of each NAL in an Annex-B access unit (5=IDR, 7=SPS, 8=PPS, 1=non-IDR, ...),
+/// for diagnostics comparing our outbound AUs against the decodable inbound ones.
+fn au_nal_types(au: &[u8]) -> Vec<u8> {
+    split_annexb(au).map(nal_unit_type).collect()
+}
+
+fn whatsapp_wire_nal_types(au: &[u8]) -> Vec<u8> {
+    au_nal_types(au)
+        .into_iter()
+        .filter(|nal_type| *nal_type != 9)
+        .collect()
+}
+
+fn parameter_set_summary(au: &[u8]) -> Option<String> {
+    let mut sps = None;
+    let mut pps = None;
+    for nal in split_annexb(au) {
+        match nal_unit_type(nal) {
+            7 => sps.get_or_insert(nal),
+            8 => pps.get_or_insert(nal),
+            _ => continue,
+        };
+    }
+    let sps = sps?;
+    let codec = sps.get(1..4).map(hex::encode).unwrap_or_default();
+    Some(format!(
+        "codec=avc1.{codec} SPS={} PPS={}",
+        hex::encode(sps),
+        pps.map(hex::encode).unwrap_or_default(),
+    ))
+}
+
+/// Reference encode parameters (H.264 Constrained Baseline, Level 3.1).
 const VIDEO_SIZE: &str = "640x480";
 const VIDEO_FPS: u32 = 15;
 const VIDEO_BITRATE: &str = "500k";
@@ -240,7 +272,8 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<async_channel::Recei
         // arbitrary dropped AU corrupts the peer's decode until the next IDR anyway. Dropping
         // *deliberately until* the next IDR turns backpressure into one clean skip.
         let mut dropping = false;
-        let (mut made, mut dropped) = (0u64, 0u64);
+        let (mut made, mut dropped, mut sent) = (0u64, 0u64, 0u64);
+        let mut logged_parameter_sets = false;
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) => break, // encoder EOF (camera unplugged, file without loop)
@@ -248,6 +281,15 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<async_channel::Recei
                     splitter.push(&buf[..n], &mut aus);
                     for au in aus.drain(..) {
                         made += 1;
+                        if !logged_parameter_sets && let Some(summary) = parameter_set_summary(&au)
+                        {
+                            info!(
+                                "🎥 OUT H.264: {summary} encoder_nals={:?} wire_nals={:?}",
+                                au_nal_types(&au),
+                                whatsapp_wire_nal_types(&au),
+                            );
+                            logged_parameter_sets = true;
+                        }
                         if dropping {
                             // Resume only on an IDR (a self-contained restart): resuming on a
                             // parameter-set-only AU would forward dependent frames the peer can't
@@ -258,8 +300,18 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<async_channel::Recei
                             }
                             dropping = false;
                         }
+                        // Periodic outbound telemetry so a live test shows whether we're actually
+                        // producing (and sending) video AUs, and whether they carry IDR keyframes.
+                        if sent.is_multiple_of(30) {
+                            info!(
+                                "🎥 OUT video: {sent} AUs queued ({dropped} source-dropped) | {}B, NALs {:?}, keyframe={}",
+                                au.len(),
+                                au_nal_types(&au),
+                                au_has_idr(&au)
+                            );
+                        }
                         match tx.try_send(au) {
-                            Ok(()) => {}
+                            Ok(()) => sent += 1,
                             Err(async_channel::TrySendError::Full(_)) => {
                                 dropped += 1;
                                 dropping = true;
@@ -267,9 +319,6 @@ pub async fn spawn_video_source(opts: &VideoOpts) -> Result<async_channel::Recei
                             // Call ended: stop the encoder.
                             Err(async_channel::TrySendError::Closed(_)) => return,
                         }
-                    }
-                    if made.is_multiple_of(300) && dropped > 0 {
-                        info!("🎥 video source: {made} AUs, {dropped} dropped (backpressure)");
                     }
                 }
                 Err(e) => {
@@ -343,7 +392,27 @@ pub async fn spawn_video_sink(
         let mut target: Option<SinkTarget> = None;
         let mut dropping = false;
         let mut last_orientation = 0u8;
+        let mut recv = 0u64;
+        let mut logged_parameter_sets = false;
         while let Ok(frame) = rx.recv().await {
+            if !logged_parameter_sets && let Some(summary) = parameter_set_summary(&frame.data) {
+                info!(
+                    "🎥 IN  H.264: {summary} nals={:?}",
+                    au_nal_types(&frame.data),
+                );
+                logged_parameter_sets = true;
+            }
+            // Inbound telemetry: the peer's AUs DO decode (ffplay shows them), so their shape is the
+            // reference to compare our outbound AUs against.
+            if recv.is_multiple_of(30) {
+                info!(
+                    "🎥 IN  video: {recv} AUs recv | {}B, NALs {:?}, keyframe={}",
+                    frame.data.len(),
+                    au_nal_types(&frame.data),
+                    au_has_idr(&frame.data)
+                );
+            }
+            recv += 1;
             if frame.orientation != last_orientation {
                 last_orientation = frame.orientation;
                 // ffplay can't rotate a live pipe; surface it so the user can tilt their head :)
@@ -452,5 +521,28 @@ pub async fn run_video_loopback(opts: &VideoOpts) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_nal_diagnostics_match_whatsapp_aud_filter() {
+        let au = [
+            &[0, 0, 0, 1, 0x69, 0xf0][..],
+            &[0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f][..],
+            &[0, 0, 0, 1, 0x68, 0xce, 0x06, 0xe2][..],
+            &[0, 0, 0, 1, 0x65, 1, 2, 3][..],
+        ]
+        .concat();
+
+        assert_eq!(au_nal_types(&au), [9, 7, 8, 5]);
+        assert_eq!(whatsapp_wire_nal_types(&au), [7, 8, 5]);
+        assert_eq!(
+            parameter_set_summary(&au).as_deref(),
+            Some("codec=avc1.42c01f SPS=6742c01f PPS=68ce06e2")
+        );
     }
 }

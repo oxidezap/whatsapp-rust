@@ -133,7 +133,26 @@ fn parse_media_offer(
     }
 
     let relay = find_relay(call).and_then(crate::voip::relay_parse::parse_relay_data);
-    Some(MediaOffer { encs, relay })
+    let (peer_abtest_bucket, peer_abtest_bucket_id_list) = offer
+        .get_optional_child("metadata")
+        .map(|metadata| {
+            let mut attrs = metadata.attrs();
+            (
+                attrs
+                    .optional_string("peer_abtest_bucket")
+                    .map(|value| value.into_owned()),
+                attrs
+                    .optional_string("peer_abtest_bucket_id_list")
+                    .map(|value| value.into_owned()),
+            )
+        })
+        .unwrap_or_default();
+    Some(MediaOffer {
+        encs,
+        relay,
+        peer_abtest_bucket,
+        peer_abtest_bucket_id_list,
+    })
 }
 
 /// Parse one `<enc>` node into the ciphertext plus the wire `type`/`v` needed to decrypt the callKey.
@@ -374,10 +393,15 @@ pub fn build_offer_ack_receipt(call: &IncomingCall, own_ad: Option<&Jid>) -> Opt
 // Stanza ids generated from random bytes (heartbeat, preaccept) are passed in so the
 // builders stay pure; the I/O layer supplies them.
 
-/// Capability blob for `<offer>`/`<accept>` (ver=1).
-pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x13];
-/// Capability blob for `<preaccept>` (ver=1).
-pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x07];
+/// Capability blob for `<offer>`/`<accept>`/video `<preaccept>` (ver=1). Byte 4 is `0xe0`, matching
+/// real WhatsApp captures (an earlier `0xe4` was tolerated for audio but is not what the client sends).
+pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13];
+/// Capability blob for an audio-only `<preaccept>` (ver=1).
+pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
+/// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
+/// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
+/// (`0xbb`), not this.
+pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
 
 /// `<terminate reason>` wire tokens. The caller-driven sibling dismiss SENDS the `*_ELSEWHERE`
 /// ones; the receive path maps every reason to a call-log outcome (see WA Web's
@@ -443,7 +467,7 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
             .build(),
     );
     if p.video {
-        children.push(offer_video_node());
+        children.push(video_offer_node());
     }
     children.push(NodeBuilder::new("net").attr("medium", "3").build());
     if let Some(cap) = p.capability {
@@ -506,19 +530,18 @@ pub struct AcceptParams<'a> {
     pub rte: Option<&'a [u8]>,
     pub voip_settings: Option<&'a [u8]>,
     pub capability: Option<&'a [u8]>,
-    /// Advertise a `<video>` child: accepting a video-from-the-start call with video media. The node
-    /// mirrors the offer's `<video dec="H264" enc="h.264" …>` (NOT a bare `enc="h264"`, which uses a
-    /// codec token the peer doesn't match). Exact accept format is still a live-validation point —
-    /// the authoritative shape lives in WA Web's WASM, not the captured JS.
+    /// Include the captured callee-side `<video>` child for a video-from-start accept.
     pub video: bool,
+    pub peer_abtest_bucket: Option<&'a str>,
+    pub peer_abtest_bucket_id_list: Option<&'a str>,
 }
 
-/// `<accept>`: audio → [video] → [te priority=2] → net medium=2 → encopt → [capability] → [rte] →
-/// [voip_settings].
+/// `<accept>`: audio → [video] → [te priority=2] → net medium=2 → encopt → [metadata] →
+/// [capability] → [rte] → [voip_settings].
 pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     let mut children: Vec<Node> = p.audio_rates.iter().map(|rate| audio_opus(rate)).collect();
     if p.video {
-        children.push(offer_video_node());
+        children.push(video_accept_node());
     }
     if let Some(te) = p.relay_te {
         children.push(
@@ -530,6 +553,16 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     }
     children.push(NodeBuilder::new("net").attr("medium", "2").build());
     children.push(encopt_node());
+    if p.peer_abtest_bucket.is_some() || p.peer_abtest_bucket_id_list.is_some() {
+        let mut metadata = NodeBuilder::new("metadata");
+        if let Some(bucket) = p.peer_abtest_bucket {
+            metadata = metadata.attr("peer_abtest_bucket", bucket.to_string());
+        }
+        if let Some(ids) = p.peer_abtest_bucket_id_list {
+            metadata = metadata.attr("peer_abtest_bucket_id_list", ids.to_string());
+        }
+        children.push(metadata.build());
+    }
     if let Some(cap) = p.capability {
         children.push(capability_node(cap));
     }
@@ -551,12 +584,35 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     )
 }
 
-/// The `<video>` advertisement in a video-from-the-start offer, as captured from WA Web:
-/// `<video dec="H264" enc="h.264" device_orientation="0" screen_width="0" screen_height="0"/>`.
-fn offer_video_node() -> Node {
+/// Default initiator-side geometry used by the WaCalls reference.
+const VIDEO_SCREEN_WIDTH: &str = "1920";
+const VIDEO_SCREEN_HEIGHT: &str = "1080";
+
+/// `<video>` for an `<offer>`: full decoder + geometry advertisement (the initiator side).
+fn video_offer_node() -> Node {
+    NodeBuilder::new("video")
+        .attr("enc", "h264")
+        .attr("dec", "h264")
+        .attr("orientation", "0")
+        .attr("screen_width", VIDEO_SCREEN_WIDTH)
+        .attr("screen_height", VIDEO_SCREEN_HEIGHT)
+        .attr("device_orientation", "0")
+        .build()
+}
+
+/// `<video>` byte-matching a captured from-start video callee.
+fn video_accept_node() -> Node {
     NodeBuilder::new("video")
         .attr("dec", "H264")
-        .attr("enc", "h.264")
+        .attr("device_orientation", "0")
+        .build()
+}
+
+/// `<video>` for a `<preaccept>`, byte-matching a real from-start video callee: `dec` +
+/// `device_orientation` + `screen_width="0" screen_height="0"` (the real client sends zero here).
+fn video_preaccept_node() -> Node {
+    NodeBuilder::new("video")
+        .attr("dec", "H264")
         .attr("device_orientation", "0")
         .attr("screen_width", "0")
         .attr("screen_height", "0")
@@ -584,17 +640,27 @@ fn capability_node(blob: &[u8]) -> Node {
         .build()
 }
 
-/// `<preaccept>`: audio → encopt → capability(preaccept blob). `id` is the random call-wrapper id.
+/// `<preaccept>`: audio → [video] → encopt → capability. `id` is the random call-wrapper id. A video
+/// callee advertises the `<video>` decoder here; the capability stays the `0xbb` [`CAPABILITY_OFFER`]
+/// blob (byte-matched to a real from-start video callee — the `0xfa` variant is the CALLER's offer).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
     call_creator: &Jid,
     wrapper_id: &str,
     audio_rates: &[&str],
+    video: bool,
 ) -> Node {
     let mut children: Vec<Node> = audio_rates.iter().map(|rate| audio_opus(rate)).collect();
+    if video {
+        children.push(video_preaccept_node());
+    }
     children.push(encopt_node());
-    children.push(capability_node(&CAPABILITY_PREACCEPT));
+    children.push(capability_node(if video {
+        &CAPABILITY_OFFER
+    } else {
+        &CAPABILITY_PREACCEPT
+    }));
     call_wrap(
         to,
         Some(wrapper_id),
@@ -871,11 +937,17 @@ mod tests {
         let node = base_call_builder()
             .children([
                 offer_builder_base()
-                    .children([NodeBuilder::new("enc")
-                        .attr("v", "2")
-                        .attr("type", "pkmsg")
-                        .bytes(vec![1, 2, 3, 4])
-                        .build()])
+                    .children([
+                        NodeBuilder::new("enc")
+                            .attr("v", "2")
+                            .attr("type", "pkmsg")
+                            .bytes(vec![1, 2, 3, 4])
+                            .build(),
+                        NodeBuilder::new("metadata")
+                            .attr("peer_abtest_bucket", "video_interop_holdout")
+                            .attr("peer_abtest_bucket_id_list", "110001,110002")
+                            .build(),
+                    ])
                     .build(),
                 relay,
             ])
@@ -889,6 +961,14 @@ mod tests {
         assert_eq!(enc.enc_type, "pkmsg");
         assert_eq!(enc.version, 2);
         assert_eq!(enc.ciphertext, vec![1, 2, 3, 4]);
+        assert_eq!(
+            media.peer_abtest_bucket.as_deref(),
+            Some("video_interop_holdout")
+        );
+        assert_eq!(
+            media.peer_abtest_bucket_id_list.as_deref(),
+            Some("110001,110002")
+        );
         let rd = media.relay.expect("the <relay> must be parsed");
         assert_eq!(rd.warp_mi_tag_len, Some(4));
         assert_eq!(rd.relay_tokens[0], vec![0xaa, 0xbb]);
@@ -1633,6 +1713,8 @@ mod tests {
             voip_settings: None,
             capability: Some(&CAPABILITY_OFFER),
             video: false,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
         });
         assert_eq!(
             child_tags(&accept),
@@ -1649,11 +1731,54 @@ mod tests {
             Some("ACCEPT-STANZA-ID")
         );
 
-        let pre = build_preaccept("CID", &peer, &creator, "abcd1234", &["8000", "16000"]);
+        let pre = build_preaccept(
+            "CID",
+            &peer,
+            &creator,
+            "abcd1234",
+            &["8000", "16000"],
+            false,
+        );
         assert_eq!(child_tags(&pre), ["audio", "audio", "encopt", "capability"]);
         assert_eq!(
             pre.as_node_ref().attrs().optional_string("id").as_deref(),
             Some("abcd1234")
+        );
+    }
+
+    #[test]
+    fn video_preaccept_advertises_video_and_video_capability() {
+        let peer = peer();
+        let creator = creator();
+        let pre = build_preaccept("CID", &peer, &creator, "abcd1234", &["16000"], true);
+        assert_eq!(child_tags(&pre), ["audio", "video", "encopt", "capability"]);
+        let pre_ref = pre.as_node_ref();
+        let action = &pre_ref.children().unwrap()[0];
+        let video = action.get_optional_child("video").unwrap();
+        assert_eq!(
+            video.attrs().optional_string("dec").as_deref(),
+            Some("H264")
+        );
+        // Real from-start video callee sends screen_width/height="0" in the preaccept <video>.
+        assert_eq!(
+            video.attrs().optional_string("screen_width").as_deref(),
+            Some("0")
+        );
+        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the 0xfa offer blob.
+        let cap = action.get_optional_child("capability").unwrap();
+        assert_eq!(cap.content_bytes().unwrap(), &CAPABILITY_OFFER);
+
+        // An audio preaccept keeps the audio capability blob.
+        let audio_pre = build_preaccept("CID", &peer, &creator, "id", &["16000"], false);
+        let audio_ref = audio_pre.as_node_ref();
+        let audio_action = &audio_ref.children().unwrap()[0];
+        assert_eq!(
+            audio_action
+                .get_optional_child("capability")
+                .unwrap()
+                .content_bytes()
+                .unwrap(),
+            &CAPABILITY_PREACCEPT
         );
     }
 
@@ -1991,9 +2116,11 @@ mod tests {
             voip_settings: None,
             capability: None,
             video: true,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
         });
         assert_eq!(child_tags(&accept), ["audio", "video", "net", "encopt"]);
-        // The accept's <video> mirrors the offer's format (dec + enc="h.264"), not a bare enc.
+        // Captured callee accept: dec + device_orientation, without enc or screen geometry.
         let vnode = accept.as_node_ref().children().unwrap()[0]
             .children()
             .unwrap()
@@ -2002,8 +2129,62 @@ mod tests {
             .unwrap()
             .to_owned();
         let vr = vnode.as_node_ref();
-        assert_eq!(vr.attrs().optional_string("enc").as_deref(), Some("h.264"));
         assert_eq!(vr.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            vr.attrs().optional_string("enc"),
+            None,
+            "accept <video> must not advertise enc"
+        );
+        assert_eq!(vr.attrs().optional_string("screen_width"), None);
+
+        // The offer's <video> carries the decoder/geometry advertisement (WaCalls reference form).
+        let ovnode = offer.as_node_ref().children().unwrap()[0]
+            .children()
+            .unwrap()
+            .iter()
+            .find(|c| c.tag == "video")
+            .unwrap()
+            .to_owned();
+        let ovr = ovnode.as_node_ref();
+        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h264"));
+        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("h264"));
+
+        let accept = build_accept(&AcceptParams {
+            call_id: "CID",
+            to: &peer,
+            id: "ACCEPT-ID-METADATA",
+            call_creator: &creator,
+            audio_rates: &["16000"],
+            relay_te: None,
+            rte: None,
+            voip_settings: None,
+            capability: None,
+            video: true,
+            peer_abtest_bucket: Some("video_interop_holdout"),
+            peer_abtest_bucket_id_list: Some("110001,110002"),
+        });
+        assert_eq!(
+            child_tags(&accept),
+            ["audio", "video", "net", "encopt", "metadata"]
+        );
+        let accept_ref = accept.as_node_ref();
+        let metadata = accept_ref.children().unwrap()[0]
+            .get_optional_child("metadata")
+            .unwrap();
+        assert_eq!(
+            metadata
+                .attrs()
+                .optional_string("peer_abtest_bucket")
+                .as_deref(),
+            Some("video_interop_holdout")
+        );
+        assert_eq!(
+            metadata
+                .attrs()
+                .optional_string("peer_abtest_bucket_id_list")
+                .as_deref(),
+            Some("110001,110002")
+        );
     }
 
     #[test]

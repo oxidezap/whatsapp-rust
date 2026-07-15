@@ -4,22 +4,60 @@
 use crate::voip::warp::audio_piggyback_extension_for;
 
 pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 120;
-/// H.264 video payload type. Taken from the WaCalls/meowcaller reference,
-/// never validated against a live capture.
+/// H.264 video payload type used by captured Android video RTP.
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
 /// Video RTP timestamp clock.
 pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// Timestamp stride per access unit at the reference 15 fps (90000 / 15).
 pub const VIDEO_TS_STRIDE_15FPS: u32 = VIDEO_CLOCK_RATE / 15;
 pub const WHATSAPP_RTP_EXTENSION_PROFILE: u16 = 0xdebe;
+
 /// RFC 3550 fixed RTP header length, before any CSRC list or extension block.
 pub const RTP_FIXED_HEADER_LEN: usize = 12;
 pub const WHATSAPP_RTP_HEADER_SIZE: usize = 16;
 pub const WHATSAPP_RTP_HEADER_DTX_SIZE: usize = 20;
+pub const WHATSAPP_VIDEO_RTP_HEADER_SIZE: usize = 28;
+/// WhatsApp frame-present and keyframe flags carried by an IDR access unit.
+pub const VIDEO_MEDIA_FRAME_INFO_IDR: u8 = 0x09;
+/// WhatsApp frame-present flag carried by a dependent H.264 access unit.
+pub const VIDEO_MEDIA_FRAME_INFO_DELTA: u8 = 0x01;
 pub const WHATSAPP_RTP_EXTENSION_DTX_WORD: u32 = 0x3001_0000;
 const RTP_VERSION: u8 = 2;
 const SRTP_AUTH_TAG_LEN: usize = 10;
 const SRTP_AUTH_TAG_LEN_SHORT: usize = 4;
+
+/// The four one-byte-header extensions emitted by WhatsApp's video sender.
+/// IDs and ordering are pinned by the Android packet captured in
+/// `video_header_matches_android_capture` and the corresponding WASM extenders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoRtpExtension {
+    pub media_frame_info: u8,
+    pub initial_bandwidth: u16,
+    pub short_offset: i16,
+    pub transport_sequence: u16,
+}
+
+impl VideoRtpExtension {
+    fn encode_into(self, out: &mut [u8; 12]) {
+        let initial_bandwidth = self.initial_bandwidth.to_be_bytes();
+        let short_offset = self.short_offset.to_be_bytes();
+        let transport_sequence = self.transport_sequence.to_be_bytes();
+        *out = [
+            0x30,
+            self.media_frame_info,
+            0x51,
+            initial_bandwidth[0],
+            initial_bandwidth[1],
+            0x61,
+            short_offset[0],
+            short_offset[1],
+            0x91,
+            transport_sequence[0],
+            transport_sequence[1],
+            0,
+        ];
+    }
+}
 
 /// Android first priming frame (18 bytes).
 pub const OPUS_PRIMING_FRAME_1: [u8; 18] = [
@@ -95,11 +133,15 @@ pub struct RtpHeader {
     pub ssrc: u32,
     /// When set, the header carries one 0xdebe extension word (DTX/piggyback).
     pub extension_word: Option<u32>,
+    /// WhatsApp video metadata, encoded as the captured 12-byte 0xdebe block.
+    pub video_extension: Option<VideoRtpExtension>,
 }
 
 impl RtpHeader {
     pub fn byte_size(&self) -> usize {
-        if self.extension_word.is_some() {
+        if self.video_extension.is_some() {
+            WHATSAPP_VIDEO_RTP_HEADER_SIZE
+        } else if self.extension_word.is_some() {
             WHATSAPP_RTP_HEADER_DTX_SIZE
         } else {
             WHATSAPP_RTP_HEADER_SIZE
@@ -134,6 +176,59 @@ pub fn rtp_header_byte_length(data: &[u8]) -> Option<usize> {
     Some(header_len)
 }
 
+/// Extension profile and its word-aligned payload. A valid RTP packet without X returns
+/// `(None, &[])` so callers can distinguish it from malformed input.
+pub fn rtp_extension_profile_and_data(data: &[u8]) -> Option<(Option<u16>, &[u8])> {
+    if data.len() < RTP_FIXED_HEADER_LEN || (data[0] >> 6) & 0x03 != RTP_VERSION {
+        return None;
+    }
+    let extension_offset = RTP_FIXED_HEADER_LEN + (data[0] & 0x0f) as usize * 4;
+    if data.len() < extension_offset {
+        return None;
+    }
+    if data[0] & 0x10 == 0 {
+        return Some((None, &[]));
+    }
+    if data.len() < extension_offset + 4 {
+        return None;
+    }
+    let words =
+        u16::from_be_bytes([data[extension_offset + 2], data[extension_offset + 3]]) as usize;
+    let data_start = extension_offset + 4;
+    let data_end = data_start.checked_add(words.checked_mul(4)?)?;
+    Some((
+        Some(u16::from_be_bytes([
+            data[extension_offset],
+            data[extension_offset + 1],
+        ])),
+        data.get(data_start..data_end)?,
+    ))
+}
+
+/// Decode the exact WhatsApp video extension set. Other 0xdebe layouts, including audio
+/// piggyback, deliberately return `None`.
+pub fn parse_whatsapp_video_extension(data: &[u8]) -> Option<VideoRtpExtension> {
+    let (Some(profile), extension) = rtp_extension_profile_and_data(data)? else {
+        return None;
+    };
+    if profile != WHATSAPP_RTP_EXTENSION_PROFILE
+        || extension.len() != 12
+        || extension[0] != 0x30
+        || extension[2] != 0x51
+        || extension[5] != 0x61
+        || extension[8] != 0x91
+        || extension[11] != 0
+    {
+        return None;
+    }
+    Some(VideoRtpExtension {
+        media_frame_info: extension[1],
+        initial_bandwidth: u16::from_be_bytes([extension[3], extension[4]]),
+        short_offset: i16::from_be_bytes([extension[6], extension[7]]),
+        transport_sequence: u16::from_be_bytes([extension[9], extension[10]]),
+    })
+}
+
 pub fn is_rtp_version2(data: &[u8]) -> bool {
     data.len() >= RTP_FIXED_HEADER_LEN && (data[0] >> 6) & 0x03 == RTP_VERSION
 }
@@ -163,6 +258,7 @@ pub fn parse_rtp_header(data: &[u8]) -> Option<RtpHeader> {
         timestamp: h.timestamp.get(),
         ssrc: h.ssrc.get(),
         extension_word: None,
+        video_extension: parse_whatsapp_video_extension(data),
     })
 }
 
@@ -172,7 +268,8 @@ pub fn parse_rtp_header(data: &[u8]) -> Option<RtpHeader> {
 /// header.
 pub fn encode_rtp_header_into(header: &RtpHeader, out: &mut Vec<u8>) {
     let size = header.byte_size();
-    let mut b = [0u8; WHATSAPP_RTP_HEADER_DTX_SIZE];
+    debug_assert!(header.extension_word.is_none() || header.video_extension.is_none());
+    let mut b = [0u8; WHATSAPP_VIDEO_RTP_HEADER_SIZE];
     b[0] = RTP_VERSION << 6;
     if size > RTP_FIXED_HEADER_LEN {
         b[0] |= 0x10; // X=1 (WhatsApp 0xdebe extension)
@@ -183,10 +280,18 @@ pub fn encode_rtp_header_into(header: &RtpHeader, out: &mut Vec<u8>) {
     b[8..12].copy_from_slice(&header.ssrc.to_be_bytes());
     if size >= 16 {
         b[12..14].copy_from_slice(&WHATSAPP_RTP_EXTENSION_PROFILE.to_be_bytes());
-        // Extension length in 32-bit words (0 or 1): high byte (b[14]) stays 0.
-        b[15] = header.extension_word.is_some() as u8;
+        // High byte stays zero: current extension blocks are at most three words.
+        b[15] = if header.video_extension.is_some() {
+            3
+        } else {
+            header.extension_word.is_some() as u8
+        };
     }
-    if size >= 20
+    if let Some(extension) = header.video_extension {
+        let mut encoded = [0u8; 12];
+        extension.encode_into(&mut encoded);
+        b[16..28].copy_from_slice(&encoded);
+    } else if size >= 20
         && let Some(w) = header.extension_word
     {
         b[16..20].copy_from_slice(&w.to_be_bytes());
@@ -205,6 +310,7 @@ pub struct RtpStream {
     pub ssrc: u32,
     seq: u16,
     timestamp: u32,
+    last_sent_timestamp: Option<u32>,
     samples_per_packet: u32,
     speech_started: bool,
     audio_packet_index: usize,
@@ -217,11 +323,17 @@ impl RtpStream {
             ssrc,
             seq: 1,
             timestamp: 0,
+            last_sent_timestamp: None,
             samples_per_packet,
             speech_started: false,
             audio_packet_index: 0,
             warp_piggyback,
         }
+    }
+
+    /// The current send timestamp (last emitted), for an RTCP Sender Report.
+    pub fn rtp_timestamp(&self) -> u32 {
+        self.last_sent_timestamp.unwrap_or(self.timestamp)
     }
 
     fn resolve_warp_extension(&mut self, dtx: bool) -> Option<u32> {
@@ -251,7 +363,9 @@ impl RtpStream {
             timestamp: self.timestamp,
             ssrc: self.ssrc,
             extension_word: self.resolve_warp_extension(dtx),
+            video_extension: None,
         };
+        self.last_sent_timestamp = Some(header.timestamp);
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
         header
@@ -266,7 +380,9 @@ impl RtpStream {
             timestamp: self.timestamp,
             ssrc: self.ssrc,
             extension_word: self.resolve_warp_extension(false),
+            video_extension: None,
         };
+        self.last_sent_timestamp = Some(header.timestamp);
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
         header
@@ -275,13 +391,14 @@ impl RtpStream {
 
 /// Send-side sequencer for the video stream: one header per RTP packet of an
 /// access unit, the timestamp is shared by every packet of the AU and advances
-/// by `ts_stride` only when the AU closes (marker packet). Plain 16-byte
-/// header — no WARP extension, no DTX, no speech latch.
+/// by `ts_stride` only when the AU closes (marker packet).
 pub struct VideoRtpStream {
     pub ssrc: u32,
     seq: u16,
     timestamp: u32,
+    last_sent_timestamp: Option<u32>,
     ts_stride: u32,
+    transport_sequence: u16,
 }
 
 impl VideoRtpStream {
@@ -290,13 +407,21 @@ impl VideoRtpStream {
             ssrc,
             seq: 0,
             timestamp: 0,
+            last_sent_timestamp: None,
             ts_stride,
+            transport_sequence: 0,
         }
     }
 
+    /// The current send timestamp (last emitted), for an RTCP Sender Report.
+    pub fn rtp_timestamp(&self) -> u32 {
+        self.last_sent_timestamp.unwrap_or(self.timestamp)
+    }
+
     /// Header for the next packet of the current AU; `last_in_au` sets the
-    /// marker and moves the timestamp to the next AU.
-    pub fn next_video_packet(&mut self, last_in_au: bool) -> RtpHeader {
+    /// marker and moves the timestamp to the next AU. `media_frame_info` is an
+    /// encoded-frame property and must be identical on every fragment of the AU.
+    pub fn next_video_packet(&mut self, last_in_au: bool, media_frame_info: u8) -> RtpHeader {
         let header = RtpHeader {
             marker: last_in_au,
             payload_type: RTP_PAYLOAD_TYPE_H264,
@@ -304,8 +429,18 @@ impl VideoRtpStream {
             timestamp: self.timestamp,
             ssrc: self.ssrc,
             extension_word: None,
+            video_extension: Some(VideoRtpExtension {
+                media_frame_info,
+                initial_bandwidth: 0,
+                // The real sender reported 29 ticks (~0.3 ms). Zero is the truthful value when
+                // the API has no capture-time origin to subtract from the RTP timestamp.
+                short_offset: 0,
+                transport_sequence: self.transport_sequence,
+            }),
         };
+        self.last_sent_timestamp = Some(header.timestamp);
         self.seq = self.seq.wrapping_add(1);
+        self.transport_sequence = self.transport_sequence.wrapping_add(1);
         if last_in_au {
             self.timestamp = self.timestamp.wrapping_add(self.ts_stride);
         }
@@ -329,6 +464,7 @@ mod tests {
             timestamp: 0,
             ssrc,
             extension_word: None,
+            video_extension: None,
         };
         assert_eq!(
             hex::encode(encode_rtp_header(&speech)),
@@ -341,6 +477,7 @@ mod tests {
             timestamp: 320,
             ssrc,
             extension_word: Some(0x3001_0000),
+            video_extension: None,
         };
         assert_eq!(
             hex::encode(encode_rtp_header(&dtx)),
@@ -357,6 +494,7 @@ mod tests {
             timestamp: 0xdead_beef,
             ssrc: 0x0102_0304,
             extension_word: None,
+            video_extension: None,
         };
         let bytes = encode_rtp_header(&h);
         assert_eq!(rtp_header_byte_length(&bytes), Some(16));
@@ -400,34 +538,152 @@ mod tests {
     fn video_stream_marker_and_timestamp_advance_per_au() {
         let mut s = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
         // 3-packet AU: ts shared, marker only on the last.
-        let p0 = s.next_video_packet(false);
-        let p1 = s.next_video_packet(false);
-        let p2 = s.next_video_packet(true);
+        let p0 = s.next_video_packet(false, VIDEO_MEDIA_FRAME_INFO_IDR);
+        let p1 = s.next_video_packet(false, VIDEO_MEDIA_FRAME_INFO_IDR);
+        let p2 = s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);
         assert_eq!(
             (p0.sequence_number, p1.sequence_number, p2.sequence_number),
             (0, 1, 2)
         );
         assert_eq!((p0.timestamp, p1.timestamp, p2.timestamp), (0, 0, 0));
         assert_eq!((p0.marker, p1.marker, p2.marker), (false, false, true));
+        assert_eq!(s.rtp_timestamp(), 0, "SR maps to the emitted AU timestamp");
+        assert_eq!(
+            [p0, p1, p2].map(|packet| packet.video_extension.unwrap().media_frame_info),
+            [VIDEO_MEDIA_FRAME_INFO_IDR; 3]
+        );
+        assert_eq!(
+            [p0, p1, p2].map(|packet| packet.video_extension.unwrap().transport_sequence),
+            [0, 1, 2]
+        );
         // Next AU: timestamp advanced by one stride.
-        let p3 = s.next_video_packet(true);
+        let p3 = s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
         assert_eq!(p3.timestamp, VIDEO_TS_STRIDE_15FPS);
         assert_eq!(p3.sequence_number, 3);
+        assert_eq!(s.rtp_timestamp(), VIDEO_TS_STRIDE_15FPS);
+        assert_eq!(
+            p3.video_extension.unwrap().media_frame_info,
+            VIDEO_MEDIA_FRAME_INFO_DELTA
+        );
+        assert_eq!(p3.video_extension.unwrap().transport_sequence, 3);
         for p in [p0, p1, p2, p3] {
             assert_eq!(p.payload_type, RTP_PAYLOAD_TYPE_H264);
             assert_eq!(p.extension_word, None);
-            assert_eq!(p.byte_size(), WHATSAPP_RTP_HEADER_SIZE);
+            assert_eq!(p.byte_size(), WHATSAPP_VIDEO_RTP_HEADER_SIZE);
         }
     }
 
     #[test]
     fn video_header_round_trips_through_parse() {
         let mut s = VideoRtpStream::new(0xdead_beef, VIDEO_TS_STRIDE_15FPS);
-        s.next_video_packet(true);
-        let h = s.next_video_packet(true);
+        s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);
+        let h = s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
         let bytes = encode_rtp_header(&h);
-        assert_eq!(rtp_header_byte_length(&bytes), Some(16));
+        assert_eq!(rtp_header_byte_length(&bytes), Some(28));
         assert_eq!(parse_rtp_header(&bytes), Some(h));
+    }
+
+    #[test]
+    fn video_header_uses_wasm_extension_layout() {
+        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
+        let header = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);
+        assert_eq!(
+            encode_rtp_header(&header),
+            [
+                0x90, 0xe1, // V=2, X=1, marker, PT=97
+                0x00, 0x00, // sequence
+                0x00, 0x00, 0x00, 0x00, // timestamp
+                0x11, 0x22, 0x33, 0x44, // SSRC
+                0xde, 0xbe, 0x00, 0x03, // WARP profile, three words
+                0x30, 0x09, // ID 3: one-byte encoded-frame flags (keyframe | IDR)
+                0x51, 0x00, 0x00, // ID 5: two-byte initial bandwidth
+                0x61, 0x00, 0x00, // ID 6: two-byte short timestamp offset
+                0x91, 0x00, 0x00, // ID 9: two-byte transport sequence
+                0x00, // word alignment
+            ]
+        );
+        let encoded = encode_rtp_header(&header);
+        assert_eq!(
+            rtp_extension_profile_and_data(&encoded),
+            Some((Some(WHATSAPP_RTP_EXTENSION_PROFILE), &encoded[16..28]))
+        );
+    }
+
+    #[test]
+    fn video_header_matches_android_capture() {
+        let k = kats();
+        let captured = hex::decode(k["rtp"]["androidVideoHeader28"].as_str().unwrap()).unwrap();
+        assert_eq!(rtp_header_byte_length(&captured), Some(28));
+        assert_eq!(
+            hex::encode(rtp_extension_profile_and_data(&captured).unwrap().1),
+            k["rtp"]["androidVideoExtension12"].as_str().unwrap()
+        );
+        assert_eq!(
+            parse_rtp_header(&captured),
+            Some(RtpHeader {
+                marker: true,
+                payload_type: RTP_PAYLOAD_TYPE_H264,
+                sequence_number: 1,
+                timestamp: 114_120,
+                ssrc: 0x49c5_fb8c,
+                extension_word: None,
+                video_extension: Some(VideoRtpExtension {
+                    media_frame_info: 0x09,
+                    initial_bandwidth: 0,
+                    short_offset: 29,
+                    transport_sequence: 0x0c3f,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn delta_video_header_matches_android_capture() {
+        let k = kats();
+        let captured =
+            hex::decode(k["rtp"]["androidVideoDeltaHeader28"].as_str().unwrap()).unwrap();
+        assert_eq!(rtp_header_byte_length(&captured), Some(28));
+        assert_eq!(
+            hex::encode(rtp_extension_profile_and_data(&captured).unwrap().1),
+            k["rtp"]["androidVideoDeltaExtension12"].as_str().unwrap()
+        );
+        assert_eq!(
+            parse_rtp_header(&captured),
+            Some(RtpHeader {
+                marker: true,
+                payload_type: RTP_PAYLOAD_TYPE_H264,
+                sequence_number: 7,
+                timestamp: 143_010,
+                ssrc: 0x9b19_59f0,
+                extension_word: None,
+                video_extension: Some(VideoRtpExtension {
+                    media_frame_info: VIDEO_MEDIA_FRAME_INFO_DELTA,
+                    initial_bandwidth: 0,
+                    short_offset: 36,
+                    transport_sequence: 0x0a6a,
+                }),
+            })
+        );
+        assert_eq!(
+            VIDEO_MEDIA_FRAME_INFO_IDR,
+            VIDEO_MEDIA_FRAME_INFO_DELTA | 0x08
+        );
+    }
+
+    #[test]
+    fn extension_view_handles_one_byte_profile_and_malformed_lengths() {
+        let packet = [
+            0x90, 97, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0xbe, 0xde, 0, 1, 0x31, 1, 2, 3, 0x65,
+        ];
+        assert_eq!(
+            rtp_extension_profile_and_data(&packet),
+            Some((Some(0xbede), &packet[16..20]))
+        );
+        assert_eq!(rtp_header_byte_length(&packet), Some(20));
+
+        let mut malformed = packet;
+        malformed[15] = 2;
+        assert_eq!(rtp_extension_profile_and_data(&malformed), None);
     }
 
     #[test]
@@ -435,9 +691,9 @@ mod tests {
         let mut s = VideoRtpStream::new(1, u32::MAX);
         s.seq = u16::MAX;
         s.timestamp = u32::MAX;
-        let p = s.next_video_packet(true);
+        let p = s.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR);
         assert_eq!(p.sequence_number, u16::MAX);
-        let p = s.next_video_packet(false);
+        let p = s.next_video_packet(false, VIDEO_MEDIA_FRAME_INFO_DELTA);
         assert_eq!(p.sequence_number, 0, "seq must wrap, not panic");
         assert_eq!(p.timestamp, u32::MAX - 1, "timestamp must wrap, not panic");
     }
@@ -454,12 +710,14 @@ mod tests {
             (2, 320, false)
         );
         assert_eq!(d1.extension_word, Some(WHATSAPP_RTP_EXTENSION_DTX_WORD));
+        assert_eq!(s.rtp_timestamp(), 320);
         // First speech frame latches the marker.
         let sp = s.next_packet(&[0x48; 40], false);
         assert_eq!(
             (sp.sequence_number, sp.timestamp, sp.marker),
             (3, 640, true)
         );
+        assert_eq!(s.rtp_timestamp(), 640);
         // Subsequent speech has no marker.
         let sp2 = s.next_packet(&[0x48; 40], false);
         assert!(!sp2.marker);

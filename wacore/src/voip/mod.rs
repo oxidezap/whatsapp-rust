@@ -33,8 +33,8 @@ pub mod warp;
 pub use demux::{RelayPacketKind, classify_relay_packet};
 pub use driver::{CallChannels, VideoControl, run_call};
 pub use engine::{
-    CallConfig, CallEngine, CallEvent, EngineError, Input, Millis, NEVER, Output, SetupError,
-    TxIdSource,
+    CallConfig, CallEngine, CallEvent, EngineError, Input, Millis, NEVER, Output, RtcpProtection,
+    RtcpRejectStage, SetupError, TxIdSource,
 };
 pub use h264::{AnnexBAuSplitter, VideoFrame};
 pub use mlow::{MlowDecoder, MlowEncoder};

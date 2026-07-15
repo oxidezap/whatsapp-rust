@@ -129,7 +129,7 @@ fn started_engine() -> CallEngine {
 
 fn started_engine_from(cfg: CallConfig) -> CallEngine {
     let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-    eng.start(0);
+    eng.start(0, 0);
     drain(&mut eng);
     eng
 }
@@ -394,6 +394,7 @@ mod framing {
             timestamp: 0x0009_6000,
             ssrc: 0xDEAD_BEEF,
             extension_word: Some(0x3001_0000),
+            video_extension: None,
         }
     }
 

@@ -4,12 +4,18 @@
 
 use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
-    verify_warp_mi_tag,
+    derive_srtcp_keys, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
 };
-use super::h264::{H264Depacketizer, packetize_au};
+use super::h264::{H264Depacketizer, au_has_idr, packetize_au};
+use super::rtcp::{
+    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_whatsapp_rtcp_cname,
+    build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
+    parse_rtcp_sender_ssrc,
+};
 use super::rtp::{
-    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VideoRtpStream, encode_rtp_header_into,
-    parse_rtp_header, rtp_header_byte_length,
+    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_MEDIA_FRAME_INFO_DELTA,
+    VIDEO_MEDIA_FRAME_INFO_IDR, VideoRtpStream, encode_rtp_header_into, parse_rtp_header,
+    rtp_header_byte_length,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
 use wacore_binary::Jid;
@@ -133,6 +139,89 @@ fn phase_rank(p: CallPhase) -> u8 {
     }
 }
 
+/// Per-stream RTCP Sender-Report state.
+struct SrtcpSender {
+    keys: E2eSrtpKeys,
+    cname: [u8; WHATSAPP_RTCP_CNAME_LEN],
+    index: u32,
+    packets_sent: u32,
+    octets_sent: u32,
+    profile_extension: bool,
+}
+
+impl SrtcpSender {
+    fn new(
+        call_key: &[u8],
+        self_lid: &str,
+        cname: [u8; WHATSAPP_RTCP_CNAME_LEN],
+        profile_extension: bool,
+    ) -> Option<Self> {
+        Some(Self::from_keys(
+            derive_srtcp_keys(call_key, &format_e2e_srtp_participant_id(self_lid))?,
+            cname,
+            profile_extension,
+        ))
+    }
+
+    fn from_keys(
+        keys: E2eSrtpKeys,
+        cname: [u8; WHATSAPP_RTCP_CNAME_LEN],
+        profile_extension: bool,
+    ) -> Self {
+        Self {
+            keys,
+            cname,
+            // libSRTP increments its SRTCP sender index before protecting the first packet.
+            index: 1,
+            packets_sent: 0,
+            octets_sent: 0,
+            profile_extension,
+        }
+    }
+
+    fn record(&mut self, packets: u32, octets: usize) {
+        self.packets_sent = self.packets_sent.wrapping_add(packets);
+        self.octets_sent = self.octets_sent.wrapping_add(octets as u32);
+    }
+
+    fn protect(&mut self, ssrc: u32, plain: &[u8]) -> Vec<u8> {
+        let out = protect_srtcp(&self.keys, ssrc, self.index, plain);
+        self.index = self.index.wrapping_add(1);
+        out
+    }
+
+    fn source_description(&mut self, ssrc: u32) -> Vec<u8> {
+        self.protect(
+            ssrc,
+            &build_whatsapp_source_description(ssrc, &self.cname, self.profile_extension),
+        )
+    }
+
+    /// Build and SRTCP-protect a Sender Report for `ssrc` at wall-clock `now_ms`.
+    fn sender_report(
+        &mut self,
+        ssrc: u32,
+        rtp_timestamp: u32,
+        now_ms: u64,
+        report: Option<&RtcpReceptionReport>,
+    ) -> Vec<u8> {
+        let stats = RtcpSenderStats {
+            packets_sent: self.packets_sent,
+            octets_sent: self.octets_sent,
+            rtp_timestamp,
+        };
+        let plain = build_whatsapp_sender_report_with_sdes(
+            ssrc,
+            &stats,
+            now_ms,
+            &self.cname,
+            report,
+            self.profile_extension,
+        );
+        self.protect(ssrc, &plain)
+    }
+}
+
 /// Composes the outbound (protect) and inbound (unprotect) media pipeline for E2E 1:1.
 /// SFrame is omitted (default-off on send; plain Opus inside WAHKDF SRTP).
 pub struct MediaPipeline {
@@ -142,6 +231,8 @@ pub struct MediaPipeline {
     rtp: RtpStream,
     send_roc: RocTracker,
     recv_roc: RecvRocTracker,
+    srtcp: SrtcpSender,
+    recv_srtcp_keys: E2eSrtpKeys,
 }
 
 /// Borrowed inputs for [`MediaPipeline::new`]. `self_lid`/`peer_lid` are the E2E-SRTP
@@ -164,6 +255,18 @@ impl MediaPipeline {
     /// must match the form the peer derives our SSRC from.
     /// Returns `None` when `call_key` is shorter than 32 bytes (a malformed peer callKey).
     pub fn new(p: &MediaPipelineParams<'_>) -> Option<Self> {
+        let mut entropy = [0u8; 12];
+        entropy[6..10].copy_from_slice(&p.ssrc.to_be_bytes());
+        if let Some(call_prefix) = p.call_key.get(..2) {
+            entropy[10..].copy_from_slice(call_prefix);
+        }
+        Self::new_with_rtcp_cname(p, build_whatsapp_rtcp_cname(&entropy))
+    }
+
+    pub(crate) fn new_with_rtcp_cname(
+        p: &MediaPipelineParams<'_>,
+        rtcp_cname: [u8; WHATSAPP_RTCP_CNAME_LEN],
+    ) -> Option<Self> {
         // The WARP MI tag is sliced from the 20-byte HMAC-SHA1 digest; a relay-advertised length
         // above 20 (or zero) would panic on the first packet, so reject it at setup instead.
         if !(1..=20).contains(&p.warp_mi_tag_len) {
@@ -176,7 +279,32 @@ impl MediaPipeline {
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
+            srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
+            recv_srtcp_keys: derive_srtcp_keys(
+                p.call_key,
+                &format_e2e_srtp_participant_id(p.peer_lid),
+            )?,
         })
+    }
+
+    pub fn send_ssrc(&self) -> u32 {
+        self.rtp.ssrc
+    }
+
+    /// An SRTCP-protected Sender Report for the audio stream (our send SSRC), or the accumulated
+    /// packet/octet totals since the call began. Emitted periodically by the engine.
+    pub(crate) fn audio_sender_report(
+        &mut self,
+        now_ms: u64,
+        report: Option<&RtcpReceptionReport>,
+    ) -> Vec<u8> {
+        self.srtcp
+            .sender_report(self.rtp.ssrc, self.rtp.rtp_timestamp(), now_ms, report)
+    }
+
+    /// The native client sends this once when the audio RTCP session is associated.
+    pub fn audio_source_description(&mut self) -> Vec<u8> {
+        self.srtcp.source_description(self.rtp.ssrc)
     }
 
     /// Caller-side: re-derive the recv keys for the device that actually answered. We dial the base
@@ -186,13 +314,15 @@ impl MediaPipeline {
     /// stream is fresh, so a stale `s_l` would mis-guess the index of its first packets. Returns
     /// `false` only on a malformed `call_key` (a setup invariant already checked in [`new`](Self::new)).
     pub fn rekey_recv(&mut self, call_key: &[u8], answering_peer_lid: &str) -> bool {
-        let Some(keys) = derive_e2e_keys(
-            call_key,
-            &format_e2e_srtp_participant_id(answering_peer_lid),
-        ) else {
+        let participant_id = format_e2e_srtp_participant_id(answering_peer_lid);
+        let Some(keys) = derive_e2e_keys(call_key, &participant_id) else {
+            return false;
+        };
+        let Some(srtcp_keys) = derive_srtcp_keys(call_key, &participant_id) else {
             return false;
         };
         self.recv_keys = keys;
+        self.recv_srtcp_keys = srtcp_keys;
         self.recv_roc = RecvRocTracker::default();
         true
     }
@@ -214,6 +344,7 @@ impl MediaPipeline {
         let mut packet = Vec::with_capacity(header.byte_size() + encrypted.len());
         encode_rtp_header_into(&header, &mut packet);
         packet.extend_from_slice(&encrypted);
+        self.srtcp.record(1, opus_payload.len());
         append_warp_mi_tag(&self.send_keys.auth_key, &packet, roc, self.warp_mi_tag_len)
     }
 
@@ -232,6 +363,12 @@ impl MediaPipeline {
             self.warp_mi_tag_len,
             packet,
         )
+    }
+
+    /// Authenticate and decrypt peer SRTCP using the sender SSRC left clear on the wire.
+    pub fn unprotect_rtcp(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        let sender_ssrc = parse_rtcp_sender_ssrc(packet)?;
+        unprotect_srtcp(&self.recv_srtcp_keys, sender_ssrc, packet)
     }
 }
 
@@ -287,6 +424,7 @@ pub struct VideoPipeline {
     recv_roc: RecvRocTracker,
     depacketizer: H264Depacketizer,
     pkt_scratch: Vec<Vec<u8>>,
+    srtcp: SrtcpSender,
 }
 
 /// Borrowed inputs for [`VideoPipeline::new`]. No `samples_per_packet`: the
@@ -303,6 +441,18 @@ pub struct VideoPipelineParams<'a> {
 
 impl VideoPipeline {
     pub fn new(p: &VideoPipelineParams<'_>) -> Option<Self> {
+        let mut entropy = [0u8; 12];
+        entropy[6..10].copy_from_slice(&p.ssrc.to_be_bytes());
+        if let Some(call_prefix) = p.call_key.get(..2) {
+            entropy[10..].copy_from_slice(call_prefix);
+        }
+        Self::new_with_rtcp_cname(p, build_whatsapp_rtcp_cname(&entropy))
+    }
+
+    pub(crate) fn new_with_rtcp_cname(
+        p: &VideoPipelineParams<'_>,
+        rtcp_cname: [u8; WHATSAPP_RTCP_CNAME_LEN],
+    ) -> Option<Self> {
         // A zero stride would leave every AU at timestamp 0 (an unusable stream); reject it at
         // setup rather than emit a frozen clock.
         if !(1..=20).contains(&p.warp_mi_tag_len) || p.ts_stride == 0 {
@@ -317,7 +467,22 @@ impl VideoPipeline {
             recv_roc: RecvRocTracker::default(),
             depacketizer: H264Depacketizer::default(),
             pkt_scratch: Vec::new(),
+            srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
+    }
+
+    /// An SRTCP-protected Sender Report for the video stream.
+    pub(crate) fn video_sender_report(
+        &mut self,
+        now_ms: u64,
+        report: Option<&RtcpReceptionReport>,
+    ) -> Vec<u8> {
+        self.srtcp
+            .sender_report(self.rtp.ssrc, self.rtp.rtp_timestamp(), now_ms, report)
+    }
+
+    pub fn send_ssrc(&self) -> u32 {
+        self.rtp.ssrc
     }
 
     /// Same answering-device rekey as [`MediaPipeline::rekey_recv`]; the video
@@ -341,10 +506,15 @@ impl VideoPipeline {
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
         let mut payloads = std::mem::take(&mut self.pkt_scratch);
         packetize_au(au, &mut payloads);
+        let media_frame_info = if au_has_idr(au) {
+            VIDEO_MEDIA_FRAME_INFO_IDR
+        } else {
+            VIDEO_MEDIA_FRAME_INFO_DELTA
+        };
         let mut packets = Vec::with_capacity(payloads.len());
         let last = payloads.len().saturating_sub(1);
         for (i, payload) in payloads.iter().enumerate() {
-            let header = self.rtp.next_video_packet(i == last);
+            let header = self.rtp.next_video_packet(i == last, media_frame_info);
             let roc = self.send_roc.advance(header.sequence_number);
             let encrypted = crypt_payload(
                 &self.send_keys,
@@ -356,6 +526,7 @@ impl VideoPipeline {
             let mut packet = Vec::with_capacity(header.byte_size() + encrypted.len());
             encode_rtp_header_into(&header, &mut packet);
             packet.extend_from_slice(&encrypted);
+            self.srtcp.record(1, payload.len());
             packets.push(append_warp_mi_tag(
                 &self.send_keys.auth_key,
                 &packet,
@@ -370,18 +541,26 @@ impl VideoPipeline {
     /// Inbound: authenticate+decrypt one RTP packet and feed the depacketizer;
     /// the reassembled access unit is returned on the AU's marker packet.
     pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        self.unprotect_video_packet(packet)?.1
+    }
+
+    pub(crate) fn unprotect_video_packet(
+        &mut self,
+        packet: &[u8],
+    ) -> Option<(RtpHeader, Option<Vec<u8>>)> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
             self.warp_mi_tag_len,
             packet,
         )?;
-        self.depacketizer.push(
+        let au = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
             &payload,
             header.marker,
-        )
+        );
+        Some((header, au))
     }
 }
 
@@ -846,6 +1025,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn srtcp_recv_rekeys_to_the_answering_device() {
+        use crate::voip::rtcp::build_compact_rtcp_208;
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let caller = "111111111111111:0@lid";
+        let callee_base = "222222222222222:0@lid";
+        let callee_answering = "222222222222222:2@lid";
+        let params = MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: caller,
+            peer_lid: callee_base,
+            ssrc: 0x0102_0304,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        };
+        let mut caller_rx = MediaPipeline::new(&params).unwrap();
+        let peer_ssrc = 0x1122_3344;
+        let plain = build_compact_rtcp_208(peer_ssrc, params.ssrc);
+        let peer_keys = derive_srtcp_keys(&call_key, callee_answering).unwrap();
+        let protected = protect_srtcp(&peer_keys, peer_ssrc, 0, &plain);
+
+        assert!(caller_rx.unprotect_rtcp(&protected).is_none());
+        assert!(caller_rx.rekey_recv(&call_key, callee_answering));
+        assert_eq!(
+            caller_rx.unprotect_rtcp(&protected).as_deref(),
+            Some(plain.as_slice())
+        );
+    }
+
     fn video_params<'a>(
         call_key: &'a [u8],
         self_lid: &'a str,
@@ -898,6 +1107,38 @@ mod tests {
     }
 
     #[test]
+    fn video_pipeline_keeps_parameter_sets_first_on_the_wire() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+        let au = [
+            &[0, 0, 0, 1, 0x69, 0xf0][..],
+            &[0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1f][..],
+            &[0, 0, 0, 1, 0x68, 0xce, 0x06, 0xe2][..],
+            &[0, 0, 0, 1, 0x65, 1, 2, 3][..],
+        ]
+        .concat();
+
+        let packets = tx.protect_video(&au);
+        let mut received = None;
+        for packet in &packets {
+            if let Some(frame) = rx.unprotect_video(packet) {
+                received = Some(frame);
+            }
+        }
+
+        let received = received.expect("marker packet completes the access unit");
+        assert_eq!(
+            crate::voip::h264::split_annexb(&received)
+                .map(crate::voip::h264::nal_unit_type)
+                .collect::<Vec<_>>(),
+            [7, 8, 5]
+        );
+    }
+
+    #[test]
     fn video_protect_uses_self_lid_and_video_headers() {
         let call_key: Vec<u8> = (0u8..32).collect();
         let self_lid = "111111111111111:0@lid";
@@ -912,6 +1153,11 @@ mod tests {
         assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
         assert!(header.marker, "single-packet AU carries the marker");
         assert_eq!(header.sequence_number, 0, "video seq starts at 0");
+        assert_eq!(
+            header.video_extension.unwrap().media_frame_info,
+            VIDEO_MEDIA_FRAME_INFO_IDR,
+            "an IDR AU carries WhatsApp's keyframe and IDR bits"
+        );
 
         // Pin the send keystream to the SELF lid (same inversion guard as audio).
         let header_len = rtp_header_byte_length(without_tag).unwrap();
@@ -925,6 +1171,36 @@ mod tests {
             nal,
         );
         assert_eq!(body, expect.as_slice(), "video send must key on self LID");
+    }
+
+    #[test]
+    fn video_frame_info_is_constant_across_every_au_fragment() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut pipe = VideoPipeline::new(&video_params(
+            &call_key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+        ))
+        .unwrap();
+
+        let idr = video_au(3_000);
+        let idr_packets = pipe.protect_video(&idr);
+        assert!(idr_packets.len() > 1);
+        assert!(idr_packets.iter().all(|packet| {
+            parse_rtp_header(packet)
+                .and_then(|header| header.video_extension)
+                .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR)
+        }));
+
+        let mut delta = vec![0, 0, 0, 1, 0x41];
+        delta.extend((0..3_000).map(|i| (i % 251) as u8));
+        let delta_packets = pipe.protect_video(&delta);
+        assert!(delta_packets.len() > 1);
+        assert!(delta_packets.iter().all(|packet| {
+            parse_rtp_header(packet)
+                .and_then(|header| header.video_extension)
+                .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_DELTA)
+        }));
     }
 
     #[test]

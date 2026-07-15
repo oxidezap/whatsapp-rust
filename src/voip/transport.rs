@@ -1,7 +1,7 @@
 //! Relay media transport: a pre-negotiated WebRTC DataChannel over SCTP-over-DTLS-over-UDP
 //! to a single WhatsApp relay endpoint. The synthetic-SDP / wrtc dance reduces, at this layer,
 //! to: connect a UDP socket to the relay, DTLS-handshake as the client (self-signed cert,
-//! server-cert verification skipped, since SRTP keys come from callKey/hbh_key, not DTLS),
+//! server-cert verification skipped, since SRTP keys come from callKey, not DTLS),
 //! run an SCTP association over it, and open the pre-negotiated id=0 DataChannel that carries
 //! STUN/RTP/RTCP as binary messages.
 

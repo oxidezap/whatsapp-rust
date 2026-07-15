@@ -131,13 +131,17 @@ pub fn au_has_idr(au: &[u8]) -> bool {
     split_annexb(au).any(|nal| nal_unit_type(nal) == NAL_TYPE_IDR)
 }
 
-/// Packetize one Annex-B access unit into RTP payloads (no RTP headers): each
-/// NAL goes out as a single-NAL payload when it fits, or a run of FU-A
-/// fragments otherwise. `out` is cleared and refilled so the send path can
-/// reuse one buffer per AU.
+/// Packetize one Annex-B access unit into WhatsApp RTP payloads (no RTP headers): each
+/// media NAL goes out as a single-NAL payload when it fits, or a run of FU-A
+/// fragments otherwise. Encoder-only AUDs are omitted because WhatsApp's H.264
+/// decoder requires SPS/PPS to lead an IDR frame. `out` is cleared and refilled
+/// so the send path can reuse one buffer per AU.
 pub fn packetize_au(au: &[u8], out: &mut Vec<Vec<u8>>) {
     out.clear();
     for nal in split_annexb(au) {
+        if nal_unit_type(nal) == NAL_TYPE_AUD {
+            continue;
+        }
         if nal.len() <= H264_SINGLE_NAL_MAX {
             out.push(nal.to_vec());
             continue;
@@ -459,12 +463,42 @@ mod tests {
 
     #[test]
     fn single_nal_round_trips() {
-        let au = au_from_nals(&[nal(9, 2), nal(1, 100)]);
+        let au = au_from_nals(&[nal(1, 100)]);
         let mut payloads = Vec::new();
         packetize_au(&au, &mut payloads);
-        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads.len(), 1);
         assert!(payloads.iter().all(|p| p.len() <= H264_SINGLE_NAL_MAX));
         assert_eq!(depacketize_all(&payloads), Some(au));
+    }
+
+    #[test]
+    fn whatsapp_packetization_omits_aud_before_parameter_sets() {
+        let sps = nal(7, 20);
+        let pps = nal(8, 8);
+        let idr = nal(5, 100);
+        let au = au_from_nals(&[nal(9, 2), sps.clone(), pps.clone(), idr.clone()]);
+        let mut payloads = Vec::new();
+
+        packetize_au(&au, &mut payloads);
+
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|nal| nal_unit_type(nal))
+                .collect::<Vec<_>>(),
+            [NAL_TYPE_SPS, NAL_TYPE_PPS, NAL_TYPE_IDR]
+        );
+        assert_eq!(
+            depacketize_all(&payloads),
+            Some(au_from_nals(&[sps, pps, idr]))
+        );
+    }
+
+    #[test]
+    fn aud_only_access_unit_produces_no_rtp_payload() {
+        let mut payloads = vec![vec![1]];
+        packetize_au(&au_from_nals(&[nal(9, 2)]), &mut payloads);
+        assert!(payloads.is_empty());
     }
 
     #[test]

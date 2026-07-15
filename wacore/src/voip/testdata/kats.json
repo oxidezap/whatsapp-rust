@@ -38,15 +38,23 @@
     "masterSalt": "749ee99101a47c82bb5dacec40cf"
   },
   "hbh_srtp": {
-    "uplinkKey30": "d7c293861dccfc246ce7c66b498e7d50e92424ae12c54f79c9131eac0a94",
-    "masterKey": "d7c293861dccfc246ce7c66b498e7d50",
-    "masterSalt": "e92424ae12c54f79c9131eac0a94",
-    "sessionKey": "8586b2992b154e6531606e8b7ceeb782",
-    "sessionSalt": "e14ea5189ca6f303f3697237cf04",
-    "authKey": "1caf9c0b1f0c08fad93a41f7d6897ba12eaf100f",
-    "icmKey30": "8586b2992b154e6531606e8b7ceeb782e14ea5189ca6f303f3697237cf04",
+    "uplinkSalt32": "501238bf8f996669b5172c9aa47338eb7de4d12ddba98eea1e531a694f894129",
+    "uplinkKey30": "f77854760b4340f0eabbe93930eafe0310c8f699d1ebaf1f609a1781f3fc",
+    "sharedSrtpKey30": "693a8070145a5d26d39183593d1b648e895a8a3f2354ab38e718cbd93822",
+    "sharedSrtcpKey30": "4ad41608b1fe681b56e8230ba5fea1060de1e767fb1275d4dcf85ce3cea9",
+    "downlinkKey30": "707aad5216a25868eea63a32403b9d0c643644f691145e02b6d7d3776301",
+    "masterKey": "f77854760b4340f0eabbe93930eafe03",
+    "masterSalt": "10c8f699d1ebaf1f609a1781f3fc",
+    "sessionKey": "cf8c0c31437c9a5ab292cbdaa533c2c0",
+    "sessionSalt": "30879d9e6a76f04e7349f40066a7",
+    "authKey": "b012d6003068b460da0121866712a335987d72b8",
+    "srtcpSessionKey": "f065528cfce4757f444bb8b5892aad7c",
+    "srtcpSessionSalt": "54bc95ca04c05be16456f0f12dc0",
+    "srtcpAuthKey": "6e6b37a126a522302a578c9713d38e85606048eb",
+    "srtcpProtectedSrIndex1": "80c80006123456787d74643dbb62b23f5005bf9b4296de885c3ff6e280000001cc486281b0510f8b2a83",
+    "icmKey30": "cf8c0c31437c9a5ab292cbdaa533c2c030879d9e6a76f04e7349f40066a7",
     "rtpIcmNonce": "00000000123456780000000000070000",
-    "cipher_out": "eacd64249a77b5270140c634"
+    "cipher_out": "363ea223cb020f6d58cea9ee"
   },
   "voip_crypto": {
     "ssrc_slot0": 1805509457,
@@ -55,6 +63,10 @@
   "rtp": {
     "speechHeader16": "90f800010000000012345678debe0000",
     "dtxHeader20": "907800020000014012345678debe000130010000",
+    "androidVideoHeader28": "90e100010001bdc849c5fb8cdebe0003300951000061001d910c3f00",
+    "androidVideoExtension12": "300951000061001d910c3f00",
+    "androidVideoDeltaHeader28": "90e1000700022ea29b1959f0debe00033001510000610024910a6a00",
+    "androidVideoDeltaExtension12": "3001510000610024910a6a00",
     "estimateSpeech12": 32,
     "estimateDtx1": 25,
     "estimatePriming2": 25

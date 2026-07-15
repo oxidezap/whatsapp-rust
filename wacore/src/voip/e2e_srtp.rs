@@ -110,6 +110,99 @@ pub fn crypt_payload(keys: &E2eSrtpKeys, ssrc: u32, seq: u16, roc: u32, payload:
     out
 }
 
+/// SRTCP auth-tag length (HMAC-SHA1-80). With the 4-byte E-flag+index word this is the 14-byte
+/// SRTCP trailer.
+pub const SRTCP_AUTH_TAG_LEN: usize = 10;
+/// First 8 bytes of an RTCP packet (V/P/RC, PT, length, sender SSRC) are left in the clear; only the
+/// body is encrypted (RFC 3711 §3.4).
+const RTCP_HEADER_LEN: usize = 8;
+
+fn hmac_sha1_20(key: &[u8], data: &[u8]) -> [u8; 20] {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha1::Sha1;
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    let mut tag = [0u8; 20];
+    tag.copy_from_slice(&mac.finalize().into_bytes());
+    tag
+}
+
+/// SRTCP session keys derived with the RFC 3711 labels used by the native client.
+#[doc(hidden)]
+pub fn derive_srtcp_keys(call_key: &[u8], participant_lid: &str) -> Option<E2eSrtpKeys> {
+    if call_key.len() < 32 {
+        return None;
+    }
+    let master = hkdf_sha256(&[0u8; 32], &call_key[..32], participant_lid.as_bytes(), 46);
+    let master_key = &master[0..16];
+    let master_salt = &master[16..30];
+    let mut keys = E2eSrtpKeys {
+        cipher_key: [0u8; 16],
+        salt: [0u8; 14],
+        auth_key: [0u8; 20],
+    };
+    keys.cipher_key
+        .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x03, 16));
+    keys.auth_key
+        .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x04, 20));
+    keys.salt
+        .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x05, 14));
+    Some(keys)
+}
+
+/// Protect one RTCP packet as SRTCP (RFC 3711 §3.4): AES-CTR the body, append the 4-byte
+/// E-flag+index word, then an HMAC-SHA1-80 tag over the whole thing. `sender_ssrc` is the SR's
+/// own SSRC (bytes 4..8) and `index` the per-SSRC SRTCP counter.
+pub fn protect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, index: u32, rtcp: &[u8]) -> Vec<u8> {
+    let split = rtcp.len().min(RTCP_HEADER_LEN);
+    let iv = build_e2e_rtp_iv(
+        &keys.salt,
+        sender_ssrc,
+        index >> 16,
+        (index & 0xffff) as u16,
+    );
+    let mut out = Vec::with_capacity(rtcp.len() + 4 + SRTCP_AUTH_TAG_LEN);
+    out.extend_from_slice(&rtcp[..split]);
+    let mut body = rtcp[split..].to_vec();
+    let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
+    cipher.apply_keystream(&mut body);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&(0x8000_0000u32 | (index & 0x7fff_ffff)).to_be_bytes());
+    let tag = hmac_sha1_20(&keys.auth_key, &out);
+    out.extend_from_slice(&tag[..SRTCP_AUTH_TAG_LEN]);
+    out
+}
+
+/// Inverse of [`protect_srtcp`]: verify the tag, then decrypt the body. `None` on a bad tag or a
+/// too-short packet. Used by the round-trip test and any future inbound-RTCP handling.
+pub fn unprotect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, packet: &[u8]) -> Option<Vec<u8>> {
+    if packet.len() < RTCP_HEADER_LEN + 4 + SRTCP_AUTH_TAG_LEN {
+        return None;
+    }
+    let tag_start = packet.len() - SRTCP_AUTH_TAG_LEN;
+    let expected = hmac_sha1_20(&keys.auth_key, &packet[..tag_start]);
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        &packet[tag_start..],
+        &expected[..SRTCP_AUTH_TAG_LEN],
+    )) {
+        return None;
+    }
+    let idx_start = tag_start - 4;
+    let index = u32::from_be_bytes(packet[idx_start..tag_start].try_into().ok()?) & 0x7fff_ffff;
+    let iv = build_e2e_rtp_iv(
+        &keys.salt,
+        sender_ssrc,
+        index >> 16,
+        (index & 0xffff) as u16,
+    );
+    let mut out = packet[..RTCP_HEADER_LEN].to_vec();
+    let mut body = packet[RTCP_HEADER_LEN..idx_start].to_vec();
+    let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
+    cipher.apply_keystream(&mut body);
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
 /// Send-side ROC tracker for monotonic 16-bit sequence numbers.
 #[derive(Default)]
 pub(crate) struct RocTracker {
@@ -216,6 +309,54 @@ mod tests {
         keys.auth_key
             .copy_from_slice(&hexd(k, &["e2e_srtp", &format!("{who}_authKey")]));
         keys
+    }
+
+    #[test]
+    fn srtcp_round_trips_and_authenticates() {
+        // SRTCP keys must be distinct from the SRTP keys (different KDF labels).
+        let call_key: Vec<u8> = (0u8..40).collect();
+        let lid = "12345:0@lid";
+        let srtp = derive_e2e_keys(&call_key, lid).unwrap();
+        let srtcp = derive_srtcp_keys(&call_key, lid).unwrap();
+        assert_ne!(
+            srtp.cipher_key, srtcp.cipher_key,
+            "SRTCP must use its own key"
+        );
+        assert_ne!(srtp.salt, srtcp.salt);
+
+        // A 28-byte Sender Report (header 8 + body 20).
+        let ssrc: u32 = 0x0a0b_0c0d;
+        let mut sr = vec![0x80, 200, 0x00, 0x06];
+        sr.extend_from_slice(&ssrc.to_be_bytes());
+        sr.extend_from_slice(&[0x11; 20]);
+
+        let protected = protect_srtcp(&srtcp, ssrc, 0, &sr);
+        // header stays clear, body is encrypted, +4 index +10 tag.
+        assert_eq!(protected.len(), sr.len() + 4 + SRTCP_AUTH_TAG_LEN);
+        assert_eq!(&protected[..8], &sr[..8], "header/SSRC left in the clear");
+        assert_ne!(&protected[8..28], &sr[8..28], "body must be encrypted");
+        // E-flag set on the index word.
+        assert_eq!(
+            protected[protected.len() - SRTCP_AUTH_TAG_LEN - 4] & 0x80,
+            0x80
+        );
+
+        assert_eq!(
+            unprotect_srtcp(&srtcp, ssrc, &protected).as_deref(),
+            Some(&sr[..])
+        );
+        // A flipped tag byte must fail authentication.
+        let mut forged = protected.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!(unprotect_srtcp(&srtcp, ssrc, &forged), None);
+        // The index increments per packet, changing the keystream.
+        let p1 = protect_srtcp(&srtcp, ssrc, 1, &sr);
+        assert_ne!(
+            protected[8..28],
+            p1[8..28],
+            "a new index must change the ciphertext"
+        );
+        assert_eq!(unprotect_srtcp(&srtcp, ssrc, &p1).as_deref(), Some(&sr[..]));
     }
 
     #[test]

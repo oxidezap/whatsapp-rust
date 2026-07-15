@@ -16,6 +16,9 @@ pub struct MediaOffer {
     pub encs: Vec<OfferRecipientEnc>,
     /// The parsed `<relay>` block (endpoints + crypto material), when the offer carried one.
     pub relay: Option<crate::voip::relay_parse::RelayData>,
+    /// Rollout metadata echoed by official callees in the video accept.
+    pub peer_abtest_bucket: Option<String>,
+    pub peer_abtest_bucket_id_list: Option<String>,
 }
 
 #[cfg(feature = "voip")]
