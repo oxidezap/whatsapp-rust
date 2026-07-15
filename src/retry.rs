@@ -1318,7 +1318,7 @@ mod tests {
         super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
     }
 
-    async fn attach_mock_noise_socket(client: &Arc<Client>) {
+    async fn attach_mock_noise_socket(client: &Client) {
         use crate::socket::NoiseSocket;
         use crate::transport::mock::MockTransport;
         use wacore::handshake::NoiseCipher;
@@ -1334,7 +1334,7 @@ mod tests {
     }
 
     async fn seed_retry_lease(
-        client: &Arc<Client>,
+        client: &Client,
         address: &wacore::libsignal::protocol::ProtocolAddress,
         durable: bool,
     ) {
