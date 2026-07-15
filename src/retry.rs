@@ -12,10 +12,10 @@ use wacore::libsignal::protocol::{PreKeyBundle, PublicKey, UsePQRatchet, process
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::JidExt as _;
-use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Jid, OwnedNodeRef};
 #[cfg(test)]
-use wacore_binary::{Node, NodeContent};
+use wacore_binary::NodeContent;
+use wacore_binary::builder::NodeBuilder;
+use wacore_binary::{Jid, Node, OwnedNodeRef};
 use wacore_binary::{NodeContentRef, NodeRef};
 
 /// Helper to extract bytes content from a Node (used in tests).
@@ -560,12 +560,10 @@ impl Client {
             )
             .await?;
 
-            // The Signal mutation is done; the batch-safe flush acquires the
-            // processing permit, and inbound processing holds that permit
-            // while taking this same session lock — release it first.
+            // The pre-wire gate can take the processing permit, whose holder
+            // may need this session lock.
             drop(_session_guard);
-            self.send_node(stanza).await?;
-            self.flush_signal_cache_batch_safe().await?;
+            self.send_retry_stanza(stanza).await?;
         } else {
             // DM retry: pairwise resend to the requesting device only.
             // Use _resolved variant: resolved_jid is already in the correct
@@ -601,10 +599,15 @@ impl Client {
 
             // Same lock-ordering rule as the group branch above.
             drop(_session_guard);
-            self.send_node(stanza).await?;
-            self.flush_signal_cache_batch_safe().await?;
+            self.send_retry_stanza(stanza).await?;
         }
 
+        Ok(())
+    }
+
+    async fn send_retry_stanza(&self, stanza: Node) -> Result<(), anyhow::Error> {
+        self.persist_signal_state_pre_wire().await?;
+        self.send_node(stanza).await?;
         Ok(())
     }
 
@@ -1313,6 +1316,119 @@ mod tests {
         own_lid: Option<&Jid>,
     ) -> Option<RetryChatInfo> {
         super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
+    }
+
+    async fn attach_mock_noise_socket(client: &Arc<Client>) {
+        use crate::socket::NoiseSocket;
+        use crate::transport::mock::MockTransport;
+        use wacore::handshake::NoiseCipher;
+
+        let key = [0u8; 32];
+        let socket = NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(MockTransport),
+            NoiseCipher::new(&key).expect("write cipher"),
+            NoiseCipher::new(&key).expect("read cipher"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(socket));
+    }
+
+    async fn seed_retry_lease(
+        client: &Arc<Client>,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
+        durable: bool,
+    ) {
+        use wacore::libsignal::protocol::SessionRecord;
+
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        client.signal_cache.put_session(address, record).await;
+        if !durable {
+            return;
+        }
+
+        client.flush_signal_cache().await.expect("durable lease");
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let record = client
+            .signal_cache
+            .get_session(address, &*snapshot.backend)
+            .await
+            .expect("session read")
+            .expect("leased session");
+        assert!(record.reserved_sender_chain_index() > 0);
+        client.signal_cache.put_session(address, record).await;
+    }
+
+    #[tokio::test]
+    async fn retry_pre_wire_flush_failure_never_reaches_send_node() {
+        use std::sync::atomic::Ordering;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("retry_pre_wire_failure").await;
+        attach_mock_noise_socket(&client).await;
+        let address = Jid::lid_device("100000000001035".to_string(), 7).to_protocol_address();
+        seed_retry_lease(&client, &address, false).await;
+        assert!(client.signal_cache.needs_pre_wire_flush().await);
+
+        client.inbound_commit_batch.reset();
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+
+        let id = "RETRY_PRE_WIRE_FAILURE";
+        let mut waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
+        let result = client
+            .send_retry_stanza(NodeBuilder::new("message").attr("id", id).build())
+            .await;
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(result.is_err(), "the failed durability gate must abort");
+        assert!(
+            waiter.try_recv().expect("waiter stays live").is_none(),
+            "send_node must not observe a stanza before durability"
+        );
+        assert!(
+            client.signal_cache.needs_pre_wire_flush().await,
+            "the failed reservation must remain gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_inside_durable_lease_skips_synchronous_full_flush() {
+        use std::sync::atomic::Ordering;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("retry_covered_by_lease").await;
+        attach_mock_noise_socket(&client).await;
+        let address = Jid::lid_device("100000000001036".to_string(), 8).to_protocol_address();
+        seed_retry_lease(&client, &address, true).await;
+        assert!(!client.signal_cache.needs_pre_wire_flush().await);
+
+        client.inbound_commit_batch.reset();
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+
+        let id = "RETRY_COVERED_BY_LEASE";
+        let waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
+        let result = client
+            .send_retry_stanza(NodeBuilder::new("message").attr("id", id).build())
+            .await;
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        result.expect("an existing durable lease must not synchronously flush");
+        let sent = waiter.await.expect("retry stanza reached send_node");
+        assert_eq!(sent.attrs().required_string("id").unwrap(), id);
     }
 
     #[tokio::test]
