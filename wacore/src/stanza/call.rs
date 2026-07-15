@@ -806,22 +806,28 @@ pub fn build_video_state(p: &VideoStateParams<'_>) -> Node {
     call_wrap(p.to, Some(p.id), action.build())
 }
 
-/// `<ack class="call" id=stanza_id to=from type="video">` for a received `<call><video>`. The
-/// typed ack is load-bearing: the generic router ack carries no `type` (the `<video>` is a child,
-/// not a `<call>` attr), and an untyped ack makes the upgrade requester assume failure and revert
-/// after ~5s. The handler sends this and cancels the generic ack.
-pub fn build_call_video_ack(call: &IncomingCall) -> Option<Node> {
+/// Typed ack for a received `<call><video>`. The original stanza supplies routing attrs because
+/// suppressing the generic ack must not drop companion routing metadata.
+pub fn build_call_video_ack(call: &IncomingCall, original: &NodeRef<'_>) -> Option<Node> {
     if call.stanza_id.is_empty() {
         return None;
     }
-    Some(
-        NodeBuilder::new("ack")
-            .attr("class", "call")
-            .attr("id", call.stanza_id.as_str())
-            .attr("to", &call.from)
-            .attr("type", "video")
-            .build(),
-    )
+    let mut ack = NodeBuilder::new("ack")
+        .attr("class", "call")
+        .attr("id", call.stanza_id.as_str())
+        .attr("to", &call.from)
+        .attr("type", "video");
+    let from = call.from.to_string();
+    if let Some(participant) = original
+        .get_attr("participant")
+        .filter(|participant| participant.as_str().as_ref() != from)
+    {
+        ack = ack.attr("participant", participant.to_node_value());
+    }
+    if let Some(recipient) = original.get_attr("recipient") {
+        ack = ack.attr("recipient", recipient.to_node_value());
+    }
+    Some(ack.build())
 }
 
 pub fn build_mute_v2(call_id: &str, to: &Jid, call_creator: &Jid, mute_state: &str) -> Node {
@@ -2196,7 +2202,8 @@ mod tests {
     fn video_ack_is_typed_and_requires_a_stanza_id() {
         let node = video_call_node(&[("state", "11"), ("voip_settings", "video")]);
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        let ack = build_call_video_ack(&call).expect("ack for an id-carrying stanza");
+        let ack =
+            build_call_video_ack(&call, &as_ref(&node)).expect("ack for an id-carrying stanza");
         let r = ack.as_node_ref();
         assert_eq!(r.tag, "ack");
         assert_eq!(r.attrs().optional_string("class").as_deref(), Some("call"));
@@ -2214,9 +2221,32 @@ mod tests {
             Some(fake_caller_lid().to_string().as_str())
         );
 
+        let participant = fake_caller_lid().with_device(3);
+        let recipient = fake_caller_pn();
+        let routed = base_call_builder()
+            .attr("participant", &participant)
+            .attr("recipient", &recipient)
+            .children([NodeBuilder::new("video")
+                .attr("call-id", "CID")
+                .attr("call-creator", fake_caller_lid())
+                .attr("state", "11")
+                .build()])
+            .build();
+        let routed_call = parse_call_stanza(&as_ref(&routed)).unwrap().unwrap();
+        let routed_ack = build_call_video_ack(&routed_call, &as_ref(&routed)).unwrap();
+        let routed_ref = routed_ack.as_node_ref();
+        assert_eq!(
+            routed_ref.attrs().optional_jid("participant"),
+            Some(participant)
+        );
+        assert_eq!(
+            routed_ref.attrs().optional_jid("recipient"),
+            Some(recipient)
+        );
+
         // No stanza id -> nothing to ack-correlate; the builder refuses.
         let mut idless = call.clone();
         idless.stanza_id = String::new();
-        assert!(build_call_video_ack(&idless).is_none());
+        assert!(build_call_video_ack(&idless, &as_ref(&node)).is_none());
     }
 }

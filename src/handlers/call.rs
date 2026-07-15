@@ -165,6 +165,10 @@ impl StanzaHandler for CallHandler {
                     ) {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
+                    #[cfg(feature = "voip")]
+                    let mut dispatch_call = true;
+                    #[cfg(not(feature = "voip"))]
+                    let dispatch_call = true;
                     // In-call <video state> signaling: send the TYPED ack (`type="video"`) and
                     // suppress the router's generic one — an untyped ack makes the upgrade
                     // requester assume failure and revert after ~5s. Serialize event publication,
@@ -185,7 +189,7 @@ impl StanzaHandler for CallHandler {
                         // A typed ack commits the received transition. Without an event permit,
                         // leave the generic ack in place so the peer reverts instead.
                         let acked = if event_permit.is_some() {
-                            match build_call_video_ack(&call) {
+                            match build_call_video_ack(&call, nr) {
                                 Some(ack) => {
                                     *cancelled = true;
                                     match client.send_node(ack).await {
@@ -206,6 +210,7 @@ impl StanzaHandler for CallHandler {
                         } else {
                             false
                         };
+                        dispatch_call = acked;
                         // Rejection ends our attempted upgrade locally even when its ack cannot get
                         // out; retaining the camera cannot help a negotiation the peer already ended.
                         if matches!(state, VideoState::UpgradeReject | VideoState::UpgradeCancel) {
@@ -257,7 +262,9 @@ impl StanzaHandler for CallHandler {
                             }
                         }
                     }
-                    client.core.event_bus.dispatch(Event::IncomingCall(call));
+                    if dispatch_call {
+                        client.core.event_bus.dispatch(Event::IncomingCall(call));
+                    }
                 }
             }
             Ok(None) => {
@@ -581,6 +588,8 @@ mod tests {
         use wacore::voip::{CallEvent, VideoControl};
 
         let client = make_sending_client().await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
         let registry = client.call_registry();
         let session = wacore::voip::CallSession::new_incoming(
             "CALL-ID-0001",
@@ -619,6 +628,13 @@ mod tests {
             registry.snapshot("CALL-ID-0001").expect("session").is_video,
             "UpgradeAccept marks the call as video"
         );
+        assert!(matches!(
+            global_rx.try_recv().as_deref(),
+            Ok(Event::IncomingCall(IncomingCall {
+                action: CallAction::VideoState { .. },
+                ..
+            }))
+        ));
         let enabled = tokio::time::timeout(std::time::Duration::from_secs(2), enabled_waiter)
             .await
             .expect("Enabled stanza must be sent")
@@ -726,6 +742,42 @@ mod tests {
         assert!(cancelled, "a built typed ack suppresses the generic ack");
         assert_eq!(torn.load(Ordering::SeqCst), 1);
         assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn unacked_video_state_is_not_dispatched_globally() {
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let client = make_client().await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
+        let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("4")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(
+            cancelled,
+            "the attempted typed ack suppresses the generic ack"
+        );
+        assert!(global_rx.try_recv().is_err());
+        assert!(ctl_rx.try_recv().is_err());
     }
 
     #[cfg(feature = "voip")]
