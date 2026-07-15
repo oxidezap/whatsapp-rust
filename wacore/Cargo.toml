@@ -19,6 +19,10 @@ ignored = ["getrandom"]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
 debug-snapshots = []
+# Expose the InMemoryBackend fault-injection / call-count hooks used by the e2e
+# suite. Off by default so normal builds carry no extra fields or per-call
+# bookkeeping. Enabled only from test crates.
+test-util = []
 # Optional observability: emit tracing spans/events. Off by default (no dep).
 tracing = ["dep:tracing"]
 # Optional metrics via the `metrics` facade. Off by default (no dep).

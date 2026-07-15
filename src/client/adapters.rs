@@ -68,11 +68,37 @@ impl Client {
             .ok_or(ClientError::NotConnected)
     }
 
-    /// Flush the in-memory signal cache to the database backend.
-    /// Called after each message is decrypted or after encryption operations.
+    /// Force any pending write-behind Signal cache state to the backend,
+    /// returning once the flush completes (or fails).
+    ///
+    /// The live receive path schedules a coalesced flush (see `signal_flush.rs`)
+    /// instead of writing through, and lease-covered sends do the same. Only a
+    /// send that raises its counter lease — or advances a group sender-key
+    /// chain, which has no lease — flushes synchronously. On success the
+    /// backend normally trails the cache by about the coalescing window, but
+    /// that is not a hard wall-clock bound — the timer can slip under runtime
+    /// starvation and the flush can wait on locks or slow/failing storage (a
+    /// backend outage extends it until the retry loop succeeds). Use this to
+    /// settle durability deterministically before reading persisted state or
+    /// ahead of a non-graceful shutdown — and check the returned `Result`, as a
+    /// failure leaves state pending.
+    ///
+    /// Call from a control task, never from inside an event handler or an
+    /// [`InboundDurabilityHook`]: during an offline-sync drain those run while
+    /// the processing permit is held, and settling routes through that same
+    /// permit — re-entering it would deadlock.
+    ///
+    /// [`InboundDurabilityHook`]: crate::types::durability_hook::InboundDurabilityHook
+    pub async fn flush_pending_signal_state(&self) -> Result<(), anyhow::Error> {
+        self.flush_signal_cache_batch_safe().await
+    }
+
+    /// Flush the in-memory signal cache to the database backend. Invoked by the
+    /// send path (synchronously, pre-wire), the receive-path coalescer, and the
+    /// drain/retry/teardown recovery paths — not unconditionally per message.
     pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {
-        // Hold no device guard across the flush: this per-message batched SQLite
-        // write would otherwise block every concurrent Device write for its duration.
+        // Clone the backend before awaiting so a slow write cannot retain the
+        // device guard and stall every concurrent Device write.
         let backend = self
             .persistence_manager
             .get_device_snapshot()
@@ -84,20 +110,13 @@ impl Client {
             .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))
     }
 
-    /// [`flush_signal_cache`](Self::flush_signal_cache) with error logging instead of propagation.
-    ///
-    /// Both of these are safe only when the caller holds the message
-    /// processing permit or the batcher is known inactive: they persist the
-    /// WHOLE cache, including ratchet advances of drain entries that may not
-    /// have a durable buffered row yet. Everything else must go through the
-    /// `_batch_safe` variants below.
-    pub(crate) async fn flush_signal_cache_logged(&self, context: &str, id: Option<&str>) {
-        if let Err(e) = self.flush_signal_cache().await {
-            log_signal_flush_error(context, id, &e);
-        }
-    }
-
     /// Signal-cache flush that is safe while the offline drain is active.
+    ///
+    /// [`flush_signal_cache`](Self::flush_signal_cache) is safe only when the
+    /// caller holds the message processing permit or the batcher is known
+    /// inactive: it persists the WHOLE cache, including ratchet advances of
+    /// drain entries that may not have a durable buffered row yet. Everything
+    /// else must go through this `_batch_safe` variant.
     ///
     /// During the drain, decrypted messages accumulate in the commit batcher
     /// with no durable buffered copy; flushing the cache from an unrelated
@@ -141,6 +160,36 @@ impl Client {
             ));
         }
         self.flush_signal_cache().await
+    }
+
+    /// Pre-wire durability gate for the send path. Flushes synchronously only
+    /// when an outbound crypto advance actually demands it — a raised session
+    /// counter lease or a sender-key chain advance not yet persisted (see
+    /// `SignalStoreCache::needs_pre_wire_flush`). Otherwise the dirty state is
+    /// covered by an existing durable lease, so it only needs to land
+    /// eventually: it rides the same coalesced write-behind as the receive
+    /// path instead of paying a serialize + storage transaction per message.
+    /// A failure must abort the send — transmitting a ciphertext whose lease
+    /// could not be persisted reintroduces the counter-reuse window.
+    ///
+    /// The gate is deliberately a GLOBAL predicate, not one scoped to the
+    /// addresses this stanza encrypted for: the send path does not carry them
+    /// back up, and erring toward an extra flush is the safe direction (it can
+    /// over-flush, never under-flush). The cost is a sharp edge under a failing
+    /// backend: another session's pending lease makes this send flush, and that
+    /// flush's failure aborts this send too — the same collateral every send
+    /// took before leases existed, now limited to the window where some lease
+    /// is actually unpersisted. So "a lease-covered send needs no flush" is a
+    /// statement about what this send REQUIRES, not a promise it never flushes.
+    pub(crate) async fn persist_signal_state_pre_wire(&self) -> Result<(), anyhow::Error> {
+        if self.signal_cache.needs_pre_wire_flush().await {
+            return self.flush_signal_cache_batch_safe().await;
+        }
+        self.schedule_signal_flush(
+            self.connection_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        Ok(())
     }
 
     /// [`flush_signal_cache_batch_safe`](Self::flush_signal_cache_batch_safe)

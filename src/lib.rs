@@ -81,6 +81,7 @@ pub mod pair;
 pub mod pair_code;
 pub mod passkey;
 pub mod request;
+pub(crate) mod signal_flush;
 pub use request::IqError;
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;

@@ -203,6 +203,14 @@ pub struct SenderKeyState {
     /// `state.sender_message_keys` is kept empty in memory; this is the source of
     /// truth, reassembled into the protobuf only at `as_protobuf` (serialization).
     message_keys: std::sync::Arc<Vec<StoredMessageKey>>,
+    /// The current sender chain key, held as a `Copy` value instead of in the
+    /// protobuf. The chain seed is a `Bytes` in the generated structure, so
+    /// keeping it there made every record clone (and the copy-on-write on every
+    /// encrypt/decrypt advance) promote that `Bytes` to a shared allocation.
+    /// Same source-of-truth-outside-the-protobuf trick as `message_keys`:
+    /// `state.sender_chain_key` stays empty in memory, reassembled only at
+    /// `as_protobuf`. `None` only for a structurally invalid state.
+    sender_chain: Option<SenderChainKey>,
     /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
     /// per-send signature skips a basepoint multiplication (~18% of a warm
     /// group send when re-derived from bytes every message). Clones carry the
@@ -247,11 +255,12 @@ impl SenderKeyState {
         let chain_key_arr: [u8; 32] = chain_key
             .try_into()
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        let sender_chain = Some(SenderChainKey::new(iteration, chain_key_arr));
         let state = SenderKeyStateStructure {
             sender_key_id: Some(chain_id),
-            sender_chain_key: MessageField::some(
-                SenderChainKey::new(iteration, chain_key_arr).as_protobuf(),
-            ),
+            // Source of truth is `sender_chain`; the protobuf field stays empty
+            // in memory and is reassembled at as_protobuf.
+            sender_chain_key: MessageField::none(),
             sender_signing_key: MessageField::some(sender_key_state_structure::SenderSigningKey {
                 public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
                 private: signature_private_key
@@ -278,6 +287,7 @@ impl SenderKeyState {
         Ok(Self {
             state,
             message_keys: std::sync::Arc::new(Vec::new()),
+            sender_chain,
             signing_key_memo,
             verifying_key_memo,
         })
@@ -292,9 +302,16 @@ impl SenderKeyState {
                 .map(StoredMessageKey::from_protobuf)
                 .collect::<Vec<_>>(),
         );
+        // Likewise move the chain key out into the Copy field; the seed was
+        // validated at deserialize before this runs.
+        let sender_chain = state.sender_chain_key.take().and_then(|sc| {
+            let seed: [u8; 32] = sc.seed.as_deref()?.try_into().ok()?;
+            Some(SenderChainKey::new(sc.iteration.unwrap_or_default(), seed))
+        });
         Self {
             state,
             message_keys,
+            sender_chain,
             signing_key_memo: std::sync::OnceLock::new(),
             verifying_key_memo: std::sync::OnceLock::new(),
         }
@@ -309,21 +326,39 @@ impl SenderKeyState {
     }
 
     pub fn sender_chain_key(&self) -> Option<SenderChainKey> {
-        let sender_chain = self.state.sender_chain_key.as_option()?;
-        let seed: [u8; 32] = sender_chain
-            .seed
-            .as_deref()
-            .unwrap_or_default()
-            .try_into()
-            .ok()?;
-        Some(SenderChainKey::new(
-            sender_chain.iteration.unwrap_or_default(),
-            seed,
-        ))
+        self.sender_chain
     }
 
     pub fn set_sender_chain_key(&mut self, chain_key: SenderChainKey) {
-        self.state.sender_chain_key = MessageField::some(chain_key.as_protobuf());
+        self.sender_chain = Some(chain_key);
+    }
+
+    /// Advance the sender chain up to a reload's reserved iteration ceiling so no
+    /// possibly-spent iteration below it stays derivable. Bounded by
+    /// `MAX_RESERVATION_FAST_FORWARD`; a target past that is a corrupt
+    /// reservation and errors rather than looping the KDF unboundedly. Mirrors
+    /// `SessionRecord::fast_forward_sender_chain`.
+    pub(crate) fn fast_forward_sender_chain(
+        &mut self,
+        target: u32,
+    ) -> Result<(), SignalProtocolError> {
+        let Some(mut chain_key) = self.sender_chain_key() else {
+            return Ok(());
+        };
+        if target.saturating_sub(chain_key.iteration()) > consts::MAX_RESERVATION_FAST_FORWARD {
+            return Err(SignalProtocolError::InvalidState(
+                "fast_forward_sender_chain",
+                "reserved sender-key iteration implausibly far ahead".into(),
+            ));
+        }
+        if chain_key.iteration() >= target {
+            return Ok(());
+        }
+        while chain_key.iteration() < target {
+            chain_key = chain_key.next()?;
+        }
+        self.set_sender_chain_key(chain_key);
+        Ok(())
     }
 
     pub fn signing_key_public(&self) -> Result<PublicKey, InvalidSenderKeySessionError> {
@@ -386,8 +421,9 @@ impl SenderKeyState {
 
     pub(crate) fn as_protobuf(&self) -> SenderKeyStateStructure {
         debug_assert!(
-            self.state.sender_message_keys.is_empty(),
-            "backlog must live only in `message_keys`; the protobuf copy stays empty"
+            self.state.sender_message_keys.is_empty()
+                && self.state.sender_chain_key.as_option().is_none(),
+            "backlog and chain key must live only in their Copy/Arc fields; the protobuf copies stay empty"
         );
         let mut state = self.state.clone();
         state.sender_message_keys = self
@@ -395,6 +431,10 @@ impl SenderKeyState {
             .iter()
             .map(StoredMessageKey::as_protobuf)
             .collect();
+        state.sender_chain_key = self
+            .sender_chain
+            .as_ref()
+            .map_or_else(MessageField::none, |c| MessageField::some(c.as_protobuf()));
         state
     }
 
@@ -428,20 +468,83 @@ impl SenderKeyState {
 #[derive(Debug, Clone)]
 pub struct SenderKeyRecord {
     states: VecDeque<SenderKeyState>,
+    /// An outbound chain advance not yet known durable. Sender-key message
+    /// keys/IVs derive deterministically from the iteration, so the advance
+    /// must reach storage before its ciphertext reaches the wire (unlike
+    /// decrypt advances, which re-derive forward). Transient — never
+    /// serialized; the store layer converts it into flush gating.
+    wire_gated: bool,
+    /// Durably-reserved iteration ceiling for the current state's sender chain,
+    /// mirroring `SessionRecord::reserved_sender_chain_index` for DM. Iterations
+    /// below this ceiling are covered by a persisted reservation, so their sends
+    /// skip the synchronous pre-wire flush and ride the coalesced write-behind;
+    /// only the send that raises the ceiling gates. A reload fast-forwards the
+    /// current chain past this ceiling so no possibly-spent iteration is
+    /// re-derivable. Reset to 0 on any state change (rotation/promotion), which
+    /// forces the next send to re-reserve and gate; never reuses an iteration.
+    reserved_iteration: u32,
 }
 
+/// Local-only field appended to the serialized record for `reserved_iteration`.
+/// The vendored `SenderKeyRecordStructure` proto is untouched; the generated
+/// decoder skips this unknown top-level field and `deserialize` scans it out.
+/// Matches the field-number scheme `SessionRecord` uses for its DM counterpart.
+const RESERVED_ITERATION_FIELD: u32 = 100;
+
 impl SenderKeyRecord {
+    /// Replaces the states wholesale, so the wire gate — which belongs to the
+    /// advance being replaced — resets with them.
     pub fn set_states_for_testing(&mut self, states: std::collections::VecDeque<SenderKeyState>) {
         self.states = states;
+        self.wire_gated = false;
+        self.reserved_iteration = 0;
     }
 
     pub fn new_empty() -> Self {
         Self {
             states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),
+            wire_gated: false,
+            reserved_iteration: 0,
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    /// Iterations strictly below this ceiling are covered by a durable
+    /// reservation and their sends need no synchronous flush.
+    pub fn reserved_iteration(&self) -> u32 {
+        self.reserved_iteration
+    }
+
+    /// Lease a fresh batch of iterations after `spent_iteration` reached the
+    /// current ceiling. Marks the record wire-gated: the caller's ciphertext
+    /// must not hit the wire until a flush persists the raised ceiling. Mirrors
+    /// `SessionRecord::reserve_sender_chain_counters`.
+    pub fn reserve_iterations(&mut self, spent_iteration: u32) {
+        self.reserved_iteration =
+            spent_iteration.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
+        self.wire_gated = true;
+    }
+
     pub fn deserialize(buf: &[u8]) -> Result<SenderKeyRecord, SignalProtocolError> {
+        Self::deserialize_inner(buf, None)
+    }
+
+    /// A matching live cache proves this snapshot was not recovered after a crash.
+    #[doc(hidden)]
+    pub fn deserialize_for_store(
+        buf: &[u8],
+        incarnation: &[u8; 16],
+    ) -> Result<SenderKeyRecord, SignalProtocolError> {
+        Self::deserialize_inner(buf, Some(incarnation))
+    }
+
+    fn deserialize_inner(
+        buf: &[u8],
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<SenderKeyRecord, SignalProtocolError> {
         let skr = SenderKeyRecordStructure::decode_from_slice(buf)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
@@ -456,7 +559,42 @@ impl SenderKeyRecord {
             }
             states.push_back(SenderKeyState::from_protobuf(state));
         }
-        Ok(Self { states })
+
+        let local_fields =
+            super::local_field::decode_local_record_fields(buf, RESERVED_ITERATION_FIELD, || {
+                SignalProtocolError::InvalidProtobufEncoding
+            })?;
+        let reserved_iteration = local_fields.reservation;
+        let trusted_reload =
+            incarnation.is_some_and(|current| local_fields.incarnation == Some(*current));
+
+        // Only an untrusted snapshot may have spent its still-reserved range.
+        if !trusted_reload
+            && reserved_iteration > 0
+            && let Some(state) = states.front_mut()
+        {
+            state.fast_forward_sender_chain(reserved_iteration)?;
+        }
+
+        Ok(Self {
+            states,
+            wire_gated: false,
+            reserved_iteration,
+        })
+    }
+
+    /// Flag an outbound chain advance; cleared by the store layer once it
+    /// owns the durability gate.
+    pub fn mark_wire_gated(&mut self) {
+        self.wire_gated = true;
+    }
+
+    pub fn is_wire_gated(&self) -> bool {
+        self.wire_gated
+    }
+
+    pub fn clear_wire_gated(&mut self) {
+        self.wire_gated = false;
     }
 
     pub fn sender_key_state(&self) -> Result<&SenderKeyState, InvalidSenderKeySessionError> {
@@ -525,6 +663,16 @@ impl SenderKeyRecord {
         }
 
         self.states.push_front(state);
+        // Reset the reservation unconditionally. It is a record-level ceiling for
+        // whatever chain is current, and this call may have replaced or reordered
+        // the current chain. Resetting is always safe (the next send re-reserves
+        // and re-gates); keeping a stale ceiling across a chain change is not,
+        // since a lower-iteration chain would treat already-covered iterations as
+        // durable and re-derive a spent (key, IV). In practice this is a no-op:
+        // the sending record only reaches here on first creation (reservation
+        // already 0, warm sends reuse the record without re-adding), and receiver
+        // records never carry a reservation.
+        self.reserved_iteration = 0;
         Ok(())
     }
 
@@ -560,7 +708,46 @@ impl SenderKeyRecord {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, SignalProtocolError> {
-        Ok(self.as_protobuf().encode_to_vec())
+        self.serialize_inner(None)
+    }
+
+    /// The incarnation prevents clean reloads from looking like crashes.
+    #[doc(hidden)]
+    pub fn serialize_for_store(
+        &self,
+        incarnation: &[u8; 16],
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        self.serialize_inner(Some(incarnation))
+    }
+
+    fn serialize_inner(
+        &self,
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
+
+        let mut buf = self.as_protobuf().encode_to_vec();
+        let incarnation = incarnation.filter(|_| self.reserved_iteration > 0);
+        let reservation_len = if self.reserved_iteration > 0 {
+            2 + varint_len(self.reserved_iteration as u64)
+        } else {
+            0
+        };
+        let incarnation_len = incarnation
+            .map(|_| super::local_field::STORE_INCARNATION_ENCODED_LEN)
+            .unwrap_or(0);
+        buf.reserve(reservation_len + incarnation_len);
+        // Append the local-only reservation as a top-level field the generated
+        // decoder skips. Emitted only when non-zero, so legacy/unreserved records
+        // stay byte-identical. Mirrors SessionRecord::serialize_into.
+        if self.reserved_iteration > 0 {
+            Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut buf);
+            encode_varint(self.reserved_iteration as u64, &mut buf);
+        }
+        if let Some(incarnation) = incarnation {
+            super::local_field::encode_store_incarnation(&mut buf, incarnation);
+        }
+        Ok(buf)
     }
 
     /// Estimated in-memory footprint proxy: encoded size of each state's
@@ -574,6 +761,8 @@ impl SenderKeyRecord {
             .map(|s| {
                 s.state.compute_size(&mut cache) as usize
                     + s.message_keys.len() * std::mem::size_of::<StoredMessageKey>()
+                    + s.sender_chain
+                        .map_or(0, |_| std::mem::size_of::<SenderChainKey>())
             })
             .sum()
     }
@@ -991,6 +1180,171 @@ mod tests {
             .sender_key_state()
             .expect("sender key state should exist");
         assert_eq!(state.chain_id(), 12345);
+    }
+
+    fn record_with_state(chain_id: u32, seed: u8) -> SenderKeyRecord {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let keypair = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(
+                3,
+                chain_id,
+                0,
+                &[seed; 32],
+                keypair.public_key,
+                Some(keypair.private_key),
+            )
+            .expect("state should be valid");
+        record
+    }
+
+    fn current_iteration(record: &SenderKeyRecord) -> u32 {
+        record
+            .sender_key_state()
+            .expect("test")
+            .sender_chain_key()
+            .expect("test")
+            .iteration()
+    }
+
+    /// A reservation survives a serialize/deserialize round-trip, and the reload
+    /// fast-forwards the current chain past the reserved ceiling so no
+    /// possibly-spent iteration below it stays derivable.
+    #[test]
+    fn reservation_survives_roundtrip_and_reload_fast_forwards() {
+        let mut record = record_with_state(12345, 0x42);
+        record.reserve_iterations(0);
+        assert_eq!(
+            record.reserved_iteration(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+        assert_eq!(
+            current_iteration(&record),
+            0,
+            "reserving does not advance the chain"
+        );
+
+        let reloaded =
+            SenderKeyRecord::deserialize(&record.serialize().expect("test")).expect("test");
+        assert_eq!(
+            reloaded.reserved_iteration(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+        assert_eq!(
+            current_iteration(&reloaded),
+            consts::SENDER_CHAIN_RESERVATION_BATCH,
+            "reload must burn the reserved iterations"
+        );
+    }
+
+    #[test]
+    fn cache_incarnation_separates_clean_reload_from_recovery() {
+        let mut record = record_with_state(12345, 0x42);
+        record.reserve_iterations(0);
+        let incarnation = [0xA1; 16];
+        let replacement = [0xB2; 16];
+        let bytes = record.serialize_for_store(&incarnation).expect("test");
+
+        let clean = SenderKeyRecord::deserialize_for_store(&bytes, &incarnation).expect("test");
+        assert_eq!(current_iteration(&clean), 0);
+
+        let recovered = SenderKeyRecord::deserialize_for_store(&bytes, &replacement).expect("test");
+        assert_eq!(
+            current_iteration(&recovered),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let conservative = SenderKeyRecord::deserialize(&bytes).expect("test");
+        assert_eq!(
+            current_iteration(&conservative),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let legacy = record.serialize().expect("test");
+        let migrated = SenderKeyRecord::deserialize_for_store(&legacy, &incarnation).expect("test");
+        assert_eq!(
+            current_iteration(&migrated),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let mut duplicated = bytes;
+        crate::protocol::local_field::encode_store_incarnation(&mut duplicated, &incarnation);
+        let duplicate_recovery =
+            SenderKeyRecord::deserialize_for_store(&duplicated, &incarnation).expect("test");
+        assert_eq!(
+            current_iteration(&duplicate_recovery),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    /// Rotating the current sender-key state (a fresh chain) resets the lease so
+    /// the next send re-reserves against the new chain instead of treating stale
+    /// iterations as durable.
+    #[test]
+    fn rotation_resets_the_lease() {
+        let mut record = record_with_state(111, 0x42);
+        record.reserve_iterations(0);
+        assert_eq!(
+            record.reserved_iteration(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        record
+            .add_sender_key_state(
+                3,
+                222,
+                0,
+                &[0x43u8; 32],
+                kp.public_key,
+                Some(kp.private_key),
+            )
+            .expect("test");
+        assert_eq!(
+            record.reserved_iteration(),
+            0,
+            "rotation must reset the lease"
+        );
+    }
+
+    /// A record written without the local-only field (an older lib, or an
+    /// unreserved record) is byte-identical to the plain generated encoding and
+    /// loads with reservation 0; the first send re-reserves.
+    #[test]
+    fn legacy_record_without_field_loads_with_zero() {
+        let record = record_with_state(12345, 0x42);
+        let bytes = record.serialize().expect("test");
+        assert_eq!(
+            bytes,
+            record.as_protobuf().encode_to_vec(),
+            "an unreserved record appends no field"
+        );
+        let loaded = SenderKeyRecord::deserialize(&bytes).expect("test");
+        assert_eq!(loaded.reserved_iteration(), 0);
+        assert_eq!(
+            current_iteration(&loaded),
+            0,
+            "no reservation, no fast-forward"
+        );
+    }
+
+    /// A reservation implausibly far past the current chain is a corrupt record
+    /// and must fail closed at load rather than looping the KDF unboundedly.
+    #[test]
+    fn corrupt_reservation_is_rejected() {
+        use buffa::encoding::{Tag, WireType, encode_varint};
+
+        let record = record_with_state(12345, 0x42);
+        let mut bytes = record.serialize().expect("test");
+        let corrupt = consts::MAX_RESERVATION_FAST_FORWARD + 1000;
+        Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut bytes);
+        encode_varint(corrupt as u64, &mut bytes);
+        assert!(
+            SenderKeyRecord::deserialize(&bytes).is_err(),
+            "an implausibly-far reservation must fail closed"
+        );
     }
 
     /// Test SenderKeyRecord state limit

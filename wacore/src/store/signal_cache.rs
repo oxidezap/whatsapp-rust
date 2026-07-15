@@ -3,10 +3,19 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_lock::Mutex;
+use rand::RngExt;
 
 use crate::libsignal::protocol::{ProtocolAddress, SenderKeyRecord, SessionRecord};
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
+
+type StoreIncarnation = [u8; 16];
+
+fn new_store_incarnation() -> StoreIncarnation {
+    let mut incarnation = [0; 16];
+    rand::make_rng::<rand::rngs::StdRng>().fill(&mut incarnation);
+    incarnation
+}
 
 /// Evict clean (non-dirty, non-deleted) entries from a cache HashMap.
 /// Negative entries (None values) are evicted first.
@@ -100,17 +109,27 @@ enum SessionEntry {
 }
 
 struct SessionStoreState {
+    incarnation: StoreIncarnation,
     cache: HashMap<Arc<str>, SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
+    /// Sessions whose raised counter reservation has not reached the backend
+    /// yet. While any address is here, an outbound ciphertext may be relying
+    /// on a lease that only exists in memory, so the send path must flush
+    /// before the wire. Entries leave only when a flush actually persists
+    /// them (or the session is deleted/cleared). Always a subset of `dirty`,
+    /// so eviction can never drop a pending entry.
+    reservation_pending: HashSet<Arc<str>>,
 }
 
 impl SessionStoreState {
-    fn new() -> Self {
+    fn new(incarnation: StoreIncarnation) -> Self {
         Self {
+            incarnation,
             cache: HashMap::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
+            reservation_pending: HashSet::new(),
         }
     }
 
@@ -123,8 +142,14 @@ impl SessionStoreState {
         }
     }
 
-    fn put(&mut self, address: &str, record: SessionRecord) {
+    fn put(&mut self, address: &str, mut record: SessionRecord) {
         let addr = self.key_for(address);
+        // Take over the record's wire gate: the address stays pending until a
+        // flush persists it, regardless of later checkout/put round trips.
+        if record.has_pending_reservation() {
+            record.clear_pending_reservation();
+            self.reservation_pending.insert(addr.clone());
+        }
         self.cache
             .insert(addr.clone(), SessionEntry::Present(Arc::new(record)));
         self.dirty.insert(addr.clone());
@@ -136,12 +161,21 @@ impl SessionStoreState {
         self.cache.insert(addr.clone(), SessionEntry::Absent);
         self.deleted.insert(addr.clone());
         self.dirty.remove(&addr);
+        self.reservation_pending.remove(&addr);
     }
 
     fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();
         self.deleted.clear();
+        // Lossy callers have removed the transport; clean callers require no
+        // pending gate before preserving exact-reload trust.
+        self.reservation_pending.clear();
+    }
+
+    fn discard(&mut self, incarnation: StoreIncarnation) {
+        self.clear();
+        self.incarnation = incarnation;
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
@@ -170,18 +204,26 @@ impl SessionStoreState {
 // === Sender key object cache (same pattern as sessions) ===
 
 struct SenderKeyStoreState {
+    incarnation: StoreIncarnation,
     // `Arc`-wrapped so a warm `get_sender_key` (the per-send peek reads and the
     // per-decrypt load) bumps a refcount instead of deep-cloning the record's
     // `VecDeque<SenderKeyState>` with up to `MAX_MESSAGE_KEYS` message keys each.
     cache: HashMap<Arc<str>, Option<Arc<SenderKeyRecord>>>,
     dirty: HashSet<Arc<str>>,
+    /// Chains advanced by an outbound encrypt and not yet persisted; the send
+    /// path must flush before the wire while any entry is here. Decrypt-side
+    /// dirtiness deliberately does NOT enter this set (it re-derives forward),
+    /// so unrelated group receives never force a sync flush onto a DM send.
+    wire_gate_pending: HashSet<Arc<str>>,
 }
 
 impl SenderKeyStoreState {
-    fn new() -> Self {
+    fn new(incarnation: StoreIncarnation) -> Self {
         Self {
+            incarnation,
             cache: HashMap::new(),
             dirty: HashSet::new(),
+            wire_gate_pending: HashSet::new(),
         }
     }
 
@@ -192,8 +234,12 @@ impl SenderKeyStoreState {
         }
     }
 
-    fn put(&mut self, address: &str, record: SenderKeyRecord) {
+    fn put(&mut self, address: &str, mut record: SenderKeyRecord) {
         let addr = self.key_for(address);
+        if record.is_wire_gated() {
+            record.clear_wire_gated();
+            self.wire_gate_pending.insert(addr.clone());
+        }
         self.cache.insert(addr.clone(), Some(Arc::new(record)));
         self.dirty.insert(addr.clone());
     }
@@ -201,12 +247,19 @@ impl SenderKeyStoreState {
     fn delete(&mut self, address: &str) {
         let addr = self.key_for(address);
         self.cache.insert(addr.clone(), None);
-        self.dirty.insert(addr);
+        self.dirty.insert(addr.clone());
+        self.wire_gate_pending.remove(&addr);
     }
 
     fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();
+        self.wire_gate_pending.clear();
+    }
+
+    fn discard(&mut self, incarnation: StoreIncarnation) {
+        self.clear();
+        self.incarnation = incarnation;
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
@@ -296,10 +349,14 @@ impl SignalStoreCache {
     }
 
     pub fn with_max_entries(max_entries: usize) -> Self {
+        Self::with_max_entries_and_incarnation(max_entries, new_store_incarnation())
+    }
+
+    fn with_max_entries_and_incarnation(max_entries: usize, incarnation: StoreIncarnation) -> Self {
         Self {
-            sessions: Mutex::new(SessionStoreState::new()),
+            sessions: Mutex::new(SessionStoreState::new(incarnation)),
             identities: Mutex::new(ByteStoreState::new()),
-            sender_keys: Mutex::new(SenderKeyStoreState::new()),
+            sender_keys: Mutex::new(SenderKeyStoreState::new(incarnation)),
             removed_prekeys: Mutex::new(HashMap::new()),
             sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
@@ -369,9 +426,12 @@ impl SignalStoreCache {
                     // Another task populated this slot while we were loading;
                     // defer to whatever they wrote (Present, CheckedOut, etc).
                     // Deserialize and return without caching to avoid conflict.
-                    return Ok(Some(SessionRecord::deserialize(&bytes)?));
+                    return Ok(Some(SessionRecord::deserialize_for_store(
+                        &bytes,
+                        &state.incarnation,
+                    )?));
                 }
-                let record = SessionRecord::deserialize(&bytes)?;
+                let record = SessionRecord::deserialize_for_store(&bytes, &state.incarnation)?;
                 state.cache.insert(Arc::from(key), SessionEntry::CheckedOut);
                 state.evict_if_needed(self.max_entries);
                 Ok(Some(record))
@@ -408,7 +468,10 @@ impl SignalStoreCache {
         let mut state = self.sessions.lock().await;
         match backend_result {
             Some(bytes) => {
-                let record = Arc::new(SessionRecord::deserialize(&bytes)?);
+                let record = Arc::new(SessionRecord::deserialize_for_store(
+                    &bytes,
+                    &state.incarnation,
+                )?);
                 if !state.cache.contains_key(key) {
                     state
                         .cache
@@ -577,7 +640,10 @@ impl SignalStoreCache {
             return Ok(cached.clone());
         }
         let record = match backend.get_sender_key(key).await? {
-            Some(bytes) => Some(Arc::new(SenderKeyRecord::deserialize(&bytes)?)),
+            Some(bytes) => Some(Arc::new(SenderKeyRecord::deserialize_for_store(
+                &bytes,
+                &state.incarnation,
+            )?)),
             None => None,
         };
         state.cache.insert(Arc::from(key), record.clone());
@@ -660,6 +726,7 @@ impl SignalStoreCache {
         // backend call (and one SQLite transaction) per session.
         {
             let mut state = self.sessions.lock().await;
+            let incarnation = state.incarnation;
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
@@ -671,12 +738,17 @@ impl SignalStoreCache {
                 // deferred below until a later flush sees it durable.
                 if let Some(SessionEntry::Present(record)) = state.cache.get(address.as_ref()) {
                     let mut buf = Vec::new();
-                    record.serialize_into(&mut buf);
+                    record.serialize_into_for_store(&mut buf, &incarnation);
                     batch.push((address.clone(), bytes::Bytes::from(buf)));
                 }
             }
             if !batch.is_empty() {
                 backend.put_sessions_batch(&batch).await?;
+                // These leases are durable now; only the written addresses
+                // leave the pending set (a CheckedOut session stays gated).
+                for (address, _) in &batch {
+                    state.reservation_pending.remove(address);
+                }
             }
             for address in &deleted_keys {
                 backend.delete_session(address).await?;
@@ -778,6 +850,7 @@ impl SignalStoreCache {
         // Flush sender keys
         {
             let mut state = self.sender_keys.lock().await;
+            let incarnation = state.incarnation;
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
 
             let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
@@ -785,7 +858,7 @@ impl SignalStoreCache {
                 match state.cache.get(name.as_ref()) {
                     Some(Some(record)) => {
                         let bytes = record
-                            .serialize()
+                            .serialize_for_store(&incarnation)
                             .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
                         batch.push((name.clone(), bytes::Bytes::from(bytes)));
                     }
@@ -797,6 +870,9 @@ impl SignalStoreCache {
             }
             if !batch.is_empty() {
                 backend.put_sender_keys_batch(&batch).await?;
+                for (name, _) in &batch {
+                    state.wire_gate_pending.remove(name);
+                }
             }
 
             for key in &dirty_keys {
@@ -806,6 +882,19 @@ impl SignalStoreCache {
         }
 
         Ok(())
+    }
+
+    /// Whether an outbound ciphertext produced since the last flush is still
+    /// gated on durability: a session counter lease was raised, or a
+    /// sender-key chain advanced via encrypt, and neither has reached the
+    /// backend. The send path flushes synchronously only while this holds;
+    /// everything else (decrypt advances, identities) safely rides the
+    /// coalesced write-behind.
+    pub async fn needs_pre_wire_flush(&self) -> bool {
+        if !self.sessions.lock().await.reservation_pending.is_empty() {
+            return true;
+        }
+        !self.sender_keys.lock().await.wire_gate_pending.is_empty()
     }
 
     /// Entry counts and estimated retained bytes for each store
@@ -883,16 +972,44 @@ impl SignalStoreCache {
         (sessions, identities, sender_keys)
     }
 
-    /// Clear all cached state (used on disconnect/reconnect).
-    /// Retains allocated capacity for reuse on reconnect.
+    /// A lossy discard must invalidate exact-reload trust.
     pub async fn clear(&self) {
-        self.sessions.lock().await.clear();
+        self.clear_with_incarnation(new_store_incarnation()).await;
+    }
+
+    async fn clear_with_incarnation(&self, incarnation: StoreIncarnation) {
+        self.sessions.lock().await.discard(incarnation);
         self.identities.lock().await.clear();
-        self.sender_keys.lock().await.clear();
+        self.sender_keys.lock().await.discard(incarnation);
         // Drop buffered prekey removals together with the volatile sessions they
         // belong to: the promoted session is gone, so the still-durable prekey
         // must stay so a redelivered pkmsg can rebuild the session.
         self.removed_prekeys.lock().await.clear();
+    }
+
+    /// Only a discard can make a post-flush write's stale snapshot reloadable.
+    #[doc(hidden)]
+    pub async fn clear_after_flush(&self) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.dirty.is_empty()
+            && sessions.deleted.is_empty()
+            && sessions.reservation_pending.is_empty()
+        {
+            sessions.clear();
+            self.removed_prekeys.lock().await.clear();
+        }
+        drop(sessions);
+
+        let mut identities = self.identities.lock().await;
+        if identities.dirty.is_empty() && identities.deleted.is_empty() {
+            identities.clear();
+        }
+        drop(identities);
+
+        let mut sender_keys = self.sender_keys.lock().await;
+        if sender_keys.dirty.is_empty() && sender_keys.wire_gate_pending.is_empty() {
+            sender_keys.clear();
+        }
     }
 }
 
@@ -1898,5 +2015,542 @@ mod eviction_tests {
                 state.cache.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_reload_tests {
+    use super::*;
+    use crate::libsignal::protocol::{
+        ChainKey, IdentityKey, KeyPair, RootKey, SenderKeyStore, SessionState,
+        create_sender_key_distribution_message, group_decrypt, group_encrypt,
+        process_sender_key_distribution_message,
+    };
+    use crate::store::in_memory::InMemoryBackend;
+
+    struct CachedSenderKeyStore<'a> {
+        cache: &'a SignalStoreCache,
+        backend: &'a InMemoryBackend,
+    }
+
+    #[async_trait::async_trait]
+    impl SenderKeyStore for CachedSenderKeyStore<'_> {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            record: SenderKeyRecord,
+        ) -> crate::libsignal::protocol::error::Result<()> {
+            self.cache.put_sender_key(name, record).await;
+            Ok(())
+        }
+
+        async fn load_sender_key(
+            &self,
+            name: &SenderKeyName,
+        ) -> crate::libsignal::protocol::error::Result<Option<SenderKeyRecord>> {
+            Ok(self
+                .cache
+                .get_sender_key(name, self.backend)
+                .await
+                .expect("test backend")
+                .map(|record| (*record).clone()))
+        }
+    }
+
+    fn sender_key_name() -> SenderKeyName {
+        SenderKeyName::from_parts("group@g.us", "15550001000@s.whatsapp.net:0")
+    }
+
+    fn leased_session() -> SessionRecord {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let base_key = KeyPair::generate(&mut rng).public_key;
+        let mut state = SessionState::new(3, &local, &remote, &RootKey::new([0; 32]), &base_key);
+        state.set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([1; 32], 0));
+        let mut record = SessionRecord::new(state);
+        record.reserve_sender_chain_counters(0);
+        record
+    }
+
+    fn session_chain_index(record: &SessionRecord) -> u32 {
+        record
+            .session_state()
+            .expect("session")
+            .get_sender_chain_key()
+            .expect("sender chain")
+            .index()
+    }
+
+    #[tokio::test]
+    async fn dm_clean_reload_is_exact_but_new_cache_burns_the_lease() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = ProtocolAddress::new("15550001001".to_string(), 1.into());
+        cache.put_session(&address, leased_session()).await;
+        cache.flush(&backend).await.expect("flush");
+        cache.clear_after_flush().await;
+
+        let clean = cache
+            .get_session(&address, &backend)
+            .await
+            .expect("cache load")
+            .expect("session");
+        assert_eq!(session_chain_index(&clean), 0);
+
+        let replacement = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        let recovered = replacement
+            .get_session(&address, &backend)
+            .await
+            .expect("recovery load")
+            .expect("session");
+        assert_eq!(
+            session_chain_index(&recovered),
+            crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_session_flush_retains_newer_state_and_fails_closed_on_recovery() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = ProtocolAddress::new("15550001002".to_string(), 1.into());
+        cache.put_session(&address, leased_session()).await;
+        cache.flush(&backend).await.expect("initial flush");
+
+        let mut advanced = cache
+            .get_session(&address, &backend)
+            .await
+            .expect("cache load")
+            .expect("session");
+        let next = advanced
+            .session_state()
+            .expect("session")
+            .get_sender_chain_key()
+            .expect("sender chain")
+            .next_chain_key()
+            .expect("chain advance");
+        advanced
+            .session_state_mut()
+            .expect("session")
+            .set_sender_chain_key(&next)
+            .expect("chain update");
+        cache.put_session(&address, advanced).await;
+
+        let checked_out = cache
+            .get_session(&address, &backend)
+            .await
+            .expect("cache checkout")
+            .expect("session");
+        cache.flush(&backend).await.expect("skipped flush");
+        cache.clear_after_flush().await;
+
+        {
+            let state = cache.sessions.lock().await;
+            assert_eq!(state.incarnation, [0xA1; 16]);
+            assert!(state.dirty.contains(address.as_str()));
+            assert!(matches!(
+                state.cache.get(address.as_str()),
+                Some(SessionEntry::CheckedOut)
+            ));
+        }
+
+        let replacement = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        let recovered = replacement
+            .get_session(&address, &backend)
+            .await
+            .expect("recovery load")
+            .expect("session");
+        assert_eq!(
+            session_chain_index(&recovered),
+            crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        cache.put_session(&address, checked_out).await;
+        cache.flush(&backend).await.expect("retry flush");
+        cache.clear_after_flush().await;
+        let exact = cache
+            .get_session(&address, &backend)
+            .await
+            .expect("exact reload")
+            .expect("session");
+        assert_eq!(session_chain_index(&exact), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_clean_reloads_keep_group_messages_within_forward_jump_limit() {
+        let sender_backend = InMemoryBackend::new();
+        let sender_cache = SignalStoreCache::new();
+        let mut sender = CachedSenderKeyStore {
+            cache: &sender_cache,
+            backend: &sender_backend,
+        };
+        let receiver_backend = InMemoryBackend::new();
+        let receiver_cache = SignalStoreCache::new();
+        let mut receiver = CachedSenderKeyStore {
+            cache: &receiver_cache,
+            backend: &receiver_backend,
+        };
+        let name = sender_key_name();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let skdm = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .expect("sender setup");
+        process_sender_key_distribution_message(&name, &skdm, &mut receiver)
+            .await
+            .expect("receiver setup");
+
+        let mut last = None;
+        for expected_iteration in 0..=32 {
+            let message = group_encrypt(&mut sender, &name, b"payload", &mut rng)
+                .await
+                .expect("group encrypt");
+            assert_eq!(message.iteration(), expected_iteration);
+            last = Some(message);
+            sender_cache.flush(&sender_backend).await.expect("flush");
+            sender_cache.clear_after_flush().await;
+        }
+
+        let plaintext = group_decrypt(last.expect("message").serialized(), &mut receiver, &name)
+            .await
+            .expect("a peer may miss every preceding message");
+        assert_eq!(plaintext, b"payload");
+    }
+
+    #[tokio::test]
+    async fn clean_sender_key_eviction_does_not_burn_a_lease() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let mut store = CachedSenderKeyStore {
+            cache: &cache,
+            backend: &backend,
+        };
+        let name = sender_key_name();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        create_sender_key_distribution_message(&name, &mut store, &mut rng)
+            .await
+            .expect("sender setup");
+
+        let first = group_encrypt(&mut store, &name, b"first", &mut rng)
+            .await
+            .expect("first send");
+        assert_eq!(first.iteration(), 0);
+        cache.flush(&backend).await.expect("flush");
+        assert!(
+            cache
+                .sender_keys
+                .lock()
+                .await
+                .cache
+                .remove(name.cache_key())
+                .is_some()
+        );
+
+        let second = group_encrypt(&mut store, &name, b"second", &mut rng)
+            .await
+            .expect("send after eviction");
+        assert_eq!(second.iteration(), 1);
+    }
+
+    #[tokio::test]
+    async fn dirty_sender_key_stays_resident_while_recovery_fails_closed() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let mut store = CachedSenderKeyStore {
+            cache: &cache,
+            backend: &backend,
+        };
+        let name = sender_key_name();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        create_sender_key_distribution_message(&name, &mut store, &mut rng)
+            .await
+            .expect("sender setup");
+
+        let first = group_encrypt(&mut store, &name, b"first", &mut rng)
+            .await
+            .expect("first send");
+        assert_eq!(first.iteration(), 0);
+        cache.flush(&backend).await.expect("flush");
+
+        let unflushed = group_encrypt(&mut store, &name, b"unflushed", &mut rng)
+            .await
+            .expect("unflushed send");
+        assert_eq!(unflushed.iteration(), 1);
+        cache.clear_after_flush().await;
+
+        {
+            let state = cache.sender_keys.lock().await;
+            assert_eq!(state.incarnation, [0xA1; 16]);
+            assert!(state.dirty.contains(name.cache_key()));
+            assert!(state.cache.contains_key(name.cache_key()));
+        }
+
+        let resumed = group_encrypt(&mut store, &name, b"resumed", &mut rng)
+            .await
+            .expect("resident send");
+        assert_eq!(resumed.iteration(), 2);
+
+        let replacement = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        let mut recovered_store = CachedSenderKeyStore {
+            cache: &replacement,
+            backend: &backend,
+        };
+        let recovered = group_encrypt(&mut recovered_store, &name, b"recovered", &mut rng)
+            .await
+            .expect("recovery send");
+        assert_eq!(
+            recovered.iteration(),
+            crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        cache.flush(&backend).await.expect("retry flush");
+        cache.clear_after_flush().await;
+        let exact = group_encrypt(&mut store, &name, b"exact", &mut rng)
+            .await
+            .expect("exact reload");
+        assert_eq!(exact.iteration(), 3);
+    }
+}
+
+#[cfg(test)]
+mod pre_wire_gate_tests {
+    use super::*;
+    use crate::libsignal::store::sender_key_name::SenderKeyName;
+    use crate::store::in_memory::InMemoryBackend;
+
+    fn addr(user: &str) -> ProtocolAddress {
+        ProtocolAddress::new(user.to_string(), 1.into())
+    }
+
+    fn leased_record() -> SessionRecord {
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        record
+    }
+
+    /// A raised lease gates the wire until a flush actually persists it; a
+    /// plain (decrypt-style) session write never does.
+    #[tokio::test]
+    async fn session_lease_gates_until_a_successful_flush() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+
+        cache
+            .put_session(&addr("15550000001"), SessionRecord::new_fresh())
+            .await;
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a dirty session without a raised lease must not gate the wire"
+        );
+
+        cache
+            .put_session(&addr("15550000002"), leased_record())
+            .await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a persisted lease releases the gate"
+        );
+    }
+
+    /// A failed flush must keep the gate closed — the lease never reached
+    /// storage, so the ciphertext must keep waiting.
+    #[tokio::test]
+    async fn failed_flush_keeps_the_gate_closed() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+
+        cache
+            .put_session(&addr("15550000003"), leased_record())
+            .await;
+        backend.set_fail_session_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "an unpersisted lease must keep gating the wire"
+        );
+
+        backend.set_fail_session_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// A checked-out session cannot be persisted by a flush, so its pending
+    /// lease must survive that flush and release only once the returned
+    /// record is actually written.
+    #[tokio::test]
+    async fn checked_out_session_keeps_its_lease_pending_across_a_flush() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let a = addr("15550000004");
+
+        cache.put_session(&a, leased_record()).await;
+        let taken = cache.get_session(&a, &backend).await.unwrap().unwrap();
+
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "a checked-out lease was not persisted and must keep the gate closed"
+        );
+
+        cache.put_session(&a, taken).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// Outbound sender-key advances gate the wire; decrypt-side dirtiness
+    /// (no wire gate mark) must not, so group receives never force a sync
+    /// flush onto an unrelated DM send.
+    #[tokio::test]
+    async fn only_encrypt_marked_sender_keys_gate_the_wire() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a decrypt-side sender-key write must not gate the wire"
+        );
+
+        let mut outbound = SenderKeyRecord::new_empty();
+        outbound.mark_wire_gated();
+        cache.put_sender_key(&name, outbound).await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// The sender-key counterpart of `failed_flush_keeps_the_gate_closed`: a
+    /// flush that fails writing the chain advance must keep the wire gated.
+    #[tokio::test]
+    async fn failed_flush_keeps_the_sender_key_gate_closed() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        let mut outbound = SenderKeyRecord::new_empty();
+        outbound.mark_wire_gated();
+        cache.put_sender_key(&name, outbound).await;
+
+        backend.set_fail_sender_key_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "an unpersisted sender-key advance must keep gating the wire"
+        );
+
+        backend.set_fail_sender_key_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// Cleanup racing a post-flush write must not release its durability gate.
+    #[tokio::test]
+    async fn clear_after_flush_retains_every_post_flush_write_and_wire_gate() {
+        const PREKEY_ID: u32 = 7001;
+
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = addr("15550000005");
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache.flush(&backend).await.unwrap();
+        cache.put_session(&address, leased_record()).await;
+        cache.put_identity(&address, &[7; 32]).await;
+        backend
+            .store_prekey(PREKEY_ID, b"prekey", false)
+            .await
+            .unwrap();
+        cache.remove_prekey(PREKEY_ID, address.as_str()).await;
+        let mut outbound = SenderKeyRecord::new_empty();
+        outbound.mark_wire_gated();
+        cache.put_sender_key(&name, outbound).await;
+
+        cache.clear_after_flush().await;
+
+        assert!(cache.needs_pre_wire_flush().await);
+        {
+            let sessions = cache.sessions.lock().await;
+            assert_eq!(sessions.incarnation, [0xA1; 16]);
+            assert!(sessions.dirty.contains(address.as_str()));
+            assert!(sessions.reservation_pending.contains(address.as_str()));
+        }
+        {
+            let identities = cache.identities.lock().await;
+            assert!(identities.dirty.contains(address.as_str()));
+        }
+        {
+            let sender_keys = cache.sender_keys.lock().await;
+            assert_eq!(sender_keys.incarnation, [0xA1; 16]);
+            assert!(sender_keys.dirty.contains(name.cache_key()));
+            assert!(sender_keys.wire_gate_pending.contains(name.cache_key()));
+        }
+        assert!(cache.removed_prekeys.lock().await.contains_key(&PREKEY_ID));
+
+        cache.flush(&backend).await.unwrap();
+
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(
+            backend
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            backend.load_identity(address.as_str()).await.unwrap(),
+            Some([7; 32])
+        );
+        assert!(
+            backend
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(backend.load_prekey(PREKEY_ID).await.unwrap().is_none());
+    }
+
+    /// Deleting or clearing drops the pending gate together with the state it
+    /// guarded (the reloaded snapshot re-reserves on its first send).
+    #[tokio::test]
+    async fn delete_and_clear_drop_the_pending_gate() {
+        let cache = SignalStoreCache::new();
+        let a = addr("15550000006");
+
+        cache.put_session(&a, leased_record()).await;
+        cache.delete_session(&a).await;
+        assert!(!cache.needs_pre_wire_flush().await);
+
+        cache.put_session(&a, leased_record()).await;
+        cache.clear().await;
+        assert!(!cache.needs_pre_wire_flush().await);
     }
 }

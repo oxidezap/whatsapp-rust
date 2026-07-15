@@ -1510,6 +1510,49 @@ async fn cleanup_connection_state_flushes_dirty_sender_key() {
     );
 }
 
+#[tokio::test]
+async fn cleanup_connection_state_does_not_burn_a_clean_sender_key_lease() {
+    use wacore::libsignal::protocol::{KeyPair, SenderKeyRecord};
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    let client = create_offline_sync_test_client().await;
+    let name = SenderKeyName::from_parts("group@g.us", "5550001001@s.whatsapp.net:1");
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let signing_key = KeyPair::generate(&mut rng);
+    let mut record = SenderKeyRecord::new_empty();
+    record
+        .add_sender_key_state(
+            3,
+            12345,
+            0,
+            &[0x42; 32],
+            signing_key.public_key,
+            Some(signing_key.private_key),
+        )
+        .expect("sender key state");
+    record.reserve_iterations(0);
+    client.signal_cache.put_sender_key(&name, record).await;
+
+    client.cleanup_connection_state().await;
+
+    let device = client.persistence_manager.get_device_arc().await;
+    let guard = device.read().await;
+    let reloaded = client
+        .signal_cache
+        .get_sender_key(&name, &*guard.backend)
+        .await
+        .expect("sender key load")
+        .expect("sender key");
+    assert_eq!(
+        reloaded
+            .sender_key_state()
+            .expect("sender key state")
+            .sender_chain_key()
+            .expect("sender chain")
+            .iteration(),
+        0
+    );
+}
+
 /// When the flush itself fails, cleanup must NOT clear the cache, or it would
 /// drop the very state the flush was meant to persist.
 #[tokio::test]

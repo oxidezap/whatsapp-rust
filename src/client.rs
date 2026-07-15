@@ -560,8 +560,9 @@ pub struct Client {
     pub(crate) unified_session: crate::unified_session::UnifiedSessionManager,
 
     /// In-memory cache for Signal protocol state (sessions, identities, sender keys).
-    /// Matches WhatsApp Web's SignalStoreCache pattern: crypto ops read/write this cache,
-    /// and DB writes are deferred to flush() after each message is processed.
+    /// Matches WhatsApp Web's SignalStoreCache pattern: crypto ops read/write this
+    /// cache, and DB writes are flushed out of it — synchronously on the send path
+    /// and coalesced on the receive path (see `signal_flush.rs`).
     pub(crate) signal_cache: Arc<crate::store::signal_cache::SignalStoreCache>,
 
     /// Limits message processing concurrency (1 permit during offline sync, N after).
@@ -835,6 +836,32 @@ pub struct Client {
     /// Weak self-reference for spawning background tasks from `&self` methods.
     /// Initialized after `Arc::new(this)` in the constructor.
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Client>>,
+
+    /// Single-flight state for the coalesced Signal-cache flush worker:
+    /// `(connection_generation << 2) | RUNNING/DIRTY bits` (see `signal_flush.rs`).
+    pub(crate) signal_flush_state: AtomicU64,
+    /// Barrier between a coalesced-flush worker's backend write and teardown's
+    /// Signal-cache settle. The generation-scoped atomic only orders
+    /// `signal_flush_state`, not the writes themselves: a worker that passed its
+    /// pre-flush generation check could still be mid-flush when teardown settles
+    /// the cache and the next connection's drain dirties it, persisting rowless
+    /// advances out of band. The worker holds this only across the flush (never
+    /// across sleep/backoff) and re-checks the generation under it; teardown
+    /// holds it around the settle. Lock order is always this-gate → processing
+    /// permit / sessions lock, so no inversion.
+    pub(crate) signal_flush_lifecycle: async_lock::Mutex<()>,
+    /// Injected failures for the coalesced flush (consumed one per attempt),
+    /// so tests can exercise the retry/backoff path deterministically.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_failures: AtomicU32,
+    /// Blocks each coalesced flush attempt while set, so a test can hold a
+    /// worker inside the flush and drive a concurrent generation change.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_block: AtomicBool,
+    /// Counts entries into the coalesced flush attempt, so a test can wait
+    /// until a worker is actually inside the (blocked) flush.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_in_attempt: AtomicU32,
 
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by

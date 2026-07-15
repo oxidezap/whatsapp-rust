@@ -1362,6 +1362,59 @@ mod tests {
         assert!(taken_again.is_none());
     }
 
+    /// DB-only path (no L1 cache, capacity 0 -- the harness/default): the wave
+    /// that resolves the chat directly and stores the caller's borrowed id must
+    /// still round-trip through the backend, so take_recent_message finds it.
+    #[tokio::test]
+    async fn recent_message_db_only_round_trip() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        // Capacity 0 keeps the L1 cache off, so the store + retrieve goes through
+        // the backend -- exactly the DB-only branch add_recent_message took.
+        let config = crate::cache_config::CacheConfig::default();
+        assert_eq!(
+            config.recent_messages.capacity, 0,
+            "this test asserts the DB-only (capacity 0) path"
+        );
+        let (client, _sync_rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let chat: Jid = "120363021033254949@g.us"
+            .parse()
+            .expect("test JID should be valid");
+        let msg_id = "DBONLY1".to_string();
+        let msg = wa::Message {
+            conversation: Some("db-only".into()),
+            ..Default::default()
+        };
+
+        client.add_recent_message(&chat, &msg_id, &msg, None).await;
+
+        let taken = client.take_recent_message(&chat, &msg_id).await;
+        assert!(
+            taken.is_some(),
+            "a DB-only stored message must be retrievable from the backend"
+        );
+        let (got, _alt) = taken.unwrap();
+        assert_eq!(got.conversation.as_deref(), Some("db-only"));
+
+        let again = client.take_recent_message(&chat, &msg_id).await;
+        assert!(again.is_none(), "take consumes the DB-only message");
+    }
+
     #[tokio::test]
     async fn peek_recent_message_does_not_consume() {
         let _ = env_logger::builder().is_test(true).try_init();

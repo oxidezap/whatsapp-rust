@@ -962,6 +962,10 @@ impl Client {
             .ensure_status_participants(prepared.node, &group_info)
             .await?;
 
+        // Gate the stanza on the sender-key ratchet advance being durable
+        // (same rule as the DM/group send path); a failure aborts the send.
+        self.persist_signal_state_pre_wire().await?;
+
         let ack = if let Some(phash) = stanza
             .attrs()
             .optional_string("phash")
@@ -990,9 +994,6 @@ impl Client {
         for user in &prepared.stale_device_users {
             self.invalidate_device_cache(user).await;
         }
-
-        self.flush_signal_cache_batch_safe_logged("send_status_message", None)
-            .await;
 
         Ok(SendResult {
             message_id: request_id,
@@ -1481,6 +1482,16 @@ impl Client {
             .await?
         };
 
+        // The outbound advance must be durable BEFORE the stanza hits the wire:
+        // reusing an outbound counter reuses its message key + IV. Counters are
+        // leased in batches (see `SessionRecord::reserve_sender_chain_counters`),
+        // so most sends are already covered by a durable lease and only
+        // schedule the coalesced write-behind; a send that raised the lease (or
+        // advanced a sender-key chain) flushes synchronously, and a persistence
+        // failure must abort the send rather than transmit an advance we
+        // couldn't save.
+        self.persist_signal_state_pre_wire().await?;
+
         let ack = if let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
                 .attrs()
@@ -1551,10 +1562,6 @@ impl Client {
         }
         // Warm marking is visible; a waiting cold send may now re-resolve.
         drop(distribution_guard);
-
-        // Flush cached Signal state to DB after encryption
-        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
-            .await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
         // Fire-and-forget so send_message returns without waiting for the IQ

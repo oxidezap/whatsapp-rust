@@ -19,6 +19,11 @@ env:
   PROTOC_VERSION: "3.25.3"
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
+  # The target dir is restored fresh each run (Swatinem cache), so incremental
+  # state is always cold and only bloats artifacts; worse, sccache refuses to
+  # cache incremental compilations, so leaving it on excludes the workspace
+  # crates from caching entirely.
+  CARGO_INCREMENTAL: "0"
   CARGO_BLOAT_VERSION: "0.12.1"
   CARGO_LLVM_LINES_VERSION: "0.4.46"
 
@@ -50,13 +55,16 @@ jobs:
           cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
-      - name: Cache Rust registry
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ runner.os }}-cargo-binary-size
-          cache-targets: "false"
+          cache-targets: "true"
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
@@ -185,13 +193,16 @@ jobs:
           cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
-      - name: Cache Rust registry
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ runner.os }}-cargo-binary-size
-          cache-targets: "false"
+          cache-targets: "true"
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
