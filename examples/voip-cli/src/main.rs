@@ -1686,6 +1686,8 @@ async fn run_bot(mode: Mode) -> Result<()> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    #[cfg(feature = "voip-opus")]
+    use super::AudioMode;
     use super::{
         CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
         parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
@@ -1804,5 +1806,33 @@ mod tests {
         mark_call_most_recent(&mut order, "CALL-B");
         mark_call_most_recent(&mut order, "CALL-A");
         assert_eq!(order, ["CALL-B", "CALL-A"]);
+    }
+
+    #[cfg(feature = "voip-opus")]
+    #[test]
+    fn native_opus_mode_keeps_codec_and_clock_negotiation_aligned() {
+        use wacore::stanza::call::{
+            CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_PREACCEPT,
+        };
+        use wacore::voip::rtp::{RTP_PAYLOAD_TYPE_OPUS, RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO};
+
+        let native = AudioMode::OpusNative;
+        assert_eq!(
+            native.format().rtp_payload_type,
+            RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO
+        );
+        assert_eq!(native.format().rtp_clock_rate, 16_000);
+        assert_eq!(
+            native.preaccept_capability(false),
+            &CAPABILITY_STANDARD_OPUS_PREACCEPT
+        );
+        assert_eq!(native.accept_capability(), &CAPABILITY_STANDARD_OPUS_OFFER);
+        assert!(native.uses_standard_opus());
+        assert!(!native.uses_48khz_rtp_clock());
+
+        let rfc7587 = AudioMode::OpusRfc7587;
+        assert_eq!(rfc7587.format().rtp_payload_type, RTP_PAYLOAD_TYPE_OPUS);
+        assert_eq!(rfc7587.format().rtp_clock_rate, 48_000);
+        assert!(rfc7587.uses_48khz_rtp_clock());
     }
 }

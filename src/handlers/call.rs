@@ -568,6 +568,120 @@ mod tests {
             .build()
     }
 
+    #[cfg(feature = "voip-runtime")]
+    fn audio_selection_stanza(rate: &str) -> wacore_binary::Node {
+        NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "STANZA-ID-AUDIO")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .children([NodeBuilder::new("audio")
+                    .attr("enc", "opus")
+                    .attr("rate", rate.to_string())
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn register_native_opus_call(
+        client: &Client,
+    ) -> async_channel::Receiver<wacore::voip::CallEvent> {
+        use wacore::voip::{AudioFormat, CallEvent};
+
+        let registry = client.call_registry();
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        );
+        session.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        let generation = registry.insert(session);
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+        event_rx
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn incompatible_audio_selection_emits_event_and_terminates_call() {
+        use wacore::voip::CallEvent;
+
+        let client = make_sending_client().await;
+        let event_rx = register_native_opus_call(&client);
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("8000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert_eq!(
+            event_rx.try_recv(),
+            Ok(CallEvent::AudioFormatMismatch {
+                expected_rate: 16_000,
+                received_rates: vec![8_000],
+            })
+        );
+        let terminate = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("terminate must be sent")
+            .expect("waiter");
+        assert_eq!(
+            terminate.as_node_ref().children().unwrap()[0].tag,
+            "terminate"
+        );
+        assert!(client.call_registry().snapshot("CALL-ID-0001").is_none());
+        assert!(!cancelled);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn compatible_audio_selection_keeps_call_active() {
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let event_rx = register_native_opus_call(&client);
+        let (handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("16000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert!(event_rx.try_recv().is_err());
+        assert!(client.call_registry().snapshot("CALL-ID-0001").is_some());
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            global_rx.try_recv().as_deref(),
+            Ok(Event::IncomingCall(IncomingCall {
+                action: CallAction::Accept { .. },
+                ..
+            }))
+        ));
+        assert!(!cancelled);
+    }
+
     // A <call><video> must be acked with the TYPED <ack class="call" type="video"> and the
     // generic router ack suppressed — an untyped ack makes the upgrade requester revert ~5s in.
     #[cfg(feature = "voip-runtime")]

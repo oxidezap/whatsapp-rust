@@ -1696,9 +1696,13 @@ mod tests {
             ["audio", "net", "encopt", "capability", "voip_settings"]
         );
         let accept_ref = accept.as_node_ref();
-        let voip_settings = accept_ref.children().unwrap()[0]
-            .get_optional_child("voip_settings")
-            .unwrap();
+        let action = &accept_ref.children().unwrap()[0];
+        let capability = action.get_optional_child("capability").unwrap();
+        assert_eq!(
+            capability.content_bytes(),
+            Some(CAPABILITY_STANDARD_OPUS_OFFER.as_slice())
+        );
+        let voip_settings = action.get_optional_child("voip_settings").unwrap();
         assert_eq!(
             voip_settings
                 .attrs()
