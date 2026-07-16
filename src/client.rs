@@ -187,14 +187,14 @@ impl ChatLane {
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         self.queue_tx.try_send(QueuedChatMessage {
             node,
-            lane_guard: Arc::clone(&self.enqueue_lock),
+            lane_liveness: Arc::clone(&self.enqueue_lock),
         })
     }
 }
 
 pub(crate) struct QueuedChatMessage {
     pub node: Arc<wacore_binary::OwnedNodeRef>,
-    pub lane_guard: Arc<async_lock::Mutex<()>>,
+    pub lane_liveness: Arc<async_lock::Mutex<()>>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;

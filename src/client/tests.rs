@@ -2889,7 +2889,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
     client.chat_lanes.insert(third, third_lane).await;
     assert!(
         client.chat_lanes.get(&first).await.is_some(),
-        "the next queued message must keep using the original worker"
+        "a lane with an in-flight message must not be evicted"
     );
 
     drop(next_active_message);

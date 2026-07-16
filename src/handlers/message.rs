@@ -87,7 +87,7 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
         .spawn(Box::pin(async move {
             while let Ok(QueuedChatMessage {
                 node: msg_node,
-                lane_guard: _lane_guard,
+                lane_liveness, // Prevents capacity eviction until processing finishes.
             }) = rx.recv().await
             {
                 if client_for_worker
@@ -115,6 +115,7 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
                         MAX_MESSAGE_DELAY_MS / 1000
                     );
                 }
+                drop(lane_liveness);
             }
         }))
         .detach();
