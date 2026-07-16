@@ -1,5 +1,5 @@
 use super::traits::StanzaHandler;
-use crate::client::{ChatLane, Client};
+use crate::client::{ChatLane, Client, QueuedChatMessage};
 use async_trait::async_trait;
 use log::warn;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ impl MessageHandler {
         // Lock serializes enqueue order for this chat
         let _guard = lane.enqueue_lock.lock().await;
 
-        if let Err(e) = lane.queue_tx.try_send(node) {
+        if let Err(e) = lane.try_enqueue(node) {
             warn!("Failed to enqueue message for processing: {e}");
             // Cancel ack so server redelivers
             *cancelled = true;
@@ -75,7 +75,7 @@ impl StanzaHandler for MessageHandler {
 /// Construct a ChatLane with a spawned worker task. Extracted to keep the
 /// init closure passed to `get_with_by_ref` small.
 fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
-    let (tx, rx) = async_channel::unbounded::<Arc<wacore_binary::OwnedNodeRef>>();
+    let (tx, rx) = async_channel::unbounded::<QueuedChatMessage>();
 
     let client_for_worker = client.clone();
     let spawn_generation = client
@@ -85,7 +85,11 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
     client
         .runtime
         .spawn(Box::pin(async move {
-            while let Ok(msg_node) = rx.recv().await {
+            while let Ok(QueuedChatMessage {
+                node: msg_node,
+                lane_guard: _lane_guard,
+            }) = rx.recv().await
+            {
                 if client_for_worker
                     .connection_generation
                     .load(std::sync::atomic::Ordering::Acquire)

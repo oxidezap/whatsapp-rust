@@ -2824,6 +2824,84 @@ async fn held_group_distribution_lane_survives_capacity_pressure() {
     assert!(first_again.try_lock().is_some());
 }
 
+#[tokio::test]
+async fn active_chat_lane_survives_capacity_pressure() {
+    fn test_lane() -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
+        let (queue_tx, queue_rx) = async_channel::unbounded();
+        (
+            ChatLane {
+                enqueue_lock: Arc::new(async_lock::Mutex::new(())),
+                queue_tx,
+            },
+            queue_rx,
+        )
+    }
+
+    let config = crate::cache_config::CacheConfig {
+        chat_lanes_capacity: 1,
+        ..Default::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "chat_lane_eviction",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    let first: Jid = "120363000000000021@g.us".parse().unwrap();
+    let second: Jid = "120363000000000022@g.us".parse().unwrap();
+    let (first_lane, first_rx) = test_lane();
+    let first_tx_probe = first_lane.queue_tx.clone();
+    client.chat_lanes.insert(first.clone(), first_lane).await;
+
+    let first_lane = client.chat_lanes.get(&first).await.unwrap();
+    let node = NodeBuilder::new("message")
+        .attr("from", first.clone())
+        .attr("id", "ACTIVE-LANE-1")
+        .build();
+    first_lane.try_enqueue(node_to_owned_ref(node)).unwrap();
+    drop(first_lane);
+    let active_message = first_rx.recv().await.unwrap();
+
+    let (second_lane, _second_rx) = test_lane();
+    client.chat_lanes.insert(second, second_lane).await;
+
+    let first_again = client
+        .chat_lanes
+        .get(&first)
+        .await
+        .expect("an active lane must remain cached");
+    assert!(first_again.queue_tx.same_channel(&first_tx_probe));
+
+    let next_node = NodeBuilder::new("message")
+        .attr("from", first.clone())
+        .attr("id", "ACTIVE-LANE-2")
+        .build();
+    first_again
+        .try_enqueue(node_to_owned_ref(next_node))
+        .unwrap();
+    drop(first_again);
+    drop(active_message);
+    let next_active_message = first_rx.recv().await.unwrap();
+
+    let third: Jid = "120363000000000023@g.us".parse().unwrap();
+    let (third_lane, _third_rx) = test_lane();
+    client.chat_lanes.insert(third, third_lane).await;
+    assert!(
+        client.chat_lanes.get(&first).await.is_some(),
+        "the next queued message must keep using the original worker"
+    );
+
+    drop(next_active_message);
+    let fourth: Jid = "120363000000000024@g.us".parse().unwrap();
+    let (fourth_lane, _fourth_rx) = test_lane();
+    client.chat_lanes.insert(fourth, fourth_lane).await;
+    assert!(
+        client.chat_lanes.get(&first).await.is_none(),
+        "an idle lane must become evictable again"
+    );
+}
+
 /// Proves that `is_connected()` no longer gives false negatives under mutex
 /// contention. Before the fix, `try_lock()` would fail when another task held
 /// the noise_socket mutex, causing `is_connected()` to return `false` even

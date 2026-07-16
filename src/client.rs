@@ -177,7 +177,24 @@ type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
 #[derive(Clone)]
 pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<async_lock::Mutex<()>>,
-    pub queue_tx: async_channel::Sender<Arc<wacore_binary::OwnedNodeRef>>,
+    pub queue_tx: async_channel::Sender<QueuedChatMessage>,
+}
+
+impl ChatLane {
+    pub(crate) fn try_enqueue(
+        &self,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+    ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        self.queue_tx.try_send(QueuedChatMessage {
+            node,
+            lane_guard: Arc::clone(&self.enqueue_lock),
+        })
+    }
+}
+
+pub(crate) struct QueuedChatMessage {
+    pub node: Arc<wacore_binary::OwnedNodeRef>,
+    pub lane_guard: Arc<async_lock::Mutex<()>>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
