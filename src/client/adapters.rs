@@ -73,8 +73,8 @@ impl Client {
     ///
     /// The live receive path schedules a coalesced flush (see `signal_flush.rs`)
     /// instead of writing through, and lease-covered sends do the same. Only a
-    /// send that raises its counter lease — or advances a group sender-key
-    /// chain, which has no lease — flushes synchronously. On success the
+    /// send that raises a session or sender-key counter lease flushes
+    /// synchronously. On success, the
     /// backend normally trails the cache by about the coalescing window, but
     /// that is not a hard wall-clock bound — the timer can slip under runtime
     /// starvation and the flush can wait on locks or slow/failing storage (a
@@ -164,7 +164,7 @@ impl Client {
 
     /// Pre-wire durability gate for the send path. Flushes synchronously only
     /// when an outbound crypto advance actually demands it — a raised session
-    /// counter lease or a sender-key chain advance not yet persisted (see
+    /// counter lease or a raised sender-key lease not yet persisted (see
     /// `SignalStoreCache::needs_pre_wire_flush`). Otherwise the dirty state is
     /// covered by an existing durable lease, so it only needs to land
     /// eventually: it rides the same coalesced write-behind as the receive

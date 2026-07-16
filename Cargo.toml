@@ -219,6 +219,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
+wacore = { workspace = true, features = ["test-util"] }
 wacore-noise = { path = "./wacore/noise", features = [
     "test-util",
     "danger-skip-cert-chain-verify",

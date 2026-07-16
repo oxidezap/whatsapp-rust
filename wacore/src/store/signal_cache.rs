@@ -297,9 +297,10 @@ struct SenderKeyStoreState {
     // `VecDeque<SenderKeyState>` with up to `MAX_MESSAGE_KEYS` message keys each.
     cache: HashMap<Arc<str>, Option<Arc<SenderKeyRecord>>>,
     dirty: HashSet<Arc<str>>,
-    /// Chains advanced by an outbound encrypt and not yet persisted; the send
-    /// path must flush before the wire while any entry is here. Decrypt-side
-    /// dirtiness deliberately does NOT enter this set (it re-derives forward),
+    /// Chains whose outbound iteration lease was raised but not yet persisted;
+    /// the send path must flush before the wire while any entry is here.
+    /// Decrypt-side dirtiness deliberately does NOT enter this set (it
+    /// re-derives forward),
     /// so unrelated group receives never force a sync flush onto a DM send.
     wire_gate_pending: HashSet<Arc<str>>,
 }
@@ -1179,9 +1180,9 @@ impl SignalStoreCache {
     }
 
     /// Whether an outbound ciphertext produced since the last flush is still
-    /// gated on durability: a session counter lease was raised, or a
-    /// sender-key chain advanced via encrypt, and neither has reached the
-    /// backend. The send path flushes synchronously only while this holds;
+    /// gated on durability because a session or sender-key counter lease was
+    /// raised and has not reached the backend. The send path flushes
+    /// synchronously only while this holds;
     /// everything else (decrypt advances, identities) safely rides the
     /// coalesced write-behind.
     pub async fn needs_pre_wire_flush(&self) -> bool {
