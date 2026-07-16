@@ -50,6 +50,8 @@ const SMPL_LSF_RDW_ADJ: f32 = 1.1952286;
 #[derive(Default)]
 pub(crate) struct SmplEncoderState {
     hist: Vec<f64>,
+    /// Reused because VAD runs for every packet on the realtime encode path.
+    vad_pcm: Vec<i16>,
     /// Input high-pass (ARMA2, fcorner 35 Hz) coefficients + carried state, matching the real encoder.
     hp_coefs: Option<([f32; 3], [f32; 3])>,
     hp_state: [f32; 4],
@@ -180,14 +182,16 @@ pub(crate) fn smpl_analyze_frame_st(
 
     // SILK VAD on the int16 input PCM (runs on the raw API samples, before the encoder HP). Produces
     // the per-internal-frame speech-activity probability + the packet coded_as_active_voice.
-    let pcm_i16: Vec<i16> = pcm[..need]
-        .iter()
-        .map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
-        .collect();
+    es.vad_pcm.clear();
+    es.vad_pcm.extend(
+        pcm[..need]
+            .iter()
+            .map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16),
+    );
     let vad = es
         .vad
         .get_or_insert_with(super::smpl_vad::SmplVadState::new)
-        .process_packet(&pcm_i16, SMPL_INTF_LEN);
+        .process_packet(&es.vad_pcm, SMPL_INTF_LEN);
     let sp_act_prob = vad.vad_results;
     let coded_as_active_voice = vad.coded_as_active_voice;
 
@@ -197,9 +201,8 @@ pub(crate) fn smpl_analyze_frame_st(
     let (hp_ma, hp_ar) = *es
         .hp_coefs
         .get_or_insert_with(|| smpl_get_hp_coefs(SMPL_ENC_HP_FCORNER_HZ));
-    let pcm_in: Vec<f32> = pcm[..need].to_vec();
     let mut hp = vec![0f32; need];
-    smpl_filt_arma2(&pcm_in, need, hp_ma, hp_ar, &mut es.hp_state, &mut hp);
+    smpl_filt_arma2(&pcm[..need], need, hp_ma, hp_ar, &mut es.hp_state, &mut hp);
 
     // int16-scaled input with smplOrder lead samples of history.
     let mut x = vec![0f64; SMPL_ORDER + need];
@@ -256,11 +259,10 @@ pub(crate) fn smpl_analyze_frame_st(
 
     // Snapshot the previous packet's HP tail (pitch history for this packet's intf=0), then refresh it
     // from this packet's tail for the next call.
-    let mut hp_pitch_hist = vec![0f32; SMPL_PITCH_LAG_MAX];
-    if es.hp_pitch_hist.len() == SMPL_PITCH_LAG_MAX {
-        hp_pitch_hist.copy_from_slice(&es.hp_pitch_hist);
+    let mut hp_pitch_hist = std::mem::take(&mut es.hp_pitch_hist);
+    if hp_pitch_hist.len() != SMPL_PITCH_LAG_MAX {
+        hp_pitch_hist.resize(SMPL_PITCH_LAG_MAX, 0.0);
     }
-    es.hp_pitch_hist = hp[need - SMPL_PITCH_LAG_MAX..need].to_vec();
 
     // Lazily size the persistent perceptually-weighted speech buffer (`ltp_buf`).
     if es.ltp_buf.len() != super::smpl_pitch_enc::MAX_LTP_BUF_LEN {
@@ -273,7 +275,7 @@ pub(crate) fn smpl_analyze_frame_st(
     let ltp_buf = &mut es.ltp_buf;
     let pitch_est = &mut es.pitch_est;
 
-    let mut prev_lsfq = es.prev_lsfq.clone();
+    let mut prev_lsfq = std::mem::take(&mut es.prev_lsfq);
     let mut prev_voiced = es.prev_voiced;
 
     let mut internal: [SmplInternalParams; 3] = Default::default();
@@ -345,9 +347,15 @@ pub(crate) fn smpl_analyze_frame_st(
     }
 
     // Carry SMPL_ORDER + SMPL_WINNEXT_WB_LEN history so the next packet's residual lead is filled.
-    es.hist = x[x.len() - (SMPL_ORDER + SMPL_WINNEXT_WB_LEN)..].to_vec();
+    es.hist.clear();
+    es.hist
+        .extend_from_slice(&x[x.len() - (SMPL_ORDER + SMPL_WINNEXT_WB_LEN)..]);
     // Carry the last 144 HP samples as next packet's LPC window history (mirrors `lpc_buf_mem`).
-    es.lpc_hist = hp[need - SMPL_LPC_HIST_LEN..need].to_vec();
+    es.lpc_hist.clear();
+    es.lpc_hist
+        .extend_from_slice(&hp[need - SMPL_LPC_HIST_LEN..need]);
+    hp_pitch_hist.copy_from_slice(&hp[need - SMPL_PITCH_LAG_MAX..need]);
+    es.hp_pitch_hist = hp_pitch_hist;
     es.prev_lsfq = prev_lsfq;
     es.prev_voiced = prev_voiced;
     super::params::SmplFrameParams {
