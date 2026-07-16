@@ -547,7 +547,7 @@ mod udp_relay_e2e {
 
     use wacore::voip::engine::{CallConfig, CallEvent, SequentialTxIds};
     use wacore::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
-    use wacore::voip::{CallChannels, CallEngine};
+    use wacore::voip::{CallChannels, CallEngine, video_control_channel};
     use webrtc_dtls::config::Config as DtlsConfig;
     use webrtc_sctp::association::{Association, Config as SctpConfig};
 
@@ -740,7 +740,7 @@ mod udp_relay_e2e {
                     rekey: None,
                     video_in: async_channel::bounded(1).1,
                     video_out: async_channel::bounded(1).0,
-                    video_ctl: async_channel::bounded(1).1,
+                    video_ctl: video_control_channel().1,
                 },
                 eng,
             ));

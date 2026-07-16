@@ -45,6 +45,110 @@ pub enum VideoControl {
     SetOrientation(u8),
 }
 
+/// State changes stay FIFO so `Disable` performs its purge before a later `Enable`; only the latest
+/// orientation matters while the driver is busy.
+#[derive(Clone)]
+pub struct VideoControlSender {
+    state: async_channel::Sender<VideoControl>,
+    orientation: async_channel::Sender<u8>,
+}
+
+/// Receiving half of [`video_control_channel`].
+pub struct VideoControlReceiver {
+    state: async_channel::Receiver<VideoControl>,
+    orientation: async_channel::Receiver<u8>,
+}
+
+/// Build the control mailbox used by one call driver.
+pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
+    let (state_tx, state_rx) = async_channel::unbounded();
+    let (orientation_tx, orientation_rx) = async_channel::bounded(1);
+    (
+        VideoControlSender {
+            state: state_tx,
+            orientation: orientation_tx,
+        },
+        VideoControlReceiver {
+            state: state_rx,
+            orientation: orientation_rx,
+        },
+    )
+}
+
+impl VideoControlSender {
+    /// Queue a state change, or replace the pending orientation with the newest value.
+    pub fn send(&self, control: VideoControl) -> bool {
+        match control {
+            VideoControl::SetOrientation(orientation) => {
+                self.orientation.force_send(orientation).is_ok()
+            }
+            state => self.state.try_send(state).is_ok(),
+        }
+    }
+}
+
+impl VideoControlReceiver {
+    /// Whether both halves have lost every sender.
+    pub fn is_closed(&self) -> bool {
+        self.state.is_closed() && self.orientation.is_closed()
+    }
+
+    /// Receive a ready state first, otherwise the latest orientation.
+    pub fn try_recv(&self) -> Result<VideoControl, async_channel::TryRecvError> {
+        let state_error = match self.state.try_recv() {
+            Ok(state) => return Ok(state),
+            Err(error) => error,
+        };
+        match self.orientation.try_recv() {
+            Ok(orientation) => Ok(VideoControl::SetOrientation(orientation)),
+            Err(async_channel::TryRecvError::Closed)
+                if state_error == async_channel::TryRecvError::Closed =>
+            {
+                Err(async_channel::TryRecvError::Closed)
+            }
+            Err(_) => Err(async_channel::TryRecvError::Empty),
+        }
+    }
+
+    /// Wait for a state or orientation until every sender is gone.
+    pub async fn recv(&self) -> Result<VideoControl, async_channel::RecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(control) => return Ok(control),
+                Err(async_channel::TryRecvError::Closed) => return self.state.recv().await,
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+
+            match (self.state.is_closed(), self.orientation.is_closed()) {
+                (false, true) => return self.state.recv().await,
+                (true, false) => {
+                    return self
+                        .orientation
+                        .recv()
+                        .await
+                        .map(VideoControl::SetOrientation);
+                }
+                (true, true) => return self.state.recv().await,
+                (false, false) => {
+                    let state = self.state.recv().fuse();
+                    let orientation = self.orientation.recv().fuse();
+                    futures::pin_mut!(state, orientation);
+                    futures::select_biased! {
+                        state = state => match state {
+                            Ok(state) => return Ok(state),
+                            Err(_) => continue,
+                        },
+                        orientation = orientation => match orientation {
+                            Ok(orientation) => return Ok(VideoControl::SetOrientation(orientation)),
+                            Err(_) => continue,
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The audio + video + event channels the driver bridges to the platform. Mic frames in, playout
 /// frames out (dropped on speaker overflow since VoIP is loss tolerant), and engine events out
 /// (RelayAllocated, ForeignAudio) for the shell to act on (e.g. decode a non-MLow frame with a
@@ -61,8 +165,8 @@ pub struct CallChannels {
     pub video_in: async_channel::Receiver<Vec<u8>>,
     /// Inbound video: reassembled peer access units (dropped on sink overflow, like the speaker).
     pub video_out: async_channel::Sender<VideoFrame>,
-    /// Mid-call video-plane control (upgrade/downgrade/orientation).
-    pub video_ctl: async_channel::Receiver<VideoControl>,
+    /// Mid-call video-plane control (lossless state, coalesced orientation).
+    pub video_ctl: VideoControlReceiver,
 }
 
 /// Bound slow relay writes without truncating a complete video access unit.
@@ -540,8 +644,8 @@ async fn run_call_with_clock_and_wallclock(
                     break 'drive; // malformed stored call_key (a setup invariant violated)
                 }
             },
-            // Video-plane control before the media arms, so an Enable lands before queued AUs and
-            // a Disable stops decoding queued inbound PT-97 right away.
+            // State control before orientation and media, so a Disable always purges before a later
+            // Enable can admit frames from the replacement source.
             ctl = video_ctl_fut => {
                 match ctl {
                     Ok(VideoControl::SetTimestampStride(ts_stride)) => {
@@ -703,6 +807,21 @@ mod tests {
         async fn disconnect(&self) {}
     }
 
+    #[test]
+    fn video_control_channel_preserves_state_and_coalesces_orientation() {
+        let (tx, rx) = video_control_channel();
+        assert!(tx.send(VideoControl::Disable));
+        for orientation in 0..100u8 {
+            assert!(tx.send(VideoControl::SetOrientation(orientation % 4)));
+        }
+        assert!(tx.send(VideoControl::Enable));
+
+        assert_eq!(rx.try_recv(), Ok(VideoControl::Disable));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
     /// CallChannels with idle video plumbing (senders/receivers dropped immediately), for the
     /// audio-only driver tests: the closed-channel guards must keep those arms inert.
     fn test_channels(
@@ -712,7 +831,7 @@ mod tests {
     ) -> CallChannels {
         let (_vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
         let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
-        let (_vctl_tx, vctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (_vctl_tx, vctl_rx) = video_control_channel();
         CallChannels {
             mic,
             speaker,
@@ -1374,14 +1493,12 @@ mod tests {
         let (ev_tx, _ev_rx) = async_channel::unbounded();
         let (vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
         let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
-        let (vctl_tx, vctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (vctl_tx, vctl_rx) = video_control_channel();
 
         // Control drains first (bias), so cadence, Enable, and orientation land before any AU.
-        vctl_tx
-            .try_send(VideoControl::SetTimestampStride(4500))
-            .unwrap();
-        vctl_tx.try_send(VideoControl::Enable).unwrap();
-        vctl_tx.try_send(VideoControl::SetOrientation(1)).unwrap();
+        assert!(vctl_tx.send(VideoControl::SetTimestampStride(4500)));
+        assert!(vctl_tx.send(VideoControl::Enable));
+        assert!(vctl_tx.send(VideoControl::SetOrientation(1)));
         let our_au = make_au(3000);
         vin_tx.try_send(our_au.clone()).unwrap();
         vin_tx.try_send(our_au).unwrap();

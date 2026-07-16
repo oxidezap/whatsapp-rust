@@ -252,17 +252,6 @@ impl StanzaHandler for CallHandler {
                             }
                             transition_current &= registry.is_current(call_id, generation);
                             if transition_current {
-                                let event_delivered = event_permit.as_ref().is_some_and(|permit| {
-                                    permit.send(CallEvent::VideoStateChanged {
-                                        state: *state,
-                                        orientation: *orientation,
-                                    })
-                                });
-                                if !event_delivered {
-                                    warn!(
-                                        "call: video state event receiver closed after typed ack"
-                                    );
-                                }
                                 if let Some(o) = orientation {
                                     registry.send_video_ctl(
                                         call_id,
@@ -288,6 +277,17 @@ impl StanzaHandler for CallHandler {
                                         registry.set_is_video(call_id, generation, false);
                                     }
                                     _ => {}
+                                }
+                                let event_delivered = event_permit.as_ref().is_some_and(|permit| {
+                                    permit.send(CallEvent::VideoStateChanged {
+                                        state: *state,
+                                        orientation: *orientation,
+                                    })
+                                });
+                                if !event_delivered {
+                                    warn!(
+                                        "call: video state event receiver closed after typed ack"
+                                    );
                                 }
                             }
                             dispatch_call = transition_current;
@@ -399,6 +399,8 @@ mod tests {
     use crate::test_utils::node_to_owned_ref;
     use std::sync::Arc;
     use wacore::types::events::{ChannelEventHandler, Event};
+    #[cfg(feature = "voip")]
+    use wacore::voip::video_control_channel;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
 
@@ -532,7 +534,7 @@ mod tests {
     #[cfg(feature = "voip")]
     #[tokio::test]
     async fn video_state_sends_typed_ack_and_cancels_generic() {
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
@@ -542,7 +544,7 @@ mod tests {
             fake_caller_lid(),
         ));
         let (event_tx, _event_rx) = async_channel::unbounded::<CallEvent>();
-        let (control_tx, _control_rx) = async_channel::unbounded::<VideoControl>();
+        let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
             generation,
@@ -573,7 +575,7 @@ mod tests {
     #[cfg(feature = "voip")]
     #[tokio::test]
     async fn video_state_is_not_visible_before_typed_ack_completes() {
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let registry = client.call_registry();
@@ -583,7 +585,7 @@ mod tests {
             fake_caller_lid(),
         ));
         let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
-        let (control_tx, _control_rx) = async_channel::unbounded::<VideoControl>();
+        let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
             generation,
@@ -623,7 +625,7 @@ mod tests {
     #[cfg(feature = "voip")]
     #[tokio::test]
     async fn video_transition_stays_serialized_through_enabled_announcement() {
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let registry = client.call_registry();
@@ -633,7 +635,7 @@ mod tests {
             fake_caller_lid(),
         ));
         let (event_tx, _event_rx) = async_channel::bounded::<CallEvent>(1);
-        let (control_tx, _control_rx) = async_channel::unbounded::<VideoControl>();
+        let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
             generation,
@@ -686,14 +688,14 @@ mod tests {
         ));
         assert!(registry.set_is_video("CALL-ID-0001", generation, true));
         let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
-        let (control_tx, control_rx) = async_channel::unbounded::<VideoControl>();
+        let (control_tx, control_rx) = video_control_channel();
         let teardown_control = control_tx.clone();
         let teardowns = Arc::new(AtomicUsize::new(0));
         registry.set_video_channels("CALL-ID-0001", generation, event_tx, control_tx, {
             let teardowns = teardowns.clone();
             Box::new(move || {
                 teardowns.fetch_add(1, Ordering::SeqCst);
-                let _ = teardown_control.force_send(VideoControl::Disable);
+                let _ = teardown_control.send(VideoControl::Disable);
             })
         });
 
@@ -719,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn video_state_does_not_mutate_a_same_id_replacement_after_ack_await() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
@@ -731,7 +733,7 @@ mod tests {
             fake_caller_lid(),
         ));
         let (stale_event_tx, stale_event_rx) = async_channel::unbounded::<CallEvent>();
-        let (stale_control_tx, _stale_control_rx) = async_channel::unbounded::<VideoControl>();
+        let (stale_control_tx, _stale_control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
             stale_generation,
@@ -758,8 +760,7 @@ mod tests {
             ));
             let (replacement_event_tx, _replacement_event_rx) =
                 async_channel::unbounded::<CallEvent>();
-            let (replacement_control_tx, replacement_control_rx) =
-                async_channel::unbounded::<VideoControl>();
+            let (replacement_control_tx, replacement_control_rx) = video_control_channel();
             registry.set_video_channels(
                 "CALL-ID-0001",
                 replacement,
@@ -824,7 +825,7 @@ mod tests {
         );
         let generation = registry.insert(session);
         let (ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
-        let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (ctl_tx, ctl_rx) = video_control_channel();
         registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
         let enabled_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
 
@@ -892,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn refused_upgrade_runs_local_video_teardown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         for state in ["5", "8"] {
             // 5 = UpgradeReject, 8 = UpgradeCancel.
@@ -907,7 +908,7 @@ mod tests {
             registry.set_is_video("CALL-ID-0001", generation, true);
             let torn = Arc::new(AtomicUsize::new(0));
             let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-            let (ctl_tx, _ctl_rx) = async_channel::unbounded::<VideoControl>();
+            let (ctl_tx, _ctl_rx) = video_control_channel();
             registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, {
                 let torn = torn.clone();
                 Box::new(move || {
@@ -934,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn refused_upgrade_tears_down_when_typed_ack_send_fails() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         let client = make_client().await;
         let registry = client.call_registry();
@@ -947,7 +948,7 @@ mod tests {
         registry.set_is_video("CALL-ID-0001", generation, true);
         let torn = Arc::new(AtomicUsize::new(0));
         let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-        let (ctl_tx, _ctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (ctl_tx, _ctl_rx) = video_control_channel();
         registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, {
             let torn = torn.clone();
             Box::new(move || {
@@ -973,7 +974,7 @@ mod tests {
     #[cfg(feature = "voip")]
     #[tokio::test]
     async fn unacked_video_state_is_not_dispatched_globally() {
-        use wacore::voip::{CallEvent, VideoControl};
+        use wacore::voip::CallEvent;
 
         let client = make_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
@@ -985,7 +986,7 @@ mod tests {
             fake_caller_lid(),
         ));
         let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-        let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (ctl_tx, ctl_rx) = video_control_channel();
         registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
 
         let mut cancelled = false;
@@ -1020,7 +1021,7 @@ mod tests {
         ));
         let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(1);
         ev_tx.try_send(CallEvent::RelayAllocated).expect("prefill");
-        let (ctl_tx, ctl_rx) = async_channel::unbounded::<VideoControl>();
+        let (ctl_tx, ctl_rx) = video_control_channel();
         registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
 
         let mut cancelled = false;

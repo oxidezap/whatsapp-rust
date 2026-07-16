@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
-use crate::voip::driver::VideoControl;
+use crate::voip::driver::{VideoControl, VideoControlSender};
 use crate::voip::engine::CallEvent;
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
@@ -47,7 +47,7 @@ struct CallEntry {
     /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
     event_tx: Option<async_channel::Sender<CallEvent>>,
     /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
-    video_ctl_tx: Option<async_channel::Sender<VideoControl>>,
+    video_ctl_tx: Option<VideoControlSender>,
     /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
     /// same teardown without keeping codec resources alive through lingering handles.
     video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
@@ -213,7 +213,7 @@ impl CallRegistry {
         call_id: &str,
         generation: u64,
         event_tx: async_channel::Sender<CallEvent>,
-        video_ctl_tx: async_channel::Sender<VideoControl>,
+        video_ctl_tx: VideoControlSender,
         video_teardown: Box<dyn Fn() + Send + Sync>,
     ) {
         if let Some(entry) = self
@@ -290,7 +290,7 @@ impl CallRegistry {
         })
     }
 
-    /// Send a mid-call video-plane command to the current drive loop (best-effort).
+    /// Send a mid-call video-plane command to the current drive loop.
     pub fn send_video_ctl(&self, call_id: &str, generation: u64, ctl: VideoControl) {
         let tx = self
             .inner
@@ -300,15 +300,7 @@ impl CallRegistry {
             .filter(|entry| entry.generation == generation)
             .and_then(|e| e.video_ctl_tx.clone());
         if let Some(tx) = tx {
-            match ctl {
-                // Orientation is advisory and must not evict a negotiated state transition.
-                VideoControl::SetOrientation(_) => {
-                    let _ = tx.try_send(ctl);
-                }
-                _ => {
-                    let _ = tx.force_send(ctl);
-                }
-            }
+            let _ = tx.send(ctl);
         }
     }
 
@@ -505,6 +497,7 @@ impl CallRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voip::driver::video_control_channel;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wacore_binary::{Jid, Server};
@@ -550,7 +543,7 @@ mod tests {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("CID"));
         let (event_tx, event_rx) = async_channel::bounded(1);
-        let (ctl_tx, _ctl_rx) = async_channel::unbounded();
+        let (ctl_tx, _ctl_rx) = video_control_channel();
         reg.set_video_channels("CID", generation, event_tx.clone(), ctl_tx, Box::new(|| {}));
 
         let event = || CallEvent::VideoStateChanged {
@@ -588,7 +581,7 @@ mod tests {
         let reg = Arc::new(CallRegistry::new());
         let generation = reg.insert(session("CID"));
         let (event_tx, _event_rx) = async_channel::bounded(1);
-        let (ctl_tx, _ctl_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
         let lock_was_free = Arc::new(AtomicBool::new(false));
         reg.set_video_channels("CID", generation, event_tx, ctl_tx, {
             let reg = reg.clone();
@@ -608,7 +601,7 @@ mod tests {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("CID"));
         let (event_tx, _event_rx) = async_channel::bounded(1);
-        let (ctl_tx, _ctl_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
         let calls = Arc::new(AtomicU64::new(0));
         let hook = |calls: &Arc<AtomicU64>| {
             let calls = calls.clone();
@@ -635,7 +628,7 @@ mod tests {
         let stale = reg.insert(session("CID"));
         let current = reg.insert(session("CID"));
         let (event_tx, _event_rx) = async_channel::bounded(1);
-        let (ctl_tx, ctl_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
         let teardown_calls = Arc::new(AtomicU64::new(0));
         reg.set_video_channels("CID", current, event_tx, ctl_tx, {
             let teardown_calls = teardown_calls.clone();
@@ -651,12 +644,17 @@ mod tests {
         assert_eq!(teardown_calls.load(Ordering::SeqCst), 0);
 
         reg.send_video_ctl("CID", current, VideoControl::Disable);
-        reg.send_video_ctl("CID", current, VideoControl::SetOrientation(1));
-        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
-
-        reg.send_video_ctl("CID", current, VideoControl::SetOrientation(2));
+        for orientation in 0..100u8 {
+            reg.send_video_ctl(
+                "CID",
+                current,
+                VideoControl::SetOrientation(orientation % 4),
+            );
+        }
         reg.send_video_ctl("CID", current, VideoControl::Enable);
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
 
         reg.send_video_ctl("CID", stale, VideoControl::Disable);
         assert!(ctl_rx.try_recv().is_err());
@@ -667,7 +665,7 @@ mod tests {
         let reg = Arc::new(CallRegistry::new());
         let generation = reg.insert(session("CID"));
         let (event_tx, _event_rx) = async_channel::bounded(1);
-        let (ctl_tx, _ctl_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
         let calls = Arc::new(AtomicU64::new(0));
         reg.set_video_channels("CID", generation, event_tx, ctl_tx, {
             let reg = reg.clone();

@@ -18,7 +18,10 @@ use wacore::stanza::call::{
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
-use wacore::voip::{CallChannels, CallConfig, CallEngine, CallEvent, VideoControl, VideoFrame};
+use wacore::voip::{
+    CallChannels, CallConfig, CallEngine, CallEvent, VideoControl, VideoControlReceiver,
+    VideoControlSender, VideoFrame, video_control_channel,
+};
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
@@ -1191,9 +1194,6 @@ async fn attach_engine(
 const VIDEO_IN_CHANNEL_CAP: usize = 4;
 /// Inbound video AU backlog between the drive loop and the sink forwarder.
 const VIDEO_OUT_CHANNEL_CAP: usize = 8;
-/// Keeps hostile signaling bursts bounded while retaining the newest control intent.
-const VIDEO_CONTROL_CHANNEL_CAP: usize = 16;
-
 /// `dec` we advertise on an upgrade request (what we can decode).
 const VIDEO_DEC_REQUEST: &str = "H264";
 /// `dec` WA Web advertises on an UpgradeAccept.
@@ -1204,7 +1204,7 @@ const VIDEO_DEC_ACCEPT: &str = "H264,AV1";
 /// and a mid-call upgrade must not have to rebuild the media task.
 pub(crate) struct VideoShared {
     /// Mid-call video-plane control into the drive loop (Enable/Disable/SetOrientation).
-    ctl_tx: async_channel::Sender<VideoControl>,
+    ctl_tx: VideoControlSender,
     /// Outbound AUs into the drive loop; a `VideoFeed` pumps the attached source into it.
     in_tx: async_channel::Sender<Vec<u8>>,
     /// The CURRENTLY attached sink (swappable: upgrade attaches, downgrade clears). The
@@ -1217,14 +1217,11 @@ pub(crate) struct VideoShared {
 }
 
 /// The drive-loop halves of the video channels: (outbound AUs, plane control).
-type VideoReceivers = (
-    async_channel::Receiver<Vec<u8>>,
-    async_channel::Receiver<VideoControl>,
-);
+type VideoReceivers = (async_channel::Receiver<Vec<u8>>, VideoControlReceiver);
 
 impl VideoShared {
     fn new() -> Self {
-        let (ctl_tx, ctl_rx) = async_channel::bounded::<VideoControl>(VIDEO_CONTROL_CHANNEL_CAP);
+        let (ctl_tx, ctl_rx) = video_control_channel();
         let (in_tx, in_rx) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
         Self {
             ctl_tx,
@@ -1242,19 +1239,14 @@ impl VideoShared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .unwrap_or_else(|| (async_channel::bounded(1).1, async_channel::bounded(1).1))
+            .unwrap_or_else(|| {
+                let (_ctl_tx, ctl_rx) = video_control_channel();
+                (async_channel::bounded(1).1, ctl_rx)
+            })
     }
 
     fn send_control(&self, control: VideoControl) {
-        match control {
-            // Orientation must not evict a negotiated state transition under signaling bursts.
-            VideoControl::SetOrientation(_) => {
-                let _ = self.ctl_tx.try_send(control);
-            }
-            _ => {
-                let _ = self.ctl_tx.force_send(control);
-            }
-        }
+        let _ = self.ctl_tx.send(control);
     }
 
     /// Attach (or replace) the consumer's endpoints: the sink becomes the forwarder's target and a
@@ -1623,6 +1615,10 @@ impl CallHandle {
                 }
                 if let Err(e) = send_state(VideoState::Enabled, None).await {
                     // The peer times out an incomplete handshake; keep local media aligned with it.
+                    warn!(
+                        "voip: video upgrade handshake failed call_id={} phase=enabled_after_accept error={e}",
+                        self.call_id
+                    );
                     self.teardown_local_video();
                     return Err(e.into());
                 }
@@ -3815,23 +3811,18 @@ mod tests {
     }
 
     #[test]
-    fn video_control_queue_is_bounded_and_prioritizes_state() {
+    fn video_control_queue_preserves_state_and_coalesces_orientation() {
         let shared = VideoShared::new();
         let (_in_rx, ctl_rx) = shared.take_receivers();
         shared.send_control(VideoControl::Disable);
         for orientation in 0..100u8 {
             shared.send_control(VideoControl::SetOrientation(orientation % 4));
         }
-        assert_eq!(ctl_rx.len(), VIDEO_CONTROL_CHANNEL_CAP);
-        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
-
-        while ctl_rx.try_recv().is_ok() {}
-        for orientation in 0..VIDEO_CONTROL_CHANNEL_CAP as u8 {
-            shared.send_control(VideoControl::SetOrientation(orientation % 4));
-        }
         shared.send_control(VideoControl::Enable);
-        let controls: Vec<_> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
-        assert_eq!(controls.len(), VIDEO_CONTROL_CHANNEL_CAP);
-        assert_eq!(controls.last(), Some(&VideoControl::Enable));
+
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+        assert_eq!(ctl_rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 }

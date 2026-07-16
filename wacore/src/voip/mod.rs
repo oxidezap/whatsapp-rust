@@ -31,7 +31,10 @@ pub mod warp;
 // The sub-modules stay `pub` for fine-grained wire helpers (parsers, attr builders), but
 // these are the ones worth surfacing by name.
 pub use demux::{RelayPacketKind, classify_relay_packet};
-pub use driver::{CallChannels, VideoControl, run_call};
+pub use driver::{
+    CallChannels, VideoControl, VideoControlReceiver, VideoControlSender, run_call,
+    video_control_channel,
+};
 pub use engine::{
     CallConfig, CallEngine, CallEvent, EngineError, Input, Millis, NEVER, Output, SetupError,
     TxIdSource,
