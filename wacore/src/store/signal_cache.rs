@@ -1300,7 +1300,9 @@ impl SignalStoreCache {
             && sessions.reservation_pending.is_empty()
         {
             sessions.clear_clean_entries();
-            self.removed_prekeys.lock().await.clear();
+            if sessions.cache.is_empty() {
+                self.removed_prekeys.lock().await.clear();
+            }
         }
         drop(sessions);
 
@@ -2820,6 +2822,7 @@ mod lease_reload_tests {
         cache.flush(&backend).await.expect("flush");
 
         let (record, checkout) = cache.checkout_session(&active, &backend).await.unwrap();
+        cache.remove_prekey(7, active.as_str()).await;
         cache.clear_after_flush().await;
 
         {
@@ -2830,6 +2833,7 @@ mod lease_reload_tests {
             ));
             assert!(!state.cache.contains_key(idle.as_str()));
         }
+        assert!(cache.removed_prekeys.lock().await.contains_key(&7));
         assert!(matches!(
             cache.restore_session_from_checkout(
                 &active,
