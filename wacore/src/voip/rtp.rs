@@ -3,10 +3,13 @@
 
 use crate::voip::warp::audio_piggyback_extension_for;
 
-/// Standard Opus payload type in the current native media profile.
+/// RFC 7587 Opus payload type used when the 48 kHz RTP-clock setting is enabled.
 pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 111;
-/// MLOW payload type in captured native and Web media.
-pub const RTP_PAYLOAD_TYPE_MLOW: u8 = 120;
+/// Default WhatsApp audio payload type; the negotiated codec decides whether its bytes are MLOW or
+/// native Opus.
+pub const RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO: u8 = 120;
+/// MLOW name for the shared default WhatsApp audio payload type.
+pub const RTP_PAYLOAD_TYPE_MLOW: u8 = RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO;
 /// MLOW SplitRed redundancy payload type (`mlow-red-1`).
 pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
 /// H.264 video payload type used by captured Android video RTP.
@@ -90,7 +93,8 @@ pub fn is_whatsapp_opus_rtp_payload(payload_type: u8) -> bool {
 pub fn is_opus_dtx_payload(payload: &[u8]) -> bool {
     match payload.len() {
         0 => false,
-        1 => matches!(payload[0], 0x10 | 0x88 | 0x90),
+        // libopus defines packets up to two bytes as DTX. This also covers MLOW's one-byte SID.
+        1..=2 => true,
         n if n <= 15 => {
             let b0 = payload[0];
             if (b0 & 0xf8) == 0x08 || b0 == 0x0a {
@@ -323,6 +327,7 @@ pub struct RtpStream {
     last_sent_timestamp: Option<u32>,
     samples_per_packet: u32,
     speech_started: bool,
+    speech_start_markers: bool,
     audio_packet_index: usize,
     warp_piggyback: bool,
     payload_type: u8,
@@ -337,6 +342,7 @@ impl RtpStream {
             last_sent_timestamp: None,
             samples_per_packet,
             speech_started: false,
+            speech_start_markers: true,
             audio_packet_index: 0,
             warp_piggyback,
             payload_type: RTP_PAYLOAD_TYPE_MLOW,
@@ -349,6 +355,10 @@ impl RtpStream {
         }
         self.payload_type = payload_type;
         true
+    }
+
+    pub fn set_speech_start_markers(&mut self, enabled: bool) {
+        self.speech_start_markers = enabled;
     }
 
     /// The current send timestamp (last emitted), for an RTCP Sender Report.
@@ -372,8 +382,10 @@ impl RtpStream {
         let dtx = is_opus_dtx_payload(payload);
         let priming = is_opus_priming_payload(payload);
         let speech = !dtx && !priming;
-        let use_marker = marker || (speech && !self.speech_started);
-        if speech {
+        let use_marker = marker || (self.speech_start_markers && speech && !self.speech_started);
+        if dtx {
+            self.speech_started = false;
+        } else if speech {
             self.speech_started = true;
         }
         let header = RtpHeader {
@@ -556,6 +568,7 @@ mod tests {
     fn classifiers() {
         assert!(is_opus_dtx_payload(&[0x10]));
         assert!(is_opus_dtx_payload(&[0x90]));
+        assert!(is_opus_dtx_payload(&[0xBB, 0x03]));
         assert!(!is_opus_dtx_payload(&[]));
         assert!(is_opus_priming_payload(&OPUS_PRIMING_FRAME_1));
         assert!(is_opus_priming_payload(&OPUS_PRIMING_FRAME_2));
@@ -788,5 +801,20 @@ mod tests {
         // Subsequent speech has no marker.
         let sp2 = s.next_packet(&[0x48; 40], false);
         assert!(!sp2.marker);
+
+        let d2 = s.next_packet(&[0x90], false);
+        assert!(!d2.marker);
+        let resumed = s.next_packet(&[0x48; 40], false);
+        assert!(resumed.marker, "speech after DTX must re-arm the marker");
+    }
+
+    #[test]
+    fn native_opus_can_disable_mlow_speech_markers() {
+        let mut stream = RtpStream::new(0xabcd, 960, false);
+        stream.set_speech_start_markers(false);
+
+        assert!(!stream.next_packet(&[0x58; 80], false).marker);
+        let _ = stream.next_packet(&[0x10], false);
+        assert!(!stream.next_packet(&[0x58; 80], false).marker);
     }
 }

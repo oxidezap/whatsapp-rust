@@ -158,7 +158,7 @@ voip = ["voip-mlow", "voip-libopus"]
 voip-encoded = ["voip-runtime"]
 # Explicit spelling for consumers that assemble feature sets instead of using `voip`.
 voip-mlow = ["voip-runtime", "wacore/voip-mlow"]
-# Optional PCM adapter for standard Opus. Encoded Opus I/O does not need libopus.
+# Optional PCM adapter for standard Opus, including MLOW's CELT escape. Encoded I/O needs no libopus.
 voip-libopus = ["voip-encoded", "dep:opus"]
 
 [dependencies]

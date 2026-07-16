@@ -1,11 +1,13 @@
 //! PCM and encoded-audio endpoints for WhatsApp calls.
 
 #[cfg(feature = "voip-libopus")]
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
 #[cfg(feature = "voip-libopus")]
-use opus::{Application, Bitrate, Channels, Decoder, Encoder};
+use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder};
 use wacore::voip::EncodedAudioFrame;
+#[cfg(feature = "voip-libopus")]
+use wacore::voip::{depacketize_opus_from_mlow, packetize_opus_for_mlow};
 
 /// A microphone source for a call: 60 ms / 960-sample mono i16 frames at 16 kHz. The media facade
 /// pulls frames from the returned channel and feeds them to the engine; a closed channel (e.g. the
@@ -42,8 +44,9 @@ impl AudioSink for async_channel::Sender<Vec<i16>> {
     }
 }
 
-/// A source of complete codec payloads. Each item must be one raw MLOW or Opus packet; container
-/// framing such as Ogg pages is not accepted. The engine adds RTP/SRTP framing without transcoding.
+/// A source of complete codec payloads. Each item must be one raw MLOW or profile-compatible Opus
+/// packet; container framing such as Ogg pages is not accepted. The engine adds RTP/SRTP framing
+/// without transcoding.
 pub trait EncodedAudioSource: Send + Sync + 'static {
     fn frames(&self) -> async_channel::Receiver<Bytes>;
 }
@@ -68,17 +71,21 @@ impl EncodedAudioSink for async_channel::Sender<EncodedAudioFrame> {
 pub const WA_SAMPLE_RATE: u32 = 16_000;
 /// 60 ms @ 16 kHz.
 pub const WA_FRAME_SAMPLES: usize = 960;
-/// Max decode frame (60 ms @ 48 kHz headroom).
-pub const WA_DECODE_MAX_SAMPLES: usize = 2880;
+/// Opus permits at most 120 ms in one packet; the decoder emits 16 kHz PCM.
+pub const WA_DECODE_MAX_SAMPLES: usize = 1_920;
 #[cfg(feature = "voip-libopus")]
-const WA_BITRATE: i32 = 25_000;
+const WA_BITRATE: i32 = 24_000;
 #[cfg(feature = "voip-libopus")]
-const WA_COMPLEXITY: i32 = 9;
+const WA_COMPLEXITY: i32 = 5;
+#[cfg(feature = "voip-libopus")]
+const OPUS_MAX_PACKET_BYTES: usize = 1_275;
 
-/// Opus encoder configured to match the WhatsApp call encoder (minus the mlow layers).
+/// Opus encoder with constructors for standard RTP and MLOW's compatible CELT escape.
 #[cfg(feature = "voip-libopus")]
 pub struct WaOpusEncoder {
     enc: Encoder,
+    frame_samples: usize,
+    require_mlow_escape: bool,
 }
 
 #[cfg(feature = "voip-libopus")]
@@ -86,23 +93,57 @@ impl WaOpusEncoder {
     pub fn new() -> Result<Self> {
         let mut enc = Encoder::new(WA_SAMPLE_RATE, Channels::Mono, Application::Voip)
             .map_err(|e| anyhow!("opus encoder init: {e}"))?;
+        Self::finish_init(&mut enc)?;
+        Ok(Self {
+            enc,
+            frame_samples: WA_FRAME_SAMPLES,
+            require_mlow_escape: false,
+        })
+    }
+
+    /// Configure libopus for the standard-Opus escape inside WhatsApp's MLOW RTP profile.
+    pub fn new_mlow_escape() -> Result<Self> {
+        let mut enc = Encoder::new(WA_SAMPLE_RATE, Channels::Mono, Application::LowDelay)
+            .map_err(|e| anyhow!("opus MLOW-escape encoder init: {e}"))?;
+        Self::finish_init(&mut enc)?;
+        enc.set_max_bandwidth(Bandwidth::Wideband)
+            .map_err(|e| anyhow!("opus set_max_bandwidth: {e}"))?;
+        enc.set_bandwidth(Bandwidth::Wideband)
+            .map_err(|e| anyhow!("opus set_bandwidth: {e}"))?;
+        Ok(Self {
+            enc,
+            frame_samples: WA_FRAME_SAMPLES,
+            require_mlow_escape: true,
+        })
+    }
+
+    fn finish_init(enc: &mut Encoder) -> Result<()> {
         enc.set_bitrate(Bitrate::Bits(WA_BITRATE))
             .map_err(|e| anyhow!("opus set_bitrate: {e}"))?;
         enc.set_complexity(WA_COMPLEXITY)
             .map_err(|e| anyhow!("opus set_complexity: {e}"))?;
-        Ok(Self { enc })
+        enc.set_dtx(true)
+            .map_err(|e| anyhow!("opus set_dtx: {e}"))?;
+        Ok(())
     }
 
-    /// Encode one mono frame of `WA_FRAME_SAMPLES` 16-bit samples to Opus.
+    /// Encode one mono frame at the rate selected by the constructor.
     pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>> {
-        debug_assert_eq!(
-            pcm.len(),
-            WA_FRAME_SAMPLES,
-            "WaOpusEncoder expects exactly one {WA_FRAME_SAMPLES}-sample frame"
+        ensure!(
+            pcm.len() == self.frame_samples,
+            "WaOpusEncoder expects exactly {} samples, got {}",
+            self.frame_samples,
+            pcm.len()
         );
-        self.enc
-            .encode_vec(pcm, pcm.len() * 2 + 64)
-            .map_err(|e| anyhow!("opus encode: {e}"))
+        let mut payload = self
+            .enc
+            .encode_vec(pcm, OPUS_MAX_PACKET_BYTES)
+            .map_err(|e| anyhow!("opus encode: {e}"))?;
+        if self.require_mlow_escape {
+            packetize_opus_for_mlow(&mut payload)
+                .map_err(|e| anyhow!("packetize Opus for MLOW: {e}"))?;
+        }
+        Ok(payload)
     }
 }
 
@@ -129,6 +170,14 @@ impl WaOpusDecoder {
             .map_err(|e| anyhow!("opus decode: {e}"))?;
         out.truncate(n);
         Ok(out)
+    }
+
+    /// Restore MLOW's CELT TOC and decode with stock libopus.
+    pub fn decode_mlow_escape(&mut self, opus: &[u8]) -> Result<Vec<i16>> {
+        let mut packet = opus.to_vec();
+        depacketize_opus_from_mlow(&mut packet)
+            .map_err(|e| anyhow!("depacketize Opus from MLOW: {e}"))?;
+        self.decode(&packet)
     }
 }
 
@@ -166,5 +215,43 @@ mod tests {
         let encoded = enc.encode(&silence).unwrap();
         let decoded = dec.decode(&encoded).unwrap();
         assert_eq!(decoded.len(), WA_FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn mlow_escape_encoder_emits_celt_toc_and_60ms_packet() {
+        let mut enc = WaOpusEncoder::new_mlow_escape().unwrap();
+        let mut dec = WaOpusDecoder::new().unwrap();
+        let pcm = sine_frame();
+        let encoded = enc.encode(&pcm).unwrap();
+
+        assert_eq!(encoded[0], 0xDD);
+        assert_eq!(encoded[1] & 0x3F, 3);
+        assert_eq!(
+            dec.decode_mlow_escape(&encoded).unwrap().len(),
+            WA_FRAME_SAMPLES
+        );
+    }
+
+    #[test]
+    fn mlow_escape_encoder_maps_opus_dtx_to_mlow_sid() {
+        let mut enc = WaOpusEncoder::new_mlow_escape().unwrap();
+        let silence = vec![0i16; WA_FRAME_SAMPLES];
+
+        let encoded = (0..20)
+            .map(|_| enc.encode(&silence).unwrap())
+            .find(|packet| packet.as_slice() == [0x90]);
+
+        assert!(
+            encoded.is_some(),
+            "Opus did not enter DTX within 1.2 seconds"
+        );
+    }
+
+    #[test]
+    fn mlow_escape_encoder_maps_initial_silence_to_mlow_sid() {
+        let mut enc = WaOpusEncoder::new_mlow_escape().unwrap();
+        let silence = vec![0i16; WA_FRAME_SAMPLES];
+
+        assert_eq!(enc.encode(&silence).unwrap(), [0x90]);
     }
 }

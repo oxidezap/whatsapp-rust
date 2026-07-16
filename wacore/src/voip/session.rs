@@ -372,6 +372,11 @@ impl MediaPipeline {
         self.rtp.set_payload_type(payload_type)
     }
 
+    /// Native Opus does not use MLOW's marker-driven speech-resume state.
+    pub fn set_audio_speech_start_markers(&mut self, enabled: bool) {
+        self.rtp.set_speech_start_markers(enabled);
+    }
+
     /// An SRTCP-protected Sender Report for the audio stream (our send SSRC), or the accumulated
     /// packet/octet totals since the call began. Emitted periodically by the engine.
     pub(crate) fn audio_sender_report(

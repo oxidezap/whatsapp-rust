@@ -13,15 +13,17 @@ use log::warn;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
-    CAPABILITY_OFFER, CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams,
-    build_offer, build_video_state,
+    CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+    CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams, build_offer,
+    build_video_state,
 };
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
-    AudioConfig, AudioFormat, CallChannels, CallConfig, CallEngine, CallEvent, EncodedAudioFrame,
-    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, video_control_channel,
+    AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallEngine, CallEvent,
+    EncodedAudioFrame, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
+    video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -515,11 +517,13 @@ fn keep_non_pkmsg_devices(devices: Vec<Jid>, would_pkmsg: &[bool]) -> Result<Vec
     Ok(kept)
 }
 
-fn offer_capability(video: bool) -> &'static [u8] {
-    if video {
-        &CAPABILITY_VIDEO_OFFER
-    } else {
-        &CAPABILITY_OFFER
+fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
+    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
+    match (video, standard_opus) {
+        (true, true) => &CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+        (false, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
+        (true, false) => &CAPABILITY_VIDEO_OFFER,
+        (false, false) => &CAPABILITY_OFFER,
     }
 }
 
@@ -676,7 +680,7 @@ async fn place_call(
         call_creator,
         device_keys: &device_keys,
         privacy_token: privacy_token.as_deref(),
-        capability: Some(offer_capability(video.is_some())),
+        capability: Some(offer_capability(video.is_some(), audio.config().format)),
         device_identity: device_identity.as_deref(),
         id: Some(&offer_stanza_id),
         // Keep the addressed `<destination>` shape for a multi-device callee even if encryption
@@ -1869,7 +1873,7 @@ mod tests {
                 is_video: false,
                 audio: vec![wacore::types::call::CallAudioCodec {
                     enc: "opus".into(),
-                    rate: 16_000,
+                    rate: 8_000,
                 }],
                 group_jid: None,
             },
@@ -1886,7 +1890,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CallError::AudioFormatNotOffered(8_000))
+            Err(CallError::AudioFormatNotOffered(16_000))
         ));
     }
 
@@ -2616,7 +2620,7 @@ mod tests {
         assert_eq!(audio.len(), 1);
         assert_eq!(
             audio[0].attrs().optional_string("rate").as_deref(),
-            Some("8000")
+            Some("16000")
         );
         assert_eq!(
             client
@@ -3614,10 +3618,23 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_video_offer_uses_video_capability() {
-        assert_eq!(offer_capability(false), CAPABILITY_OFFER);
-        assert_eq!(offer_capability(true), CAPABILITY_VIDEO_OFFER);
-        assert_ne!(offer_capability(false), offer_capability(true));
+    fn outgoing_offer_capability_matches_audio_profile() {
+        assert_eq!(
+            offer_capability(false, AudioFormat::MLOW_16KHZ_60MS),
+            CAPABILITY_OFFER
+        );
+        assert_eq!(
+            offer_capability(true, AudioFormat::MLOW_16KHZ_60MS),
+            CAPABILITY_VIDEO_OFFER
+        );
+        assert_eq!(
+            offer_capability(false, AudioFormat::OPUS_16KHZ_60MS),
+            CAPABILITY_STANDARD_OPUS_OFFER
+        );
+        assert_eq!(
+            offer_capability(true, AudioFormat::OPUS_16KHZ_60MS),
+            CAPABILITY_STANDARD_OPUS_VIDEO_OFFER
+        );
     }
 
     /// A live handle over a mock relay + a sending client, for the video handshake tests. The

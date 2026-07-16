@@ -540,7 +540,7 @@ mod tests {
 /// by `run_call_tokio` exchanges packets with it. This is the one place CI exercises the native
 /// transport's I/O (the rest of the suite mocks the socket), closing the `connect_relay_media is not
 /// exercised in CI` gap in the module header.
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-mlow"))]
 mod udp_relay_e2e {
     use super::*;
     use std::time::Duration;

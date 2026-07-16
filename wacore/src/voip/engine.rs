@@ -16,7 +16,9 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use super::audio::{AudioCodec, AudioConfig, AudioFormat, AudioIo, EncodedAudioFrame};
+use super::audio::{
+    AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
+};
 use super::demux::{RelayPacketKind, classify_relay_packet};
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 #[cfg(feature = "voip-mlow")]
@@ -75,6 +77,7 @@ const MAX_PRIME_TICKS: u32 = 10;
 /// never gaps; protect_audio frames it with the DTX RTP header and the peer decodes it to silence.
 #[cfg(feature = "voip-mlow")]
 const MLOW_DTX_CNG: [u8; 1] = [0x90];
+
 /// One 60ms MLow frame at 16kHz. `Input::MicFrame` must carry exactly this; a wrong-length buffer is
 /// dropped (the encoder requires it), never sent.
 #[cfg(feature = "voip-mlow")]
@@ -419,6 +422,7 @@ struct MediaState {
     /// The video plane, present while video is enabled (from the start or via upgrade).
     video: Option<VideoPlaneState>,
     audio_rtcp_announced: bool,
+    audio_tx_invalid_logged: bool,
     sframe: Option<SframeSession>,
     #[cfg(feature = "voip-mlow")]
     pcm: Option<PcmAudioState>,
@@ -607,6 +611,10 @@ impl CallEngine {
             if !pipe.set_audio_payload_type(config.audio.format.rtp_payload_type) {
                 return Err(EngineError::BadAudioFormat);
             }
+            pipe.set_audio_speech_start_markers(matches!(
+                config.audio.format.rtp_profile,
+                AudioRtpProfile::Mlow
+            ));
             let sframe = if config.enable_sframe {
                 SframeSession::new(&config.call_key, &config.self_lid, &config.peer_lid)
             } else {
@@ -640,6 +648,7 @@ impl CallEngine {
                 video_ts_stride: VIDEO_TS_STRIDE_15FPS,
                 video,
                 audio_rtcp_announced: false,
+                audio_tx_invalid_logged: false,
                 sframe,
                 #[cfg(feature = "voip-mlow")]
                 pcm: (config.audio.io == AudioIo::Pcm).then(|| PcmAudioState {
@@ -1119,12 +1128,9 @@ impl CallEngine {
             Some(SframeIn::Decrypted(plain)) => plain,
             _ => payload,
         };
+        let codec = m.audio.format.inbound_codec(header.payload_type, &encoded);
         #[cfg(feature = "voip-mlow")]
-        if m.audio.io == AudioIo::Pcm
-            && m.audio.format.codec == AudioCodec::Mlow
-            && header.payload_type != RTP_PAYLOAD_TYPE_MLOW_RED
-            && mlow::is_embedded_opus(&encoded)
-        {
+        if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
             self.outbox
                 .push_back(Output::Event(CallEvent::ForeignAudio(Bytes::from(encoded))));
             return;
@@ -1133,6 +1139,7 @@ impl CallEngine {
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
                     format: m.audio.format,
+                    codec,
                     data: Bytes::from(encoded),
                     payload_type: header.payload_type,
                     sequence_number: header.sequence_number,
@@ -1221,6 +1228,20 @@ impl CallEngine {
         else {
             return;
         };
+        if !m.audio.format.accepts_encoded_payload(payload) {
+            if !m.audio_tx_invalid_logged {
+                log::warn!(
+                    "voip dropping encoded audio incompatible with the negotiated RTP profile call_id={} codec={:?} profile={:?} payload_len={} toc={:?}",
+                    self.call_id,
+                    m.audio.format.codec,
+                    m.audio.format.rtp_profile,
+                    payload.len(),
+                    payload.first().copied(),
+                );
+                m.audio_tx_invalid_logged = true;
+            }
+            return;
+        }
         let packet = m.pipe.protect_audio(payload);
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }
@@ -1376,7 +1397,8 @@ mod encoded_tests {
         let (header, recovered) = peer
             .unprotect_audio(&protected)
             .expect("peer decrypts outbound audio");
-        assert_eq!(header.payload_type, 111);
+        assert_eq!(header.payload_type, 120);
+        assert!(!header.marker);
         assert_eq!(recovered, outbound);
 
         let inbound = [0x08, 0x44, 0x55, 0x66];
@@ -1390,8 +1412,73 @@ mod encoded_tests {
             })
             .expect("encoded output");
         assert_eq!(frame.data.as_ref(), inbound);
-        assert_eq!(frame.payload_type, 111);
+        assert_eq!(frame.payload_type, 120);
+        assert_eq!(frame.codec, AudioCodec::Opus);
         assert_eq!(frame.format, AudioFormat::OPUS_16KHZ_60MS);
+    }
+
+    #[test]
+    fn opus_mlow_escape_uses_pt120_and_rejects_ambiguous_toc() {
+        let mut cfg = config();
+        cfg.audio = AudioConfig::encoded(AudioFormat::OPUS_MLOW_16KHZ_60MS);
+        let mut engine =
+            CallEngine::new(cfg.clone(), Box::new(SequentialTxIds::new())).expect("engine");
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        engine.handle_input(1, Input::EncodedAudio(&[0x08, 1, 2]));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Transmit(_)))
+        );
+
+        let mut peer = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &cfg.call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: cfg.ssrc,
+            samples_per_packet: AudioFormat::OPUS_MLOW_16KHZ_60MS.rtp_timestamp_step,
+            warp_mi_tag_len: cfg.warp_mi_tag_len,
+        })
+        .expect("peer pipeline");
+        assert!(peer.set_audio_payload_type(AudioFormat::OPUS_MLOW_16KHZ_60MS.rtp_payload_type));
+
+        let outbound = [0xDD, 0x03, 0x11, 0x22, 0x33];
+        engine.handle_input(2, Input::EncodedAudio(&outbound));
+        let protected: Vec<_> = drain(&mut engine)
+            .into_iter()
+            .filter_map(|output| match output {
+                Output::Transmit(packet) => Some(packet),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(protected.len(), 1);
+        let (header, payload) = peer
+            .unprotect_audio(&protected[0])
+            .expect("peer decrypts initial outbound audio");
+        assert_eq!(
+            header.payload_type,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS.rtp_payload_type
+        );
+        assert_eq!(payload, outbound);
+        assert_eq!(
+            (header.sequence_number, header.timestamp, header.marker),
+            (1, 0, true)
+        );
+
+        let inbound_mlow = [0x50, 0x44, 0x55, 0x66];
+        let protected = peer.protect_audio(&inbound_mlow);
+        engine.handle_input(3, Input::RelayPacket(&protected));
+        let frame = drain(&mut engine)
+            .into_iter()
+            .find_map(|output| match output {
+                Output::EncodedAudio(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("encoded output");
+        assert_eq!(frame.codec, AudioCodec::Mlow);
+        assert_eq!(frame.data.as_ref(), inbound_mlow);
     }
 }
 

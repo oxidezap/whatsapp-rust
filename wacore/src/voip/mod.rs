@@ -32,7 +32,10 @@ pub mod warp;
 // Curated facade: the headline entry points a consumer reaches for, hoisted to `voip::`.
 // The sub-modules stay `pub` for fine-grained wire helpers (parsers, attr builders), but
 // these are the ones worth surfacing by name.
-pub use audio::{AudioCodec, AudioConfig, AudioFormat, AudioIo, EncodedAudioFrame};
+pub use audio::{
+    AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
+    OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
+};
 pub use demux::{RelayPacketKind, classify_relay_packet};
 pub use driver::{
     CallChannels, VideoControl, VideoControlReceiver, VideoControlSender, run_call,

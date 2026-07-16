@@ -38,18 +38,24 @@ use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use portable_atomic::AtomicU64;
-use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER};
+use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER, CAPABILITY_PREACCEPT};
+#[cfg(feature = "voip-opus")]
+use wacore::stanza::call::{CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_PREACCEPT};
 use wacore::types::call::{CallAction, IncomingCall};
 use wacore::types::events::{Event, EventHandler};
 use wacore::voip::CallEvent;
+#[cfg(all(feature = "voip-opus", feature = "voip-mlow"))]
+use wacore::voip::MlowDecoder;
+#[cfg(all(feature = "voip-opus", feature = "voip-mlow"))]
+use wacore::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use whatsapp_rust::prelude::*;
 #[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
 #[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
 #[cfg(feature = "voip-opus")]
-use whatsapp_rust::voip::{AudioFormat, EncodedAudioFrame};
-use whatsapp_rust::voip::{CallHandle, VideoState};
+use whatsapp_rust::voip::{AudioCodec, EncodedAudioFrame};
+use whatsapp_rust::voip::{AudioFormat, CallHandle, VideoState};
 
 mod video;
 use video::VideoOpts;
@@ -67,7 +73,11 @@ enum AudioMode {
     #[cfg(feature = "voip-mlow")]
     Mlow,
     #[cfg(feature = "voip-opus")]
-    Opus,
+    OpusMlow,
+    #[cfg(feature = "voip-opus")]
+    OpusNative,
+    #[cfg(feature = "voip-opus")]
+    OpusRfc7587,
 }
 
 impl AudioMode {
@@ -81,13 +91,34 @@ impl AudioMode {
             #[cfg(feature = "voip-mlow")]
             None | Some("mlow") => Ok(Self::Mlow),
             #[cfg(all(not(feature = "voip-mlow"), feature = "voip-opus"))]
-            None => Ok(Self::Opus),
+            None => Self::opus_from_env(),
             #[cfg(feature = "voip-opus")]
-            Some("opus") => Ok(Self::Opus),
+            Some("opus") => Self::opus_from_env(),
+            #[cfg(feature = "voip-opus")]
+            Some("opus-pt111") => Ok(Self::OpusRfc7587),
             Some(other) => bail!(
                 "WA_AUDIO_CODEC={other:?} is unavailable in this build; compile the matching \
                  voip-mlow/voip-opus feature"
             ),
+        }
+    }
+
+    #[cfg(feature = "voip-opus")]
+    fn opus_from_env() -> Result<Self> {
+        match std::env::var("WA_AUDIO_PROFILE")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("native") | Some("standard") | Some("pt120") => Ok(Self::OpusNative),
+            Some("rfc7587") | Some("pt111") => Ok(Self::OpusRfc7587),
+            Some("mlow") | Some("mlow-escape") => Ok(Self::OpusMlow),
+            Some(other) => {
+                bail!(
+                    "unknown WA_AUDIO_PROFILE={other:?}; expected native (default), rfc7587, or mlow"
+                )
+            }
         }
     }
 
@@ -96,25 +127,71 @@ impl AudioMode {
             #[cfg(feature = "voip-mlow")]
             Self::Mlow => "mlow",
             #[cfg(feature = "voip-opus")]
-            Self::Opus => "opus",
+            Self::OpusMlow => "opus/mlow-escape",
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative => "opus-native/pt120",
+            #[cfg(feature = "voip-opus")]
+            Self::OpusRfc7587 => "opus-rfc7587/pt111",
+        }
+    }
+
+    fn format(self) -> AudioFormat {
+        match self {
+            #[cfg(feature = "voip-mlow")]
+            Self::Mlow => AudioFormat::MLOW_16KHZ_60MS,
+            #[cfg(feature = "voip-opus")]
+            Self::OpusMlow => AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative => AudioFormat::OPUS_16KHZ_60MS,
+            #[cfg(feature = "voip-opus")]
+            Self::OpusRfc7587 => AudioFormat::OPUS_RFC7587_16KHZ_60MS,
         }
     }
 
     fn signaling_rate(self) -> u32 {
-        match self {
-            #[cfg(feature = "voip-mlow")]
-            Self::Mlow => 16_000,
-            #[cfg(feature = "voip-opus")]
-            Self::Opus => 8_000,
-        }
+        self.format().signaling_rate
     }
 
     fn signaling_rate_wire(self) -> &'static str {
-        match self {
-            #[cfg(feature = "voip-mlow")]
-            Self::Mlow => "16000",
+        match self.signaling_rate() {
+            16_000 => "16000",
+            8_000 => "8000",
+            _ => unreachable!("built-in audio formats use known signaling rates"),
+        }
+    }
+
+    fn preaccept_capability(self, video: bool) -> &'static [u8] {
+        match (self, video) {
             #[cfg(feature = "voip-opus")]
-            Self::Opus => "8000",
+            (Self::OpusNative | Self::OpusRfc7587, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
+            #[cfg(feature = "voip-opus")]
+            (Self::OpusNative | Self::OpusRfc7587, false) => &CAPABILITY_STANDARD_OPUS_PREACCEPT,
+            (_, true) => &CAPABILITY_OFFER,
+            (_, false) => &CAPABILITY_PREACCEPT,
+        }
+    }
+
+    fn accept_capability(self) -> &'static [u8] {
+        match self {
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative | Self::OpusRfc7587 => &CAPABILITY_STANDARD_OPUS_OFFER,
+            _ => &CAPABILITY_OFFER,
+        }
+    }
+
+    fn uses_standard_opus(self) -> bool {
+        match self {
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative | Self::OpusRfc7587 => true,
+            _ => false,
+        }
+    }
+
+    fn uses_48khz_rtp_clock(self) -> bool {
+        match self {
+            #[cfg(feature = "voip-opus")]
+            Self::OpusRfc7587 => true,
+            _ => false,
         }
     }
 }
@@ -765,20 +842,26 @@ async fn run_loopback() -> Result<()> {
 fn spawn_opus_bridge(
     mic: async_channel::Receiver<Vec<i16>>,
     speaker: async_channel::Sender<Vec<i16>>,
+    audio: AudioMode,
 ) -> Result<(
     async_channel::Receiver<Bytes>,
     async_channel::Sender<EncodedAudioFrame>,
 )> {
-    let mut encoder = WaOpusEncoder::new()?;
+    let mlow_escape = audio == AudioMode::OpusMlow;
+    let mut encoder = if mlow_escape {
+        WaOpusEncoder::new_mlow_escape()?
+    } else {
+        WaOpusEncoder::new()?
+    };
     let mut decoder = WaOpusDecoder::new()?;
     let (encoded_tx, encoded_rx) = async_channel::bounded::<Bytes>(3);
     let (playout_tx, playout_rx) = async_channel::bounded::<EncodedAudioFrame>(3);
 
     tokio::spawn(async move {
         while let Ok(pcm) = mic.recv().await {
-            match encoder.encode(&pcm) {
+            match encoder.encode(&pcm).map(Bytes::from) {
                 Ok(payload) => {
-                    if encoded_tx.send(Bytes::from(payload)).await.is_err() {
+                    if encoded_tx.send(payload).await.is_err() {
                         break;
                     }
                 }
@@ -790,12 +873,44 @@ fn spawn_opus_bridge(
         }
     });
     tokio::spawn(async move {
+        #[cfg(feature = "voip-mlow")]
+        let mut mlow_decoder = MlowDecoder::new();
+        #[cfg(not(feature = "voip-mlow"))]
+        let mut mlow_warning_logged = false;
         while let Ok(frame) = playout_rx.recv().await {
-            match decoder.decode(&frame.data) {
-                Ok(pcm) => {
-                    let _ = speaker.try_send(pcm);
+            match frame.codec {
+                AudioCodec::Opus => match if mlow_escape {
+                    decoder.decode_mlow_escape(&frame.data)
+                } else {
+                    decoder.decode(&frame.data)
+                } {
+                    Ok(pcm) => {
+                        let _ = speaker.try_send(pcm);
+                    }
+                    Err(error) => warn!("Opus decode failed: {error}"),
+                },
+                AudioCodec::Mlow => {
+                    #[cfg(feature = "voip-mlow")]
+                    {
+                        mlow_decoder.set_redundancy(i32::from(
+                            frame.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED,
+                        ));
+                        let pcm = mlow_decoder
+                            .decode(&frame.data)
+                            .into_iter()
+                            .map(|sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                            .collect();
+                        let _ = speaker.try_send(pcm);
+                    }
+                    #[cfg(not(feature = "voip-mlow"))]
+                    if !mlow_warning_logged {
+                        warn!(
+                            "peer selected MLOW inbound audio; this Opus-only binary will keep the call but cannot play it"
+                        );
+                        mlow_warning_logged = true;
+                    }
                 }
-                Err(error) => warn!("Opus decode failed: {error}"),
+                _ => {}
             }
         }
     });
@@ -1029,10 +1144,10 @@ async fn start_media(
         #[cfg(feature = "voip-mlow")]
         AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
         #[cfg(feature = "voip-opus")]
-        AudioMode::Opus => {
-            let (source, sink) = spawn_opus_bridge(mic, speaker)?;
+        AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
+            let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
             voip.accept(call)
-                .encoded_audio(AudioFormat::OPUS_16KHZ_60MS, source, sink)
+                .encoded_audio(audio.format(), source, sink)
         }
     };
     if let Some((source, sink)) = video_endpoints {
@@ -1076,10 +1191,9 @@ async fn place_outgoing_call(
         #[cfg(feature = "voip-mlow")]
         AudioMode::Mlow => voip.call(peer).audio(mic, speaker),
         #[cfg(feature = "voip-opus")]
-        AudioMode::Opus => {
-            let (source, sink) = spawn_opus_bridge(mic, speaker)?;
-            voip.call(peer)
-                .encoded_audio(AudioFormat::OPUS_16KHZ_60MS, source, sink)
+        AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
+            let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
+            voip.call(peer).encoded_audio(audio.format(), source, sink)
         }
     };
     if video {
@@ -1149,7 +1263,7 @@ fn spawn_call_event_listener(
                 CallEvent::ForeignAudio(payload) => {
                     #[cfg(feature = "voip-opus")]
                     if let Some(decoder) = fallback_opus.as_mut()
-                        && let Ok(pcm) = decoder.decode(&payload)
+                        && let Ok(pcm) = decoder.decode_mlow_escape(&payload)
                     {
                         let _ = speaker.try_send(pcm);
                     }
@@ -1332,14 +1446,14 @@ async fn respond_to_offer(
     let audio_rates = &[audio.signaling_rate_wire()];
     let pre_id = hex::encode(rand::random::<[u8; 8]>());
     client
-        .send_node(stanza::build_preaccept(
+        .send_node(stanza::build_preaccept_with_capability(
             call_id,
             &call.from,
             call_creator,
             &pre_id,
             audio_rates,
-            // Byte-matched to a real from-start video callee: <video dec=H264 screen 0x0> in the
-            // preaccept, with the 0xbb capability (the caller offers 0xfa; the callee preaccepts 0xbb).
+            audio.preaccept_capability(video),
+            // The video node is capture-matched; standard Opus only clears the MLOW capability bit.
             video,
         ))
         .await
@@ -1364,6 +1478,9 @@ async fn send_final_accept(
     let audio_rates = &[audio.signaling_rate_wire()];
     let accept_id = hex::encode(rand::random::<[u8; 8]>());
     let metadata = if video { call.media.as_deref() } else { None };
+    let voip_settings = audio
+        .uses_standard_opus()
+        .then(|| stanza::standard_opus_voip_settings(audio.uses_48khz_rtp_clock()));
     let accept_node = stanza::build_accept(&stanza::AcceptParams {
         call_id,
         to: &call.from,
@@ -1372,10 +1489,14 @@ async fn send_final_accept(
         audio_rates,
         relay_te: None,
         rte: None,
-        voip_settings: None,
+        voip_settings,
         // A real from-start video accept carries NO <capability> (just audio/video/net/encopt); the
         // audio path keeps advertising it.
-        capability: if video { None } else { Some(&CAPABILITY_OFFER) },
+        capability: if video {
+            None
+        } else {
+            Some(audio.accept_capability())
+        },
         video,
         peer_abtest_bucket: metadata.and_then(|media| media.peer_abtest_bucket.as_deref()),
         peer_abtest_bucket_id_list: metadata

@@ -422,6 +422,21 @@ pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
 /// (`0xbb`), not this.
 pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
 
+const fn without_mlow_capability(mut capability: [u8; 7]) -> [u8; 7] {
+    // Capability 31 is the peer gate for `use_mlow_codec_v1`.
+    capability[5] &= 0x7f;
+    capability
+}
+
+/// Audio offer/accept capability selecting WhatsApp's standard Opus fallback instead of MLOW.
+pub const CAPABILITY_STANDARD_OPUS_OFFER: [u8; 7] = without_mlow_capability(CAPABILITY_OFFER);
+/// Audio-only preaccept capability selecting WhatsApp's standard Opus fallback instead of MLOW.
+pub const CAPABILITY_STANDARD_OPUS_PREACCEPT: [u8; 7] =
+    without_mlow_capability(CAPABILITY_PREACCEPT);
+/// Video offer capability selecting standard Opus for its audio stream instead of MLOW.
+pub const CAPABILITY_STANDARD_OPUS_VIDEO_OFFER: [u8; 7] =
+    without_mlow_capability(CAPABILITY_VIDEO_OFFER);
+
 /// `<terminate reason>` wire tokens. The caller-driven sibling dismiss SENDS the `*_ELSEWHERE`
 /// ones; the receive path maps every reason to a call-log outcome (see WA Web's
 /// `ActionWebHandleIncomingSignalingMessage`): `TIMEOUT`/`GROUP_CALL_ENDED`/absent -> missed.
@@ -527,6 +542,21 @@ fn enc_node(dk: &OfferDeviceKey) -> Node {
         .build()
 }
 
+const STANDARD_OPUS_PT120_SETTINGS: &[u8] =
+    br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false"}}"#;
+const STANDARD_OPUS_PT111_SETTINGS: &[u8] =
+    br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"true"}}"#;
+
+/// Directional decoder selection for a standard-Opus answer. Android overlays these fields on its
+/// local defaults, so copying the peer's large rollout settings is unnecessary and can be harmful.
+pub fn standard_opus_voip_settings(enable_48khz_rtp_clock: bool) -> &'static [u8] {
+    if enable_48khz_rtp_clock {
+        STANDARD_OPUS_PT111_SETTINGS
+    } else {
+        STANDARD_OPUS_PT120_SETTINGS
+    }
+}
+
 pub struct AcceptParams<'a> {
     pub call_id: &'a str,
     pub to: &'a Jid,
@@ -535,8 +565,8 @@ pub struct AcceptParams<'a> {
     /// caller (which then never marks the call accepted, leaving siblings ringing and timing it out).
     pub id: &'a str,
     pub call_creator: &'a Jid,
-    /// Advertised `<audio enc=opus rate=…>` formats, in preference order. Selecting only `8000`
-    /// is the lever to steer the caller off Meta's 16 kHz mlow codec onto RFC Opus NB.
+    /// Advertised `<audio enc=opus rate=…>` formats, in preference order. The MLOW selection in
+    /// `voip_settings` is independent, so a rate alone must not be treated as an RTP profile.
     pub audio_rates: &'a [&'a str],
     pub relay_te: Option<&'a [u8]>,
     pub rte: Option<&'a [u8]>,
@@ -653,8 +683,8 @@ fn capability_node(blob: &[u8]) -> Node {
 }
 
 /// `<preaccept>`: audio → [video] → encopt → capability. `id` is the random call-wrapper id. A video
-/// callee advertises the `<video>` decoder here; the capability stays the `0xbb` [`CAPABILITY_OFFER`]
-/// blob (byte-matched to a real from-start video callee — the `0xfa` variant is the CALLER's offer).
+/// callee advertises the `<video>` decoder here; the default capability stays the `0xbb`
+/// [`CAPABILITY_OFFER`] blob (the `0xfa` variant is the caller's offer).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
@@ -663,16 +693,37 @@ pub fn build_preaccept(
     audio_rates: &[&str],
     video: bool,
 ) -> Node {
+    build_preaccept_with_capability(
+        call_id,
+        to,
+        call_creator,
+        wrapper_id,
+        audio_rates,
+        if video {
+            &CAPABILITY_OFFER
+        } else {
+            &CAPABILITY_PREACCEPT
+        },
+        video,
+    )
+}
+
+/// Build a preaccept with an explicit media capability blob.
+pub fn build_preaccept_with_capability(
+    call_id: &str,
+    to: &Jid,
+    call_creator: &Jid,
+    wrapper_id: &str,
+    audio_rates: &[&str],
+    capability: &[u8],
+    video: bool,
+) -> Node {
     let mut children: Vec<Node> = audio_rates.iter().map(|rate| audio_opus(rate)).collect();
     if video {
         children.push(video_preaccept_node());
     }
     children.push(encopt_node());
-    children.push(capability_node(if video {
-        &CAPABILITY_OFFER
-    } else {
-        &CAPABILITY_PREACCEPT
-    }));
+    children.push(capability_node(capability));
     call_wrap(
         to,
         Some(wrapper_id),
@@ -1602,6 +1653,62 @@ mod tests {
 
     // --- Outbound signaling builder tests ---
 
+    #[test]
+    fn audio_voip_settings_select_native_opus_pt120() {
+        let settings: serde_json::Value =
+            serde_json::from_slice(standard_opus_voip_settings(false)).unwrap();
+
+        assert_eq!(settings["encode"]["use_mlow_codec_v1"], "false");
+        assert_eq!(settings["options"]["enable_48khz_rtp_clock"], "false");
+    }
+
+    #[test]
+    fn audio_voip_settings_select_rfc7587_pt111() {
+        let settings: serde_json::Value =
+            serde_json::from_slice(standard_opus_voip_settings(true)).unwrap();
+
+        assert_eq!(settings["encode"]["use_mlow_codec_v1"], "false");
+        assert_eq!(settings["options"]["enable_48khz_rtp_clock"], "true");
+    }
+
+    #[test]
+    fn native_opus_accept_carries_directional_settings() {
+        let peer = peer();
+        let creator = creator();
+        let settings = standard_opus_voip_settings(false);
+        let accept = build_accept(&AcceptParams {
+            call_id: "CID",
+            to: &peer,
+            id: "ACCEPT-ID",
+            call_creator: &creator,
+            audio_rates: &["16000"],
+            relay_te: None,
+            rte: None,
+            voip_settings: Some(settings),
+            capability: Some(&CAPABILITY_STANDARD_OPUS_OFFER),
+            video: false,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
+        });
+
+        assert_eq!(
+            child_tags(&accept),
+            ["audio", "net", "encopt", "capability", "voip_settings"]
+        );
+        let accept_ref = accept.as_node_ref();
+        let voip_settings = accept_ref.children().unwrap()[0]
+            .get_optional_child("voip_settings")
+            .unwrap();
+        assert_eq!(
+            voip_settings
+                .attrs()
+                .optional_string("uncompressed")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(voip_settings.content_bytes(), Some(settings));
+    }
+
     fn peer() -> Jid {
         Jid::new("111111111111111", Server::Lid)
     }
@@ -1820,6 +1927,32 @@ mod tests {
         assert_eq!(
             pre.as_node_ref().attrs().optional_string("id").as_deref(),
             Some("abcd1234")
+        );
+
+        let standard_opus = build_preaccept_with_capability(
+            "CID",
+            &peer,
+            &creator,
+            "abcd1234",
+            &["8000"],
+            &CAPABILITY_STANDARD_OPUS_PREACCEPT,
+            false,
+        );
+        let standard_ref = standard_opus.as_node_ref();
+        let action = &standard_ref.children().unwrap()[0];
+        let capability = action
+            .children()
+            .unwrap()
+            .iter()
+            .find(|child| child.tag == "capability")
+            .unwrap();
+        assert_eq!(
+            capability.content_bytes().unwrap(),
+            &CAPABILITY_STANDARD_OPUS_PREACCEPT
+        );
+        assert_eq!(
+            CAPABILITY_OFFER[5] ^ CAPABILITY_STANDARD_OPUS_OFFER[5],
+            0x80
         );
     }
 
