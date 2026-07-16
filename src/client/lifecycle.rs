@@ -166,6 +166,7 @@ impl Client {
                 .build(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
+                .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
                 .build(),
             lid_pn_cache: Arc::new(LidPnCache::with_config(
                 &cache_config.lid_pn_cache,
