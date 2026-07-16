@@ -2,6 +2,7 @@
 //! E2E SRTP protect, and the reverse). The byte-level crypto/framing lives in the sibling
 //! `wacore::voip` modules; this stitches it together. Pure logic: no socket, clock, or runtime.
 
+use super::audio::AudioFormat;
 use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
     derive_srtcp_keys, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
@@ -48,6 +49,8 @@ pub struct CallSession {
     pub call_creator: Jid,
     pub direction: CallDirection,
     pub is_video: bool,
+    /// The single media profile selected for this call.
+    pub audio_format: Option<AudioFormat>,
     /// For an OUTGOING call: the callee device JIDs the offer rang, so when one accepts/rejects the
     /// caller can dismiss the rest (`accepted_elsewhere`). Empty for incoming calls and single-device
     /// callees. Lives on the session so it is dropped automatically whenever the call deregisters --
@@ -70,6 +73,7 @@ impl CallSession {
             call_creator,
             direction: CallDirection::Outgoing,
             is_video: false,
+            audio_format: None,
             ring_devices: Vec::new(),
             answering_device: None,
             phase: CallPhase::Idle,
@@ -83,6 +87,7 @@ impl CallSession {
             call_creator,
             direction: CallDirection::Incoming,
             is_video: false,
+            audio_format: None,
             ring_devices: Vec::new(),
             answering_device: None,
             phase: CallPhase::Ringing,
@@ -360,6 +365,11 @@ impl MediaPipeline {
 
     pub fn send_ssrc(&self) -> u32 {
         self.rtp.ssrc
+    }
+
+    /// Select the negotiated audio RTP payload type without resetting sequence/timestamp state.
+    pub fn set_audio_payload_type(&mut self, payload_type: u8) -> bool {
+        self.rtp.set_payload_type(payload_type)
     }
 
     /// An SRTCP-protected Sender Report for the audio stream (our send SSRC), or the accumulated

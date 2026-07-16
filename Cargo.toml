@@ -140,10 +140,8 @@ tokio-runtime = ["dep:tokio"]
 signal = ["tokio-runtime", "tokio/signal"]
 sqlite-storage = ["whatsapp-rust-sqlite-storage"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
-# VoIP calls media plane (opt-in, NOT default): pulls wacore's voip crypto plus the
-# DTLS/SCTP/DataChannel transport (webrtc-rs) and libopus FFI. Not buildable on wasm32/esp32
-# (a compile_error in src/voip/mod.rs enforces this); use wacore's `voip` feature there.
-voip = [
+# Shared native VoIP runtime. Public profiles below select which codec implementation is linked.
+voip-runtime = [
     "wacore/voip",
     "tokio-runtime",
     "tokio/net",
@@ -152,9 +150,16 @@ voip = [
     "dep:webrtc-data",
     "dep:webrtc-util",
     "dep:webrtc-util-011",
-    "dep:opus",
     "dep:rustls",
 ]
+# Backwards-compatible full profile: preserves both codec adapters from the former single feature.
+voip = ["voip-mlow", "voip-libopus"]
+# Codec-bypass profile: raw MLOW/Opus payloads supplied by the application, no codec linked.
+voip-encoded = ["voip-runtime"]
+# Explicit spelling for consumers that assemble feature sets instead of using `voip`.
+voip-mlow = ["voip-runtime", "wacore/voip-mlow"]
+# Optional PCM adapter for standard Opus. Encoded Opus I/O does not need libopus.
+voip-libopus = ["voip-encoded", "dep:opus"]
 
 [dependencies]
 anyhow = { workspace = true }

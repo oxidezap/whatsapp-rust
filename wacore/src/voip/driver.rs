@@ -19,6 +19,7 @@ use futures::future::{Fuse, FusedFuture};
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
+use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::h264::VideoFrame;
@@ -149,14 +150,14 @@ impl VideoControlReceiver {
     }
 }
 
-/// The audio + video + event channels the driver bridges to the platform. Mic frames in, playout
-/// frames out (dropped on speaker overflow since VoIP is loss tolerant), and engine events out
-/// (RelayAllocated, ForeignAudio) for the shell to act on (e.g. decode a non-MLow frame with a
-/// platform codec). The video channels are always present — a call that never negotiates video
-/// simply leaves them idle (the engine drops AUs while its video plane is off).
+/// The audio + video + event channels the driver bridges to the platform. PCM and encoded audio
+/// channels are both present; the call's [`super::audio::AudioIo`] selects which pair is active.
+/// Media outputs shed frames on sink overflow, while lifecycle events use their own bounded queue.
 pub struct CallChannels {
     pub mic: async_channel::Receiver<Vec<i16>>,
     pub speaker: async_channel::Sender<Vec<i16>>,
+    pub encoded_audio_in: async_channel::Receiver<Bytes>,
+    pub encoded_audio_out: async_channel::Sender<EncodedAudioFrame>,
     pub events: async_channel::Sender<CallEvent>,
     /// Caller-only: the answering device's LID, delivered once the callee's `<accept>` is received so
     /// the drive loop can rekey the recv path before media flows. `None` on the callee side and esp32.
@@ -417,7 +418,7 @@ pub async fn run_call(
         fields(call_id = %eng.call_id())
     )
 )]
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-mlow"))]
 async fn run_call_with_clock(
     rt: Arc<dyn Runtime>,
     transport: Arc<dyn RelayTransport>,
@@ -455,6 +456,7 @@ async fn run_call_with_clock_and_wallclock(
     // The mic feeds outgoing audio only; its liveness must not gate the call. Flipped false when the
     // mic channel closes so we stop polling it without tearing the call down (see the mic arm).
     let mut mic_open = true;
+    let mut encoded_audio_open = true;
 
     // The recv-rekey is one-shot (the first callee `<accept>` picks the answering device). Flipped
     // false after the first event -- a rekey or the sender closing -- so the closed channel's
@@ -507,6 +509,9 @@ async fn run_call_with_clock_and_wallclock(
                 // Loss tolerant: drop the frame if the speaker can't keep up.
                 Output::Playout(pcm) => {
                     let _ = channels.speaker.try_send(pcm);
+                }
+                Output::EncodedAudio(frame) => {
+                    let _ = channels.encoded_audio_out.try_send(frame);
                 }
                 // Same policy for video: a stalled sink sheds frames, never the drive loop.
                 Output::VideoPlayout(frame) => {
@@ -580,6 +585,17 @@ async fn run_call_with_clock_and_wallclock(
         }
         .fuse();
         futures::pin_mut!(mic_fut);
+
+        let encoded_audio = &channels.encoded_audio_in;
+        let encoded_audio_fut = async move {
+            if encoded_audio_open {
+                encoded_audio.recv().await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(encoded_audio_fut);
 
         // Caller-only recv-rekey: the answering device's LID. Parked (pending) when there is no rekey
         // channel (callee/esp32) or once consumed, mirroring the mic arm so a closed channel can't spin.
@@ -720,6 +736,19 @@ async fn run_call_with_clock_and_wallclock(
                 // alive: muting the mic must not hang up the call (see the comment above).
                 Err(_) => mic_open = false,
             },
+            frame = encoded_audio_fut => match frame {
+                Ok(encoded) => {
+                    eng.handle_input(now_ms(), Input::EncodedAudio(&encoded));
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
+                }
+                Err(_) => encoded_audio_open = false,
+            },
             au = video_in_fut => match au {
                 Ok(au) => {
                     eng.handle_input(now_ms(), Input::VideoFrame(&au));
@@ -754,7 +783,7 @@ async fn run_call_with_clock_and_wallclock(
     transport.disconnect().await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-mlow"))]
 mod tests {
     use super::*;
     use crate::runtime::AbortHandle;
@@ -832,9 +861,13 @@ mod tests {
         let (_vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
         let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
         let (_vctl_tx, vctl_rx) = video_control_channel();
+        let (_encoded_tx, encoded_rx) = async_channel::unbounded::<Bytes>();
+        let (encoded_out_tx, _encoded_out_rx) = async_channel::unbounded::<EncodedAudioFrame>();
         CallChannels {
             mic,
             speaker,
+            encoded_audio_in: encoded_rx,
+            encoded_audio_out: encoded_out_tx,
             events,
             rekey: None,
             video_in: vin_rx,
@@ -851,7 +884,7 @@ mod tests {
             peer_lid: "222222222222222:0@lid".into(),
             call_key: (0u8..32).collect(),
             ssrc: 0x5741_0001,
-            samples_per_packet: 960,
+            audio: crate::voip::AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
             relay_ip: "203.0.113.7".into(),
             relay_port: 3478,
@@ -1241,7 +1274,7 @@ mod tests {
             self_lid: &cfg.peer_lid,
             peer_lid: &cfg.self_lid,
             ssrc: cfg.ssrc,
-            samples_per_packet: cfg.samples_per_packet,
+            samples_per_packet: cfg.audio.format.rtp_timestamp_step,
             warp_mi_tag_len: cfg.warp_mi_tag_len,
         })
         .unwrap();
@@ -1257,7 +1290,7 @@ mod tests {
         });
 
         let (mic_tx, mic_rx) = async_channel::unbounded();
-        let tone: Vec<i16> = (0..cfg.samples_per_packet as usize)
+        let tone: Vec<i16> = (0..cfg.audio.format.samples_per_frame as usize)
             .map(|i| (8000.0 * (i as f32 * 0.1).sin()) as i16)
             .collect();
         mic_tx.try_send(tone).unwrap();
@@ -1376,7 +1409,7 @@ mod tests {
             self_lid: &cfg.peer_lid,
             peer_lid: &cfg.self_lid,
             ssrc: cfg.ssrc,
-            samples_per_packet: cfg.samples_per_packet,
+            samples_per_packet: cfg.audio.format.rtp_timestamp_step,
             warp_mi_tag_len: cfg.warp_mi_tag_len,
         })
         .unwrap();
@@ -1511,6 +1544,8 @@ mod tests {
             CallChannels {
                 mic: mic_rx,
                 speaker: spk_tx,
+                encoded_audio_in: async_channel::unbounded::<Bytes>().1,
+                encoded_audio_out: async_channel::unbounded::<EncodedAudioFrame>().0,
                 events: ev_tx,
                 rekey: None,
                 video_in: vin_rx,

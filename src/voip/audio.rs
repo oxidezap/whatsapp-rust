@@ -1,9 +1,11 @@
-//! Opus audio for WhatsApp calls. Standard libopus (the proprietary "mlow" encode is not
-//! portable) at 16 kHz mono, Voip mode, 60 ms frames, which the peer accepts. Priming frames
-//! are hardcoded constants (see `wacore::voip::rtp`) and bypass the encoder.
+//! PCM and encoded-audio endpoints for WhatsApp calls.
 
+#[cfg(feature = "voip-libopus")]
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
+#[cfg(feature = "voip-libopus")]
 use opus::{Application, Bitrate, Channels, Decoder, Encoder};
+use wacore::voip::EncodedAudioFrame;
 
 /// A microphone source for a call: 60 ms / 960-sample mono i16 frames at 16 kHz. The media facade
 /// pulls frames from the returned channel and feeds them to the engine; a closed channel (e.g. the
@@ -40,19 +42,46 @@ impl AudioSink for async_channel::Sender<Vec<i16>> {
     }
 }
 
+/// A source of complete codec payloads. Each item must be one raw MLOW or Opus packet; container
+/// framing such as Ogg pages is not accepted. The engine adds RTP/SRTP framing without transcoding.
+pub trait EncodedAudioSource: Send + Sync + 'static {
+    fn frames(&self) -> async_channel::Receiver<Bytes>;
+}
+
+/// A sink for decrypted codec payloads with their original RTP metadata.
+pub trait EncodedAudioSink: Send + Sync + 'static {
+    fn frames(&self) -> async_channel::Sender<EncodedAudioFrame>;
+}
+
+impl EncodedAudioSource for async_channel::Receiver<Bytes> {
+    fn frames(&self) -> async_channel::Receiver<Bytes> {
+        self.clone()
+    }
+}
+
+impl EncodedAudioSink for async_channel::Sender<EncodedAudioFrame> {
+    fn frames(&self) -> async_channel::Sender<EncodedAudioFrame> {
+        self.clone()
+    }
+}
+
 pub const WA_SAMPLE_RATE: u32 = 16_000;
 /// 60 ms @ 16 kHz.
 pub const WA_FRAME_SAMPLES: usize = 960;
 /// Max decode frame (60 ms @ 48 kHz headroom).
 pub const WA_DECODE_MAX_SAMPLES: usize = 2880;
+#[cfg(feature = "voip-libopus")]
 const WA_BITRATE: i32 = 25_000;
+#[cfg(feature = "voip-libopus")]
 const WA_COMPLEXITY: i32 = 9;
 
 /// Opus encoder configured to match the WhatsApp call encoder (minus the mlow layers).
+#[cfg(feature = "voip-libopus")]
 pub struct WaOpusEncoder {
     enc: Encoder,
 }
 
+#[cfg(feature = "voip-libopus")]
 impl WaOpusEncoder {
     pub fn new() -> Result<Self> {
         let mut enc = Encoder::new(WA_SAMPLE_RATE, Channels::Mono, Application::Voip)
@@ -78,10 +107,12 @@ impl WaOpusEncoder {
 }
 
 /// Opus decoder (mono, 16 kHz).
+#[cfg(feature = "voip-libopus")]
 pub struct WaOpusDecoder {
     dec: Decoder,
 }
 
+#[cfg(feature = "voip-libopus")]
 impl WaOpusDecoder {
     pub fn new() -> Result<Self> {
         let dec = Decoder::new(WA_SAMPLE_RATE, Channels::Mono)
@@ -101,7 +132,7 @@ impl WaOpusDecoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-libopus"))]
 mod tests {
     use super::*;
 

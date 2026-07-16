@@ -566,7 +566,7 @@ mod udp_relay_e2e {
             peer_lid: PEER_LID.into(),
             call_key: (0u8..32).collect(),
             ssrc: SSRC,
-            samples_per_packet: SAMPLES,
+            audio: wacore::voip::AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
             relay_ip: relay_addr.ip().to_string(),
             relay_port: relay_addr.port(),
@@ -736,6 +736,8 @@ mod udp_relay_e2e {
                 CallChannels {
                     mic: mic_rx,
                     speaker: spk_tx,
+                    encoded_audio_in: async_channel::bounded(1).1,
+                    encoded_audio_out: async_channel::bounded(1).0,
                     events: ev_tx,
                     rekey: None,
                     video_in: async_channel::bounded(1).1,

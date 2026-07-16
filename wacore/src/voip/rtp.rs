@@ -3,7 +3,12 @@
 
 use crate::voip::warp::audio_piggyback_extension_for;
 
-pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 120;
+/// Standard Opus payload type in the current native media profile.
+pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 111;
+/// MLOW payload type in captured native and Web media.
+pub const RTP_PAYLOAD_TYPE_MLOW: u8 = 120;
+/// MLOW SplitRed redundancy payload type (`mlow-red-1`).
+pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
 /// H.264 video payload type used by captured Android video RTP.
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
 /// Video RTP timestamp clock.
@@ -75,7 +80,10 @@ pub const OPUS_PRIMING_FRAME_1_WASM: [u8; 24] = [
 pub const OPUS_PRIMING_FRAME_2: [u8; 5] = [0x90, 0xb8, 0x14, 0x14, 0xc4];
 
 pub fn is_whatsapp_opus_rtp_payload(payload_type: u8) -> bool {
-    payload_type == RTP_PAYLOAD_TYPE_OPUS || payload_type == 121
+    matches!(
+        payload_type,
+        RTP_PAYLOAD_TYPE_OPUS | RTP_PAYLOAD_TYPE_MLOW | RTP_PAYLOAD_TYPE_MLOW_RED
+    )
 }
 
 /// DTX / comfort-noise: RFC `0x10`, mlow `0x90`, and short warmup silence frames.
@@ -317,6 +325,7 @@ pub struct RtpStream {
     speech_started: bool,
     audio_packet_index: usize,
     warp_piggyback: bool,
+    payload_type: u8,
 }
 
 impl RtpStream {
@@ -330,7 +339,16 @@ impl RtpStream {
             speech_started: false,
             audio_packet_index: 0,
             warp_piggyback,
+            payload_type: RTP_PAYLOAD_TYPE_MLOW,
         }
+    }
+
+    pub fn set_payload_type(&mut self, payload_type: u8) -> bool {
+        if payload_type > 127 {
+            return false;
+        }
+        self.payload_type = payload_type;
+        true
     }
 
     /// The current send timestamp (last emitted), for an RTCP Sender Report.
@@ -360,7 +378,7 @@ impl RtpStream {
         }
         let header = RtpHeader {
             marker: use_marker,
-            payload_type: RTP_PAYLOAD_TYPE_OPUS,
+            payload_type: self.payload_type,
             sequence_number: self.seq,
             timestamp: self.timestamp,
             ssrc: self.ssrc,
@@ -377,7 +395,7 @@ impl RtpStream {
     pub fn next_pre_speech_packet(&mut self) -> RtpHeader {
         let header = RtpHeader {
             marker: false,
-            payload_type: RTP_PAYLOAD_TYPE_OPUS,
+            payload_type: self.payload_type,
             sequence_number: self.seq,
             timestamp: self.timestamp,
             ssrc: self.ssrc,
@@ -544,9 +562,25 @@ mod tests {
         assert!(!is_opus_priming_payload(&[0x12, 0x36]));
         assert!(is_opus_mlow_speech_payload(&[0x48; 20]));
         assert!(!is_opus_mlow_speech_payload(&[0x48; 4]));
+        assert!(is_whatsapp_opus_rtp_payload(111));
         assert!(is_whatsapp_opus_rtp_payload(120));
         assert!(is_whatsapp_opus_rtp_payload(121));
         assert!(!is_whatsapp_opus_rtp_payload(96));
+    }
+
+    #[test]
+    fn audio_stream_payload_type_is_configurable_without_resetting_timing() {
+        let mut stream = RtpStream::new(0x1122_3344, 2_880, false);
+        let first = stream.next_packet(&[0x48; 20], false);
+        assert_eq!(first.payload_type, RTP_PAYLOAD_TYPE_MLOW);
+        assert_eq!(first.timestamp, 0);
+
+        assert!(stream.set_payload_type(RTP_PAYLOAD_TYPE_OPUS));
+        let second = stream.next_packet(&[0x48; 20], false);
+        assert_eq!(second.payload_type, RTP_PAYLOAD_TYPE_OPUS);
+        assert_eq!(second.sequence_number, 2);
+        assert_eq!(second.timestamp, 2_880);
+        assert!(!stream.set_payload_type(128));
     }
 
     #[test]

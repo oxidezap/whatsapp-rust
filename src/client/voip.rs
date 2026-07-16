@@ -1,7 +1,7 @@
 //! Call-control accessor. Signaling (reject/terminate) is always available since
 //! the stanza builders live in core; media (call/accept) needs the `voip` feature.
 
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
 use std::sync::Arc;
 
 use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
@@ -25,7 +25,7 @@ impl Client {
 
     /// The per-call media registry the `voip` facade registers active calls in. `pub(crate)` so the
     /// facade and the connection-cleanup teardown share one instance.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
         self.call_registry.clone()
     }
@@ -41,37 +41,41 @@ pub enum CallError {
     #[error("call_id cannot be empty")]
     EmptyCallId,
     /// `accept` was called with an `IncomingCall` that is not an `<offer>` (nothing to answer).
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("not an incoming call offer")]
     NotAnOffer,
-    /// `accept().start()` was called without `audio(source, sink)`.
-    #[cfg(feature = "voip")]
-    #[error("accept() requires audio(source, sink) before start()")]
+    /// `accept().start()` was called without PCM or encoded audio endpoints.
+    #[cfg(feature = "voip-runtime")]
+    #[error("accept() requires audio(...) or encoded_audio(...) before start()")]
     MissingAudio,
+    /// The selected media profile was not present in the incoming offer.
+    #[cfg(feature = "voip-runtime")]
+    #[error("incoming offer does not advertise the selected audio rate {0}")]
+    AudioFormatNotOffered(u32),
     /// Decrypting the offer's encrypted callKey failed.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("callKey decrypt failed: {0}")]
     Decrypt(String),
     /// Assembling the call config from the offer's relay block failed.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("call setup failed: {0}")]
     Setup(String),
     /// Connecting the relay media transport (UDP/DTLS/SCTP) failed.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("relay connect failed: {0}")]
     Connect(String),
     /// The offer was missing media material (no `<enc>`/`<relay>`, no callKey, no own LID, etc.).
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("media offer error: {0}")]
     Media(&'static str),
     /// `call(peer)` resolved zero devices for the peer (nothing to address an offer to).
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("peer has no resolvable devices")]
     NoDevices,
     /// An outgoing offer would emit a pkmsg `<enc>` but we hold no ADV account, so the peer could
     /// not validate the pre-key message. Refused before send to avoid advancing the sender chain
     /// (mirrors the peer-send path's `<device-identity>` requirement).
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[error("offer pkmsg requires <device-identity> (account is None)")]
     MissingDeviceIdentity,
 }
@@ -88,7 +92,7 @@ impl Voip<'_> {
         // Consume the ringing flag BEFORE the async send: a caller <terminate> processed while we await
         // the send would otherwise hit take_ringing first and surface a phantom missed call for a call
         // we already declined (WA Web deletes it from _ringingCalls on reject). No-op if never ringing.
-        #[cfg(feature = "voip")]
+        #[cfg(feature = "voip-runtime")]
         self.client.call_registry().take_ringing(call_id);
         self.client.send_node(stanza).await?;
         Ok(())
@@ -98,7 +102,7 @@ impl Voip<'_> {
     /// `.audio(source, sink)` then `.start().await` to decrypt the callKey, connect the relay, and
     /// drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Signaling (preaccept /
     /// accept) is the consumer's concern; this drives only media. Requires the `voip` feature.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub fn accept<'b>(&'b self, incoming: &'b IncomingCall) -> crate::voip::AcceptCall<'b> {
         crate::voip::facade::AcceptCall::new(self.client, incoming)
     }
@@ -108,7 +112,7 @@ impl Voip<'_> {
     /// and register the call, yielding a [`CallHandle`](crate::voip::CallHandle). The media engine
     /// only attaches once the server hands back the relay for our call-id (live), so the returned
     /// handle is dormant until then. Requires the `voip` feature.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub fn call<'b>(&'b self, peer: &'b Jid) -> crate::voip::OutgoingCall<'b> {
         crate::voip::facade::OutgoingCall::new(self.client, peer)
     }
@@ -136,7 +140,7 @@ impl Voip<'_> {
         // hang up, and a failed signaling send must not leave the media task capturing/sending (or a
         // dormant outgoing call free to attach on a late relay ack). Reuse the same teardown the peer's
         // `<terminate>` triggers so the public hangup actually ends our side too.
-        #[cfg(feature = "voip")]
+        #[cfg(feature = "voip-runtime")]
         crate::voip::facade::terminate_call(self.client, call_id);
         sent?;
         Ok(())
@@ -188,10 +192,10 @@ mod tests {
         (client, count)
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     struct FailingTransport;
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::transport::Transport for FailingTransport {
@@ -201,7 +205,7 @@ mod tests {
         async fn disconnect(&self) {}
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     async fn make_client_failing() -> Arc<Client> {
         let client = crate::test_utils::create_test_client().await;
         let socket_transport: Arc<dyn crate::transport::Transport> = Arc::new(FailingTransport);
@@ -261,7 +265,7 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn terminate_aborts_the_local_call() {
         use wacore::voip::CallSession;
@@ -285,7 +289,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn terminate_tears_down_local_even_when_send_fails() {
         use wacore::voip::CallSession;

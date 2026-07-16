@@ -1,6 +1,6 @@
-//! MLow "smpl_toc": the first byte of a bare MLow frame. The smpl TOC is only valid when
-//! `(b & 0xC0) != 0xC0`; `(b & 0xC0) == 0xC0` marks a STANDARD Opus/CELT TOC instead, which is
-//! routed to stock Opus.
+//! MLOW "smpl_toc": the first byte of a payload after negotiation selected the MLOW profile.
+//! `(b & 0xC0) == 0xC0` is its in-profile standard Opus/CELT escape; it is not a global codec
+//! discriminator.
 //!
 //! Bit layout (LSB = bit0): bit7=SID(DTX/CNG), bit6=VAD, bit5=internal rate(0->16k,1->32k),
 //! bits4:3->frame size index into {10,20,60,120}ms, bit2=flag2, bit1=voiced-enable, bit0=flag0.
@@ -38,8 +38,7 @@ fn standard_opus_frame_ms(b: u8) -> i32 {
     }
 }
 
-/// Parse the smpl TOC byte. Emits a per-frame `trace!` so production logs can show the routing of
-/// every inbound frame (this parse is not yet prod-validated, so keep it instrumented).
+/// Parse the smpl TOC byte. Emits a per-frame `trace!` while this parse is production-validated.
 pub(crate) fn parse_mlow_toc(b: u8) -> MlowToc {
     if b & 0xC0 == 0xC0 {
         let toc = MlowToc {

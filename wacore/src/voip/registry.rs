@@ -107,6 +107,17 @@ impl CallRegistry {
         Self::default()
     }
 
+    /// Deliver a terminal/signaling diagnostic through the call's existing consumer queue.
+    pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|entry| entry.event_tx.clone());
+        tx.is_some_and(|tx| tx.force_send(event).is_ok())
+    }
+
     /// Register a call, returning its generation token. A same-call-id re-offer (retry/glare)
     /// REPLACES the prior registration, aborting its media task; the returned generation
     /// distinguishes the new call from the old. Pass it to [`set_media_task`](Self::set_media_task)

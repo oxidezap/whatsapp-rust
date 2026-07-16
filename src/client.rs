@@ -910,14 +910,14 @@ pub struct Client {
     /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
     /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
     /// `voip` feature: it is populated only by the `voip` media facade.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
 
     /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
     /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
     /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
     /// arrives. Behind the `voip` feature; populated only by the media facade.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub(crate) pending_outgoing_calls: Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::voip::facade::PendingOutgoing>>,
     >,

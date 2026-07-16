@@ -731,20 +731,11 @@ fn voiced_harmonic_multiple_frames_no_panic() {
 // The encoder's voiced/unvoiced decision is pitch/VAD-driven, so there is no byte-exact-encoder gate
 // here: the wire format stays pinned by the byte-exact decoder round-trip vectors and the golden test.
 
-/// Inbound-routing regression: an mlow stream (`inbound_capture_frames.json`) must decode to clean,
-/// voice-level audio through `MlowDecoder`, and EVERY frame must be classified as mlow
-/// (`!is_standard_opus_frame`) so the inbound router never hands one to the standard Opus decoder.
-///
-/// This guards the bug where the inbound path defaulted to the standard Opus decoder, which
-/// mis-decodes mlow into energy-correct clipping noise (and rejects the config-2 TOC-0x12 frames
-/// outright). Routing by the TOC byte to `MlowDecoder` instead yields voice-level audio with no
-/// clipping. The stream is a captured-encoder fixture (see PROVENANCE.md): not Rust-reproducible
-/// because we ship no encoder matching the peer's exact wire bytes, so it is committed and pinned by
-/// the tripwire test below.
+/// A captured, negotiated MLOW stream must decode to clean, voice-level audio. The stream is a
+/// captured-encoder fixture (see PROVENANCE.md): not Rust-reproducible because our encoder does not
+/// match the peer's exact wire bytes, so it is committed and pinned by the tripwire test below.
 #[test]
-fn captured_inbound_routes_to_mlow_and_decodes_clean() {
-    use super::is_standard_opus_frame;
-
+fn captured_inbound_mlow_decodes_clean() {
     let frames: Vec<String> =
         serde_json::from_str(include_str!("testdata/inbound_capture_frames.json"))
             .expect("inbound_capture_frames.json");
@@ -752,15 +743,10 @@ fn captured_inbound_routes_to_mlow_and_decodes_clean() {
 
     let mut dec = MlowDecoder::new();
     let mut all: Vec<f32> = Vec::new();
-    let mut std_opus_frames = 0usize;
     let mut active_frames = 0usize;
 
     for hex_frame in &frames {
         let frame = hex::decode(hex_frame).unwrap();
-        let toc = frame.first().copied().unwrap_or(0);
-        if is_standard_opus_frame(toc) {
-            std_opus_frames += 1;
-        }
         let pcm = dec.decode(&frame);
         // `decode` is total: even a TOC the standard Opus decoder would reject yields valid PCM.
         // Active frames are 960 samples (60 ms); DTX/CN frames return a shorter block, never empty.
@@ -771,12 +757,7 @@ fn captured_inbound_routes_to_mlow_and_decodes_clean() {
         all.extend_from_slice(&pcm);
     }
 
-    assert_eq!(
-        std_opus_frames, 0,
-        "inbound stream is all mlow; routing any of it to the standard Opus decoder garbles it"
-    );
-
-    // Clean decode is voice-level and never saturates; the mis-routed path would clip heavily.
+    // Clean decode is voice-level and never saturates.
     let overall_rms = rms(&all);
     let peak = all.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let clip = all.iter().filter(|&&x| x.abs() >= 0.999).count();
