@@ -1246,7 +1246,15 @@ impl VideoShared {
     }
 
     fn send_control(&self, control: VideoControl) {
-        let _ = self.ctl_tx.force_send(control);
+        match control {
+            // Orientation must not evict a negotiated state transition under signaling bursts.
+            VideoControl::SetOrientation(_) => {
+                let _ = self.ctl_tx.try_send(control);
+            }
+            _ => {
+                let _ = self.ctl_tx.force_send(control);
+            }
+        }
     }
 
     /// Attach (or replace) the consumer's endpoints: the sink becomes the forwarder's target and a
@@ -1535,8 +1543,14 @@ impl CallHandle {
                 .and_then(|entry| entry.video.take())
         };
         drop(pending_video);
-        self.video.detach_endpoints();
-        self.client_registry.set_is_video(&self.call_id, false);
+        if !self
+            .client_registry
+            .run_video_teardown(&self.call_id, self.generation)
+        {
+            self.video.detach_endpoints();
+        }
+        self.client_registry
+            .set_is_video(&self.call_id, self.generation, false);
     }
 
     /// Shared upgrade/accept body: attach endpoints, enable the plane, send the handshake stanzas.
@@ -1557,6 +1571,14 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         self.video
             .attach_endpoints(&client, &source, &sink, self.ended.clone());
+        if !self.client_registry.set_video_teardown(
+            &self.call_id,
+            self.generation,
+            video_teardown_hook(&self.video),
+        ) {
+            self.video.detach_endpoints();
+            return Err(CallError::Media("call no longer active"));
+        }
         // The upgrade INITIATOR holds outbound video until the peer accepts (the handler ungates on
         // the peer's UpgradeAccept/Enabled). The acceptor's peer already requested, so it may send
         // immediately.
@@ -1566,7 +1588,8 @@ impl CallHandle {
             VideoControl::Enable
         };
         self.video.send_control(ctl);
-        self.client_registry.set_is_video(&self.call_id, true);
+        self.client_registry
+            .set_is_video(&self.call_id, self.generation, true);
 
         let peer = self.peer_jid();
         let send_state = |state: VideoState, dec: Option<&'static str>| {
@@ -3690,7 +3713,18 @@ mod tests {
                 .is_video,
             "stop_video must clear the session's video flag"
         );
+
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .start_video(vsrc, vsink)
+            .await
+            .expect("restart_video");
+        assert!(handle.video.sink_slot.lock().unwrap().is_some());
         handle.hangup().await;
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "a restarted video plane must rearm terminal teardown"
+        );
     }
 
     #[tokio::test]
@@ -3780,18 +3814,23 @@ mod tests {
     }
 
     #[test]
-    fn video_control_queue_is_bounded_and_retains_latest_intent() {
+    fn video_control_queue_is_bounded_and_prioritizes_state() {
         let shared = VideoShared::new();
         let (_in_rx, ctl_rx) = shared.take_receivers();
+        shared.send_control(VideoControl::Disable);
         for orientation in 0..100u8 {
             shared.send_control(VideoControl::SetOrientation(orientation % 4));
         }
         assert_eq!(ctl_rx.len(), VIDEO_CONTROL_CHANNEL_CAP);
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
 
-        let mut last = None;
-        while let Ok(control) = ctl_rx.try_recv() {
-            last = Some(control);
+        while ctl_rx.try_recv().is_ok() {}
+        for orientation in 0..VIDEO_CONTROL_CHANNEL_CAP as u8 {
+            shared.send_control(VideoControl::SetOrientation(orientation % 4));
         }
-        assert_eq!(last, Some(VideoControl::SetOrientation(3)));
+        shared.send_control(VideoControl::Enable);
+        let controls: Vec<_> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
+        assert_eq!(controls.len(), VIDEO_CONTROL_CHANNEL_CAP);
+        assert_eq!(controls.last(), Some(&VideoControl::Enable));
     }
 }

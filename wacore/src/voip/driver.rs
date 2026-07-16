@@ -131,6 +131,24 @@ fn record_drop(dropped: &mut DroppedMedia, batch: &SendBatch) {
     }
 }
 
+fn purge_unstarted_video(
+    queue: &mut VecDeque<SendBatch>,
+    awaiting_video_keyframe: &mut bool,
+) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    queue.retain(|batch| {
+        let discard = !batch.started && batch.kind == SendBatchKind::Video;
+        if discard {
+            record_drop(&mut dropped, batch);
+        }
+        !discard
+    });
+    if dropped.video_access_units != 0 {
+        *awaiting_video_keyframe = true;
+    }
+    dropped
+}
+
 fn discard_video_until_keyframe(
     queue: &mut VecDeque<SendBatch>,
     dropped: &mut DroppedMedia,
@@ -539,6 +557,16 @@ async fn run_call_with_clock_and_wallclock(
                     }
                     Ok(VideoControl::Disable) => {
                         eng.disable_video();
+                        let dropped = purge_unstarted_video(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
                         // Discard any AUs still queued from the (now-detached) source, so a quick
                         // re-Enable can't transmit stale frames from the previous session under the
                         // new negotiation. Drained after the select block (the futures borrow the
@@ -1499,6 +1527,37 @@ mod tests {
         assert_eq!(dropped.packets, 40);
         assert!(queue.is_empty(), "no partial AU may remain queued");
         assert!(awaiting_keyframe);
+    }
+
+    #[test]
+    fn disabling_purges_only_video_batches_that_have_not_started() {
+        let mut started = SendBatch::video(vec![
+            Bytes::from_static(b"started-1"),
+            Bytes::from_static(b"started-2"),
+        ]);
+        started.started = true;
+        let mut queue = VecDeque::from([
+            SendBatch::packet(Bytes::from_static(&[0x90, 0x01])),
+            started,
+            SendBatch::video(vec![Bytes::from_static(b"stale")]),
+            SendBatch::packet(Bytes::from_static(&[0x00, 0x01])),
+        ]);
+        let mut awaiting_keyframe = false;
+
+        let dropped = purge_unstarted_video(&mut queue, &mut awaiting_keyframe);
+
+        assert_eq!(dropped.video_access_units, 1);
+        assert_eq!(dropped.packets, 1);
+        assert!(awaiting_keyframe);
+        assert_eq!(queue.len(), 3);
+        assert!(queue.iter().any(|batch| {
+            batch.kind == SendBatchKind::Video && batch.started && batch.packets.len() == 2
+        }));
+        assert!(
+            queue
+                .iter()
+                .all(|batch| batch.kind != SendBatchKind::Video || batch.started)
+        );
     }
 
     #[test]

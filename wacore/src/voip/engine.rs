@@ -479,7 +479,7 @@ fn make_video_plane(
         reception: RtpReceptionStats::default(),
         active: true,
         send_gated: false,
-        keyframe_required: false,
+        keyframe_required: true,
     })
 }
 
@@ -703,10 +703,10 @@ impl CallEngine {
             return false;
         };
         if let Some(v) = m.video.as_mut() {
-            let resuming_after_gate = v.send_gated && !send_gated;
+            let needs_recovery = !v.active || (v.send_gated && !send_gated);
             v.active = true;
             v.send_gated = send_gated;
-            v.keyframe_required |= resuming_after_gate;
+            v.keyframe_required |= needs_recovery;
             return true;
         }
         let rtcp_cname = build_whatsapp_rtcp_cname(&self.tx_ids.next_tx_id());
@@ -1101,13 +1101,15 @@ impl CallEngine {
         else {
             return;
         };
-        if v.keyframe_required {
-            if !au_has_idr(au) {
-                return;
-            }
-            v.keyframe_required = false;
+        if v.keyframe_required && !au_has_idr(au) {
+            return;
         }
-        for packet in v.pipe.protect_video(au) {
+        let packets = v.pipe.protect_video(au);
+        if packets.is_empty() {
+            return;
+        }
+        v.keyframe_required = false;
+        for packet in packets {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
         }
     }
@@ -2485,6 +2487,12 @@ mod tests {
         assert!(eng.is_video_enabled());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_delta_au(300)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "from-start video must wait for a decoder-safe IDR"
+        );
         eng.handle_input(1, Input::VideoFrame(&video_au(3000)));
         let (outs, _) = drain(&mut eng);
         let transmits: Vec<&Bytes> = outs
@@ -2513,9 +2521,11 @@ mod tests {
         // Off: dropped.
         eng.handle_input(1, Input::VideoFrame(&au));
         assert_eq!(count_transmits(&drain(&mut eng).0), 0);
-        // Upgrade: transmits.
+        // Upgrade: dependent frames wait for the first IDR.
         assert!(eng.enable_video());
         assert!(eng.enable_video(), "enable_video must be idempotent");
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(200)));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 0);
         eng.handle_input(2, Input::VideoFrame(&au));
         assert_eq!(count_transmits(&drain(&mut eng).0), 1);
         // Downgrade: dropped again, audio untouched.
@@ -2565,6 +2575,8 @@ mod tests {
         eng.handle_input(2, Input::VideoFrame(&video_au(100))); // dropped while inactive
         assert!(seq_of(&drain(&mut eng).0).is_empty());
         assert!(eng.enable_video());
+        eng.handle_input(3, Input::VideoFrame(&video_delta_au(100)));
+        assert!(seq_of(&drain(&mut eng).0).is_empty());
         eng.handle_input(3, Input::VideoFrame(&video_au(100)));
         let after = seq_of(&drain(&mut eng).0);
         assert_eq!(
@@ -2572,6 +2584,28 @@ mod tests {
             vec![1],
             "re-enabled video must continue the sequence, not reset to 0 (keystream reuse)"
         );
+    }
+
+    #[test]
+    fn rejected_idr_packetization_keeps_the_recovery_gate_armed() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        let oversized = video_au(crate::voip::h264::H264_MAX_AU_BYTES);
+        eng.handle_input(1, Input::VideoFrame(&oversized));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 0);
+
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(100)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a rejected IDR must not admit dependent frames"
+        );
+
+        eng.handle_input(3, Input::VideoFrame(&video_au(100)));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 1);
     }
 
     // The upgrade initiator holds outbound video until the peer accepts: a send-gated plane decodes
