@@ -107,7 +107,7 @@ impl CallRegistry {
         Self::default()
     }
 
-    /// Deliver a terminal/signaling diagnostic through the call's existing consumer queue.
+    /// Deliver a signaling event through the call's consumer queue.
     pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
         let tx = self
             .inner
