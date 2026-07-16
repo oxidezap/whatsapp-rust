@@ -554,7 +554,7 @@ async fn place_call(
         .map_err(|e| CallError::Setup(e.to_string()))?;
         drop(_session_guards);
         client
-            .flush_signal_cache_batch_safe()
+            .persist_signal_state_pre_wire()
             .await
             .map_err(|e| CallError::Setup(e.to_string()))?;
         raw
@@ -1713,7 +1713,8 @@ mod tests {
     use wacore_binary::{Jid, Server};
 
     use crate::store::persistence_manager::PersistenceManager;
-    use crate::test_utils::{MockHttpClient, create_test_backend};
+    use crate::store::traits::Backend;
+    use crate::test_utils::{MockHttpClient, create_test_backend, seed_peer_session};
 
     async fn make_client() -> Arc<Client> {
         let client = crate::test_utils::create_test_client().await;
@@ -2220,8 +2221,15 @@ mod tests {
     async fn make_sending_client_with_failure_after(
         failure_after: Option<usize>,
     ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
-        use wacore::handshake::NoiseCipher;
         let backend = create_test_backend().await;
+        make_sending_client_with_backend(backend, failure_after).await
+    }
+
+    async fn make_sending_client_with_backend(
+        backend: Arc<dyn Backend>,
+        failure_after: Option<usize>,
+    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+        use wacore::handshake::NoiseCipher;
         let pm = PersistenceManager::new(backend).await.expect("pm");
         // Set our own LID so get_lid() resolves (the send-side participant id).
         pm.process_command(crate::store::commands::DeviceCommand::SetLid(Some(
@@ -2278,50 +2286,6 @@ mod tests {
         *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
         client.set_connected_for_test(true);
         (client, count)
-    }
-
-    /// Seed a Signal session for `peer` so encrypt_message yields a real pkmsg (fresh session).
-    async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
-        use wacore::libsignal::protocol::{
-            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
-            process_prekey_bundle,
-        };
-        let bundle =
-            tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
-                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-                let receiver = IdentityKeyPair::generate(&mut rng);
-                let spk = KeyPair::generate(&mut rng);
-                let opk = KeyPair::generate(&mut rng);
-                let sig = receiver
-                    .private_key()
-                    .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
-                PreKeyBundle::new(
-                    1,
-                    1u32.into(),
-                    Some((1u32.into(), opk.public_key)),
-                    1u32.into(),
-                    spk.public_key,
-                    sig.to_vec(),
-                    *receiver.identity_key(),
-                )
-            })
-            .await
-            .expect("bundle task")
-            .expect("bundle");
-
-        use wacore::types::jid::JidExt;
-        let mut adapter = client.signal_adapter().await;
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        process_prekey_bundle(
-            &peer.to_protocol_address(),
-            &mut adapter.session_store,
-            &mut adapter.identity_store,
-            &bundle,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("peer session");
     }
 
     // The offer-build path for an outgoing call: a fresh callKey is generated, encrypted per device
@@ -2428,6 +2392,57 @@ mod tests {
             !enc.content_bytes().unwrap_or_default().is_empty(),
             "the per-device <enc> must carry the encrypted callKey"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_call_key_fanout_reuses_durable_session_leases() {
+        use wacore::store::in_memory::InMemoryBackend;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let (client, _) =
+            make_sending_client_with_backend(backend.clone() as Arc<dyn Backend>, None).await;
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let devices = [peer.clone().with_device(0), peer.clone().with_device(1)];
+
+        for device in &devices {
+            seed_peer_session(&client, device).await;
+            client
+                .signal()
+                .encrypt_message(device, b"warm lease")
+                .await
+                .expect("lease warmup");
+        }
+        let writes_before = backend.session_batch_write_count();
+
+        client
+            .signal_flush_test_block
+            .store(true, Ordering::Release);
+        let own_lid = client.get_lid().expect("own lid");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+        let _handle = place_call(
+            &client,
+            "001234567890abcdef1234567890abcd".into(),
+            &peer,
+            &own_lid,
+            &own_lid,
+            &devices,
+            &devices,
+            Arc::new(mic_rx),
+            Arc::new(spk_tx),
+            None,
+        )
+        .await
+        .expect("warm multi-device call");
+
+        assert_eq!(
+            backend.session_batch_write_count(),
+            writes_before,
+            "a warm call-key fanout must not flush durable leases synchronously"
+        );
+        client
+            .signal_flush_test_block
+            .store(false, Ordering::Release);
     }
 
     // A stored token must ride on the offer as the leading `<privacy>` child, or a

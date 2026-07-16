@@ -1484,10 +1484,9 @@ impl Client {
         // reusing an outbound counter reuses its message key + IV. Counters are
         // leased in batches (see `SessionRecord::reserve_sender_chain_counters`),
         // so most sends are already covered by a durable lease and only
-        // schedule the coalesced write-behind; a send that raised the lease (or
-        // advanced a sender-key chain) flushes synchronously, and a persistence
-        // failure must abort the send rather than transmit an advance we
-        // couldn't save.
+        // schedule the coalesced write-behind; a send that raised either lease
+        // flushes synchronously, and a persistence failure must abort the send
+        // rather than transmit an advance we couldn't save.
         self.persist_signal_state_pre_wire().await?;
 
         let ack = if let Some(phash) = dm_phash

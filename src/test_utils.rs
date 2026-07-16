@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::Client;
-use wacore_binary::{Node, OwnedNodeRef};
+use wacore_binary::{Jid, Node, OwnedNodeRef};
 
 /// Marshal a `Node` into an `Arc<OwnedNodeRef>` for use in tests.
 pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
@@ -104,6 +104,23 @@ pub async fn create_test_client_with_config(
             .expect("test backend should initialize"),
     ) as Arc<dyn Backend>;
 
+    create_test_client_from_backend(backend, http_client, cache_config).await
+}
+
+pub async fn create_test_client_with_backend(backend: Arc<dyn Backend>) -> Arc<Client> {
+    create_test_client_from_backend(
+        backend,
+        Arc::new(MockHttpClient),
+        crate::cache_config::CacheConfig::default(),
+    )
+    .await
+}
+
+async fn create_test_client_from_backend(
+    backend: Arc<dyn Backend>,
+    http_client: Arc<dyn HttpClient>,
+    cache_config: crate::cache_config::CacheConfig,
+) -> Arc<Client> {
     let pm = Arc::new(
         PersistenceManager::new(backend)
             .await
@@ -127,6 +144,49 @@ pub async fn create_test_client_with_config(
     client.enter_live_mode_for_tests();
 
     client
+}
+
+pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
+    use wacore::libsignal::protocol::{
+        IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+        process_prekey_bundle,
+    };
+    use wacore::types::jid::JidExt;
+
+    let bundle = tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let receiver = IdentityKeyPair::generate(&mut rng);
+        let spk = KeyPair::generate(&mut rng);
+        let opk = KeyPair::generate(&mut rng);
+        let signature = receiver
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
+        PreKeyBundle::new(
+            1,
+            1u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            signature.to_vec(),
+            *receiver.identity_key(),
+        )
+    })
+    .await
+    .expect("bundle task")
+    .expect("bundle");
+
+    let mut adapter = client.signal_adapter().await;
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    process_prekey_bundle(
+        &peer.to_protocol_address(),
+        &mut adapter.session_store,
+        &mut adapter.identity_store,
+        &bundle,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .expect("peer session");
 }
 
 use std::sync::Mutex;
