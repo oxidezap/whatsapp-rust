@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard};
 
 use anyhow::Result;
@@ -7,7 +8,7 @@ use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::RngExt;
 
 use crate::libsignal::protocol::{
-    ProtocolAddress, SenderKeyRecord, SessionCheckoutStoreResult, SessionRecord,
+    ProtocolAddress, SenderKeyRecord, SessionCheckoutKey, SessionCheckoutStoreResult, SessionRecord,
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
@@ -110,20 +111,36 @@ enum SessionEntry {
     // instead of deep-cloning the record (KBs with archived states).
     Present(Arc<SessionRecord>),
     Absent,
-    /// Taken by load_session; has_session treats as present, flush/eviction skip.
-    CheckedOut(bool),
+    CheckedOut {
+        had_session: bool,
+        token: NonZeroU64,
+    },
+}
+
+impl SessionEntry {
+    fn exists(&self) -> bool {
+        matches!(
+            self,
+            Self::Present(_)
+                | Self::CheckedOut {
+                    had_session: true,
+                    ..
+                }
+        )
+    }
 }
 
 enum CachedSessionCheckout {
-    Missing,
-    Absent,
+    Missing(SessionCheckoutKey),
+    Absent(SessionCheckoutKey),
     Busy,
-    Present(SessionRecord),
+    Present(SessionRecord, SessionCheckoutKey),
 }
 
 struct SessionStoreState {
     incarnation: StoreIncarnation,
     checkout_generation: u64,
+    next_checkout_token: u64,
     cache: HashMap<Arc<str>, SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
@@ -141,6 +158,7 @@ impl SessionStoreState {
         Self {
             incarnation,
             checkout_generation: 0,
+            next_checkout_token: 1,
             cache: HashMap::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
@@ -176,25 +194,39 @@ impl SessionStoreState {
     }
 
     fn checkout(&mut self, address: &str) -> CachedSessionCheckout {
+        let token = NonZeroU64::new(self.next_checkout_token).unwrap_or(NonZeroU64::MIN);
+        self.next_checkout_token = self.next_checkout_token.wrapping_add(1);
+        if self.next_checkout_token == 0 {
+            self.next_checkout_token = 1;
+        }
+        let checkout = SessionCheckoutKey::new(self.checkout_generation, token);
         let Some(entry) = self.cache.get_mut(address) else {
-            return CachedSessionCheckout::Missing;
+            return CachedSessionCheckout::Missing(checkout);
         };
         match entry {
             SessionEntry::Present(_) => {
-                let SessionEntry::Present(record) =
-                    std::mem::replace(entry, SessionEntry::CheckedOut(true))
-                else {
+                let SessionEntry::Present(record) = std::mem::replace(
+                    entry,
+                    SessionEntry::CheckedOut {
+                        had_session: true,
+                        token,
+                    },
+                ) else {
                     unreachable!()
                 };
                 CachedSessionCheckout::Present(
                     Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone()),
+                    checkout,
                 )
             }
             SessionEntry::Absent => {
-                *entry = SessionEntry::CheckedOut(false);
-                CachedSessionCheckout::Absent
+                *entry = SessionEntry::CheckedOut {
+                    had_session: false,
+                    token,
+                };
+                CachedSessionCheckout::Absent(checkout)
             }
-            SessionEntry::CheckedOut(_) => CachedSessionCheckout::Busy,
+            SessionEntry::CheckedOut { .. } => CachedSessionCheckout::Busy,
         }
     }
 
@@ -232,7 +264,7 @@ impl SessionStoreState {
                 continue;
             }
             match v {
-                SessionEntry::CheckedOut(_) => continue, // never evict checked-out
+                SessionEntry::CheckedOut { .. } => continue, // never evict checked-out
                 SessionEntry::Absent => negative.push(k.clone()),
                 SessionEntry::Present(_) => positive.push(k.clone()),
             }
@@ -246,7 +278,7 @@ impl SessionStoreState {
 struct PendingSessionRestore {
     address: Arc<str>,
     record: Option<SessionRecord>,
-    generation: u64,
+    checkout: SessionCheckoutKey,
     had_session: bool,
     completion: Option<Arc<AtomicBool>>,
 }
@@ -429,15 +461,21 @@ impl SignalStoreCache {
         for PendingSessionRestore {
             address,
             record,
-            generation,
+            checkout,
             had_session,
             completion,
         } in pending.drain(..)
         {
-            let key = if generation == state.checkout_generation
-                && let Some((key, SessionEntry::CheckedOut(was_present))) =
-                    state.cache.get_key_value(address.as_ref())
+            let key = if checkout.generation() == state.checkout_generation
+                && let Some((
+                    key,
+                    SessionEntry::CheckedOut {
+                        had_session: was_present,
+                        token,
+                    },
+                )) = state.cache.get_key_value(address.as_ref())
                 && *was_present == had_session
+                && *token == checkout.token()
             {
                 Some(key.clone())
             } else {
@@ -478,19 +516,29 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         record: SessionRecord,
-        generation: u64,
+        checkout: SessionCheckoutKey,
         had_session: bool,
     ) -> SessionCheckoutStoreResult {
+        if checkout.generation() != self.session_recovery_generation.load(Ordering::Acquire) {
+            return SessionCheckoutStoreResult::Rejected;
+        }
         if let Some(mut state) = self.try_lock_sessions() {
-            if generation != state.checkout_generation {
+            if checkout.generation() != self.session_recovery_generation.load(Ordering::Acquire)
+                || checkout.generation() != state.checkout_generation
+            {
                 return SessionCheckoutStoreResult::Rejected;
             }
-            let Some((key, SessionEntry::CheckedOut(was_present))) =
-                state.cache.get_key_value(address.as_str())
+            let Some((
+                key,
+                SessionEntry::CheckedOut {
+                    had_session: was_present,
+                    token,
+                },
+            )) = state.cache.get_key_value(address.as_str())
             else {
                 return SessionCheckoutStoreResult::Rejected;
             };
-            if *was_present != had_session {
+            if *was_present != had_session || *token != checkout.token() {
                 return SessionCheckoutStoreResult::Rejected;
             }
             let key = key.clone();
@@ -500,14 +548,14 @@ impl SignalStoreCache {
         }
 
         let mut pending = self.pending_session_restores();
-        if generation != self.session_recovery_generation.load(Ordering::Acquire) {
+        if checkout.generation() != self.session_recovery_generation.load(Ordering::Acquire) {
             return SessionCheckoutStoreResult::Rejected;
         }
         let completion = Arc::new(AtomicBool::new(false));
         pending.push(PendingSessionRestore {
             address: Arc::from(address.as_str()),
             record: Some(record),
-            generation,
+            checkout,
             had_session,
             completion: Some(completion.clone()),
         });
@@ -518,14 +566,17 @@ impl SignalStoreCache {
 
     /// An empty checkout must release its pinned cache slot even when dropped.
     #[doc(hidden)]
-    pub fn cancel_session_checkout(&self, address: &ProtocolAddress, generation: u64) {
+    pub fn cancel_session_checkout(&self, address: &ProtocolAddress, checkout: SessionCheckoutKey) {
+        if checkout.generation() != self.session_recovery_generation.load(Ordering::Acquire) {
+            return;
+        }
         let Some(mut state) = self.try_lock_sessions() else {
             let mut pending = self.pending_session_restores();
-            if generation == self.session_recovery_generation.load(Ordering::Acquire) {
+            if checkout.generation() == self.session_recovery_generation.load(Ordering::Acquire) {
                 pending.push(PendingSessionRestore {
                     address: Arc::from(address.as_str()),
                     record: None,
-                    generation,
+                    checkout,
                     had_session: false,
                     completion: None,
                 });
@@ -534,13 +585,23 @@ impl SignalStoreCache {
             }
             return;
         };
-        if generation == state.checkout_generation
-            && matches!(
-                state.cache.get(address.as_str()),
-                Some(SessionEntry::CheckedOut(false))
-            )
+        let key = if checkout.generation()
+            == self.session_recovery_generation.load(Ordering::Acquire)
+            && checkout.generation() == state.checkout_generation
+            && let Some((
+                key,
+                SessionEntry::CheckedOut {
+                    had_session: false,
+                    token,
+                },
+            )) = state.cache.get_key_value(address.as_str())
+            && *token == checkout.token()
         {
-            let key = state.key_for(address.as_str());
+            Some(key.clone())
+        } else {
+            None
+        };
+        if let Some(key) = key {
             state.cache.insert(key, SessionEntry::Absent);
             state.evict_if_needed(self.max_entries);
         }
@@ -587,60 +648,68 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
     ) -> Result<Option<SessionRecord>> {
-        let (record, generation) = self.checkout_session(address, backend).await?;
+        let (record, checkout) = self.checkout_session(address, backend).await?;
         if record.is_none() {
-            self.cancel_session_checkout(address, generation);
+            self.cancel_session_checkout(address, checkout);
         }
         Ok(record)
     }
 
-    /// The generation prevents a cancelled checkout from surviving a lossy reset.
+    /// The checkout key rejects stale owners and owners from before a lossy reset.
     #[doc(hidden)]
     pub async fn checkout_session(
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<(Option<SessionRecord>, u64)> {
+    ) -> Result<(Option<SessionRecord>, SessionCheckoutKey)> {
         let key = address.as_str();
         {
             let mut state = self.lock_sessions().await;
-            let generation = state.checkout_generation;
             match state.checkout(key) {
-                CachedSessionCheckout::Present(record) => {
-                    return Ok((Some(record), generation));
+                CachedSessionCheckout::Present(record, checkout) => {
+                    return Ok((Some(record), checkout));
                 }
-                CachedSessionCheckout::Absent => return Ok((None, generation)),
+                CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
                 CachedSessionCheckout::Busy => {
                     anyhow::bail!("session is already checked out")
                 }
-                CachedSessionCheckout::Missing => {}
+                CachedSessionCheckout::Missing(_) => {}
             }
         }
         // Backend I/O outside the lock
         let backend_result = backend.get_session(key).await?;
         let mut state = self.lock_sessions().await;
-        let generation = state.checkout_generation;
-        match state.checkout(key) {
-            CachedSessionCheckout::Present(record) => return Ok((Some(record), generation)),
-            CachedSessionCheckout::Absent => return Ok((None, generation)),
+        let checkout = match state.checkout(key) {
+            CachedSessionCheckout::Present(record, checkout) => {
+                return Ok((Some(record), checkout));
+            }
+            CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
             CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
-            CachedSessionCheckout::Missing => {}
-        }
+            CachedSessionCheckout::Missing(checkout) => checkout,
+        };
         match backend_result {
             Some(bytes) => {
                 let record = SessionRecord::deserialize_for_store(&bytes, &state.incarnation)?;
-                state
-                    .cache
-                    .insert(Arc::from(key), SessionEntry::CheckedOut(true));
+                state.cache.insert(
+                    Arc::from(key),
+                    SessionEntry::CheckedOut {
+                        had_session: true,
+                        token: checkout.token(),
+                    },
+                );
                 state.evict_if_needed(self.max_entries);
-                Ok((Some(record), generation))
+                Ok((Some(record), checkout))
             }
             None => {
-                state
-                    .cache
-                    .insert(Arc::from(key), SessionEntry::CheckedOut(false));
+                state.cache.insert(
+                    Arc::from(key),
+                    SessionEntry::CheckedOut {
+                        had_session: false,
+                        token: checkout.token(),
+                    },
+                );
                 state.evict_if_needed(self.max_entries);
-                Ok((None, generation))
+                Ok((None, checkout))
             }
         }
     }
@@ -650,16 +719,15 @@ impl SignalStoreCache {
     pub fn try_checkout_session(
         &self,
         address: &ProtocolAddress,
-    ) -> Option<Result<(Option<SessionRecord>, u64)>> {
+    ) -> Option<Result<(Option<SessionRecord>, SessionCheckoutKey)>> {
         let mut state = self.try_lock_sessions()?;
-        let generation = state.checkout_generation;
         match state.checkout(address.as_str()) {
-            CachedSessionCheckout::Present(record) => Some(Ok((Some(record), generation))),
-            CachedSessionCheckout::Absent => Some(Ok((None, generation))),
+            CachedSessionCheckout::Present(record, checkout) => Some(Ok((Some(record), checkout))),
+            CachedSessionCheckout::Absent(checkout) => Some(Ok((None, checkout))),
             CachedSessionCheckout::Busy => {
                 Some(Err(anyhow::anyhow!("session is already checked out")))
             }
-            CachedSessionCheckout::Missing => None,
+            CachedSessionCheckout::Missing(_) => None,
         }
     }
 
@@ -683,25 +751,27 @@ impl SignalStoreCache {
         // Backend I/O outside the lock
         let backend_result = backend.get_session(key).await?;
         let mut state = self.lock_sessions().await;
+        if let Some(entry) = state.cache.get(key) {
+            return match entry {
+                SessionEntry::Present(record) => Ok(Some(record.clone())),
+                SessionEntry::Absent | SessionEntry::CheckedOut { .. } => Ok(None),
+            };
+        }
         match backend_result {
             Some(bytes) => {
                 let record = Arc::new(SessionRecord::deserialize_for_store(
                     &bytes,
                     &state.incarnation,
                 )?);
-                if !state.cache.contains_key(key) {
-                    state
-                        .cache
-                        .insert(Arc::from(key), SessionEntry::Present(record.clone()));
-                    state.evict_if_needed(self.max_entries);
-                }
+                state
+                    .cache
+                    .insert(Arc::from(key), SessionEntry::Present(record.clone()));
+                state.evict_if_needed(self.max_entries);
                 Ok(Some(record))
             }
             None => {
-                if !state.cache.contains_key(key) {
-                    state.cache.insert(Arc::from(key), SessionEntry::Absent);
-                    state.evict_if_needed(self.max_entries);
-                }
+                state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                state.evict_if_needed(self.max_entries);
                 Ok(None)
             }
         }
@@ -740,10 +810,7 @@ impl SignalStoreCache {
     /// `None` sends the caller to the async path (backend consult).
     pub fn try_has_session(&self, address: &ProtocolAddress) -> Option<bool> {
         let state = self.try_lock_sessions()?;
-        state
-            .cache
-            .get(address.as_str())
-            .map(|entry| !matches!(entry, SessionEntry::Absent))
+        state.cache.get(address.as_str()).map(SessionEntry::exists)
     }
 
     pub async fn delete_session(&self, address: &ProtocolAddress) {
@@ -751,7 +818,7 @@ impl SignalStoreCache {
         state.delete(address.as_str());
     }
 
-    /// Non-destructive existence check (`CheckedOut` counts as present).
+    /// Non-destructive existence check; an empty checkout remains absent.
     /// Backend misses are negative-cached; hits are not cached to skip
     /// deserialization (the subsequent `get_session` will cache on demand).
     pub async fn has_session(
@@ -763,18 +830,18 @@ impl SignalStoreCache {
         {
             let state = self.lock_sessions().await;
             if let Some(entry) = state.cache.get(key) {
-                return Ok(!matches!(entry, SessionEntry::Absent));
+                return Ok(entry.exists());
             }
         }
         // Backend I/O outside the lock
         let exists = backend.has_session(key).await?;
+        let mut state = self.lock_sessions().await;
+        if let Some(entry) = state.cache.get(key) {
+            return Ok(entry.exists());
+        }
         if !exists {
-            let mut state = self.lock_sessions().await;
-            // Re-check: another task may have populated the cache
-            if !state.cache.contains_key(key) {
-                state.cache.insert(Arc::from(key), SessionEntry::Absent);
-                state.evict_if_needed(self.max_entries);
-            }
+            state.cache.insert(Arc::from(key), SessionEntry::Absent);
+            state.evict_if_needed(self.max_entries);
         }
         Ok(exists)
     }
@@ -978,7 +1045,7 @@ impl SignalStoreCache {
             for key in &dirty_keys {
                 if !matches!(
                     state.cache.get(key.as_ref()),
-                    Some(SessionEntry::CheckedOut(_))
+                    Some(SessionEntry::CheckedOut { .. })
                 ) {
                     state.dirty.remove(key);
                 }
@@ -1013,7 +1080,7 @@ impl SignalStoreCache {
                         // borrow is held across the backend roundtrip.
                         let durable = match state.cache.get(addr.as_ref()) {
                             Some(SessionEntry::Present(_)) => Some(true),
-                            Some(SessionEntry::CheckedOut(_)) => Some(false),
+                            Some(SessionEntry::CheckedOut { .. }) => Some(false),
                             Some(SessionEntry::Absent) | None => None,
                         };
                         let durable = match durable {
@@ -1151,7 +1218,7 @@ impl SignalStoreCache {
                     keys_len += k.len();
                     match v {
                         SessionEntry::Present(rec) => Some(rec.clone()),
-                        SessionEntry::Absent | SessionEntry::CheckedOut(_) => None,
+                        SessionEntry::Absent | SessionEntry::CheckedOut { .. } => None,
                     }
                 })
                 .collect();
@@ -1200,13 +1267,12 @@ impl SignalStoreCache {
     }
 
     async fn clear_with_incarnation(&self, incarnation: StoreIncarnation) {
+        self.session_recovery_generation
+            .fetch_add(1, Ordering::AcqRel);
         {
             let mut sessions = self.sessions.lock().await;
             let mut pending = self.pending_session_restores();
-            let generation = self
-                .session_recovery_generation
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1);
+            let generation = self.session_recovery_generation.load(Ordering::Acquire);
             pending.clear();
             self.has_pending_session_restores
                 .store(false, Ordering::Release);
@@ -1250,6 +1316,105 @@ impl SignalStoreCache {
 mod sender_key_lock_tests {
     use super::*;
     use crate::libsignal::store::sender_key_name::SenderKeyName;
+    use crate::store::error::Result as StoreResult;
+    use bytes::Bytes;
+
+    struct BlockingSessionLookup {
+        started: async_lock::Barrier,
+        release: async_lock::Barrier,
+    }
+
+    impl BlockingSessionLookup {
+        fn new() -> Self {
+            Self {
+                started: async_lock::Barrier::new(2),
+                release: async_lock::Barrier::new(2),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SignalStore for BlockingSessionLookup {
+        async fn put_identity(&self, _: &str, _: [u8; 32]) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn load_identity(&self, _: &str) -> StoreResult<Option<[u8; 32]>> {
+            unreachable!()
+        }
+
+        async fn delete_identity(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn get_session(&self, _: &str) -> StoreResult<Option<Bytes>> {
+            self.started.wait().await;
+            self.release.wait().await;
+            Ok(None)
+        }
+
+        async fn has_session(&self, _: &str) -> StoreResult<bool> {
+            self.started.wait().await;
+            self.release.wait().await;
+            Ok(false)
+        }
+
+        async fn put_session(&self, _: &str, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn delete_session(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn store_prekey(&self, _: u32, _: &[u8], _: bool) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn load_prekey(&self, _: u32) -> StoreResult<Option<Bytes>> {
+            unreachable!()
+        }
+
+        async fn mark_prekeys_uploaded(&self, _: &[u32]) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn remove_prekey(&self, _: u32) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn get_max_prekey_id(&self) -> StoreResult<u32> {
+            unreachable!()
+        }
+
+        async fn store_signed_prekey(&self, _: u32, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn load_signed_prekey(&self, _: u32) -> StoreResult<Option<Vec<u8>>> {
+            unreachable!()
+        }
+
+        async fn load_all_signed_prekeys(&self) -> StoreResult<Vec<(u32, Vec<u8>)>> {
+            unreachable!()
+        }
+
+        async fn remove_signed_prekey(&self, _: u32) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn put_sender_key(&self, _: &str, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+
+        async fn get_sender_key(&self, _: &str) -> StoreResult<Option<Vec<u8>>> {
+            unreachable!()
+        }
+
+        async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+    }
 
     async fn wait_for_lock_waiter(lock: &Arc<Mutex<()>>, baseline: usize) {
         for _ in 0..10_000 {
@@ -1479,6 +1644,81 @@ mod sender_key_lock_tests {
     }
 
     #[tokio::test]
+    async fn lossy_clear_invalidates_checkouts_before_waiting_for_the_cache() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550007776".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        let (record, checkout) = cache.checkout_session(&addr, &backend).await.unwrap();
+
+        let sessions = cache.sessions.lock().await;
+        let clear = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.clear().await }
+        });
+        for _ in 0..10_000 {
+            if cache.session_recovery_generation.load(Ordering::Acquire) != checkout.generation() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_ne!(
+            cache.session_recovery_generation.load(Ordering::Acquire),
+            checkout.generation(),
+            "clear must invalidate owners before waiting"
+        );
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &addr,
+                record.expect("checked-out record"),
+                checkout,
+                true,
+            ),
+            SessionCheckoutStoreResult::Rejected
+        ));
+
+        drop(sessions);
+        clear.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_checkout_cannot_overwrite_a_new_owner() {
+        let cache = SignalStoreCache::new();
+        let addr = ProtocolAddress::new("15550007775".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+
+        let (old_record, old_checkout) = cache
+            .try_checkout_session(&addr)
+            .expect("warm checkout")
+            .expect("old owner");
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        let (new_record, new_checkout) = cache
+            .try_checkout_session(&addr)
+            .expect("warm checkout")
+            .expect("new owner");
+        assert_ne!(old_checkout, new_checkout);
+
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &addr,
+                old_record.expect("old record"),
+                old_checkout,
+                true,
+            ),
+            SessionCheckoutStoreResult::Rejected
+        ));
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &addr,
+                new_record.expect("new record"),
+                new_checkout,
+                true,
+            ),
+            SessionCheckoutStoreResult::Stored
+        ));
+    }
+
+    #[tokio::test]
     async fn checkout_rejects_a_competing_owner() {
         let cache = SignalStoreCache::new();
         let addr = ProtocolAddress::new("15550007770".to_string(), 1.into());
@@ -1561,6 +1801,8 @@ mod sender_key_lock_tests {
 
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
         assert!(record.is_none());
+        assert_eq!(cache.try_has_session(&addr), Some(false));
+        assert!(!cache.has_session(&addr, &backend).await.unwrap());
         assert!(cache.checkout_session(&addr, &backend).await.is_err());
         cache.cancel_session_checkout(&addr, generation);
 
@@ -1572,6 +1814,44 @@ mod sender_key_lock_tests {
         drop(sessions);
         cache.complete_session_checkout().await;
         assert_eq!(cache.try_has_session(&addr), Some(false));
+    }
+
+    #[tokio::test]
+    async fn peek_prefers_a_cache_write_that_wins_the_backend_race() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(BlockingSessionLookup::new());
+        let addr = ProtocolAddress::new("15550007774".to_string(), 1.into());
+
+        let peek = tokio::spawn({
+            let cache = cache.clone();
+            let backend = backend.clone();
+            let addr = addr.clone();
+            async move { cache.peek_session(&addr, backend.as_ref()).await }
+        });
+        backend.started.wait().await;
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        backend.release.wait().await;
+
+        assert!(peek.await.unwrap().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn existence_prefers_a_cache_write_that_wins_the_backend_race() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(BlockingSessionLookup::new());
+        let addr = ProtocolAddress::new("15550007772".to_string(), 2.into());
+
+        let exists = tokio::spawn({
+            let cache = cache.clone();
+            let backend = backend.clone();
+            let addr = addr.clone();
+            async move { cache.has_session(&addr, backend.as_ref()).await }
+        });
+        backend.started.wait().await;
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        backend.release.wait().await;
+
+        assert!(exists.await.unwrap().unwrap());
     }
 
     #[tokio::test]
@@ -2448,7 +2728,7 @@ mod eviction_tests {
             let state = cache.sessions.lock().await;
             let entry = state.cache.get(pinned.as_str());
             assert!(
-                matches!(entry, Some(SessionEntry::CheckedOut(_))),
+                matches!(entry, Some(SessionEntry::CheckedOut { .. })),
                 "checked-out session must survive eviction"
             );
             assert!(
@@ -2602,7 +2882,7 @@ mod lease_reload_tests {
             assert!(state.dirty.contains(address.as_str()));
             assert!(matches!(
                 state.cache.get(address.as_str()),
-                Some(SessionEntry::CheckedOut(_))
+                Some(SessionEntry::CheckedOut { .. })
             ));
         }
 

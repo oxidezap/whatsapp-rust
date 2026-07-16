@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, PreKeyId,
-    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionCheckoutStoreResult, SessionRecord,
-    SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionCheckoutKey, SessionCheckoutStoreResult,
+    SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord,
+    SignedPreKeyStore,
 };
 
 use wacore::libsignal::store::record_helpers as wacore_record;
@@ -110,23 +111,24 @@ impl SessionStore for SessionAdapter {
     async fn load_session_for_update(
         &self,
         address: &ProtocolAddress,
-    ) -> Result<(Option<SessionRecord>, Option<u64>), SignalProtocolError> {
+    ) -> Result<(Option<SessionRecord>, Option<SessionCheckoutKey>), SignalProtocolError> {
         let device = self.0.device.read().await;
         self.0
             .cache
             .checkout_session(address, &*device.backend)
             .await
-            .map(|(record, generation)| (record, Some(generation)))
+            .map(|(record, checkout)| (record, Some(checkout)))
             .map_err(signal_err("backend"))
     }
 
     fn try_load_session_for_update(
         &self,
         address: &ProtocolAddress,
-    ) -> Option<Result<(Option<SessionRecord>, Option<u64>), SignalProtocolError>> {
+    ) -> Option<Result<(Option<SessionRecord>, Option<SessionCheckoutKey>), SignalProtocolError>>
+    {
         self.0.cache.try_checkout_session(address).map(|result| {
             result
-                .map(|(record, generation)| (record, Some(generation)))
+                .map(|(record, checkout)| (record, Some(checkout)))
                 .map_err(signal_err("backend"))
         })
     }
@@ -135,20 +137,24 @@ impl SessionStore for SessionAdapter {
         &mut self,
         address: &ProtocolAddress,
         record: SessionRecord,
-        generation: Option<u64>,
+        checkout: Option<SessionCheckoutKey>,
         had_session: bool,
     ) -> SessionCheckoutStoreResult {
-        let Some(generation) = generation else {
+        let Some(checkout) = checkout else {
             return SessionCheckoutStoreResult::Unhandled(record);
         };
         self.0
             .cache
-            .restore_session_from_checkout(address, record, generation, had_session)
+            .restore_session_from_checkout(address, record, checkout, had_session)
     }
 
-    fn cancel_session_checkout(&mut self, address: &ProtocolAddress, generation: Option<u64>) {
-        if let Some(generation) = generation {
-            self.0.cache.cancel_session_checkout(address, generation);
+    fn cancel_session_checkout(
+        &mut self,
+        address: &ProtocolAddress,
+        checkout: Option<SessionCheckoutKey>,
+    ) {
+        if let Some(checkout) = checkout {
+            self.0.cache.cancel_session_checkout(address, checkout);
         }
     }
 
