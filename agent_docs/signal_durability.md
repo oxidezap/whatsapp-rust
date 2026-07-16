@@ -108,8 +108,8 @@ For any new or changed ciphertext path, verify:
 Focused unit tests live beside `SignalStoreCache`, record serialization, and
 the libsignal ciphers. The deterministic state machine combines DM and group
 sends, failed writes, cancellation, checkout/flush overlap, tombstones, clean
-reloads, lossy clears, crash recovery, out-of-order group delivery, and retry
-redistribution.
+reloads, lossy clears, crash recovery, out-of-order group delivery, receiver
+state loss, and retry redistribution.
 
 ```bash
 # Small matrix in normal CI

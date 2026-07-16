@@ -249,5 +249,7 @@ async fn signal_durability_sqlite_process_restart() {
     assert_eq!(status.code(), Some(CHILD_EXIT_CODE));
 
     verify_recovery(database.to_str().expect("UTF-8 database path")).await;
-    remove_database(&database);
+    tokio::task::spawn_blocking(move || remove_database(&database))
+        .await
+        .expect("database cleanup task");
 }

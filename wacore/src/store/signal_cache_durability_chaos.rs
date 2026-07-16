@@ -19,8 +19,7 @@ const NIGHTLY_SEEDS: usize = 128;
 const NIGHTLY_STEPS: usize = 256;
 const DEFAULT_SEED: u64 = 0x51A6_DA7A_B1E5_0001;
 
-type DmFingerprint = ([u8; 32], [u8; 16]);
-type GroupFingerprint = (u32, u32);
+type KeyIvFingerprint = ([u8; 32], [u8; 16]);
 
 struct CachedSenderKeyStore<'a> {
     cache: &'a SignalStoreCache,
@@ -70,6 +69,7 @@ enum Action {
     DeleteDm,
     DeleteGroup,
     CheckoutDuringFlush,
+    RecoverGroup,
 }
 
 #[derive(Clone, Copy)]
@@ -91,7 +91,7 @@ impl SplitMix64 {
     }
 
     fn action(&mut self) -> Action {
-        match self.next() % 24 {
+        match self.next() % 25 {
             0 => Action::DmSend { fail_gate: true },
             1..=6 => Action::DmSend { fail_gate: false },
             7 => Action::GroupSend { fail_gate: true },
@@ -108,6 +108,7 @@ impl SplitMix64 {
             21 => Action::DeleteDm,
             22 => Action::DeleteGroup,
             23 => Action::CheckoutDuringFlush,
+            24 => Action::RecoverGroup,
             _ => unreachable!(),
         }
     }
@@ -122,8 +123,8 @@ struct ChaosHarness {
     group_name: SenderKeyName,
     crypto_rng: rand::rngs::StdRng,
     incarnation_generation: u64,
-    published_dm: HashSet<DmFingerprint>,
-    published_group: HashSet<GroupFingerprint>,
+    published_dm: HashSet<KeyIvFingerprint>,
+    published_group: HashSet<KeyIvFingerprint>,
     pending_group: VecDeque<SenderKeyMessage>,
 }
 
@@ -169,7 +170,9 @@ impl ChaosHarness {
                 self.group_send(fail_gate).await?;
             }
             Action::DmCancel => self.dm_cancel().await?,
-            Action::DeliverGroup { newest } => self.deliver_group(newest).await?,
+            Action::DeliverGroup { newest } => {
+                self.deliver_group(newest).await?;
+            }
             Action::Flush => self.flush_successfully().await?,
             Action::FailPendingFlush => self.fail_pending_flush().await?,
             Action::CleanReload => self.clean_reload().await?,
@@ -182,6 +185,7 @@ impl ChaosHarness {
                     .await;
             }
             Action::CheckoutDuringFlush => self.checkout_during_flush().await?,
+            Action::RecoverGroup => self.recover_group().await?,
         }
         self.assert_invariants().await
     }
@@ -286,14 +290,21 @@ impl ChaosHarness {
     }
 
     async fn group_send(&mut self, fail_gate: bool) -> anyhow::Result<bool> {
-        if self
+        let record = if let Some(record) = self
             .cache
             .get_sender_key(&self.group_name, &self.backend)
             .await?
-            .is_none()
         {
+            record
+        } else {
             self.sync_group_distribution().await?;
-        }
+            self.cache
+                .get_sender_key(&self.group_name, &self.backend)
+                .await?
+                .context("sender-key setup did not populate the cache")?
+        };
+        let fingerprint = group_key_fingerprint(&record)?;
+        drop(record);
         let message = {
             let mut sender = CachedSenderKeyStore {
                 cache: &self.cache,
@@ -307,7 +318,6 @@ impl ChaosHarness {
             )
             .await?
         };
-        let fingerprint = (message.chain_id(), message.iteration());
         let published = self
             .release_wire_gate(if fail_gate {
                 FlushFailure::SenderKey
@@ -318,7 +328,9 @@ impl ChaosHarness {
         if published {
             ensure!(
                 self.published_group.insert(fingerprint),
-                "group chain/iteration was published twice: {fingerprint:?}"
+                "group key/IV was published twice at chain {} iteration {}",
+                message.chain_id(),
+                message.iteration()
             );
             self.pending_group.push_back(message);
             if self.pending_group.len() > 64 {
@@ -351,20 +363,20 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn deliver_group(&mut self, newest: bool) -> anyhow::Result<()> {
+    async fn deliver_group(&mut self, newest: bool) -> anyhow::Result<bool> {
         let Some(message) = (if newest {
             self.pending_group.pop_back()
         } else {
             self.pending_group.pop_front()
         }) else {
-            return Ok(());
+            return Ok(false);
         };
         let mut receiver = CachedSenderKeyStore {
             cache: &self.receiver_cache,
             backend: &self.receiver_backend,
         };
         match group_decrypt(message.serialized(), &mut receiver, &self.group_name).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(false),
             Err(SignalProtocolError::InvalidMessage(
                 CiphertextMessageType::SenderKey,
                 "message from too far into the future",
@@ -391,6 +403,23 @@ impl ChaosHarness {
             plaintext == b"durability-chaos",
             "group retry decrypted the wrong plaintext"
         );
+        Ok(true)
+    }
+
+    async fn recover_group(&mut self) -> anyhow::Result<()> {
+        if self.pending_group.is_empty() {
+            ensure!(
+                self.group_send(false).await?,
+                "group recovery setup remained behind a durability gate"
+            );
+        }
+        self.receiver_cache
+            .delete_sender_key(self.group_name.cache_key())
+            .await;
+        ensure!(
+            self.deliver_group(false).await?,
+            "lost receiver state did not exercise group recovery"
+        );
         Ok(())
     }
 
@@ -398,6 +427,7 @@ impl ChaosHarness {
         if !self.cache.needs_pre_wire_flush().await {
             return Ok(true);
         }
+        let failure = self.failure_for_pending_gate(failure).await;
         self.backend
             .set_fail_session_writes(matches!(failure, FlushFailure::Session));
         self.backend
@@ -420,6 +450,32 @@ impl ChaosHarness {
             "failed pre-wire flush released its gate"
         );
         Ok(false)
+    }
+
+    async fn failure_for_pending_gate(&self, preferred: FlushFailure) -> FlushFailure {
+        if matches!(preferred, FlushFailure::None) {
+            return preferred;
+        }
+        let session_pending = !self
+            .cache
+            .lock_sessions()
+            .await
+            .reservation_pending
+            .is_empty();
+        let sender_pending = !self
+            .cache
+            .sender_keys
+            .lock()
+            .await
+            .wire_gate_pending
+            .is_empty();
+        match preferred {
+            FlushFailure::Session if session_pending => preferred,
+            FlushFailure::SenderKey if sender_pending => preferred,
+            _ if session_pending => FlushFailure::Session,
+            _ if sender_pending => FlushFailure::SenderKey,
+            _ => preferred,
+        }
     }
 
     async fn fail_pending_flush(&self) -> anyhow::Result<()> {
@@ -657,6 +713,21 @@ fn group_position(record: &SenderKeyRecord) -> anyhow::Result<(u32, u32)> {
     ))
 }
 
+fn group_key_fingerprint(record: &SenderKeyRecord) -> anyhow::Result<KeyIvFingerprint> {
+    let message_key = record
+        .sender_key_state()
+        .map_err(|_| anyhow::anyhow!("group sender-key state missing"))?
+        .sender_chain_key()
+        .context("group sender chain missing")?
+        .sender_message_key();
+    let cipher_key: [u8; 32] = message_key
+        .cipher_key()
+        .try_into()
+        .context("group cipher key length")?;
+    let iv: [u8; 16] = message_key.iv().try_into().context("group IV length")?;
+    Ok((cipher_key, iv))
+}
+
 fn incarnation(seed: u64, generation: u64) -> StoreIncarnation {
     let mut rng = SplitMix64(seed ^ generation.wrapping_mul(0xD134_2543_DE82_EF95));
     let mut value = [0; 16];
@@ -666,22 +737,37 @@ fn incarnation(seed: u64, generation: u64) -> StoreIncarnation {
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    let Some(value) = std::env::var(name).ok() else {
-        return default;
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return default,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            panic!("invalid {name}={value:?}: expected Unicode")
+        }
     };
-    if let Some(hex) = value.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).unwrap_or(default)
+    let parsed = if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16)
     } else {
-        value.parse().unwrap_or(default)
-    }
+        value.parse()
+    };
+    parsed.unwrap_or_else(|error| panic!("invalid {name}={value:?}: {error}"))
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-        .clamp(1, 4096)
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return default,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            panic!("invalid {name}={value:?}: expected Unicode")
+        }
+    };
+    let parsed = value
+        .parse::<usize>()
+        .unwrap_or_else(|error| panic!("invalid {name}={value:?}: {error}"));
+    assert!(
+        (1..=4096).contains(&parsed),
+        "invalid {name}={value:?}: expected 1..=4096"
+    );
+    parsed
 }
 
 async fn run_seed(seed: u64, steps: usize) -> anyhow::Result<()> {
