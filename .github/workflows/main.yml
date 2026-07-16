@@ -65,6 +65,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Reclaim unused Android SDK space
+        run: |
+          df -h /
+          sudo rm -rf --one-file-system /usr/local/lib/android
+          df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
