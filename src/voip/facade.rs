@@ -1621,8 +1621,11 @@ impl CallHandle {
                     self.teardown_local_video();
                     return Err(e.into());
                 }
-                // The accept already committed the peer; a failed follow-up cannot be rolled back.
-                send_state(VideoState::Enabled, None).await?;
+                if let Err(e) = send_state(VideoState::Enabled, None).await {
+                    // The peer times out an incomplete handshake; keep local media aligned with it.
+                    self.teardown_local_video();
+                    return Err(e.into());
+                }
             }
         }
         Ok(())
@@ -3640,7 +3643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_video_keeps_local_plane_after_accept_reaches_peer() {
+    async fn accept_video_enabled_failure_rolls_back_local_plane() {
         let (client, sent) = make_sending_client_with_failure_after(Some(1)).await;
         let registry = client.call_registry();
         let generation = registry.insert(mk_session());
@@ -3670,10 +3673,8 @@ mod tests {
         let (source, sink) = video_endpoints();
         assert!(handle.accept_video(source, sink).await.is_err());
         assert_eq!(sent.load(Ordering::SeqCst), 2);
-        assert!(video.sink_slot.lock().unwrap().is_some());
-        assert!(registry.snapshot("CID-FACADE").unwrap().is_video);
-
-        handle.teardown_local_video();
+        assert!(video.sink_slot.lock().unwrap().is_none());
+        assert!(!registry.snapshot("CID-FACADE").unwrap().is_video);
     }
 
     #[tokio::test]

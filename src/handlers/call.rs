@@ -211,7 +211,7 @@ impl StanzaHandler for CallHandler {
                         } else {
                             false
                         };
-                        let transition_current = acked
+                        let mut transition_current = acked
                             && generation
                                 .is_some_and(|generation| registry.is_current(call_id, generation));
                         dispatch_call = transition_current;
@@ -225,41 +225,6 @@ impl StanzaHandler for CallHandler {
                         }
                         // Only drive our local plane once the peer has been acked; see above.
                         if transition_current && let Some(generation) = generation {
-                            let event_delivered = event_permit.as_ref().is_some_and(|permit| {
-                                permit.send(CallEvent::VideoStateChanged {
-                                    state: *state,
-                                    orientation: *orientation,
-                                })
-                            });
-                            if !event_delivered {
-                                warn!("call: video state event receiver closed after typed ack");
-                            }
-                            if let Some(o) = orientation {
-                                registry.send_video_ctl(
-                                    call_id,
-                                    generation,
-                                    VideoControl::SetOrientation(*o),
-                                );
-                            }
-                            match state {
-                                // The peer's video is (about to be) live; make sure our plane decodes
-                                // it even when the consumer skipped `.video()` and only accepts later
-                                // — decoding costs nothing until packets arrive.
-                                VideoState::UpgradeAccept | VideoState::Enabled => {
-                                    registry.set_is_video(call_id, generation, true);
-                                    registry.send_video_ctl(
-                                        call_id,
-                                        generation,
-                                        VideoControl::Enable,
-                                    );
-                                }
-                                // The peer stopped ITS video; our outbound is the consumer's call
-                                // (stop_video), so only the flag is updated here.
-                                VideoState::Disabled | VideoState::Stopped => {
-                                    registry.set_is_video(call_id, generation, false);
-                                }
-                                _ => {}
-                            }
                             if *state == VideoState::UpgradeAccept
                                 && registry.is_current(call_id, generation)
                             {
@@ -274,9 +239,58 @@ impl StanzaHandler for CallHandler {
                                 });
                                 if let Err(e) = client.send_node(enabled).await {
                                     warn!("call: failed to announce accepted video upgrade: {e}");
+                                    if !registry.run_video_teardown(call_id, generation) {
+                                        registry.send_video_ctl(
+                                            call_id,
+                                            generation,
+                                            VideoControl::Disable,
+                                        );
+                                    }
+                                    registry.set_is_video(call_id, generation, false);
+                                    transition_current = false;
                                 }
                             }
-                            dispatch_call = registry.is_current(call_id, generation);
+                            transition_current &= registry.is_current(call_id, generation);
+                            if transition_current {
+                                let event_delivered = event_permit.as_ref().is_some_and(|permit| {
+                                    permit.send(CallEvent::VideoStateChanged {
+                                        state: *state,
+                                        orientation: *orientation,
+                                    })
+                                });
+                                if !event_delivered {
+                                    warn!(
+                                        "call: video state event receiver closed after typed ack"
+                                    );
+                                }
+                                if let Some(o) = orientation {
+                                    registry.send_video_ctl(
+                                        call_id,
+                                        generation,
+                                        VideoControl::SetOrientation(*o),
+                                    );
+                                }
+                                match state {
+                                    // The peer's video is (about to be) live; make sure our plane decodes
+                                    // it even when the consumer skipped `.video()` and only accepts later
+                                    // — decoding costs nothing until packets arrive.
+                                    VideoState::UpgradeAccept | VideoState::Enabled => {
+                                        registry.set_is_video(call_id, generation, true);
+                                        registry.send_video_ctl(
+                                            call_id,
+                                            generation,
+                                            VideoControl::Enable,
+                                        );
+                                    }
+                                    // The peer stopped ITS video; our outbound is the consumer's call
+                                    // (stop_video), so only the flag is updated here.
+                                    VideoState::Disabled | VideoState::Stopped => {
+                                        registry.set_is_video(call_id, generation, false);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            dispatch_call = transition_current;
                         }
                         // Keep the transition serialized through every committed side effect.
                         drop(event_permit);
@@ -415,28 +429,47 @@ mod tests {
     /// A client whose sends land on a counting transport (so ack sends succeed and can be counted).
     #[cfg(feature = "voip")]
     async fn make_sending_client() -> Arc<Client> {
+        make_sending_client_with_failure_after(None).await.0
+    }
+
+    #[cfg(feature = "voip")]
+    async fn make_sending_client_with_failure_after(
+        failure_after: Option<usize>,
+    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use wacore::handshake::NoiseCipher;
 
-        struct NullTransport;
+        struct CountingTransport {
+            sends: Arc<AtomicUsize>,
+            failure_after: Option<usize>,
+        }
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl crate::transport::Transport for NullTransport {
+        impl crate::transport::Transport for CountingTransport {
             async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+                let attempt = self.sends.fetch_add(1, Ordering::SeqCst);
+                if self.failure_after.is_some_and(|limit| attempt >= limit) {
+                    return Err(anyhow::anyhow!("injected transport send failure"));
+                }
                 Ok(())
             }
             async fn disconnect(&self) {}
         }
 
         let client = make_client().await;
+        let sends = Arc::new(AtomicUsize::new(0));
         let key = [0u8; 32];
         let noise_socket = crate::socket::NoiseSocket::new(
             Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(NullTransport) as Arc<dyn crate::transport::Transport>,
+            Arc::new(CountingTransport {
+                sends: sends.clone(),
+                failure_after,
+            }) as Arc<dyn crate::transport::Transport>,
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
         *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
-        client
+        (client, sends)
     }
 
     #[cfg(feature = "voip")]
@@ -633,6 +666,52 @@ mod tests {
         };
         assert!(handled);
         assert!(cancelled);
+        assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn failed_enabled_announcement_rolls_back_the_video_upgrade() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        assert!(registry.set_is_video("CALL-ID-0001", generation, true));
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, control_rx) = async_channel::unbounded::<VideoControl>();
+        let teardown_control = control_tx.clone();
+        let teardowns = Arc::new(AtomicUsize::new(0));
+        registry.set_video_channels("CALL-ID-0001", generation, event_tx, control_tx, {
+            let teardowns = teardowns.clone();
+            Box::new(move || {
+                teardowns.fetch_add(1, Ordering::SeqCst);
+                let _ = teardown_control.force_send(VideoControl::Disable);
+            })
+        });
+
+        let node = node_to_owned_ref(&video_stanza("4"));
+        let mut cancelled = false;
+        assert!(CallHandler.handle(client, node, &mut cancelled).await);
+
+        assert!(
+            cancelled,
+            "the successful typed ack suppresses the generic ack"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert_eq!(teardowns.load(Ordering::SeqCst), 1);
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(control_rx.try_recv(), Ok(VideoControl::Disable));
+        assert!(control_rx.try_recv().is_err());
+        assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
+        assert!(global_rx.try_recv().is_err());
         assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
     }
 
