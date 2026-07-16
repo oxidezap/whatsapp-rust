@@ -130,14 +130,15 @@ pub trait SignedPreKeyStore: ThreadSafe {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait SessionStore: ThreadSafe {
-    /// Takes the session for `address`. Implementations with caches should
-    /// treat this as a logical checkout; callers must always call
-    /// [`store_session`] to return the record, even on error paths. Async
-    /// mutation paths use [`SessionCheckout`] so cancellation also returns it.
+    /// Loads the session for `address` without removing it from the store.
+    /// Destructive cache checkouts belong in [`load_session_for_update`].
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
 
-    /// Couples take-style loads to a generation so cancellation cannot restore
-    /// state across a lossy cache reset.
+    /// Loads a mutation copy and optionally marks it as destructively checked out.
+    ///
+    /// `None` is an assertion that [`load_session`] was non-destructive. A store
+    /// returning a generation must also implement
+    /// [`try_store_session_from_checkout`] so cancellation can restore the record.
     #[doc(hidden)]
     async fn load_session_for_update(
         &self,
@@ -156,18 +157,35 @@ pub trait SessionStore: ThreadSafe {
         record: SessionRecord,
     ) -> Result<()>;
 
-    /// Gives take-style stores a synchronous recovery path before an async
+    /// Gives destructive stores a synchronous recovery path before an async
     /// owner can be cancelled again.
     #[doc(hidden)]
-    #[allow(clippy::result_large_err)]
     fn try_store_session_from_checkout(
         &mut self,
         _address: &ProtocolAddress,
         record: SessionRecord,
         _generation: Option<u64>,
-    ) -> core::result::Result<bool, SessionRecord> {
-        Err(record)
+        _had_session: bool,
+    ) -> SessionCheckoutStoreResult {
+        SessionCheckoutStoreResult::Unhandled(record)
     }
+
+    /// Releases an empty reservation made by a destructive update load.
+    #[doc(hidden)]
+    fn cancel_session_checkout(&mut self, _address: &ProtocolAddress, _generation: Option<u64>) {}
+
+    /// Drives a queued synchronous return once the contended store is available.
+    #[doc(hidden)]
+    async fn complete_session_checkout(&mut self) {}
+}
+
+/// Result of returning a record from a cancellation-safe checkout.
+#[doc(hidden)]
+pub enum SessionCheckoutStoreResult {
+    Stored,
+    Rejected,
+    Pending(std::sync::Arc<portable_atomic::AtomicBool>),
+    Unhandled(SessionRecord),
 }
 
 /// Keeps an owned session recoverable while an async protocol operation can be cancelled.
@@ -186,7 +204,11 @@ impl<'a> SessionCheckout<'a> {
         address: &'a ProtocolAddress,
     ) -> Result<Option<Self>> {
         let (record, generation) = store.load_session_for_update(address).await?;
-        Ok(record.map(|record| Self {
+        let Some(record) = record else {
+            store.cancel_session_checkout(address, generation);
+            return Ok(None);
+        };
+        Ok(Some(Self {
             store,
             address,
             record: Some(record),
@@ -237,7 +259,13 @@ impl<'a> SessionCheckout<'a> {
 
     /// Prevents a deliberately rejected fresh session from being recovered.
     pub fn discard(mut self) {
+        debug_assert!(!self.had_session, "only a fresh checkout can be discarded");
+        if self.had_session {
+            return;
+        }
         self.record.take();
+        self.store
+            .cancel_session_checkout(self.address, self.generation);
     }
 
     /// Returns the record by move without a cancellation gap on take-style stores.
@@ -246,18 +274,34 @@ impl<'a> SessionCheckout<'a> {
             .record
             .take()
             .expect("a live checkout always owns its record");
-        match self
-            .store
-            .try_store_session_from_checkout(self.address, record, self.generation)
-        {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(SignalProtocolError::InvalidState(
-                "SessionCheckout::commit",
-                "cache reset during session mutation".to_string(),
-            )),
-            Err(record) => self.store.store_session(self.address, record).await,
+        match self.store.try_store_session_from_checkout(
+            self.address,
+            record,
+            self.generation,
+            self.had_session,
+        ) {
+            SessionCheckoutStoreResult::Stored => Ok(()),
+            SessionCheckoutStoreResult::Rejected => Err(checkout_rejected()),
+            SessionCheckoutStoreResult::Pending(completion) => {
+                self.store.complete_session_checkout().await;
+                if completion.load(portable_atomic::Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(checkout_rejected())
+                }
+            }
+            SessionCheckoutStoreResult::Unhandled(record) => {
+                self.store.store_session(self.address, record).await
+            }
         }
     }
+}
+
+fn checkout_rejected() -> SignalProtocolError {
+    SignalProtocolError::InvalidState(
+        "SessionCheckout::commit",
+        "session changed during mutation".to_string(),
+    )
 }
 
 impl Drop for SessionCheckout<'_> {
@@ -266,9 +310,20 @@ impl Drop for SessionCheckout<'_> {
             return;
         };
         if self.had_session || record.session_state().is_some() {
-            let _ =
-                self.store
-                    .try_store_session_from_checkout(self.address, record, self.generation);
+            match self.store.try_store_session_from_checkout(
+                self.address,
+                record,
+                self.generation,
+                self.had_session,
+            ) {
+                SessionCheckoutStoreResult::Stored
+                | SessionCheckoutStoreResult::Rejected
+                | SessionCheckoutStoreResult::Pending(_) => {}
+                SessionCheckoutStoreResult::Unhandled(_) => {}
+            }
+        } else {
+            self.store
+                .cancel_session_checkout(self.address, self.generation);
         }
     }
 }

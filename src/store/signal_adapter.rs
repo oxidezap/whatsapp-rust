@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, PreKeyId,
-    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError,
-    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionCheckoutStoreResult, SessionRecord,
+    SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
 };
 
 use wacore::libsignal::store::record_helpers as wacore_record;
@@ -101,8 +101,9 @@ impl SessionStore for SessionAdapter {
         let device = self.0.device.read().await;
         self.0
             .cache
-            .get_session(address, &*device.backend)
+            .peek_session(address, &*device.backend)
             .await
+            .map(|record| record.map(|record| (*record).clone()))
             .map_err(signal_err("backend"))
     }
 
@@ -119,20 +120,29 @@ impl SessionStore for SessionAdapter {
             .map_err(signal_err("backend"))
     }
 
-    #[allow(clippy::result_large_err)]
     fn try_store_session_from_checkout(
         &mut self,
         address: &ProtocolAddress,
         record: SessionRecord,
         generation: Option<u64>,
-    ) -> core::result::Result<bool, SessionRecord> {
+        had_session: bool,
+    ) -> SessionCheckoutStoreResult {
         let Some(generation) = generation else {
-            return Err(record);
+            return SessionCheckoutStoreResult::Unhandled(record);
         };
-        Ok(self
-            .0
+        self.0
             .cache
-            .restore_session_from_checkout(address, record, generation))
+            .restore_session_from_checkout(address, record, generation, had_session)
+    }
+
+    fn cancel_session_checkout(&mut self, address: &ProtocolAddress, generation: Option<u64>) {
+        if let Some(generation) = generation {
+            self.0.cache.cancel_session_checkout(address, generation);
+        }
+    }
+
+    async fn complete_session_checkout(&mut self) {
+        self.0.cache.complete_session_checkout().await;
     }
 
     // Hand-desugared (see `BoxFut`): a cached answer skips the device lock
@@ -704,6 +714,15 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "stored session must be loadable"
+        );
+        assert!(
+            adapter
+                .session_store
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .is_some(),
+            "plain loads must not consume the cached session"
         );
     }
 

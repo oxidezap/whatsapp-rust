@@ -6,7 +6,9 @@ use async_lock::Mutex;
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::RngExt;
 
-use crate::libsignal::protocol::{ProtocolAddress, SenderKeyRecord, SessionRecord};
+use crate::libsignal::protocol::{
+    ProtocolAddress, SenderKeyRecord, SessionCheckoutStoreResult, SessionRecord,
+};
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
 
@@ -109,7 +111,14 @@ enum SessionEntry {
     Present(Arc<SessionRecord>),
     Absent,
     /// Taken by load_session; has_session treats as present, flush/eviction skip.
-    CheckedOut,
+    CheckedOut(bool),
+}
+
+enum CachedSessionCheckout {
+    Missing,
+    Absent,
+    Busy,
+    Present(SessionRecord),
 }
 
 struct SessionStoreState {
@@ -166,6 +175,29 @@ impl SessionStoreState {
         self.deleted.remove(&addr);
     }
 
+    fn checkout(&mut self, address: &str) -> CachedSessionCheckout {
+        let Some(entry) = self.cache.get_mut(address) else {
+            return CachedSessionCheckout::Missing;
+        };
+        match entry {
+            SessionEntry::Present(_) => {
+                let SessionEntry::Present(record) =
+                    std::mem::replace(entry, SessionEntry::CheckedOut(true))
+                else {
+                    unreachable!()
+                };
+                CachedSessionCheckout::Present(
+                    Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone()),
+                )
+            }
+            SessionEntry::Absent => {
+                *entry = SessionEntry::CheckedOut(false);
+                CachedSessionCheckout::Absent
+            }
+            SessionEntry::CheckedOut(_) => CachedSessionCheckout::Busy,
+        }
+    }
+
     fn delete(&mut self, address: &str) {
         let addr = self.key_for(address);
         self.cache.insert(addr.clone(), SessionEntry::Absent);
@@ -200,7 +232,7 @@ impl SessionStoreState {
                 continue;
             }
             match v {
-                SessionEntry::CheckedOut => continue, // never evict checked-out
+                SessionEntry::CheckedOut(_) => continue, // never evict checked-out
                 SessionEntry::Absent => negative.push(k.clone()),
                 SessionEntry::Present(_) => positive.push(k.clone()),
             }
@@ -213,8 +245,10 @@ impl SessionStoreState {
 
 struct PendingSessionRestore {
     address: Arc<str>,
-    record: SessionRecord,
+    record: Option<SessionRecord>,
     generation: u64,
+    had_session: bool,
+    completion: Option<Arc<AtomicBool>>,
 }
 
 // === Sender key object cache (same pattern as sessions) ===
@@ -396,16 +430,28 @@ impl SignalStoreCache {
             address,
             record,
             generation,
+            had_session,
+            completion,
         } in pending.drain(..)
         {
-            if generation != state.checkout_generation {
-                continue;
+            let expected = matches!(
+                state.cache.get(address.as_ref()),
+                Some(SessionEntry::CheckedOut(was_present)) if *was_present == had_session
+            );
+            let restored = generation == state.checkout_generation && expected;
+            if restored && let Some(record) = record {
+                let address = state
+                    .cache
+                    .get_key_value(address.as_ref())
+                    .map_or(address, |(cached, _)| cached.clone());
+                state.put_with_key(address, record);
+            } else if restored {
+                let address = state.key_for(address.as_ref());
+                state.cache.insert(address, SessionEntry::Absent);
             }
-            let address = state
-                .cache
-                .get_key_value(address.as_ref())
-                .map_or(address, |(cached, _)| cached.clone());
-            state.put_with_key(address, record);
+            if let Some(completion) = completion {
+                completion.store(restored, Ordering::Release);
+            }
         }
         self.has_pending_session_restores
             .store(false, Ordering::Release);
@@ -431,28 +477,72 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         record: SessionRecord,
         generation: u64,
-    ) -> bool {
+        had_session: bool,
+    ) -> SessionCheckoutStoreResult {
         if let Some(mut state) = self.try_lock_sessions() {
-            if generation != state.checkout_generation {
-                return false;
+            let expected = matches!(
+                state.cache.get(address.as_str()),
+                Some(SessionEntry::CheckedOut(was_present)) if *was_present == had_session
+            );
+            if generation != state.checkout_generation || !expected {
+                return SessionCheckoutStoreResult::Rejected;
             }
             state.put(address.as_str(), record);
             state.evict_if_needed(self.max_entries);
-            return true;
+            return SessionCheckoutStoreResult::Stored;
         }
 
         let mut pending = self.pending_session_restores();
         if generation != self.session_recovery_generation.load(Ordering::Acquire) {
-            return false;
+            return SessionCheckoutStoreResult::Rejected;
         }
+        let completion = Arc::new(AtomicBool::new(false));
         pending.push(PendingSessionRestore {
             address: Arc::from(address.as_str()),
-            record,
+            record: Some(record),
             generation,
+            had_session,
+            completion: Some(completion.clone()),
         });
         self.has_pending_session_restores
             .store(true, Ordering::Release);
-        true
+        SessionCheckoutStoreResult::Pending(completion)
+    }
+
+    /// An empty checkout must release its pinned cache slot even when dropped.
+    #[doc(hidden)]
+    pub fn cancel_session_checkout(&self, address: &ProtocolAddress, generation: u64) {
+        let Some(mut state) = self.try_lock_sessions() else {
+            let mut pending = self.pending_session_restores();
+            if generation == self.session_recovery_generation.load(Ordering::Acquire) {
+                pending.push(PendingSessionRestore {
+                    address: Arc::from(address.as_str()),
+                    record: None,
+                    generation,
+                    had_session: false,
+                    completion: None,
+                });
+                self.has_pending_session_restores
+                    .store(true, Ordering::Release);
+            }
+            return;
+        };
+        if generation == state.checkout_generation
+            && matches!(
+                state.cache.get(address.as_str()),
+                Some(SessionEntry::CheckedOut(false))
+            )
+        {
+            let key = state.key_for(address.as_str());
+            state.cache.insert(key, SessionEntry::Absent);
+            state.evict_if_needed(self.max_entries);
+        }
+    }
+
+    /// A queued commit drives its own restore; cancellation may leave it for the next cache access.
+    #[doc(hidden)]
+    pub async fn complete_session_checkout(&self) {
+        drop(self.lock_sessions().await);
     }
 
     /// Whether any session or identity is known for `user` (across device ids),
@@ -490,9 +580,11 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
     ) -> Result<Option<SessionRecord>> {
-        self.checkout_session(address, backend)
-            .await
-            .map(|(record, _)| record)
+        let (record, generation) = self.checkout_session(address, backend).await?;
+        if record.is_none() {
+            self.cancel_session_checkout(address, generation);
+        }
+        Ok(record)
     }
 
     /// The generation prevents a cancelled checkout from surviving a lossy reset.
@@ -506,51 +598,41 @@ impl SignalStoreCache {
         {
             let mut state = self.lock_sessions().await;
             let generation = state.checkout_generation;
-            if let Some(entry) = state.cache.get_mut(key) {
-                if matches!(entry, SessionEntry::Present(_)) {
-                    let SessionEntry::Present(record) =
-                        std::mem::replace(entry, SessionEntry::CheckedOut)
-                    else {
-                        unreachable!()
-                    };
-                    // Unique unless a peek's Arc is still alive (short-lived
-                    // inspection paths), so this is a move, not a clone.
-                    return Ok((
-                        Some(Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone())),
-                        generation,
-                    ));
+            match state.checkout(key) {
+                CachedSessionCheckout::Present(record) => {
+                    return Ok((Some(record), generation));
                 }
-                return Ok((None, generation));
+                CachedSessionCheckout::Absent => return Ok((None, generation)),
+                CachedSessionCheckout::Busy => {
+                    anyhow::bail!("session is already checked out")
+                }
+                CachedSessionCheckout::Missing => {}
             }
         }
         // Backend I/O outside the lock
         let backend_result = backend.get_session(key).await?;
         let mut state = self.lock_sessions().await;
         let generation = state.checkout_generation;
+        match state.checkout(key) {
+            CachedSessionCheckout::Present(record) => return Ok((Some(record), generation)),
+            CachedSessionCheckout::Absent => return Ok((None, generation)),
+            CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
+            CachedSessionCheckout::Missing => {}
+        }
         match backend_result {
             Some(bytes) => {
-                if state.cache.contains_key(key) {
-                    // Another task populated this slot while we were loading;
-                    // defer to whatever they wrote (Present, CheckedOut, etc).
-                    // Deserialize and return without caching to avoid conflict.
-                    return Ok((
-                        Some(SessionRecord::deserialize_for_store(
-                            &bytes,
-                            &state.incarnation,
-                        )?),
-                        generation,
-                    ));
-                }
                 let record = SessionRecord::deserialize_for_store(&bytes, &state.incarnation)?;
-                state.cache.insert(Arc::from(key), SessionEntry::CheckedOut);
+                state
+                    .cache
+                    .insert(Arc::from(key), SessionEntry::CheckedOut(true));
                 state.evict_if_needed(self.max_entries);
                 Ok((Some(record), generation))
             }
             None => {
-                if !state.cache.contains_key(key) {
-                    state.cache.insert(Arc::from(key), SessionEntry::Absent);
-                    state.evict_if_needed(self.max_entries);
-                }
+                state
+                    .cache
+                    .insert(Arc::from(key), SessionEntry::CheckedOut(false));
+                state.evict_if_needed(self.max_entries);
                 Ok((None, generation))
             }
         }
@@ -871,7 +953,7 @@ impl SignalStoreCache {
             for key in &dirty_keys {
                 if !matches!(
                     state.cache.get(key.as_ref()),
-                    Some(SessionEntry::CheckedOut)
+                    Some(SessionEntry::CheckedOut(_))
                 ) {
                     state.dirty.remove(key);
                 }
@@ -906,7 +988,7 @@ impl SignalStoreCache {
                         // borrow is held across the backend roundtrip.
                         let durable = match state.cache.get(addr.as_ref()) {
                             Some(SessionEntry::Present(_)) => Some(true),
-                            Some(SessionEntry::CheckedOut) => Some(false),
+                            Some(SessionEntry::CheckedOut(_)) => Some(false),
                             Some(SessionEntry::Absent) | None => None,
                         };
                         let durable = match durable {
@@ -1044,7 +1126,7 @@ impl SignalStoreCache {
                     keys_len += k.len();
                     match v {
                         SessionEntry::Present(rec) => Some(rec.clone()),
-                        SessionEntry::Absent | SessionEntry::CheckedOut => None,
+                        SessionEntry::Absent | SessionEntry::CheckedOut(_) => None,
                     }
                 })
                 .collect();
@@ -1323,11 +1405,15 @@ mod sender_key_lock_tests {
 
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
         let sessions = cache.sessions.lock().await;
-        assert!(cache.restore_session_from_checkout(
+        let SessionCheckoutStoreResult::Pending(completion) = cache.restore_session_from_checkout(
             &addr,
             record.expect("checked-out record"),
             generation,
-        ));
+            true,
+        ) else {
+            panic!("contended restore must be queued")
+        };
+        drop(completion);
         assert_eq!(cache.pending_session_restores().len(), 1);
         drop(sessions);
 
@@ -1350,12 +1436,107 @@ mod sender_key_lock_tests {
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
 
         cache.clear().await;
-        assert!(!cache.restore_session_from_checkout(
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &addr,
+                record.expect("checked-out record"),
+                generation,
+                true,
+            ),
+            SessionCheckoutStoreResult::Rejected
+        ));
+        assert!(cache.peek_session(&addr, &backend).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_a_competing_owner() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550007770".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+        let error = match cache.checkout_session(&addr, &backend).await {
+            Ok(_) => panic!("a second owner must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already checked out"));
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &addr,
+                record.expect("first owner"),
+                generation,
+                true,
+            ),
+            SessionCheckoutStoreResult::Stored
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_resurrect_a_deleted_slot() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550007771".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+        cache.delete_session(&addr).await;
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &addr,
+                record.expect("checked-out record"),
+                generation,
+                true,
+            ),
+            SessionCheckoutStoreResult::Rejected
+        ));
+        assert!(cache.peek_session(&addr, &backend).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_restore_does_not_overwrite_a_delete() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550007772".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+
+        let mut sessions = cache.sessions.lock().await;
+        sessions.delete(addr.as_str());
+        let SessionCheckoutStoreResult::Pending(completion) = cache.restore_session_from_checkout(
             &addr,
             record.expect("checked-out record"),
             generation,
-        ));
+            true,
+        ) else {
+            panic!("contended restore must be queued")
+        };
+        drop(sessions);
+
+        cache.complete_session_checkout().await;
+        assert!(!completion.load(Ordering::Acquire));
         assert!(cache.peek_session(&addr, &backend).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_checkout_reserves_and_releases_its_slot() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550007773".to_string(), 1.into());
+
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+        assert!(record.is_none());
+        assert!(cache.checkout_session(&addr, &backend).await.is_err());
+        cache.cancel_session_checkout(&addr, generation);
+
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+        assert!(record.is_none());
+        let sessions = cache.sessions.lock().await;
+        cache.cancel_session_checkout(&addr, generation);
+        assert_eq!(cache.pending_session_restores().len(), 1);
+        drop(sessions);
+        cache.complete_session_checkout().await;
+        assert_eq!(cache.try_has_session(&addr), Some(false));
     }
 
     #[tokio::test]
@@ -2232,7 +2413,7 @@ mod eviction_tests {
             let state = cache.sessions.lock().await;
             let entry = state.cache.get(pinned.as_str());
             assert!(
-                matches!(entry, Some(SessionEntry::CheckedOut)),
+                matches!(entry, Some(SessionEntry::CheckedOut(_))),
                 "checked-out session must survive eviction"
             );
             assert!(
@@ -2386,7 +2567,7 @@ mod lease_reload_tests {
             assert!(state.dirty.contains(address.as_str()));
             assert!(matches!(
                 state.cache.get(address.as_str()),
-                Some(SessionEntry::CheckedOut)
+                Some(SessionEntry::CheckedOut(_))
             ));
         }
 

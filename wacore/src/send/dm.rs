@@ -256,16 +256,13 @@ where
     // "would be pkmsg" so the caller bails. Silently treating Err as false
     // would let message_encrypt run with a corrupt session and potentially
     // burn the sender chain.
-    let needs_pkmsg = match loaded.as_ref().map(|session| session.record()) {
-        None => true,
-        Some(record) => match record.session_state() {
-            None => true,
-            Some(state) => match state.unacknowledged_pre_key_message_items() {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
-                Err(_) => true,
-            },
-        },
+    let needs_pkmsg = if let Some(session) = loaded.as_ref()
+        && let Some(state) = session.record().session_state()
+        && let Ok(None) = state.unacknowledged_pre_key_message_items()
+    {
+        false
+    } else {
+        true
     };
     if let Some(session) = loaded {
         session

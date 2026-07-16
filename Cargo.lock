@@ -4057,6 +4057,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "log",
+ "portable-atomic",
  "rand 0.10.2",
  "serde",
  "sha1 0.11.0",
