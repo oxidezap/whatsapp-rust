@@ -132,13 +132,15 @@ impl InMemoryBackend {
         }
     }
 
-    /// Number of `put_sessions_batch` calls since construction.
+    /// Number of `put_sessions_batch` attempts since construction, including
+    /// injected failures.
     #[cfg(any(test, feature = "test-util"))]
     pub fn session_batch_write_count(&self) -> u32 {
         self.session_batch_writes.load(Ordering::Relaxed)
     }
 
-    /// Number of `put_sender_keys_batch` calls since construction.
+    /// Number of `put_sender_keys_batch` attempts since construction, including
+    /// injected failures.
     #[cfg(any(test, feature = "test-util"))]
     pub fn sender_key_batch_write_count(&self) -> u32 {
         self.sender_key_batch_writes.load(Ordering::Relaxed)
