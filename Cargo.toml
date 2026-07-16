@@ -10,6 +10,9 @@ readme = "README.md"
 description = "Rust client for WhatsApp Web"
 
 [workspace]
+# apps/desktop is its own workspace (heavy gpui tree, own Cargo.lock and
+# [patch]); it consumes this workspace's crates via path deps.
+exclude = ["apps/desktop"]
 members = [
     ".",
     "examples/voip-cli",

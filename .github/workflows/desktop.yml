@@ -1,0 +1,70 @@
+# Desktop app (apps/desktop): a standalone cargo workspace excluded from the
+# root one, so the library jobs never build the gpui tree. It still runs on
+# library-path changes: the app is the library's consumer test.
+name: Desktop App
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "apps/desktop/**"
+      - "src/**"
+      - "wacore/**"
+      - "waproto/**"
+      - "storages/**"
+      - "transports/**"
+      - "http_clients/**"
+      - "Cargo.toml"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "src/**"
+      - "wacore/**"
+      - "waproto/**"
+      - "storages/**"
+      - "transports/**"
+      - "http_clients/**"
+      - "Cargo.toml"
+      - ".github/workflows/desktop.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Check desktop app
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+          components: rustfmt, clippy
+      - name: Install system dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev libfreetype6-dev
+          version: 1.2
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test

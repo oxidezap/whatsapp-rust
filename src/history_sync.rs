@@ -185,7 +185,7 @@ impl Client {
 
                 // Update own push name if found
                 if let Some(new_name) = sync_result.own_pushname {
-                    log::info!("Updating own push name from history sync to '{new_name}'");
+                    log::info!("Updating own push name from history sync");
                     self.update_push_name_and_notify(new_name).await;
                 }
 

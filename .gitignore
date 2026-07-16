@@ -15,3 +15,6 @@ dhat-heap*.json
 # proptest persists failure seeds next to the test on failure; these are
 # environment-local replay caches, not source.
 *.proptest-regressions
+
+# Nested workspaces build output
+apps/*/target/

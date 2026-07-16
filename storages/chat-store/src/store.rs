@@ -48,6 +48,10 @@ pub(crate) enum WriterMsg {
         text: Option<String>,
         timestamp_ms: i64,
     },
+    SendFailed {
+        chat: Jid,
+        msg_id: String,
+    },
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
     Flush(oneshot::Sender<std::result::Result<(), String>>),
@@ -164,6 +168,20 @@ impl ChatStore {
                 kind: message_kind(base),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Mark a send this client gave up on (no server answer will come to do
+    /// it). Goes through the writer queue so it cannot outrun the
+    /// [`record_outgoing`](Self::record_outgoing) row it targets. Same rule
+    /// as a server nack: only a still-[`Pending`](crate::types::MessageStatus::Pending)
+    /// row fails — a positive ack that won the race must not be regressed.
+    pub fn mark_send_failed(&self, chat: &Jid, msg_id: impl Into<String>) -> Result<()> {
+        self.tx
+            .send(WriterMsg::SendFailed {
+                chat: chat.clone(),
+                msg_id: msg_id.into(),
             })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
@@ -528,6 +546,25 @@ fn apply_writer_msg(
                 cs.chats = true;
             }
             cs.message_chats.insert(chat_str);
+            Ok(())
+        }
+        WriterMsg::SendFailed { chat, msg_id } => {
+            let chat_str = chat.to_string();
+            // Same guard as the nack path: a row past PENDING already got its
+            // positive answer, so a late local failure must not regress it.
+            let updated =
+                diesel::update(message_row(device_id, &chat_str, msg_id).filter(
+                    schema::messages::from_me.eq(true).and(
+                        schema::messages::status.eq(wa::web_message_info::Status::PENDING as i32),
+                    ),
+                ))
+                .set(schema::messages::status.eq(wa::web_message_info::Status::ERROR as i32))
+                .execute(conn)?;
+            // A no-op update (row already acked, or unknown id) must not
+            // broadcast an invalidation and re-hydrate the UI for nothing.
+            if updated > 0 {
+                cs.message_chats.insert(chat_str);
+            }
             Ok(())
         }
         WriterMsg::Flush(_) => Ok(()),
@@ -1424,14 +1461,23 @@ fn apply_history_conversation(
 
     {
         use schema::chats::dsl;
-        let name = conv.name.as_deref().or(conv.display_name.as_deref());
+        let name = conv
+            .name
+            .as_deref()
+            .or(conv.display_name.as_deref())
+            .or(conv.username.as_deref());
+        let unread_count = match conv.unread_count {
+            _ if conv.marked_as_unread == Some(true) => UNREAD_MARKER,
+            Some(count) if count > 0 => i32::try_from(count).unwrap_or(i32::MAX),
+            _ => 0,
+        };
         diesel::insert_into(dsl::chats)
             .values((
                 dsl::device_id.eq(device_id),
                 dsl::jid.eq(chat),
                 dsl::name.eq(name),
                 dsl::last_message_ts.eq(last_ts_ms),
-                dsl::unread_count.eq(conv.unread_count.unwrap_or(0) as i32),
+                dsl::unread_count.eq(unread_count),
                 // Wire values are unix SECONDS; the columns (and the live
                 // app-state paths) are milliseconds.
                 dsl::pinned_at.eq(conv

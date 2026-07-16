@@ -39,9 +39,9 @@ pub struct HistorySyncResult {
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
     pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
-    /// PN↔LID pairs from `HistorySync.phoneNumberToLidMappings` (field 15) —
-    /// the bulk identity seed the server sends alongside the chats. Same
-    /// source whatsmeow harvests in `storeHistoricalPNLIDMappings`.
+    /// PN/LID pairs from the bulk mapping block and from per-conversation
+    /// metadata (both are harvested; conversations often carry pairs the
+    /// bulk block omits).
     pub lid_mappings: Vec<HistoryLidMapping>,
     /// The original zlib-compressed input, handed back (moved, never copied or
     /// re-inflated) only when event listeners exist. Wrapped in
@@ -309,9 +309,11 @@ fn process_history_sync_streaming(
             // conversations (repeated)
             tags::history_sync::CONVERSATIONS => {
                 result.conversations_processed += 1;
-                if let Some(candidate) =
-                    extract_conversation_fields(value, &mut result.msg_secret_records)
-                {
+                if let Some(candidate) = extract_conversation_fields(
+                    value,
+                    &mut result.msg_secret_records,
+                    &mut result.lid_mappings,
+                ) {
                     result.tc_token_candidates.push(candidate);
                 }
                 if !density_reserved && result.msg_secret_records.len() >= RESERVE_SAMPLE_RECORDS {
@@ -634,8 +636,6 @@ fn read_str_field<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a str> {
 // Best-effort: a malformed mapping entry (optional metadata) must not abort
 // the sync, mirroring the pushname extractor above.
 fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
-    use wacore_binary::{Jid, Server};
-
     let mut pn_raw: Option<&str> = None;
     let mut lid_raw: Option<&str> = None;
     let mut pos = 0;
@@ -659,8 +659,14 @@ fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
         }
     }
 
-    let pn: Jid = pn_raw?.parse().ok()?;
-    let lid: Jid = lid_raw?.parse().ok()?;
+    history_lid_mapping(pn_raw?, lid_raw?)
+}
+
+fn history_lid_mapping(pn_raw: &str, lid_raw: &str) -> Option<HistoryLidMapping> {
+    use wacore_binary::{Jid, Server};
+
+    let pn: Jid = pn_raw.parse().ok()?;
+    let lid: Jid = lid_raw.parse().ok()?;
     // Legacy `@c.us` is the PN namespace under its old name (whatsmeow maps it
     // to `@s.whatsapp.net` the same way); the user part is the phone either way.
     if !(pn.is_pn() || pn.server == Server::Legacy) || !lid.is_lid() {
@@ -683,6 +689,10 @@ const _: () = {
     assert!(tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS == 15);
     assert!(tags::phone_number_to_lid_mapping::PN_JID == 1);
     assert!(tags::phone_number_to_lid_mapping::LID_JID == 2);
+
+    assert!(tags::conversation::ID == 1);
+    assert!(tags::conversation::PN_JID == 39);
+    assert!(tags::conversation::LID_JID == 42);
 
     assert!(tags::history_sync_msg::MESSAGE == 1);
 
@@ -1394,6 +1404,7 @@ pub struct HistoryMsgSecretRecord {
 fn extract_conversation_fields(
     data: &[u8],
     records: &mut Vec<HistoryMsgSecretRecord>,
+    lid_mappings: &mut Vec<HistoryLidMapping>,
 ) -> Option<TcTokenCandidate> {
     let mut pos = 0;
     // Conversation.id precedes messages/tctoken in tag order, so it is
@@ -1405,6 +1416,8 @@ fn extract_conversation_fields(
     let mut tc_token: &[u8] = &[];
     let mut tc_token_timestamp: Option<u64> = None;
     let mut tc_token_sender_timestamp: Option<u64> = None;
+    let mut pn_jid: Option<&str> = None;
+    let mut lid_jid: Option<&str> = None;
 
     while pos < data.len() {
         let Some((tag, br)) = read_varint(&data[pos..]) else {
@@ -1501,11 +1514,37 @@ fn extract_conversation_fields(
                 tc_token_sender_timestamp = Some(v);
                 pos += vl;
             }
+            (tags::conversation::PN_JID, wire_type::LENGTH_DELIMITED) => {
+                let Some(value) = read_str_field(data, &mut pos) else {
+                    break;
+                };
+                pn_jid = Some(value);
+            }
+            (tags::conversation::LID_JID, wire_type::LENGTH_DELIMITED) => {
+                let Some(value) = read_str_field(data, &mut pos) else {
+                    break;
+                };
+                lid_jid = Some(value);
+            }
             _ => match skip_field(wt, data, pos) {
                 Ok(np) => pos = np,
                 Err(_) => break,
             },
         }
+    }
+
+    let chat_jid = chat_id.parse::<wacore_binary::Jid>().ok();
+    let pn_jid = pn_jid.or_else(|| chat_jid.as_ref().filter(|jid| jid.is_pn()).map(|_| chat_id));
+    let lid_jid = lid_jid.or_else(|| {
+        chat_jid
+            .as_ref()
+            .filter(|jid| jid.is_lid())
+            .map(|_| chat_id)
+    });
+    if let (Some(pn_jid), Some(lid_jid)) = (pn_jid, lid_jid)
+        && let Some(mapping) = history_lid_mapping(pn_jid, lid_jid)
+    {
+        lid_mappings.push(mapping);
     }
 
     // tc-token candidate: only for 1:1 chats that actually carry a token. A
@@ -1799,6 +1838,67 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_lid_mappings_extracted_from_conversations() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![
+                wa::Conversation {
+                    id: "111222333444555@lid".to_string(),
+                    pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "12025550144@s.whatsapp.net".to_string(),
+                    lid_jid: Some("222333444555666@lid".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![
+                HistoryLidMapping {
+                    phone_number: "12025550143".to_string(),
+                    lid: "111222333444555".to_string(),
+                },
+                HistoryLidMapping {
+                    phone_number: "12025550144".to_string(),
+                    lid: "222333444555666".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_optional_mapping_does_not_drop_tc_token() {
+        let chat = "12025550143@s.whatsapp.net";
+        let tc_token = vec![0xAB; 16];
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        emit_len_field(&mut conv, tags::conversation::TC_TOKEN, &tc_token);
+        emit_varint(
+            &mut conv,
+            ((tags::conversation::TC_TOKEN_TIMESTAMP << 3) | wire_type::VARINT) as u64,
+        );
+        emit_varint(&mut conv, 1_700_000_000);
+        emit_len_field(&mut conv, tags::conversation::PN_JID, &[0xFF, 0xFE]);
+
+        let mut raw = Vec::new();
+        emit_len_field(&mut raw, tags::history_sync::CONVERSATIONS, &conv);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = process_history_sync(compressed, None, false).unwrap();
+        assert!(result.lid_mappings.is_empty());
+        assert_eq!(result.tc_token_candidates.len(), 1);
+        assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
     }
 
     /// Prost-only oracle: what the pre-fast-path pipeline produced for one
@@ -2988,6 +3088,7 @@ mod tests {
                     if let Some(candidate) = extract_conversation_fields(
                         &decompressed[pos..end],
                         &mut result.msg_secret_records,
+                        &mut result.lid_mappings,
                     ) {
                         result.tc_token_candidates.push(candidate);
                     }

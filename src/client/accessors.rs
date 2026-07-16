@@ -321,7 +321,7 @@ impl Client {
             return;
         }
 
-        log::debug!("Updating push name from '{}' -> '{}'", old_name, new_name);
+        log::debug!("Updating push name");
         self.persistence_manager
             .process_command(DeviceCommand::SetPushName(new_name.clone()))
             .await;

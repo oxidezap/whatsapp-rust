@@ -1,0 +1,87 @@
+# Standalone workspace, excluded from the repository root workspace: the gpui
+# dependency tree (and its [patch]) stays out of the library's Cargo.lock, CI
+# and MSRV. The app tracks the library via path deps, so an API change in the
+# lib breaks this build in the same PR that makes it.
+[workspace]
+
+# Mirror the root workspace's safeguards (see /clippy.toml for the lists):
+# wacore::time instead of std clocks, portable-atomic for 64-bit atomics.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
+[package]
+name = "whatsapp-desktop"
+version = "0.1.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+description = "WhatsApp desktop client built on whatsapp-rust + GPUI"
+
+[[bin]]
+name = "whatsapp-desktop"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0"
+async-channel = "2"
+async-trait = "0.1"
+base64 = "0.22"
+buffa = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# Audio capture/playback (PTT voice messages + calls)
+cpal = "0.18"
+env_logger = "0.11"
+
+# UI framework: GPUI upstream + gpui-component. gpui-component leaves its gpui
+# dep unpinned (tracks zed HEAD), and cargo forbids [patch]-pinning a source to
+# itself — so the rev pin lives in THIS workspace's committed Cargo.lock
+# (`cargo update -p gpui --precise <rev>` to move it). Same-source everywhere =
+# one gpui in the tree, no fork.
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Ordered maps for deterministic cache eviction
+indexmap = "2"
+log = "0.4"
+mp4 = "0.14"
+ogg = "0.9"
+openh264 = "0.9" # H.264 software decoder
+opus = "0.3"
+qrcode = "0.14"
+portable-atomic = "1"
+rand = "0.10"
+ringbuf = "0.5"
+rust-embed = "8"
+smallvec = "1"
+# Async utilities (GPUI-compatible timers)
+smol = "2"
+# Audio processing (waveform generation)
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "ogg", "pcm"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# The library and its satellites, by path: always the checkout's version.
+wacore = { path = "../../wacore" }
+wacore-binary = { path = "../../wacore/binary" }
+waproto = { path = "../../waproto" }
+whatsapp-rust = { path = "../..", features = ["voip"] }
+whatsapp-rust-chat-store = { path = "../../storages/chat-store", features = ["search"] }
+whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage" }
+whatsapp-rust-tokio-transport = { path = "../../transports/tokio-transport" }
+whatsapp-rust-ureq-http-client = { path = "../../http_clients/ureq-client" }
+
+[profile.dev]
+# gpui is unusably slow unoptimized; match zed's own dev profile for it.
+[profile.dev.package.gpui]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+strip = true

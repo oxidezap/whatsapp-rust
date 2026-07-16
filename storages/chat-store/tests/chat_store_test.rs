@@ -372,6 +372,9 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
                 conversation_timestamp: Some(1_700_000_500),
                 mute_end_time: Some(1_800_000_000),
                 pinned: Some(1_700_000_800),
+                username: Some("alice_example".to_string()),
+                unread_count: Some(7),
+                marked_as_unread: Some(true),
                 ..Default::default()
             },
             wa::Conversation {
@@ -446,6 +449,8 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
         .iter()
         .find(|c| c.jid == jid("559900000004@s.whatsapp.net"))
         .expect("muted chat");
+    assert_eq!(muted.name.as_deref(), Some("alice_example"));
+    assert_eq!(muted.unread_count, -1);
     assert!(muted.muted_until.unwrap().year() > 2020);
     assert!(muted.pinned_at.unwrap().year() > 2020);
 
@@ -2520,5 +2525,56 @@ async fn server_nack_marks_outgoing_failed() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(msg.status, MessageStatus::ServerAck);
+}
+
+#[tokio::test]
+async fn mark_send_failed_fails_pending_row_only() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // A client-side send error has no server nack to fail the row; the
+    // explicit mark does it. Same writer queue as the record, so the mark
+    // cannot outrun the row it targets.
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-LOCAL",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.mark_send_failed(&chat, "OUT-LOCAL").unwrap();
+    chat_store.flush().await.unwrap();
+    let msg = chat_store
+        .message(&chat, "OUT-LOCAL")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Error);
+
+    // A row the server already answered keeps its positive status.
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-WON",
+            &wa::Message::text("oi2"),
+            Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-WON".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .build(),
+        )],
+    )
+    .await;
+    chat_store.mark_send_failed(&chat, "OUT-WON").unwrap();
+    chat_store.flush().await.unwrap();
+    let msg = chat_store.message(&chat, "OUT-WON").await.unwrap().unwrap();
     assert_eq!(msg.status, MessageStatus::ServerAck);
 }
