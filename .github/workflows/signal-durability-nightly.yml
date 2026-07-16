@@ -1,0 +1,82 @@
+name: Signal Durability Nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: First deterministic seed (decimal or 0x-prefixed)
+        required: false
+        default: '0x51A6DA7AB1E50001'
+      seeds:
+        description: Number of seeds
+        required: false
+        default: '128'
+      steps:
+        description: Actions per seed
+        required: false
+        default: '256'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signal-durability-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: '3.25.3'
+  SCCACHE_GHA_ENABLED: 'true'
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  durability:
+    name: Signal durability chaos
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Reclaim unused Android SDK space
+        run: |
+          df -h /
+          sudo rm -rf --one-file-system /usr/local/lib/android
+          df -h /
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install protoc
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          cache-targets: 'true'
+      - name: Run deterministic DM and group matrix
+        env:
+          SIGNAL_CHAOS_SEED: ${{ inputs.seed || '0x51A6DA7AB1E50001' }}
+          SIGNAL_CHAOS_SEEDS: ${{ inputs.seeds || '128' }}
+          SIGNAL_CHAOS_STEPS: ${{ inputs.steps || '256' }}
+        run: >-
+          cargo test -p wacore --lib signal_durability_chaos_nightly --
+          --ignored --nocapture
+      - name: Run abrupt SQLite restart test
+        run: >-
+          cargo test -p whatsapp-rust --test signal_durability_sqlite
+          signal_durability_sqlite_process_restart --
+          --ignored --exact --nocapture
+      - name: Preserve failed SQLite fixture
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signal-durability-sqlite-${{ github.run_id }}
+          path: /tmp/whatsapp-rust-signal-durability-*.db*
+          if-no-files-found: ignore
+          retention-days: 7

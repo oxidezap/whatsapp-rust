@@ -3577,3 +3577,7 @@ mod pre_wire_gate_tests {
         assert!(!cache.needs_pre_wire_flush().await);
     }
 }
+
+#[cfg(test)]
+#[path = "signal_cache_durability_chaos.rs"]
+mod durability_chaos_tests;
