@@ -613,6 +613,7 @@ async fn place_call(
         // failures left a single surviving key, so that key stays tied to its device.
         multi_device,
         video: video.is_some(),
+        audio_rates: wacore::stanza::call::DEFAULT_AUDIO_RATES,
     });
 
     // Register the ack-waiter for the offer's stanza id BEFORE send_node so a fast server reply can't

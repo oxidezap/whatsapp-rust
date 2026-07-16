@@ -264,9 +264,17 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
+            let audio = node
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .filter(|child| child.tag == "audio")
+                .map(parse_audio_codec)
+                .collect::<Result<Vec<_>>>()?;
             CallAction::PreAccept {
                 call_id,
                 call_creator,
+                audio,
             }
         }
         "transport" => {
@@ -297,9 +305,17 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         }
         "accept" => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
+            let audio = node
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .filter(|child| child.tag == "audio")
+                .map(parse_audio_codec)
+                .collect::<Result<Vec<_>>>()?;
             CallAction::Accept {
                 call_id,
                 call_creator,
+                audio,
             }
         }
         "reject" => {
@@ -399,6 +415,8 @@ pub fn build_offer_ack_receipt(call: &IncomingCall, own_ad: Option<&Jid>) -> Opt
 pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13];
 /// Capability blob for an audio-only `<preaccept>` (ver=1).
 pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
+/// Legacy offer order observed on WhatsApp Web.
+pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
 /// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
 /// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
 /// (`0xbb`), not this.
@@ -445,6 +463,10 @@ pub struct OfferParams<'a> {
     /// (after the `<audio>` children) come from a WA Web capture; unvalidated against the real
     /// server's 439 child-order enforcement.
     pub video: bool,
+    /// Advertised `<audio enc=opus rate=…>` formats, in preference order. WhatsApp uses the
+    /// signaling rate to select its audio path; callers that need the legacy behavior pass
+    /// `["8000", "16000"]`.
+    pub audio_rates: &'a [&'a str],
 }
 
 /// `<call to=peer><offer call-id call-creator>…</offer></call>` with the mandatory
@@ -455,18 +477,7 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
     if let Some(privacy) = p.privacy_token {
         children.push(NodeBuilder::new("privacy").bytes(privacy.to_vec()).build());
     }
-    children.push(
-        NodeBuilder::new("audio")
-            .attr("enc", "opus")
-            .attr("rate", "8000")
-            .build(),
-    );
-    children.push(
-        NodeBuilder::new("audio")
-            .attr("enc", "opus")
-            .attr("rate", "16000")
-            .build(),
-    );
+    children.extend(p.audio_rates.iter().map(|rate| audio_opus(rate)));
     if p.video {
         children.push(video_offer_node());
     }
@@ -1306,6 +1317,32 @@ mod tests {
     }
 
     #[test]
+    fn preaccept_and_accept_preserve_audio_selection() {
+        for tag in ["preaccept", "accept"] {
+            let node = base_call_builder()
+                .children([NodeBuilder::new(tag)
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("call-id", "CID")
+                    .children([audio_opus("8000")])
+                    .build()])
+                .build();
+
+            let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+            let audio = match call.action {
+                CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } => audio,
+                other => panic!("expected {tag}, got {other:?}"),
+            };
+            assert_eq!(
+                audio,
+                [CallAudioCodec {
+                    enc: "opus".to_string(),
+                    rate: 8_000,
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn terminate_with_duration() {
         let node = base_call_builder()
             .children([NodeBuilder::new("terminate")
@@ -1607,6 +1644,7 @@ mod tests {
             id: Some("OFFER-STANZA-ID"),
             multi_device: false,
             video: false,
+            audio_rates: DEFAULT_AUDIO_RATES,
         });
         // Single device key → bare <enc> (not <destination>).
         assert_eq!(
@@ -1664,10 +1702,45 @@ mod tests {
             id: None,
             multi_device: false,
             video: false,
+            audio_rates: DEFAULT_AUDIO_RATES,
         });
         let tags = child_tags(&call);
         assert!(tags.contains(&"destination".to_string()));
         assert!(!tags.contains(&"enc".to_string()));
+    }
+
+    #[test]
+    fn offer_audio_rates_are_configurable() {
+        let peer = peer();
+        let creator = creator();
+        let dk = OfferDeviceKey {
+            device_jid: peer.clone(),
+            ciphertext: vec![1],
+            enc_type: "msg".into(),
+        };
+        let call = build_offer(&OfferParams {
+            call_id: "CID",
+            to: &peer,
+            call_creator: &creator,
+            device_keys: std::slice::from_ref(&dk),
+            privacy_token: None,
+            capability: None,
+            device_identity: None,
+            id: None,
+            multi_device: false,
+            video: false,
+            audio_rates: &["8000"],
+        });
+        let call_ref = call.as_node_ref();
+        let offer = &call_ref.children().unwrap()[0];
+        let rates: Vec<_> = offer
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|child| child.tag == "audio")
+            .map(|child| child.attrs().optional_u64("rate"))
+            .collect();
+        assert_eq!(rates, [Some(8_000)]);
     }
 
     // A multi-device callee whose encryption left a single survivor must keep the addressed
@@ -1692,6 +1765,7 @@ mod tests {
             id: None,
             multi_device: true,
             video: false,
+            audio_rates: DEFAULT_AUDIO_RATES,
         });
         let tags = child_tags(&call);
         assert!(tags.contains(&"destination".to_string()));
@@ -2096,6 +2170,7 @@ mod tests {
             id: None,
             multi_device: false,
             video: true,
+            audio_rates: DEFAULT_AUDIO_RATES,
         };
         let offer = build_offer(&base);
         // The <video> child sits right after the <audio> children (capture-observed position).

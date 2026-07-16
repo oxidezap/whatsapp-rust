@@ -62,7 +62,7 @@ pub struct OfferEnc {
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CallAudioCodec {
     pub enc: String,
     pub rate: u32,
@@ -130,10 +130,12 @@ pub enum CallAction {
     PreAccept {
         call_id: String,
         call_creator: Jid,
+        audio: Vec<CallAudioCodec>,
     },
     Accept {
         call_id: String,
         call_creator: Jid,
+        audio: Vec<CallAudioCodec>,
     },
     Reject {
         call_id: String,
