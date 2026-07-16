@@ -151,6 +151,7 @@ impl WaOpusEncoder {
 #[cfg(feature = "voip-libopus")]
 pub struct WaOpusDecoder {
     dec: Decoder,
+    packet_scratch: Vec<u8>,
 }
 
 #[cfg(feature = "voip-libopus")]
@@ -158,14 +159,20 @@ impl WaOpusDecoder {
     pub fn new() -> Result<Self> {
         let dec = Decoder::new(WA_SAMPLE_RATE, Channels::Mono)
             .map_err(|e| anyhow!("opus decoder init: {e}"))?;
-        Ok(Self { dec })
+        Ok(Self {
+            dec,
+            packet_scratch: Vec::with_capacity(OPUS_MAX_PACKET_BYTES),
+        })
     }
 
     /// Decode one Opus frame to mono 16-bit PCM, returning the decoded samples.
     pub fn decode(&mut self, opus: &[u8]) -> Result<Vec<i16>> {
+        Self::decode_packet(&mut self.dec, opus)
+    }
+
+    fn decode_packet(dec: &mut Decoder, opus: &[u8]) -> Result<Vec<i16>> {
         let mut out = vec![0i16; WA_DECODE_MAX_SAMPLES];
-        let n = self
-            .dec
+        let n = dec
             .decode(opus, &mut out, false)
             .map_err(|e| anyhow!("opus decode: {e}"))?;
         out.truncate(n);
@@ -174,10 +181,11 @@ impl WaOpusDecoder {
 
     /// Restore MLOW's CELT TOC and decode with stock libopus.
     pub fn decode_mlow_escape(&mut self, opus: &[u8]) -> Result<Vec<i16>> {
-        let mut packet = opus.to_vec();
-        depacketize_opus_from_mlow(&mut packet)
+        self.packet_scratch.clear();
+        self.packet_scratch.extend_from_slice(opus);
+        depacketize_opus_from_mlow(&mut self.packet_scratch)
             .map_err(|e| anyhow!("depacketize Opus from MLOW: {e}"))?;
-        self.decode(&packet)
+        Self::decode_packet(&mut self.dec, &self.packet_scratch)
     }
 }
 
