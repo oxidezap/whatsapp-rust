@@ -68,6 +68,6 @@ pub use state::{
 };
 pub use storage::{
     Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
-    SessionStore, SignedPreKeyStore,
+    SessionCheckout, SessionStore, SignedPreKeyStore,
 };
 pub use timestamp::Timestamp;

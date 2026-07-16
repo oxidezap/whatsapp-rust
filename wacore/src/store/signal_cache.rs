@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard};
 
 use anyhow::Result;
 use async_lock::Mutex;
+use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::RngExt;
 
 use crate::libsignal::protocol::{ProtocolAddress, SenderKeyRecord, SessionRecord};
@@ -81,6 +82,9 @@ fn high_watermark(max_entries: usize) -> usize {
 /// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
+    session_recovery_generation: AtomicU64,
+    has_pending_session_restores: AtomicBool,
+    pending_session_restores: SyncMutex<Vec<PendingSessionRestore>>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
     /// Consumed one-time prekeys buffered for durable deletion, keyed by the
@@ -110,6 +114,7 @@ enum SessionEntry {
 
 struct SessionStoreState {
     incarnation: StoreIncarnation,
+    checkout_generation: u64,
     cache: HashMap<Arc<str>, SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
@@ -126,6 +131,7 @@ impl SessionStoreState {
     fn new(incarnation: StoreIncarnation) -> Self {
         Self {
             incarnation,
+            checkout_generation: 0,
             cache: HashMap::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
@@ -142,8 +148,12 @@ impl SessionStoreState {
         }
     }
 
-    fn put(&mut self, address: &str, mut record: SessionRecord) {
+    fn put(&mut self, address: &str, record: SessionRecord) {
         let addr = self.key_for(address);
+        self.put_with_key(addr, record);
+    }
+
+    fn put_with_key(&mut self, addr: Arc<str>, mut record: SessionRecord) {
         // Take over the record's wire gate: the address stays pending until a
         // flush persists it, regardless of later checkout/put round trips.
         if record.has_pending_reservation() {
@@ -172,9 +182,10 @@ impl SessionStoreState {
         self.reservation_pending.clear();
     }
 
-    fn discard(&mut self, incarnation: StoreIncarnation) {
+    fn discard(&mut self, incarnation: StoreIncarnation, generation: u64) {
         self.clear();
         self.incarnation = incarnation;
+        self.checkout_generation = generation;
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
@@ -198,6 +209,12 @@ impl SessionStoreState {
             self.cache.remove(&key);
         }
     }
+}
+
+struct PendingSessionRestore {
+    address: Arc<str>,
+    record: SessionRecord,
+    generation: u64,
 }
 
 // === Sender key object cache (same pattern as sessions) ===
@@ -353,12 +370,89 @@ impl SignalStoreCache {
     fn with_max_entries_and_incarnation(max_entries: usize, incarnation: StoreIncarnation) -> Self {
         Self {
             sessions: Mutex::new(SessionStoreState::new(incarnation)),
+            session_recovery_generation: AtomicU64::new(0),
+            has_pending_session_restores: AtomicBool::new(false),
+            pending_session_restores: SyncMutex::new(Vec::new()),
             identities: Mutex::new(ByteStoreState::new()),
             sender_keys: Mutex::new(SenderKeyStoreState::new(incarnation)),
             removed_prekeys: Mutex::new(HashMap::new()),
             sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
         }
+    }
+
+    fn pending_session_restores(&self) -> SyncMutexGuard<'_, Vec<PendingSessionRestore>> {
+        self.pending_session_restores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn drain_session_restores(&self, state: &mut SessionStoreState) {
+        if !self.has_pending_session_restores.load(Ordering::Acquire) {
+            return;
+        }
+        let mut pending = self.pending_session_restores();
+        for PendingSessionRestore {
+            address,
+            record,
+            generation,
+        } in pending.drain(..)
+        {
+            if generation != state.checkout_generation {
+                continue;
+            }
+            let address = state
+                .cache
+                .get_key_value(address.as_ref())
+                .map_or(address, |(cached, _)| cached.clone());
+            state.put_with_key(address, record);
+        }
+        self.has_pending_session_restores
+            .store(false, Ordering::Release);
+        state.evict_if_needed(self.max_entries);
+    }
+
+    async fn lock_sessions(&self) -> async_lock::MutexGuard<'_, SessionStoreState> {
+        let mut state = self.sessions.lock().await;
+        self.drain_session_restores(&mut state);
+        state
+    }
+
+    fn try_lock_sessions(&self) -> Option<async_lock::MutexGuard<'_, SessionStoreState>> {
+        let mut state = self.sessions.try_lock()?;
+        self.drain_session_restores(&mut state);
+        Some(state)
+    }
+
+    /// A cancelled owner must return its record without awaiting the contested cache lock.
+    #[doc(hidden)]
+    pub fn restore_session_from_checkout(
+        &self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+        generation: u64,
+    ) -> bool {
+        if let Some(mut state) = self.try_lock_sessions() {
+            if generation != state.checkout_generation {
+                return false;
+            }
+            state.put(address.as_str(), record);
+            state.evict_if_needed(self.max_entries);
+            return true;
+        }
+
+        let mut pending = self.pending_session_restores();
+        if generation != self.session_recovery_generation.load(Ordering::Acquire) {
+            return false;
+        }
+        pending.push(PendingSessionRestore {
+            address: Arc::from(address.as_str()),
+            record,
+            generation,
+        });
+        self.has_pending_session_restores
+            .store(true, Ordering::Release);
+        true
     }
 
     /// Whether any session or identity is known for `user` (across device ids),
@@ -373,7 +467,7 @@ impl SignalStoreCache {
                 .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
         }
         {
-            let state = self.sessions.lock().await;
+            let state = self.lock_sessions().await;
             if state.cache.keys().any(|k| matches(k, user)) {
                 return Ok(true);
             }
@@ -396,9 +490,22 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
     ) -> Result<Option<SessionRecord>> {
+        self.checkout_session(address, backend)
+            .await
+            .map(|(record, _)| record)
+    }
+
+    /// The generation prevents a cancelled checkout from surviving a lossy reset.
+    #[doc(hidden)]
+    pub async fn checkout_session(
+        &self,
+        address: &ProtocolAddress,
+        backend: &dyn SignalStore,
+    ) -> Result<(Option<SessionRecord>, u64)> {
         let key = address.as_str();
         {
-            let mut state = self.sessions.lock().await;
+            let mut state = self.lock_sessions().await;
+            let generation = state.checkout_generation;
             if let Some(entry) = state.cache.get_mut(key) {
                 if matches!(entry, SessionEntry::Present(_)) {
                     let SessionEntry::Present(record) =
@@ -408,38 +515,43 @@ impl SignalStoreCache {
                     };
                     // Unique unless a peek's Arc is still alive (short-lived
                     // inspection paths), so this is a move, not a clone.
-                    return Ok(Some(
-                        Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone()),
+                    return Ok((
+                        Some(Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone())),
+                        generation,
                     ));
                 }
-                return Ok(None);
+                return Ok((None, generation));
             }
         }
         // Backend I/O outside the lock
         let backend_result = backend.get_session(key).await?;
-        let mut state = self.sessions.lock().await;
+        let mut state = self.lock_sessions().await;
+        let generation = state.checkout_generation;
         match backend_result {
             Some(bytes) => {
                 if state.cache.contains_key(key) {
                     // Another task populated this slot while we were loading;
                     // defer to whatever they wrote (Present, CheckedOut, etc).
                     // Deserialize and return without caching to avoid conflict.
-                    return Ok(Some(SessionRecord::deserialize_for_store(
-                        &bytes,
-                        &state.incarnation,
-                    )?));
+                    return Ok((
+                        Some(SessionRecord::deserialize_for_store(
+                            &bytes,
+                            &state.incarnation,
+                        )?),
+                        generation,
+                    ));
                 }
                 let record = SessionRecord::deserialize_for_store(&bytes, &state.incarnation)?;
                 state.cache.insert(Arc::from(key), SessionEntry::CheckedOut);
                 state.evict_if_needed(self.max_entries);
-                Ok(Some(record))
+                Ok((Some(record), generation))
             }
             None => {
                 if !state.cache.contains_key(key) {
                     state.cache.insert(Arc::from(key), SessionEntry::Absent);
                     state.evict_if_needed(self.max_entries);
                 }
-                Ok(None)
+                Ok((None, generation))
             }
         }
     }
@@ -453,7 +565,7 @@ impl SignalStoreCache {
     ) -> Result<Option<Arc<SessionRecord>>> {
         let key = address.as_str();
         {
-            let state = self.sessions.lock().await;
+            let state = self.lock_sessions().await;
             if let Some(entry) = state.cache.get(key) {
                 return match entry {
                     SessionEntry::Present(record) => Ok(Some(record.clone())),
@@ -463,7 +575,7 @@ impl SignalStoreCache {
         }
         // Backend I/O outside the lock
         let backend_result = backend.get_session(key).await?;
-        let mut state = self.sessions.lock().await;
+        let mut state = self.lock_sessions().await;
         match backend_result {
             Some(bytes) => {
                 let record = Arc::new(SessionRecord::deserialize_for_store(
@@ -489,7 +601,7 @@ impl SignalStoreCache {
     }
 
     pub async fn put_session(&self, address: &ProtocolAddress, record: SessionRecord) {
-        let mut state = self.sessions.lock().await;
+        let mut state = self.lock_sessions().await;
         state.put(address.as_str(), record);
         state.evict_if_needed(self.max_entries);
     }
@@ -506,7 +618,7 @@ impl SignalStoreCache {
         address: &ProtocolAddress,
         record: SessionRecord,
     ) -> core::result::Result<(), SessionRecord> {
-        match self.sessions.try_lock() {
+        match self.try_lock_sessions() {
             Some(mut state) => {
                 state.put(address.as_str(), record);
                 state.evict_if_needed(self.max_entries);
@@ -520,7 +632,7 @@ impl SignalStoreCache {
     /// knows: `Some` only when the lock is free AND the entry is cached;
     /// `None` sends the caller to the async path (backend consult).
     pub fn try_has_session(&self, address: &ProtocolAddress) -> Option<bool> {
-        let state = self.sessions.try_lock()?;
+        let state = self.try_lock_sessions()?;
         state
             .cache
             .get(address.as_str())
@@ -528,7 +640,7 @@ impl SignalStoreCache {
     }
 
     pub async fn delete_session(&self, address: &ProtocolAddress) {
-        let mut state = self.sessions.lock().await;
+        let mut state = self.lock_sessions().await;
         state.delete(address.as_str());
     }
 
@@ -542,7 +654,7 @@ impl SignalStoreCache {
     ) -> Result<bool> {
         let key = address.as_str();
         {
-            let state = self.sessions.lock().await;
+            let state = self.lock_sessions().await;
             if let Some(entry) = state.cache.get(key) {
                 return Ok(!matches!(entry, SessionEntry::Absent));
             }
@@ -550,7 +662,7 @@ impl SignalStoreCache {
         // Backend I/O outside the lock
         let exists = backend.has_session(key).await?;
         if !exists {
-            let mut state = self.sessions.lock().await;
+            let mut state = self.lock_sessions().await;
             // Re-check: another task may have populated the cache
             if !state.cache.contains_key(key) {
                 state.cache.insert(Arc::from(key), SessionEntry::Absent);
@@ -726,7 +838,7 @@ impl SignalStoreCache {
         // Flush sessions: one batched write for all dirty puts instead of one
         // backend call (and one SQLite transaction) per session.
         {
-            let mut state = self.sessions.lock().await;
+            let mut state = self.lock_sessions().await;
             let incarnation = state.incarnation;
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
@@ -894,7 +1006,7 @@ impl SignalStoreCache {
     /// everything else (decrypt advances, identities) safely rides the
     /// coalesced write-behind.
     pub async fn needs_pre_wire_flush(&self) -> bool {
-        if !self.sessions.lock().await.reservation_pending.is_empty() {
+        if !self.lock_sessions().await.reservation_pending.is_empty() {
             return true;
         }
         !self.sender_keys.lock().await.wire_gate_pending.is_empty()
@@ -923,7 +1035,7 @@ impl SignalStoreCache {
         // run after each guard drops. Identities are raw bytes (len is free)
         // and stay fully under their lock.
         let (session_count, session_keys_len, session_recs): (u64, usize, Vec<_>) = {
-            let s = self.sessions.lock().await;
+            let s = self.lock_sessions().await;
             let mut keys_len = 0usize;
             let recs = s
                 .cache
@@ -981,7 +1093,18 @@ impl SignalStoreCache {
     }
 
     async fn clear_with_incarnation(&self, incarnation: StoreIncarnation) {
-        self.sessions.lock().await.discard(incarnation);
+        {
+            let mut sessions = self.sessions.lock().await;
+            let mut pending = self.pending_session_restores();
+            let generation = self
+                .session_recovery_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            pending.clear();
+            self.has_pending_session_restores
+                .store(false, Ordering::Release);
+            sessions.discard(incarnation, generation);
+        }
         self.identities.lock().await.clear();
         self.sender_keys.lock().await.discard(incarnation);
         // Drop buffered prekey removals together with the volatile sessions they
@@ -993,7 +1116,7 @@ impl SignalStoreCache {
     /// Only a discard can make a post-flush write's stale snapshot reloadable.
     #[doc(hidden)]
     pub async fn clear_after_flush(&self) {
-        let mut sessions = self.sessions.lock().await;
+        let mut sessions = self.lock_sessions().await;
         if sessions.dirty.is_empty()
             && sessions.deleted.is_empty()
             && sessions.reservation_pending.is_empty()
@@ -1189,6 +1312,50 @@ mod sender_key_lock_tests {
             "released lock must accept try_put_session"
         );
         assert_eq!(cache.try_has_session(&addr), Some(true));
+    }
+
+    #[tokio::test]
+    async fn cancelled_checkout_queues_under_contention_and_remains_flushable() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550008888".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+        let sessions = cache.sessions.lock().await;
+        assert!(cache.restore_session_from_checkout(
+            &addr,
+            record.expect("checked-out record"),
+            generation,
+        ));
+        assert_eq!(cache.pending_session_restores().len(), 1);
+        drop(sessions);
+
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            crate::store::traits::SignalStore::get_session(&backend, addr.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "a queued cancellation restore must not strand dirty state"
+        );
+    }
+
+    #[tokio::test]
+    async fn lossy_clear_rejects_an_older_checkout_generation() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550007777".to_string(), 1.into());
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
+
+        cache.clear().await;
+        assert!(!cache.restore_session_from_checkout(
+            &addr,
+            record.expect("checked-out record"),
+            generation,
+        ));
+        assert!(cache.peek_session(&addr, &backend).await.unwrap().is_none());
     }
 
     #[tokio::test]

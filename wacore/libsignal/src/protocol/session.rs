@@ -9,8 +9,8 @@ use crate::protocol::state::GenericSignedPreKey;
 use crate::protocol::{AliceSignalProtocolParameters, BobSignalProtocolParameters};
 use crate::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionRecord, SessionStore,
-    SignalProtocolError, SignedPreKeyStore, ratchet,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionCheckout, SessionRecord,
+    SessionStore, SignalProtocolError, SignedPreKeyStore, ratchet,
 };
 
 #[derive(Default)]
@@ -172,13 +172,12 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
         return Err(SignalProtocolError::SignatureValidationFailed);
     }
 
-    let existing = session_store.load_session(remote_address).await?;
-    let had_session = existing.is_some();
-    let mut session_record = existing.unwrap_or_else(SessionRecord::new_fresh);
+    let mut session = SessionCheckout::load_or_create(session_store, remote_address).await?;
+    let had_session = session.had_session();
 
     let result = process_prekey_bundle_inner(
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         bundle,
         their_identity_key,
@@ -188,9 +187,9 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     .await;
 
     if had_session || result.is_ok() {
-        session_store
-            .store_session(remote_address, session_record)
-            .await?;
+        session.commit().await?;
+    } else {
+        session.discard();
     }
 
     result

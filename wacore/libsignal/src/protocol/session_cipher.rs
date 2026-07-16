@@ -77,8 +77,8 @@ use crate::protocol::state::PreKeyId;
 use crate::protocol::state::SessionState;
 use crate::protocol::{
     CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionRecord,
-    SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionCheckout,
+    SessionRecord, SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
 };
 
 /// Plaintext plus whether decrypting this message replaced a previously-stored
@@ -104,19 +104,16 @@ pub async fn message_encrypt(
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
 ) -> Result<CiphertextMessage> {
-    let mut session_record = session_store
-        .load_session(remote_address)
+    let mut session = SessionCheckout::load(session_store, remote_address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
     let result =
-        message_encrypt_inner(ptext, remote_address, &mut session_record, identity_store).await;
+        message_encrypt_inner(ptext, remote_address, session.record_mut(), identity_store).await;
 
     // Always restore — chain key is only advanced inside the inner
     // function after identity checks pass, so no counters are burned.
-    session_store
-        .store_session(remote_address, session_record)
-        .await?;
+    session.commit().await?;
 
     result
 }
@@ -298,20 +295,19 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
 ) -> Result<DecryptionResult> {
-    let existing = session_store.load_session(remote_address).await?;
-    let had_session = existing.is_some();
+    let mut session = SessionCheckout::load_or_create(session_store, remote_address).await?;
+    let had_session = session.had_session();
     // Snapshot before process_prekey so a BadMac/InvalidMessage at the
     // record-level decrypt doesn't persist the promoted (but unusable)
     // session. Without this, an attacker that crafts a pkmsg with a valid
     // prekey header but tampered payload would replace our current_session
     // with a session only they can write to.
-    let pre_call_snapshot = existing.clone();
-    let mut session_record = existing.unwrap_or_else(SessionRecord::new_fresh);
+    let pre_call_snapshot = had_session.then(|| session.record().clone());
 
     let result = message_decrypt_prekey_inner(
         ciphertext,
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         pre_key_store,
         signed_pre_key_store,
@@ -326,15 +322,13 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     //     CheckedOut marker is replaced with the original record.
     //   - Err + !had_session: nothing to put back; new_fresh wasn't
     //     persisted before the call and there's no CheckedOut to honor.
-    let store_target = match (&result, pre_call_snapshot) {
-        (Ok(_), _) => Some(session_record),
-        (Err(_), Some(snapshot)) => Some(snapshot),
-        (Err(_), None) => None,
-    };
-    if let Some(record) = store_target
-        && (had_session || record.session_state().is_some())
-    {
-        session_store.store_session(remote_address, record).await?;
+    match (&result, pre_call_snapshot) {
+        (Ok(_), _) => session.commit().await?,
+        (Err(_), Some(snapshot)) => {
+            session.replace(snapshot);
+            session.commit().await?;
+        }
+        (Err(_), None) => session.discard(),
     }
 
     let (plaintext, pre_key_used, identity_change) = result?;
@@ -428,23 +422,20 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
 ) -> Result<DecryptionResult> {
-    let mut session_record = session_store
-        .load_session(remote_address)
+    let mut session = SessionCheckout::load(session_store, remote_address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
     let result = message_decrypt_signal_inner(
         ciphertext,
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         csprng,
     )
     .await;
 
-    session_store
-        .store_session(remote_address, session_record)
-        .await?;
+    session.commit().await?;
 
     let (plaintext, identity_change) = result?;
     Ok(DecryptionResult {

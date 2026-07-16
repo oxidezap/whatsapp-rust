@@ -10,7 +10,7 @@ use crate::protocol::sender_keys::SenderKeyRecord;
 use crate::protocol::state::{
     PreKeyId, PreKeyRecord, SessionRecord, SignedPreKeyId, SignedPreKeyRecord,
 };
-use crate::protocol::{IdentityKey, IdentityKeyPair, ProtocolAddress};
+use crate::protocol::{IdentityKey, IdentityKeyPair, ProtocolAddress, SignalProtocolError};
 use crate::store::sender_key_name::SenderKeyName;
 
 /// Each Signal message can be considered to have exactly two participants, a sender and receiver.
@@ -132,8 +132,19 @@ pub trait SignedPreKeyStore: ThreadSafe {
 pub trait SessionStore: ThreadSafe {
     /// Takes the session for `address`. Implementations with caches should
     /// treat this as a logical checkout; callers must always call
-    /// [`store_session`] to return the record, even on error paths.
+    /// [`store_session`] to return the record, even on error paths. Async
+    /// mutation paths use [`SessionCheckout`] so cancellation also returns it.
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
+
+    /// Couples take-style loads to a generation so cancellation cannot restore
+    /// state across a lossy cache reset.
+    #[doc(hidden)]
+    async fn load_session_for_update(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Result<(Option<SessionRecord>, Option<u64>)> {
+        Ok((self.load_session(address).await?, None))
+    }
 
     /// Non-destructive existence check (must not consume the cached entry).
     async fn has_session(&self, address: &ProtocolAddress) -> Result<bool>;
@@ -144,6 +155,122 @@ pub trait SessionStore: ThreadSafe {
         address: &ProtocolAddress,
         record: SessionRecord,
     ) -> Result<()>;
+
+    /// Gives take-style stores a synchronous recovery path before an async
+    /// owner can be cancelled again.
+    #[doc(hidden)]
+    #[allow(clippy::result_large_err)]
+    fn try_store_session_from_checkout(
+        &mut self,
+        _address: &ProtocolAddress,
+        record: SessionRecord,
+        _generation: Option<u64>,
+    ) -> core::result::Result<bool, SessionRecord> {
+        Err(record)
+    }
+}
+
+/// Keeps an owned session recoverable while an async protocol operation can be cancelled.
+pub struct SessionCheckout<'a> {
+    store: &'a mut dyn SessionStore,
+    address: &'a ProtocolAddress,
+    record: Option<SessionRecord>,
+    generation: Option<u64>,
+    had_session: bool,
+}
+
+impl<'a> SessionCheckout<'a> {
+    /// Loads an existing session and arms cancellation recovery.
+    pub async fn load(
+        store: &'a mut dyn SessionStore,
+        address: &'a ProtocolAddress,
+    ) -> Result<Option<Self>> {
+        let (record, generation) = store.load_session_for_update(address).await?;
+        Ok(record.map(|record| Self {
+            store,
+            address,
+            record: Some(record),
+            generation,
+            had_session: true,
+        }))
+    }
+
+    /// Creates an empty working record if the store has no session yet.
+    pub async fn load_or_create(
+        store: &'a mut dyn SessionStore,
+        address: &'a ProtocolAddress,
+    ) -> Result<Self> {
+        let (record, generation) = store.load_session_for_update(address).await?;
+        let had_session = record.is_some();
+        Ok(Self {
+            store,
+            address,
+            record: Some(record.unwrap_or_else(SessionRecord::new_fresh)),
+            generation,
+            had_session,
+        })
+    }
+
+    /// Reports whether the store supplied the working record.
+    pub fn had_session(&self) -> bool {
+        self.had_session
+    }
+
+    /// Borrows the working record.
+    pub fn record(&self) -> &SessionRecord {
+        self.record
+            .as_ref()
+            .expect("a live checkout always owns its record")
+    }
+
+    /// Mutably borrows the working record.
+    pub fn record_mut(&mut self) -> &mut SessionRecord {
+        self.record
+            .as_mut()
+            .expect("a live checkout always owns its record")
+    }
+
+    /// Preserves recovery while replacing a rejected mutation with its snapshot.
+    pub fn replace(&mut self, record: SessionRecord) {
+        self.record = Some(record);
+    }
+
+    /// Prevents a deliberately rejected fresh session from being recovered.
+    pub fn discard(mut self) {
+        self.record.take();
+    }
+
+    /// Returns the record by move without a cancellation gap on take-style stores.
+    pub async fn commit(mut self) -> Result<()> {
+        let record = self
+            .record
+            .take()
+            .expect("a live checkout always owns its record");
+        match self
+            .store
+            .try_store_session_from_checkout(self.address, record, self.generation)
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(SignalProtocolError::InvalidState(
+                "SessionCheckout::commit",
+                "cache reset during session mutation".to_string(),
+            )),
+            Err(record) => self.store.store_session(self.address, record).await,
+        }
+    }
+}
+
+impl Drop for SessionCheckout<'_> {
+    fn drop(&mut self) {
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        if self.had_session || record.session_state().is_some() {
+            let _ =
+                self.store
+                    .try_store_session_from_checkout(self.address, record, self.generation);
+        }
+    }
 }
 
 /// Interface for storing sender key records, allowing multiple keys per user.
