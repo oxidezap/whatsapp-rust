@@ -44,5 +44,6 @@ Read these when working on the relevant area:
 - `agent_docs/debugging.md` — evcxr REPL, binary protocol debugging
 - `agent_docs/binary_size_ci.md` — size-tracking CI: metrics, budgets, baseline semantics
 - `agent_docs/observability.md` — per-session stats (I/O, memory report, TaskInstrument/CPU), design rules
+- `agent_docs/signal_durability.md` — Signal counter leases, pre-wire gates, crash recovery, review checklist
 
 When adding comments to the code, dont be so verbose, also only explain why, not what

@@ -96,7 +96,7 @@ sha2 = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 futures = { workspace = true, features = ["executor", "thread-pool"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [[bench]]
 name = "reporting_token_benchmark"
