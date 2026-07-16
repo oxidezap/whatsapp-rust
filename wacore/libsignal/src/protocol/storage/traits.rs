@@ -147,6 +147,15 @@ pub trait SessionStore: ThreadSafe {
         Ok((self.load_session(address).await?, None))
     }
 
+    /// Avoids boxing the async fallback when a destructive store can answer immediately.
+    #[doc(hidden)]
+    fn try_load_session_for_update(
+        &self,
+        _address: &ProtocolAddress,
+    ) -> Option<Result<(Option<SessionRecord>, Option<u64>)>> {
+        None
+    }
+
     /// Non-destructive existence check (must not consume the cached entry).
     async fn has_session(&self, address: &ProtocolAddress) -> Result<bool>;
 
@@ -203,7 +212,10 @@ impl<'a> SessionCheckout<'a> {
         store: &'a mut dyn SessionStore,
         address: &'a ProtocolAddress,
     ) -> Result<Option<Self>> {
-        let (record, generation) = store.load_session_for_update(address).await?;
+        let (record, generation) = match store.try_load_session_for_update(address) {
+            Some(result) => result?,
+            None => store.load_session_for_update(address).await?,
+        };
         let Some(record) = record else {
             store.cancel_session_checkout(address, generation);
             return Ok(None);
@@ -222,7 +234,10 @@ impl<'a> SessionCheckout<'a> {
         store: &'a mut dyn SessionStore,
         address: &'a ProtocolAddress,
     ) -> Result<Self> {
-        let (record, generation) = store.load_session_for_update(address).await?;
+        let (record, generation) = match store.try_load_session_for_update(address) {
+            Some(result) => result?,
+            None => store.load_session_for_update(address).await?,
+        };
         let had_session = record.is_some();
         Ok(Self {
             store,

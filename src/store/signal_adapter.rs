@@ -120,6 +120,17 @@ impl SessionStore for SessionAdapter {
             .map_err(signal_err("backend"))
     }
 
+    fn try_load_session_for_update(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Option<Result<(Option<SessionRecord>, Option<u64>), SignalProtocolError>> {
+        self.0.cache.try_checkout_session(address).map(|result| {
+            result
+                .map(|(record, generation)| (record, Some(generation)))
+                .map_err(signal_err("backend"))
+        })
+    }
+
     fn try_store_session_from_checkout(
         &mut self,
         address: &ProtocolAddress,

@@ -645,6 +645,24 @@ impl SignalStoreCache {
         }
     }
 
+    /// A warm checkout avoids the device lock and boxed async store future.
+    #[doc(hidden)]
+    pub fn try_checkout_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Option<Result<(Option<SessionRecord>, u64)>> {
+        let mut state = self.try_lock_sessions()?;
+        let generation = state.checkout_generation;
+        match state.checkout(address.as_str()) {
+            CachedSessionCheckout::Present(record) => Some(Ok((Some(record), generation))),
+            CachedSessionCheckout::Absent => Some(Ok((None, generation))),
+            CachedSessionCheckout::Busy => {
+                Some(Err(anyhow::anyhow!("session is already checked out")))
+            }
+            CachedSessionCheckout::Missing => None,
+        }
+    }
+
     /// Non-destructive read. Clones the session without removing it from
     /// cache. Use for inspection-only paths (retry, LID migration checks).
     pub async fn peek_session(
@@ -1387,6 +1405,10 @@ mod sender_key_lock_tests {
             None,
             "held sessions lock must reject try_has_session"
         );
+        assert!(
+            cache.try_checkout_session(&addr).is_none(),
+            "held sessions lock must defer checkout"
+        );
         drop(guard);
 
         assert_eq!(
@@ -1394,6 +1416,7 @@ mod sender_key_lock_tests {
             None,
             "unknown entry must defer to the async path"
         );
+        assert!(cache.try_checkout_session(&addr).is_none());
         assert!(
             cache
                 .try_put_session(&addr, SessionRecord::new_fresh())
@@ -1458,12 +1481,17 @@ mod sender_key_lock_tests {
     #[tokio::test]
     async fn checkout_rejects_a_competing_owner() {
         let cache = SignalStoreCache::new();
-        let backend = crate::store::in_memory::InMemoryBackend::new();
         let addr = ProtocolAddress::new("15550007770".to_string(), 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
 
-        let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
-        let error = match cache.checkout_session(&addr, &backend).await {
+        let (record, generation) = cache
+            .try_checkout_session(&addr)
+            .expect("warm checkout")
+            .expect("first owner");
+        let error = match cache
+            .try_checkout_session(&addr)
+            .expect("checked-out slots are known")
+        {
             Ok(_) => panic!("a second owner must be rejected"),
             Err(error) => error,
         };
