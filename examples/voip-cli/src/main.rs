@@ -22,6 +22,7 @@
 //! Env: `WA_VIDEO_INPUT` = `testsrc` | file/URL | webcam device (default: OS webcam);
 //! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`; optional quality overrides:
 //! `WA_VIDEO_SIZE`, `WA_VIDEO_FPS`, `WA_VIDEO_BITRATE_KBPS`, `WA_VIDEO_SINK_FPS`.
+//! `WA_AUDIO_CODEC` = `mlow` (default when available) | `opus`.
 //!
 //! The inbound MEDIA path is the library facade: `client.voip().accept(&call).audio(mic,
 //! speaker).start()` returns a `CallHandle` and the library owns the callKey decrypt, the relay
@@ -33,6 +34,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
+#[cfg(feature = "voip-opus")]
+use bytes::Bytes;
 use log::{debug, error, info, warn};
 use portable_atomic::AtomicU64;
 use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER};
@@ -40,8 +43,12 @@ use wacore::types::call::{CallAction, IncomingCall};
 use wacore::types::events::{Event, EventHandler};
 use wacore::voip::CallEvent;
 use whatsapp_rust::prelude::*;
+#[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
+#[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
+#[cfg(feature = "voip-opus")]
+use whatsapp_rust::voip::{AudioFormat, EncodedAudioFrame};
 use whatsapp_rust::voip::{CallHandle, VideoState};
 
 mod video;
@@ -49,7 +56,68 @@ use video::VideoOpts;
 
 const FRAME_SAMPLES: usize = 960; // 60 ms @ 16 kHz
 const WA_RATE: u32 = 16_000;
+#[cfg(feature = "voip-opus")]
 const SSRC: u32 = 0x5741_0001;
+
+#[cfg(not(any(feature = "voip-mlow", feature = "voip-opus")))]
+compile_error!("enable at least one of voip-mlow or voip-opus");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioMode {
+    #[cfg(feature = "voip-mlow")]
+    Mlow,
+    #[cfg(feature = "voip-opus")]
+    Opus,
+}
+
+impl AudioMode {
+    fn from_env() -> Result<Self> {
+        let configured = std::env::var("WA_AUDIO_CODEC").ok();
+        match configured
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            #[cfg(feature = "voip-mlow")]
+            None | Some("mlow") => Ok(Self::Mlow),
+            #[cfg(all(not(feature = "voip-mlow"), feature = "voip-opus"))]
+            None => Ok(Self::Opus),
+            #[cfg(feature = "voip-opus")]
+            Some("opus") => Ok(Self::Opus),
+            Some(other) => bail!(
+                "WA_AUDIO_CODEC={other:?} is unavailable in this build; compile the matching \
+                 voip-mlow/voip-opus feature"
+            ),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            #[cfg(feature = "voip-mlow")]
+            Self::Mlow => "mlow",
+            #[cfg(feature = "voip-opus")]
+            Self::Opus => "opus",
+        }
+    }
+
+    fn signaling_rate(self) -> u32 {
+        match self {
+            #[cfg(feature = "voip-mlow")]
+            Self::Mlow => 16_000,
+            #[cfg(feature = "voip-opus")]
+            Self::Opus => 8_000,
+        }
+    }
+
+    fn signaling_rate_wire(self) -> &'static str {
+        match self {
+            #[cfg(feature = "voip-mlow")]
+            Self::Mlow => "16000",
+            #[cfg(feature = "voip-opus")]
+            Self::Opus => "8000",
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -89,13 +157,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // The realtime media path encodes one mlow frame every 60 ms; a debug build makes that encode
-    // ~7-10x slower (measured ~19 ms avg / ~49 ms peak vs ~2.5 ms release), and on a slower machine it
-    // overruns the 60 ms budget so frames back up and the far end breaks up. Run calls in release.
+    // Codec work in a debug build can overrun the 60 ms frame budget on slower machines.
     #[cfg(debug_assertions)]
     warn!(
-        "⚠ debug build: mlow encode is much slower than release and may not keep up with realtime \
-         audio (choppy/inaudible far-end voice). Run VoIP with `cargo run --release` for clean audio."
+        "⚠ debug build: audio encoding may not keep up with realtime. Run VoIP with \
+         `cargo run --release` for clean audio."
     );
 
     let args: Vec<String> = std::env::args().collect();
@@ -287,7 +353,7 @@ fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
             .unwrap_or_else(|_| "?".into())
     );
 
-    let (tx, rx) = async_channel::bounded::<Vec<i16>>(8);
+    let (tx, rx) = async_channel::bounded::<Vec<i16>>(3);
 
     // ~1 s of native-rate mono headroom: absorbs the callback's bursty deliveries so the drain (and
     // the channel) see a steady 60 ms cadence.
@@ -642,6 +708,7 @@ where
 
 // ===================== loopback (no WhatsApp) =====================
 
+#[cfg(feature = "voip-opus")]
 async fn run_loopback() -> Result<()> {
     info!(
         "voip loopback: mic → Opus → E2E-SRTP protect/unprotect → Opus → speaker. Ctrl+C to stop."
@@ -687,7 +754,54 @@ async fn run_loopback() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "voip-opus"))]
+async fn run_loopback() -> Result<()> {
+    bail!("loopback requires the voip-opus feature")
+}
+
 // ===================== live call / listen =====================
+
+#[cfg(feature = "voip-opus")]
+fn spawn_opus_bridge(
+    mic: async_channel::Receiver<Vec<i16>>,
+    speaker: async_channel::Sender<Vec<i16>>,
+) -> Result<(
+    async_channel::Receiver<Bytes>,
+    async_channel::Sender<EncodedAudioFrame>,
+)> {
+    let mut encoder = WaOpusEncoder::new()?;
+    let mut decoder = WaOpusDecoder::new()?;
+    let (encoded_tx, encoded_rx) = async_channel::bounded::<Bytes>(3);
+    let (playout_tx, playout_rx) = async_channel::bounded::<EncodedAudioFrame>(3);
+
+    tokio::spawn(async move {
+        while let Ok(pcm) = mic.recv().await {
+            match encoder.encode(&pcm) {
+                Ok(payload) => {
+                    if encoded_tx.send(Bytes::from(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!("Opus encode failed: {error}");
+                    break;
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(frame) = playout_rx.recv().await {
+            match decoder.decode(&frame.data) {
+                Ok(pcm) => {
+                    let _ = speaker.try_send(pcm);
+                }
+                Err(error) => warn!("Opus decode failed: {error}"),
+            }
+        }
+    });
+
+    Ok((encoded_rx, playout_tx))
+}
 
 enum Mode {
     Listen { accept: bool, video: bool },
@@ -701,6 +815,7 @@ enum Mode {
 struct CallObserver {
     client: Arc<Client>,
     accept: bool,
+    audio: AudioMode,
     /// `--video`: start/answer calls with video media and auto-accept peer upgrade requests.
     video: bool,
     /// Per-call UI bookkeeping. The client's `CallRegistry` owns media termination.
@@ -729,10 +844,11 @@ enum VideoUi {
 }
 
 impl CallObserver {
-    fn new(client: Arc<Client>, accept: bool, video: bool) -> Self {
+    fn new(client: Arc<Client>, accept: bool, video: bool, audio: AudioMode) -> Self {
         Self {
             client,
             accept,
+            audio,
             video,
             state: Arc::new(Mutex::new(CallState::default())),
         }
@@ -822,6 +938,7 @@ impl EventHandler for CallObserver {
                     let client = self.client.clone();
                     let call = call.clone();
                     let accept = self.accept;
+                    let audio = self.audio;
                     // Only answer with video when we're allowed to AND the offer is actually a video
                     // call; advertising `<video>` on an audio offer would be wrong.
                     let video = self.video && *is_video;
@@ -829,7 +946,8 @@ impl EventHandler for CallObserver {
                     let cid = call_id.clone();
                     begin_call_startup(&state, &cid);
                     tokio::spawn(async move {
-                        if let Err(e) = respond_to_offer(&client, &call, accept, video).await {
+                        if let Err(e) = respond_to_offer(&client, &call, accept, video, audio).await
+                        {
                             error!("call signaling failed: {e}");
                             complete_call_startup(&state, &cid);
                             return;
@@ -838,7 +956,7 @@ impl EventHandler for CallObserver {
                             complete_call_startup(&state, &cid);
                             return;
                         }
-                        match start_media(&client, &call, video, &state).await {
+                        match start_media(&client, &call, video, audio, &state).await {
                             Ok(handle) => register_handle(&state, cid.clone(), handle).await,
                             Err(e) => {
                                 let peer_ended = peer_terminated_during_startup(&state, &cid);
@@ -885,10 +1003,12 @@ async fn start_media(
     client: &Arc<Client>,
     call: &IncomingCall,
     video: bool,
+    audio: AudioMode,
     state: &Arc<Mutex<CallState>>,
 ) -> Result<Arc<CallHandle>> {
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
+    let event_speaker = speaker.clone();
     info!("🔌 connecting media via client.voip().accept(..)…");
     let video_endpoints = if video {
         let opts = VideoOpts::from_env().await?;
@@ -903,9 +1023,18 @@ async fn start_media(
     if peer_terminated_during_startup(state, call.action.call_id()) {
         bail!("peer ended the call during media preparation");
     }
-    send_final_accept(client, call, video).await?;
+    send_final_accept(client, call, video, audio).await?;
     let voip = client.voip();
-    let mut builder = voip.accept(call).audio(mic, speaker.clone());
+    let mut builder = match audio {
+        #[cfg(feature = "voip-mlow")]
+        AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
+        #[cfg(feature = "voip-opus")]
+        AudioMode::Opus => {
+            let (source, sink) = spawn_opus_bridge(mic, speaker)?;
+            voip.accept(call)
+                .encoded_audio(AudioFormat::OPUS_16KHZ_60MS, source, sink)
+        }
+    };
     if let Some((source, sink)) = video_endpoints {
         builder = builder.video(source, sink);
     }
@@ -914,7 +1043,8 @@ async fn start_media(
         .await
         .map_err(|e| anyhow!("accept media: {e}"))?;
     info!(
-        "🎙  media flow live for call {} — speak into the mic.{}",
+        "🎙  {} media flow live for call {} — speak into the mic.{}",
+        audio.name(),
         handle.call_id(),
         if video { " 🎥 video on." } else { "" }
     );
@@ -922,7 +1052,7 @@ async fn start_media(
     if video {
         mark_video(state, handle.call_id(), Some(VideoUi::Active));
     }
-    spawn_call_event_listener(handle.clone(), speaker, video, state.clone());
+    spawn_call_event_listener(handle.clone(), event_speaker, video, state.clone());
     Ok(handle)
 }
 
@@ -934,13 +1064,24 @@ async fn place_outgoing_call(
     client: &Arc<Client>,
     peer: &Jid,
     video: bool,
+    audio: AudioMode,
     state: &Arc<Mutex<CallState>>,
 ) -> Result<Arc<CallHandle>> {
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
+    let event_speaker = speaker.clone();
     info!("📞 placing call to {peer} via client.voip().call(..)…");
     let voip = client.voip();
-    let mut builder = voip.call(peer).audio(mic, speaker.clone());
+    let mut builder = match audio {
+        #[cfg(feature = "voip-mlow")]
+        AudioMode::Mlow => voip.call(peer).audio(mic, speaker),
+        #[cfg(feature = "voip-opus")]
+        AudioMode::Opus => {
+            let (source, sink) = spawn_opus_bridge(mic, speaker)?;
+            voip.call(peer)
+                .encoded_audio(AudioFormat::OPUS_16KHZ_60MS, source, sink)
+        }
+    };
     if video {
         let opts = VideoOpts::from_env().await?;
         builder = builder.video(
@@ -953,7 +1094,8 @@ async fn place_outgoing_call(
         .await
         .map_err(|e| anyhow!("place call: {e}"))?;
     info!(
-        "☎  offer sent for call {} — waiting for the peer's relay to connect media.{}",
+        "☎  {} offer sent for call {} — waiting for the peer's relay to connect media.{}",
+        audio.name(),
         handle.call_id(),
         if video { " 🎥 video call." } else { "" }
     );
@@ -961,7 +1103,7 @@ async fn place_outgoing_call(
     if video {
         mark_video(state, handle.call_id(), Some(VideoUi::Active));
     }
-    spawn_call_event_listener(handle.clone(), speaker, video, state.clone());
+    spawn_call_event_listener(handle.clone(), event_speaker, video, state.clone());
     Ok(handle)
 }
 
@@ -978,10 +1120,7 @@ fn mark_video(state: &Arc<Mutex<CallState>>, call_id: &str, ui: Option<VideoUi>)
     }
 }
 
-/// Surface the call's engine events: log relay-allocate outcomes, decode any non-MLow (standard
-/// Opus) frame the core hands back and play it, and drive the video upgrade handshake (auto-accept
-/// under `--video`, otherwise park it for the stdin `v` toggle). MLow audio is decoded inside the
-/// engine and arrives as playout on the speaker channel directly.
+/// Surface call diagnostics and drive the video upgrade handshake.
 fn spawn_call_event_listener(
     handle: Arc<CallHandle>,
     speaker: async_channel::Sender<Vec<i16>>,
@@ -990,7 +1129,10 @@ fn spawn_call_event_listener(
 ) {
     let events = handle.events();
     tokio::spawn(async move {
-        let mut opus = WaOpusDecoder::new().ok();
+        #[cfg(feature = "voip-opus")]
+        let mut fallback_opus = WaOpusDecoder::new().ok();
+        #[cfg(not(feature = "voip-opus"))]
+        let mut fallback_warning_logged = false;
         let mut peer_video_receiver_confirmed = false;
         let mut peer_keyframe_request_logged = false;
         while let Ok(ev) = events.recv().await {
@@ -1005,11 +1147,31 @@ fn spawn_call_event_listener(
                     warn!("relay never acked the allocate (wedged relay) — media never came up")
                 }
                 CallEvent::ForeignAudio(payload) => {
-                    if let Some(dec) = opus.as_mut()
-                        && let Ok(pcm) = dec.decode(&payload)
+                    #[cfg(feature = "voip-opus")]
+                    if let Some(decoder) = fallback_opus.as_mut()
+                        && let Ok(pcm) = decoder.decode(&payload)
                     {
                         let _ = speaker.try_send(pcm);
                     }
+                    #[cfg(not(feature = "voip-opus"))]
+                    if !fallback_warning_logged {
+                        warn!(
+                            "peer sent a {}-byte MLOW embedded Opus fallback, but this binary has \
+                             no Opus decoder",
+                            payload.len()
+                        );
+                        let _ = &speaker;
+                        fallback_warning_logged = true;
+                    }
+                }
+                CallEvent::AudioFormatMismatch {
+                    expected_rate,
+                    received_rates,
+                } => {
+                    error!(
+                        "peer selected incompatible audio rates {received_rates:?}; expected \
+                         {expected_rate}"
+                    );
                 }
                 CallEvent::RtcpReceived {
                     packet_types,
@@ -1126,10 +1288,12 @@ async fn respond_to_offer(
     call: &IncomingCall,
     accept: bool,
     video: bool,
+    audio: AudioMode,
 ) -> Result<()> {
     let CallAction::Offer {
         call_id,
         call_creator,
+        audio: offered_audio,
         ..
     } = &call.action
     else {
@@ -1148,8 +1312,24 @@ async fn respond_to_offer(
             .map_err(|e| anyhow!("send reject: {e}"))?;
         return Ok(());
     }
+    if !offered_audio.is_empty()
+        && !offered_audio.iter().any(|codec| {
+            codec.enc.eq_ignore_ascii_case("opus") && codec.rate == audio.signaling_rate()
+        })
+    {
+        client
+            .voip()
+            .reject(call)
+            .await
+            .map_err(|e| anyhow!("reject incompatible audio offer: {e}"))?;
+        bail!(
+            "peer did not offer {} signaling rate {}",
+            audio.name(),
+            audio.signaling_rate()
+        );
+    }
     // Callee flow: preaccept immediately; final accept waits for ready media.
-    let audio_rates = &["16000"];
+    let audio_rates = &[audio.signaling_rate_wire()];
     let pre_id = hex::encode(rand::random::<[u8; 8]>());
     client
         .send_node(stanza::build_preaccept(
@@ -1167,7 +1347,12 @@ async fn respond_to_offer(
     Ok(())
 }
 
-async fn send_final_accept(client: &Arc<Client>, call: &IncomingCall, video: bool) -> Result<()> {
+async fn send_final_accept(
+    client: &Arc<Client>,
+    call: &IncomingCall,
+    video: bool,
+    audio: AudioMode,
+) -> Result<()> {
     let CallAction::Offer {
         call_id,
         call_creator,
@@ -1176,7 +1361,7 @@ async fn send_final_accept(client: &Arc<Client>, call: &IncomingCall, video: boo
     else {
         return Ok(());
     };
-    let audio_rates = &["16000"];
+    let audio_rates = &[audio.signaling_rate_wire()];
     let accept_id = hex::encode(rand::random::<[u8; 8]>());
     let metadata = if video { call.media.as_deref() } else { None };
     let accept_node = stanza::build_accept(&stanza::AcceptParams {
@@ -1300,6 +1485,12 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
 }
 
 async fn run_bot(mode: Mode) -> Result<()> {
+    let audio = AudioMode::from_env()?;
+    info!(
+        "🔊 selected {} audio (signaling rate {})",
+        audio.name(),
+        audio.signaling_rate()
+    );
     let store = SqliteStore::new("whatsapp.db")
         .await
         .map_err(|e| anyhow!("sqlite: {e}"))?;
@@ -1325,7 +1516,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
     // The structured `Event::IncomingCall` (which now carries the offer's <enc>/<relay>) drives the
     // accept flow, so the raw-node-forwarding crutch the old hand-rolled inbound path needed is gone.
     let manages_media = accept || target.is_some();
-    let observer = Arc::new(CallObserver::new(client.clone(), accept, video));
+    let observer = Arc::new(CallObserver::new(client.clone(), accept, video, audio));
     client.register_handler(observer.clone());
 
     if let Some(peer) = target {
@@ -1341,7 +1532,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
                 warn!("not connected within 60s, skipping outgoing call: {e}");
                 return;
             }
-            match place_outgoing_call(&client2, &peer, video, &state).await {
+            match place_outgoing_call(&client2, &peer, video, audio, &state).await {
                 Ok(handle) => {
                     let cid = handle.call_id().to_string();
                     register_handle(&state, cid, handle).await;
@@ -1351,8 +1542,9 @@ async fn run_bot(mode: Mode) -> Result<()> {
         });
     } else {
         warn!(
-            "listening for calls ({}{}). Ctrl+C to exit.",
+            "listening for calls ({}, {}{}). Ctrl+C to exit.",
             if accept { "auto-accept" } else { "auto-reject" },
+            audio.name(),
             if video { ", video" } else { "" }
         );
     }
