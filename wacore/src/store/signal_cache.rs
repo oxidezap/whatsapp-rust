@@ -434,20 +434,22 @@ impl SignalStoreCache {
             completion,
         } in pending.drain(..)
         {
-            let expected = matches!(
-                state.cache.get(address.as_ref()),
-                Some(SessionEntry::CheckedOut(was_present)) if *was_present == had_session
-            );
-            let restored = generation == state.checkout_generation && expected;
-            if restored && let Some(record) = record {
-                let address = state
-                    .cache
-                    .get_key_value(address.as_ref())
-                    .map_or(address, |(cached, _)| cached.clone());
-                state.put_with_key(address, record);
-            } else if restored {
-                let address = state.key_for(address.as_ref());
-                state.cache.insert(address, SessionEntry::Absent);
+            let key = if generation == state.checkout_generation
+                && let Some((key, SessionEntry::CheckedOut(was_present))) =
+                    state.cache.get_key_value(address.as_ref())
+                && *was_present == had_session
+            {
+                Some(key.clone())
+            } else {
+                None
+            };
+            let restored = key.is_some();
+            match (key, record) {
+                (Some(key), Some(record)) => state.put_with_key(key, record),
+                (Some(key), None) => {
+                    state.cache.insert(key, SessionEntry::Absent);
+                }
+                (None, _) => {}
             }
             if let Some(completion) = completion {
                 completion.store(restored, Ordering::Release);
@@ -480,14 +482,19 @@ impl SignalStoreCache {
         had_session: bool,
     ) -> SessionCheckoutStoreResult {
         if let Some(mut state) = self.try_lock_sessions() {
-            let expected = matches!(
-                state.cache.get(address.as_str()),
-                Some(SessionEntry::CheckedOut(was_present)) if *was_present == had_session
-            );
-            if generation != state.checkout_generation || !expected {
+            if generation != state.checkout_generation {
                 return SessionCheckoutStoreResult::Rejected;
             }
-            state.put(address.as_str(), record);
+            let Some((key, SessionEntry::CheckedOut(was_present))) =
+                state.cache.get_key_value(address.as_str())
+            else {
+                return SessionCheckoutStoreResult::Rejected;
+            };
+            if *was_present != had_session {
+                return SessionCheckoutStoreResult::Rejected;
+            }
+            let key = key.clone();
+            state.put_with_key(key, record);
             state.evict_if_needed(self.max_entries);
             return SessionCheckoutStoreResult::Stored;
         }
