@@ -73,12 +73,11 @@ const fn forward_jump_limit(is_self: bool) -> usize {
 }
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
-use crate::protocol::state::PreKeyId;
-use crate::protocol::state::SessionState;
+use crate::protocol::state::{DecryptSnapshot, PreKeyId, SessionState};
 use crate::protocol::{
     CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionRecord,
-    SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionCheckout,
+    SessionRecord, SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
 };
 
 /// Plaintext plus whether decrypting this message replaced a previously-stored
@@ -104,19 +103,16 @@ pub async fn message_encrypt(
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
 ) -> Result<CiphertextMessage> {
-    let mut session_record = session_store
-        .load_session(remote_address)
+    let mut session = SessionCheckout::load(session_store, remote_address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
     let result =
-        message_encrypt_inner(ptext, remote_address, &mut session_record, identity_store).await;
+        message_encrypt_inner(ptext, remote_address, session.record_mut(), identity_store).await;
 
     // Always restore — chain key is only advanced inside the inner
     // function after identity checks pass, so no counters are burned.
-    session_store
-        .store_session(remote_address, session_record)
-        .await?;
+    session.commit().await?;
 
     result
 }
@@ -298,20 +294,13 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
 ) -> Result<DecryptionResult> {
-    let existing = session_store.load_session(remote_address).await?;
-    let had_session = existing.is_some();
-    // Snapshot before process_prekey so a BadMac/InvalidMessage at the
-    // record-level decrypt doesn't persist the promoted (but unusable)
-    // session. Without this, an attacker that crafts a pkmsg with a valid
-    // prekey header but tampered payload would replace our current_session
-    // with a session only they can write to.
-    let pre_call_snapshot = existing.clone();
-    let mut session_record = existing.unwrap_or_else(SessionRecord::new_fresh);
+    let mut session = SessionCheckout::load_or_create(session_store, remote_address).await?;
+    session.snapshot_for_rollback();
 
     let result = message_decrypt_prekey_inner(
         ciphertext,
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         pre_key_store,
         signed_pre_key_store,
@@ -320,21 +309,10 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     )
     .await;
 
-    // Persistence rules:
-    //   - Ok: store the (mutated) record with the promoted session.
-    //   - Err + had_session: restore the pre-call snapshot so the cache's
-    //     CheckedOut marker is replaced with the original record.
-    //   - Err + !had_session: nothing to put back; new_fresh wasn't
-    //     persisted before the call and there's no CheckedOut to honor.
-    let store_target = match (&result, pre_call_snapshot) {
-        (Ok(_), _) => Some(session_record),
-        (Err(_), Some(snapshot)) => Some(snapshot),
-        (Err(_), None) => None,
-    };
-    if let Some(record) = store_target
-        && (had_session || record.session_state().is_some())
-    {
-        session_store.store_session(remote_address, record).await?;
+    if result.is_ok() {
+        session.commit().await?;
+    } else {
+        session.rollback().await?;
     }
 
     let (plaintext, pre_key_used, identity_change) = result?;
@@ -389,7 +367,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
         }
     };
 
-    let decrypt_result = decrypt_message_with_record(
+    let decrypt = decrypt_message_with_record(
         remote_address,
         session_record,
         ciphertext.message(),
@@ -403,6 +381,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
             identity_to_save.their_identity_key,
         )
         .await?;
+    let plaintext = decrypt.commit();
 
     // A duplicate/out-of-order pkmsg that matched an existing session carries the
     // identity from when that session was built, not a fresh rotation. Reporting
@@ -414,11 +393,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
         saved
     };
 
-    Ok((
-        decrypt_result.plaintext,
-        pre_key_used.pre_key_id,
-        identity_change,
-    ))
+    Ok((plaintext, pre_key_used.pre_key_id, identity_change))
 }
 
 pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
@@ -428,23 +403,20 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
 ) -> Result<DecryptionResult> {
-    let mut session_record = session_store
-        .load_session(remote_address)
+    let mut session = SessionCheckout::load(session_store, remote_address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
     let result = message_decrypt_signal_inner(
         ciphertext,
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         csprng,
     )
     .await;
 
-    session_store
-        .store_session(remote_address, session_record)
-        .await?;
+    session.commit().await?;
 
     let (plaintext, identity_change) = result?;
     Ok(DecryptionResult {
@@ -474,7 +446,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
         return Err(SignalProtocolError::SessionNotFound(remote_address.clone()));
     }
 
-    let decrypt_result = decrypt_message_with_record(
+    let decrypt = decrypt_message_with_record(
         remote_address,
         session_record,
         ciphertext,
@@ -482,10 +454,8 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
         csprng,
     )?;
 
-    // Get the identity key from the (now current) session state
-    let their_identity_key = session_record
-        .session_state()
-        .expect("successfully decrypted; must have a current state")
+    let their_identity_key = decrypt
+        .state()
         .remote_identity_key()
         .expect("successfully decrypted; must have a remote identity key")
         .expect("successfully decrypted; must have a remote identity key");
@@ -500,7 +470,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     // The previous session gets promoted to current via `promote_old_session`, so we need
     // to save its identity to avoid UntrustedIdentity errors on subsequent messages.
     // This handles out-of-order message delivery after an identity change gracefully.
-    let identity_change = if decrypt_result.used_previous_session {
+    let identity_change = if decrypt.used_previous_session() {
         log::debug!(
             "Saving identity for {} from previous session (skipping trust check)",
             remote_address,
@@ -533,7 +503,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
             .await?
     };
 
-    Ok((decrypt_result.plaintext, identity_change))
+    Ok((decrypt.commit(), identity_change))
 }
 
 fn create_decryption_failure_log(
@@ -627,23 +597,143 @@ fn create_decryption_failure_log(
     Ok(lines.join("\n"))
 }
 
-/// Result of decrypting a message against a session record, including whether a
-/// previous session was used.
-struct RecordDecryptResult {
-    plaintext: Vec<u8>,
-    /// True if the message was decrypted using a previous (archived) session state
-    /// rather than the current session. When true, the identity check should be
-    /// skipped since we already had a valid session with that identity.
-    used_previous_session: bool,
+enum RecordDecryptState {
+    Current(DecryptSnapshot),
+    Previous {
+        state: Box<SessionState>,
+        effect: StateDecryptEffect,
+        index: usize,
+    },
 }
 
-fn decrypt_message_with_record<R: Rng + CryptoRng>(
+struct DeferredCurrentDecrypt<'a> {
+    record: &'a mut SessionRecord,
+    ratchet_key: PublicKey,
+    chain_key: ChainKey,
+    plaintext: Vec<u8>,
+}
+
+enum RecordDecrypt<'a> {
+    Deferred(DeferredCurrentDecrypt<'a>),
+    Transaction(RecordDecryptTransaction<'a>),
+}
+
+impl RecordDecrypt<'_> {
+    fn state(&self) -> &SessionState {
+        match self {
+            Self::Deferred(decrypt) => decrypt
+                .record
+                .session_state()
+                .expect("a deferred decrypt keeps the current state installed"),
+            Self::Transaction(decrypt) => decrypt.state(),
+        }
+    }
+
+    fn used_previous_session(&self) -> bool {
+        match self {
+            Self::Deferred(_) => false,
+            Self::Transaction(decrypt) => decrypt.used_previous_session(),
+        }
+    }
+
+    fn commit(self) -> Vec<u8> {
+        match self {
+            Self::Deferred(mut decrypt) => {
+                let state = decrypt
+                    .record
+                    .session_state_mut()
+                    .expect("a deferred decrypt keeps the current state installed");
+                state
+                    .set_receiver_chain_key(&decrypt.ratchet_key, &decrypt.chain_key)
+                    .expect("the deferred in-order receiver chain remains installed");
+                state.clear_unacknowledged_pre_key_message();
+                std::mem::take(&mut decrypt.plaintext)
+            }
+            Self::Transaction(decrypt) => decrypt.commit(),
+        }
+    }
+}
+
+struct RecordDecryptTransaction<'a> {
+    record: &'a mut SessionRecord,
+    state: Option<RecordDecryptState>,
+    plaintext: Vec<u8>,
+}
+
+impl RecordDecryptTransaction<'_> {
+    fn state(&self) -> &SessionState {
+        match self
+            .state
+            .as_ref()
+            .expect("a live decrypt transaction owns its rollback")
+        {
+            RecordDecryptState::Current(_) => self
+                .record
+                .session_state()
+                .expect("a current decrypt transaction keeps the current state installed"),
+            RecordDecryptState::Previous { state, .. } => state,
+        }
+    }
+
+    fn used_previous_session(&self) -> bool {
+        matches!(self.state, Some(RecordDecryptState::Previous { .. }))
+    }
+
+    fn commit(mut self) -> Vec<u8> {
+        match self
+            .state
+            .take()
+            .expect("a live decrypt transaction owns its rollback")
+        {
+            RecordDecryptState::Current(_) => {
+                let state = self
+                    .record
+                    .session_state_mut()
+                    .expect("a current decrypt transaction keeps the current state installed");
+                state.clear_unacknowledged_pre_key_message();
+            }
+            RecordDecryptState::Previous {
+                mut state, effect, ..
+            } => {
+                effect.commit(&mut state);
+                state.clear_unacknowledged_pre_key_message();
+                self.record.promote_state(*state);
+            }
+        }
+        std::mem::take(&mut self.plaintext)
+    }
+}
+
+impl Drop for RecordDecryptTransaction<'_> {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        match state {
+            RecordDecryptState::Current(snapshot) => self
+                .record
+                .session_state_mut()
+                .expect("a current decrypt transaction keeps the current state installed")
+                .restore_decrypt_snapshot(snapshot),
+            RecordDecryptState::Previous {
+                mut state,
+                effect,
+                index,
+            } => {
+                effect.rollback(&mut state);
+                self.record.restore_previous_session(index, *state);
+            }
+        }
+    }
+}
+
+fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
-    record: &mut SessionRecord,
+    record: &'a mut SessionRecord,
     ciphertext: &SignalMessage,
     original_message_type: CiphertextMessageType,
     csprng: &mut R,
-) -> Result<RecordDecryptResult> {
+) -> Result<RecordDecrypt<'a>> {
     debug_assert!(matches!(
         original_message_type,
         CiphertextMessageType::Whisper | CiphertextMessageType::PreKey
@@ -679,7 +769,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
         );
 
         match result {
-            Ok(ptext) => {
+            Ok(result) => {
                 log::debug!(
                     "decrypted {:?} message from {} with current session state (base key {})",
                     original_message_type,
@@ -688,11 +778,25 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
                         .sender_ratchet_key_for_logging()
                         .expect("successful decrypt always has a valid base key"),
                 );
-                record.set_session_state(current_state); // update the state
-                return Ok(RecordDecryptResult {
-                    plaintext: ptext,
-                    used_previous_session: false,
-                });
+                record.set_session_state(current_state);
+                return match result.effect {
+                    StateDecryptEffect::DeferredChainKey {
+                        ratchet_key,
+                        chain_key,
+                    } => Ok(RecordDecrypt::Deferred(DeferredCurrentDecrypt {
+                        record,
+                        ratchet_key,
+                        chain_key,
+                        plaintext: result.plaintext,
+                    })),
+                    StateDecryptEffect::Applied(snapshot) => {
+                        Ok(RecordDecrypt::Transaction(RecordDecryptTransaction {
+                            record,
+                            state: Some(RecordDecryptState::Current(snapshot)),
+                            plaintext: result.plaintext,
+                        }))
+                    }
+                };
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
                 // Restore state before returning error
@@ -767,7 +871,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
         );
 
         match result {
-            Ok(ptext) => {
+            Ok(result) => {
                 log::debug!(
                     "decrypted {:?} message from {} with PREVIOUS session state (base key {})",
                     original_message_type,
@@ -776,12 +880,15 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
                         .sender_ratchet_key_for_logging()
                         .expect("successful decrypt always has a valid base key"),
                 );
-                // Promote this session (it's already been removed by take_previous_session)
-                record.promote_state(previous);
-                return Ok(RecordDecryptResult {
-                    plaintext: ptext,
-                    used_previous_session: true,
-                });
+                return Ok(RecordDecrypt::Transaction(RecordDecryptTransaction {
+                    record,
+                    state: Some(RecordDecryptState::Previous {
+                        state: Box::new(previous),
+                        effect: result.effect,
+                        index: idx,
+                    }),
+                    plaintext: result.plaintext,
+                }));
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
                 // Restore the session before returning error
@@ -854,6 +961,42 @@ impl std::fmt::Display for CurrentOrPrevious {
     }
 }
 
+struct StateDecryptResult {
+    plaintext: Vec<u8>,
+    effect: StateDecryptEffect,
+}
+
+enum StateDecryptEffect {
+    DeferredChainKey {
+        ratchet_key: PublicKey,
+        chain_key: ChainKey,
+    },
+    Applied(DecryptSnapshot),
+}
+
+impl StateDecryptEffect {
+    fn commit(self, state: &mut SessionState) {
+        match self {
+            Self::DeferredChainKey {
+                ratchet_key,
+                chain_key,
+            } => {
+                state
+                    .set_receiver_chain_key(&ratchet_key, &chain_key)
+                    .expect("the deferred in-order receiver chain remains installed");
+            }
+            Self::Applied(_) => {}
+        }
+    }
+
+    fn rollback(self, state: &mut SessionState) {
+        match self {
+            Self::DeferredChainKey { .. } => {}
+            Self::Applied(snapshot) => state.restore_decrypt_snapshot(snapshot),
+        }
+    }
+}
+
 fn decrypt_message_with_state<R: Rng + CryptoRng>(
     current_or_previous: CurrentOrPrevious,
     state: &mut SessionState,
@@ -861,7 +1004,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     csprng: &mut R,
-) -> Result<Vec<u8>> {
+) -> Result<StateDecryptResult> {
     // Check for a completely empty or invalid session state before we do anything else.
     let _ = state.root_key().map_err(|_| {
         SignalProtocolError::InvalidMessage(
@@ -880,24 +1023,29 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let their_ephemeral = ciphertext.sender_ratchet_key();
     let counter = ciphertext.counter();
 
-    // Transactional decrypt — roll back chain advance / new-chain DH step on any
-    // failure so the next msg derives from an uncorrupted ratchet.
-    //
-    // Fast path for the common in-order message on an existing receiver chain
-    // (counter == the chain's current index): the only mutation is a single
-    // `set_receiver_chain_key` advance — no DH ratchet, no skipped-key caching,
-    // no chain eviction — so saving the old `ChainKey` (a `Copy`) is a complete
-    // rollback and avoids cloning the whole receiver-chain set. Every other case
-    // (new chain, skip-ahead, out-of-order key removal) and any lookup error
-    // falls through to the full `decrypt_snapshot`, unchanged.
-    let fast_rollback: Option<ChainKey> = match state.get_receiver_chain_key(their_ephemeral) {
-        Ok(Some(chain_key)) if chain_key.index() == counter => Some(chain_key),
-        _ => None,
-    };
-    let full_snapshot = match fast_rollback {
-        Some(_) => None,
-        None => Some(state.decrypt_snapshot()),
-    };
+    // Deferring the common in-order advance keeps cancellation rollback free.
+    if let Some(chain_key) = state.get_receiver_chain_key(their_ephemeral)?
+        && chain_key.index() == counter
+    {
+        let (message_key_gen, next_chain) = chain_key.step_with_message_keys()?;
+        let plaintext = decrypt_with_message_keys(
+            current_or_previous,
+            state,
+            ciphertext,
+            original_message_type,
+            remote_address,
+            message_key_gen,
+        )?;
+        return Ok(StateDecryptResult {
+            plaintext,
+            effect: StateDecryptEffect::DeferredChainKey {
+                ratchet_key: *their_ephemeral,
+                chain_key: next_chain,
+            },
+        });
+    }
+
+    let snapshot = state.decrypt_snapshot();
 
     let result = decrypt_with_pending_state(
         current_or_previous,
@@ -910,19 +1058,12 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         counter,
     );
     match result {
-        Ok(ptext) => {
-            drop(full_snapshot);
-            state.clear_unacknowledged_pre_key_message();
-            Ok(ptext)
-        }
+        Ok(plaintext) => Ok(StateDecryptResult {
+            plaintext,
+            effect: StateDecryptEffect::Applied(snapshot),
+        }),
         Err(e) => {
-            if let Some(chain_key) = fast_rollback {
-                // The chain still exists (in-order decrypt never removes it), so
-                // restoring its key cannot fail; keep the original decrypt error.
-                let _ = state.set_receiver_chain_key(their_ephemeral, &chain_key);
-            } else if let Some(snapshot) = full_snapshot {
-                state.restore_decrypt_snapshot(snapshot);
-            }
+            state.restore_decrypt_snapshot(snapshot);
             Err(e)
         }
     }
@@ -950,6 +1091,24 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
         counter,
     )?;
 
+    decrypt_with_message_keys(
+        current_or_previous,
+        state,
+        ciphertext,
+        original_message_type,
+        remote_address,
+        message_key_gen,
+    )
+}
+
+fn decrypt_with_message_keys(
+    current_or_previous: CurrentOrPrevious,
+    state: &SessionState,
+    ciphertext: &SignalMessage,
+    original_message_type: CiphertextMessageType,
+    remote_address: &ProtocolAddress,
+    message_key_gen: MessageKeyGenerator,
+) -> Result<Vec<u8>> {
     let message_keys = message_key_gen.generate_keys();
 
     let their_identity_key =
@@ -1107,6 +1266,11 @@ mod tests {
     use crate::protocol::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::future::Future;
+    use std::num::NonZeroU64;
+    use std::sync::Mutex as SyncMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     #[test]
     fn forward_jump_limit_matches_wa_web_signal_future_messages_max() {
@@ -1131,6 +1295,70 @@ mod tests {
     impl MemSessionStore {
         fn new() -> Self {
             Self(HashMap::new())
+        }
+    }
+
+    struct DestructiveSessionStore(SyncMutex<Option<SessionRecord>>);
+
+    impl DestructiveSessionStore {
+        const CHECKOUT: SessionCheckoutKey = SessionCheckoutKey::new(0, NonZeroU64::MIN);
+
+        fn new(record: Option<SessionRecord>) -> Self {
+            Self(SyncMutex::new(record))
+        }
+
+        fn take(&self) -> Option<SessionRecord> {
+            self.0.lock().expect("test store lock poisoned").take()
+        }
+
+        fn replace(&self, record: SessionRecord) {
+            *self.0.lock().expect("test store lock poisoned") = Some(record);
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl SessionStore for DestructiveSessionStore {
+        async fn load_session(
+            &self,
+            _address: &ProtocolAddress,
+        ) -> error::Result<Option<SessionRecord>> {
+            Ok(self.0.lock().expect("test store lock poisoned").clone())
+        }
+
+        fn try_load_session_for_update(
+            &self,
+            _address: &ProtocolAddress,
+        ) -> Option<error::Result<(Option<SessionRecord>, Option<SessionCheckoutKey>)>> {
+            Some(Ok((self.take(), Some(Self::CHECKOUT))))
+        }
+
+        async fn has_session(&self, _address: &ProtocolAddress) -> error::Result<bool> {
+            Ok(self.0.lock().expect("test store lock poisoned").is_some())
+        }
+
+        async fn store_session(
+            &mut self,
+            _address: &ProtocolAddress,
+            record: SessionRecord,
+        ) -> error::Result<()> {
+            self.replace(record);
+            Ok(())
+        }
+
+        fn try_store_session_from_checkout(
+            &mut self,
+            _address: &ProtocolAddress,
+            record: SessionRecord,
+            checkout: Option<SessionCheckoutKey>,
+            _had_session: bool,
+        ) -> SessionCheckoutStoreResult {
+            if checkout != Some(Self::CHECKOUT)
+                || self.0.lock().expect("test store lock poisoned").is_some()
+            {
+                return SessionCheckoutStoreResult::Rejected;
+            }
+            self.replace(record);
+            SessionCheckoutStoreResult::Stored
         }
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -1158,6 +1386,78 @@ mod tests {
         pair: IdentityKeyPair,
         reg_id: u32,
         known: HashMap<String, IdentityKey>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum PendingIdentityCall {
+        Trust,
+        Save,
+    }
+
+    struct PendingIdentityStore {
+        inner: MemIdentityStore,
+        call: PendingIdentityCall,
+        entered: AtomicBool,
+    }
+
+    impl PendingIdentityStore {
+        fn new(inner: MemIdentityStore, call: PendingIdentityCall) -> Self {
+            Self {
+                inner,
+                call,
+                entered: AtomicBool::new(false),
+            }
+        }
+
+        fn wait_forever<T>(&self) -> impl Future<Output = T> {
+            self.entered.store(true, Ordering::Release);
+            futures::future::pending()
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl IdentityKeyStore for PendingIdentityStore {
+        async fn get_identity_key_pair(&self) -> error::Result<IdentityKeyPair> {
+            self.inner.get_identity_key_pair().await
+        }
+
+        async fn get_local_registration_id(&self) -> error::Result<u32> {
+            self.inner.get_local_registration_id().await
+        }
+
+        async fn save_identity(
+            &mut self,
+            address: &ProtocolAddress,
+            identity: &IdentityKey,
+        ) -> error::Result<IdentityChange> {
+            if matches!(self.call, PendingIdentityCall::Save) {
+                self.wait_forever().await
+            } else {
+                self.inner.save_identity(address, identity).await
+            }
+        }
+
+        async fn is_trusted_identity(
+            &self,
+            address: &ProtocolAddress,
+            identity: &IdentityKey,
+            direction: Direction,
+        ) -> error::Result<bool> {
+            if matches!(self.call, PendingIdentityCall::Trust) {
+                self.wait_forever().await
+            } else {
+                self.inner
+                    .is_trusted_identity(address, identity, direction)
+                    .await
+            }
+        }
+
+        async fn get_identity(
+            &self,
+            address: &ProtocolAddress,
+        ) -> error::Result<Option<IdentityKey>> {
+            self.inner.get_identity(address).await
+        }
     }
     impl MemIdentityStore {
         fn new(pair: IdentityKeyPair, reg_id: u32) -> Self {
@@ -1262,6 +1562,8 @@ mod tests {
         bob_addr: ProtocolAddress,
         bob_sessions: MemSessionStore,
         bob_identity: MemIdentityStore,
+        bob_prekeys: MemPreKeyStore,
+        bob_signed: MemSignedPreKeyStore,
     }
 
     fn setup_established_session() -> TestPair {
@@ -1369,7 +1671,133 @@ mod tests {
             bob_addr,
             bob_sessions,
             bob_identity,
+            bob_prekeys,
+            bob_signed,
         }
+    }
+
+    #[test]
+    fn cancelled_signal_decrypt_restores_the_ratchet_for_retry() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let ciphertext = futures::executor::block_on(async {
+            let reply = message_encrypt(
+                b"ack",
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+            )
+            .await
+            .expect("encrypt reply");
+            let CiphertextMessage::SignalMessage(reply) = reply else {
+                panic!("established reply must be a SignalMessage");
+            };
+            message_decrypt_signal(
+                &reply,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+                &mut rng,
+            )
+            .await
+            .expect("decrypt reply");
+
+            let message = message_encrypt(
+                b"retry-safe",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt test message");
+            let CiphertextMessage::SignalMessage(message) = message else {
+                panic!("acknowledged session must emit a SignalMessage");
+            };
+            message
+        });
+
+        let record = tp
+            .bob_sessions
+            .0
+            .remove(tp.alice_addr.as_str())
+            .expect("Bob session");
+        let before = record.serialize().expect("serialize baseline");
+        let mut sessions = DestructiveSessionStore::new(Some(record));
+        let mut identity = PendingIdentityStore::new(tp.bob_identity, PendingIdentityCall::Trust);
+
+        let mut decrypt = Box::pin(message_decrypt_signal(
+            &ciphertext,
+            &tp.alice_addr,
+            &mut sessions,
+            &mut identity,
+            &mut rng,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(decrypt.as_mut().poll(&mut context), Poll::Pending));
+        drop(decrypt);
+        assert!(identity.entered.load(Ordering::Acquire));
+
+        let restored = sessions.take().expect("cancelled checkout restored");
+        assert_eq!(restored.serialize().expect("serialize restored"), before);
+        sessions.replace(restored);
+        let retried = futures::executor::block_on(message_decrypt_signal(
+            &ciphertext,
+            &tp.alice_addr,
+            &mut sessions,
+            &mut identity.inner,
+            &mut rng,
+        ))
+        .expect("redelivery must decrypt");
+        assert_eq!(retried.plaintext, b"retry-safe");
+    }
+
+    #[test]
+    fn cancelled_fresh_prekey_decrypt_discards_the_promoted_session() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let ciphertext = futures::executor::block_on(message_encrypt(
+            b"fresh-retry",
+            &tp.bob_addr,
+            &mut tp.alice_sessions,
+            &mut tp.alice_identity,
+        ))
+        .expect("encrypt prekey test message");
+        let CiphertextMessage::PreKeySignalMessage(ciphertext) = ciphertext else {
+            panic!("unacknowledged session must emit a PreKeySignalMessage");
+        };
+
+        let mut sessions = DestructiveSessionStore::new(None);
+        let mut identity = PendingIdentityStore::new(tp.bob_identity, PendingIdentityCall::Save);
+        let mut decrypt = Box::pin(message_decrypt_prekey(
+            &ciphertext,
+            &tp.alice_addr,
+            &mut sessions,
+            &mut identity,
+            &mut tp.bob_prekeys,
+            &tp.bob_signed,
+            &mut rng,
+            UsePQRatchet::No,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(decrypt.as_mut().poll(&mut context), Poll::Pending));
+        drop(decrypt);
+        assert!(identity.entered.load(Ordering::Acquire));
+        assert!(sessions.take().is_none());
+
+        let retried = futures::executor::block_on(message_decrypt_prekey(
+            &ciphertext,
+            &tp.alice_addr,
+            &mut sessions,
+            &mut identity.inner,
+            &mut tp.bob_prekeys,
+            &tp.bob_signed,
+            &mut rng,
+            UsePQRatchet::No,
+        ))
+        .expect("redelivery must establish the session");
+        assert_eq!(retried.plaintext, b"fresh-retry");
     }
 
     /// Builds Bob's prekey stores plus a self-signed `PreKeyBundle`, without
