@@ -246,6 +246,11 @@ impl SessionStoreState {
         self.reservation_pending.clear();
     }
 
+    fn clear_clean_entries(&mut self) {
+        self.cache
+            .retain(|_, entry| matches!(entry, SessionEntry::CheckedOut { .. }));
+    }
+
     fn discard(&mut self, incarnation: StoreIncarnation, generation: u64) {
         self.clear();
         self.incarnation = incarnation;
@@ -1294,7 +1299,7 @@ impl SignalStoreCache {
             && sessions.deleted.is_empty()
             && sessions.reservation_pending.is_empty()
         {
-            sessions.clear();
+            sessions.clear_clean_entries();
             self.removed_prekeys.lock().await.clear();
         }
         drop(sessions);
@@ -2802,6 +2807,38 @@ mod lease_reload_tests {
             .get_sender_chain_key()
             .expect("sender chain")
             .index()
+    }
+
+    #[tokio::test]
+    async fn post_flush_clear_preserves_only_live_checkouts() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let active = ProtocolAddress::new("15550001007".to_string(), 1.into());
+        let idle = ProtocolAddress::new("15550001008".to_string(), 1.into());
+        cache.put_session(&active, leased_session()).await;
+        cache.put_session(&idle, leased_session()).await;
+        cache.flush(&backend).await.expect("flush");
+
+        let (record, checkout) = cache.checkout_session(&active, &backend).await.unwrap();
+        cache.clear_after_flush().await;
+
+        {
+            let state = cache.sessions.lock().await;
+            assert!(matches!(
+                state.cache.get(active.as_str()),
+                Some(SessionEntry::CheckedOut { .. })
+            ));
+            assert!(!state.cache.contains_key(idle.as_str()));
+        }
+        assert!(matches!(
+            cache.restore_session_from_checkout(
+                &active,
+                record.expect("checked-out record"),
+                checkout,
+                true,
+            ),
+            SessionCheckoutStoreResult::Stored
+        ));
     }
 
     #[tokio::test]
