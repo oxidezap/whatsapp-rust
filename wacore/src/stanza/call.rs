@@ -264,9 +264,17 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
+            let audio = node
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .filter(|child| child.tag == "audio")
+                .map(parse_audio_codec)
+                .collect::<Result<Vec<_>>>()?;
             CallAction::PreAccept {
                 call_id,
                 call_creator,
+                audio,
             }
         }
         "transport" => {
@@ -297,9 +305,17 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         }
         "accept" => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
+            let audio = node
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .filter(|child| child.tag == "audio")
+                .map(parse_audio_codec)
+                .collect::<Result<Vec<_>>>()?;
             CallAction::Accept {
                 call_id,
                 call_creator,
+                audio,
             }
         }
         "reject" => {
@@ -399,10 +415,27 @@ pub fn build_offer_ack_receipt(call: &IncomingCall, own_ad: Option<&Jid>) -> Opt
 pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13];
 /// Capability blob for an audio-only `<preaccept>` (ver=1).
 pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
+/// Legacy offer order observed on WhatsApp Web.
+pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
 /// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
 /// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
 /// (`0xbb`), not this.
 pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
+
+const fn without_mlow_capability(mut capability: [u8; 7]) -> [u8; 7] {
+    // Capability 31 is the peer gate for `use_mlow_codec_v1`.
+    capability[5] &= 0x7f;
+    capability
+}
+
+/// Audio offer/accept capability selecting WhatsApp's standard Opus fallback instead of MLOW.
+pub const CAPABILITY_STANDARD_OPUS_OFFER: [u8; 7] = without_mlow_capability(CAPABILITY_OFFER);
+/// Audio-only preaccept capability selecting WhatsApp's standard Opus fallback instead of MLOW.
+pub const CAPABILITY_STANDARD_OPUS_PREACCEPT: [u8; 7] =
+    without_mlow_capability(CAPABILITY_PREACCEPT);
+/// Video offer capability selecting standard Opus for its audio stream instead of MLOW.
+pub const CAPABILITY_STANDARD_OPUS_VIDEO_OFFER: [u8; 7] =
+    without_mlow_capability(CAPABILITY_VIDEO_OFFER);
 
 /// `<terminate reason>` wire tokens. The caller-driven sibling dismiss SENDS the `*_ELSEWHERE`
 /// ones; the receive path maps every reason to a call-log outcome (see WA Web's
@@ -445,6 +478,10 @@ pub struct OfferParams<'a> {
     /// (after the `<audio>` children) come from a WA Web capture; unvalidated against the real
     /// server's 439 child-order enforcement.
     pub video: bool,
+    /// Advertised `<audio enc=opus rate=…>` formats, in preference order. WhatsApp uses the
+    /// signaling rate to select its audio path; callers that need the legacy behavior pass
+    /// `["8000", "16000"]`.
+    pub audio_rates: &'a [&'a str],
 }
 
 /// `<call to=peer><offer call-id call-creator>…</offer></call>` with the mandatory
@@ -455,18 +492,7 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
     if let Some(privacy) = p.privacy_token {
         children.push(NodeBuilder::new("privacy").bytes(privacy.to_vec()).build());
     }
-    children.push(
-        NodeBuilder::new("audio")
-            .attr("enc", "opus")
-            .attr("rate", "8000")
-            .build(),
-    );
-    children.push(
-        NodeBuilder::new("audio")
-            .attr("enc", "opus")
-            .attr("rate", "16000")
-            .build(),
-    );
+    children.extend(p.audio_rates.iter().map(|rate| audio_opus(rate)));
     if p.video {
         children.push(video_offer_node());
     }
@@ -516,6 +542,21 @@ fn enc_node(dk: &OfferDeviceKey) -> Node {
         .build()
 }
 
+const STANDARD_OPUS_PT120_SETTINGS: &[u8] =
+    br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false"}}"#;
+const STANDARD_OPUS_PT111_SETTINGS: &[u8] =
+    br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"true"}}"#;
+
+/// Directional decoder selection for a standard-Opus answer. Android overlays these fields on its
+/// local defaults, so copying the peer's large rollout settings is unnecessary and can be harmful.
+pub fn standard_opus_voip_settings(enable_48khz_rtp_clock: bool) -> &'static [u8] {
+    if enable_48khz_rtp_clock {
+        STANDARD_OPUS_PT111_SETTINGS
+    } else {
+        STANDARD_OPUS_PT120_SETTINGS
+    }
+}
+
 pub struct AcceptParams<'a> {
     pub call_id: &'a str,
     pub to: &'a Jid,
@@ -524,8 +565,8 @@ pub struct AcceptParams<'a> {
     /// caller (which then never marks the call accepted, leaving siblings ringing and timing it out).
     pub id: &'a str,
     pub call_creator: &'a Jid,
-    /// Advertised `<audio enc=opus rate=…>` formats, in preference order. Selecting only `8000`
-    /// is the lever to steer the caller off Meta's 16 kHz mlow codec onto RFC Opus NB.
+    /// Advertised `<audio enc=opus rate=…>` formats, in preference order. The MLOW selection in
+    /// `voip_settings` is independent, so a rate alone must not be treated as an RTP profile.
     pub audio_rates: &'a [&'a str],
     pub relay_te: Option<&'a [u8]>,
     pub rte: Option<&'a [u8]>,
@@ -642,8 +683,8 @@ fn capability_node(blob: &[u8]) -> Node {
 }
 
 /// `<preaccept>`: audio → [video] → encopt → capability. `id` is the random call-wrapper id. A video
-/// callee advertises the `<video>` decoder here; the capability stays the `0xbb` [`CAPABILITY_OFFER`]
-/// blob (byte-matched to a real from-start video callee — the `0xfa` variant is the CALLER's offer).
+/// callee advertises the `<video>` decoder here; the default capability stays the `0xbb`
+/// [`CAPABILITY_OFFER`] blob (the `0xfa` variant is the caller's offer).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
@@ -652,16 +693,37 @@ pub fn build_preaccept(
     audio_rates: &[&str],
     video: bool,
 ) -> Node {
+    build_preaccept_with_capability(
+        call_id,
+        to,
+        call_creator,
+        wrapper_id,
+        audio_rates,
+        if video {
+            &CAPABILITY_OFFER
+        } else {
+            &CAPABILITY_PREACCEPT
+        },
+        video,
+    )
+}
+
+/// Build a preaccept with an explicit media capability blob.
+pub fn build_preaccept_with_capability(
+    call_id: &str,
+    to: &Jid,
+    call_creator: &Jid,
+    wrapper_id: &str,
+    audio_rates: &[&str],
+    capability: &[u8],
+    video: bool,
+) -> Node {
     let mut children: Vec<Node> = audio_rates.iter().map(|rate| audio_opus(rate)).collect();
     if video {
         children.push(video_preaccept_node());
     }
     children.push(encopt_node());
-    children.push(capability_node(if video {
-        &CAPABILITY_OFFER
-    } else {
-        &CAPABILITY_PREACCEPT
-    }));
+    children.push(capability_node(capability));
     call_wrap(
         to,
         Some(wrapper_id),
@@ -1306,6 +1368,32 @@ mod tests {
     }
 
     #[test]
+    fn preaccept_and_accept_preserve_audio_selection() {
+        for tag in ["preaccept", "accept"] {
+            let node = base_call_builder()
+                .children([NodeBuilder::new(tag)
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("call-id", "CID")
+                    .children([audio_opus("8000")])
+                    .build()])
+                .build();
+
+            let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+            let audio = match call.action {
+                CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } => audio,
+                other => panic!("expected {tag}, got {other:?}"),
+            };
+            assert_eq!(
+                audio,
+                [CallAudioCodec {
+                    enc: "opus".to_string(),
+                    rate: 8_000,
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn terminate_with_duration() {
         let node = base_call_builder()
             .children([NodeBuilder::new("terminate")
@@ -1565,6 +1653,66 @@ mod tests {
 
     // --- Outbound signaling builder tests ---
 
+    #[test]
+    fn audio_voip_settings_select_native_opus_pt120() {
+        let settings: serde_json::Value =
+            serde_json::from_slice(standard_opus_voip_settings(false)).unwrap();
+
+        assert_eq!(settings["encode"]["use_mlow_codec_v1"], "false");
+        assert_eq!(settings["options"]["enable_48khz_rtp_clock"], "false");
+    }
+
+    #[test]
+    fn audio_voip_settings_select_rfc7587_pt111() {
+        let settings: serde_json::Value =
+            serde_json::from_slice(standard_opus_voip_settings(true)).unwrap();
+
+        assert_eq!(settings["encode"]["use_mlow_codec_v1"], "false");
+        assert_eq!(settings["options"]["enable_48khz_rtp_clock"], "true");
+    }
+
+    #[test]
+    fn native_opus_accept_carries_directional_settings() {
+        let peer = peer();
+        let creator = creator();
+        let settings = standard_opus_voip_settings(false);
+        let accept = build_accept(&AcceptParams {
+            call_id: "CID",
+            to: &peer,
+            id: "ACCEPT-ID",
+            call_creator: &creator,
+            audio_rates: &["16000"],
+            relay_te: None,
+            rte: None,
+            voip_settings: Some(settings),
+            capability: Some(&CAPABILITY_STANDARD_OPUS_OFFER),
+            video: false,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
+        });
+
+        assert_eq!(
+            child_tags(&accept),
+            ["audio", "net", "encopt", "capability", "voip_settings"]
+        );
+        let accept_ref = accept.as_node_ref();
+        let action = &accept_ref.children().unwrap()[0];
+        let capability = action.get_optional_child("capability").unwrap();
+        assert_eq!(
+            capability.content_bytes(),
+            Some(CAPABILITY_STANDARD_OPUS_OFFER.as_slice())
+        );
+        let voip_settings = action.get_optional_child("voip_settings").unwrap();
+        assert_eq!(
+            voip_settings
+                .attrs()
+                .optional_string("uncompressed")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(voip_settings.content_bytes(), Some(settings));
+    }
+
     fn peer() -> Jid {
         Jid::new("111111111111111", Server::Lid)
     }
@@ -1607,6 +1755,7 @@ mod tests {
             id: Some("OFFER-STANZA-ID"),
             multi_device: false,
             video: false,
+            audio_rates: DEFAULT_AUDIO_RATES,
         });
         // Single device key → bare <enc> (not <destination>).
         assert_eq!(
@@ -1664,10 +1813,45 @@ mod tests {
             id: None,
             multi_device: false,
             video: false,
+            audio_rates: DEFAULT_AUDIO_RATES,
         });
         let tags = child_tags(&call);
         assert!(tags.contains(&"destination".to_string()));
         assert!(!tags.contains(&"enc".to_string()));
+    }
+
+    #[test]
+    fn offer_audio_rates_are_configurable() {
+        let peer = peer();
+        let creator = creator();
+        let dk = OfferDeviceKey {
+            device_jid: peer.clone(),
+            ciphertext: vec![1],
+            enc_type: "msg".into(),
+        };
+        let call = build_offer(&OfferParams {
+            call_id: "CID",
+            to: &peer,
+            call_creator: &creator,
+            device_keys: std::slice::from_ref(&dk),
+            privacy_token: None,
+            capability: None,
+            device_identity: None,
+            id: None,
+            multi_device: false,
+            video: false,
+            audio_rates: &["8000"],
+        });
+        let call_ref = call.as_node_ref();
+        let offer = &call_ref.children().unwrap()[0];
+        let rates: Vec<_> = offer
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|child| child.tag == "audio")
+            .map(|child| child.attrs().optional_u64("rate"))
+            .collect();
+        assert_eq!(rates, [Some(8_000)]);
     }
 
     // A multi-device callee whose encryption left a single survivor must keep the addressed
@@ -1692,6 +1876,7 @@ mod tests {
             id: None,
             multi_device: true,
             video: false,
+            audio_rates: DEFAULT_AUDIO_RATES,
         });
         let tags = child_tags(&call);
         assert!(tags.contains(&"destination".to_string()));
@@ -1746,6 +1931,32 @@ mod tests {
         assert_eq!(
             pre.as_node_ref().attrs().optional_string("id").as_deref(),
             Some("abcd1234")
+        );
+
+        let standard_opus = build_preaccept_with_capability(
+            "CID",
+            &peer,
+            &creator,
+            "abcd1234",
+            &["8000"],
+            &CAPABILITY_STANDARD_OPUS_PREACCEPT,
+            false,
+        );
+        let standard_ref = standard_opus.as_node_ref();
+        let action = &standard_ref.children().unwrap()[0];
+        let capability = action
+            .children()
+            .unwrap()
+            .iter()
+            .find(|child| child.tag == "capability")
+            .unwrap();
+        assert_eq!(
+            capability.content_bytes().unwrap(),
+            &CAPABILITY_STANDARD_OPUS_PREACCEPT
+        );
+        assert_eq!(
+            CAPABILITY_OFFER[5] ^ CAPABILITY_STANDARD_OPUS_OFFER[5],
+            0x80
         );
     }
 
@@ -2096,6 +2307,7 @@ mod tests {
             id: None,
             multi_device: false,
             video: true,
+            audio_rates: DEFAULT_AUDIO_RATES,
         };
         let offer = build_offer(&base);
         // The <video> child sits right after the <audio> children (capture-observed position).

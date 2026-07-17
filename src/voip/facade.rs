@@ -8,28 +8,58 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use log::warn;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
-    CAPABILITY_OFFER, CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams,
-    build_offer, build_video_state,
+    CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+    CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams, build_offer,
+    build_video_state,
 };
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
-    CallChannels, CallConfig, CallEngine, CallEvent, VideoControl, VideoControlReceiver,
-    VideoControlSender, VideoFrame, video_control_channel,
+    AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallEngine, CallEvent,
+    EncodedAudioFrame, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
+    video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
 use crate::client::{CallError, Client};
-use crate::voip::audio::{AudioSink, AudioSource, WA_FRAME_SAMPLES};
+use crate::voip::audio::{
+    AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
+};
 use crate::voip::driver::{RandTxIds, run_call_tokio};
 use crate::voip::transport::RelayMediaChannelFactory;
 use crate::voip::video::{VideoSink, VideoSource};
+
+enum AudioEndpoints {
+    Pcm {
+        source: Arc<dyn AudioSource>,
+        sink: Arc<dyn AudioSink>,
+    },
+    Encoded {
+        format: AudioFormat,
+        source: Arc<dyn EncodedAudioSource>,
+        sink: Arc<dyn EncodedAudioSink>,
+    },
+}
+
+impl AudioEndpoints {
+    fn config(&self) -> AudioConfig {
+        match self {
+            Self::Pcm { .. } => AudioConfig::MLOW_PCM,
+            Self::Encoded { format, .. } => AudioConfig::encoded(*format),
+        }
+    }
+
+    fn signaling_rate(&self) -> u32 {
+        self.config().format.signaling_rate
+    }
+}
 
 /// Builder returned by [`Voip::accept`](super::super::client::voip::Voip::accept). Holds the offer
 /// and, once [`audio`](Self::audio) is called, the source/sink, then [`start`](Self::start) drives
@@ -37,8 +67,7 @@ use crate::voip::video::{VideoSink, VideoSource};
 pub struct AcceptCall<'a> {
     pub(crate) client: &'a Client,
     pub(crate) incoming: &'a IncomingCall,
-    source: Option<Arc<dyn AudioSource>>,
-    sink: Option<Arc<dyn AudioSink>>,
+    audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
 }
 
@@ -47,8 +76,7 @@ impl<'a> AcceptCall<'a> {
         Self {
             client,
             incoming,
-            source: None,
-            sink: None,
+            audio: None,
             video: None,
         }
     }
@@ -60,8 +88,25 @@ impl<'a> AcceptCall<'a> {
         S: AudioSource,
         K: AudioSink,
     {
-        self.source = Some(Arc::new(source));
-        self.sink = Some(Arc::new(sink));
+        self.audio = Some(AudioEndpoints::Pcm {
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+        });
+        self
+    }
+
+    /// Use complete codec payloads instead of the built-in PCM/MLOW adapter. `Bytes` ownership is
+    /// preserved at the external Opus or MLOW boundary; the engine only adds media framing.
+    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
+    where
+        S: EncodedAudioSource,
+        K: EncodedAudioSink,
+    {
+        self.audio = Some(AudioEndpoints::Encoded {
+            format,
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+        });
         self
     }
 
@@ -94,8 +139,19 @@ impl<'a> AcceptCall<'a> {
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
         // Take the audio endpoints out first; the offline setup (decrypt + config + addr) only
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
-        let source = self.source.take().ok_or(CallError::MissingAudio)?;
-        let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
+        let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
+        let audio_config = audio.config();
+        if let CallAction::Offer { audio, .. } = &self.incoming.action
+            && !audio.is_empty()
+            && !audio.iter().any(|codec| {
+                codec.enc.eq_ignore_ascii_case("opus")
+                    && codec.rate == audio_config.format.signaling_rate
+            })
+        {
+            return Err(CallError::AudioFormatNotOffered(
+                audio_config.format.signaling_rate,
+            ));
+        }
         let video = self.video.take();
         if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
             return Err(CallError::Media(
@@ -109,7 +165,7 @@ impl<'a> AcceptCall<'a> {
         self.client
             .call_registry()
             .take_ringing(self.incoming.action.call_id());
-        let (engine, call_id, addr) = self.build_engine(video.is_some()).await?;
+        let (engine, call_id, addr) = self.build_engine(video.is_some(), audio_config).await?;
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state already ran with no registry entry to abort, so bail
         // rather than register + connect a relay that would outlive the connection.
@@ -122,6 +178,7 @@ impl<'a> AcceptCall<'a> {
             self.incoming.from.clone(),
             self.incoming.action.call_creator().clone(),
         );
+        session.audio_format = Some(audio_config.format);
         session.is_video = video.is_some();
         spawn_call(
             self.client,
@@ -129,8 +186,7 @@ impl<'a> AcceptCall<'a> {
             session,
             engine,
             &factory,
-            source,
-            sink,
+            audio,
             video,
         )
         .await
@@ -142,6 +198,7 @@ impl<'a> AcceptCall<'a> {
     async fn build_engine(
         &self,
         enable_video: bool,
+        audio: AudioConfig,
     ) -> Result<(CallEngine, String, SocketAddr), CallError> {
         let media = self.incoming.media.as_ref().ok_or(CallError::NotAnOffer)?;
         let CallAction::Offer {
@@ -195,6 +252,7 @@ impl<'a> AcceptCall<'a> {
 
         let mut config = CallConfig::for_incoming(call_id, &self_lid, &peer_lid, call_key, relay)
             .map_err(|e| CallError::Setup(e.to_string()))?;
+        config.audio = audio;
         config.enable_video = enable_video;
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
@@ -211,8 +269,7 @@ impl<'a> AcceptCall<'a> {
 pub struct OutgoingCall<'a> {
     pub(crate) client: &'a Client,
     pub(crate) peer: &'a Jid,
-    source: Option<Arc<dyn AudioSource>>,
-    sink: Option<Arc<dyn AudioSink>>,
+    audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
 }
 
@@ -221,8 +278,7 @@ impl<'a> OutgoingCall<'a> {
         Self {
             client,
             peer,
-            source: None,
-            sink: None,
+            audio: None,
             video: None,
         }
     }
@@ -234,8 +290,25 @@ impl<'a> OutgoingCall<'a> {
         S: AudioSource,
         K: AudioSink,
     {
-        self.source = Some(Arc::new(source));
-        self.sink = Some(Arc::new(sink));
+        self.audio = Some(AudioEndpoints::Pcm {
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+        });
+        self
+    }
+
+    /// Send and receive complete codec payloads. The selected format also controls the outgoing
+    /// offer's single audio rate and the engine's RTP payload type/clock.
+    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
+    where
+        S: EncodedAudioSource,
+        K: EncodedAudioSink,
+    {
+        self.audio = Some(AudioEndpoints::Encoded {
+            format,
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+        });
         self
     }
 
@@ -294,8 +367,7 @@ impl<'a> OutgoingCall<'a> {
         )
     )]
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
-        let source = self.source.take().ok_or(CallError::MissingAudio)?;
-        let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
+        let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
         let video = self.video.take();
         if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
             return Err(CallError::Media(
@@ -395,8 +467,7 @@ impl<'a> OutgoingCall<'a> {
             &own_lid,
             &devices,
             &ring_devices,
-            source,
-            sink,
+            audio,
             video,
         )
         .await
@@ -446,11 +517,13 @@ fn keep_non_pkmsg_devices(devices: Vec<Jid>, would_pkmsg: &[bool]) -> Result<Vec
     Ok(kept)
 }
 
-fn offer_capability(video: bool) -> &'static [u8] {
-    if video {
-        &CAPABILITY_VIDEO_OFFER
-    } else {
-        &CAPABILITY_OFFER
+fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
+    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
+    match (video, standard_opus) {
+        (true, true) => &CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+        (false, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
+        (true, false) => &CAPABILITY_VIDEO_OFFER,
+        (false, false) => &CAPABILITY_OFFER,
     }
 }
 
@@ -487,8 +560,7 @@ async fn place_call(
     // The FULL callee device set the server rings (a superset of `devices` -- it includes devices we
     // can't encrypt for). Drives the sibling-dismiss target set and the addressed offer shape.
     ring_devices: &[Jid],
-    source: Arc<dyn AudioSource>,
-    sink: Arc<dyn AudioSink>,
+    audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
     // The offer keeps the addressed `<destination><to jid>` shape whenever the callee is multi-device
@@ -600,19 +672,22 @@ async fn place_call(
     // The offer needs a stanza id so the server can ack-correlate it: the initiator's relay rides
     // back on the `<ack type=offer>` reply to THIS id, not on a later <call>.
     let offer_stanza_id = client.generate_request_id();
+    let audio_rate = audio.signaling_rate().to_string();
+    let audio_rates = [audio_rate.as_str()];
     let offer = build_offer(&OfferParams {
         call_id: &call_id,
         to: peer,
         call_creator,
         device_keys: &device_keys,
         privacy_token: privacy_token.as_deref(),
-        capability: Some(offer_capability(video.is_some())),
+        capability: Some(offer_capability(video.is_some(), audio.config().format)),
         device_identity: device_identity.as_deref(),
         id: Some(&offer_stanza_id),
         // Keep the addressed `<destination>` shape for a multi-device callee even if encryption
         // failures left a single surviving key, so that key stays tied to its device.
         multi_device,
         video: video.is_some(),
+        audio_rates: &audio_rates,
     });
 
     // Register the ack-waiter for the offer's stanza id BEFORE send_node so a fast server reply can't
@@ -626,6 +701,7 @@ async fn place_call(
     let registry = client.call_registry();
     let mut session =
         wacore::voip::CallSession::new_outgoing(&call_id, peer.clone(), call_creator.clone());
+    session.audio_format = Some(audio.config().format);
     session.is_video = video.is_some();
     // The rung device set lives on the session so an inbound <accept>/<reject> from one callee device
     // can dismiss the rest (caller-driven accepted_elsewhere); it is dropped automatically whenever the
@@ -678,8 +754,7 @@ async fn place_call(
                 self_lid: own_lid.to_string(),
                 peer_lid: peer.to_string(),
                 call_key: call_key.to_vec(),
-                source,
-                sink,
+                audio,
                 video,
                 video_shared: video_shared.clone(),
                 muted: muted.clone(),
@@ -739,14 +814,13 @@ fn client_weak(client: &Client) -> std::sync::Weak<Client> {
 /// Time to wait for the server's `<ack type=offer>` carrying the relay before giving up.
 const OFFER_ACK_RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Pre-encode mic-frame backlog before the channel back-pressures the source (8 × 20 ms = 160 ms).
-const MIC_CHANNEL_CAPACITY: usize = 8;
+/// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
+const MIC_CHANNEL_CAPACITY: usize = 3;
 
 /// Bound on the consumer-facing `CallEvent` queue. The driver posts with `try_send`, so once a slow
-/// or absent consumer lets it fill, further events drop instead of growing without bound: an
-/// authenticated peer streaming `ForeignAudio` frames can't drive an OOM. Lifecycle events
-/// (RelayAllocated/Failed/TimedOut) are emitted before any media flows, so they are never dropped,
-/// and call teardown is driven by the `ended` flag, not this channel.
+/// or absent consumer lets it fill, further diagnostics drop instead of growing without bound.
+/// Lifecycle events (RelayAllocated/Failed/TimedOut) are emitted before media flows, so they are
+/// never dropped, and call teardown is driven by the `ended` flag, not this channel.
 const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
@@ -875,8 +949,7 @@ pub(crate) struct PendingOutgoing {
     self_lid: String,
     peer_lid: String,
     call_key: Vec<u8>,
-    source: Arc<dyn AudioSource>,
-    sink: Arc<dyn AudioSink>,
+    audio: AudioEndpoints,
     /// `.video()` endpoints for a video-from-the-start call; `None` for audio-only.
     video: Option<VideoEndpoints>,
     /// The handle's video plumbing (created at place time so `start_video` works while dormant).
@@ -943,6 +1016,7 @@ pub(crate) async fn attach_outgoing_relay(
             relay,
         )
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        config.audio = pending.audio.config();
         config.enable_video = pending.video.is_some();
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
@@ -970,8 +1044,7 @@ pub(crate) async fn attach_outgoing_relay(
         pending.generation,
         engine,
         &factory,
-        pending.source,
-        pending.sink,
+        pending.audio,
         pending.video,
         pending.video_shared,
         pending.muted,
@@ -995,8 +1068,7 @@ async fn spawn_call(
     session: wacore::voip::CallSession,
     engine: CallEngine,
     factory: &dyn RelayTransportFactory,
-    source: Arc<dyn AudioSource>,
-    sink: Arc<dyn AudioSink>,
+    audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
     // Register BEFORE connecting so the entry exists before the driver task can self-clean.
@@ -1028,8 +1100,7 @@ async fn spawn_call(
         generation,
         engine,
         factory,
-        source,
-        sink,
+        audio,
         video,
         video_shared.clone(),
         muted.clone(),
@@ -1064,8 +1135,7 @@ async fn attach_engine(
     generation: u64,
     engine: CallEngine,
     factory: &dyn RelayTransportFactory,
-    source: Arc<dyn AudioSource>,
-    sink: Arc<dyn AudioSink>,
+    audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
     video_shared: Arc<VideoShared>,
     muted: Arc<AtomicBool>,
@@ -1119,17 +1189,33 @@ async fn attach_engine(
             }
         };
 
-    // The shared mute flag the mic feed checks: muted frames become exact-zero (the engine sends a
-    // cheap DTX comfort-noise frame for an all-zero frame, so the relay stream never gaps).
-    let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_CHANNEL_CAPACITY);
-    let mute_feed = MuteFeed {
-        src: source.frames(),
-        out: mic_tx,
-        muted,
+    // Only the selected I/O pair stays open. Closed inactive channels make their driver select arms
+    // retire immediately without per-frame branching or idle tasks.
+    let (mic_rx, speaker, encoded_audio_in, encoded_audio_out, audio_feed) = match audio {
+        AudioEndpoints::Pcm { source, sink } => {
+            let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_CHANNEL_CAPACITY);
+            let mute_feed = MuteFeed {
+                src: source.frames(),
+                out: mic_tx,
+                muted,
+            };
+            let feed = client.runtime.spawn(Box::pin(mute_feed.run()));
+            let (_encoded_tx, encoded_audio_in) = async_channel::bounded::<Bytes>(1);
+            let (encoded_audio_out, _encoded_rx) = async_channel::bounded::<EncodedAudioFrame>(1);
+            (
+                mic_rx,
+                sink.playout(),
+                encoded_audio_in,
+                encoded_audio_out,
+                Some(feed),
+            )
+        }
+        AudioEndpoints::Encoded { source, sink, .. } => {
+            let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+            let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+            (mic_rx, speaker, source.frames(), sink.frames(), None)
+        }
     };
-    // Keep the feed's AbortHandle (don't detach): it moves into the driver task below so the feed
-    // dies with the call instead of parking on `src.recv()` forever, holding the mic channel open.
-    let mic_feed = client.runtime.spawn(Box::pin(mute_feed.run()));
 
     // Video plumbing: the drive loop always gets the channels; the endpoints attach now (a
     // `.video()` call) or later (an upgrade via CallHandle::start_video/accept_video).
@@ -1156,7 +1242,9 @@ async fn attach_engine(
 
     let channels = CallChannels {
         mic: mic_rx,
-        speaker: sink.playout(),
+        speaker,
+        encoded_audio_in,
+        encoded_audio_out,
         events: ev_tx,
         rekey: rekey_rx,
         video_in: video_in_rx,
@@ -1178,7 +1266,7 @@ async fn attach_engine(
         // All are captured (moved in), so any teardown -- even an abort before the first poll --
         // drops them: the feeds are aborted and `ended` is notified.
         let _ended_guard = ended_guard;
-        let _mic_feed = mic_feed;
+        let _audio_feed = audio_feed;
         let _video_out_feed = video_out_feed;
         run_call_tokio(transport, relay_events, channels, engine).await;
         // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
@@ -1441,6 +1529,7 @@ impl CallHandle {
 
     /// Mute or unmute the local microphone. While muted the engine sends DTX comfort-noise (the
     /// stream stays fed); it does not gap, so the peer doesn't re-negotiate the transport.
+    /// This affects PCM audio only; encoded-audio callers must mute their external source.
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
     }
@@ -1683,7 +1772,7 @@ impl CallHandle {
         }
     }
 
-    /// Subscribe to the call's engine events (relay allocate, foreign-audio, allocate failures).
+    /// Subscribe to call lifecycle and media diagnostics.
     ///
     /// All receivers returned here (and across cloned handles) share ONE queue: each event is
     /// delivered to exactly one receiver, competitively. Drive a single consumer loop per call;
@@ -1751,6 +1840,58 @@ mod tests {
 
     fn mk_session() -> wacore::voip::CallSession {
         wacore::voip::CallSession::new_incoming("CID-FACADE", caller(), caller())
+    }
+
+    fn pcm_audio(source: Arc<dyn AudioSource>, sink: Arc<dyn AudioSink>) -> AudioEndpoints {
+        AudioEndpoints::Pcm { source, sink }
+    }
+
+    fn encoded_audio(format: AudioFormat) -> AudioEndpoints {
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+        AudioEndpoints::Encoded {
+            format,
+            source: Arc::new(source_rx),
+            sink: Arc::new(sink_tx),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_rejects_an_audio_profile_the_peer_did_not_offer() {
+        let client = make_client().await;
+        let incoming = IncomingCall::new_for_test(
+            caller(),
+            "STANZA-AUDIO-MISMATCH".into(),
+            wacore::time::from_secs(1_700_000_000).expect("timestamp"),
+            CallAction::Offer {
+                call_id: "CALL-AUDIO-MISMATCH".into(),
+                call_creator: caller(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: false,
+                is_video: false,
+                audio: vec![wacore::types::call::CallAudioCodec {
+                    enc: "opus".into(),
+                    rate: 8_000,
+                }],
+                group_jid: None,
+            },
+        );
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::OPUS_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CallError::AudioFormatNotOffered(16_000))
+        ));
     }
 
     // peer_jid() is the <terminate> target: the bare peer until an <accept> records the answering
@@ -1856,8 +1997,7 @@ mod tests {
             mk_session(),
             engine(),
             &factory,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -1924,8 +2064,7 @@ mod tests {
             session,
             engine(),
             &factory,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -1978,8 +2117,7 @@ mod tests {
             mk_session(),
             engine(),
             &factory,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -2017,8 +2155,7 @@ mod tests {
             mk_session(),
             engine(),
             &f1,
-            mic1,
-            spk1,
+            pcm_audio(mic1, spk1),
             None,
         )
         .await
@@ -2031,8 +2168,7 @@ mod tests {
             mk_session(),
             engine(),
             &f2,
-            mic2,
-            spk2,
+            pcm_audio(mic2, spk2),
             None,
         )
         .await
@@ -2079,8 +2215,7 @@ mod tests {
             mk_session(),
             engine(),
             &f1,
-            mic1,
-            spk1,
+            pcm_audio(mic1, spk1),
             None,
         )
         .await
@@ -2092,8 +2227,7 @@ mod tests {
             mk_session(),
             engine(),
             &f2,
-            mic2,
-            spk2,
+            pcm_audio(mic2, spk2),
             None,
         )
         .await
@@ -2127,8 +2261,7 @@ mod tests {
                 mk_session(),
                 engine(),
                 &factory,
-                Arc::new(mic_rx),
-                Arc::new(spk_tx),
+                pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                 None,
             )
             .await
@@ -2313,8 +2446,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -2375,7 +2507,6 @@ mod tests {
             tags,
             [
                 "audio",
-                "audio",
                 "net",
                 "capability",
                 "enc",
@@ -2384,6 +2515,13 @@ mod tests {
             ]
         );
         let enc = offer.get_optional_child("enc").unwrap();
+        assert_eq!(
+            offer
+                .get_optional_child("audio")
+                .and_then(|audio| audio.attrs().optional_string("rate"))
+                .as_deref(),
+            Some("16000")
+        );
         assert_eq!(
             enc.attrs().optional_string("type").as_deref(),
             Some("pkmsg")
@@ -2428,8 +2566,7 @@ mod tests {
             &own_lid,
             &devices,
             &devices,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -2443,6 +2580,55 @@ mod tests {
         client
             .signal_flush_test_block
             .store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn encoded_opus_offer_advertises_only_its_selected_profile() {
+        let (client, _sent_count) = make_sending_client().await;
+        let peer_user = Jid::new("333333333333333", Server::Lid);
+        let device = peer_lid();
+        seed_peer_session(&client, &device).await;
+        let own_lid = client.get_lid().expect("own lid");
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+
+        let handle = place_call(
+            &client,
+            "00abcdef0123456789abcdef00c0dec0".into(),
+            &peer_user,
+            &own_lid,
+            &own_lid,
+            std::slice::from_ref(&device),
+            std::slice::from_ref(&device),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
+            None,
+        )
+        .await
+        .expect("place encoded call");
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("offer must be sent")
+            .expect("waiter");
+        let node_ref = node.as_node_ref();
+        let offer = &node_ref.children().unwrap()[0];
+        let audio = offer
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|child| child.tag.as_ref() == "audio")
+            .collect::<Vec<_>>();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(
+            audio[0].attrs().optional_string("rate").as_deref(),
+            Some("16000")
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .snapshot(handle.call_id())
+                .and_then(|session| session.audio_format),
+            Some(AudioFormat::OPUS_16KHZ_60MS)
+        );
     }
 
     // A stored token must ride on the offer as the leading `<privacy>` child, or a
@@ -2485,8 +2671,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -2539,8 +2724,7 @@ mod tests {
             &own_lid,
             &[good0.clone(), good1.clone(), bad.clone()],
             &[good0.clone(), good1.clone(), bad.clone()],
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await
@@ -2612,8 +2796,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await;
@@ -2662,8 +2845,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             video,
         )
         .await
@@ -2776,8 +2958,7 @@ mod tests {
                     mk_session(),
                     engine(),
                     &factory,
-                    Arc::new(mic_rx),
-                    Arc::new(spk_tx),
+                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
                 )
                 .await
@@ -2842,8 +3023,7 @@ mod tests {
             mk_session(),
             engine(),
             &factory,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await;
@@ -2906,8 +3086,7 @@ mod tests {
                     generation,
                     engine(),
                     &*factory,
-                    Arc::new(mic_rx),
-                    Arc::new(spk_tx),
+                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
                     Arc::new(VideoShared::new()),
                     muted,
@@ -2984,8 +3163,7 @@ mod tests {
                     generation,
                     engine(),
                     &*factory,
-                    Arc::new(mic_rx),
-                    Arc::new(spk_tx),
+                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
                     Arc::new(VideoShared::new()),
                     muted,
@@ -3056,8 +3234,7 @@ mod tests {
                     generation,
                     engine(),
                     &*factory,
-                    Arc::new(mic_rx),
-                    Arc::new(spk_tx),
+                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
                     Arc::new(VideoShared::new()),
                     muted,
@@ -3127,8 +3304,7 @@ mod tests {
             mk_session(),
             engine(),
             &FailingFactory,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await;
@@ -3201,8 +3377,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await;
@@ -3368,8 +3543,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await;
@@ -3444,10 +3618,23 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_video_offer_uses_video_capability() {
-        assert_eq!(offer_capability(false), CAPABILITY_OFFER);
-        assert_eq!(offer_capability(true), CAPABILITY_VIDEO_OFFER);
-        assert_ne!(offer_capability(false), offer_capability(true));
+    fn outgoing_offer_capability_matches_audio_profile() {
+        assert_eq!(
+            offer_capability(false, AudioFormat::MLOW_16KHZ_60MS),
+            CAPABILITY_OFFER
+        );
+        assert_eq!(
+            offer_capability(true, AudioFormat::MLOW_16KHZ_60MS),
+            CAPABILITY_VIDEO_OFFER
+        );
+        assert_eq!(
+            offer_capability(false, AudioFormat::OPUS_16KHZ_60MS),
+            CAPABILITY_STANDARD_OPUS_OFFER
+        );
+        assert_eq!(
+            offer_capability(true, AudioFormat::OPUS_16KHZ_60MS),
+            CAPABILITY_STANDARD_OPUS_VIDEO_OFFER
+        );
     }
 
     /// A live handle over a mock relay + a sending client, for the video handshake tests. The
@@ -3473,8 +3660,7 @@ mod tests {
             mk_session(),
             engine(),
             &factory,
-            Arc::new(mic_rx),
-            Arc::new(spk_tx),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
         .await

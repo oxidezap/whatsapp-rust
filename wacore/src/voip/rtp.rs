@@ -3,7 +3,15 @@
 
 use crate::voip::warp::audio_piggyback_extension_for;
 
-pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 120;
+/// RFC 7587 Opus payload type used when the 48 kHz RTP-clock setting is enabled.
+pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 111;
+/// Default WhatsApp audio payload type; the negotiated codec decides whether its bytes are MLOW or
+/// native Opus.
+pub const RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO: u8 = 120;
+/// MLOW name for the shared default WhatsApp audio payload type.
+pub const RTP_PAYLOAD_TYPE_MLOW: u8 = RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO;
+/// MLOW SplitRed redundancy payload type (`mlow-red-1`).
+pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
 /// H.264 video payload type used by captured Android video RTP.
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
 /// Video RTP timestamp clock.
@@ -75,14 +83,18 @@ pub const OPUS_PRIMING_FRAME_1_WASM: [u8; 24] = [
 pub const OPUS_PRIMING_FRAME_2: [u8; 5] = [0x90, 0xb8, 0x14, 0x14, 0xc4];
 
 pub fn is_whatsapp_opus_rtp_payload(payload_type: u8) -> bool {
-    payload_type == RTP_PAYLOAD_TYPE_OPUS || payload_type == 121
+    matches!(
+        payload_type,
+        RTP_PAYLOAD_TYPE_OPUS | RTP_PAYLOAD_TYPE_MLOW | RTP_PAYLOAD_TYPE_MLOW_RED
+    )
 }
 
-/// DTX / comfort-noise: RFC `0x10`, mlow `0x90`, and short warmup silence frames.
+/// Standard Opus DTX / comfort-noise and short warmup silence frames.
 pub fn is_opus_dtx_payload(payload: &[u8]) -> bool {
     match payload.len() {
         0 => false,
-        1 => matches!(payload[0], 0x10 | 0x88 | 0x90),
+        // libopus defines packets up to two bytes as DTX. This also covers MLOW's one-byte SID.
+        1..=2 => true,
         n if n <= 15 => {
             let b0 = payload[0];
             if (b0 & 0xf8) == 0x08 || b0 == 0x0a {
@@ -92,6 +104,10 @@ pub fn is_opus_dtx_payload(payload: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_mlow_dtx_payload(payload: &[u8]) -> bool {
+    payload.first().is_some_and(|byte| byte & 0xC0 == 0x80)
 }
 
 /// mlow speech frame (20 ms `0x48..0x4f` or 60 ms `0x50..0x57`).
@@ -315,8 +331,11 @@ pub struct RtpStream {
     last_sent_timestamp: Option<u32>,
     samples_per_packet: u32,
     speech_started: bool,
+    speech_start_markers: bool,
+    mlow_profile: bool,
     audio_packet_index: usize,
     warp_piggyback: bool,
+    payload_type: u8,
 }
 
 impl RtpStream {
@@ -328,9 +347,25 @@ impl RtpStream {
             last_sent_timestamp: None,
             samples_per_packet,
             speech_started: false,
+            speech_start_markers: true,
+            mlow_profile: true,
             audio_packet_index: 0,
             warp_piggyback,
+            payload_type: RTP_PAYLOAD_TYPE_MLOW,
         }
+    }
+
+    pub fn set_payload_type(&mut self, payload_type: u8) -> bool {
+        if payload_type > 127 {
+            return false;
+        }
+        self.payload_type = payload_type;
+        true
+    }
+
+    pub fn set_mlow_profile(&mut self, enabled: bool) {
+        self.mlow_profile = enabled;
+        self.speech_start_markers = enabled;
     }
 
     /// The current send timestamp (last emitted), for an RTCP Sender Report.
@@ -351,16 +386,22 @@ impl RtpStream {
     }
 
     pub fn next_packet(&mut self, payload: &[u8], marker: bool) -> RtpHeader {
-        let dtx = is_opus_dtx_payload(payload);
+        let dtx = if self.mlow_profile {
+            is_mlow_dtx_payload(payload)
+        } else {
+            is_opus_dtx_payload(payload)
+        };
         let priming = is_opus_priming_payload(payload);
         let speech = !dtx && !priming;
-        let use_marker = marker || (speech && !self.speech_started);
-        if speech {
+        let use_marker = marker || (self.speech_start_markers && speech && !self.speech_started);
+        if dtx {
+            self.speech_started = false;
+        } else if speech {
             self.speech_started = true;
         }
         let header = RtpHeader {
             marker: use_marker,
-            payload_type: RTP_PAYLOAD_TYPE_OPUS,
+            payload_type: self.payload_type,
             sequence_number: self.seq,
             timestamp: self.timestamp,
             ssrc: self.ssrc,
@@ -377,7 +418,7 @@ impl RtpStream {
     pub fn next_pre_speech_packet(&mut self) -> RtpHeader {
         let header = RtpHeader {
             marker: false,
-            payload_type: RTP_PAYLOAD_TYPE_OPUS,
+            payload_type: self.payload_type,
             sequence_number: self.seq,
             timestamp: self.timestamp,
             ssrc: self.ssrc,
@@ -538,15 +579,34 @@ mod tests {
     fn classifiers() {
         assert!(is_opus_dtx_payload(&[0x10]));
         assert!(is_opus_dtx_payload(&[0x90]));
+        assert!(is_opus_dtx_payload(&[0xBB, 0x03]));
         assert!(!is_opus_dtx_payload(&[]));
+        assert!(is_mlow_dtx_payload(&[0x90]));
+        assert!(!is_mlow_dtx_payload(&[0x48, 0x00]));
         assert!(is_opus_priming_payload(&OPUS_PRIMING_FRAME_1));
         assert!(is_opus_priming_payload(&OPUS_PRIMING_FRAME_2));
         assert!(!is_opus_priming_payload(&[0x12, 0x36]));
         assert!(is_opus_mlow_speech_payload(&[0x48; 20]));
         assert!(!is_opus_mlow_speech_payload(&[0x48; 4]));
+        assert!(is_whatsapp_opus_rtp_payload(111));
         assert!(is_whatsapp_opus_rtp_payload(120));
         assert!(is_whatsapp_opus_rtp_payload(121));
         assert!(!is_whatsapp_opus_rtp_payload(96));
+    }
+
+    #[test]
+    fn audio_stream_payload_type_is_configurable_without_resetting_timing() {
+        let mut stream = RtpStream::new(0x1122_3344, 2_880, false);
+        let first = stream.next_packet(&[0x48; 20], false);
+        assert_eq!(first.payload_type, RTP_PAYLOAD_TYPE_MLOW);
+        assert_eq!(first.timestamp, 0);
+
+        assert!(stream.set_payload_type(RTP_PAYLOAD_TYPE_OPUS));
+        let second = stream.next_packet(&[0x48; 20], false);
+        assert_eq!(second.payload_type, RTP_PAYLOAD_TYPE_OPUS);
+        assert_eq!(second.sequence_number, 2);
+        assert_eq!(second.timestamp, 2_880);
+        assert!(!stream.set_payload_type(128));
     }
 
     #[test]
@@ -737,7 +797,7 @@ mod tests {
         // Priming/DTX before speech: no marker, no speech latch.
         let p0 = s.next_packet(&OPUS_PRIMING_FRAME_2, false);
         assert_eq!((p0.sequence_number, p0.timestamp, p0.marker), (1, 0, false));
-        let d1 = s.next_packet(&[0x10], false);
+        let d1 = s.next_packet(&[0x90], false);
         assert_eq!(
             (d1.sequence_number, d1.timestamp, d1.marker),
             (2, 320, false)
@@ -754,5 +814,31 @@ mod tests {
         // Subsequent speech has no marker.
         let sp2 = s.next_packet(&[0x48; 40], false);
         assert!(!sp2.marker);
+
+        let d2 = s.next_packet(&[0x90], false);
+        assert!(!d2.marker);
+        let resumed = s.next_packet(&[0x48; 40], false);
+        assert!(resumed.marker, "speech after DTX must re-arm the marker");
+    }
+
+    #[test]
+    fn native_opus_can_disable_mlow_speech_markers() {
+        let mut stream = RtpStream::new(0xabcd, 960, false);
+        stream.set_mlow_profile(false);
+
+        assert!(!stream.next_packet(&[0x58; 80], false).marker);
+        let _ = stream.next_packet(&[0x10], false);
+        assert!(!stream.next_packet(&[0x58; 80], false).marker);
+    }
+
+    #[test]
+    fn short_mlow_speech_is_not_classified_as_dtx() {
+        let mut stream = RtpStream::new(0xabcd, 960, false);
+
+        assert!(stream.next_packet(&[0x48, 0x00], false).marker);
+        let next = stream.next_packet(&[0x48, 0x00], false);
+
+        assert!(!next.marker);
+        assert_eq!(next.extension_word, None);
     }
 }

@@ -97,7 +97,7 @@ pub mod socket;
 pub mod store;
 pub mod transport;
 pub mod upload;
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
 pub mod voip;
 pub use upload::UploadOptions;
 

@@ -731,7 +731,7 @@ pub(crate) fn smpl_pitch(
     pitch_hp_filter(ltp_buf, &mut stage1[offset..offset + l]);
     // ltp_buf_hp = stage1[offset .. offset + (L - look)]
     let hp_len = l - look;
-    let ltp_buf_hp: Vec<f32> = stage1[offset..offset + hp_len].to_vec();
+    let ltp_buf_hp = &stage1[offset..offset + hp_len];
 
     // Downsample stage1[0 .. L+offset] -> stage1_ds. We keep the HP signal already copied out, so a
     // separate output buffer is equivalent to the reference in-place write.
@@ -749,7 +749,7 @@ pub(crate) fn smpl_pitch(
         MAXPITCH_STAGE1,
         LAG_SUBFRLEN_STAGE1 as usize,
     );
-    let mut e2 = vec![0.0f32; numsubfrs];
+    let mut e2 = [0.0f32; NUM_SUBFRAMES];
     // C / E arrays are over-allocated: the upsample stages expand them in place to full-res widths.
     let cap = (2 * FS_KHZ / STAGE1_FS_KHZ) as usize * NUM_LAGS_STAGE1 * numsubfrs + 64;
     let mut c = vec![0.0f32; cap];
@@ -761,13 +761,10 @@ pub(crate) fn smpl_pitch(
     // E from sqrt-energy blend (stage 1).
     let numlags = numlags0;
     for sf in 0..numsubfrs {
-        let mut sqrt_e1 = vec![0.0f32; numlags];
-        for i in 0..numlags {
-            sqrt_e1[i] = (e1[sf * numlags + i] + 1e-30).sqrt();
-        }
         let sqrt_e2 = (e2[sf] + 1e-30).sqrt();
         for i in 0..numlags {
-            let tmp = 0.5 * (sqrt_e1[i] + sqrt_e2);
+            let sqrt_e1 = (e1[sf * numlags + i] + 1e-30).sqrt();
+            let tmp = 0.5 * (sqrt_e1 + sqrt_e2);
             e[sf * numlags + i] = tmp * tmp;
         }
     }
@@ -850,7 +847,7 @@ pub(crate) fn smpl_pitch(
     let mut e1_fs = vec![0.0f32; numlags_e * numsubfrs + 16];
     calc_e1(
         &mut e1_fs,
-        &ltp_buf_hp,
+        ltp_buf_hp,
         l - look,
         numsubfrs,
         minpitch_e,
@@ -953,7 +950,7 @@ pub(crate) fn smpl_pitch(
     // Fine search: per survivor, per blockseg, per block: combine H over the seg's subframes, argmax.
     let mut laginds_surv: Vec<[i32; NUM_SUBFRAMES]> = Vec::new();
     let mut blocksegs_ix_list: Vec<usize> = Vec::new();
-    let mut h_comb = vec![0.0f32; 2 * PITCHBLOCK];
+    let mut h_comb = [0.0f32; 2 * PITCHBLOCK];
     let mut lagind_cache: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
     for &idx in &track_idx {
         let range = tab.blocksegs_ix[idx];
@@ -997,7 +994,7 @@ pub(crate) fn smpl_pitch(
     let pitch_ratewght = if LOW_RATE { 0.028 } else { RATEWGHT_HR };
     let f2w = build_f2w(f2);
     let max_ix = get_maxi(&sf_wght[..numsubfrs]);
-    let mut spectral_harm_cache = vec![0.0f32; 50];
+    let mut spectral_harm_cache = [0.0f32; 50];
 
     let mut best_util = 0.0f32;
     let mut best_pitchcorr = 0.0f32;

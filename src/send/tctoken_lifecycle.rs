@@ -155,7 +155,7 @@ impl Client {
     /// sender bucket. Independent of the 1:1 message AB props — WA Web schedules
     /// `sendTcToken` on its own cadence (`MsgJob`, `StartCall`) regardless of
     /// whether a token was attached to the outgoing stanza.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
         use wacore::iq::tctoken::should_send_new_tc_token_with;
 
@@ -462,7 +462,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn should_issue_tc_token_true_for_unknown_contact() {
         let client = create_test_client().await;
@@ -473,7 +473,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn should_issue_tc_token_false_within_sender_bucket() {
         let client = create_test_client().await;
@@ -498,7 +498,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn should_issue_tc_token_false_for_self() {
         let client = create_test_client().await;

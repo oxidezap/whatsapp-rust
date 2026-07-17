@@ -4449,6 +4449,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "bytes",
  "cpal",
  "env_logger",
  "hex",

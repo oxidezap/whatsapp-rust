@@ -36,6 +36,8 @@ pub enum MlowError {
 /// per internal frame via analysis-by-synthesis.
 pub struct MlowEncoder {
     state: SmplEncoderState,
+    clean: Vec<f32>,
+    range: RangeEncoder,
 }
 
 impl Default for MlowEncoder {
@@ -48,16 +50,27 @@ impl MlowEncoder {
     pub fn new() -> Self {
         MlowEncoder {
             state: SmplEncoderState::default(),
+            clean: Vec::with_capacity(OPUS_FRAME_SAMPS),
+            range: RangeEncoder::new(1 + SMPL_ENCODE_BUF_BYTES),
         }
     }
 
     /// Clear the cross-frame analysis history (call at a stream discontinuity).
     pub fn reset(&mut self) {
         self.state = SmplEncoderState::default();
+        self.clean.clear();
+        self.range.reset();
     }
 
     /// Encode one 60 ms frame. Expects exactly 960 samples.
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u8>, MlowError> {
+        let mut output = Vec::with_capacity(1 + SMPL_ENCODE_BUF_BYTES);
+        self.encode_into(pcm, &mut output)?;
+        Ok(output)
+    }
+
+    /// Encode into a caller-owned buffer so a realtime stream can reuse its allocation.
+    pub fn encode_into(&mut self, pcm: &[f32], output: &mut Vec<u8>) -> Result<(), MlowError> {
         if pcm.len() != OPUS_FRAME_SAMPS {
             return Err(MlowError::FrameLength {
                 expected: OPUS_FRAME_SAMPS,
@@ -65,32 +78,36 @@ impl MlowEncoder {
             });
         }
         // Sanitize: NaN → 0, clamp to [-1,1] (the LPC analysis degenerates on non-finite input).
-        let clean: Vec<f32> = pcm
-            .iter()
-            .map(|&s| if s.is_nan() { 0.0 } else { s.clamp(-1.0, 1.0) })
-            .collect();
-        let fp = smpl_analyze_frame_st(&mut self.state, &clean);
-        encode_smpl_frame(&fp)
+        self.clean.clear();
+        self.clean.extend(
+            pcm.iter()
+                .map(|&s| if s.is_nan() { 0.0 } else { s.clamp(-1.0, 1.0) }),
+        );
+        let fp = smpl_analyze_frame_st(&mut self.state, &self.clean);
+        encode_smpl_frame_into(&fp, &mut self.range, output)
     }
 }
 
-/// Encode one 60 ms MLow frame from its parameters → `[TOC || range-coded body]`.
-pub(crate) fn encode_smpl_frame(fp: &SmplFrameParams) -> Result<Vec<u8>, MlowError> {
+fn encode_smpl_frame_into(
+    fp: &SmplFrameParams,
+    enc: &mut RangeEncoder,
+    output: &mut Vec<u8>,
+) -> Result<(), MlowError> {
     let (p2, p3, p4) = (320i32, 4i32, 1i32);
     let p6 = fp.config as i32;
     let tbl = load_smpl_tables();
     let mem = load_smpl_mem();
     let cc = load_cc_tables();
-    let mut enc = RangeEncoder::new(1 + SMPL_ENCODE_BUF_BYTES);
+    enc.reset();
     let mut st = SmplLsfState::default();
     for f in 0..3 {
         let ip = &fp.internal[f];
-        encode_smpl_lsf(&mut enc, tbl, &mut st, fp.config, f, &ip.lsf);
-        encode_smpl_pulses(&mut enc, cc, p2, p3, p4, p6, ip.lsf.stage1, &ip.pulses);
+        encode_smpl_lsf(enc, tbl, &mut st, fp.config, f, &ip.lsf);
+        encode_smpl_pulses(enc, cc, p2, p3, p4, p6, ip.lsf.stage1, &ip.pulses);
         // Voiced internal frames emit a pitch block; unvoiced emit a gains block (never both).
         if ip.lsf.stage1 == 1 {
             encode_smpl_pitch(
-                &mut enc,
+                enc,
                 mem,
                 cc,
                 &mut st,
@@ -101,7 +118,7 @@ pub(crate) fn encode_smpl_frame(fp: &SmplFrameParams) -> Result<Vec<u8>, MlowErr
                 &ip.pitch,
             );
         } else {
-            encode_smpl_gains(&mut enc, cc, p3, ip.pulses.subfr, &ip.gains);
+            encode_smpl_gains(enc, cc, p3, ip.pulses.subfr, &ip.gains);
         }
     }
     enc.done();
@@ -110,10 +127,11 @@ pub(crate) fn encode_smpl_frame(fp: &SmplFrameParams) -> Result<Vec<u8>, MlowErr
     }
     let n = enc.consumed_len();
     let body = enc.bytes();
-    let mut out = Vec::with_capacity(1 + n);
-    out.push(fp.toc);
-    out.extend_from_slice(&body[..n]);
-    Ok(out)
+    output.clear();
+    output.reserve(1 + n);
+    output.push(fp.toc);
+    output.extend_from_slice(&body[..n]);
+    Ok(())
 }
 
 /// Inverse of `decode_smpl_lsf`: mirror the selector/grid/16-residual/extra reads, mutating `st`.
@@ -595,19 +613,13 @@ mod tests {
         );
     }
 
-    // R9: the encoder is config-0 / no-DTX, so every emitted frame is an active mlow TOC (0x50) and
-    // never a standard Opus/CELT TOC. Makes the implicit contract explicit; a future DTX/SID path
-    // would trip this.
+    // R9: the encoder is config-0 / no-DTX, so every emitted frame has the active MLOW TOC. Codec
+    // routing comes from negotiation, not from interpreting this byte.
     #[test]
     fn encoder_emits_only_active_mlow_toc() {
-        use super::super::is_standard_opus_frame;
         let input = synth_input();
         for frame in encode_all(&mut MlowEncoder::new(), &input) {
             let toc = frame[0];
-            assert!(
-                !is_standard_opus_frame(toc),
-                "encoder emitted a standard-opus TOC 0x{toc:02x}"
-            );
             assert_eq!(toc, 0x50, "encoder emitted non-config-0 TOC 0x{toc:02x}");
         }
     }

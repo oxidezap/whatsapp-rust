@@ -287,9 +287,9 @@ impl Client {
             saver_handle: std::sync::OnceLock::new(),
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicBool::new(false),
-            #[cfg(feature = "voip")]
+            #[cfg(feature = "voip-runtime")]
             call_registry: std::sync::Arc::new(wacore::voip::CallRegistry::new()),
-            #[cfg(feature = "voip")]
+            #[cfg(feature = "voip-runtime")]
             pending_outgoing_calls: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -789,7 +789,7 @@ impl Client {
         self.is_connected.store(false, Ordering::Release);
         // Tear down every in-flight VoIP call: the relay socket and signaling are connection-scoped,
         // so a call can't survive a disconnect/reconnect. Aborts each media task and clears the map.
-        #[cfg(feature = "voip")]
+        #[cfg(feature = "voip-runtime")]
         {
             self.call_registry.abort_all();
             // Dormant outgoing calls (relay never arrived) live in pending_outgoing_calls, not the
@@ -992,7 +992,7 @@ impl Client {
 
     /// Force the connected flag (tests only): the facade's connect path now gates on `is_connected`,
     /// so a unit test driving `spawn_call`/`place_call` must mark the client connected first.
-    #[cfg(all(test, feature = "voip"))]
+    #[cfg(all(test, feature = "voip-runtime"))]
     pub(crate) fn set_connected_for_test(&self, connected: bool) {
         self.is_connected.store(connected, Ordering::Release);
     }
