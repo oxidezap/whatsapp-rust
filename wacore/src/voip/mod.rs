@@ -48,7 +48,7 @@ pub use engine::{
 pub use h264::{AnnexBAuSplitter, VideoFrame};
 #[cfg(feature = "voip-mlow")]
 pub use mlow::{MlowDecoder, MlowEncoder};
-pub use registry::CallRegistry;
+pub use registry::{CallRegistry, PeerVideoTransition, VideoUpgradeToken};
 pub use session::{
     CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
     VideoPipelineParams,

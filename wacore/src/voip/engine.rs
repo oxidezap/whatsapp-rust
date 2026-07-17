@@ -377,11 +377,13 @@ pub enum CallEvent {
     RelayAllocateTimedOut,
     /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
     /// Pushed by the signaling handler, not the engine; surfaced here so one event stream carries
-    /// the whole call. `UpgradeRequestV2` is the peer asking for video — answer with
-    /// `accept_video` or ignore to decline.
+    /// the whole call. For an upgrade request, pass `upgrade_token` to `accept_video`; a cancelled
+    /// or superseded token cannot attach video endpoints.
     VideoStateChanged {
         state: crate::types::call::VideoState,
         orientation: Option<u8>,
+        /// Present only for a peer upgrade request; accepting requires this exact request token.
+        upgrade_token: Option<super::VideoUpgradeToken>,
     },
     /// Authenticated peer RTCP. A referenced local video SSRC proves the peer built a receiver for
     /// our outbound stream; RR, NACK, PLI and FIR are all represented here.

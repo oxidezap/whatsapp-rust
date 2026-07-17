@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use log::warn;
@@ -23,7 +24,7 @@ use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
     AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallEngine, CallEvent,
     EncodedAudioFrame, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
-    video_control_channel,
+    VideoUpgradeToken, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -1286,6 +1287,14 @@ const VIDEO_OUT_CHANNEL_CAP: usize = 8;
 const VIDEO_DEC_REQUEST: &str = "H264";
 /// `dec` WA Web advertises on an UpgradeAccept.
 const VIDEO_DEC_ACCEPT: &str = "H264,AV1";
+/// WA's native upgrade timer downgrades an unanswered request after five seconds.
+const VIDEO_UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum VideoUpgradeRole {
+    Initiate,
+    Accept(VideoUpgradeToken),
+}
 
 /// Per-call video plumbing shared between the [`CallHandle`], the registry (signaling handler),
 /// and the drive loop. Created for EVERY call at registration time — idle channels cost nothing,
@@ -1384,6 +1393,28 @@ impl VideoShared {
 fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> {
     let video = video.clone();
     Box::new(move || video.detach_endpoints())
+}
+
+fn release_video_endpoints(
+    registry: &wacore::voip::CallRegistry,
+    pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
+    video: &VideoShared,
+    call_id: &str,
+    generation: u64,
+) {
+    let pending_video = {
+        let mut pending = pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.video.take())
+    };
+    drop(pending_video);
+    if !registry.run_video_teardown(call_id, generation) {
+        video.detach_endpoints();
+    }
 }
 
 /// Forwards encoded AUs from the consumer's source into the drive loop. Bounded on the call's
@@ -1549,29 +1580,41 @@ impl CallHandle {
         S: VideoSource,
         K: VideoSink,
     {
-        self.begin_video(
-            Arc::new(source),
-            Arc::new(sink),
-            VideoState::UpgradeRequestV2,
-        )
-        .await
+        self.begin_video(Arc::new(source), Arc::new(sink), VideoUpgradeRole::Initiate)
+            .await
     }
 
     /// ACCEPT the peer's video upgrade request (a `VideoStateChanged { state: UpgradeRequestV2 }`
-    /// event): attaches the endpoints, enables the media plane, and answers
+    /// event): the token binds this action to that exact request, then the method attaches the
+    /// endpoints, enables the media plane, and answers
     /// `<video state=4 dec="H264,AV1">` followed by `<video state=1>` (Enabled).
-    pub async fn accept_video<S, K>(&self, source: S, sink: K) -> Result<(), CallError>
+    pub async fn accept_video<S, K>(
+        &self,
+        request: VideoUpgradeToken,
+        source: S,
+        sink: K,
+    ) -> Result<(), CallError>
     where
         S: VideoSource,
         K: VideoSink,
     {
-        self.begin_video(Arc::new(source), Arc::new(sink), VideoState::UpgradeAccept)
-            .await
+        self.begin_video(
+            Arc::new(source),
+            Arc::new(sink),
+            VideoUpgradeRole::Accept(request),
+        )
+        .await
     }
 
     /// Send the standalone `<video state=1>` used after a mid-call video upgrade. Captured
     /// video-from-start callees do not need this extra stanza.
     pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
         self.ensure_current()?;
         let client = self.upgrade_client()?;
         let stanza = build_video_state(&VideoStateParams {
@@ -1587,15 +1630,24 @@ impl CallHandle {
         Ok(())
     }
 
-    /// DOWNGRADE to audio: sends `<video state=6>` (Stopped, no marker), tears the local video
-    /// plane down, and releases the source/sink. The audio plane is untouched. Idempotent.
+    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker), tears the local
+    /// video plane down, and releases the source/sink. The peer may keep sending its direction;
+    /// audio is untouched. Idempotent.
     pub async fn stop_video(&self) -> Result<(), CallError> {
         self.ensure_current()?;
-        let client = self.upgrade_client()?;
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
         // Tear local media down FIRST, matching `Voip::terminate`: the app asked to stop video, so
         // a failed signaling send must NOT leave the camera streaming. If the peer misses the
         // Stopped it keeps sending video, but our plane is disabled so those PT-97 packets drop.
-        self.teardown_local_video();
+        self.release_local_video();
+        self.client_registry
+            .stop_local_video(&self.call_id, self.generation);
+        let client = self.upgrade_client()?;
         let stanza = build_video_state(&VideoStateParams {
             call_id: &self.call_id,
             to: &self.peer_jid(),
@@ -1609,29 +1661,15 @@ impl CallHandle {
         Ok(())
     }
 
-    /// Release the local video plane: detach the endpoints (stops the camera feed, drops the sink,
-    /// disables the drive-loop plane) and clear the session flag. Shared by `stop_video` and the
-    /// `begin_video` rollback.
-    fn teardown_local_video(&self) {
-        let pending_video = {
-            let mut pending = self
-                .pending_outgoing_calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending
-                .get_mut(&self.call_id)
-                .filter(|entry| entry.generation == self.generation)
-                .and_then(|entry| entry.video.take())
-        };
-        drop(pending_video);
-        if !self
-            .client_registry
-            .run_video_teardown(&self.call_id, self.generation)
-        {
-            self.video.detach_endpoints();
-        }
-        self.client_registry
-            .set_is_video(&self.call_id, self.generation, false);
+    /// Release local codec endpoints without changing the directional signaling state.
+    fn release_local_video(&self) {
+        release_video_endpoints(
+            &self.client_registry,
+            &self.pending_outgoing_calls,
+            &self.video,
+            &self.call_id,
+            self.generation,
+        );
     }
 
     /// Shared upgrade/accept body: attach endpoints, enable the plane, send the handshake stanzas.
@@ -1639,7 +1677,7 @@ impl CallHandle {
         &self,
         source: Arc<dyn VideoSource>,
         sink: Arc<dyn VideoSink>,
-        role: VideoState,
+        role: VideoUpgradeRole,
     ) -> Result<(), CallError> {
         // A stale handle (superseded by a same-call-id glare/retry) must not attach endpoints or
         // send `<video>` for a call it no longer owns — that would mutate the replacement's state.
@@ -1650,6 +1688,29 @@ impl CallHandle {
             ));
         }
         let client = self.upgrade_client()?;
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+        let request_epoch = match role {
+            VideoUpgradeRole::Initiate => Some(
+                self.client_registry
+                    .begin_local_video_request(&self.call_id, self.generation)
+                    .ok_or(CallError::Media("video transition already in progress"))?,
+            ),
+            VideoUpgradeRole::Accept(request) => {
+                if request.generation() != self.generation
+                    || !self
+                        .client_registry
+                        .peer_video_request_is_current(&self.call_id, request)
+                {
+                    return Err(CallError::VideoUpgradeExpired);
+                }
+                None
+            }
+        };
         self.video
             .attach_endpoints(&client, &source, &sink, self.ended.clone());
         if !self.client_registry.set_video_teardown(
@@ -1658,19 +1719,20 @@ impl CallHandle {
             video_teardown_hook(&self.video),
         ) {
             self.video.detach_endpoints();
+            if let Some(epoch) = request_epoch {
+                self.client_registry
+                    .end_local_video_request(&self.call_id, self.generation, epoch);
+            }
             return Err(CallError::Media("call no longer active"));
         }
         // The upgrade INITIATOR holds outbound video until the peer accepts (the handler ungates on
         // the peer's UpgradeAccept/Enabled). The acceptor's peer already requested, so it may send
         // immediately.
-        let ctl = if role == VideoState::UpgradeRequestV2 {
-            VideoControl::EnableAwaitingAccept
-        } else {
-            VideoControl::Enable
+        let ctl = match role {
+            VideoUpgradeRole::Initiate => VideoControl::EnableAwaitingAccept,
+            VideoUpgradeRole::Accept(_) => VideoControl::Enable,
         };
         self.video.send_control(ctl);
-        self.client_registry
-            .set_is_video(&self.call_id, self.generation, true);
 
         let peer = self.peer_jid();
         let send_state = |state: VideoState, dec: Option<&'static str>| {
@@ -1687,33 +1749,106 @@ impl CallHandle {
             let client = client.clone();
             async move { client.send_node(stanza).await }
         };
-        match role {
-            VideoState::UpgradeRequestV2 => {
+        let send_result = match role {
+            VideoUpgradeRole::Initiate => {
                 if let Err(e) =
                     send_state(VideoState::UpgradeRequestV2, Some(VIDEO_DEC_REQUEST)).await
                 {
-                    self.teardown_local_video();
-                    return Err(e.into());
+                    Err(e)
+                } else {
+                    Ok(())
                 }
             }
-            _ => {
+            VideoUpgradeRole::Accept(_) => {
                 if let Err(e) = send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT)).await
                 {
-                    self.teardown_local_video();
-                    return Err(e.into());
-                }
-                if let Err(e) = send_state(VideoState::Enabled, None).await {
+                    Err(e)
+                } else if let Err(e) = send_state(VideoState::Enabled, None).await {
                     // The peer times out an incomplete handshake; keep local media aligned with it.
                     warn!(
                         "voip: video upgrade handshake failed call_id={} phase=enabled_after_accept error={e}",
                         self.call_id
                     );
-                    self.teardown_local_video();
-                    return Err(e.into());
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = send_result {
+            self.release_local_video();
+            if let Some(epoch) = request_epoch {
+                self.client_registry
+                    .end_local_video_request(&self.call_id, self.generation, epoch);
+            } else {
+                self.client_registry
+                    .reset_video(&self.call_id, self.generation);
+            }
+            return Err(e.into());
+        }
+
+        match role {
+            VideoUpgradeRole::Initiate => {
+                drop(transition_guard);
+                if let Some(epoch) = request_epoch {
+                    self.spawn_video_upgrade_timeout(epoch, client);
+                }
+            }
+            VideoUpgradeRole::Accept(request) => {
+                if !self
+                    .client_registry
+                    .complete_peer_video_request(&self.call_id, request)
+                {
+                    self.release_local_video();
+                    self.client_registry
+                        .reset_video(&self.call_id, self.generation);
+                    return Err(CallError::VideoUpgradeExpired);
                 }
             }
         }
         Ok(())
+    }
+
+    fn spawn_video_upgrade_timeout(&self, epoch: u64, client: Arc<Client>) {
+        let runtime = client.runtime.clone();
+        let sleeper = runtime.clone();
+        let registry = self.client_registry.clone();
+        let pending = self.pending_outgoing_calls.clone();
+        let video = self.video.clone();
+        let weak_client = Arc::downgrade(&client);
+        let call_id = self.call_id.clone();
+        let generation = self.generation;
+        let peer = self.peer_jid();
+        let call_creator = self.call_creator.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                sleeper.sleep(VIDEO_UPGRADE_TIMEOUT).await;
+                let Some(transition_lock) = registry.video_transition_lock(&call_id, generation)
+                else {
+                    return;
+                };
+                let _transition_guard = transition_lock.lock().await;
+                if !registry.end_local_video_request(&call_id, generation, epoch) {
+                    return;
+                }
+                release_video_endpoints(&registry, &pending, &video, &call_id, generation);
+                let Some(client) = weak_client.upgrade() else {
+                    return;
+                };
+                let stanza = build_video_state(&VideoStateParams {
+                    call_id: &call_id,
+                    to: &peer,
+                    id: &client.generate_request_id(),
+                    call_creator: &call_creator,
+                    state: VideoState::Disabled,
+                    dec: None,
+                    device_orientation: None,
+                });
+                if let Err(e) = client.send_node(stanza).await {
+                    warn!("voip: failed to announce video upgrade timeout call_id={call_id}: {e}");
+                }
+            }))
+            .detach();
     }
 
     fn upgrade_client(&self) -> Result<Arc<Client>, CallError> {
@@ -3681,6 +3816,22 @@ mod tests {
         (vin_rx, vout_tx)
     }
 
+    async fn peer_upgrade_request(handle: &CallHandle) -> VideoUpgradeToken {
+        let transition_lock = handle
+            .client_registry
+            .video_transition_lock(&handle.call_id, handle.generation)
+            .expect("active call");
+        let _guard = transition_lock.lock().await;
+        match handle.client_registry.apply_peer_video_state(
+            &handle.call_id,
+            handle.generation,
+            VideoState::UpgradeRequestV2,
+        ) {
+            wacore::voip::PeerVideoTransition::UpgradeRequested(token) => token,
+            transition => panic!("unexpected transition: {transition:?}"),
+        }
+    }
+
     struct TimedVideoSource {
         frames: async_channel::Receiver<Vec<u8>>,
         timestamp_stride: u32,
@@ -3693,6 +3844,23 @@ mod tests {
 
         fn rtp_timestamp_stride(&self) -> u32 {
             self.timestamp_stride
+        }
+    }
+
+    struct DropTrackedVideoSource {
+        frames: async_channel::Receiver<Vec<u8>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl VideoSource for DropTrackedVideoSource {
+        fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+            self.frames.clone()
+        }
+    }
+
+    impl Drop for DropTrackedVideoSource {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -3808,11 +3976,12 @@ mod tests {
     #[tokio::test]
     async fn accept_video_sends_accept_then_enabled() {
         let (client, sent_count, handle, _relay_keepalive) = sending_handle().await;
+        let request = peer_upgrade_request(&handle).await;
         let (vsrc, vsink) = video_endpoints();
         let before = sent_count.load(Ordering::SeqCst);
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         handle
-            .accept_video(vsrc, vsink)
+            .accept_video(request, vsrc, vsink)
             .await
             .expect("accept_video");
         assert_eq!(
@@ -3867,11 +4036,125 @@ mod tests {
             ended: Arc::new(EndedFlag::default()),
         };
 
+        let request = peer_upgrade_request(&handle).await;
         let (source, sink) = video_endpoints();
-        assert!(handle.accept_video(source, sink).await.is_err());
+        assert!(handle.accept_video(request, source, sink).await.is_err());
         assert_eq!(sent.load(Ordering::SeqCst), 2);
         assert!(video.sink_slot.lock().unwrap().is_none());
         assert!(!registry.snapshot("CID-FACADE").unwrap().is_video);
+    }
+
+    #[tokio::test]
+    async fn stale_peer_request_cannot_accept_a_newer_request() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let first = peer_upgrade_request(&handle).await;
+        let transition_lock = handle
+            .client_registry
+            .video_transition_lock(&handle.call_id, handle.generation)
+            .expect("active call");
+        let second = {
+            let _guard = transition_lock.lock().await;
+            assert!(matches!(
+                handle.client_registry.apply_peer_video_state(
+                    &handle.call_id,
+                    handle.generation,
+                    VideoState::UpgradeCancel,
+                ),
+                wacore::voip::PeerVideoTransition::Applied { .. }
+            ));
+            match handle.client_registry.apply_peer_video_state(
+                &handle.call_id,
+                handle.generation,
+                VideoState::UpgradeRequestV2,
+            ) {
+                wacore::voip::PeerVideoTransition::UpgradeRequested(token) => token,
+                transition => panic!("unexpected transition: {transition:?}"),
+            }
+        };
+        assert_ne!(first, second);
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (frames_tx, frames) = async_channel::unbounded();
+        let source = DropTrackedVideoSource {
+            frames,
+            drops: drops.clone(),
+        };
+        let (_sink_rx, sink) = {
+            let (sink, receiver) = async_channel::unbounded::<VideoFrame>();
+            (receiver, sink)
+        };
+        assert!(matches!(
+            handle.accept_video(first, source, sink).await,
+            Err(CallError::VideoUpgradeExpired)
+        ));
+        drop(frames_tx);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(handle.video.sink_slot.lock().unwrap().is_none());
+        assert!(
+            handle
+                .client_registry
+                .peer_video_request_is_current(&handle.call_id, second)
+        );
+        handle.hangup().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_local_upgrade_times_out_and_releases_source() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+        };
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_frames_tx, frames) = async_channel::unbounded();
+        let source = DropTrackedVideoSource {
+            frames,
+            drops: drops.clone(),
+        };
+        let (sink, _sink_rx) = async_channel::unbounded::<VideoFrame>();
+        handle
+            .start_video(source, sink)
+            .await
+            .expect("request sent");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(VIDEO_UPGRADE_TIMEOUT).await;
+        for _ in 0..10 {
+            if drops.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert!(!registry.snapshot("CID-FACADE").unwrap().is_video);
+        assert_eq!(
+            registry.video_states("CID-FACADE", generation),
+            Some((VideoState::Disabled, VideoState::Disabled))
+        );
+        handle.hangup().await;
     }
 
     #[tokio::test]
@@ -3951,7 +4234,12 @@ mod tests {
                 .is_some_and(|pending| pending.video.is_none()),
             "relay attach must not resurrect endpoints removed before its ack"
         );
-        assert!(!client.call_registry().snapshot(&call_id).unwrap().is_video);
+        let registry = client.call_registry();
+        assert_eq!(
+            registry.video_states(&call_id, handle.generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+        assert!(registry.snapshot(&call_id).unwrap().is_video);
         handle.hangup().await;
     }
 

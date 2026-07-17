@@ -11,13 +11,92 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use async_lock::Mutex as AsyncMutex;
 use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
+use crate::types::call::VideoState;
 use crate::voip::driver::{VideoControl, VideoControlSender};
 use crate::voip::engine::CallEvent;
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
+
+/// Identifies one peer video-upgrade request within one call generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VideoUpgradeToken {
+    generation: u64,
+    epoch: u64,
+}
+
+impl VideoUpgradeToken {
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub fn epoch(self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Result of applying a committed peer video-state transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PeerVideoTransition {
+    Ignored,
+    UpgradeRequested(VideoUpgradeToken),
+    Applied {
+        enable_plane: bool,
+        teardown_local: bool,
+        answer_upgrade: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VideoNegotiation {
+    self_state: VideoState,
+    peer_state: VideoState,
+    peer_request_epoch: u64,
+    pending_peer_request: Option<u64>,
+    self_request_epoch: u64,
+    pending_self_request: Option<u64>,
+}
+
+impl VideoNegotiation {
+    fn new(is_video: bool) -> Self {
+        let state = if is_video {
+            VideoState::Enabled
+        } else {
+            VideoState::Disabled
+        };
+        Self {
+            self_state: state,
+            peer_state: state,
+            peer_request_epoch: 0,
+            pending_peer_request: None,
+            self_request_epoch: 0,
+            pending_self_request: None,
+        }
+    }
+
+    fn is_video(self) -> bool {
+        !self.self_state.is_inactive_for_call_mode() || !self.peer_state.is_inactive_for_call_mode()
+    }
+
+    fn next_peer_request(&mut self, generation: u64) -> VideoUpgradeToken {
+        self.peer_request_epoch = self.peer_request_epoch.wrapping_add(1).max(1);
+        self.pending_peer_request = Some(self.peer_request_epoch);
+        VideoUpgradeToken {
+            generation,
+            epoch: self.peer_request_epoch,
+        }
+    }
+
+    fn next_self_request(&mut self) -> u64 {
+        self.self_request_epoch = self.self_request_epoch.wrapping_add(1).max(1);
+        self.pending_self_request = Some(self.self_request_epoch);
+        self.self_request_epoch
+    }
+}
 
 /// Runs its closure when dropped. Stored on a [`CallEntry`] to wake the call's `wait_ended()` waiter
 /// whenever the entry is removed (terminal stanza, disconnect, supersession) -- including in the
@@ -53,6 +132,9 @@ struct CallEntry {
     video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
     /// Prevents concurrent video transitions from overtaking each other while an ack is in flight.
     event_publication_reserved: Arc<AtomicBool>,
+    /// Mirrors WA's stream mutex for user actions, peer signaling, and timeout callbacks.
+    video_transition_lock: Arc<AsyncMutex<()>>,
+    video: VideoNegotiation,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -125,6 +207,7 @@ impl CallRegistry {
     /// OWN entry, never a newer replacement.
     pub fn insert(&self, session: CallSession) -> u64 {
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        let video = VideoNegotiation::new(session.is_video);
         // Registering a call as active answers (accept) or places (outgoing) it: it is no longer
         // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
         // offer this clears the ringing flag so a later `<terminate>` reads as ended, not missed.
@@ -142,6 +225,8 @@ impl CallRegistry {
                     video_ctl_tx: None,
                     video_teardown: None,
                     event_publication_reserved: Arc::new(AtomicBool::new(false)),
+                    video_transition_lock: Arc::new(AsyncMutex::new(())),
+                    video,
                     on_terminal: None,
                 },
             )
@@ -301,6 +386,263 @@ impl CallRegistry {
         })
     }
 
+    /// The current call generation and its shared video-transition lock.
+    pub fn current_video_transition(&self, call_id: &str) -> Option<(u64, Arc<AsyncMutex<()>>)> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .map(|entry| (entry.generation, entry.video_transition_lock.clone()))
+    }
+
+    /// The video-transition lock for one known call generation.
+    pub fn video_transition_lock(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Arc<AsyncMutex<()>>> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.video_transition_lock.clone())
+    }
+
+    /// Apply a peer state while the caller holds this generation's video-transition lock.
+    pub fn apply_peer_video_state(
+        &self,
+        call_id: &str,
+        generation: u64,
+        state: VideoState,
+    ) -> PeerVideoTransition {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return PeerVideoTransition::Ignored;
+        };
+
+        let outcome = match state {
+            VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
+                if entry.video.peer_state.is_upgrade_request()
+                    && let Some(epoch) = entry.video.pending_peer_request
+                {
+                    PeerVideoTransition::UpgradeRequested(VideoUpgradeToken { generation, epoch })
+                } else if entry.video.self_state.is_upgrade_request()
+                    && entry.video.pending_self_request.is_some()
+                {
+                    entry.video.self_state = VideoState::Enabled;
+                    entry.video.peer_state = VideoState::Enabled;
+                    entry.video.pending_self_request = None;
+                    entry.video.pending_peer_request = None;
+                    PeerVideoTransition::Applied {
+                        enable_plane: true,
+                        teardown_local: false,
+                        answer_upgrade: true,
+                    }
+                } else if !entry.video.self_state.is_inactive_for_call_mode() {
+                    PeerVideoTransition::Ignored
+                } else {
+                    entry.video.peer_state = state;
+                    let token = entry.video.next_peer_request(generation);
+                    PeerVideoTransition::UpgradeRequested(token)
+                }
+            }
+            VideoState::UpgradeAccept => {
+                if entry.video.self_state.is_upgrade_request()
+                    && entry.video.pending_self_request.is_some()
+                {
+                    entry.video.self_state = VideoState::Enabled;
+                    entry.video.peer_state = VideoState::Enabled;
+                    entry.video.pending_self_request = None;
+                    PeerVideoTransition::Applied {
+                        enable_plane: true,
+                        teardown_local: false,
+                        answer_upgrade: false,
+                    }
+                } else {
+                    PeerVideoTransition::Ignored
+                }
+            }
+            VideoState::Enabled => {
+                if entry.video.self_state.is_upgrade_request() {
+                    entry.video.self_state = VideoState::Enabled;
+                    entry.video.pending_self_request = None;
+                }
+                entry.video.peer_state = VideoState::Enabled;
+                entry.video.pending_peer_request = None;
+                PeerVideoTransition::Applied {
+                    enable_plane: true,
+                    teardown_local: false,
+                    answer_upgrade: false,
+                }
+            }
+            VideoState::UpgradeReject | VideoState::UpgradeRejectByTimeout => {
+                if entry.video.self_state.is_upgrade_request()
+                    && entry.video.pending_self_request.is_some()
+                {
+                    entry.video.self_state = VideoState::Disabled;
+                    entry.video.peer_state = state;
+                    entry.video.pending_self_request = None;
+                    PeerVideoTransition::Applied {
+                        enable_plane: false,
+                        teardown_local: true,
+                        answer_upgrade: false,
+                    }
+                } else {
+                    PeerVideoTransition::Ignored
+                }
+            }
+            VideoState::Disabled
+            | VideoState::UpgradeCancel
+            | VideoState::UpgradeCancelByTimeout
+            | VideoState::Error => {
+                entry.video.self_state = VideoState::Disabled;
+                entry.video.peer_state = state;
+                entry.video.pending_self_request = None;
+                entry.video.pending_peer_request = None;
+                PeerVideoTransition::Applied {
+                    enable_plane: false,
+                    teardown_local: true,
+                    answer_upgrade: false,
+                }
+            }
+            VideoState::Stopped => {
+                entry.video.peer_state = VideoState::Stopped;
+                entry.video.pending_peer_request = None;
+                PeerVideoTransition::Applied {
+                    enable_plane: false,
+                    teardown_local: false,
+                    answer_upgrade: false,
+                }
+            }
+            VideoState::Paused | VideoState::UnknownPeer => {
+                entry.video.peer_state = state;
+                PeerVideoTransition::Applied {
+                    enable_plane: false,
+                    teardown_local: false,
+                    answer_upgrade: false,
+                }
+            }
+            VideoState::Unknown(_) => PeerVideoTransition::Ignored,
+        };
+        entry.session.is_video = entry.video.is_video();
+        outcome
+    }
+
+    /// Begin a local upgrade and return its timeout epoch.
+    pub fn begin_local_video_request(&self, call_id: &str, generation: u64) -> Option<u64> {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let entry = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        if !entry.video.self_state.is_inactive_for_call_mode()
+            || entry.video.pending_peer_request.is_some()
+        {
+            return None;
+        }
+        entry.video.self_state = VideoState::UpgradeRequestV2;
+        let epoch = entry.video.next_self_request();
+        entry.session.is_video = entry.video.is_video();
+        Some(epoch)
+    }
+
+    /// Complete a peer request only when the same request is still pending.
+    pub fn complete_peer_video_request(&self, call_id: &str, token: VideoUpgradeToken) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == token.generation)
+        else {
+            return false;
+        };
+        if entry.video.pending_peer_request != Some(token.epoch)
+            || !entry.video.peer_state.is_upgrade_request()
+        {
+            return false;
+        }
+        entry.video.self_state = VideoState::Enabled;
+        entry.video.peer_state = VideoState::Enabled;
+        entry.video.pending_peer_request = None;
+        entry.session.is_video = entry.video.is_video();
+        true
+    }
+
+    pub fn peer_video_request_is_current(&self, call_id: &str, token: VideoUpgradeToken) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == token.generation)
+            .is_some_and(|entry| {
+                entry.video.pending_peer_request == Some(token.epoch)
+                    && entry.video.peer_state.is_upgrade_request()
+            })
+    }
+
+    /// Roll back or expire one local request without touching a newer request.
+    pub fn end_local_video_request(&self, call_id: &str, generation: u64, epoch: u64) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        if entry.video.pending_self_request != Some(epoch)
+            || !entry.video.self_state.is_upgrade_request()
+        {
+            return false;
+        }
+        entry.video.self_state = VideoState::Disabled;
+        entry.video.pending_self_request = None;
+        entry.session.is_video = entry.video.is_video();
+        true
+    }
+
+    /// Clear both directions after a failed handshake or full downgrade.
+    pub fn reset_video(&self, call_id: &str, generation: u64) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        entry.video.self_state = VideoState::Disabled;
+        entry.video.peer_state = VideoState::Disabled;
+        entry.video.pending_self_request = None;
+        entry.video.pending_peer_request = None;
+        entry.session.is_video = false;
+        true
+    }
+
+    /// Mark only our direction stopped; the peer may keep sending video.
+    pub fn stop_local_video(&self, call_id: &str, generation: u64) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        entry.video.self_state = VideoState::Stopped;
+        entry.video.pending_self_request = None;
+        entry.session.is_video = entry.video.is_video();
+        true
+    }
+
+    pub fn video_states(&self, call_id: &str, generation: u64) -> Option<(VideoState, VideoState)> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| (entry.video.self_state, entry.video.peer_state))
+    }
+
     /// Send a mid-call video-plane command to the current drive loop.
     pub fn send_video_ctl(&self, call_id: &str, generation: u64, ctl: VideoControl) {
         let tx = self
@@ -326,6 +668,7 @@ impl CallRegistry {
             && entry.generation == generation
         {
             entry.session.is_video = is_video;
+            entry.video = VideoNegotiation::new(is_video);
             true
         } else {
             false
@@ -560,6 +903,7 @@ mod tests {
         let event = || CallEvent::VideoStateChanged {
             state: crate::types::call::VideoState::Enabled,
             orientation: None,
+            upgrade_token: None,
         };
         let permit = reg.reserve_call_event("CID").expect("first reservation");
         assert!(
@@ -585,6 +929,113 @@ mod tests {
         drop(permit);
         assert!(reg.reserve_call_event("CID").is_some());
         assert!(reg.reserve_call_event("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn peer_upgrade_tokens_reject_cancel_request_aba() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let first =
+            match reg.apply_peer_video_state("CID", generation, VideoState::UpgradeRequestV2) {
+                PeerVideoTransition::UpgradeRequested(token) => token,
+                transition => panic!("unexpected transition: {transition:?}"),
+            };
+        assert!(reg.peer_video_request_is_current("CID", first));
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::UpgradeCancel),
+            PeerVideoTransition::Applied {
+                teardown_local: true,
+                ..
+            }
+        ));
+
+        let second =
+            match reg.apply_peer_video_state("CID", generation, VideoState::UpgradeRequestV2) {
+                PeerVideoTransition::UpgradeRequested(token) => token,
+                transition => panic!("unexpected transition: {transition:?}"),
+            };
+        assert_ne!(first, second);
+        assert!(!reg.peer_video_request_is_current("CID", first));
+        assert!(reg.peer_video_request_is_current("CID", second));
+        assert!(!reg.complete_peer_video_request("CID", first));
+        assert!(reg.peer_video_request_is_current("CID", second));
+        assert!(reg.complete_peer_video_request("CID", second));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Enabled, VideoState::Enabled))
+        );
+    }
+
+    #[test]
+    fn duplicate_peer_request_keeps_the_same_token() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let request = |state| match reg.apply_peer_video_state("CID", generation, state) {
+            PeerVideoTransition::UpgradeRequested(token) => token,
+            transition => panic!("unexpected transition: {transition:?}"),
+        };
+        assert_eq!(
+            request(VideoState::UpgradeRequest),
+            request(VideoState::UpgradeRequestV2)
+        );
+    }
+
+    #[test]
+    fn stopped_is_directional_but_disabled_is_a_full_downgrade() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let token =
+            match reg.apply_peer_video_state("CID", generation, VideoState::UpgradeRequestV2) {
+                PeerVideoTransition::UpgradeRequested(token) => token,
+                transition => panic!("unexpected transition: {transition:?}"),
+            };
+        assert!(reg.complete_peer_video_request("CID", token));
+
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Stopped),
+            PeerVideoTransition::Applied {
+                teardown_local: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Enabled, VideoState::Stopped))
+        );
+        assert!(reg.snapshot("CID").expect("session").is_video);
+
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Disabled),
+            PeerVideoTransition::Applied {
+                teardown_local: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Disabled, VideoState::Disabled))
+        );
+        assert!(!reg.snapshot("CID").expect("session").is_video);
+    }
+
+    #[test]
+    fn local_request_timeout_epoch_cannot_end_a_newer_request() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let first = reg
+            .begin_local_video_request("CID", generation)
+            .expect("first request");
+        assert!(reg.end_local_video_request("CID", generation, first));
+        let second = reg
+            .begin_local_video_request("CID", generation)
+            .expect("second request");
+        assert_ne!(first, second);
+        assert!(!reg.end_local_video_request("CID", generation, first));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::UpgradeRequestV2, VideoState::Disabled))
+        );
+        assert!(reg.end_local_video_request("CID", generation, second));
     }
 
     #[test]

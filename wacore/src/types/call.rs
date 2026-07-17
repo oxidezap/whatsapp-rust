@@ -78,6 +78,8 @@ pub enum VideoState {
     Disabled,
     #[wire = 1]
     Enabled,
+    #[wire = 2]
+    Paused,
     #[wire = 3]
     UpgradeRequest,
     #[wire = 4]
@@ -86,12 +88,40 @@ pub enum VideoState {
     UpgradeReject,
     #[wire = 6]
     Stopped,
+    #[wire = 7]
+    UpgradeRejectByTimeout,
     #[wire = 8]
     UpgradeCancel,
+    #[wire = 9]
+    UpgradeCancelByTimeout,
+    #[wire = 10]
+    UnknownPeer,
     #[wire = 11]
     UpgradeRequestV2,
+    #[wire = 20]
+    Error,
     #[wire_fallback]
     Unknown(i32),
+}
+
+impl VideoState {
+    /// Matches WA Web's call-mode predicate: a call remains video while either direction is active.
+    pub const fn is_inactive_for_call_mode(self) -> bool {
+        matches!(
+            self,
+            Self::Disabled
+                | Self::UpgradeReject
+                | Self::Stopped
+                | Self::UpgradeRejectByTimeout
+                | Self::UpgradeCancel
+                | Self::UpgradeCancelByTimeout
+                | Self::Error
+        )
+    }
+
+    pub const fn is_upgrade_request(self) -> bool {
+        matches!(self, Self::UpgradeRequest | Self::UpgradeRequestV2)
+    }
 }
 
 /// Fields kept per-variant (not a shared `BasicCallMeta`) so the `serde` shape
