@@ -917,6 +917,22 @@ fn spawn_opus_bridge(
     Ok((encoded_rx, playout_tx))
 }
 
+#[cfg(feature = "voip-opus")]
+fn spawn_fallback_opus_decoder(
+    speaker: async_channel::Sender<Vec<i16>>,
+) -> Option<async_channel::Sender<Bytes>> {
+    let mut decoder = WaOpusDecoder::new().ok()?;
+    let (payload_tx, payload_rx) = async_channel::bounded::<Bytes>(3);
+    tokio::task::spawn_blocking(move || {
+        while let Ok(payload) = payload_rx.recv_blocking() {
+            if let Ok(pcm) = decoder.decode_mlow_escape(&payload) {
+                let _ = speaker.try_send(pcm.to_vec());
+            }
+        }
+    });
+    Some(payload_tx)
+}
+
 enum Mode {
     Listen { accept: bool, video: bool },
     Call { jid: Jid, video: bool },
@@ -1241,9 +1257,9 @@ fn spawn_call_event_listener(
     state: Arc<Mutex<CallState>>,
 ) {
     let events = handle.events();
+    #[cfg(feature = "voip-opus")]
+    let fallback_opus_tx = spawn_fallback_opus_decoder(speaker.clone());
     tokio::spawn(async move {
-        #[cfg(feature = "voip-opus")]
-        let mut fallback_opus = WaOpusDecoder::new().ok();
         #[cfg(not(feature = "voip-opus"))]
         let mut fallback_warning_logged = false;
         let mut peer_video_receiver_confirmed = false;
@@ -1261,10 +1277,8 @@ fn spawn_call_event_listener(
                 }
                 CallEvent::ForeignAudio(payload) => {
                     #[cfg(feature = "voip-opus")]
-                    if let Some(decoder) = fallback_opus.as_mut()
-                        && let Ok(pcm) = decoder.decode_mlow_escape(&payload)
-                    {
-                        let _ = speaker.try_send(pcm.to_vec());
+                    if let Some(fallback_opus_tx) = &fallback_opus_tx {
+                        let _ = fallback_opus_tx.try_send(payload);
                     }
                     #[cfg(not(feature = "voip-opus"))]
                     if !fallback_warning_logged {
@@ -1686,7 +1700,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "voip-opus")]
-    use super::{AudioMode, FRAME_SAMPLES, spawn_opus_bridge};
+    use super::{
+        AudioMode, FRAME_SAMPLES, WaOpusEncoder, spawn_fallback_opus_decoder, spawn_opus_bridge,
+    };
     use super::{
         CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
         parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
@@ -1851,5 +1867,28 @@ mod tests {
             .expect("encoder worker must continue")
             .unwrap();
         assert!(!payload.is_empty());
+    }
+
+    #[cfg(feature = "voip-opus")]
+    #[tokio::test]
+    async fn fallback_opus_decoder_delivers_pcm() {
+        let mut encoder = WaOpusEncoder::new_mlow_escape().unwrap();
+        let voice = (0..FRAME_SAMPLES)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                (16_000.0 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()) as i16
+            })
+            .collect::<Vec<_>>();
+        let payload = bytes::Bytes::from(encoder.encode(&voice).unwrap());
+        let (speaker_tx, speaker_rx) = async_channel::bounded(2);
+        let fallback_tx = spawn_fallback_opus_decoder(speaker_tx).unwrap();
+
+        fallback_tx.send(payload).await.unwrap();
+
+        let pcm = tokio::time::timeout(std::time::Duration::from_secs(2), speaker_rx.recv())
+            .await
+            .expect("decoder worker must respond")
+            .unwrap();
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
     }
 }

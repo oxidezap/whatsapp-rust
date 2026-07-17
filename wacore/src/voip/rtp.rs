@@ -107,9 +107,7 @@ pub fn is_opus_dtx_payload(payload: &[u8]) -> bool {
 }
 
 fn is_mlow_dtx_payload(payload: &[u8]) -> bool {
-    payload
-        .first()
-        .is_some_and(|byte| byte & 0xC0 != 0xC0 && byte & 0x80 != 0)
+    payload.first().is_some_and(|byte| byte & 0xC0 == 0x80)
 }
 
 /// mlow speech frame (20 ms `0x48..0x4f` or 60 ms `0x50..0x57`).
