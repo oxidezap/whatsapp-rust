@@ -921,12 +921,21 @@ fn spawn_opus_bridge(
 fn spawn_fallback_opus_decoder(
     speaker: async_channel::Sender<Vec<i16>>,
 ) -> Option<async_channel::Sender<Bytes>> {
-    let mut decoder = WaOpusDecoder::new().ok()?;
+    let mut decoder = match WaOpusDecoder::new() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            error!("failed to initialize fallback Opus decoder: {error}");
+            return None;
+        }
+    };
     let (payload_tx, payload_rx) = async_channel::bounded::<Bytes>(3);
     tokio::task::spawn_blocking(move || {
         while let Ok(payload) = payload_rx.recv_blocking() {
-            if let Ok(pcm) = decoder.decode_mlow_escape(&payload) {
-                let _ = speaker.try_send(pcm.to_vec());
+            match decoder.decode_mlow_escape(&payload) {
+                Ok(pcm) => {
+                    let _ = speaker.try_send(pcm.to_vec());
+                }
+                Err(error) => debug!("failed to decode MLOW escape payload: {error}"),
             }
         }
     });
