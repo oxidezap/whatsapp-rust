@@ -106,6 +106,23 @@ async fn connect_diagnostics(
     client: &Arc<whatsapp_rust::client::Client>,
     backend: &Arc<InMemoryBackend>,
 ) -> String {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    match tokio::time::timeout(TIMEOUT, collect_connect_diagnostics(client, backend)).await {
+        Ok(diagnostics) => diagnostics,
+        Err(_) => format!(
+            "diagnostics_timed_out_after={}s, socket_connected={}, logged_in={}",
+            TIMEOUT.as_secs(),
+            client.is_connected(),
+            client.is_logged_in(),
+        ),
+    }
+}
+
+async fn collect_connect_diagnostics(
+    client: &Arc<whatsapp_rust::client::Client>,
+    backend: &Arc<InMemoryBackend>,
+) -> String {
     async fn session_status(
         client: &whatsapp_rust::client::Client,
         jid: Option<whatsapp_rust::Jid>,

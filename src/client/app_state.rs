@@ -7,6 +7,14 @@ use super::*;
 /// fetching). WA Web fans these out under `Promise.all` (`Syncd/CollectionHandler`);
 /// bounded here because a snapshot can be multi-MB and a batch carries several.
 const APPSTATE_BLOB_DOWNLOAD_CONCURRENCY: usize = 4;
+const APP_STATE_KEY_REQUEST_DEDUP: Duration = Duration::from_secs(24 * 3600);
+const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppStateKeyRequestDelivery {
+    AllPeers,
+    SomePeers,
+}
 
 impl Client {
     pub(crate) async fn get_app_state_processor(&self) -> Arc<AppStateProcessor> {
@@ -675,7 +683,7 @@ impl Client {
     }
 
     /// Request missing app-state keys with dedup stamps.
-    /// On send failure, removes stamps so keys can be retried next sync.
+    /// Total failure removes stamps; partial fanout gets a short retry deadline.
     /// Returns true iff a fresh key request was actually sent (some ids passed the
     /// per-key dedup and the send succeeded), so the caller knows whether a re-share
     /// is plausibly inbound and worth waiting for.
@@ -689,27 +697,39 @@ impl Client {
         for key_id in missing {
             let should = guard
                 .get(key_id.as_slice())
-                .map(|t| t.elapsed() > std::time::Duration::from_secs(24 * 3600))
+                .map(|retry_at| now >= *retry_at)
                 .unwrap_or(true);
             if should {
-                guard.insert(key_id.clone(), now);
+                guard.insert(key_id.clone(), now + APP_STATE_KEY_REQUEST_DEDUP);
                 to_request.push(key_id);
             }
         }
-        guard.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(24 * 3600));
+        guard.retain(|_, retry_at| now < *retry_at);
         drop(guard);
         if to_request.is_empty() {
             return false;
         }
-        if let Err(e) = self.request_app_state_keys(&to_request).await {
-            warn!("Failed to send app state key request: {e}");
-            let mut guard = self.app_state_key_requests.lock().await;
-            for key_id in &to_request {
-                guard.remove(key_id.as_slice());
+        match self.request_app_state_keys(&to_request).await {
+            Ok(AppStateKeyRequestDelivery::AllPeers) => true,
+            Ok(AppStateKeyRequestDelivery::SomePeers) => {
+                let retry_at = wacore::time::Instant::now() + APP_STATE_KEY_PARTIAL_RETRY;
+                let mut guard = self.app_state_key_requests.lock().await;
+                for key_id in &to_request {
+                    if let Some(deadline) = guard.get_mut(key_id.as_slice()) {
+                        *deadline = retry_at;
+                    }
+                }
+                true
             }
-            return false;
+            Err(e) => {
+                warn!("Failed to send app state key request: {e}");
+                let mut guard = self.app_state_key_requests.lock().await;
+                for key_id in &to_request {
+                    guard.remove(key_id.as_slice());
+                }
+                false
+            }
         }
-        true
     }
 
     async fn app_state_key_request_peers(&self) -> Result<Vec<Jid>, anyhow::Error> {
@@ -742,9 +762,12 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.request_keys", level = "debug", skip_all, fields(count = raw_key_ids.len()), err(Debug)))]
-    async fn request_app_state_keys(&self, raw_key_ids: &[Vec<u8>]) -> Result<(), anyhow::Error> {
+    async fn request_app_state_keys(
+        &self,
+        raw_key_ids: &[Vec<u8>],
+    ) -> Result<AppStateKeyRequestDelivery, anyhow::Error> {
         if raw_key_ids.is_empty() {
-            return Ok(());
+            return Ok(AppStateKeyRequestDelivery::AllPeers);
         }
         let peers = self.app_state_key_request_peers().await?;
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
@@ -809,8 +832,9 @@ impl Client {
                 peer_count,
                 failures.join(", ")
             );
+            return Ok(AppStateKeyRequestDelivery::SomePeers);
         }
-        Ok(())
+        Ok(AppStateKeyRequestDelivery::AllPeers)
     }
 
     /// Send an app state patch to the server for a given collection.
