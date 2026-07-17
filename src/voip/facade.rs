@@ -819,9 +819,8 @@ const MIC_CHANNEL_CAPACITY: usize = 3;
 
 /// Bound on the consumer-facing `CallEvent` queue. The driver posts with `try_send`, so once a slow
 /// or absent consumer lets it fill, further diagnostics drop instead of growing without bound.
-/// Lifecycle events
-/// (RelayAllocated/Failed/TimedOut) are emitted before any media flows, so they are never dropped,
-/// and call teardown is driven by the `ended` flag, not this channel.
+/// Lifecycle events (RelayAllocated/Failed/TimedOut) are emitted before media flows, so they are
+/// never dropped, and call teardown is driven by the `ended` flag, not this channel.
 const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
@@ -1530,6 +1529,7 @@ impl CallHandle {
 
     /// Mute or unmute the local microphone. While muted the engine sends DTX comfort-noise (the
     /// stream stays fed); it does not gap, so the peer doesn't re-negotiate the transport.
+    /// This affects PCM audio only; encoded-audio callers must mute their external source.
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
     }

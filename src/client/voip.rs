@@ -101,7 +101,8 @@ impl Voip<'_> {
     /// Begin answering an incoming call's MEDIA plane: returns a builder; call
     /// `.audio(source, sink)` then `.start().await` to decrypt the callKey, connect the relay, and
     /// drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Signaling (preaccept /
-    /// accept) is the consumer's concern; this drives only media. Requires the `voip` feature.
+    /// accept) is the consumer's concern; this drives only media. Requires `voip-runtime` or a
+    /// profile that enables it: `voip`, `voip-encoded`, `voip-mlow`, or `voip-libopus`.
     #[cfg(feature = "voip-runtime")]
     pub fn accept<'b>(&'b self, incoming: &'b IncomingCall) -> crate::voip::AcceptCall<'b> {
         crate::voip::facade::AcceptCall::new(self.client, incoming)
@@ -111,7 +112,8 @@ impl Voip<'_> {
     /// then `.start().await` to generate the callKey, encrypt it per peer device, send the `<offer>`,
     /// and register the call, yielding a [`CallHandle`](crate::voip::CallHandle). The media engine
     /// only attaches once the server hands back the relay for our call-id (live), so the returned
-    /// handle is dormant until then. Requires the `voip` feature.
+    /// handle is dormant until then. Requires `voip-runtime` or a profile that enables it: `voip`,
+    /// `voip-encoded`, `voip-mlow`, or `voip-libopus`.
     #[cfg(feature = "voip-runtime")]
     pub fn call<'b>(&'b self, peer: &'b Jid) -> crate::voip::OutgoingCall<'b> {
         crate::voip::facade::OutgoingCall::new(self.client, peer)

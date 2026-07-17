@@ -152,6 +152,7 @@ impl WaOpusEncoder {
 pub struct WaOpusDecoder {
     dec: Decoder,
     packet_scratch: Vec<u8>,
+    pcm_scratch: Vec<i16>,
 }
 
 #[cfg(feature = "voip-libopus")]
@@ -162,30 +163,35 @@ impl WaOpusDecoder {
         Ok(Self {
             dec,
             packet_scratch: Vec::with_capacity(OPUS_MAX_PACKET_BYTES),
+            pcm_scratch: vec![0; WA_DECODE_MAX_SAMPLES],
         })
     }
 
-    /// Decode one Opus frame to mono 16-bit PCM, returning the decoded samples.
-    pub fn decode(&mut self, opus: &[u8]) -> Result<Vec<i16>> {
-        Self::decode_packet(&mut self.dec, opus)
+    /// Decode one Opus frame to mono 16-bit PCM. The returned view is valid until the next decode.
+    pub fn decode(&mut self, opus: &[u8]) -> Result<&[i16]> {
+        Self::decode_packet(&mut self.dec, &mut self.pcm_scratch, opus)
     }
 
-    fn decode_packet(dec: &mut Decoder, opus: &[u8]) -> Result<Vec<i16>> {
-        let mut out = vec![0i16; WA_DECODE_MAX_SAMPLES];
+    fn decode_packet<'a>(
+        dec: &mut Decoder,
+        pcm_scratch: &'a mut Vec<i16>,
+        opus: &[u8],
+    ) -> Result<&'a [i16]> {
+        pcm_scratch.resize(WA_DECODE_MAX_SAMPLES, 0);
         let n = dec
-            .decode(opus, &mut out, false)
+            .decode(opus, pcm_scratch, false)
             .map_err(|e| anyhow!("opus decode: {e}"))?;
-        out.truncate(n);
-        Ok(out)
+        pcm_scratch.truncate(n);
+        Ok(pcm_scratch)
     }
 
     /// Restore MLOW's CELT TOC and decode with stock libopus.
-    pub fn decode_mlow_escape(&mut self, opus: &[u8]) -> Result<Vec<i16>> {
+    pub fn decode_mlow_escape(&mut self, opus: &[u8]) -> Result<&[i16]> {
         self.packet_scratch.clear();
         self.packet_scratch.extend_from_slice(opus);
         depacketize_opus_from_mlow(&mut self.packet_scratch)
             .map_err(|e| anyhow!("depacketize Opus from MLOW: {e}"))?;
-        Self::decode_packet(&mut self.dec, &self.packet_scratch)
+        Self::decode_packet(&mut self.dec, &mut self.pcm_scratch, &self.packet_scratch)
     }
 }
 
@@ -223,6 +229,18 @@ mod tests {
         let encoded = enc.encode(&silence).unwrap();
         let decoded = dec.decode(&encoded).unwrap();
         assert_eq!(decoded.len(), WA_FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn decoder_reuses_pcm_scratch() {
+        let mut enc = WaOpusEncoder::new().unwrap();
+        let mut dec = WaOpusDecoder::new().unwrap();
+        let encoded = enc.encode(&sine_frame()).unwrap();
+
+        let first = dec.decode(&encoded).unwrap().as_ptr();
+        let second = dec.decode(&encoded).unwrap().as_ptr();
+
+        assert_eq!(first, second);
     }
 
     #[test]

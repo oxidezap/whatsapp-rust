@@ -84,6 +84,7 @@ const MLOW_DTX_CNG: [u8; 1] = [0x90];
 const MIC_FRAME_SAMPLES: usize = 960;
 #[cfg(feature = "voip-mlow")]
 const MLOW_ENCODED_CAPACITY: usize = 513;
+const MAX_INVALID_AUDIO_WARNINGS: u8 = 3;
 
 /// Supplies STUN transaction ids. Injected so the core stays RNG-free and deterministically
 /// testable. Production shells MUST back this with a real RNG (the ids gate consent freshness);
@@ -422,7 +423,7 @@ struct MediaState {
     /// The video plane, present while video is enabled (from the start or via upgrade).
     video: Option<VideoPlaneState>,
     audio_rtcp_announced: bool,
-    audio_tx_invalid_logged: bool,
+    audio_tx_invalid_streak: u8,
     sframe: Option<SframeSession>,
     #[cfg(feature = "voip-mlow")]
     pcm: Option<PcmAudioState>,
@@ -611,7 +612,7 @@ impl CallEngine {
             if !pipe.set_audio_payload_type(config.audio.format.rtp_payload_type) {
                 return Err(EngineError::BadAudioFormat);
             }
-            pipe.set_audio_speech_start_markers(matches!(
+            pipe.set_audio_mlow_profile(matches!(
                 config.audio.format.rtp_profile,
                 AudioRtpProfile::Mlow
             ));
@@ -648,7 +649,7 @@ impl CallEngine {
                 video_ts_stride: VIDEO_TS_STRIDE_15FPS,
                 video,
                 audio_rtcp_announced: false,
-                audio_tx_invalid_logged: false,
+                audio_tx_invalid_streak: 0,
                 sframe,
                 #[cfg(feature = "voip-mlow")]
                 pcm: (config.audio.io == AudioIo::Pcm).then(|| PcmAudioState {
@@ -1229,7 +1230,7 @@ impl CallEngine {
             return;
         };
         if !m.audio.format.accepts_encoded_payload(payload) {
-            if !m.audio_tx_invalid_logged {
+            if m.audio_tx_invalid_streak < MAX_INVALID_AUDIO_WARNINGS {
                 log::warn!(
                     "voip dropping encoded audio incompatible with the negotiated RTP profile call_id={} codec={:?} profile={:?} payload_len={} toc={:?}",
                     self.call_id,
@@ -1238,10 +1239,11 @@ impl CallEngine {
                     payload.len(),
                     payload.first().copied(),
                 );
-                m.audio_tx_invalid_logged = true;
+                m.audio_tx_invalid_streak += 1;
             }
             return;
         }
+        m.audio_tx_invalid_streak = 0;
         let packet = m.pipe.protect_audio(payload);
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }

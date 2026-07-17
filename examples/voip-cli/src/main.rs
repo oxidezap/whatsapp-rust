@@ -818,7 +818,7 @@ async fn run_loopback() -> Result<()> {
         // The recv tracker derives the ROC per packet, so this stays correct past a 16-bit wrap.
         if let Some((_, opus_out)) = recv.unprotect_audio(&packet) {
             let out = dec.decode(&opus_out)?;
-            let _ = speaker.send(out).await;
+            let _ = speaker.send(out.to_vec()).await;
         }
         frames += 1;
         if frames.is_multiple_of(100) {
@@ -857,27 +857,26 @@ fn spawn_opus_bridge(
     let (encoded_tx, encoded_rx) = async_channel::bounded::<Bytes>(3);
     let (playout_tx, playout_rx) = async_channel::bounded::<EncodedAudioFrame>(3);
 
-    tokio::spawn(async move {
-        while let Ok(pcm) = mic.recv().await {
+    tokio::task::spawn_blocking(move || {
+        while let Ok(pcm) = mic.recv_blocking() {
             match encoder.encode(&pcm).map(Bytes::from) {
                 Ok(payload) => {
-                    if encoded_tx.send(payload).await.is_err() {
+                    if encoded_tx.send_blocking(payload).is_err() {
                         break;
                     }
                 }
                 Err(error) => {
                     warn!("Opus encode failed: {error}");
-                    break;
                 }
             }
         }
     });
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
         #[cfg(feature = "voip-mlow")]
         let mut mlow_decoder = MlowDecoder::new();
         #[cfg(not(feature = "voip-mlow"))]
         let mut mlow_warning_logged = false;
-        while let Ok(frame) = playout_rx.recv().await {
+        while let Ok(frame) = playout_rx.recv_blocking() {
             match frame.codec {
                 AudioCodec::Opus => match if mlow_escape {
                     decoder.decode_mlow_escape(&frame.data)
@@ -885,7 +884,7 @@ fn spawn_opus_bridge(
                     decoder.decode(&frame.data)
                 } {
                     Ok(pcm) => {
-                        let _ = speaker.try_send(pcm);
+                        let _ = speaker.try_send(pcm.to_vec());
                     }
                     Err(error) => warn!("Opus decode failed: {error}"),
                 },
@@ -1265,7 +1264,7 @@ fn spawn_call_event_listener(
                     if let Some(decoder) = fallback_opus.as_mut()
                         && let Ok(pcm) = decoder.decode_mlow_escape(&payload)
                     {
-                        let _ = speaker.try_send(pcm);
+                        let _ = speaker.try_send(pcm.to_vec());
                     }
                     #[cfg(not(feature = "voip-opus"))]
                     if !fallback_warning_logged {
@@ -1687,7 +1686,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "voip-opus")]
-    use super::AudioMode;
+    use super::{AudioMode, FRAME_SAMPLES, spawn_opus_bridge};
     use super::{
         CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
         parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
@@ -1834,5 +1833,23 @@ mod tests {
         assert_eq!(rfc7587.format().rtp_payload_type, RTP_PAYLOAD_TYPE_OPUS);
         assert_eq!(rfc7587.format().rtp_clock_rate, 48_000);
         assert!(rfc7587.uses_48khz_rtp_clock());
+    }
+
+    #[cfg(feature = "voip-opus")]
+    #[tokio::test]
+    async fn opus_bridge_recovers_after_bad_input_frame() {
+        let (mic_tx, mic_rx) = async_channel::bounded(2);
+        let (speaker_tx, _speaker_rx) = async_channel::bounded(2);
+        let (encoded_rx, _playout_tx) =
+            spawn_opus_bridge(mic_rx, speaker_tx, AudioMode::OpusNative).unwrap();
+
+        mic_tx.send(vec![0; FRAME_SAMPLES - 1]).await.unwrap();
+        mic_tx.send(vec![0; FRAME_SAMPLES]).await.unwrap();
+
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), encoded_rx.recv())
+            .await
+            .expect("encoder worker must continue")
+            .unwrap();
+        assert!(!payload.is_empty());
     }
 }

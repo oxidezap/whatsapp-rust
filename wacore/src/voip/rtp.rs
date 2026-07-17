@@ -89,7 +89,7 @@ pub fn is_whatsapp_opus_rtp_payload(payload_type: u8) -> bool {
     )
 }
 
-/// DTX / comfort-noise: RFC `0x10`, mlow `0x90`, and short warmup silence frames.
+/// Standard Opus DTX / comfort-noise and short warmup silence frames.
 pub fn is_opus_dtx_payload(payload: &[u8]) -> bool {
     match payload.len() {
         0 => false,
@@ -104,6 +104,12 @@ pub fn is_opus_dtx_payload(payload: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_mlow_dtx_payload(payload: &[u8]) -> bool {
+    payload
+        .first()
+        .is_some_and(|byte| byte & 0xC0 != 0xC0 && byte & 0x80 != 0)
 }
 
 /// mlow speech frame (20 ms `0x48..0x4f` or 60 ms `0x50..0x57`).
@@ -328,6 +334,7 @@ pub struct RtpStream {
     samples_per_packet: u32,
     speech_started: bool,
     speech_start_markers: bool,
+    mlow_profile: bool,
     audio_packet_index: usize,
     warp_piggyback: bool,
     payload_type: u8,
@@ -343,6 +350,7 @@ impl RtpStream {
             samples_per_packet,
             speech_started: false,
             speech_start_markers: true,
+            mlow_profile: true,
             audio_packet_index: 0,
             warp_piggyback,
             payload_type: RTP_PAYLOAD_TYPE_MLOW,
@@ -357,7 +365,8 @@ impl RtpStream {
         true
     }
 
-    pub fn set_speech_start_markers(&mut self, enabled: bool) {
+    pub fn set_mlow_profile(&mut self, enabled: bool) {
+        self.mlow_profile = enabled;
         self.speech_start_markers = enabled;
     }
 
@@ -379,7 +388,11 @@ impl RtpStream {
     }
 
     pub fn next_packet(&mut self, payload: &[u8], marker: bool) -> RtpHeader {
-        let dtx = is_opus_dtx_payload(payload);
+        let dtx = if self.mlow_profile {
+            is_mlow_dtx_payload(payload)
+        } else {
+            is_opus_dtx_payload(payload)
+        };
         let priming = is_opus_priming_payload(payload);
         let speech = !dtx && !priming;
         let use_marker = marker || (self.speech_start_markers && speech && !self.speech_started);
@@ -570,6 +583,8 @@ mod tests {
         assert!(is_opus_dtx_payload(&[0x90]));
         assert!(is_opus_dtx_payload(&[0xBB, 0x03]));
         assert!(!is_opus_dtx_payload(&[]));
+        assert!(is_mlow_dtx_payload(&[0x90]));
+        assert!(!is_mlow_dtx_payload(&[0x48, 0x00]));
         assert!(is_opus_priming_payload(&OPUS_PRIMING_FRAME_1));
         assert!(is_opus_priming_payload(&OPUS_PRIMING_FRAME_2));
         assert!(!is_opus_priming_payload(&[0x12, 0x36]));
@@ -784,7 +799,7 @@ mod tests {
         // Priming/DTX before speech: no marker, no speech latch.
         let p0 = s.next_packet(&OPUS_PRIMING_FRAME_2, false);
         assert_eq!((p0.sequence_number, p0.timestamp, p0.marker), (1, 0, false));
-        let d1 = s.next_packet(&[0x10], false);
+        let d1 = s.next_packet(&[0x90], false);
         assert_eq!(
             (d1.sequence_number, d1.timestamp, d1.marker),
             (2, 320, false)
@@ -811,10 +826,21 @@ mod tests {
     #[test]
     fn native_opus_can_disable_mlow_speech_markers() {
         let mut stream = RtpStream::new(0xabcd, 960, false);
-        stream.set_speech_start_markers(false);
+        stream.set_mlow_profile(false);
 
         assert!(!stream.next_packet(&[0x58; 80], false).marker);
         let _ = stream.next_packet(&[0x10], false);
         assert!(!stream.next_packet(&[0x58; 80], false).marker);
+    }
+
+    #[test]
+    fn short_mlow_speech_is_not_classified_as_dtx() {
+        let mut stream = RtpStream::new(0xabcd, 960, false);
+
+        assert!(stream.next_packet(&[0x48, 0x00], false).marker);
+        let next = stream.next_packet(&[0x48, 0x00], false);
+
+        assert!(!next.marker);
+        assert_eq!(next.extension_word, None);
     }
 }

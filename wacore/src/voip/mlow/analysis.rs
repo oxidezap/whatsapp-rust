@@ -52,6 +52,11 @@ pub(crate) struct SmplEncoderState {
     hist: Vec<f64>,
     /// Reused because VAD runs for every packet on the realtime encode path.
     vad_pcm: Vec<i16>,
+    /// Reused to avoid four packet-sized allocations on the realtime encode path.
+    hp: Vec<f32>,
+    x: Vec<f64>,
+    xn: Vec<f32>,
+    hp_full: Vec<f32>,
     /// Input high-pass (ARMA2, fcorner 35 Hz) coefficients + carried state, matching the real encoder.
     hp_coefs: Option<([f32; 3], [f32; 3])>,
     hp_state: [f32; 4],
@@ -201,16 +206,25 @@ pub(crate) fn smpl_analyze_frame_st(
     let (hp_ma, hp_ar) = *es
         .hp_coefs
         .get_or_insert_with(|| smpl_get_hp_coefs(SMPL_ENC_HP_FCORNER_HZ));
-    let mut hp = vec![0f32; need];
-    smpl_filt_arma2(&pcm[..need], need, hp_ma, hp_ar, &mut es.hp_state, &mut hp);
+    es.hp.resize(need, 0.0);
+    es.hp.fill(0.0);
+    smpl_filt_arma2(
+        &pcm[..need],
+        need,
+        hp_ma,
+        hp_ar,
+        &mut es.hp_state,
+        &mut es.hp,
+    );
 
     // int16-scaled input with smplOrder lead samples of history.
-    let mut x = vec![0f64; SMPL_ORDER + need];
+    es.x.resize(SMPL_ORDER + need, 0.0);
+    es.x.fill(0.0);
     if es.hist.len() >= SMPL_ORDER {
-        x[..SMPL_ORDER].copy_from_slice(&es.hist[es.hist.len() - SMPL_ORDER..]);
+        es.x[..SMPL_ORDER].copy_from_slice(&es.hist[es.hist.len() - SMPL_ORDER..]);
     }
     for i in 0..need {
-        x[SMPL_ORDER + i] = hp[i] as f64 * 32768.0;
+        es.x[SMPL_ORDER + i] = es.hp[i] as f64 * 32768.0;
     }
 
     let mut shadow = SmplFrameSynth::default();
@@ -241,21 +255,29 @@ pub(crate) fn smpl_analyze_frame_st(
     // xhp_packet_buf + SMPL_LPC_BUF_MEM_LEN + SMPL_WINNEXT_WB_LEN), so the excitation it codes leads
     // the input by 32 samples. Carry SMPL_ORDER + 32 lead so the residual can read that far back.
     let res_lead: usize = SMPL_ORDER + SMPL_WINNEXT_WB_LEN;
-    let mut xn = vec![0f32; res_lead + need];
+    es.xn.resize(res_lead + need, 0.0);
+    es.xn.fill(0.0);
     if es.hist.len() >= res_lead {
         for i in 0..res_lead {
-            xn[i] = (es.hist[es.hist.len() - res_lead + i] / 32768.0) as f32;
+            es.xn[i] = (es.hist[es.hist.len() - res_lead + i] / 32768.0) as f32;
         }
     }
-    xn[res_lead..res_lead + need].copy_from_slice(&hp[..need]);
+    es.xn[res_lead..res_lead + need].copy_from_slice(&es.hp[..need]);
 
     // Full HP-domain buffer that `lpcbuf` indexes: [history(144)] ++ [current 960 HP] ++ [32 zeros].
     // The 32-sample lookahead tail is zero at 16 kHz (no band split), per the buffer layout.
-    let mut hp_full = vec![0f32; SMPL_LPC_HIST_LEN + need + SMPL_WINNEXT_WB_LEN];
+    es.hp_full
+        .resize(SMPL_LPC_HIST_LEN + need + SMPL_WINNEXT_WB_LEN, 0.0);
+    es.hp_full.fill(0.0);
     if es.lpc_hist.len() == SMPL_LPC_HIST_LEN {
-        hp_full[..SMPL_LPC_HIST_LEN].copy_from_slice(&es.lpc_hist);
+        es.hp_full[..SMPL_LPC_HIST_LEN].copy_from_slice(&es.lpc_hist);
     }
-    hp_full[SMPL_LPC_HIST_LEN..SMPL_LPC_HIST_LEN + need].copy_from_slice(&hp[..need]);
+    es.hp_full[SMPL_LPC_HIST_LEN..SMPL_LPC_HIST_LEN + need].copy_from_slice(&es.hp[..need]);
+
+    let hp = es.hp.as_slice();
+    let x = es.x.as_slice();
+    let xn = es.xn.as_slice();
+    let hp_full = es.hp_full.as_slice();
 
     // Snapshot the previous packet's HP tail (pitch history for this packet's intf=0), then refresh it
     // from this packet's tail for the next call.
@@ -304,7 +326,7 @@ pub(crate) fn smpl_analyze_frame_st(
             perc,
             perc_prev: &mut es.perc_prev,
             bitrate,
-            hp_n: &hp,
+            hp_n: hp,
             intf: f,
             sp_act_prob: sp_act_prob[f],
             coded_as_active_voice,

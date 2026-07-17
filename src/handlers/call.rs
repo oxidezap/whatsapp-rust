@@ -113,6 +113,7 @@ impl StanzaHandler for CallHandler {
                             "call: peer selected audio rates {received_rates:?}, expected {}",
                             expected.signaling_rate
                         );
+                        dismiss_outgoing_siblings(&client, &call).await;
                         client.call_registry().send_call_event(
                             call.action.call_id(),
                             CallEvent::AudioFormatMismatch {
@@ -588,6 +589,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     fn register_native_opus_call(
         client: &Client,
+        ring_devices: Vec<Jid>,
     ) -> async_channel::Receiver<wacore::voip::CallEvent> {
         use wacore::voip::{AudioFormat, CallEvent};
 
@@ -598,6 +600,7 @@ mod tests {
             fake_caller_lid(),
         );
         session.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        session.ring_devices = ring_devices;
         let generation = registry.insert(session);
         let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
         let (control_tx, _control_rx) = video_control_channel();
@@ -616,9 +619,10 @@ mod tests {
     async fn incompatible_audio_selection_emits_event_and_terminates_call() {
         use wacore::voip::CallEvent;
 
-        let client = make_sending_client().await;
-        let event_rx = register_native_opus_call(&client);
-        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let accepting = fake_caller_lid();
+        let event_rx =
+            register_native_opus_call(&client, vec![accepting.clone(), accepting.with_device(1)]);
 
         let mut cancelled = false;
         assert!(
@@ -638,14 +642,7 @@ mod tests {
                 received_rates: vec![8_000],
             })
         );
-        let terminate = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
-            .await
-            .expect("terminate must be sent")
-            .expect("waiter");
-        assert_eq!(
-            terminate.as_node_ref().children().unwrap()[0].tag,
-            "terminate"
-        );
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(client.call_registry().snapshot("CALL-ID-0001").is_none());
         assert!(!cancelled);
     }
@@ -654,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn compatible_audio_selection_keeps_call_active() {
         let (client, sends) = make_sending_client_with_failure_after(None).await;
-        let event_rx = register_native_opus_call(&client);
+        let event_rx = register_native_opus_call(&client, Vec::new());
         let (handler, global_rx) = ChannelEventHandler::new();
         client.register_handler(handler);
 
