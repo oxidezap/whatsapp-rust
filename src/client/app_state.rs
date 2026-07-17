@@ -697,8 +697,7 @@ impl Client {
         for key_id in missing {
             let should = guard
                 .get(key_id.as_slice())
-                .map(|retry_at| now >= *retry_at)
-                .unwrap_or(true);
+                .is_none_or(|retry_at| now >= *retry_at);
             if should {
                 guard.insert(key_id.clone(), now + APP_STATE_KEY_REQUEST_DEDUP);
                 to_request.push(key_id);

@@ -103,8 +103,8 @@ pub struct TestClient {
 }
 
 async fn connect_diagnostics(
-    client: &Arc<whatsapp_rust::client::Client>,
-    backend: &Arc<InMemoryBackend>,
+    client: &whatsapp_rust::client::Client,
+    backend: &InMemoryBackend,
 ) -> String {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -120,8 +120,8 @@ async fn connect_diagnostics(
 }
 
 async fn collect_connect_diagnostics(
-    client: &Arc<whatsapp_rust::client::Client>,
-    backend: &Arc<InMemoryBackend>,
+    client: &whatsapp_rust::client::Client,
+    backend: &InMemoryBackend,
 ) -> String {
     async fn session_status(
         client: &whatsapp_rust::client::Client,
