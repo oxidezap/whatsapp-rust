@@ -311,7 +311,7 @@ impl StanzaHandler for CallHandler {
                                             call_creator: call.action.call_creator(),
                                             state: VideoState::UpgradeAccept,
                                             dec: Some("H264,AV1"),
-                                            device_orientation: None,
+                                            device_orientation: Some(0),
                                         });
                                         if let Err(e) = client.send_node(accept).await {
                                             warn!(
@@ -327,8 +327,8 @@ impl StanzaHandler for CallHandler {
                                             id: &client.generate_request_id(),
                                             call_creator: call.action.call_creator(),
                                             state: VideoState::Enabled,
-                                            dec: None,
-                                            device_orientation: None,
+                                            dec: Some("H264"),
+                                            device_orientation: Some(0),
                                         });
                                         if let Err(e) = client.send_node(enabled).await {
                                             warn!(
@@ -1151,6 +1151,17 @@ mod tests {
         let video = &children[0];
         assert_eq!(video.tag, "video");
         assert_eq!(video.attrs().optional_string("state").as_deref(), Some("1"));
+        assert_eq!(
+            video.attrs().optional_string("dec").as_deref(),
+            Some("H264")
+        );
+        assert_eq!(
+            video
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("0")
+        );
 
         // The peer stopping its direction does NOT stop ours or disable the shared plane.
         let node = node_to_owned_ref(&video_stanza("6"));

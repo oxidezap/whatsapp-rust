@@ -1573,7 +1573,8 @@ impl CallHandle {
     }
 
     /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
-    /// and sends `<video state=11 dec="H264" voip_settings="video">`. The peer answers with
+    /// and sends `<video state=11 dec="H264" device_orientation="0" voip_settings="video">`.
+    /// The peer answers with
     /// `UpgradeAccept`/`Enabled` (surfaced as [`CallEvent::VideoStateChanged`]); media flows as
     /// soon as both planes are up. Also the way to start media on a `.video()` call whose builder
     /// endpoints you skipped.
@@ -1589,7 +1590,8 @@ impl CallHandle {
     /// ACCEPT the peer's video upgrade request (a `VideoStateChanged { state: UpgradeRequestV2 }`
     /// event): the token binds this action to that exact request, then the method attaches the
     /// endpoints, enables the media plane, and answers
-    /// `<video state=4 dec="H264,AV1">` followed by `<video state=1>` (Enabled).
+    /// `<video state=4 dec="H264,AV1" device_orientation="0">` followed by
+    /// `<video state=1 dec="H264" device_orientation="0">` (Enabled).
     pub async fn accept_video<S, K>(
         &self,
         request: VideoUpgradeToken,
@@ -1608,8 +1610,8 @@ impl CallHandle {
         .await
     }
 
-    /// Send the standalone `<video state=1>` used after a mid-call video upgrade. Captured
-    /// video-from-start callees do not need this extra stanza.
+    /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a
+    /// mid-call video upgrade. Captured video-from-start callees do not need this extra stanza.
     pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
         self.ensure_current()?;
         let transition_lock = self
@@ -1625,8 +1627,8 @@ impl CallHandle {
             id: &client.generate_request_id(),
             call_creator: &self.call_creator,
             state: VideoState::Enabled,
-            dec: None,
-            device_orientation: None,
+            dec: Some(VIDEO_DEC_REQUEST),
+            device_orientation: Some(0),
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -1746,7 +1748,7 @@ impl CallHandle {
                 call_creator: &self.call_creator,
                 state,
                 dec,
-                device_orientation: None,
+                device_orientation: Some(0),
             });
             let client = client.clone();
             async move { client.send_node(stanza).await }
@@ -1765,7 +1767,9 @@ impl CallHandle {
                 if let Err(e) = send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT)).await
                 {
                     Err(e)
-                } else if let Err(e) = send_state(VideoState::Enabled, None).await {
+                } else if let Err(e) =
+                    send_state(VideoState::Enabled, Some(VIDEO_DEC_REQUEST)).await
+                {
                     // The peer times out an incomplete handshake; keep local media aligned with it.
                     warn!(
                         "voip: video upgrade handshake failed call_id={} phase=enabled_after_accept error={e}",
@@ -3894,6 +3898,10 @@ mod tests {
         assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("11"));
         assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
         assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
             ar.attrs().optional_string("voip_settings").as_deref(),
             Some("video"),
             "the upgrade request must carry the marker attr"
@@ -4001,6 +4009,10 @@ mod tests {
         assert_eq!(
             ar.attrs().optional_string("dec").as_deref(),
             Some("H264,AV1")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
         );
         assert_eq!(
             ar.attrs().optional_string("voip_settings"),
