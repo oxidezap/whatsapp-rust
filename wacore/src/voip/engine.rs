@@ -382,7 +382,8 @@ pub enum CallEvent {
     VideoStateChanged {
         state: crate::types::call::VideoState,
         orientation: Option<u8>,
-        /// Present only for a peer upgrade request; accepting requires this exact request token.
+        /// Accepting requires this exact token. `None` means simultaneous local and peer requests
+        /// were already resolved by the signaling state machine.
         upgrade_token: Option<super::VideoUpgradeToken>,
     },
     /// Authenticated peer RTCP. A referenced local video SSRC proves the peer built a receiver for

@@ -1279,8 +1279,10 @@ fn activate_peer_video_request(
     request: VideoUpgradeToken,
 ) {
     let mut st = lock_call_state(state);
-    if st.video_ui.get(call_id) == Some(&VideoUi::PendingPeerRequest(request)) {
-        st.video_ui.insert(call_id.to_string(), VideoUi::Active);
+    if let Some(ui) = st.video_ui.get_mut(call_id)
+        && *ui == VideoUi::PendingPeerRequest(request)
+    {
+        *ui = VideoUi::Active;
     }
 }
 
@@ -1413,7 +1415,7 @@ fn spawn_call_event_listener(
                 } => match vs {
                     VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
                         let Some(request) = upgrade_token else {
-                            warn!("peer video request arrived without an acceptance token");
+                            info!("🎥 concurrent video upgrade resolved automatically");
                             continue;
                         };
                         mark_video(
@@ -1423,11 +1425,15 @@ fn spawn_call_event_listener(
                         );
                         if auto_video {
                             info!("🎥 peer asked for video — auto-accepting (--video)");
-                            if let Err(e) = accept_peer_video(&handle, request).await {
-                                warn!("accepting peer video failed: {e}");
-                            } else {
-                                activate_peer_video_request(&state, handle.call_id(), request);
-                            }
+                            let handle = handle.clone();
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = accept_peer_video(&handle, request).await {
+                                    warn!("accepting peer video failed: {e}");
+                                } else {
+                                    activate_peer_video_request(&state, handle.call_id(), request);
+                                }
+                            });
                         } else {
                             info!("🎥 peer asked for video — press `v` + Enter to accept");
                         }

@@ -1403,6 +1403,8 @@ fn release_video_endpoints(
     generation: u64,
 ) {
     let pending_video = {
+        // This synchronous map is shared with non-async setup paths; its lock covers only one
+        // lookup/take and is never held across an await.
         let mut pending = pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1840,7 +1842,7 @@ impl CallHandle {
                     to: &peer,
                     id: &client.generate_request_id(),
                     call_creator: &call_creator,
-                    state: VideoState::Disabled,
+                    state: VideoState::UpgradeCancelByTimeout,
                     dec: None,
                     device_orientation: None,
                 });
@@ -4139,6 +4141,7 @@ mod tests {
             .expect("request sent");
         assert_eq!(sends.load(Ordering::SeqCst), 1);
 
+        let timeout_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         tokio::task::yield_now().await;
         tokio::time::advance(VIDEO_UPGRADE_TIMEOUT).await;
         for _ in 0..10 {
@@ -4149,6 +4152,16 @@ mod tests {
         }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(sends.load(Ordering::SeqCst), 2);
+        let timeout_node = timeout_waiter.await.expect("timeout stanza");
+        let timeout_action = call_action_of(&timeout_node);
+        assert_eq!(
+            timeout_action
+                .as_node_ref()
+                .attrs()
+                .optional_string("state")
+                .as_deref(),
+            Some("9")
+        );
         assert!(!registry.snapshot("CID-FACADE").unwrap().is_video);
         assert_eq!(
             registry.video_states("CID-FACADE", generation),

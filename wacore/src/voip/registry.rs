@@ -32,10 +32,6 @@ impl VideoUpgradeToken {
     pub fn generation(self) -> u64 {
         self.generation
     }
-
-    pub fn epoch(self) -> u64 {
-        self.epoch
-    }
 }
 
 /// Result of applying a committed peer video-state transition.
@@ -597,7 +593,9 @@ impl CallRegistry {
             return false;
         }
         entry.video.self_state = VideoState::Disabled;
+        entry.video.peer_state = VideoState::Disabled;
         entry.video.pending_self_request = None;
+        entry.video.pending_peer_request = None;
         entry.session.is_video = entry.video.is_video();
         true
     }
@@ -1036,6 +1034,25 @@ mod tests {
             Some((VideoState::UpgradeRequestV2, VideoState::Disabled))
         );
         assert!(reg.end_local_video_request("CID", generation, second));
+    }
+
+    #[test]
+    fn cancelling_a_local_request_is_a_full_native_downgrade() {
+        let reg = CallRegistry::new();
+        let mut video_session = session("CID");
+        video_session.is_video = true;
+        let generation = reg.insert(video_session);
+        assert!(reg.stop_local_video("CID", generation));
+        let epoch = reg
+            .begin_local_video_request("CID", generation)
+            .expect("local request");
+
+        assert!(reg.end_local_video_request("CID", generation, epoch));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Disabled, VideoState::Disabled))
+        );
+        assert!(!reg.snapshot("CID").expect("session").is_video);
     }
 
     #[test]
