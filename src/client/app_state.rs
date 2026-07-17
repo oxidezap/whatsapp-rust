@@ -719,12 +719,8 @@ impl Client {
             return Ok(());
         }
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        // Address the request to the PRIMARY (device 0), not our own device JID: this is
-        // a peer message and `device_snapshot.pn` carries OUR device number, so sending
-        // it as-is encrypts to ourselves (no self-session exists) and fails with
-        // "session ... not found". The primary is the app-state key source and we hold a
-        // session with it from pairing. Mirrors whatsmeow's `ownID.ToNonAD()`.
-        let own_jid = match device_snapshot.pn.clone() {
+        // The primary owns app-state keys; the companion has no self-session.
+        let own_jid = match device_snapshot.pn.as_ref() {
             Some(j) => j.to_non_ad(),
             None => {
                 return Err(anyhow::anyhow!(
@@ -732,6 +728,10 @@ impl Client {
                 ));
             }
         };
+        drop(device_snapshot);
+        // Key delivery can complete before pairing leaves a primary LID session behind.
+        self.ensure_e2e_sessions(std::slice::from_ref(&own_jid))
+            .await?;
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
             .iter()
             .map(|k| wa::message::AppStateSyncKeyId {
