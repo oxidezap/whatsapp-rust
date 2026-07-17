@@ -687,13 +687,12 @@ impl Client {
         let mut guard = self.app_state_key_requests.lock().await;
         let now = wacore::time::Instant::now();
         for key_id in missing {
-            let hex_id = hex::encode(&key_id);
             let should = guard
-                .get(&hex_id)
+                .get(key_id.as_slice())
                 .map(|t| t.elapsed() > std::time::Duration::from_secs(24 * 3600))
                 .unwrap_or(true);
             if should {
-                guard.insert(hex_id, now);
+                guard.insert(key_id.clone(), now);
                 to_request.push(key_id);
             }
         }
@@ -706,11 +705,40 @@ impl Client {
             warn!("Failed to send app state key request: {e}");
             let mut guard = self.app_state_key_requests.lock().await;
             for key_id in &to_request {
-                guard.remove(&hex::encode(key_id));
+                guard.remove(key_id.as_slice());
             }
             return false;
         }
         true
+    }
+
+    async fn app_state_key_request_peers(&self) -> Result<Vec<Jid>, anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let own_jid = device_snapshot
+            .pn
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no own JID available for app-state key request"))?;
+        let current_device = own_jid.device;
+        let primary = own_jid.to_non_ad();
+        drop(device_snapshot);
+
+        let mut peers = match self.get_user_devices(std::slice::from_ref(&primary)).await {
+            Ok(devices) => devices,
+            Err(error) => {
+                warn!(
+                    "Own device-list query failed; requesting app-state keys from primary only: {error}"
+                );
+                vec![primary]
+            }
+        };
+        peers.retain(|jid| jid.device != current_device);
+        wacore::types::jid::sort_dedup_by_device(&mut peers);
+        if peers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no peer devices available for app-state key request"
+            ));
+        }
+        Ok(peers)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.request_keys", level = "debug", skip_all, fields(count = raw_key_ids.len()), err(Debug)))]
@@ -718,20 +746,7 @@ impl Client {
         if raw_key_ids.is_empty() {
             return Ok(());
         }
-        let device_snapshot = self.persistence_manager.get_device_snapshot();
-        // The primary owns app-state keys; the companion has no self-session.
-        let own_jid = match device_snapshot.pn.as_ref() {
-            Some(j) => j.to_non_ad(),
-            None => {
-                return Err(anyhow::anyhow!(
-                    "no own JID available for app-state key request"
-                ));
-            }
-        };
-        drop(device_snapshot);
-        // Key delivery can complete before pairing leaves a primary LID session behind.
-        self.ensure_e2e_sessions(std::slice::from_ref(&own_jid))
-            .await?;
+        let peers = self.app_state_key_request_peers().await?;
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
             .iter()
             .map(|k| wa::message::AppStateSyncKeyId {
@@ -748,17 +763,53 @@ impl Client {
             }),
             ..Default::default()
         };
-        self.send_message_impl(
-            own_jid,
-            &msg,
-            Some(self.generate_message_id()),
-            true,
-            false,
-            None,
-            vec![],
-            None,
-        )
-        .await?;
+
+        let peer_count = peers.len();
+        let results = futures::future::join_all(peers.into_iter().map(|peer| {
+            let msg = &msg;
+            async move {
+                let device = peer.device;
+                let result = async {
+                    self.ensure_e2e_sessions(std::slice::from_ref(&peer))
+                        .await?;
+                    self.send_message_impl(
+                        peer,
+                        msg,
+                        Some(self.generate_message_id()),
+                        true,
+                        false,
+                        None,
+                        Vec::new(),
+                        None,
+                    )
+                    .await
+                }
+                .await;
+                (device, result)
+            }
+        }))
+        .await;
+
+        let mut failures = Vec::new();
+        for (device, result) in results {
+            if let Err(error) = result {
+                failures.push(format!("device {device}: {error}"));
+            }
+        }
+        if failures.len() == peer_count {
+            return Err(anyhow::anyhow!(
+                "app-state key request failed for all {peer_count} peer device(s): {}",
+                failures.join(", ")
+            ));
+        }
+        if !failures.is_empty() {
+            warn!(
+                "App-state key request failed for {}/{} peer device(s): {}",
+                failures.len(),
+                peer_count,
+                failures.join(", ")
+            );
+        }
         Ok(())
     }
 

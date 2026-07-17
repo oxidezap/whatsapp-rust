@@ -80,9 +80,11 @@ impl Client {
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let key_store = device_snapshot.backend.clone();
+        drop(device_snapshot);
 
         let mut stored_count = 0;
         let mut failed_count = 0;
+        let mut fulfilled_request_ids = Vec::new();
 
         for key in &keys.keys {
             if let Some(components) = extract_key_components(key) {
@@ -94,14 +96,22 @@ impl Client {
 
                 if let Err(e) = key_store.set_sync_key(components.key_id, new_key).await {
                     log::error!(
-                        "Failed to store app state sync key {:?}: {:?}",
-                        hex::encode(components.key_id),
+                        "Failed to store app state sync key {:02x?}: {:?}",
+                        components.key_id,
                         e
                     );
                     failed_count += 1;
                 } else {
                     stored_count += 1;
+                    fulfilled_request_ids.push(components.key_id);
                 }
+            }
+        }
+
+        if !fulfilled_request_ids.is_empty() {
+            let mut requests = self.app_state_key_requests.lock().await;
+            for key_id in fulfilled_request_ids {
+                requests.remove(key_id);
             }
         }
 
@@ -122,6 +132,76 @@ impl Client {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.initial_keys_synced_notifier.notify(usize::MAX);
         }
+    }
+
+    pub(super) async fn build_app_state_sync_key_share(
+        &self,
+        request: &wa::message::AppStateSyncKeyRequest,
+    ) -> Result<wa::message::AppStateSyncKeyShare, anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let key_store = device_snapshot.backend.clone();
+        drop(device_snapshot);
+
+        let keys = futures::future::try_join_all(request.key_ids.iter().filter_map(|requested| {
+            let key_id = requested.key_id.as_deref()?;
+            let key_store = &key_store;
+            Some(async move {
+                let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
+                    let fingerprint = wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
+                        &stored.fingerprint,
+                    )?;
+                    buffa::MessageField::some(wa::message::AppStateSyncKeyData {
+                        key_data: Some(stored.key_data),
+                        fingerprint: buffa::MessageField::some(fingerprint),
+                        timestamp: Some(stored.timestamp),
+                    })
+                } else {
+                    buffa::MessageField::default()
+                };
+
+                Ok::<_, anyhow::Error>(wa::message::AppStateSyncKey {
+                    key_id: buffa::MessageField::some(requested.clone()),
+                    key_data,
+                })
+            })
+        }))
+        .await?;
+
+        Ok(wa::message::AppStateSyncKeyShare { keys })
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.appstate_key_request", level = "debug", skip_all, fields(requester = %requester.observe(), count = request.key_ids.len()), err(Debug))
+    )]
+    pub(crate) async fn handle_app_state_sync_key_request(
+        &self,
+        request: &wa::message::AppStateSyncKeyRequest,
+        requester: &Jid,
+    ) -> Result<(), anyhow::Error> {
+        let share = self.build_app_state_sync_key_share(request).await?;
+        let message = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
+                app_state_sync_key_share: buffa::MessageField::some(share),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        self.ensure_e2e_sessions(std::slice::from_ref(requester))
+            .await?;
+        self.send_message_impl(
+            requester.clone(),
+            &message,
+            Some(self.generate_message_id()),
+            true,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.skdm", level = "debug", skip_all, fields(group = %group_jid.observe(), sender = %sender_jid.observe())))]

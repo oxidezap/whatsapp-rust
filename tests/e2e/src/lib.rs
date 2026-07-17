@@ -106,36 +106,44 @@ async fn connect_diagnostics(
     client: &Arc<whatsapp_rust::client::Client>,
     backend: &Arc<InMemoryBackend>,
 ) -> String {
+    async fn session_status(
+        client: &whatsapp_rust::client::Client,
+        jid: Option<whatsapp_rust::Jid>,
+    ) -> &'static str {
+        match jid {
+            Some(jid) => match client.signal().validate_session(&jid).await {
+                Ok(true) => "present",
+                Ok(false) => "absent",
+                Err(_) => "unknown",
+            },
+            None => "unavailable",
+        }
+    }
+
     let snapshot = client.persistence_manager().get_device_snapshot();
-    let primary = snapshot
-        .lid
-        .as_ref()
-        .or(snapshot.pn.as_ref())
-        .map(|jid| jid.to_non_ad());
+    let primary_pn = snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
+    let primary_lid = snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
     let has_pn = snapshot.pn.is_some();
     let has_lid = snapshot.lid.is_some();
     drop(snapshot);
 
-    let primary_session = match primary {
-        Some(jid) => match client.signal().validate_session(&jid).await {
-            Ok(true) => "present",
-            Ok(false) => "absent",
-            Err(_) => "unknown",
-        },
-        None => "unavailable",
-    };
+    let (primary_pn_session, primary_lid_session) = futures::join!(
+        session_status(client, primary_pn),
+        session_status(client, primary_lid),
+    );
     let sync_keys = backend.sync_key_count_for_test().await;
     let report = client.memory_report().await;
 
     format!(
         "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, sync_keys={}, \
-         primary_session={}, app_state_requests={}, app_state_syncs={}",
+         primary_pn_session={}, primary_lid_session={}, app_state_requests={}, app_state_syncs={}",
         client.is_connected(),
         client.is_logged_in(),
         has_pn,
         has_lid,
         sync_keys,
-        primary_session,
+        primary_pn_session,
+        primary_lid_session,
         report.app_state_key_requests,
         report.app_state_syncing,
     )
@@ -448,7 +456,12 @@ impl TestClient {
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for app-state sync key"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timed out after {}s waiting for app-state sync key {key_id:02x?}",
+                timeout_secs,
+            )
+        })?
     }
 
     // ── Connection lifecycle ────────────────────────────────────────────────

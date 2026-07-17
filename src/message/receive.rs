@@ -1463,11 +1463,8 @@ impl Client {
             .await;
         }
 
-        // app_state_sync_key_share is a self-only protocol message (app-state
-        // sync keys shared between our own devices). A peer could otherwise
-        // inject keys and forge app-state mutations, so honour it only from
-        // self. WA Web `WAWebKeyManagementHandleKeyShareApi` gates on
-        // `isMeAccountNonLid(from)`; whatsmeow on `info.IsFromMe`.
+        // A peer-provided key could forge app-state mutations, so match WA Web's
+        // `isMeAccount(from)` gate before accepting a share.
         if let Some(protocol_msg) = msg.protocol_message.as_option()
             && let Some(keys) = protocol_msg.app_state_sync_key_share.as_option()
         {
@@ -1476,6 +1473,29 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping app_state_sync_key_share from non-self sender {}",
+                    info.id,
+                    info.source.sender.observe()
+                );
+            }
+        }
+
+        if let Some(protocol_msg) = msg.protocol_message.as_option()
+            && let Some(request) = protocol_msg.app_state_sync_key_request.as_option()
+        {
+            if info.source.is_from_me {
+                if let Err(error) = self
+                    .handle_app_state_sync_key_request(request, &info.source.sender)
+                    .await
+                {
+                    warn!(
+                        "[msg:{}] Failed to answer app_state_sync_key_request from {}: {error:?}",
+                        info.id,
+                        info.source.sender.observe()
+                    );
+                }
+            } else {
+                warn!(
+                    "[msg:{}] Dropping app_state_sync_key_request from non-self sender {}",
                     info.id,
                     info.source.sender.observe()
                 );

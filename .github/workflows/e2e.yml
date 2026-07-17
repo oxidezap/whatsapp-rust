@@ -42,6 +42,7 @@ jobs:
           --log-driver local
           --log-opt max-size=10m
           --log-opt max-file=1
+          --log-opt compress=false
     steps:
       - uses: actions/checkout@v6
         with:

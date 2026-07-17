@@ -311,10 +311,10 @@ async fn test_missing_key_request_rebuilds_primary_session() -> anyhow::Result<(
     let _ = env_logger::builder().is_test(true).try_init();
 
     let account = e2e_tests::unique_push_name("e2e_as_key_recovery");
-    let mut client_a = TestClient::connect_as("e2e_as_key_recovery_a", &account).await?;
     let mut client_b = TestClient::connect_as("e2e_as_key_recovery_b", &account).await?;
-    client_a.wait_for_app_state_sync().await?;
+    let mut client_a = TestClient::connect_as("e2e_as_key_recovery_a", &account).await?;
     client_b.wait_for_app_state_sync().await?;
+    client_a.wait_for_app_state_sync().await?;
 
     let key_id = client_a
         .backend
@@ -327,6 +327,14 @@ async fn test_missing_key_request_rebuilds_primary_session() -> anyhow::Result<(
     );
 
     let primary = client_a.jid().await;
+    let sibling = client_b
+        .client
+        .get_pn()
+        .ok_or_else(|| anyhow::anyhow!("sibling PN missing after connect"))?;
+    assert_ne!(
+        sibling.device, 0,
+        "the sibling companion must have a non-primary device id"
+    );
     client_a
         .client
         .signal()
@@ -337,9 +345,25 @@ async fn test_missing_key_request_rebuilds_primary_session() -> anyhow::Result<(
         "primary session must be absent before recovery"
     );
 
-    let request = client_a
+    let primary_request = client_a.client.wait_for_sent_node(
+        NodeFilter::tag("message")
+            .attr("category", "peer")
+            .attr("to", primary.to_string()),
+    );
+    let sibling_request = client_a.client.wait_for_sent_node(
+        NodeFilter::tag("message")
+            .attr("category", "peer")
+            .attr("to", sibling.to_string()),
+    );
+    let requester_lid = client_a
         .client
-        .wait_for_sent_node(NodeFilter::tag("message").attr("category", "peer"));
+        .get_lid()
+        .ok_or_else(|| anyhow::anyhow!("requester LID missing after connect"))?;
+    let sibling_share = client_b.client.wait_for_sent_node(
+        NodeFilter::tag("message")
+            .attr("category", "peer")
+            .attr("to", requester_lid.to_string()),
+    );
     let updated_name = e2e_tests::unique_push_name("key_recovery_update");
     client_b
         .client
@@ -347,14 +371,25 @@ async fn test_missing_key_request_rebuilds_primary_session() -> anyhow::Result<(
         .set_push_name(&updated_name)
         .await?;
 
-    let node = tokio::time::timeout(tokio::time::Duration::from_secs(10), request)
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), primary_request)
         .await
-        .map_err(|_| anyhow::anyhow!("missing-key recovery did not send a peer request"))?
-        .map_err(|_| anyhow::anyhow!("peer request waiter was canceled"))?;
+        .map_err(|_| anyhow::anyhow!("missing-key recovery did not request the primary"))?
+        .map_err(|_| anyhow::anyhow!("primary request waiter was canceled"))?;
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), sibling_request)
+        .await
+        .map_err(|_| anyhow::anyhow!("missing-key recovery did not request the sibling"))?
+        .map_err(|_| anyhow::anyhow!("sibling request waiter was canceled"))?;
+    let sibling_share = tokio::time::timeout(tokio::time::Duration::from_secs(10), sibling_share)
+        .await
+        .map_err(|_| anyhow::anyhow!("the sibling did not return an app-state key share"))?
+        .map_err(|_| anyhow::anyhow!("sibling key-share waiter was canceled"))?;
+    let share_target = sibling_share
+        .attrs()
+        .optional_jid("to")
+        .ok_or_else(|| anyhow::anyhow!("sibling key share had no target"))?;
     assert_eq!(
-        node.attrs().optional_jid("to").map(|jid| jid.user),
-        Some(primary.user.clone()),
-        "the key request must target this account's primary"
+        share_target, requester_lid,
+        "the key share must return only to the requesting device"
     );
     assert!(
         client_a.client.signal().validate_session(&primary).await?,

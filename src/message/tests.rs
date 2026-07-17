@@ -7684,6 +7684,11 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     };
     let padded = MessageUtils::encode_and_pad(&share);
     let backend = client.persistence_manager.backend();
+    client
+        .app_state_key_requests
+        .lock()
+        .await
+        .insert(key_id.clone(), wacore::time::Instant::now());
 
     // Non-self sender: the key share must be dropped.
     let mut info =
@@ -7696,6 +7701,14 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     assert!(
         backend.get_sync_key(&key_id).await.unwrap().is_none(),
         "app-state sync key from a non-self sender must not be stored"
+    );
+    assert!(
+        client
+            .app_state_key_requests
+            .lock()
+            .await
+            .contains_key(key_id.as_slice()),
+        "a spoofed key share must not clear missing-key tracking"
     );
 
     // Self sender: the key share is honoured and stored.
@@ -7712,6 +7725,77 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     assert!(
         backend.get_sync_key(&key_id).await.unwrap().is_some(),
         "app-state sync key from self must be stored"
+    );
+    assert!(
+        !client
+            .app_state_key_requests
+            .lock()
+            .await
+            .contains_key(key_id.as_slice()),
+        "a stored key must become requestable again if it is later lost"
+    );
+}
+
+#[tokio::test]
+async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
+    use buffa::Message as _;
+
+    let client = crate::test_utils::create_test_client().await;
+    let backend = client.persistence_manager.backend();
+    let known_id = vec![1, 2, 3, 4, 5, 6];
+    let orphan_id = vec![6, 5, 4, 3, 2, 1];
+    let fingerprint = wa::message::AppStateSyncKeyFingerprint {
+        raw_id: Some(7),
+        current_index: Some(3),
+        device_indexes: vec![0, 3],
+    };
+    backend
+        .set_sync_key(
+            &known_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![9; 32],
+                fingerprint: fingerprint.encode_to_vec(),
+                timestamp: 123,
+            },
+        )
+        .await
+        .unwrap();
+
+    let request = wa::message::AppStateSyncKeyRequest {
+        key_ids: vec![
+            wa::message::AppStateSyncKeyId {
+                key_id: Some(known_id.clone()),
+            },
+            wa::message::AppStateSyncKeyId {
+                key_id: Some(orphan_id.clone()),
+            },
+            wa::message::AppStateSyncKeyId { key_id: None },
+        ],
+    };
+    let share = client
+        .build_app_state_sync_key_share(&request)
+        .await
+        .unwrap();
+
+    assert_eq!(share.keys.len(), 2, "keyless requests must be ignored");
+    let known = &share.keys[0];
+    assert_eq!(
+        known.key_id.as_option().and_then(|id| id.key_id.as_ref()),
+        Some(&known_id)
+    );
+    let known_data = known.key_data.as_option().expect("known key data");
+    assert_eq!(known_data.key_data.as_deref(), Some(&[9; 32][..]));
+    assert_eq!(known_data.fingerprint.as_option(), Some(&fingerprint));
+    assert_eq!(known_data.timestamp, Some(123));
+
+    let orphan = &share.keys[1];
+    assert_eq!(
+        orphan.key_id.as_option().and_then(|id| id.key_id.as_ref()),
+        Some(&orphan_id)
+    );
+    assert!(
+        orphan.key_data.is_unset(),
+        "an unknown ID must be returned without fabricated key data"
     );
 }
 

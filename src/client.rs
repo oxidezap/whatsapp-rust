@@ -685,7 +685,7 @@ pub struct Client {
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 
     pub(crate) app_state_processor: async_lock::Mutex<Option<Arc<AppStateProcessor>>>,
-    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<String, wacore::time::Instant>>>,
+    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
     pub(crate) app_state_syncing: Arc<Mutex<HashSet<WAPatchName>>>,
