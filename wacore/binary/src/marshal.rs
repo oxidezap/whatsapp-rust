@@ -74,7 +74,7 @@ pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     // so a plan/encode traversal divergence must fail the marshal instead of
     // shipping corrupt bytes. Two integer compares per stanza.
     if written != payload.len() || !plan.hints.fully_consumed() {
-        return Err(crate::error::BinaryError::InvalidNode);
+        return Err(crate::error::BinaryError::PlanMismatch);
     }
     Ok(payload)
 }
@@ -122,7 +122,7 @@ pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let written = encoder.bytes_written();
     // Same invariant enforcement as marshal_exact.
     if written != payload.len() || !plan.hints.fully_consumed() {
-        return Err(crate::error::BinaryError::InvalidNode);
+        return Err(crate::error::BinaryError::PlanMismatch);
     }
     Ok(payload)
 }
@@ -332,6 +332,13 @@ mod tests {
         attrs.push("count".to_string(), "12345");
         attrs.push("hexish".to_string(), "0123ABCDEF");
         attrs.push("plain".to_string(), "not_a_token_value");
+        // Empty-user JID: the one branch that skips a hint entirely.
+        attrs.push("empty_user".to_string(), "@s.whatsapp.net");
+        // Typed JID value: user/server hints with no wrapping string hint.
+        attrs.push(
+            "typed_jid".to_string(),
+            NodeValue::Jid("15550000003:7@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
         let node = Node::new(
             "iq",
             attrs,
