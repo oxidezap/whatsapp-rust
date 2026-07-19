@@ -249,6 +249,8 @@ impl Client {
             signal_flush_test_block: AtomicBool::new(false),
             #[cfg(test)]
             signal_flush_test_in_attempt: AtomicU32::new(0),
+            #[cfg(test)]
+            app_state_key_share_prepare_test_failures: AtomicU32::new(0),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),

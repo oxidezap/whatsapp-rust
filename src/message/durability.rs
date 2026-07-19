@@ -45,6 +45,7 @@ impl Client {
                                 .message(Arc::new(msg))
                                 .info(Arc::clone(info))
                                 .build(),
+                            false,
                         )
                         .await;
                     }
@@ -149,7 +150,7 @@ mod tests {
             Arc::from([test_item("MSG_OK_1"), test_item("MSG_OK_2")]);
         let infos: Vec<_> = items.iter().map(|i| Arc::clone(&i.info)).collect();
         client
-            .commit_inbound_batch(Arc::clone(&items), BatchOrigin::OfflineDrain)
+            .commit_inbound_batch(Arc::clone(&items), BatchOrigin::OfflineDrain, None)
             .await;
 
         assert_eq!(hook.calls.load(Ordering::SeqCst), 1, "one commit per batch");
@@ -192,6 +193,7 @@ mod tests {
                     .info(Arc::clone(&info))
                     .build()]),
                 BatchOrigin::OfflineDrain,
+                None,
             )
             .await;
 

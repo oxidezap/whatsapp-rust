@@ -9,7 +9,8 @@ impl Client {
         self: &Arc<Self>,
         msg: wa::Message,
         info: &Arc<MessageInfo>,
-    ) {
+        track_commit: bool,
+    ) -> InboundCommitState {
         use wacore::proto_helpers::MessageExt;
         wacore::telemetry::recv("decrypted");
         self.stats.record_message_received();
@@ -56,7 +57,7 @@ impl Client {
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
             ));
-            return;
+            return InboundCommitState::Durable;
         }
 
         // Live traffic commits (and acks) as a batch of one; during the
@@ -68,8 +69,9 @@ impl Client {
                 .message(dispatch_msg)
                 .info(info)
                 .build(),
+            track_commit,
         )
-        .await;
+        .await
     }
 
     /// Acknowledge a received message so the server drops it from the offline

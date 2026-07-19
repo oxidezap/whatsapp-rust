@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use wacore::net::{HttpClient, HttpRequest};
 use wacore::store::InMemoryBackend;
-use wacore::store::traits::TcTokenEntry;
+use wacore::store::traits::{AppSyncStore, TcTokenEntry};
 use wacore::types::events::{ChannelEventHandler, Event};
 use wacore_binary::node::Node;
 use whatsapp_rust::Jid;
@@ -102,6 +102,70 @@ pub struct TestClient {
     pub backend: Arc<InMemoryBackend>,
 }
 
+async fn connect_diagnostics(
+    client: &whatsapp_rust::client::Client,
+    backend: &InMemoryBackend,
+) -> String {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    match tokio::time::timeout(TIMEOUT, collect_connect_diagnostics(client, backend)).await {
+        Ok(diagnostics) => diagnostics,
+        Err(_) => format!(
+            "diagnostics_timed_out_after={}s, socket_connected={}, logged_in={}",
+            TIMEOUT.as_secs(),
+            client.is_connected(),
+            client.is_logged_in(),
+        ),
+    }
+}
+
+async fn collect_connect_diagnostics(
+    client: &whatsapp_rust::client::Client,
+    backend: &InMemoryBackend,
+) -> String {
+    async fn session_status(
+        client: &whatsapp_rust::client::Client,
+        jid: Option<whatsapp_rust::Jid>,
+    ) -> &'static str {
+        match jid {
+            Some(jid) => match client.signal().validate_session(&jid).await {
+                Ok(true) => "present",
+                Ok(false) => "absent",
+                Err(_) => "unknown",
+            },
+            None => "unavailable",
+        }
+    }
+
+    let snapshot = client.persistence_manager().get_device_snapshot();
+    let primary_pn = snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
+    let primary_lid = snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
+    let has_pn = snapshot.pn.is_some();
+    let has_lid = snapshot.lid.is_some();
+    drop(snapshot);
+
+    let (primary_pn_session, primary_lid_session) = futures::join!(
+        session_status(client, primary_pn),
+        session_status(client, primary_lid),
+    );
+    let sync_keys = backend.sync_key_count_for_test().await;
+    let report = client.memory_report().await;
+
+    format!(
+        "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, sync_keys={}, \
+         primary_pn_session={}, primary_lid_session={}, app_state_requests={}, app_state_syncs={}",
+        client.is_connected(),
+        client.is_logged_in(),
+        has_pn,
+        has_lid,
+        sync_keys,
+        primary_pn_session,
+        primary_lid_session,
+        report.app_state_key_requests,
+        report.app_state_syncing,
+    )
+}
+
 impl TestClient {
     /// Create a client, connect to the mock server, and wait for PairSuccess + Connected.
     /// Returns the connected TestClient with its JID available via `client.get_pn()`.
@@ -125,7 +189,7 @@ impl TestClient {
         Self::connect_inner(prefix, Some(push_name.to_string())).await
     }
 
-    async fn connect_inner(_prefix: &str, push_name: Option<String>) -> anyhow::Result<Self> {
+    async fn connect_inner(prefix: &str, push_name: Option<String>) -> anyhow::Result<Self> {
         let transport_factory = TokioWebSocketTransportFactory::new().with_url(mock_server_url());
         let (event_handler, event_rx) = ChannelEventHandler::new();
 
@@ -174,10 +238,11 @@ impl TestClient {
             .wait_for_connected(tokio::time::Duration::from_secs(60))
             .await
         {
+            let diagnostics = connect_diagnostics(&client, &backend).await;
             client.disconnect().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
-                "client never became ready after pairing: {e}"
+                "{prefix}: client never became ready after pairing ({diagnostics}): {e}"
             ));
         }
 
@@ -190,10 +255,11 @@ impl TestClient {
             .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
             .await
         {
+            let diagnostics = connect_diagnostics(&client, &backend).await;
             client.disconnect().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
-                "startup sync did not settle before the connect deadline: {e}"
+                "{prefix}: startup sync did not settle ({diagnostics}): {e}"
             ));
         }
 
@@ -395,6 +461,24 @@ impl TestClient {
         self.wait_for_event(10, |e| matches!(e, Event::SelfPushNameUpdated(_)))
             .await?;
         Ok(())
+    }
+
+    pub async fn wait_for_sync_key(&self, key_id: &[u8], timeout_secs: u64) -> anyhow::Result<()> {
+        tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), async {
+            loop {
+                if self.backend.get_sync_key(key_id).await?.is_some() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timed out after {}s waiting for app-state sync key {key_id:02x?}",
+                timeout_secs,
+            )
+        })?
     }
 
     // ── Connection lifecycle ────────────────────────────────────────────────

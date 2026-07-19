@@ -1463,11 +1463,8 @@ impl Client {
             .await;
         }
 
-        // app_state_sync_key_share is a self-only protocol message (app-state
-        // sync keys shared between our own devices). A peer could otherwise
-        // inject keys and forge app-state mutations, so honour it only from
-        // self. WA Web `WAWebKeyManagementHandleKeyShareApi` gates on
-        // `isMeAccountNonLid(from)`; whatsmeow on `info.IsFromMe`.
+        // A peer-provided key could forge app-state mutations, so match WA Web's
+        // `isMeAccount(from)` gate before accepting a share.
         if let Some(protocol_msg) = msg.protocol_message.as_option()
             && let Some(keys) = protocol_msg.app_state_sync_key_share.as_option()
         {
@@ -1476,6 +1473,21 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping app_state_sync_key_share from non-self sender {}",
+                    info.id,
+                    info.source.sender.observe()
+                );
+            }
+        }
+
+        let mut app_state_key_share_job = None;
+        if let Some(protocol_msg) = msg.protocol_message.as_option()
+            && let Some(request) = protocol_msg.app_state_sync_key_request.as_option()
+        {
+            if info.source.is_from_me {
+                app_state_key_share_job = Some((info.source.sender.clone(), request.clone()));
+            } else {
+                warn!(
+                    "[msg:{}] Dropping app_state_sync_key_request from non-self sender {}",
                     info.id,
                     info.source.sender.observe()
                 );
@@ -1547,7 +1559,25 @@ impl Client {
                 ..Default::default()
             })
         } else {
-            self.dispatch_parsed_message(msg, info).await;
+            let commit_state = self
+                .dispatch_parsed_message(msg, info, app_state_key_share_job.is_some())
+                .await;
+            if let Some((requester, request)) = app_state_key_share_job {
+                match commit_state {
+                    InboundCommitState::Durable => {
+                        self.schedule_app_state_sync_key_share(requester, request, None);
+                    }
+                    InboundCommitState::Deferred(Some(ticket)) => {
+                        self.schedule_app_state_sync_key_share(requester, request, Some(ticket));
+                    }
+                    InboundCommitState::Deferred(None) | InboundCommitState::Failed => {
+                        warn!(
+                            "[msg:{}] Deferring app-state key-share recovery to the requester's retry because the inbound request was not durable",
+                            info.id
+                        );
+                    }
+                }
+            }
             Ok(PlaintextHandleOutcome {
                 dispatched: true,
                 ..Default::default()

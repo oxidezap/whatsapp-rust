@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mock-server:
-        image: ghcr.io/whiskeysockets-devtools/bartender:latest
+        image: ghcr.io/whiskeysockets-devtools/bartender@sha256:975e9ce5143b56b527deea1afb5aed9423461671c546fc521473a25d1ffe26fa
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.BARTENDER_GHCR_TOKEN }}
@@ -37,7 +37,12 @@ jobs:
           - 8080:8080
         env:
           CHATSTATE_TTL_SECS: "3"
-        options: --log-driver none
+        # Keep service-side evidence for flakes without allowing logs to consume the runner disk.
+        options: >-
+          --log-driver local
+          --log-opt max-size=10m
+          --log-opt max-file=1
+          --log-opt compress=false
     steps:
       - uses: actions/checkout@v6
         with:

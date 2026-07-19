@@ -81,6 +81,19 @@ pub enum IqError {
     ParseError(#[from] anyhow::Error),
 }
 
+impl IqError {
+    pub(crate) fn is_transport_unavailable(&self) -> bool {
+        match self {
+            IqError::NotConnected | IqError::Disconnected(_) | IqError::InternalChannelClosed => {
+                true
+            }
+            IqError::EncryptSend(error) => error.is_transport_unavailable(),
+            IqError::ClientState(client) => client.is_transport_unavailable(),
+            _ => false,
+        }
+    }
+}
+
 impl From<wacore::request::IqError> for IqError {
     fn from(err: wacore::request::IqError) -> Self {
         match err {
