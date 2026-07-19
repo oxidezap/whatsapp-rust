@@ -70,8 +70,12 @@ pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
     encoder.write_node(node)?;
     let written = encoder.bytes_written();
-    debug_assert_eq!(written, payload.len(), "plan size mismatch for Node");
-    payload.truncate(written);
+    // Real checks, not debug_asserts: replayed hints are trusted in release,
+    // so a plan/encode traversal divergence must fail the marshal instead of
+    // shipping corrupt bytes. Two integer compares per stanza.
+    if written != payload.len() || !plan.hints.fully_consumed() {
+        return Err(crate::error::BinaryError::InvalidNode);
+    }
     Ok(payload)
 }
 
@@ -116,8 +120,10 @@ pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
     encoder.write_node(node)?;
     let written = encoder.bytes_written();
-    debug_assert_eq!(written, payload.len(), "plan size mismatch for NodeRef");
-    payload.truncate(written);
+    // Same invariant enforcement as marshal_exact.
+    if written != payload.len() || !plan.hints.fully_consumed() {
+        return Err(crate::error::BinaryError::InvalidNode);
+    }
     Ok(payload)
 }
 

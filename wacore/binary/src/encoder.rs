@@ -268,6 +268,15 @@ impl StringHintCache {
         }
         hint
     }
+
+    /// The exact-marshal fns require this after encoding: a leftover hint
+    /// means plan and encode diverged, and the output can't be trusted.
+    /// (Reusing an exhausted tape for a second encode is merely slow, not
+    /// wrong — `next` returns None and `write_string` classifies inline.)
+    #[inline]
+    pub(crate) fn fully_consumed(&self) -> bool {
+        self.cursor.get() == self.hints.len()
+    }
 }
 
 #[derive(Debug)]
