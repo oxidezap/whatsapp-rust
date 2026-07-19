@@ -5,25 +5,18 @@
 //! 2. Optional: format with `buf format src/whatsapp.proto -w`.
 //! 3. Regenerate the descriptor: `scripts/regenerate-proto-desc.sh`
 //!    (wraps `protoc --descriptor_set_out=src/whatsapp.desc …`).
-//! 4. `cargo build` — this script consumes `whatsapp.desc`, snake_cases the
-//!    field names for the Rust API, and writes `whatsapp.rs` to `OUT_DIR`.
-//!    Consumers never need `protoc`; only editors of the proto do.
+//! 4. `cargo build` — this script consumes `whatsapp.desc` and writes
+//!    `whatsapp.rs` to `OUT_DIR`. Consumers never need `protoc`; only editors
+//!    of the proto do.
 //!
-//! ## Why the descriptor is snake_cased at build time
-//!
-//! buffa generates Rust field idents verbatim from the proto field names, so a
-//! camelCase proto would yield camelCase Rust fields. To keep the proto in the
-//! upstream camelCase form (so it can be regenerated from whatspec untouched)
-//! while exposing the prost-style snake_case Rust API the codebase uses, this
-//! script decodes the committed descriptor, snake_cases every message/oneof
-//! field name, and feeds the rewritten descriptor to buffa. Wire format is
-//! unaffected (the wire keys on field numbers, not names); message/enum type
-//! names and enum value names are left as-is. Drop this once buffa grows a
-//! native idiomatic-field-names option (anthropics/buffa#256).
+//! The proto stays in the upstream camelCase form; buffa's
+//! `idiomatic_field_names` converts field/oneof idents to snake_case at
+//! codegen time (word boundaries match heck/prost), so the Rust API keeps the
+//! prost-style names. Attribute/override paths below therefore use the
+//! *proto* (camelCase) field names.
 
 use buffa::Message as _;
 use buffa_descriptor::generated::descriptor::{DescriptorProto, FileDescriptorSet};
-use heck::ToSnakeCase as _;
 
 fn main() -> std::io::Result<()> {
     // Rerun on desc change (new codegen) and proto change (so the staleness
@@ -38,21 +31,25 @@ fn main() -> std::io::Result<()> {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
     let out_path = std::path::PathBuf::from(&out_dir);
 
-    // Rewrite the committed camelCase descriptor into a snake_case-field one for
-    // buffa codegen (see module docs). buffa reads the rewritten copy from OUT_DIR.
-    let snake_desc = out_path.join("whatsapp.snake.desc");
-    snake_case_descriptor_fields("src/whatsapp.desc", &snake_desc)?;
-
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
-    // Generated from the original descriptor; the shouty/snake transforms are
-    // unaffected by the camelCase->snake_case field rename.
     let fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
         .map_err(std::io::Error::other)?;
     generate_tags(&fds, &out_path.join("tags.rs"))?;
 
     buffa_build::Config::new()
-        .descriptor_set(&snake_desc)
+        .descriptor_set("src/whatsapp.desc")
         .files(&["whatsapp.proto"])
+        // snake_case Rust idents from the upstream camelCase proto (see module
+        // docs); wire format and descriptor names are untouched.
+        .idiomatic_field_names(true)
+        // Open enum (buffa 0.9): unknown wire values surface as
+        // EnumValue::Unknown(n) instead of silently decoding as None (which
+        // the appstate LTHash path used to default to SET, corrupting the
+        // hash). Scoped to SyncdOperation only: opening an enum changes its
+        // serde shape (EnumValue serializes known values as proto names,
+        // unknown as numbers), so the message-level enums under the
+        // serde-enum-repr JS-bridge contract stay closed.
+        .open_enums_in(&[".whatsapp.SyncdMutation.SyncdOperation"])
         // Box every singular message field. buffa defaults them to inline; for
         // WhatsApp's deep, many-optional-field messages (every message variant
         // is its own inline slot) that makes size_of explode recursively,
@@ -115,11 +112,11 @@ fn main() -> std::io::Result<()> {
             "#[serde(skip)]",
         )
         .field_attribute(
-            ".whatsapp.SessionStructure.Chain.MessageKey.cipher_key",
+            ".whatsapp.SessionStructure.Chain.MessageKey.cipherKey",
             "#[serde(skip)]",
         )
         .field_attribute(
-            ".whatsapp.SessionStructure.Chain.MessageKey.mac_key",
+            ".whatsapp.SessionStructure.Chain.MessageKey.macKey",
             "#[serde(skip)]",
         )
         .field_attribute(
@@ -154,54 +151,6 @@ fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(())
-}
-
-/// Decode the committed (camelCase-field) descriptor, snake_case every message
-/// and oneof field name, and write the rewritten descriptor to `output`. Field
-/// numbers — the only thing the wire format depends on — are untouched, so this
-/// is wire-compatible; it only changes the Rust field idents buffa generates.
-fn snake_case_descriptor_fields(input: &str, output: &std::path::Path) -> std::io::Result<()> {
-    let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read(input)?)
-        .map_err(std::io::Error::other)?;
-    for file in &mut fds.file {
-        for message in &mut file.message_type {
-            snake_case_message_fields(message);
-        }
-    }
-    write_if_changed(output, &fds.encode_to_vec())
-}
-
-/// Skip the write when bytes are unchanged, to keep the file's mtime stable.
-///
-/// buffa_build emits a `cargo:rerun-if-changed` for this OUT_DIR descriptor, so
-/// rewriting it every run would re-invalidate the build script and force a full
-/// waproto rebuild on every `cargo run`.
-fn write_if_changed(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Ok(existing) = std::fs::read(path)
-        && existing == contents
-    {
-        return Ok(());
-    }
-    std::fs::write(path, contents)
-}
-
-fn snake_case_message_fields(message: &mut DescriptorProto) {
-    for field in &mut message.field {
-        if let Some(name) = &field.name {
-            let snake = name.to_snake_case();
-            // Keep json_name in sync so buffa's serde/proto_name matches the ident.
-            field.json_name = Some(snake.clone());
-            field.name = Some(snake);
-        }
-    }
-    for oneof in &mut message.oneof_decl {
-        if let Some(name) = &oneof.name {
-            oneof.name = Some(name.to_snake_case());
-        }
-    }
-    for nested in &mut message.nested_type {
-        snake_case_message_fields(nested);
-    }
 }
 
 /// Emit `tags.rs`: a nested module tree mirroring the proto's message

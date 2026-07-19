@@ -63,11 +63,11 @@ fn snapshot_and_patch_mac_roundtrip() {
     let index_mac2 = vec![8u8; 32];
 
     let mutation1 = wa::SyncdMutation {
-        operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+        operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
         record: make_record(key_id, value_blob1.clone(), index_mac1.clone()).into(),
     };
     let mutation2 = wa::SyncdMutation {
-        operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+        operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
         record: make_record(key_id, value_blob2.clone(), index_mac2.clone()).into(),
     };
 

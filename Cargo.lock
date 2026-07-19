@@ -435,9 +435,9 @@ dependencies = [
 
 [[package]]
 name = "buffa"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
+checksum = "b97ce1f34252b8e2516042e1002d56c160908a7ff8a1c9d47e97836558d1c83a"
 dependencies = [
  "base64",
  "bytes",
@@ -447,15 +447,15 @@ dependencies = [
  "rustversion",
  "serde",
  "serde_json",
- "smoothutf8 0.1.1",
+ "smoothutf8",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "buffa-build"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef33217cabddfad99c0a54d42ddb7ca5b73fa492f7b16ddb621132ef51107556"
+checksum = "bbcfe99b1fc17c2ba15b99de057667da0fa2e7825c6a9f454fd9244dfcf5d171"
 dependencies = [
  "buffa",
  "buffa-codegen",
@@ -464,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "buffa-codegen"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6681b562b18ea719622d0d12684e88ecbdca600d517557dc7bcef7704631e28"
+checksum = "ccb7d9d432a6b8d1810089cf6779e5f8ae640b421502ab96771c2eb20ccb85c2"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -479,9 +479,9 @@ dependencies = [
 
 [[package]]
 name = "buffa-descriptor"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57ed423c4ecec86d1500879ce42e7e5f6def01bc632985ac756c1fd723fa21fc"
+checksum = "b3865eb96d1d2fe968f077752c47fb192cb2ce02262dcb90b37948ea93f673f2"
 dependencies = [
  "buffa",
  "rustversion",
@@ -3399,18 +3399,12 @@ dependencies = [
 
 [[package]]
 name = "smoothutf8"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36358427d32ecdb1624616deed99eccfef0a167fe5bf40ddb51efe6980bc1ec8"
-dependencies = [
- "simdutf8",
-]
-
-[[package]]
-name = "smoothutf8"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b4ec95892483d6d94284caccfddb9b77111a4dcac33ed25d624248def0fa5f1"
+dependencies = [
+ "simdutf8",
+]
 
 [[package]]
 name = "socket2"
@@ -3968,7 +3962,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "smoothutf8 0.2.3",
+ "smoothutf8",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -4019,7 +4013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "smoothutf8 0.2.3",
+ "smoothutf8",
  "stable_deref_trait",
  "yoke",
  "zlib-rs",

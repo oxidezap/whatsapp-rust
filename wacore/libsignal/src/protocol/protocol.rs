@@ -817,7 +817,7 @@ impl buffa::Message for DecryptionErrorMessageProto {
         size
     }
 
-    fn write_to(&self, _cache: &mut buffa::SizeCache, buf: &mut impl buffa::bytes::BufMut) {
+    fn write_to(&self, _cache: &mut buffa::SizeCache, buf: &mut impl buffa::EncodeSink) {
         if let Some(ref v) = self.ratchet_key {
             buffa::encoding::Tag::new(1, buffa::encoding::WireType::LengthDelimited).encode(buf);
             buffa::types::encode_bytes(v, buf);

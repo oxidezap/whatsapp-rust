@@ -72,7 +72,7 @@ pub fn encode_record(
     };
 
     let mutation = wa::SyncdMutation {
-        operation: Some(operation),
+        operation: Some(operation.into()),
         record: buffa::MessageField::some(record),
     };
 

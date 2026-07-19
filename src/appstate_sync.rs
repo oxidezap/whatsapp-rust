@@ -329,7 +329,7 @@ mod tests {
         value_blob.extend_from_slice(&value_mac);
 
         wa::SyncdMutation {
-            operation: Some(op),
+            operation: Some(op.into()),
             record: buffa::MessageField::some(wa::SyncdRecord {
                 index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),
