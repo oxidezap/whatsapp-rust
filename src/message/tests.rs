@@ -7774,7 +7774,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -7798,7 +7798,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -7949,7 +7949,7 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     let info = Arc::new(info);
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext("msg", &MessageUtils::encode_and_pad(&request), 2, &info),
+        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
     )
     .await
     .expect("the inbound lane must not wait for offline sync")
@@ -7967,7 +7967,7 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     );
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext("msg", &MessageUtils::encode_and_pad(&request), 2, &info),
+        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
     )
     .await
     .expect("the redelivery must not wait for offline sync")
@@ -8268,7 +8268,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -8284,7 +8284,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
         .await
         .unwrap();
     assert_eq!(

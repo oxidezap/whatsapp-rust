@@ -5,9 +5,11 @@
 
 use buffa::Message;
 use buffa::view::MessageView;
+use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::{CryptoRng, Rng};
 use sha2::Sha256;
+use std::ops::Range;
 use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
@@ -27,6 +29,82 @@ fn get_or_try_init_bytes(
     Ok(cache.get().expect("just set"))
 }
 
+fn subslice_range(parent: &[u8], child: &[u8]) -> Option<Range<usize>> {
+    let start = (child.as_ptr() as usize).checked_sub(parent.as_ptr() as usize)?;
+    let end = start.checked_add(child.len())?;
+    (end <= parent.len()).then_some(start..end)
+}
+
+/// Own a borrowed wire buffer in one allocation. Constructing `Bytes` from a
+/// boxed slice keeps its allocation directly recoverable by
+/// [`bytes_into_boxed_slice`] until sharing is actually requested.
+#[inline]
+fn bytes_from_slice(value: &[u8]) -> Bytes {
+    Bytes::from(Box::<[u8]>::from(value))
+}
+
+/// Preserve the historical owned-return API. `Bytes -> Vec` reuses a unique,
+/// full backing allocation and copies only when the input is a shared slice,
+/// which is the only case where returning one standalone `Box<[u8]>` requires
+/// new ownership.
+#[inline]
+fn bytes_into_boxed_slice(value: Bytes) -> Box<[u8]> {
+    Vec::<u8>::from(value).into_boxed_slice()
+}
+
+const PROTOBUF_TAG_WIRE_BITS: u32 = 3;
+const VERSION_NIBBLE_BITS: u32 = 4;
+const VERSION_NIBBLE_MASK: u8 = (1 << VERSION_NIBBLE_BITS) - 1;
+
+#[inline]
+fn wire_tag_value(field: u32, wire_type: buffa::encoding::WireType) -> u64 {
+    (u64::from(field) << PROTOBUF_TAG_WIRE_BITS) | wire_type as u64
+}
+
+#[inline]
+fn wire_tag_len(field: u32, wire_type: buffa::encoding::WireType) -> usize {
+    buffa::encoding::varint_len(wire_tag_value(field, wire_type))
+}
+
+#[inline]
+fn varint_field_len(field: u32, value: u64) -> usize {
+    wire_tag_len(field, buffa::encoding::WireType::Varint) + buffa::encoding::varint_len(value)
+}
+
+#[inline]
+fn bytes_field_len(field: u32, value_len: usize) -> usize {
+    wire_tag_len(field, buffa::encoding::WireType::LengthDelimited)
+        + buffa::encoding::varint_len(value_len as u64)
+        + value_len
+}
+
+#[inline]
+fn push_varint_field(field: u32, value: u64, output: &mut Vec<u8>) {
+    buffa::encoding::Tag::new(field, buffa::encoding::WireType::Varint).encode(output);
+    buffa::encoding::encode_varint(value, output);
+}
+
+/// Append a protobuf bytes field and return the value's range in `output`.
+#[inline]
+fn push_bytes_field(field: u32, value: &[u8], output: &mut Vec<u8>) -> Range<usize> {
+    buffa::encoding::Tag::new(field, buffa::encoding::WireType::LengthDelimited).encode(output);
+    buffa::encoding::encode_varint(value.len() as u64, output);
+    let start = output.len();
+    output.extend_from_slice(value);
+    start..output.len()
+}
+
+#[inline]
+fn encode_version_byte(message_version: u8, current_version: u8) -> u8 {
+    ((message_version & VERSION_NIBBLE_MASK) << VERSION_NIBBLE_BITS)
+        | (current_version & VERSION_NIBBLE_MASK)
+}
+
+#[inline]
+fn decode_message_version(version_byte: u8) -> u8 {
+    version_byte >> VERSION_NIBBLE_BITS
+}
+
 // Signal's original implementation uses version 4, but WhatsApp Web,
 // Baileys (libsignal-node), and whatsmeow all use version 3.
 pub const CIPHERTEXT_MESSAGE_CURRENT_VERSION: u8 = 3;
@@ -34,6 +112,106 @@ pub const SENDERKEY_MESSAGE_CURRENT_VERSION: u8 = 3;
 
 const MIN_SUPPORTED_VERSION: u8 = 3;
 const MAX_SUPPORTED_VERSION: u8 = 4;
+
+struct ParsedSignalMessage {
+    message_version: u8,
+    sender_ratchet_key: PublicKey,
+    counter: u32,
+    ciphertext_range: Range<usize>,
+}
+
+/// Expand validation into each ownership adapter so parse errors are lowered
+/// directly into its final `Result`. A function returning an intermediate
+/// parsed value prevents that optimization on current LLVM and adds work to
+/// the common format-probing failure path.
+macro_rules! parse_signal_message {
+    ($value:expr) => {{
+        let value: &[u8] = $value;
+        if value.len() < SignalMessage::MAC_LENGTH + 1 {
+            return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
+        }
+        let message_version = decode_message_version(value[0]);
+        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&message_version) {
+            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
+                message_version,
+            ));
+        }
+
+        let view = SignalMessage::decode_view_from(value)?;
+        let sender_ratchet_key = view
+            .ratchet_key
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let sender_ratchet_key = PublicKey::deserialize(sender_ratchet_key)?;
+        let counter = view
+            .counter
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let ciphertext_range = SignalMessage::ciphertext_range_from(value, &view)?;
+
+        ParsedSignalMessage {
+            message_version,
+            sender_ratchet_key,
+            counter,
+            ciphertext_range,
+        }
+    }};
+}
+
+struct ParsedPreKeySignalMessage {
+    message_version: u8,
+    registration_id: u32,
+    pre_key_id: Option<PreKeyId>,
+    signed_pre_key_id: SignedPreKeyId,
+    base_key: PublicKey,
+    identity_key: IdentityKey,
+    message_range: Range<usize>,
+    message: ParsedSignalMessage,
+}
+
+/// Parse both layers of a PreKey envelope before either ownership adapter
+/// allocates or increments a reference count.
+macro_rules! parse_pre_key_signal_message {
+    ($value:expr) => {{
+        let value: &[u8] = $value;
+        if value.is_empty() {
+            return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
+        }
+
+        let message_version = decode_message_version(value[0]);
+        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&message_version) {
+            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
+                message_version,
+            ));
+        }
+
+        let view = waproto::whatsapp::PreKeySignalMessageView::decode_view(&value[1..])
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        let base_key = view
+            .base_key
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let identity_key = view
+            .identity_key
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let message_bytes = view
+            .message
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let signed_pre_key_id = view
+            .signed_pre_key_id
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let message_range = subslice_range(value, message_bytes)
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+
+        ParsedPreKeySignalMessage {
+            message_version,
+            registration_id: view.registration_id.unwrap_or_default(),
+            pre_key_id: view.pre_key_id.map(Into::into),
+            signed_pre_key_id: signed_pre_key_id.into(),
+            base_key: PublicKey::deserialize(base_key)?,
+            identity_key: IdentityKey::try_from(identity_key)?,
+            message_range,
+            message: parse_signal_message!(message_bytes),
+        }
+    }};
+}
 
 #[derive(Debug)]
 pub enum CiphertextMessage {
@@ -73,31 +251,37 @@ impl CiphertextMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+struct SignalStorage {
+    /// Immutable, reference-counted ownership lets a decoded Signal envelope
+    /// remain a slice of its transport or enclosing PreKey allocation.
+    serialized: Bytes,
+    ciphertext_range: Range<usize>,
+}
+
+impl SignalStorage {
+    #[inline]
+    fn serialized(&self) -> &[u8] {
+        self.serialized.as_ref()
+    }
+
+    #[inline]
+    fn ciphertext(&self) -> &[u8] {
+        &self.serialized[self.ciphertext_range.clone()]
+    }
+
+    #[inline]
+    fn into_boxed_slice(self) -> Box<[u8]> {
+        bytes_into_boxed_slice(self.serialized)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SignalMessage {
     message_version: u8,
     sender_ratchet_key: PublicKey,
     counter: u32,
-    previous_counter: u32,
-    serialized: Box<[u8]>,
-    ciphertext_cache: OnceLock<Box<[u8]>>,
-}
-
-impl Clone for SignalMessage {
-    fn clone(&self) -> Self {
-        let ciphertext_cache = OnceLock::new();
-        if let Some(ct) = self.ciphertext_cache.get() {
-            let _ = ciphertext_cache.set(ct.clone());
-        }
-        Self {
-            message_version: self.message_version,
-            sender_ratchet_key: self.sender_ratchet_key,
-            counter: self.counter,
-            previous_counter: self.previous_counter,
-            serialized: self.serialized.clone(),
-            ciphertext_cache,
-        }
-    }
+    storage: SignalStorage,
 }
 
 impl SignalMessage {
@@ -114,17 +298,32 @@ impl SignalMessage {
         sender_identity_key: &IdentityKey,
         receiver_identity_key: &IdentityKey,
     ) -> Result<Self> {
-        let message = waproto::whatsapp::SignalMessage {
-            ratchet_key: Some(sender_ratchet_key.serialize().to_vec()),
-            counter: Some(counter),
-            previous_counter: Some(previous_counter),
-            ciphertext: Some(Vec::<u8>::from(ciphertext)),
-        };
-        let mut size_cache = buffa::SizeCache::new();
-        let message_len = message.compute_size(&mut size_cache) as usize;
-        let mut serialized = Vec::with_capacity(1 + message_len + Self::MAC_LENGTH);
-        serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
-        message.write_to(&mut size_cache, &mut serialized);
+        use waproto::tags::signal_message as tags;
+
+        // Encode the tiny envelope straight into its final allocation. The
+        // generated field tags keep this schema-driven, while direct framing
+        // avoids allocating a temporary Vec for both the ratchet key and the
+        // potentially large ciphertext before copying them into the envelope.
+        let ratchet_key = sender_ratchet_key.serialize();
+        let proto_len = bytes_field_len(tags::RATCHET_KEY, ratchet_key.len())
+            + varint_field_len(tags::COUNTER, u64::from(counter))
+            + varint_field_len(tags::PREVIOUS_COUNTER, u64::from(previous_counter))
+            + bytes_field_len(tags::CIPHERTEXT, ciphertext.len());
+        let mut serialized = Vec::with_capacity(1 + proto_len + Self::MAC_LENGTH);
+        serialized.push(encode_version_byte(
+            message_version,
+            CIPHERTEXT_MESSAGE_CURRENT_VERSION,
+        ));
+        push_bytes_field(tags::RATCHET_KEY, &ratchet_key, &mut serialized);
+        push_varint_field(tags::COUNTER, u64::from(counter), &mut serialized);
+        push_varint_field(
+            tags::PREVIOUS_COUNTER,
+            u64::from(previous_counter),
+            &mut serialized,
+        );
+        let ciphertext_range = push_bytes_field(tags::CIPHERTEXT, ciphertext, &mut serialized);
+        debug_assert_eq!(serialized.len(), 1 + proto_len);
+
         let mac = Self::compute_mac(
             sender_identity_key,
             receiver_identity_key,
@@ -132,14 +331,14 @@ impl SignalMessage {
             &serialized,
         )?;
         serialized.extend_from_slice(&mac);
-        let serialized = serialized.into_boxed_slice();
         Ok(Self {
             message_version,
             sender_ratchet_key,
             counter,
-            previous_counter,
-            serialized,
-            ciphertext_cache: OnceLock::new(),
+            storage: SignalStorage {
+                serialized: Bytes::from(serialized),
+                ciphertext_range,
+            },
         })
     }
 
@@ -160,26 +359,71 @@ impl SignalMessage {
 
     #[inline]
     pub fn serialized(&self) -> &[u8] {
-        &self.serialized
+        self.storage.serialized()
     }
 
     #[inline]
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.serialized
+        self.storage.into_boxed_slice()
     }
 
+    #[inline]
     pub fn body(&self) -> Result<&[u8]> {
-        get_or_try_init_bytes(&self.ciphertext_cache, || self.decode_ciphertext())
+        Ok(self.storage.ciphertext())
     }
 
-    fn decode_ciphertext(&self) -> Result<Box<[u8]>> {
-        let proto_bytes = &self.serialized[1..self.serialized.len() - Self::MAC_LENGTH];
-        let view = waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
-            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-        match view.ciphertext {
-            Some(ciphertext) => Ok(Box::from(ciphertext)),
-            None => Err(SignalProtocolError::InvalidProtobufEncoding),
+    #[inline]
+    fn decode_view_from(serialized: &[u8]) -> Result<waproto::whatsapp::SignalMessageView<'_>> {
+        let proto_bytes = &serialized[1..serialized.len() - Self::MAC_LENGTH];
+        waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)
+    }
+
+    fn ciphertext_range_from(
+        serialized: &[u8],
+        view: &waproto::whatsapp::SignalMessageView<'_>,
+    ) -> Result<Range<usize>> {
+        let ciphertext = view
+            .ciphertext
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        subslice_range(serialized, ciphertext).ok_or(SignalProtocolError::InvalidProtobufEncoding)
+    }
+
+    fn rebase_serialized(&mut self, serialized: Bytes) {
+        let ciphertext_range = self.storage.ciphertext_range.clone();
+        debug_assert_eq!(self.storage.serialized(), serialized.as_ref());
+        self.storage = SignalStorage {
+            serialized,
+            ciphertext_range,
+        };
+    }
+
+    #[inline]
+    fn from_parsed(serialized: Bytes, parsed: ParsedSignalMessage) -> Self {
+        Self {
+            message_version: parsed.message_version,
+            sender_ratchet_key: parsed.sender_ratchet_key,
+            counter: parsed.counter,
+            storage: SignalStorage {
+                serialized,
+                ciphertext_range: parsed.ciphertext_range,
+            },
         }
+    }
+
+    #[inline]
+    fn try_from_borrowed(value: &[u8]) -> Result<Self> {
+        // Validate before taking ownership. Besides avoiding wasted work for
+        // malformed input, this preserves the allocation-free rejection path
+        // used when callers probe a ciphertext's Signal envelope type.
+        let parsed = parse_signal_message!(value);
+        Ok(Self::from_parsed(bytes_from_slice(value), parsed))
+    }
+
+    #[inline]
+    fn try_from_shared(serialized: Bytes) -> Result<Self> {
+        let parsed = parse_signal_message!(&serialized);
+        Ok(Self::from_parsed(serialized, parsed))
     }
 
     pub fn verify_mac(
@@ -188,13 +432,14 @@ impl SignalMessage {
         receiver_identity_key: &IdentityKey,
         mac_key: &[u8],
     ) -> Result<bool> {
+        let serialized = self.storage.serialized();
         let our_mac = &Self::compute_mac(
             sender_identity_key,
             receiver_identity_key,
             mac_key,
-            &self.serialized[..self.serialized.len() - Self::MAC_LENGTH],
+            &serialized[..serialized.len() - Self::MAC_LENGTH],
         )?;
-        let their_mac = &self.serialized[self.serialized.len() - Self::MAC_LENGTH..];
+        let their_mac = &serialized[serialized.len() - Self::MAC_LENGTH..];
         let result: bool = our_mac.ct_eq(their_mac).into();
         if !result {
             // A warning instead of an error because we try multiple sessions.
@@ -230,7 +475,7 @@ impl SignalMessage {
 
 impl AsRef<[u8]> for SignalMessage {
     fn as_ref(&self) -> &[u8] {
-        &self.serialized
+        self.storage.serialized()
     }
 }
 
@@ -238,46 +483,15 @@ impl TryFrom<&[u8]> for SignalMessage {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
-        if value.len() < SignalMessage::MAC_LENGTH + 1 {
-            return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
-        }
-        let message_version = value[0] >> 4;
+        Self::try_from_borrowed(value)
+    }
+}
 
-        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&message_version) {
-            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
-                message_version,
-            ));
-        }
+impl TryFrom<Bytes> for SignalMessage {
+    type Error = SignalProtocolError;
 
-        let view = waproto::whatsapp::SignalMessageView::decode_view(
-            &value[1..value.len() - SignalMessage::MAC_LENGTH],
-        )
-        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-
-        let Some(sender_ratchet_key) = view.ratchet_key else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let sender_ratchet_key = PublicKey::deserialize(sender_ratchet_key)?;
-        let Some(counter) = view.counter else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let previous_counter = view.previous_counter.unwrap_or(0);
-        let Some(ciphertext) = view.ciphertext else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let ciphertext: Box<[u8]> = Box::from(ciphertext);
-
-        let ciphertext_cache = OnceLock::new();
-        let _ = ciphertext_cache.set(ciphertext);
-
-        Ok(SignalMessage {
-            message_version,
-            sender_ratchet_key,
-            counter,
-            previous_counter,
-            serialized: Box::from(value),
-            ciphertext_cache,
-        })
+    fn try_from(value: Bytes) -> Result<Self> {
+        Self::try_from_shared(value)
     }
 }
 
@@ -290,7 +504,7 @@ pub struct PreKeySignalMessage {
     base_key: PublicKey,
     identity_key: IdentityKey,
     message: SignalMessage,
-    serialized: Box<[u8]>,
+    serialized: Bytes,
 }
 
 impl PreKeySignalMessage {
@@ -301,24 +515,57 @@ impl PreKeySignalMessage {
         signed_pre_key_id: SignedPreKeyId,
         base_key: PublicKey,
         identity_key: IdentityKey,
-        message: SignalMessage,
+        mut message: SignalMessage,
     ) -> Result<Self> {
-        let proto_message = waproto::whatsapp::PreKeySignalMessage {
-            registration_id: Some(registration_id),
-            pre_key_id: pre_key_id.map(|id| id.into()),
-            signed_pre_key_id: Some(signed_pre_key_id.into()),
-            base_key: Some(base_key.serialize().to_vec()),
-            identity_key: Some(identity_key.serialize().to_vec()),
-            message: Some(Vec::from(message.as_ref())),
-            // Post-quantum (Kyber) prekeys are not implemented; classic X3DH only.
-            kyber_pre_key_id: None,
-            kyber_ciphertext: None,
-        };
-        let mut size_cache = buffa::SizeCache::new();
-        let message_len = proto_message.compute_size(&mut size_cache) as usize;
-        let mut serialized = Vec::with_capacity(1 + message_len);
-        serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
-        proto_message.write_to(&mut size_cache, &mut serialized);
+        use waproto::tags::pre_key_signal_message as tags;
+
+        let pre_key_id_value = pre_key_id.map(Into::<u32>::into);
+        let signed_pre_key_id_value: u32 = signed_pre_key_id.into();
+        let base_key_bytes = base_key.serialize();
+        let identity_key_bytes = identity_key.serialize();
+        let nested_message = message.serialized();
+
+        // Follow the generated encoder's ascending-tag order while writing all
+        // byte fields directly into the final envelope. This removes three
+        // temporary Vec allocations/copies without changing canonical wire
+        // output.
+        let proto_len = pre_key_id_value
+            .map(|id| varint_field_len(tags::PRE_KEY_ID, u64::from(id)))
+            .unwrap_or_default()
+            + bytes_field_len(tags::BASE_KEY, base_key_bytes.len())
+            + bytes_field_len(tags::IDENTITY_KEY, identity_key_bytes.len())
+            + bytes_field_len(tags::MESSAGE, nested_message.len())
+            + varint_field_len(tags::REGISTRATION_ID, u64::from(registration_id))
+            + varint_field_len(tags::SIGNED_PRE_KEY_ID, u64::from(signed_pre_key_id_value));
+        let mut serialized = Vec::with_capacity(1 + proto_len);
+        serialized.push(encode_version_byte(
+            message_version,
+            CIPHERTEXT_MESSAGE_CURRENT_VERSION,
+        ));
+        if let Some(id) = pre_key_id_value {
+            push_varint_field(tags::PRE_KEY_ID, u64::from(id), &mut serialized);
+        }
+        push_bytes_field(tags::BASE_KEY, &base_key_bytes, &mut serialized);
+        push_bytes_field(tags::IDENTITY_KEY, &identity_key_bytes, &mut serialized);
+        let message_range = push_bytes_field(tags::MESSAGE, nested_message, &mut serialized);
+        push_varint_field(
+            tags::REGISTRATION_ID,
+            u64::from(registration_id),
+            &mut serialized,
+        );
+        push_varint_field(
+            tags::SIGNED_PRE_KEY_ID,
+            u64::from(signed_pre_key_id_value),
+            &mut serialized,
+        );
+        debug_assert_eq!(serialized.len(), 1 + proto_len);
+
+        let serialized = Bytes::from(serialized);
+        // The outer envelope must be contiguous, so it necessarily copied the
+        // inner bytes once. Rebase the retained parsed message onto that copy
+        // and release its old allocation: steady-state PreKey storage is now a
+        // single allocation shared by both handles.
+        message.rebase_serialized(serialized.slice(message_range));
         Ok(Self {
             message_version,
             registration_id,
@@ -327,8 +574,34 @@ impl PreKeySignalMessage {
             base_key,
             identity_key,
             message,
-            serialized: serialized.into_boxed_slice(),
+            serialized,
         })
+    }
+
+    #[inline]
+    fn from_parsed(serialized: Bytes, parsed: ParsedPreKeySignalMessage) -> Self {
+        let ParsedPreKeySignalMessage {
+            message_version,
+            registration_id,
+            pre_key_id,
+            signed_pre_key_id,
+            base_key,
+            identity_key,
+            message_range,
+            message,
+        } = parsed;
+        let message = SignalMessage::from_parsed(serialized.slice(message_range), message);
+
+        Self {
+            message_version,
+            registration_id,
+            pre_key_id,
+            signed_pre_key_id,
+            base_key,
+            identity_key,
+            message,
+            serialized,
+        }
     }
 
     #[inline]
@@ -368,18 +641,26 @@ impl PreKeySignalMessage {
 
     #[inline]
     pub fn serialized(&self) -> &[u8] {
-        &self.serialized
+        self.serialized.as_ref()
     }
 
     #[inline]
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.serialized
+        let Self {
+            message,
+            serialized,
+            ..
+        } = self;
+        // Release the nested slice first so a uniquely-owned outer allocation
+        // can be recovered by `Bytes -> Vec` without a copy.
+        drop(message);
+        bytes_into_boxed_slice(serialized)
     }
 }
 
 impl AsRef<[u8]> for PreKeySignalMessage {
     fn as_ref(&self) -> &[u8] {
-        &self.serialized
+        self.serialized.as_ref()
     }
 }
 
@@ -387,46 +668,17 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
-        if value.is_empty() {
-            return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
-        }
+        let parsed = parse_pre_key_signal_message!(value);
+        Ok(Self::from_parsed(bytes_from_slice(value), parsed))
+    }
+}
 
-        let message_version = value[0] >> 4;
+impl TryFrom<Bytes> for PreKeySignalMessage {
+    type Error = SignalProtocolError;
 
-        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&message_version) {
-            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
-                message_version,
-            ));
-        }
-
-        let view = waproto::whatsapp::PreKeySignalMessageView::decode_view(&value[1..])
-            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-
-        let Some(base_key) = view.base_key else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let Some(identity_key) = view.identity_key else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let Some(message) = view.message else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let Some(signed_pre_key_id) = view.signed_pre_key_id else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-
-        let base_key = PublicKey::deserialize(base_key)?;
-
-        Ok(PreKeySignalMessage {
-            message_version,
-            registration_id: view.registration_id.unwrap_or(0),
-            pre_key_id: view.pre_key_id.map(|id| id.into()),
-            signed_pre_key_id: signed_pre_key_id.into(),
-            base_key,
-            identity_key: IdentityKey::try_from(identity_key)?,
-            message: SignalMessage::try_from(message)?,
-            serialized: Box::from(value),
-        })
+    fn try_from(value: Bytes) -> Result<Self> {
+        let parsed = parse_pre_key_signal_message!(&value);
+        Ok(Self::from_parsed(value, parsed))
     }
 }
 
@@ -981,6 +1233,234 @@ impl TryFrom<&[u8]> for DecryptionErrorMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_MESSAGE_VERSION: u8 = CIPHERTEXT_MESSAGE_CURRENT_VERSION;
+    const TEST_MAC_KEY: [u8; 32] = [0xA5; 32];
+    const TEST_RATCHET_SEED: u8 = 0x11;
+    const TEST_SENDER_IDENTITY_SEED: u8 = 0x22;
+    const TEST_RECEIVER_IDENTITY_SEED: u8 = 0x33;
+    const TEST_BASE_KEY_SEED: u8 = 0x44;
+
+    fn public_key_from_seed(seed: u8) -> PublicKey {
+        PrivateKey::deserialize(&[seed; 32])
+            .expect("test private key")
+            .public_key()
+            .expect("test public key")
+    }
+
+    fn test_signal_message(
+        counter: u32,
+        previous_counter: u32,
+        ciphertext: &[u8],
+    ) -> SignalMessage {
+        SignalMessage::new(
+            TEST_MESSAGE_VERSION,
+            &TEST_MAC_KEY,
+            public_key_from_seed(TEST_RATCHET_SEED),
+            counter,
+            previous_counter,
+            ciphertext,
+            &IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED)),
+            &IdentityKey::new(public_key_from_seed(TEST_RECEIVER_IDENTITY_SEED)),
+        )
+        .expect("test SignalMessage")
+    }
+
+    fn generated_signal_wire(counter: u32, previous_counter: u32, ciphertext: &[u8]) -> Vec<u8> {
+        let sender_identity = IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED));
+        let receiver_identity = IdentityKey::new(public_key_from_seed(TEST_RECEIVER_IDENTITY_SEED));
+        let proto = waproto::whatsapp::SignalMessage {
+            ratchet_key: Some(public_key_from_seed(TEST_RATCHET_SEED).serialize().to_vec()),
+            counter: Some(counter),
+            previous_counter: Some(previous_counter),
+            ciphertext: Some(ciphertext.to_vec()),
+        };
+        let mut wire =
+            Vec::with_capacity(1 + proto.encoded_len() as usize + SignalMessage::MAC_LENGTH);
+        wire.push(encode_version_byte(
+            TEST_MESSAGE_VERSION,
+            CIPHERTEXT_MESSAGE_CURRENT_VERSION,
+        ));
+        wire.extend_from_slice(&proto.encode_to_vec());
+        let mac =
+            SignalMessage::compute_mac(&sender_identity, &receiver_identity, &TEST_MAC_KEY, &wire)
+                .expect("test MAC");
+        wire.extend_from_slice(&mac);
+        wire
+    }
+
+    fn generated_pre_key_wire(
+        registration_id: u32,
+        pre_key_id: Option<PreKeyId>,
+        signed_pre_key_id: SignedPreKeyId,
+        nested_message: &[u8],
+    ) -> Vec<u8> {
+        let proto = waproto::whatsapp::PreKeySignalMessage {
+            registration_id: Some(registration_id),
+            pre_key_id: pre_key_id.map(Into::into),
+            signed_pre_key_id: Some(signed_pre_key_id.into()),
+            base_key: Some(
+                public_key_from_seed(TEST_BASE_KEY_SEED)
+                    .serialize()
+                    .to_vec(),
+            ),
+            identity_key: Some(
+                public_key_from_seed(TEST_SENDER_IDENTITY_SEED)
+                    .serialize()
+                    .to_vec(),
+            ),
+            message: Some(nested_message.to_vec()),
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
+        };
+        let mut wire = Vec::with_capacity(1 + proto.encoded_len() as usize);
+        wire.push(encode_version_byte(
+            TEST_MESSAGE_VERSION,
+            CIPHERTEXT_MESSAGE_CURRENT_VERSION,
+        ));
+        wire.extend_from_slice(&proto.encode_to_vec());
+        wire
+    }
+
+    #[test]
+    fn direct_signal_encoder_matches_generated_wire() {
+        let counters = [0, 127, 128, u32::MAX];
+        let ciphertexts = [Vec::new(), vec![0x5A], vec![0xC3; 128]];
+
+        for counter in counters {
+            for previous_counter in counters {
+                for ciphertext in &ciphertexts {
+                    let direct = test_signal_message(counter, previous_counter, ciphertext);
+                    let generated = generated_signal_wire(counter, previous_counter, ciphertext);
+                    assert_eq!(direct.serialized(), generated);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_pre_key_encoder_matches_generated_wire() {
+        let signal_wire = generated_signal_wire(128, 127, &[0x7E; 64]);
+        let cases = [
+            (0, None, 0),
+            (127, Some(127), 127),
+            (128, Some(128), 128),
+            (u32::MAX, Some(u32::MAX), u32::MAX),
+        ];
+
+        for (registration_id, pre_key_id, signed_pre_key_id) in cases {
+            let pre_key_id = pre_key_id.map(Into::into);
+            let signed_pre_key_id = signed_pre_key_id.into();
+            let direct = PreKeySignalMessage::new(
+                TEST_MESSAGE_VERSION,
+                registration_id,
+                pre_key_id,
+                signed_pre_key_id,
+                public_key_from_seed(TEST_BASE_KEY_SEED),
+                IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED)),
+                SignalMessage::try_from(signal_wire.as_slice()).expect("nested SignalMessage"),
+            )
+            .expect("test PreKeySignalMessage");
+            let generated = generated_pre_key_wire(
+                registration_id,
+                pre_key_id,
+                signed_pre_key_id,
+                &signal_wire,
+            );
+            assert_eq!(direct.serialized(), generated);
+        }
+    }
+
+    #[test]
+    fn parsed_signal_body_shares_its_wire_allocation() {
+        let wire = test_signal_message(7, 3, &[0x42; 256]).into_serialized();
+
+        let borrowed = SignalMessage::try_from(wire.as_ref()).expect("borrowed SignalMessage");
+        assert!(
+            subslice_range(
+                borrowed.serialized(),
+                borrowed.body().expect("borrowed Signal body"),
+            )
+            .is_some()
+        );
+
+        let transport = Bytes::from(wire);
+        let transport_ptr = transport.as_ptr();
+        let shared = SignalMessage::try_from(transport).expect("shared SignalMessage");
+        assert_eq!(shared.serialized().as_ptr(), transport_ptr);
+        assert!(
+            subslice_range(
+                shared.serialized(),
+                shared.body().expect("shared Signal body"),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn parsed_pre_key_and_nested_signal_share_one_wire_allocation() {
+        let signal_wire = generated_signal_wire(9, 4, &[0x24; 256]);
+        let wire = PreKeySignalMessage::new(
+            TEST_MESSAGE_VERSION,
+            128,
+            Some(127.into()),
+            129.into(),
+            public_key_from_seed(TEST_BASE_KEY_SEED),
+            IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED)),
+            SignalMessage::try_from(signal_wire.as_slice()).expect("nested SignalMessage"),
+        )
+        .expect("test PreKeySignalMessage")
+        .into_serialized();
+
+        let borrowed =
+            PreKeySignalMessage::try_from(wire.as_ref()).expect("borrowed PreKeySignalMessage");
+        assert!(subslice_range(borrowed.serialized(), borrowed.message().serialized()).is_some());
+        assert!(
+            subslice_range(
+                borrowed.serialized(),
+                borrowed
+                    .message()
+                    .body()
+                    .expect("borrowed nested Signal body"),
+            )
+            .is_some()
+        );
+
+        let transport = Bytes::from(wire);
+        let transport_ptr = transport.as_ptr();
+        let shared = PreKeySignalMessage::try_from(transport).expect("shared PreKeySignalMessage");
+        assert_eq!(shared.serialized().as_ptr(), transport_ptr);
+        assert!(subslice_range(shared.serialized(), shared.message().serialized()).is_some());
+        assert!(
+            subslice_range(
+                shared.serialized(),
+                shared.message().body().expect("shared nested Signal body"),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn consuming_unique_encoded_messages_reuses_their_wire_allocations() {
+        let signal = test_signal_message(1, 0, b"signal");
+        let signal_ptr = signal.serialized().as_ptr();
+        let signal_wire = signal.into_serialized();
+        assert_eq!(signal_wire.as_ptr(), signal_ptr);
+
+        let pre_key = PreKeySignalMessage::new(
+            TEST_MESSAGE_VERSION,
+            1,
+            Some(1.into()),
+            1.into(),
+            public_key_from_seed(TEST_BASE_KEY_SEED),
+            IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED)),
+            SignalMessage::try_from(signal_wire.as_ref()).expect("nested SignalMessage"),
+        )
+        .expect("test PreKeySignalMessage");
+        let pre_key_ptr = pre_key.serialized().as_ptr();
+        let pre_key_wire = pre_key.into_serialized();
+        assert_eq!(pre_key_wire.as_ptr(), pre_key_ptr);
+    }
 
     #[test]
     fn decryption_error_proto_uses_buffa_size_cache_encoding() {

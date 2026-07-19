@@ -5,6 +5,34 @@ use crate::protocol::{
 use chrono::Utc;
 use waproto::whatsapp as wa;
 
+/// Append a pre-key record directly from the key pair's fixed-size buffers.
+///
+/// The generated protobuf view keeps both key fields borrowed, avoiding the two
+/// temporary `Vec<u8>` allocations performed by [`new_pre_key_record`]. The
+/// schema-generated `ViewEncode` implementation remains the single source of
+/// truth for field numbers and wire types.
+pub fn encode_pre_key_record_to(id: u32, key_pair: &KeyPair, out: &mut Vec<u8>) {
+    use buffa::ViewEncode as _;
+
+    let view = wa::PreKeyRecordStructureView {
+        id: Some(id),
+        public_key: Some(key_pair.public_key.public_key_bytes()),
+        private_key: Some(key_pair.private_key.serialize()),
+    };
+
+    // `ViewEncode::encode` computes the size but leaves capacity management to
+    // the sink. Reserve from that schema-derived size, then reuse the same
+    // cache for the write: an empty output allocates once, while a retained
+    // batch buffer remains allocation-free.
+    let mut cache = buffa::SizeCache::new();
+    let encoded_len = buffa::checked_encode_size(view.compute_size(&mut cache))
+        .unwrap_or_else(|_| buffa::encode_size_overflow()) as usize;
+    let start_len = out.len();
+    out.reserve(encoded_len);
+    view.write_to(&mut cache, out);
+    buffa::debug_assert_two_pass(out.len() - start_len, encoded_len);
+}
+
 pub fn new_pre_key_record(id: u32, key_pair: &KeyPair) -> wa::PreKeyRecordStructure {
     wa::PreKeyRecordStructure {
         id: Some(id),
@@ -101,6 +129,40 @@ mod tests {
     use super::*;
     use crate::protocol::{GenericSignedPreKey, KeyPair, PreKeyRecord};
     use rand::Rng;
+
+    #[test]
+    fn borrowed_prekey_encoder_matches_owned_encoder() {
+        use buffa::Message as _;
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        let mut actual = Vec::new();
+        let mut retained_allocation = None;
+        for id in [u32::MAX, (1 << 24) - 1, 1] {
+            let expected = new_pre_key_record(id, &key_pair).encode_to_vec();
+            actual.clear();
+            encode_pre_key_record_to(id, &key_pair, &mut actual);
+            assert_eq!(actual, expected);
+
+            if let Some((ptr, capacity)) = retained_allocation {
+                assert_eq!(actual.as_ptr(), ptr);
+                assert_eq!(actual.capacity(), capacity);
+            } else {
+                retained_allocation = Some((actual.as_ptr(), actual.capacity()));
+            }
+
+            let decoded = wa::PreKeyRecordStructure::decode_from_slice(&actual)
+                .expect("borrowed record should decode");
+            assert_eq!(decoded.id, Some(id));
+            assert_eq!(
+                decoded.public_key.as_deref(),
+                Some(key_pair.public_key.public_key_bytes())
+            );
+            assert_eq!(
+                decoded.private_key.as_deref(),
+                Some(key_pair.private_key.serialize().as_slice())
+            );
+        }
+    }
 
     #[test]
     fn test_prekey_serialization_length() -> Result<(), Box<dyn std::error::Error>> {
