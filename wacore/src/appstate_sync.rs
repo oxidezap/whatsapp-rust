@@ -182,13 +182,10 @@ impl AppStateProcessor {
     /// Pre-fetch and cache all keys needed for a patch list.
     async fn prefetch_keys(&self, pl: &PatchList) -> Result<()> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
-        // TEMP-DIAG(#1053): trace the e2e app-state freeze; remove before merge.
-        log::info!(target: "AppState", "TEMP-DIAG prefetch_keys start: {} ids for {:?}", key_ids.len(), pl.name);
         for key_id in key_ids {
             // This will fetch and cache if not already cached
             let _ = self.get_app_state_key(key_id).await;
         }
-        log::info!(target: "AppState", "TEMP-DIAG prefetch_keys done for {:?}", pl.name);
         Ok(())
     }
 
@@ -345,8 +342,6 @@ impl AppStateProcessor {
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
             let keys_map = self.key_cache.lock().await.clone();
             let collection_name_owned = collection_name.to_string();
-            // TEMP-DIAG(#1053)
-            log::info!(target: "AppState", "TEMP-DIAG snapshot processing start: {} records for {collection_name}", snapshot.records.len());
 
             // Offload CPU-intensive snapshot processing to a blocking thread. The
             // snapshot moves into the closure (its 'static bound used to force a
@@ -363,17 +358,10 @@ impl AppStateProcessor {
                 )?;
                 Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
             })
-            .await;
-            // TEMP-DIAG(#1053): log before `?` so error exits are visible too.
-            log::info!(target: "AppState", "TEMP-DIAG snapshot blocking returned: ok={} for {collection_name}", result.is_ok());
-            if let Err(e) = &result {
-                log::warn!(target: "AppState", "TEMP-DIAG snapshot processing error for {collection_name}: {e}");
-            }
-            let result = result.map_err(|e| anyhow!("{}", e))?;
+            .await
+            .map_err(|e| anyhow!("{}", e))?;
 
             let (snapshot_result, snapshot_state, snapshot) = result;
-            // TEMP-DIAG(#1053)
-            log::info!(target: "AppState", "TEMP-DIAG snapshot processing done: {} mutations for {collection_name}", snapshot_result.mutations.len());
             pl.snapshot = Some(snapshot);
             state = snapshot_state;
 
@@ -456,8 +444,6 @@ impl AppStateProcessor {
         let patches = std::mem::take(&mut pl.patches);
         let mut processed_patches = Vec::with_capacity(patches.len());
         for patch in patches {
-            // TEMP-DIAG(#1053)
-            log::info!(target: "AppState", "TEMP-DIAG patch processing start: {} mutations for {collection_name}", patch.mutations.len());
             let need_db_lookup = collect_unique_index_macs(&patch.mutations);
 
             // Fetch previous value MACs in one backend round-trip instead of a
@@ -494,8 +480,6 @@ impl AppStateProcessor {
             })
             .await
             .map_err(|e| anyhow!("{}", e))?;
-            // TEMP-DIAG(#1053)
-            log::info!(target: "AppState", "TEMP-DIAG patch processing done for {collection_name}");
             processed_patches.push(patch);
 
             // Update local state with the result from the blocking task

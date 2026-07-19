@@ -342,8 +342,7 @@ impl Client {
                         && attempt == 1
                     {
                         if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
-                            // TEMP-DIAG(#1053): raised from debug! so CI shows it.
-                            log::info!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
+                            debug!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
                             if rt_timeout(
                                 &*self.runtime,
                                 Duration::from_secs(10),
@@ -785,8 +784,7 @@ impl Client {
 
         backend.set_version(name.as_str(), state.clone()).await?;
 
-        // TEMP-DIAG(#1053)
-        log::info!(target: "Client/AppState", "TEMP-DIAG sync task complete for {:?} (final version={})", name, state.version);
+        debug!(target: "Client/AppState", "Completed and saved app state sync for {:?} (final version={})", name, state.version);
         Ok(())
     }
 
