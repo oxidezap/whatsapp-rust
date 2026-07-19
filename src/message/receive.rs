@@ -379,7 +379,23 @@ impl Client {
         // silently dropped, losing pkmsg messages carrying SKDM (sender key
         // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
         // sender with "No sender key state".
+        // TEMP-DIAG4(#1053)
+        log::info!(
+            "TEMP4 msg permit wait id={} chat={}",
+            info.id,
+            info.source.chat.observe()
+        );
         let _global_permit = self.acquire_message_processing_permit().await;
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 msg permit held id={}", info.id);
+        // TEMP-DIAG4(#1053): log permit release even on early returns/panics.
+        struct PermitDiag(String);
+        impl Drop for PermitDiag {
+            fn drop(&mut self) {
+                log::info!("TEMP4 msg permit release id={}", self.0);
+            }
+        }
+        let _permit_diag = PermitDiag(info.id.clone());
         if self
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire)

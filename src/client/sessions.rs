@@ -359,9 +359,13 @@ impl Client {
             return Ok(0);
         }
 
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 prekey fetch begin n={}", jids.len());
         let prekey_bundles = self
             .fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity))
             .await?;
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 prekey bundles received n={}", prekey_bundles.len());
 
         let mut adapter = self.signal_adapter().await;
 
@@ -429,7 +433,14 @@ impl Client {
         // deferred live transition — in both windows a raw whole-cache flush
         // would persist rowless drain entries' ratchet advances.
         if success_count > 0 {
+            // TEMP-DIAG4(#1053)
+            log::info!(
+                "TEMP4 establish flush begin (drain_active={})",
+                self.inbound_commit_batch.is_active()
+            );
             self.flush_signal_cache_batch_safe().await?;
+            // TEMP-DIAG4(#1053)
+            log::info!("TEMP4 establish flush done");
         }
 
         Ok(success_count)

@@ -219,6 +219,11 @@ impl Client {
         info: &Arc<MessageInfo>,
         reason: RetryReason,
     ) -> bool {
+        // TEMP-DIAG4(#1053)
+        log::info!(
+            "TEMP4 retry receipt begin msg={} reason={reason:?}",
+            info.id
+        );
         let cache_key = self
             .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
             .await;

@@ -381,7 +381,14 @@ impl Client {
         expected_epoch: Option<u64>,
         expected_generation: Option<u64>,
     ) -> bool {
+        // TEMP-DIAG4(#1053)
+        log::info!(
+            "TEMP4 drain-flush permit wait (deactivate={deactivate}, drain_active={})",
+            self.inbound_commit_batch.is_active()
+        );
         let _permit = self.acquire_message_processing_permit().await;
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 drain-flush permit held");
         if let Some(generation) = expected_generation
             && self.connection_generation.load(Ordering::Acquire) != generation
         {
@@ -449,6 +456,8 @@ impl Client {
         } else if durable && was_draining && self.inbound_commit_batch.live_transition_pending() {
             self.complete_deferred_live_transition();
         }
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 drain-flush done (durable={durable}, was_draining={was_draining})");
         durable
     }
 

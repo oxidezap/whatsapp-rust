@@ -958,7 +958,15 @@ impl Client {
 
         // Gate the stanza on the sender-key ratchet advance being durable
         // (same rule as the DM/group send path); a failure aborts the send.
+        // TEMP-DIAG4(#1053)
+        log::info!(
+            "TEMP4 status pre-wire gate begin (needs_flush={}, drain_active={})",
+            self.signal_cache.needs_pre_wire_flush().await,
+            self.inbound_commit_batch.is_active()
+        );
         self.persist_signal_state_pre_wire().await?;
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 status pre-wire gate done");
 
         let ack = if let Some(phash) = stanza
             .attrs()
@@ -1487,7 +1495,15 @@ impl Client {
         // schedule the coalesced write-behind; a send that raised either lease
         // flushes synchronously, and a persistence failure must abort the send
         // rather than transmit an advance we couldn't save.
+        // TEMP-DIAG4(#1053)
+        log::info!(
+            "TEMP4 pre-wire gate begin (needs_flush={}, drain_active={})",
+            self.signal_cache.needs_pre_wire_flush().await,
+            self.inbound_commit_batch.is_active()
+        );
         self.persist_signal_state_pre_wire().await?;
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 pre-wire gate done");
 
         let ack = if let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
@@ -1517,6 +1533,8 @@ impl Client {
             }
             return Err(e.into());
         }
+        // TEMP-DIAG4(#1053)
+        log::info!("TEMP4 stanza on wire id={outbound_id_clone}");
 
         if let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
