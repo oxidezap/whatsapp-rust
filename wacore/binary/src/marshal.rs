@@ -309,6 +309,48 @@ mod tests {
         Ok(())
     }
 
+    // The exact path replays plan-recorded hints by traversal order, so it
+    // must produce byte-identical output to the hint-free vec path for every
+    // string shape (tokens, numerics, hex, JIDs with device/agent/empty user,
+    // long strings, bytes, nesting). A divergence in traversal order shows up
+    // here (and as a debug_assert in write_string) before it can corrupt the
+    // wire.
+    #[test]
+    fn test_exact_matches_plain_for_all_string_shapes() -> TestResult {
+        let mut attrs = Attrs::with_capacity(8);
+        attrs.push("to".to_string(), "15551234567@s.whatsapp.net");
+        attrs.push("from".to_string(), "15550000001:12@s.whatsapp.net");
+        attrs.push("participant".to_string(), "15550000002_1@lid");
+        attrs.push("broadcast".to_string(), "status@broadcast");
+        attrs.push("type".to_string(), "text");
+        attrs.push("count".to_string(), "12345");
+        attrs.push("hexish".to_string(), "0123ABCDEF");
+        attrs.push("plain".to_string(), "not_a_token_value");
+        let node = Node::new(
+            "iq",
+            attrs,
+            Some(NodeContent::Nodes(vec![
+                Node::new(
+                    "text",
+                    Attrs::new(),
+                    Some(NodeContent::String("x".repeat(300).into())),
+                ),
+                Node::new("empty", Attrs::new(), Some(NodeContent::String("".into()))),
+                Node::new(
+                    "bin",
+                    Attrs::new(),
+                    Some(NodeContent::Bytes(vec![0xAB; 64])),
+                ),
+                Node::new("leaf", Attrs::new(), None),
+            ])),
+        );
+
+        assert_eq!(marshal(&node)?, marshal_exact(&node)?);
+        let node_ref = node.as_node_ref();
+        assert_eq!(marshal_ref(&node_ref)?, marshal_ref_exact(&node_ref)?);
+        Ok(())
+    }
+
     #[test]
     fn test_marshaled_node_ref_size_matches_output() -> TestResult {
         let node = fixture_node();
