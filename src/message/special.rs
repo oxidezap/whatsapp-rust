@@ -263,12 +263,14 @@ impl Client {
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
-                    let Some(flush_guard) = client.outbound_flush.try_track() else {
-                        return;
-                    };
                     let send_generation = client
                         .connection_generation
                         .load(std::sync::atomic::Ordering::Acquire);
+                    let Some(flush_guard) = client.outbound_flush.try_track() else {
+                        reconnect_after = Some(send_generation);
+                        drop(client);
+                        continue;
+                    };
                     let result = client
                         .send_app_state_sync_key_share_once(
                             &requester,

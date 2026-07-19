@@ -581,6 +581,10 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
         .expect("Message should decrypt after on-the-fly PN->LID migration");
     info!("Message decrypted despite PN-only backend state");
 
+    // Event delivery precedes the coalesced Signal flush; inspect durability only
+    // after crossing the same persistence boundary used by production shutdown.
+    client_a.client.flush_pending_signal_state().await?;
+
     client_a
         .assert_no_event(
             3,

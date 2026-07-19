@@ -7989,6 +7989,62 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
     assert!(transport.sent_count() > sent_before);
 }
 
+#[tokio::test]
+async fn app_state_key_share_survives_a_closed_flush_scope() {
+    let (client, transport) = capturing_client("appstate_key_share_closed_flush").await;
+    let requester_str = "5511000000001:35@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+    let request = wa::message::AppStateSyncKeyRequest {
+        key_ids: vec![wa::message::AppStateSyncKeyId {
+            key_id: Some(vec![4, 3, 2, 1]),
+        }],
+    };
+    let (message, message_id) = client
+        .prepare_app_state_sync_key_share(&request)
+        .await
+        .expect("prepare key share");
+
+    client.outbound_flush.close();
+    let rejected_before = client.outbound_flush.track_rejections();
+    client.schedule_app_state_sync_key_share(requester, message, message_id);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while client.outbound_flush.track_rejections() == rejected_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("key-share job should observe the closed scope");
+    assert_eq!(transport.sent_count(), sent_before);
+
+    client
+        .connection_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    client.outbound_flush.reopen();
+    client.offline_sync_notifier.notify(usize::MAX);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.sent_count() == sent_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("key-share job should resume on the new connection");
+}
+
 /// Security regression: the primary's `lid_migration_mapping_sync_message`
 /// must be honoured only from self — a peer could otherwise poison the
 /// LID-PN cache and flip the account to LID wire addressing.

@@ -28,6 +28,24 @@ enum AppStateKeyRequestProgress {
     TimedOut,
 }
 
+#[cold]
+#[inline(never)]
+fn classify_app_state_key_request_failures(
+    peer_count: usize,
+    failure_count: usize,
+    failures: &str,
+) -> Result<AppStateKeyRequestDelivery, anyhow::Error> {
+    if failure_count == peer_count {
+        return Err(anyhow::anyhow!(
+            "app-state key request failed for all {peer_count} peer device(s): {failures}"
+        ));
+    }
+    warn!(
+        "App-state key request failed for {failure_count}/{peer_count} peer device(s): {failures}"
+    );
+    Ok(AppStateKeyRequestDelivery::SomePeers)
+}
+
 async fn app_state_keys_available(
     backend: &dyn crate::store::traits::Backend,
     key_ids: &[Vec<u8>],
@@ -65,6 +83,13 @@ fn finalize_app_state_key_request_peers(
     current_device: u16,
     primary: Jid,
 ) -> Result<Vec<Jid>, anyhow::Error> {
+    // WA Web derives every sibling address from the account's PN namespace.
+    for peer in &mut peers {
+        peer.user.clone_from(&primary.user);
+        peer.server = primary.server;
+        peer.agent = primary.agent;
+        peer.integrator = primary.integrator;
+    }
     peers.retain(|jid| jid.device != current_device);
     wacore::types::jid::sort_dedup_by_device(&mut peers);
     if peers.is_empty() && current_device != primary.device {
@@ -921,9 +946,10 @@ impl Client {
         };
 
         let peer_count = peers.len();
-        let results = futures::future::join_all(peers.into_iter().map(|peer| {
+        let mut requests = futures::stream::FuturesUnordered::new();
+        for peer in peers {
             let msg = &msg;
-            async move {
+            requests.push(async move {
                 let device = peer.device;
                 let result = async {
                     self.ensure_e2e_sessions(std::slice::from_ref(&peer))
@@ -942,30 +968,29 @@ impl Client {
                 }
                 .await;
                 (device, result)
-            }
-        }))
-        .await;
+            });
+        }
 
-        let mut failures = Vec::new();
-        for (device, result) in results {
+        let mut failure_count = 0;
+        let mut failures = None;
+        use futures::StreamExt;
+        while let Some((device, result)) = requests.next().await {
             if let Err(error) = result {
-                failures.push(format!("device {device}: {error}"));
+                failure_count += 1;
+                let failures = failures.get_or_insert_with(String::new);
+                if !failures.is_empty() {
+                    failures.push_str(", ");
+                }
+                let _ =
+                    std::fmt::Write::write_fmt(failures, format_args!("device {device}: {error}"));
             }
         }
-        if failures.len() == peer_count {
-            return Err(anyhow::anyhow!(
-                "app-state key request failed for all {peer_count} peer device(s): {}",
-                failures.join(", ")
-            ));
-        }
-        if !failures.is_empty() {
-            warn!(
-                "App-state key request failed for {}/{} peer device(s): {}",
-                failures.len(),
+        if failure_count != 0 {
+            return classify_app_state_key_request_failures(
                 peer_count,
-                failures.join(", ")
+                failure_count,
+                failures.as_deref().unwrap_or_default(),
             );
-            return Ok(AppStateKeyRequestDelivery::SomePeers);
         }
         Ok(AppStateKeyRequestDelivery::AllPeers)
     }
@@ -1128,14 +1153,26 @@ mod tests {
         let notifier = client.initial_keys_synced_notifier.clone();
         let writer = backend.clone();
         let stored_id = key_id.clone();
+        let (fanout_polled_tx, fanout_polled_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            fanout_polled_rx.await.expect("fanout must be polled");
             writer
-                .set_sync_key(&stored_id, crate::store::traits::AppStateSyncKey::default())
+                .set_sync_key(
+                    &stored_id,
+                    crate::store::traits::AppStateSyncKey {
+                        key_data: vec![7; 32],
+                        ..Default::default()
+                    },
+                )
                 .await
                 .expect("store recovered key");
             notifier.notify(usize::MAX);
         });
+
+        let slow_fanout = async move {
+            let _ = fanout_polled_tx.send(());
+            std::future::pending::<AppStateKeyRequestSchedule>().await
+        };
 
         let progress = client
             .await_app_state_key_request(
@@ -1143,7 +1180,7 @@ mod tests {
                 std::slice::from_ref(&key_id),
                 wacore::time::Instant::now() + Duration::from_secs(1),
                 listener,
-                std::future::pending::<AppStateKeyRequestSchedule>(),
+                slow_fanout,
             )
             .await;
 
@@ -1157,6 +1194,23 @@ mod tests {
             .expect("companion fallback");
         assert_eq!(peers, vec![primary.clone()]);
         assert!(finalize_app_state_key_request_peers(Vec::new(), 0, primary).is_err());
+    }
+
+    #[test]
+    fn app_state_peers_use_the_own_pn_namespace() {
+        let primary = Jid::pn("5511000000000");
+        let peers = finalize_app_state_key_request_peers(
+            vec![
+                Jid::lid_device("100000000000001", 0),
+                Jid::lid_device("100000000000001", 7),
+                Jid::pn_device("5511000000000", 7),
+            ],
+            33,
+            primary.clone(),
+        )
+        .expect("peer devices");
+
+        assert_eq!(peers, vec![primary, Jid::pn_device("5511000000000", 7)]);
     }
 
     #[tokio::test]
