@@ -23,6 +23,57 @@ pub mod whatsapp {
     buffa::include_proto!("whatsapp");
 }
 
+/// Field-level serde for `Option<EnumValue<E>>` fields (open enums, currently
+/// only `SyncdMutation.operation`), wired in via `field_attribute` in
+/// `build.rs`.
+///
+/// `EnumValue`'s own serde impls speak exact protobuf names (`SET`) on both
+/// sides, which would silently break the per-feature contracts the closed
+/// enums honor: `serde-enum-repr` serializes numerically for the JS bridge,
+/// and `serde-snake-case` deserializes lowercase variant names. Routing the
+/// known-value case through the enum's derived impls keeps an opened field on
+/// exactly the closed-enum contract; only `Unknown` values add behavior
+/// (serialized as, and deserializable from, the raw integer).
+pub mod open_enum_serde {
+    use buffa::{EnumValue, Enumeration};
+
+    pub fn serialize<E, S>(value: &Option<EnumValue<E>>, s: S) -> Result<S::Ok, S::Error>
+    where
+        E: Enumeration + serde::Serialize,
+        S: serde::Serializer,
+    {
+        match value {
+            None => s.serialize_none(),
+            Some(EnumValue::Known(e)) => s.serialize_some(e),
+            Some(EnumValue::Unknown(n)) => s.serialize_some(n),
+        }
+    }
+
+    #[cfg(feature = "serde-deserialize")]
+    pub fn deserialize<'de, E, D>(d: D) -> Result<Option<EnumValue<E>>, D::Error>
+    where
+        E: Enumeration + serde::Deserialize<'de>,
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire<E> {
+            // The enum's derived impl first, so every feature-selected input
+            // shape (lowercase names, numeric repr) keeps working; the raw
+            // integer fallback only catches values the enum doesn't know.
+            Known(E),
+            Raw(i32),
+        }
+        Ok(
+            match <Option<Wire<E>> as serde::Deserialize>::deserialize(d)? {
+                None => None,
+                Some(Wire::Known(e)) => Some(EnumValue::Known(e)),
+                Some(Wire::Raw(n)) => Some(EnumValue::from(n)),
+            },
+        )
+    }
+}
+
 /// Wire tags of every message field in `whatsapp.proto`, generated alongside
 /// the buffa code. Hand-written partial decoders must reference these consts
 /// (or compile-time assert against them) instead of magic numbers, so schema

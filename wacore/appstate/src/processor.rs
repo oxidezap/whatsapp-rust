@@ -806,6 +806,7 @@ mod tests {
 
         assert!(matches!(err, AppStateError::UnsupportedSyncdOperation(7)));
         assert_eq!(state.hash, before, "hash must be untouched on rejection");
+        assert_eq!(state.version, 0, "version must be untouched on rejection");
     }
 
     #[test]

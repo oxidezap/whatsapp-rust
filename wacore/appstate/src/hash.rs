@@ -87,17 +87,17 @@ impl HashState {
             // add or subtract, so bail before touching the hash.
             let op = match mutation.operation {
                 None => wa::syncd_mutation::SyncdOperation::SET,
-                Some(v) => match v.as_known() {
-                    Some(op) => op,
-                    None => {
+                Some(v) => {
+                    let Some(op) = v.as_known() else {
                         return (
                             result,
                             Err(anyhow::anyhow!(AppStateError::UnsupportedSyncdOperation(
                                 v.to_i32()
                             ))),
                         );
-                    }
-                },
+                    };
+                    op
+                }
             };
             let is_set = op == wa::syncd_mutation::SyncdOperation::SET;
             if is_set
