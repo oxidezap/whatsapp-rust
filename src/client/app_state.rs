@@ -8,6 +8,7 @@ use super::*;
 /// bounded here because a snapshot can be multi-MB and a batch carries several.
 const APPSTATE_BLOB_DOWNLOAD_CONCURRENCY: usize = 4;
 const APP_STATE_KEY_REQUEST_DEDUP: Duration = Duration::from_secs(24 * 3600);
+const APP_STATE_KEY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 
@@ -44,6 +45,69 @@ fn classify_app_state_key_request_failures(
         "App-state key request failed for {failure_count}/{peer_count} peer device(s): {failures}"
     );
     Ok(AppStateKeyRequestDelivery::SomePeers)
+}
+
+#[cold]
+#[inline(never)]
+fn append_app_state_key_request_failure(
+    failures: &mut Option<String>,
+    message: std::fmt::Arguments<'_>,
+) {
+    let failures = failures.get_or_insert_with(String::new);
+    if !failures.is_empty() {
+        failures.push_str(", ");
+    }
+    let _ = std::fmt::Write::write_fmt(failures, message);
+}
+
+async fn collect_app_state_key_request_results<F, E>(
+    runtime: &dyn wacore::runtime::Runtime,
+    mut requests: futures::stream::FuturesUnordered<F>,
+    timeout: Duration,
+) -> Result<AppStateKeyRequestDelivery, anyhow::Error>
+where
+    F: std::future::Future<Output = (u16, std::result::Result<(), E>)>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+    use futures::future::Either;
+
+    let peer_count = requests.len();
+    let mut failure_count = 0;
+    let mut failures = None;
+    let mut deadline = runtime.sleep(timeout);
+    while !requests.is_empty() {
+        match futures::future::select(requests.next(), deadline.as_mut()).await {
+            Either::Left((Some((device, result)), _)) => {
+                if let Err(error) = result {
+                    failure_count += 1;
+                    append_app_state_key_request_failure(
+                        &mut failures,
+                        format_args!("device {device}: {error}"),
+                    );
+                }
+            }
+            Either::Left((None, _)) => break,
+            Either::Right(((), _)) => {
+                let timed_out = requests.len();
+                failure_count += timed_out;
+                append_app_state_key_request_failure(
+                    &mut failures,
+                    format_args!("{timed_out} peer request(s) timed out"),
+                );
+                break;
+            }
+        }
+    }
+
+    if failure_count != 0 {
+        return classify_app_state_key_request_failures(
+            peer_count,
+            failure_count,
+            failures.as_deref().unwrap_or_default(),
+        );
+    }
+    Ok(AppStateKeyRequestDelivery::AllPeers)
 }
 
 async fn app_state_keys_available(
@@ -459,7 +523,7 @@ impl Client {
             // the explicit request on this connection; otherwise a fixed short wait.
             let key_wait = match key_wait_deadline {
                 Some(deadline) => deadline.saturating_duration_since(wacore::time::Instant::now()),
-                None => Duration::from_secs(10),
+                None => APP_STATE_KEY_REQUEST_TIMEOUT,
             };
             if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all, key_wait).await {
                 // The re-shared key didn't land in time. Report failure rather than a
@@ -671,7 +735,7 @@ impl Client {
                 .unwrap_or_default();
             if !missing.is_empty()
                 && !self
-                    .request_keys_and_wait(missing, Duration::from_secs(10))
+                    .request_keys_and_wait(missing, APP_STATE_KEY_REQUEST_TIMEOUT)
                     .await
             {
                 // Report failure (not a partial success) so the caller retries instead of
@@ -945,8 +1009,7 @@ impl Client {
             ..Default::default()
         };
 
-        let peer_count = peers.len();
-        let mut requests = futures::stream::FuturesUnordered::new();
+        let requests = futures::stream::FuturesUnordered::new();
         for peer in peers {
             let msg = &msg;
             requests.push(async move {
@@ -971,28 +1034,12 @@ impl Client {
             });
         }
 
-        let mut failure_count = 0;
-        let mut failures = None;
-        use futures::StreamExt;
-        while let Some((device, result)) = requests.next().await {
-            if let Err(error) = result {
-                failure_count += 1;
-                let failures = failures.get_or_insert_with(String::new);
-                if !failures.is_empty() {
-                    failures.push_str(", ");
-                }
-                let _ =
-                    std::fmt::Write::write_fmt(failures, format_args!("device {device}: {error}"));
-            }
-        }
-        if failure_count != 0 {
-            return classify_app_state_key_request_failures(
-                peer_count,
-                failure_count,
-                failures.as_deref().unwrap_or_default(),
-            );
-        }
-        Ok(AppStateKeyRequestDelivery::AllPeers)
+        collect_app_state_key_request_results(
+            &*self.runtime,
+            requests,
+            APP_STATE_KEY_REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     /// Send an app state patch to the server for a given collection.
@@ -1185,6 +1232,39 @@ mod tests {
             .await;
 
         assert!(matches!(progress, AppStateKeyRequestProgress::KeysReady));
+    }
+
+    #[tokio::test]
+    async fn passive_key_request_fanout_is_bounded() {
+        async fn peer_request(
+            device: u16,
+            completes: bool,
+        ) -> (u16, std::result::Result<(), anyhow::Error>) {
+            if !completes {
+                std::future::pending::<()>().await;
+            }
+            (device, Ok(()))
+        }
+
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate_fanout_timeout").await;
+        let requests = futures::stream::FuturesUnordered::new();
+        requests.push(peer_request(1, true));
+        requests.push(peer_request(2, false));
+
+        let delivery = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_app_state_key_request_results(
+                &*client.runtime,
+                requests,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("fanout collection must finish")
+        .expect("one completed peer must preserve partial delivery");
+
+        assert_eq!(delivery, AppStateKeyRequestDelivery::SomePeers);
     }
 
     #[test]

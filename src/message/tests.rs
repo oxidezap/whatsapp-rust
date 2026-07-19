@@ -7759,6 +7759,7 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
     let backend = client.persistence_manager.backend();
     let known_id = vec![1, 2, 3, 4, 5, 6];
     let orphan_id = vec![6, 5, 4, 3, 2, 1];
+    let corrupt_id = vec![9, 8, 7, 6, 5, 4];
     let fingerprint = wa::message::AppStateSyncKeyFingerprint {
         raw_id: Some(7),
         current_index: Some(3),
@@ -7775,6 +7776,17 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
         )
         .await
         .unwrap();
+    backend
+        .set_sync_key(
+            &corrupt_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![8; 32],
+                fingerprint: vec![0xff],
+                timestamp: 456,
+            },
+        )
+        .await
+        .unwrap();
 
     let request = wa::message::AppStateSyncKeyRequest {
         key_ids: vec![
@@ -7784,6 +7796,9 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
             wa::message::AppStateSyncKeyId {
                 key_id: Some(orphan_id.clone()),
             },
+            wa::message::AppStateSyncKeyId {
+                key_id: Some(corrupt_id.clone()),
+            },
             wa::message::AppStateSyncKeyId { key_id: None },
         ],
     };
@@ -7792,7 +7807,7 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
         .await
         .unwrap();
 
-    assert_eq!(share.keys.len(), 2, "keyless requests must be ignored");
+    assert_eq!(share.keys.len(), 3, "keyless requests must be ignored");
     let known = &share.keys[0];
     assert_eq!(
         known.key_id.as_option().and_then(|id| id.key_id.as_ref()),
@@ -7811,6 +7826,16 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
     assert!(
         orphan.key_data.is_unset(),
         "an unknown ID must be returned without fabricated key data"
+    );
+
+    let corrupt = &share.keys[2];
+    assert_eq!(
+        corrupt.key_id.as_option().and_then(|id| id.key_id.as_ref()),
+        Some(&corrupt_id)
+    );
+    assert!(
+        corrupt.key_data.is_unset(),
+        "an unusable stored key must not suppress valid key shares"
     );
 }
 

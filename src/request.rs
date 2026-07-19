@@ -84,7 +84,9 @@ pub enum IqError {
 impl IqError {
     pub(crate) fn is_transport_unavailable(&self) -> bool {
         match self {
-            IqError::NotConnected => true,
+            IqError::NotConnected | IqError::Disconnected(_) | IqError::InternalChannelClosed => {
+                true
+            }
             IqError::EncryptSend(error) => error.is_transport_unavailable(),
             IqError::ClientState(client) => client.is_transport_unavailable(),
             _ => false,

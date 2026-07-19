@@ -164,14 +164,21 @@ impl Client {
             let key_store = &key_store;
             Some(async move {
                 let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
-                    let fingerprint = wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
+                    match wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
                         &stored.fingerprint,
-                    )?;
-                    buffa::MessageField::some(wa::message::AppStateSyncKeyData {
-                        key_data: Some(stored.key_data),
-                        fingerprint: buffa::MessageField::some(fingerprint),
-                        timestamp: Some(stored.timestamp),
-                    })
+                    ) {
+                        Ok(fingerprint) => {
+                            buffa::MessageField::some(wa::message::AppStateSyncKeyData {
+                                key_data: Some(stored.key_data),
+                                fingerprint: buffa::MessageField::some(fingerprint),
+                                timestamp: Some(stored.timestamp),
+                            })
+                        }
+                        Err(error) => {
+                            warn!(target: "Client/AppState", "Stored app-state key fingerprint is invalid; returning orphan: {error}");
+                            buffa::MessageField::default()
+                        }
+                    }
                 } else {
                     buffa::MessageField::default()
                 };
@@ -446,11 +453,21 @@ mod tests {
 
     #[test]
     fn key_share_reconnects_for_direct_and_iq_connection_loss() {
+        use wacore_binary::builder::NodeBuilder;
+
         let direct = anyhow::Error::new(crate::client::ClientError::NotConnected);
         assert!(app_state_key_share_requires_reconnect(&direct));
 
         let iq = anyhow::Error::new(crate::request::IqError::NotConnected);
         assert!(app_state_key_share_requires_reconnect(&iq));
+
+        let channel_closed = anyhow::Error::new(crate::request::IqError::InternalChannelClosed);
+        assert!(app_state_key_share_requires_reconnect(&channel_closed));
+
+        let disconnected = anyhow::Error::new(crate::request::IqError::Disconnected(Box::new(
+            NodeBuilder::new("disconnect").build(),
+        )));
+        assert!(app_state_key_share_requires_reconnect(&disconnected));
 
         let non_transport = anyhow::anyhow!("pre-wire failure");
         assert!(!app_state_key_share_requires_reconnect(&non_transport));
