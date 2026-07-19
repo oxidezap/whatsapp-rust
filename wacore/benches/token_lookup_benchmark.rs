@@ -41,8 +41,12 @@ fn miss_strings() -> Vec<String> {
         out.push(format!("15551{:07}", i * 7919)); // phone-number users
         out.push(format!("3EB0{:012X}", i.wrapping_mul(0x9E37_79B9))); // msg ids
         out.push(format!("{}", i * 37)); // short numerics
+        out.push(format!("{}", i * 32 + 1)); // in-bucket numerics (the fat 1-4 byte groups)
         out.push(format!("abcdef{:02x}u", i)); // hex-ish short strings
     }
+    // A few short numerics ("0", "37", "407", ...) are real dictionary
+    // tokens; drop them so this stays a pure miss metric.
+    out.retain(|s| index_of_token(s).is_none());
     out
 }
 

@@ -11,29 +11,57 @@ struct Tokens {
     double_byte: Vec<Vec<String>>,
 }
 
-/// Pick the pair of byte positions that best splits the same-length tokens
-/// (smallest worst-case bucket). Two positions instead of one because the
-/// fat length groups (3-4 bytes, ~280 tokens each, mostly numeric) collide
-/// heavily on any single byte.
-fn best_disc_pair(tokens: &[&[u8]], len: usize) -> (u8, u8) {
-    let mut best = (usize::MAX, (0u8, 0u8));
-    for p1 in 0..len {
-        // p2 == p1 is deliberate: for groups a single byte already splits
-        // best, the pair degenerates to that byte repeated.
-        for p2 in p1..len {
-            let mut buckets: HashMap<(u8, u8), usize> = HashMap::new();
-            let mut worst = 0;
-            for t in tokens {
-                let c = buckets.entry((t[p1], t[p2])).or_insert(0);
-                *c += 1;
-                worst = worst.max(*c);
-            }
-            if worst < best.0 {
-                best = (worst, (p1 as u8, p2 as u8));
-            }
+/// Must mirror lookup_bytes in src/token.rs. For len <= 4 the padded word is
+/// the key itself (injective because tokens are NUL-free); longer tokens get
+/// a first4/last4/len signature that the runtime byte-verifies on match.
+fn token_key(b: &[u8]) -> u32 {
+    match *b {
+        [a] => a as u32,
+        [a, b] => u32::from_le_bytes([a, b, 0, 0]),
+        [a, b, c] => u32::from_le_bytes([a, b, c, 0]),
+        [a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
+        _ => {
+            let len = b.len();
+            let head = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            let tail = u32::from_le_bytes([b[len - 4], b[len - 3], b[len - 2], b[len - 1]]);
+            head.rotate_left(11) ^ tail ^ (len as u32).wrapping_mul(0x9E37_79B1)
         }
     }
-    best.1
+}
+
+/// Linear-probing layout: power-of-two size at <= 75% load, multiplier chosen
+/// deterministically so the worst probe chain stays short. Misses stop at the
+/// first empty (0) slot.
+fn build_table(entries: &[(u32, u16, u16)]) -> (u32, Vec<u32>, Vec<u16>, Vec<u16>) {
+    let mut k = usize::BITS - (entries.len() * 4 / 3).leading_zeros();
+    loop {
+        let size = 1usize << k;
+        let mut mul: u32 = 0x9E37_79B1;
+        for _ in 0..256 {
+            let mut keys = vec![0u32; size];
+            let mut meta = vec![0u16; size];
+            let mut off = vec![0u16; size];
+            'insert: {
+                for &(x, m, o) in entries {
+                    let mut h = (x.wrapping_mul(mul) >> (32 - k)) as usize;
+                    let mut disp = 0usize;
+                    while keys[h] != 0 {
+                        h = (h + 1) & (size - 1);
+                        disp += 1;
+                        if disp > 8 {
+                            break 'insert;
+                        }
+                    }
+                    keys[h] = x;
+                    meta[h] = m;
+                    off[h] = o;
+                }
+                return (mul, keys, meta, off);
+            }
+            mul = mul.wrapping_mul(0x85EB_CA6B) | 1;
+        }
+        k += 1;
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,6 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (dict_idx, dict) in tokens.double_byte.iter().enumerate() {
         for (token_idx, token) in dict.iter().enumerate() {
             if !token.is_empty() {
+                // The packed kind offers no compile-time range check (the old
+                // generated TokenKind::Double literals did), so guard here:
+                // an overflowing index would silently bleed into the dict bits.
+                assert!(token_idx < 256, "double-byte token index out of range");
+                assert!(dict_idx + 1 < 256, "double-byte dict index out of range");
                 let kind = u16::try_from((dict_idx + 1) * 256 + token_idx)?;
                 if let Some(existing) = seen.get(token) {
                     panic!("duplicate token {:?}: {} vs {}", token, existing, kind);
@@ -75,111 +108,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Length-bucketed, data-driven lookup. Same probe shape as the previous
-    // code-generated (hashify::tiny_map) lookup — reject by length, then by a
-    // discriminator, full compare only on near-hits — but as ~16 KiB of
-    // static tables instead of ~55 KiB of generated compare chains, and still
-    // with no full-key hash (the encode path probes every stanza string and
-    // most miss, so misses must stay nearly free; a PTHash map was measured
-    // worse here for exactly that reason).
-    //
-    // Layout: entries sorted by (len, disc_key, bytes). Per length L the
-    // entry index range is LEN_START[L]..LEN_START[L+1] and the token bytes
-    // live at LEN_BLOB_START[L] + (i - LEN_START[L]) * L, so no per-entry
-    // offset table is needed. disc_key = key[p1] << 8 | key[p2] with (p1, p2)
-    // chosen per length at build time for the smallest worst-case bucket.
+    // One open-addressing table over every token, replacing the previous
+    // code-generated (hashify::tiny_map) compare chains (~55 KiB of .text)
+    // with ~25 KiB of .rodata. The key is a u32: for len <= 4 the padded
+    // bytes themselves (exact — tokens are NUL-free, so padding can't alias
+    // real bytes, and the meta word's length bits reject "a" vs "a\0"),
+    // otherwise a first4/last4/len mix that the runtime byte-verifies via
+    // TOK_OFF into TOK_BLOB. Misses stop at the first empty slot, so the
+    // encode path's dominant miss traffic costs one multiply and one or two
+    // loads — a full-key PHF over the bytes was measured worse precisely
+    // because it made misses pay the whole hash.
     let max_len = values.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+    assert!(max_len < 256, "length no longer fits blob prefix byte");
 
-    let mut by_len: Vec<Vec<(&[u8], u16)>> = vec![Vec::new(); max_len + 1];
-    for (t, k) in &values {
-        by_len[t.len()].push((t.as_bytes(), *k));
-    }
-
-    let mut disc_pos: Vec<(u8, u8)> = vec![(0, 0); max_len + 1];
-    for (len, group) in by_len.iter().enumerate().skip(1) {
-        if !group.is_empty() {
-            let toks: Vec<&[u8]> = group.iter().map(|(t, _)| *t).collect();
-            disc_pos[len] = best_disc_pair(&toks, len);
-        }
-    }
-
-    let mut len_start: Vec<u16> = Vec::with_capacity(max_len + 2);
-    let mut len_blob_start: Vec<u16> = Vec::with_capacity(max_len + 2);
-    let mut disc_keys: Vec<u16> = Vec::new();
-    let mut kinds: Vec<u16> = Vec::new();
+    // meta layout: bits 0..11 kind, bits 11..16 tag. Tags 0-3 are exact short
+    // lengths (len - 1); tag 31 marks a long token whose length is the blob
+    // prefix byte (48-byte tokens exist, so length can't live in the meta).
     let mut blob: Vec<u8> = Vec::new();
-    // Direct-indexed p1-byte range tables, so a probe whose p1 byte matches no
-    // token of that length dies in a couple of loads (the dominant miss case)
-    // instead of a binary search. Per length: the occurring p1-byte span
-    // [min, max] plus span+1 cumulative entry offsets, all concatenated.
-    let mut d1_min: Vec<u8> = vec![0; max_len + 1];
-    let mut d1_table_start: Vec<u16> = Vec::with_capacity(max_len + 2);
-    let mut d1_off: Vec<u16> = Vec::new();
-
-    for (len, group) in by_len.iter_mut().enumerate() {
-        len_start.push(u16::try_from(disc_keys.len())?);
-        len_blob_start.push(u16::try_from(blob.len())?);
-        d1_table_start.push(u16::try_from(d1_off.len())?);
-        let (p1, p2) = (disc_pos[len].0 as usize, disc_pos[len].1 as usize);
-        group.sort_by_key(|(t, _)| (((t[p1] as u16) << 8) | t[p2] as u16, *t));
-
-        if !group.is_empty() {
-            let min = group.iter().map(|(t, _)| t[p1]).min().unwrap();
-            let max = group.iter().map(|(t, _)| t[p1]).max().unwrap();
-            d1_min[len] = min;
-            // Cumulative offsets, relative to this length's first entry.
-            let mut cum = 0u16;
-            for b in min..=max {
-                d1_off.push(cum);
-                cum += group.iter().filter(|(t, _)| t[p1] == b).count() as u16;
-            }
-            d1_off.push(cum);
-        }
-
-        for (t, k) in group.iter() {
-            disc_keys.push(((t[p1] as u16) << 8) | t[p2] as u16);
-            kinds.push(*k);
-            blob.extend_from_slice(t);
-        }
+    let mut entries: Vec<(u32, u16, u16)> = Vec::new();
+    for (t, k) in &values {
+        let b = t.as_bytes();
+        assert!(!b.contains(&0), "token {t:?} contains NUL");
+        assert!(*k < (1 << 11), "kind overflows meta word");
+        let x = token_key(b);
+        assert!(x != 0, "token key collides with empty-slot sentinel");
+        let (tag, off) = if b.len() <= 4 {
+            (b.len() as u16 - 1, 0)
+        } else {
+            let o = u16::try_from(blob.len())?;
+            blob.push(b.len() as u8);
+            blob.extend_from_slice(b);
+            (31, o)
+        };
+        entries.push((x, *k | (tag << 11), off));
     }
-    len_start.push(u16::try_from(disc_keys.len())?);
-    len_blob_start.push(u16::try_from(blob.len())?);
-    d1_table_start.push(u16::try_from(d1_off.len())?);
 
-    // One 12-byte header per length so a probe's dependent-load chain is one
-    // cache line for all per-length metadata, then the offset pair, then the
-    // candidate bytes.
+    let (tok_mul, tok_keys, tok_meta, tok_off) = build_table(&entries);
     writeln!(file, "const MAX_TOKEN_LEN: usize = {max_len};")?;
-    writeln!(file, "static LEN_HDR: [LenHdr; {}] = [", max_len + 1)?;
-    for len in 0..=max_len {
-        let span_plus_1 = d1_table_start[len + 1] - d1_table_start[len];
-        writeln!(
-            file,
-            "    LenHdr {{ p1: {}, p2: {}, d1_min: {}, span_plus_1: {}, d1_table: {}, entry_start: {}, blob_start: {} }},",
-            disc_pos[len].0,
-            disc_pos[len].1,
-            d1_min[len],
-            span_plus_1,
-            d1_table_start[len],
-            len_start[len],
-            len_blob_start[len],
-        )?;
-    }
-    writeln!(file, "];")?;
+    writeln!(file, "const TOK_MUL: u32 = {tok_mul};")?;
     writeln!(
         file,
-        "static DISC_KEYS: [u16; {}] = {:?};",
-        disc_keys.len(),
-        disc_keys
+        "const TOK_SHIFT: u32 = {};",
+        32 - tok_keys.len().trailing_zeros()
     )?;
-    writeln!(file, "static KINDS: [u16; {}] = {:?};", kinds.len(), kinds)?;
-    writeln!(file, "static BLOB: [u8; {}] = {:?};", blob.len(), blob)?;
+    writeln!(file, "const TOK_MASK: usize = {};", tok_keys.len() - 1)?;
     writeln!(
         file,
-        "static D1_OFF: [u16; {}] = {:?};",
-        d1_off.len(),
-        d1_off
+        "static TOK_KEYS: [u32; {}] = {:?};",
+        tok_keys.len(),
+        tok_keys
     )?;
+    writeln!(
+        file,
+        "static TOK_META: [u16; {}] = {:?};",
+        tok_meta.len(),
+        tok_meta
+    )?;
+    writeln!(
+        file,
+        "static TOK_OFF: [u16; {}] = {:?};",
+        tok_off.len(),
+        tok_off
+    )?;
+    writeln!(file, "static TOK_BLOB: [u8; {}] = {:?};", blob.len(), blob)?;
 
     // Decode arrays: index → string
     writeln!(file, "\nstatic SINGLE_BYTE_TOKENS: &[&str] = &[")?;

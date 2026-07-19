@@ -28,71 +28,88 @@ pub enum TokenKind {
     Double(u8, u8),
 }
 
-/// Per-length probe metadata; layout mirrors what build.rs emits.
-struct LenHdr {
-    p1: u8,
-    p2: u8,
-    d1_min: u8,
-    /// Stored as span + 1 so 0 doubles as the empty-length sentinel: the
-    /// `idx + 1 >= span_plus_1` check then rejects every probe without a
-    /// separate branch.
-    span_plus_1: u16,
-    d1_table: u16,
-    entry_start: u16,
-    blob_start: u16,
-}
-
 include!(concat!(env!("OUT_DIR"), "/token_maps.rs"));
 
-/// Length-bucketed probe over the build-generated static tables (see
-/// build.rs for the layout and the miss-speed rationale). No full-key hash:
-/// a miss is rejected by length or by a two-byte discriminator before any
-/// full compare runs.
+/// One open-addressing probe over the build-generated table (layout and
+/// rationale in build.rs). Keys of length <= 4 — the bulk of probe traffic —
+/// are matched exactly by their padded u32; longer keys match a two-load
+/// signature first and byte-verify only on signature hits, so a miss of any
+/// shape costs a handful of instructions and no full compare.
+#[inline]
 pub fn index_of_token(token: &str) -> Option<TokenKind> {
     lookup_bytes(token.as_bytes())
 }
 
+#[inline(always)]
+fn decode_kind(kind: u16) -> TokenKind {
+    if kind < SINGLE_BYTE_MAX {
+        TokenKind::Single(kind as u8)
+    } else {
+        TokenKind::Double((kind >> 8) as u8 - 1, kind as u8)
+    }
+}
+
+#[inline(always)]
 fn lookup_bytes(key: &[u8]) -> Option<TokenKind> {
     let len = key.len();
     if len == 0 || len > MAX_TOKEN_LEN {
         return None;
     }
-    let h = &LEN_HDR[len];
-    let b1 = key[h.p1 as usize];
-
-    // Range table on the primary discriminator byte: a probe whose p1 byte
-    // matches no token of this length (the dominant miss case) exits on the
-    // span/offset checks, before any comparison loop.
-    let idx = (b1 as usize).checked_sub(h.d1_min as usize)?;
-    if idx + 1 >= h.span_plus_1 as usize {
-        return None;
-    }
-
-    let start = h.entry_start as usize;
-    let tstart = h.d1_table as usize;
-    let run_start = start + D1_OFF[tstart + idx] as usize;
-    let run_end = start + D1_OFF[tstart + idx + 1] as usize;
-    let disc = ((b1 as u16) << 8) | key[h.p2 as usize] as u16;
-    let blob_base = h.blob_start as usize;
-
-    // Early exit is sound only because build.rs sorts each run by (b2, bytes).
-    for i in run_start..run_end {
-        if DISC_KEYS[i] > disc {
-            break;
+    // Key derivation must mirror build.rs exactly. For len <= 4 the padded
+    // word IS the key (tokens are NUL-free, so padding can't collide with
+    // real bytes) and the meta tag pins the exact length; longer keys match
+    // a signature and byte-verify against the length-prefixed blob. In both
+    // loops 0 marks an empty slot (build.rs asserts no key is 0), so most
+    // misses stop on the first load, and a false key match — an alias across
+    // the short/long split or a signature collision — just keeps probing:
+    // the real owner may live further down the chain.
+    if len <= 4 {
+        let x = match *key {
+            [a] => a as u32,
+            [a, b] => u32::from_le_bytes([a, b, 0, 0]),
+            [a, b, c] => u32::from_le_bytes([a, b, c, 0]),
+            _ => u32::from_le_bytes([key[0], key[1], key[2], key[3]]),
+        };
+        let mut h = (x.wrapping_mul(TOK_MUL) >> TOK_SHIFT) as usize;
+        loop {
+            let k = TOK_KEYS[h];
+            if k == 0 {
+                return None;
+            }
+            if k == x {
+                let meta = TOK_META[h];
+                if (meta >> 11) as usize == len - 1 {
+                    return Some(decode_kind(meta & 0x7FF));
+                }
+            }
+            h = (h + 1) & TOK_MASK;
         }
-        if DISC_KEYS[i] == disc {
-            let off = blob_base + (i - start) * len;
-            if &BLOB[off..off + len] == key {
-                let kind = KINDS[i];
-                return Some(if kind < SINGLE_BYTE_MAX {
-                    TokenKind::Single(kind as u8)
-                } else {
-                    TokenKind::Double((kind >> 8) as u8 - 1, kind as u8)
-                });
+    }
+    let head = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+    let tail = u32::from_le_bytes([key[len - 4], key[len - 3], key[len - 2], key[len - 1]]);
+    let x = head.rotate_left(11) ^ tail ^ (len as u32).wrapping_mul(0x9E37_79B1);
+    let mut h = (x.wrapping_mul(TOK_MUL) >> TOK_SHIFT) as usize;
+    loop {
+        let k = TOK_KEYS[h];
+        if k == 0 {
+            return None;
+        }
+        if k == x {
+            let meta = TOK_META[h];
+            if meta >> 11 == 31 {
+                let off = TOK_OFF[h] as usize;
+                if TOK_BLOB[off] as usize == len
+                    && TOK_BLOB[off + 1..off + 1 + len]
+                        .iter()
+                        .zip(key)
+                        .all(|(a, b)| a == b)
+                {
+                    return Some(decode_kind(meta & 0x7FF));
+                }
             }
         }
+        h = (h + 1) & TOK_MASK;
     }
-    None
 }
 
 pub fn get_single_token(index: u8) -> Option<&'static str> {
