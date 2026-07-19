@@ -644,6 +644,8 @@ impl Client {
         mut message: Box<wa::Message>,
         options: SendOptions,
     ) -> Result<SendResult, SendError> {
+        // TEMP-DIAG(#1053)
+        log::info!("TEMP-DIAG send begin to {}", to.observe());
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 

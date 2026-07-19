@@ -785,7 +785,8 @@ impl Client {
 
         backend.set_version(name.as_str(), state.clone()).await?;
 
-        debug!(target: "Client/AppState", "Completed and saved app state sync for {:?} (final version={})", name, state.version);
+        // TEMP-DIAG(#1053)
+        log::info!(target: "Client/AppState", "TEMP-DIAG sync task complete for {:?} (final version={})", name, state.version);
         Ok(())
     }
 
