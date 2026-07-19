@@ -1001,12 +1001,6 @@ impl Client {
         if raw_key_ids.is_empty() {
             return Ok(AppStateKeyRequestDelivery::AllPeers);
         }
-        // TEMP-DIAG4(#1053)
-        log::info!(
-            "TEMP4 appstate key request begin n={} (drain_active={})",
-            raw_key_ids.len(),
-            self.inbound_commit_batch.is_active()
-        );
         let peers = self.app_state_key_request_peers().await?;
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
             .iter()
