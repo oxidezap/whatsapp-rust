@@ -25,14 +25,8 @@ env:
   # Freeze glibc malloc's adaptive thresholds: mmap/trim/arena decisions vary
   # with allocation history and read as spurious instruction/memory deltas
   # under the deterministic instruments (codspeed.io/docs -> reducing-variance).
-  # The mmap threshold sits BELOW the large bench payloads (~119 KB) on
-  # purpose: brk-heap chunks that size linger in fastbins after a bench's
-  # teardown, and the NEXT bench's first malloc pays malloc_consolidate
-  # inside its measured window (PR #1057 flamegraph: a heap-neighborhood
-  # change misread as a -29% regression on an untouched bench). mmap'd
-  # chunks go back to the OS on free and can't leak state across benches.
   MALLOC_ARENA_MAX: "1"
-  MALLOC_MMAP_THRESHOLD_: "65536"
+  MALLOC_MMAP_THRESHOLD_: "131072"
   MALLOC_TRIM_THRESHOLD_: "131072"
   MALLOC_TOP_PAD_: "131072"
 
