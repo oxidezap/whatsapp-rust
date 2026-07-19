@@ -704,7 +704,7 @@ impl Client {
             info.id,
             info.source.sender.observe()
         );
-        self.dispatch_parsed_message(msg, info).await;
+        self.dispatch_parsed_message(msg, info, false).await;
     }
 
     /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when

@@ -1,7 +1,8 @@
 use e2e_tests::TestClient;
 use log::info;
+use wacore::store::traits::AppSyncStore;
 use wacore::types::events::Event;
-use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust::{NodeFilter, waproto::whatsapp as wa};
 
 // ─── Initial Sync Tests ─────────────────────────────────────────────
 
@@ -252,10 +253,9 @@ async fn test_star_received_message() -> anyhow::Result<()> {
 async fn test_multi_device_app_state_sync() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    // Both clients use the same push_name → mock server assigns them the same phone
-    let push_name = "multidev_test_user";
-    let mut client_a1 = TestClient::connect_as("e2e_multidev_a1", push_name).await?;
-    let mut client_a2 = TestClient::connect_as("e2e_multidev_a2", push_name).await?;
+    let push_name = e2e_tests::unique_push_name("e2e_multidev");
+    let mut client_a1 = TestClient::connect_as("e2e_multidev_a1", &push_name).await?;
+    let mut client_a2 = TestClient::connect_as("e2e_multidev_a2", &push_name).await?;
 
     // Verify both devices got the same phone number
     let phone_a1 = client_a1.client.get_pn().expect("A1 should have JID");
@@ -300,6 +300,110 @@ async fn test_multi_device_app_state_sync() -> anyhow::Result<()> {
 
     client_a1.disconnect().await;
     client_a2.disconnect().await;
+    Ok(())
+}
+
+// ─── Recovery Tests ─────────────────────────────────────────────────
+
+/// A missing decode key must remain recoverable when the pairing session is absent.
+#[tokio::test]
+async fn test_missing_key_request_rebuilds_primary_session() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let account = e2e_tests::unique_push_name("e2e_as_key_recovery");
+    let mut client_b = TestClient::connect_as("e2e_as_key_recovery_b", &account).await?;
+    let mut client_a = TestClient::connect_as("e2e_as_key_recovery_a", &account).await?;
+    client_b.wait_for_app_state_sync().await?;
+    client_a.wait_for_app_state_sync().await?;
+
+    let key_id = client_a
+        .backend
+        .get_latest_sync_key_id()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("initial key share did not store a sync key"))?;
+    assert!(
+        client_a.backend.remove_sync_key_for_test(&key_id).await,
+        "active sync key must exist before the simulated loss"
+    );
+
+    let primary = client_a.jid().await;
+    let sibling = client_b
+        .client
+        .get_pn()
+        .ok_or_else(|| anyhow::anyhow!("sibling PN missing after connect"))?;
+    assert_ne!(
+        sibling.device, 0,
+        "the sibling companion must have a non-primary device id"
+    );
+    client_a
+        .client
+        .signal()
+        .delete_sessions(std::slice::from_ref(&primary))
+        .await?;
+    assert!(
+        !client_a.client.signal().validate_session(&primary).await?,
+        "primary session must be absent before recovery"
+    );
+
+    let primary_request = client_a.client.wait_for_sent_node(
+        NodeFilter::tag("message")
+            .attr("category", "peer")
+            .attr("to", primary.to_string()),
+    );
+    let sibling_request = client_a.client.wait_for_sent_node(
+        NodeFilter::tag("message")
+            .attr("category", "peer")
+            .attr("to", sibling.to_string()),
+    );
+    let requester_lid = client_a
+        .client
+        .get_lid()
+        .ok_or_else(|| anyhow::anyhow!("requester LID missing after connect"))?;
+    let sibling_share = client_b.client.wait_for_sent_node(
+        NodeFilter::tag("message")
+            .attr("category", "peer")
+            .attr("to", requester_lid.to_string()),
+    );
+    let updated_name = e2e_tests::unique_push_name("key_recovery_update");
+    client_b
+        .client
+        .profile()
+        .set_push_name(&updated_name)
+        .await?;
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), primary_request)
+        .await
+        .map_err(|_| anyhow::anyhow!("missing-key recovery did not request the primary"))?
+        .map_err(|_| anyhow::anyhow!("primary request waiter was canceled"))?;
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), sibling_request)
+        .await
+        .map_err(|_| anyhow::anyhow!("missing-key recovery did not request the sibling"))?
+        .map_err(|_| anyhow::anyhow!("sibling request waiter was canceled"))?;
+    let sibling_share = tokio::time::timeout(tokio::time::Duration::from_secs(10), sibling_share)
+        .await
+        .map_err(|_| anyhow::anyhow!("the sibling did not return an app-state key share"))?
+        .map_err(|_| anyhow::anyhow!("sibling key-share waiter was canceled"))?;
+    let share_target = sibling_share
+        .attrs()
+        .optional_jid("to")
+        .ok_or_else(|| anyhow::anyhow!("sibling key share had no target"))?;
+    assert_eq!(
+        share_target, requester_lid,
+        "the key share must return only to the requesting device"
+    );
+    assert!(
+        client_a.client.signal().validate_session(&primary).await?,
+        "missing-key recovery must establish the primary session"
+    );
+    client_a.wait_for_sync_key(&key_id, 10).await?;
+    client_a
+        .wait_for_event(10, |event| {
+            matches!(event, Event::SelfPushNameUpdated(update) if update.new_name == updated_name)
+        })
+        .await?;
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
     Ok(())
 }
 
