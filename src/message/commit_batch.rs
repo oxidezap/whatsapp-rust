@@ -245,15 +245,22 @@ impl Client {
 
     /// Batch a message decrypted while the offline drain is active, or commit
     /// immediately (batch of one) on the live path.
-    pub(crate) async fn commit_or_batch_inbound(self: &Arc<Self>, item: InboundMessage) {
+    pub(crate) async fn commit_or_batch_inbound(
+        self: &Arc<Self>,
+        item: InboundMessage,
+    ) -> InboundCommitState {
         if !self.inbound_commit_batch.is_active() {
             // Arc::from([item]) builds the event/hook slice in one allocation;
             // a Vec would add an alloc+dealloc per live message (measured
             // ~18ns and 2x the allocations of this step).
-            let _ = self
+            return if self
                 .commit_inbound_batch(std::sync::Arc::from([item]), BatchOrigin::Live)
-                .await;
-            return;
+                .await
+            {
+                InboundCommitState::Durable
+            } else {
+                InboundCommitState::Failed
+            };
         }
         if let Some(epoch) = self.enqueue_inbound_commit(item) {
             // Weak: a sleeper must not keep the whole Client graph alive for
@@ -276,6 +283,7 @@ impl Client {
                 }))
                 .detach();
         }
+        InboundCommitState::Deferred
     }
 
     /// Size/byte-cap check, run at the end of stanza processing while the
@@ -408,6 +416,8 @@ impl Client {
         // the durable flush that triggered this completion persisted their
         // Signal state.
         self.flush_offline_receipts();
+        // Key-share jobs may have observed the earlier failed transition.
+        self.offline_sync_notifier.notify(usize::MAX);
         log::info!("Deferred drain-to-live transition completed after a durable flush");
     }
 

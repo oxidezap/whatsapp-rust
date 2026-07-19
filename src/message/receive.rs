@@ -1479,19 +1479,23 @@ impl Client {
             }
         }
 
+        let mut app_state_key_share_job = None;
         if let Some(protocol_msg) = msg.protocol_message.as_option()
             && let Some(request) = protocol_msg.app_state_sync_key_request.as_option()
         {
             if info.source.is_from_me {
-                if let Err(error) = self
-                    .handle_app_state_sync_key_request(request, &info.source.sender)
-                    .await
-                {
-                    warn!(
-                        "[msg:{}] Failed to answer app_state_sync_key_request from {}: {error:?}",
-                        info.id,
-                        info.source.sender.observe()
-                    );
+                match self.prepare_app_state_sync_key_share(request).await {
+                    Ok((message, message_id)) => {
+                        app_state_key_share_job =
+                            Some((info.source.sender.clone(), message, message_id));
+                    }
+                    Err(error) => {
+                        warn!(
+                            "[msg:{}] Failed to prepare app_state_sync_key_share for {}: {error:?}",
+                            info.id,
+                            info.source.sender.observe()
+                        );
+                    }
                 }
             } else {
                 warn!(
@@ -1567,7 +1571,17 @@ impl Client {
                 ..Default::default()
             })
         } else {
-            self.dispatch_parsed_message(msg, info).await;
+            let commit_state = self.dispatch_parsed_message(msg, info).await;
+            if let Some((requester, message, message_id)) = app_state_key_share_job {
+                if commit_state == InboundCommitState::Failed {
+                    warn!(
+                        "[msg:{}] Deferring app-state key-share recovery to the requester's retry because the inbound request was not durable",
+                        info.id
+                    );
+                } else {
+                    self.schedule_app_state_sync_key_share(requester, message, message_id);
+                }
+            }
             Ok(PlaintextHandleOutcome {
                 dispatched: true,
                 ..Default::default()

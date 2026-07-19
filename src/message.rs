@@ -100,6 +100,13 @@ pub(crate) struct PlaintextHandleOutcome {
     skdm_only: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InboundCommitState {
+    Durable,
+    Deferred,
+    Failed,
+}
+
 /// A decrypted session plaintext buffered during the locked decrypt loop and
 /// handled after the per-sender session lock is released.
 struct DeferredPlaintext {

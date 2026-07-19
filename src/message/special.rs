@@ -3,6 +3,9 @@
 use super::*;
 use buffa::Message as _;
 
+const APP_STATE_KEY_SHARE_SEND_ATTEMPTS: u8 = 3;
+const APP_STATE_KEY_SHARE_SEND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Client {
     /// Handles a newsletter plaintext message.
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
@@ -172,13 +175,12 @@ impl Client {
 
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.recv.appstate_key_request", level = "debug", skip_all, fields(requester = %requester.observe(), count = request.key_ids.len()), err(Debug))
+        tracing::instrument(name = "wa.recv.appstate_key_request.prepare", level = "debug", skip_all, fields(count = request.key_ids.len()), err(Debug))
     )]
-    pub(crate) async fn handle_app_state_sync_key_request(
+    pub(crate) async fn prepare_app_state_sync_key_share(
         &self,
         request: &wa::message::AppStateSyncKeyRequest,
-        requester: &Jid,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(wa::Message, String), anyhow::Error> {
         let share = self.build_app_state_sync_key_share(request).await?;
         let message = wa::Message {
             protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
@@ -188,13 +190,123 @@ impl Client {
             }),
             ..Default::default()
         };
+        Ok((message, self.generate_message_id()))
+    }
 
+    pub(crate) fn schedule_app_state_sync_key_share(
+        self: &Arc<Self>,
+        requester: Jid,
+        message: wa::Message,
+        message_id: String,
+    ) {
+        let weak = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                let mut attempt = 0;
+                let mut retry_delay = APP_STATE_KEY_SHARE_SEND_RETRY;
+                let mut reconnect_after = None;
+
+                loop {
+                    let wait_deadline =
+                        wacore::time::Instant::now() + Client::DEFAULT_OFFLINE_SYNC_TIMEOUT;
+                    loop {
+                        let Some(client) = weak.upgrade() else {
+                            return;
+                        };
+                        let listener = client.offline_sync_notifier.listen();
+                        let ready = client
+                            .offline_sync_completed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            && !client.inbound_commit_batch.is_active()
+                            && reconnect_after.is_none_or(|generation| {
+                                client
+                                    .connection_generation
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                    != generation
+                            });
+                        drop(client);
+
+                        if ready {
+                            reconnect_after = None;
+                            break;
+                        }
+                        let remaining = wait_deadline
+                            .saturating_duration_since(wacore::time::Instant::now());
+                        if remaining.is_zero()
+                            || wacore::runtime::timeout(&*runtime, remaining, listener)
+                                .await
+                                .is_err()
+                        {
+                            warn!(
+                                "Dropping deferred app-state key share to {} after offline sync timeout",
+                                requester.observe()
+                            );
+                            return;
+                        }
+                    }
+
+                    let Some(client) = weak.upgrade() else {
+                        return;
+                    };
+                    let Some(flush_guard) = client.outbound_flush.try_track() else {
+                        return;
+                    };
+                    let send_generation = client
+                        .connection_generation
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let result = client
+                        .send_app_state_sync_key_share_once(
+                            &requester,
+                            &message,
+                            &message_id,
+                        )
+                        .await;
+                    drop(flush_guard);
+                    drop(client);
+
+                    let Err(error) = result else {
+                        return;
+                    };
+                    attempt += 1;
+                    warn!(
+                        "App-state key share to {} failed (attempt {attempt}/{APP_STATE_KEY_SHARE_SEND_ATTEMPTS}): {error}",
+                        requester.observe()
+                    );
+                    if attempt >= APP_STATE_KEY_SHARE_SEND_ATTEMPTS {
+                        return;
+                    }
+
+                    let transport_unavailable = error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::socket::error::EncryptSendError>()
+                            .is_some_and(
+                                crate::socket::error::EncryptSendError::is_transport_unavailable,
+                            )
+                    });
+                    if transport_unavailable {
+                        reconnect_after = Some(send_generation);
+                    } else {
+                        runtime.sleep(retry_delay).await;
+                    }
+                    retry_delay = retry_delay.saturating_mul(2);
+                }
+            }))
+            .detach();
+    }
+
+    async fn send_app_state_sync_key_share_once(
+        &self,
+        requester: &Jid,
+        message: &wa::Message,
+        message_id: &str,
+    ) -> Result<(), anyhow::Error> {
         self.ensure_e2e_sessions(std::slice::from_ref(requester))
             .await?;
         self.send_message_impl(
             requester.clone(),
-            &message,
-            Some(self.generate_message_id()),
+            message,
+            Some(message_id.to_owned()),
             true,
             false,
             None,

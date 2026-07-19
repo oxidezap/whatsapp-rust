@@ -5659,6 +5659,21 @@ fn decode_frame(index: usize, frame: &[u8]) -> Option<Vec<u8>> {
     (!buf.is_empty()).then_some(buf)
 }
 
+fn has_message_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> bool {
+    frames.iter().enumerate().skip(start).any(|(index, frame)| {
+        let Some(buf) = decode_frame(index, frame) else {
+            return false;
+        };
+        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+            return false;
+        };
+        node.tag.as_ref() == "message"
+            && node
+                .get_attr("to")
+                .is_some_and(|value| value.as_str() == to)
+    })
+}
+
 /// First `<ack class="message">` on the wire as `(to, recipient)`.
 fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)> {
     for (i, frame) in frames.iter().enumerate() {
@@ -7797,6 +7812,181 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
         orphan.key_data.is_unset(),
         "an unknown ID must be returned without fabricated key data"
     );
+}
+
+#[tokio::test]
+async fn app_state_key_share_waits_outside_the_offline_message_lane() {
+    use std::sync::atomic::Ordering;
+    use wacore::messages::MessageUtils;
+
+    let (client, transport) = capturing_client("appstate_key_share_offline").await;
+    let requester_str = "5511000000001:33@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+
+    client
+        .offline_sync_completed
+        .store(false, Ordering::Release);
+    let _ = client.inbound_commit_batch.reset();
+    client.swap_message_semaphore(1);
+    assert!(client.inbound_commit_batch.is_active());
+    let request = wa::Message {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+            app_state_sync_key_request: buffa::MessageField::some(
+                wa::message::AppStateSyncKeyRequest {
+                    key_ids: vec![wa::message::AppStateSyncKeyId {
+                        key_id: Some(vec![1, 2, 3, 4]),
+                    }],
+                },
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut info = create_test_message_info(requester_str, "AKR_OFFLINE", requester_str);
+    info.source.is_from_me = true;
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        client.handle_decrypted_plaintext(
+            "msg",
+            &MessageUtils::encode_and_pad(&request),
+            2,
+            &Arc::new(info),
+        ),
+    )
+    .await
+    .expect("the inbound lane must not wait for offline sync")
+    .expect("handle key request");
+
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        transport.sent_count(),
+        sent_before,
+        "the response must stay deferred while the inbound drain is active"
+    );
+
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    assert!(
+        !client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the injected commit failure must keep the request non-durable"
+    );
+    client.offline_sync_completed.store(true, Ordering::Release);
+    client.offline_sync_notifier.notify(usize::MAX);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !has_message_to_after(&transport.sent(), sent_before, requester_str),
+        "a non-durable request must not put a key share on the wire"
+    );
+
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(false, Ordering::Release);
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await,
+        "the retried inbound commit must become durable"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut observed = sent_before;
+        loop {
+            let count = transport.sent_count();
+            if count != observed {
+                observed = count;
+                if has_message_to_after(&transport.sent(), sent_before, requester_str) {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred key share should send after the drain");
+}
+
+#[tokio::test]
+async fn app_state_key_share_transport_retry_waits_for_reconnect() {
+    let (client, transport) = capturing_client("appstate_key_share_retry").await;
+    let requester_str = "5511000000001:34@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+    let request = wa::message::AppStateSyncKeyRequest {
+        key_ids: vec![wa::message::AppStateSyncKeyId {
+            key_id: Some(vec![4, 3, 2, 1]),
+        }],
+    };
+    let (message, message_id) = client
+        .prepare_app_state_sync_key_share(&request)
+        .await
+        .expect("prepare key share");
+
+    transport.fail_next_sends(1);
+    client.schedule_app_state_sync_key_share(requester, message, message_id);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.failed_sends() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("key-share job should observe the transport failure");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        transport.sent_count(),
+        sent_before,
+        "an uncertain transport failure must not retry on the same Noise connection"
+    );
+
+    client
+        .connection_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    client.offline_sync_notifier.notify(usize::MAX);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.sent_count() == sent_before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("key-share job should retry on the new connection generation");
+
+    assert_eq!(transport.failed_sends(), 1);
+    assert!(transport.sent_count() > sent_before);
 }
 
 /// Security regression: the primary's `lid_migration_mapping_sync_message`
