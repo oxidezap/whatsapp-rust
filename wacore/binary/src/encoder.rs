@@ -291,24 +291,18 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
     let server = &input[server_start..];
     let user_combined = &input[..sep_idx];
 
-    let (user_agent, device) = if let Some(colon_idx) = user_combined.find(':') {
-        let device_part = &user_combined[colon_idx + 1..];
-        if let Ok(parsed_device) = device_part.parse::<u8>() {
-            (&user_combined[..colon_idx], Some(parsed_device))
-        } else {
-            (user_combined, None)
-        }
+    let (user_agent, device) = if let Some(colon_idx) = user_combined.find(':')
+        && let Ok(parsed_device) = user_combined[colon_idx + 1..].parse::<u8>()
+    {
+        (&user_combined[..colon_idx], Some(parsed_device))
     } else {
         (user_combined, None)
     };
 
-    let user_end = if let Some(underscore_idx) = user_agent.find('_') {
-        let agent_part = &user_agent[underscore_idx + 1..];
-        if agent_part.parse::<u8>().is_ok() {
-            underscore_idx
-        } else {
-            user_agent.len()
-        }
+    let user_end = if let Some(underscore_idx) = user_agent.find('_')
+        && user_agent[underscore_idx + 1..].parse::<u8>().is_ok()
+    {
+        underscore_idx
     } else {
         user_agent.len()
     };
