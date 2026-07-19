@@ -1058,6 +1058,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod window_tests {
     use wacore::libsignal::protocol::PublicKey;
 

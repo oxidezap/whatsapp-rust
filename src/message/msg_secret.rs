@@ -464,12 +464,10 @@ impl Client {
         info: &Arc<MessageInfo>,
         payload: EncPayload,
     ) {
-        use buffa::Message as _;
-        use wa::MessageSecretMessage;
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
-        let ms_msg = match MessageSecretMessage::decode_from_slice(&payload.ciphertext) {
+        let ms_msg = match waproto::codec::message_secret_message_decode(&payload.ciphertext) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(

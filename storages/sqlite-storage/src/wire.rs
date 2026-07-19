@@ -8,6 +8,10 @@
 //! equivalents (same field numbers, same proto3 semantics). Domain types in
 //! `wacore` stay untouched; conversion happens only at this boundary.
 
+// Crate-local wire protos: this file is their sole instantiation site, so
+// direct buffa calls duplicate nothing and there is no waproto::codec home.
+#![allow(clippy::disallowed_methods)]
+
 use buffa::Message as _;
 use wacore::appstate::hash::HashState;
 use wacore::store::device::{CachedNoiseCert, CachedServerCertChain};

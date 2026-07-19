@@ -4,6 +4,9 @@
 //! 1. Patches have external_mutations that need to be downloaded
 //! 2. REMOVE mutations reference entries we don't have locally (hasMissingRemove)
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use buffa::Message;
 use wacore::appstate::WAPATCH_INTEGRITY;
 use wacore::appstate::hash::{HashState, generate_content_mac};

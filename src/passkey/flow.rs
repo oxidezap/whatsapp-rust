@@ -617,6 +617,7 @@ pub(crate) async fn handle_passkey_continuation(client: &Arc<Client>, node: Arc<
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::test_utils::{TestEventCollector, create_test_client, node_to_owned_ref};

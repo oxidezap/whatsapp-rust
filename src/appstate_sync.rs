@@ -3,6 +3,7 @@ pub use wacore::appstate::Mutation;
 pub use wacore::appstate_sync::{AppStateProcessor, AppStateSyncDriver, AppStateSyncError};
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use async_lock::Mutex;

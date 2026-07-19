@@ -32,6 +32,8 @@ fn main() -> std::io::Result<()> {
     let out_path = std::path::PathBuf::from(&out_dir);
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
+    // Build-time descriptor decode — nothing to pin in waproto::codec.
+    #[allow(clippy::disallowed_methods)]
     let fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
         .map_err(std::io::Error::other)?;
     generate_tags(&fds, &out_path.join("tags.rs"))?;

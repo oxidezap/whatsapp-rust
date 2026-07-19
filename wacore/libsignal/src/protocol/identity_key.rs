@@ -134,6 +134,8 @@ impl IdentityKeyPair {
     }
 
     /// Return a byte slice which can later be deserialized with [`Self::try_from`].
+    // IdentityKeyPairStructure round-trips only here; no codec pin needed.
+    #[allow(clippy::disallowed_methods)]
     pub fn serialize(&self) -> Box<[u8]> {
         let structure = IdentityKeyPairStructure {
             public_key: Some(self.identity_key.serialize().to_vec()),
@@ -164,6 +166,7 @@ impl IdentityKeyPair {
 impl TryFrom<&[u8]> for IdentityKeyPair {
     type Error = SignalProtocolError;
 
+    #[allow(clippy::disallowed_methods)]
     fn try_from(value: &[u8]) -> Result<Self> {
         let structure = IdentityKeyPairStructure::decode_from_slice(value)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;

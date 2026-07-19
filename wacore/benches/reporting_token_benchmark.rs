@@ -1,3 +1,6 @@
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use buffa::Message;
 use divan::black_box;
 use wacore::reporting_token::{

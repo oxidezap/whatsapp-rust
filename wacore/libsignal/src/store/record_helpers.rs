@@ -124,7 +124,10 @@ pub fn signed_prekey_structure_to_record(
     )
 }
 
+// Tests intentionally exercise the raw buffa Message methods: the borrowed
+// encoder is verified byte-for-byte against the owned trait encoder.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocol::{GenericSignedPreKey, KeyPair, PreKeyRecord};

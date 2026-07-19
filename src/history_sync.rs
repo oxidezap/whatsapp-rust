@@ -625,6 +625,7 @@ fn push_unique_sender(senders: &mut Vec<Jid>, sender: Jid) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use buffa::Message as ProtoMessage;

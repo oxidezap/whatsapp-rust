@@ -1869,6 +1869,7 @@ pub struct TcTokenCandidate {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use buffa::Message;
