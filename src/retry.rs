@@ -1,7 +1,6 @@
 use crate::client::Client;
 use crate::message::RetryReason;
 use crate::types::events::Receipt;
-use buffa::Message;
 use log::{debug, info, warn};
 use wacore::types::message::MessageCategory;
 
@@ -1149,11 +1148,11 @@ impl Client {
             // Validate the account BEFORE reserving/marking the prekey: a missing
             // account bails here, and marking after would abandon a one-time
             // prekey from the upload window without any receipt going out.
-            let device_identity_bytes = device_snapshot
-                .account
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing device account info for retry receipt"))?
-                .encode_to_vec();
+            let device_identity_bytes = waproto::codec::adv_signed_device_identity_to_vec(
+                device_snapshot.account.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing device account info for retry receipt")
+                })?,
+            );
 
             // markKeyAsUploaded: the retry prekey goes directly to the peer, so
             // it must not also be re-offered to the server pool (a third party

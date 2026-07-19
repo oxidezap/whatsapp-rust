@@ -275,6 +275,128 @@ pub mod codec {
     pub fn sync_action_data_to_vec(data: &whatsapp::SyncActionData) -> Vec<u8> {
         data.encode_to_vec()
     }
+
+    /// Signal storage records. Decoded/encoded from wacore-libsignal and the
+    /// prekey upload paths in the main crate — two private copies of each tree
+    /// before being pinned here.
+    #[inline(never)]
+    pub fn pre_key_record_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::PreKeyRecordStructure, buffa::DecodeError> {
+        whatsapp::PreKeyRecordStructure::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn pre_key_record_to_vec(record: &whatsapp::PreKeyRecordStructure) -> Vec<u8> {
+        record.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn signed_pre_key_record_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SignedPreKeyRecordStructure, buffa::DecodeError> {
+        whatsapp::SignedPreKeyRecordStructure::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn signed_pre_key_record_to_vec(record: &whatsapp::SignedPreKeyRecordStructure) -> Vec<u8> {
+        record.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn sender_key_record_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SenderKeyRecordStructure, buffa::DecodeError> {
+        whatsapp::SenderKeyRecordStructure::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn sender_key_record_to_vec(record: &whatsapp::SenderKeyRecordStructure) -> Vec<u8> {
+        record.encode_to_vec()
+    }
+
+    /// Pairing / device-identity roots. The ADV trees were instantiated in
+    /// both wacore (adv verification, pair-success, device store) and the main
+    /// crate (pairing events, retry receipts).
+    #[inline(never)]
+    pub fn adv_signed_device_identity_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ADVSignedDeviceIdentity, buffa::DecodeError> {
+        whatsapp::ADVSignedDeviceIdentity::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn adv_signed_device_identity_to_vec(id: &whatsapp::ADVSignedDeviceIdentity) -> Vec<u8> {
+        id.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn adv_signed_device_identity_hmac_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ADVSignedDeviceIdentityHMAC, buffa::DecodeError> {
+        whatsapp::ADVSignedDeviceIdentityHMAC::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn adv_signed_key_index_list_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ADVSignedKeyIndexList, buffa::DecodeError> {
+        whatsapp::ADVSignedKeyIndexList::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn adv_key_index_list_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ADVKeyIndexList, buffa::DecodeError> {
+        whatsapp::ADVKeyIndexList::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn client_pairing_props_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ClientPairingProps, buffa::DecodeError> {
+        whatsapp::ClientPairingProps::decode_from_slice(bytes)
+    }
+
+    /// Connection handshake roots (once per connection, but the ClientPayload
+    /// tree — UserAgent, WebInfo, DevicePairingRegistrationData — is wide).
+    #[inline(never)]
+    pub fn client_payload_to_vec(payload: &whatsapp::ClientPayload) -> Vec<u8> {
+        payload.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn device_props_to_vec(props: &whatsapp::DeviceProps) -> Vec<u8> {
+        props.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn handshake_message_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::HandshakeMessage, buffa::DecodeError> {
+        whatsapp::HandshakeMessage::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn handshake_message_to_vec(msg: &whatsapp::HandshakeMessage) -> Vec<u8> {
+        msg.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn lid_migration_mapping_sync_payload_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::LIDMigrationMappingSyncPayload, buffa::DecodeError> {
+        whatsapp::LIDMigrationMappingSyncPayload::decode_from_slice(bytes)
+    }
+
+    /// Owned decode of the Go-style SKDM fallback in message/special.rs; the
+    /// hot SKDM path stays on libsignal's view decode.
+    #[inline(never)]
+    pub fn sender_key_distribution_message_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SenderKeyDistributionMessage, buffa::DecodeError> {
+        whatsapp::SenderKeyDistributionMessage::decode_from_slice(bytes)
+    }
 }
 
 #[cfg(test)]

@@ -126,7 +126,7 @@ impl HandshakeUtils {
     pub fn parse_server_hello_body(
         response_bytes: &[u8],
     ) -> Result<wa::handshake_message::ServerHello> {
-        let handshake_response = HandshakeMessage::decode_from_slice(response_bytes)?;
+        let handshake_response = waproto::codec::handshake_message_decode(response_bytes)?;
         let server_hello = handshake_response
             .server_hello
             .into_option()
@@ -424,7 +424,7 @@ impl XxHandshakeState {
     pub fn build_client_hello(&self) -> Result<Vec<u8>> {
         let client_hello =
             HandshakeUtils::build_client_hello(self.ephemeral_kp.public_key.public_key_bytes());
-        Ok(client_hello.encode_to_vec())
+        Ok(waproto::codec::handshake_message_to_vec(&client_hello))
     }
 
     pub fn read_server_hello_and_build_client_finish(
@@ -502,7 +502,7 @@ fn process_xx_server_hello_into(
     let encrypted_payload = noise.encrypt(payload)?;
 
     let client_finish = HandshakeUtils::build_client_finish(encrypted_pubkey, encrypted_payload);
-    Ok(client_finish.encode_to_vec())
+    Ok(waproto::codec::handshake_message_to_vec(&client_finish))
 }
 
 /// Handshake state for **Noise IK** — used on reconnect when the device has a
