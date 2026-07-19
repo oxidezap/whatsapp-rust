@@ -6,6 +6,20 @@ use buffa::Message as _;
 const APP_STATE_KEY_SHARE_SEND_ATTEMPTS: u8 = 3;
 const APP_STATE_KEY_SHARE_SEND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
+fn app_state_key_share_requires_reconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::client::ClientError>()
+            .is_some_and(crate::client::ClientError::is_transport_unavailable)
+            || cause
+                .downcast_ref::<crate::request::IqError>()
+                .is_some_and(crate::request::IqError::is_transport_unavailable)
+            || cause
+                .downcast_ref::<crate::socket::error::EncryptSendError>()
+                .is_some_and(crate::socket::error::EncryptSendError::is_transport_unavailable)
+    })
+}
+
 impl Client {
     /// Handles a newsletter plaintext message.
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
@@ -277,14 +291,7 @@ impl Client {
                         return;
                     }
 
-                    let transport_unavailable = error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<crate::socket::error::EncryptSendError>()
-                            .is_some_and(
-                                crate::socket::error::EncryptSendError::is_transport_unavailable,
-                            )
-                    });
-                    if transport_unavailable {
+                    if app_state_key_share_requires_reconnect(&error) {
                         reconnect_after = Some(send_generation);
                     } else {
                         runtime.sleep(retry_delay).await;
@@ -428,5 +435,22 @@ impl Client {
                 sender_jid.observe()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_state_key_share_requires_reconnect;
+
+    #[test]
+    fn key_share_reconnects_for_direct_and_iq_connection_loss() {
+        let direct = anyhow::Error::new(crate::client::ClientError::NotConnected);
+        assert!(app_state_key_share_requires_reconnect(&direct));
+
+        let iq = anyhow::Error::new(crate::request::IqError::NotConnected);
+        assert!(app_state_key_share_requires_reconnect(&iq));
+
+        let non_transport = anyhow::anyhow!("pre-wire failure");
+        assert!(!app_state_key_share_requires_reconnect(&non_transport));
     }
 }

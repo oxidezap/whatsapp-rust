@@ -484,14 +484,7 @@ impl ClientError {
         match self {
             ClientError::NotConnected => true,
             ClientError::EncryptSend(e) => e.is_transport_unavailable(),
-            // Transport loss can now arrive wrapped in an IQ failure (the base
-            // error gained `Iq`); unwrap it so retry/reconnect still triggers.
-            ClientError::Iq(e) => match e {
-                crate::request::IqError::NotConnected => true,
-                crate::request::IqError::EncryptSend(e) => e.is_transport_unavailable(),
-                crate::request::IqError::ClientState(client) => client.is_transport_unavailable(),
-                _ => false,
-            },
+            ClientError::Iq(e) => e.is_transport_unavailable(),
             _ => false,
         }
     }

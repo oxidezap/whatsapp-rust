@@ -22,6 +22,62 @@ struct AppStateKeyRequestSchedule {
     sent: bool,
 }
 
+enum AppStateKeyRequestProgress {
+    Scheduled(AppStateKeyRequestSchedule),
+    KeysReady,
+    TimedOut,
+}
+
+async fn app_state_keys_available(
+    backend: &dyn crate::store::traits::Backend,
+    key_ids: &[Vec<u8>],
+) -> bool {
+    for key_id in key_ids {
+        if backend.get_sync_key(key_id).await.ok().flatten().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn remove_available_app_state_keys(
+    backend: &dyn crate::store::traits::Backend,
+    missing: &mut Vec<Vec<u8>>,
+) {
+    let mut index = 0;
+    while index < missing.len() {
+        if backend
+            .get_sync_key(&missing[index])
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            missing.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn finalize_app_state_key_request_peers(
+    mut peers: Vec<Jid>,
+    current_device: u16,
+    primary: Jid,
+) -> Result<Vec<Jid>, anyhow::Error> {
+    peers.retain(|jid| jid.device != current_device);
+    wacore::types::jid::sort_dedup_by_device(&mut peers);
+    if peers.is_empty() && current_device != primary.device {
+        peers.push(primary);
+    }
+    if peers.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no peer devices available for app-state key request"
+        ));
+    }
+    Ok(peers)
+}
+
 impl Client {
     pub(crate) async fn get_app_state_processor(&self) -> Arc<AppStateProcessor> {
         let mut guard = self.app_state_processor.lock().await;
@@ -654,34 +710,30 @@ impl Client {
         let backend = self.persistence_manager.backend();
         let mut retry_after = APP_STATE_KEY_PARTIAL_RETRY;
         loop {
-            // Register the listener before the store check: the notifier is not sticky,
-            // so a key-share persisted in the check→listen gap would be lost.
             let listener = self.initial_keys_synced_notifier.listen();
-
-            let mut index = 0;
-            while index < missing.len() {
-                if backend
-                    .get_sync_key(&missing[index])
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    missing.swap_remove(index);
-                } else {
-                    index += 1;
-                }
-            }
+            remove_available_app_state_keys(&*backend, &mut missing).await;
             if missing.is_empty() {
                 return true;
             }
 
-            let schedule = self
-                .request_missing_keys_with_dedup(&missing, retry_after)
-                .await;
+            let request = self.request_missing_keys_with_dedup(&missing, retry_after);
+            let schedule = match self
+                .await_app_state_key_request(&*backend, &missing, deadline, listener, request)
+                .await
+            {
+                AppStateKeyRequestProgress::Scheduled(schedule) => schedule,
+                AppStateKeyRequestProgress::KeysReady => return true,
+                AppStateKeyRequestProgress::TimedOut => return false,
+            };
             if schedule.sent {
                 debug!(target: "Client/AppState", "Requested {} missing app-state key(s); retrying after {retry_after:?} if no share arrives", missing.len());
                 retry_after = retry_after.saturating_mul(2).min(APP_STATE_KEY_RETRY_MAX);
+            }
+
+            let listener = self.initial_keys_synced_notifier.listen();
+            remove_available_app_state_keys(&*backend, &mut missing).await;
+            if missing.is_empty() {
+                return true;
             }
 
             let remaining = deadline.saturating_duration_since(wacore::time::Instant::now());
@@ -695,6 +747,48 @@ impl Client {
             let wait = remaining.min(retry_wait);
             if !wait.is_zero() {
                 let _ = rt_timeout(&*self.runtime, wait, listener).await;
+            }
+        }
+    }
+
+    async fn await_app_state_key_request<F>(
+        &self,
+        backend: &dyn crate::store::traits::Backend,
+        missing: &[Vec<u8>],
+        deadline: wacore::time::Instant,
+        mut listener: event_listener::EventListener,
+        request: F,
+    ) -> AppStateKeyRequestProgress
+    where
+        F: std::future::Future<Output = AppStateKeyRequestSchedule>,
+    {
+        futures::pin_mut!(request);
+        loop {
+            let remaining = deadline.saturating_duration_since(wacore::time::Instant::now());
+            if remaining.is_zero() {
+                return if app_state_keys_available(backend, missing).await {
+                    AppStateKeyRequestProgress::KeysReady
+                } else {
+                    AppStateKeyRequestProgress::TimedOut
+                };
+            }
+
+            let notified = rt_timeout(&*self.runtime, remaining, listener);
+            futures::pin_mut!(notified);
+            match futures::future::select(request.as_mut(), notified.as_mut()).await {
+                futures::future::Either::Left((schedule, _)) => {
+                    return AppStateKeyRequestProgress::Scheduled(schedule);
+                }
+                futures::future::Either::Right((notification, _)) => {
+                    let next_listener = self.initial_keys_synced_notifier.listen();
+                    if app_state_keys_available(backend, missing).await {
+                        return AppStateKeyRequestProgress::KeysReady;
+                    }
+                    if notification.is_err() {
+                        return AppStateKeyRequestProgress::TimedOut;
+                    }
+                    listener = next_listener;
+                }
             }
         }
     }
@@ -788,23 +882,16 @@ impl Client {
         let primary = own_jid.to_non_ad();
         drop(device_snapshot);
 
-        let mut peers = match self.get_user_devices(std::slice::from_ref(&primary)).await {
+        let peers = match self.get_user_devices(std::slice::from_ref(&primary)).await {
             Ok(devices) => devices,
             Err(error) => {
                 warn!(
                     "Own device-list query failed; requesting app-state keys from primary only: {error}"
                 );
-                vec![primary]
+                Vec::new()
             }
         };
-        peers.retain(|jid| jid.device != current_device);
-        wacore::types::jid::sort_dedup_by_device(&mut peers);
-        if peers.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no peer devices available for app-state key request"
-            ));
-        }
-        Ok(peers)
+        finalize_app_state_key_request_peers(peers, current_device, primary)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.request_keys", level = "debug", skip_all, fields(count = raw_key_ids.len()), err(Debug)))]
@@ -1031,6 +1118,46 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn key_arrival_finishes_before_a_slow_fanout() {
+        let client = crate::test_utils::create_test_client_with_name("appstate_slow_peer").await;
+        let backend = client.persistence_manager.backend();
+        let key_id = vec![7, 8, 9, 10];
+        let listener = client.initial_keys_synced_notifier.listen();
+        let notifier = client.initial_keys_synced_notifier.clone();
+        let writer = backend.clone();
+        let stored_id = key_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            writer
+                .set_sync_key(&stored_id, crate::store::traits::AppStateSyncKey::default())
+                .await
+                .expect("store recovered key");
+            notifier.notify(usize::MAX);
+        });
+
+        let progress = client
+            .await_app_state_key_request(
+                &*backend,
+                std::slice::from_ref(&key_id),
+                wacore::time::Instant::now() + Duration::from_secs(1),
+                listener,
+                std::future::pending::<AppStateKeyRequestSchedule>(),
+            )
+            .await;
+
+        assert!(matches!(progress, AppStateKeyRequestProgress::KeysReady));
+    }
+
+    #[test]
+    fn empty_companion_discovery_falls_back_to_primary() {
+        let primary: Jid = "5511000000000@s.whatsapp.net".parse().expect("primary jid");
+        let peers = finalize_app_state_key_request_peers(Vec::new(), 7, primary.clone())
+            .expect("companion fallback");
+        assert_eq!(peers, vec![primary.clone()]);
+        assert!(finalize_app_state_key_request_peers(Vec::new(), 0, primary).is_err());
+    }
 
     #[tokio::test]
     async fn active_key_wait_shortens_a_passive_dedup_stamp() {
