@@ -301,6 +301,11 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.serde_json]
 opt-level = "s"
+# The bundled SQLite amalgamation (sqlite3.c) — cargo exports OPT_LEVEL to the
+# build script and the cc crate maps it to -Oz. The C core was the one crate
+# the per-package sweep above missed; same I/O-bound tradeoff as diesel.
+[profile.release.package.libsqlite3-sys]
+opt-level = "z"
 
 # Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
 # fast (release uses fat LTO) and debug symbols stay for local profiling.
