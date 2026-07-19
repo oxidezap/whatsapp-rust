@@ -151,57 +151,14 @@ impl Client {
         }
     }
 
-    pub(super) async fn build_app_state_sync_key_share(
-        &self,
-        request: &wa::message::AppStateSyncKeyRequest,
-    ) -> Result<wa::message::AppStateSyncKeyShare, anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let key_store = device_snapshot.backend.clone();
-        drop(device_snapshot);
-
-        let keys = futures::future::try_join_all(request.key_ids.iter().filter_map(|requested| {
-            let key_id = requested.key_id.as_deref()?;
-            let key_store = &key_store;
-            Some(async move {
-                let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
-                    match wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
-                        &stored.fingerprint,
-                    ) {
-                        Ok(fingerprint) => {
-                            buffa::MessageField::some(wa::message::AppStateSyncKeyData {
-                                key_data: Some(stored.key_data),
-                                fingerprint: buffa::MessageField::some(fingerprint),
-                                timestamp: Some(stored.timestamp),
-                            })
-                        }
-                        Err(error) => {
-                            warn!(target: "Client/AppState", "Stored app-state key fingerprint is invalid; returning orphan: {error}");
-                            buffa::MessageField::default()
-                        }
-                    }
-                } else {
-                    buffa::MessageField::default()
-                };
-
-                Ok::<_, anyhow::Error>(wa::message::AppStateSyncKey {
-                    key_id: buffa::MessageField::some(requested.clone()),
-                    key_data,
-                })
-            })
-        }))
-        .await?;
-
-        Ok(wa::message::AppStateSyncKeyShare { keys })
-    }
-
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.recv.appstate_key_request.prepare", level = "debug", skip_all, fields(count = request.key_ids.len()), err(Debug))
     )]
-    pub(crate) async fn prepare_app_state_sync_key_share(
+    pub(super) async fn build_app_state_sync_key_share(
         &self,
         request: &wa::message::AppStateSyncKeyRequest,
-    ) -> Result<wa::Message, anyhow::Error> {
+    ) -> Result<wa::message::AppStateSyncKeyShare, anyhow::Error> {
         #[cfg(test)]
         if self
             .app_state_key_share_prepare_test_failures
@@ -215,15 +172,41 @@ impl Client {
             anyhow::bail!("injected app-state key-share preparation failure");
         }
 
-        let share = self.build_app_state_sync_key_share(request).await?;
-        Ok(wa::Message {
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
-                app_state_sync_key_share: buffa::MessageField::some(share),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let key_store = device_snapshot.backend.clone();
+        drop(device_snapshot);
+
+        let mut keys = Vec::with_capacity(request.key_ids.len());
+        for requested in &request.key_ids {
+            let Some(key_id) = requested.key_id.as_deref() else {
+                continue;
+            };
+            let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
+                match wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
+                    &stored.fingerprint,
+                ) {
+                    Ok(fingerprint) => {
+                        buffa::MessageField::some(wa::message::AppStateSyncKeyData {
+                            key_data: Some(stored.key_data),
+                            fingerprint: buffa::MessageField::some(fingerprint),
+                            timestamp: Some(stored.timestamp),
+                        })
+                    }
+                    Err(error) => {
+                        warn!(target: "Client/AppState", "Stored app-state key fingerprint is invalid; returning orphan: {error}");
+                        buffa::MessageField::default()
+                    }
+                }
+            } else {
+                buffa::MessageField::default()
+            };
+            keys.push(wa::message::AppStateSyncKey {
+                key_id: buffa::MessageField::some(requested.clone()),
+                key_data,
+            });
+        }
+
+        Ok(wa::message::AppStateSyncKeyShare { keys })
     }
 
     pub(crate) fn schedule_app_state_sync_key_share(
@@ -291,24 +274,45 @@ impl Client {
                         drop(client);
                         continue;
                     };
-                    let result = async {
-                        if message.is_none() {
-                            message = Some(
-                                client
-                                    .prepare_app_state_sync_key_share(&request)
-                                    .await?,
-                            );
+                    let result = match message.as_ref() {
+                        Some(message) => {
+                            client
+                                .send_app_state_sync_key_share_once(
+                                    &requester,
+                                    message,
+                                    &message_id,
+                                )
+                                .await
                         }
-                        let Some(message) = message.as_ref() else {
-                            return Err(anyhow::anyhow!(
-                                "app-state key-share preparation produced no message"
-                            ));
-                        };
-                        client
-                            .send_app_state_sync_key_share_once(&requester, message, &message_id)
-                            .await
-                    }
-                    .await;
+                        None => match client.build_app_state_sync_key_share(&request).await {
+                            Ok(share) => {
+                                let prepared = wa::Message {
+                                    protocol_message: buffa::MessageField::some(
+                                        wa::message::ProtocolMessage {
+                                            r#type: Some(
+                                                wa::message::protocol_message::Type::AppStateSyncKeyShare,
+                                            ),
+                                            app_state_sync_key_share: buffa::MessageField::some(
+                                                share,
+                                            ),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    ..Default::default()
+                                };
+                                let result = client
+                                    .send_app_state_sync_key_share_once(
+                                        &requester,
+                                        &prepared,
+                                        &message_id,
+                                    )
+                                    .await;
+                                message = Some(prepared);
+                                result
+                            }
+                            Err(error) => Err(error),
+                        },
+                    };
                     drop(flush_guard);
                     drop(client);
 
