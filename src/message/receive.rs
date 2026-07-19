@@ -1484,19 +1484,7 @@ impl Client {
             && let Some(request) = protocol_msg.app_state_sync_key_request.as_option()
         {
             if info.source.is_from_me {
-                match self.prepare_app_state_sync_key_share(request).await {
-                    Ok((message, message_id)) => {
-                        app_state_key_share_job =
-                            Some((info.source.sender.clone(), message, message_id));
-                    }
-                    Err(error) => {
-                        warn!(
-                            "[msg:{}] Failed to prepare app_state_sync_key_share for {}: {error:?}",
-                            info.id,
-                            info.source.sender.observe()
-                        );
-                    }
-                }
+                app_state_key_share_job = Some((info.source.sender.clone(), request.clone()));
             } else {
                 warn!(
                     "[msg:{}] Dropping app_state_sync_key_request from non-self sender {}",
@@ -1572,14 +1560,14 @@ impl Client {
             })
         } else {
             let commit_state = self.dispatch_parsed_message(msg, info).await;
-            if let Some((requester, message, message_id)) = app_state_key_share_job {
+            if let Some((requester, request)) = app_state_key_share_job {
                 if commit_state == InboundCommitState::Failed {
                     warn!(
                         "[msg:{}] Deferring app-state key-share recovery to the requester's retry because the inbound request was not durable",
                         info.id
                     );
                 } else {
-                    self.schedule_app_state_sync_key_share(requester, message, message_id);
+                    self.schedule_app_state_sync_key_share(requester, request);
                 }
             }
             Ok(PlaintextHandleOutcome {

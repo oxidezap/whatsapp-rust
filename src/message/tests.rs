@@ -548,7 +548,8 @@ use wacore::libsignal::protocol::{
     PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SenderKeyName,
     SenderKeyRecord, SenderKeyStore as SigSenderKeyStore, SessionRecord,
     SessionStore as SigSessionStore, SignedPreKeyStore as SigSignedPreKeyStore, UsePQRatchet,
-    create_sender_key_distribution_message, group_encrypt, message_encrypt, process_prekey_bundle,
+    create_sender_key_distribution_message, group_encrypt, message_decrypt_signal, message_encrypt,
+    process_prekey_bundle,
 };
 use wacore::libsignal::protocol::{IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError};
 
@@ -697,6 +698,20 @@ impl AlicePeer {
             ..Default::default()
         });
         self.encrypt(bob_addr, &plaintext).await
+    }
+
+    async fn decrypt_signal(&mut self, bob_addr: &ProtocolAddress, ciphertext: &[u8]) -> Vec<u8> {
+        let message = SignalMessage::try_from(ciphertext).expect("signal message");
+        message_decrypt_signal(
+            &message,
+            bob_addr,
+            &mut self.sessions,
+            &mut self.identity,
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+        )
+        .await
+        .expect("decrypt signal message")
+        .plaintext
     }
 
     async fn create_group_skdm(
@@ -5674,6 +5689,46 @@ fn has_message_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> bool
     })
 }
 
+async fn decrypt_peer_message_after(
+    peer: &mut AlicePeer,
+    remote_address: &ProtocolAddress,
+    frames: &[bytes::Bytes],
+    start: usize,
+    to: &str,
+) -> Option<wa::Message> {
+    let (ciphertext, padding_version) =
+        frames
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, frame)| {
+                let buf = decode_frame(index, frame)?;
+                let node = wacore_binary::marshal::unmarshal_ref(&buf[1..]).ok()?;
+                if node.tag.as_ref() != "message"
+                    || !node
+                        .get_attr("to")
+                        .is_some_and(|value| value.as_str() == to)
+                {
+                    return None;
+                }
+                let enc = node.get_optional_child_by_tag(&["enc"])?;
+                if !enc
+                    .get_attr("type")
+                    .is_some_and(|value| value.as_str() == "msg")
+                {
+                    return None;
+                }
+                Some((
+                    enc.content_bytes()?.to_vec(),
+                    enc.get_attr("v")
+                        .and_then(|value| value.as_str().parse().ok())
+                        .unwrap_or(2),
+                ))
+            })?;
+    let plaintext = peer.decrypt_signal(remote_address, &ciphertext).await;
+    wacore::messages::decode_plaintext(&plaintext, padding_version).ok()
+}
+
 /// First `<ack class="message">` on the wire as `(to, recipient)`.
 fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)> {
     for (i, frame) in frames.iter().enumerate() {
@@ -7841,6 +7896,7 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
 
 #[tokio::test]
 async fn app_state_key_share_waits_outside_the_offline_message_lane() {
+    use buffa::Message as _;
     use std::sync::atomic::Ordering;
     use wacore::messages::MessageUtils;
 
@@ -7864,13 +7920,14 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     let _ = client.inbound_commit_batch.reset();
     client.swap_message_semaphore(1);
     assert!(client.inbound_commit_batch.is_active());
+    let requested_key_id = vec![1, 2, 3, 4];
     let request = wa::Message {
         protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
             r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
             app_state_sync_key_request: buffa::MessageField::some(
                 wa::message::AppStateSyncKeyRequest {
                     key_ids: vec![wa::message::AppStateSyncKeyId {
-                        key_id: Some(vec![1, 2, 3, 4]),
+                        key_id: Some(requested_key_id.clone()),
                     }],
                 },
             ),
@@ -7924,6 +7981,25 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
         "a non-durable request must not put a key share on the wire"
     );
 
+    let fingerprint = wa::message::AppStateSyncKeyFingerprint {
+        raw_id: Some(42),
+        current_index: Some(1),
+        device_indexes: vec![0, 1],
+    };
+    client
+        .persistence_manager
+        .backend()
+        .set_sync_key(
+            &requested_key_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![7; 32],
+                fingerprint: fingerprint.encode_to_vec(),
+                timestamp: 456,
+            },
+        )
+        .await
+        .expect("store key learned during the offline drain");
+
     client
         .inbound_commit_batch
         .fail_commits
@@ -7949,6 +8025,26 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     })
     .await
     .expect("deferred key share should send after the drain");
+
+    let response = decrypt_peer_message_after(
+        &mut peer,
+        &own_address,
+        &transport.sent(),
+        sent_before,
+        requester_str,
+    )
+    .await
+    .expect("decrypt deferred key share");
+    let shared_key = response
+        .protocol_message
+        .as_option()
+        .and_then(|protocol| protocol.app_state_sync_key_share.as_option())
+        .and_then(|share| share.keys.first())
+        .and_then(|key| key.key_data.as_option())
+        .expect("the deferred response must include the key learned during the drain");
+    assert_eq!(shared_key.key_data.as_deref(), Some(&[7; 32][..]));
+    assert_eq!(shared_key.fingerprint.as_option(), Some(&fingerprint));
+    assert_eq!(shared_key.timestamp, Some(456));
 }
 
 #[tokio::test]
@@ -7976,13 +8072,9 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
             key_id: Some(vec![4, 3, 2, 1]),
         }],
     };
-    let (message, message_id) = client
-        .prepare_app_state_sync_key_share(&request)
-        .await
-        .expect("prepare key share");
 
     transport.fail_next_sends(1);
-    client.schedule_app_state_sync_key_share(requester, message, message_id);
+    client.schedule_app_state_sync_key_share(requester, request);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while transport.failed_sends() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -8015,6 +8107,53 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
 }
 
 #[tokio::test]
+async fn app_state_key_share_preparation_failure_is_retried() {
+    let (client, transport) = capturing_client("appstate_key_share_prepare_retry").await;
+    let requester_str = "5511000000001:36@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+    client
+        .app_state_key_share_prepare_test_failures
+        .store(1, std::sync::atomic::Ordering::Release);
+    client.schedule_app_state_sync_key_share(
+        requester,
+        wa::message::AppStateSyncKeyRequest {
+            key_ids: vec![wa::message::AppStateSyncKeyId {
+                key_id: Some(vec![4, 3, 2, 1]),
+            }],
+        },
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !has_message_to_after(&transport.sent(), sent_before, requester_str) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a transient preparation failure must keep the response job alive");
+    assert_eq!(
+        client
+            .app_state_key_share_prepare_test_failures
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}
+
+#[tokio::test]
 async fn app_state_key_share_survives_a_closed_flush_scope() {
     let (client, transport) = capturing_client("appstate_key_share_closed_flush").await;
     let requester_str = "5511000000001:35@s.whatsapp.net";
@@ -8039,14 +8178,10 @@ async fn app_state_key_share_survives_a_closed_flush_scope() {
             key_id: Some(vec![4, 3, 2, 1]),
         }],
     };
-    let (message, message_id) = client
-        .prepare_app_state_sync_key_share(&request)
-        .await
-        .expect("prepare key share");
 
     client.outbound_flush.close();
     let rejected_before = client.outbound_flush.track_rejections();
-    client.schedule_app_state_sync_key_share(requester, message, message_id);
+    client.schedule_app_state_sync_key_share(requester, request);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while client.outbound_flush.track_rejections() == rejected_before {
             tokio::task::yield_now().await;

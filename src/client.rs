@@ -884,6 +884,9 @@ pub struct Client {
     /// until a worker is actually inside the (blocked) flush.
     #[cfg(test)]
     pub(crate) signal_flush_test_in_attempt: AtomicU32,
+    /// Keeps retry regressions deterministic without corrupting the test database.
+    #[cfg(test)]
+    pub(crate) app_state_key_share_prepare_test_failures: AtomicU32,
 
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by

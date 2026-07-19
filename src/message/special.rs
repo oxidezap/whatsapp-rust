@@ -201,32 +201,45 @@ impl Client {
     pub(crate) async fn prepare_app_state_sync_key_share(
         &self,
         request: &wa::message::AppStateSyncKeyRequest,
-    ) -> Result<(wa::Message, String), anyhow::Error> {
+    ) -> Result<wa::Message, anyhow::Error> {
+        #[cfg(test)]
+        if self
+            .app_state_key_share_prepare_test_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected app-state key-share preparation failure");
+        }
+
         let share = self.build_app_state_sync_key_share(request).await?;
-        let message = wa::Message {
+        Ok(wa::Message {
             protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
                 app_state_sync_key_share: buffa::MessageField::some(share),
                 ..Default::default()
             }),
             ..Default::default()
-        };
-        Ok((message, self.generate_message_id()))
+        })
     }
 
     pub(crate) fn schedule_app_state_sync_key_share(
         self: &Arc<Self>,
         requester: Jid,
-        message: wa::Message,
-        message_id: String,
+        request: wa::message::AppStateSyncKeyRequest,
     ) {
         let weak = Arc::downgrade(self);
         let runtime = self.runtime.clone();
+        let message_id = self.generate_message_id();
         self.runtime
             .spawn(Box::pin(async move {
                 let mut attempt = 0;
                 let mut retry_delay = APP_STATE_KEY_SHARE_SEND_RETRY;
                 let mut reconnect_after = None;
+                let mut message = None;
 
                 loop {
                     let wait_deadline =
@@ -278,13 +291,24 @@ impl Client {
                         drop(client);
                         continue;
                     };
-                    let result = client
-                        .send_app_state_sync_key_share_once(
-                            &requester,
-                            &message,
-                            &message_id,
-                        )
-                        .await;
+                    let result = async {
+                        if message.is_none() {
+                            message = Some(
+                                client
+                                    .prepare_app_state_sync_key_share(&request)
+                                    .await?,
+                            );
+                        }
+                        let Some(message) = message.as_ref() else {
+                            return Err(anyhow::anyhow!(
+                                "app-state key-share preparation produced no message"
+                            ));
+                        };
+                        client
+                            .send_app_state_sync_key_share_once(&requester, message, &message_id)
+                            .await
+                    }
+                    .await;
                     drop(flush_guard);
                     drop(client);
 
