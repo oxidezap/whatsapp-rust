@@ -28,10 +28,74 @@ pub enum TokenKind {
     Double(u8, u8),
 }
 
+/// Per-length probe metadata; layout mirrors what build.rs emits.
+struct LenHdr {
+    /// Primary/secondary discriminator byte positions.
+    p1: u8,
+    p2: u8,
+    /// Smallest p1 byte occurring among this length's tokens.
+    d1_min: u8,
+    /// p1-byte span + 1; 0 for lengths with no tokens.
+    span_plus_1: u16,
+    /// Start of this length's range table in `D1_OFF`.
+    d1_table: u16,
+    /// First entry index in `DISC_KEYS`/`KINDS`.
+    entry_start: u16,
+    /// First byte of this length's tokens in `BLOB`.
+    blob_start: u16,
+}
+
 include!(concat!(env!("OUT_DIR"), "/token_maps.rs"));
 
+/// Length-bucketed probe over the build-generated static tables (see
+/// build.rs for the layout and the miss-speed rationale). No full-key hash:
+/// a miss is rejected by length or by a two-byte discriminator before any
+/// full compare runs.
 pub fn index_of_token(token: &str) -> Option<TokenKind> {
-    hashify_lookup(token.as_bytes())
+    lookup_bytes(token.as_bytes())
+}
+
+fn lookup_bytes(key: &[u8]) -> Option<TokenKind> {
+    let len = key.len();
+    if len == 0 || len > MAX_TOKEN_LEN {
+        return None;
+    }
+    let h = &LEN_HDR[len];
+    let b1 = key[h.p1 as usize];
+
+    // Range table on the primary discriminator byte: a probe whose p1 byte
+    // matches no token of this length (the dominant miss case) exits on the
+    // span/offset checks, before any comparison loop.
+    let idx = (b1 as usize).checked_sub(h.d1_min as usize)?;
+    if idx + 1 >= h.span_plus_1 as usize {
+        return None;
+    }
+
+    let start = h.entry_start as usize;
+    let tstart = h.d1_table as usize;
+    let run_start = start + D1_OFF[tstart + idx] as usize;
+    let run_end = start + D1_OFF[tstart + idx + 1] as usize;
+    let disc = ((b1 as u16) << 8) | key[h.p2 as usize] as u16;
+    let blob_base = h.blob_start as usize;
+
+    // The run shares b1 and is sorted by (b2, bytes); scan with early exit.
+    for i in run_start..run_end {
+        if DISC_KEYS[i] > disc {
+            break;
+        }
+        if DISC_KEYS[i] == disc {
+            let off = blob_base + (i - start) * len;
+            if &BLOB[off..off + len] == key {
+                let kind = KINDS[i];
+                return Some(if kind < SINGLE_BYTE_MAX {
+                    TokenKind::Single(kind as u8)
+                } else {
+                    TokenKind::Double((kind >> 8) as u8 - 1, kind as u8)
+                });
+            }
+        }
+    }
+    None
 }
 
 pub fn get_single_token(index: u8) -> Option<&'static str> {
@@ -151,7 +215,7 @@ mod tests {
 
         let check = |bytes: &[u8]| {
             assert_eq!(
-                hashify_lookup(bytes),
+                lookup_bytes(bytes),
                 reference.get(bytes).copied(),
                 "lookup disagrees with reference for {bytes:?}",
             );

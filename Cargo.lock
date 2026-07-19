@@ -1709,18 +1709,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
-name = "hashify"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26"
-dependencies = [
- "indexmap",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4007,7 +3995,6 @@ dependencies = [
  "codspeed-divan-compat",
  "compact_str",
  "flate2",
- "hashify",
  "itoa",
  "proptest",
  "serde",
