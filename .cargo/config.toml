@@ -19,9 +19,11 @@ rustflags = [
 
 [env]
 # Trim bundled-SQLite subsystems the workspace never touches. FTS5 stays:
-# chat-store's `search` feature builds its index on it. JSON and extension
-# loading are unused by diesel/sqlite-storage/chat-store (checked: no json_*
-# SQL, no load_extension callers); dropping loadable extensions also removes
-# a dlopen surface. STAT4/DBSTAT/RTREE/FTS3/SOUNDEX are upstream-default-off
+# chat-store's `search` feature builds its index on it. Shared cache stays:
+# sqlite-storage's in-memory mode shares one DB across the pool via
+# `cache=shared` URIs. JSON and extension loading are unused by
+# diesel/sqlite-storage/chat-store (checked: no json_* SQL, no
+# load_extension callers); dropping loadable extensions also removes a
+# dlopen surface. STAT4/DBSTAT/RTREE/FTS3/SOUNDEX are upstream-default-off
 # features libsqlite3-sys turns on; none are exercised here.
-LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -DSQLITE_OMIT_JSON -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE"
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -DSQLITE_OMIT_JSON -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK"
