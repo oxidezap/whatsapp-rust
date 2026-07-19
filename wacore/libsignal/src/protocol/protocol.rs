@@ -8,6 +8,7 @@ use buffa::view::MessageView;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::{CryptoRng, Rng};
 use sha2::Sha256;
+use std::ops::Range;
 use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
@@ -25,6 +26,40 @@ fn get_or_try_init_bytes(
     let _ = cache.set(init()?);
     // get() can't be None: even if a racing set() lost, the winner's value is stored
     Ok(cache.get().expect("just set"))
+}
+
+/// Serialized protocol bytes are owned on the send path, where callers consume
+/// them without a copy, and shared on the receive path, where nested Signal
+/// envelopes can all point into the transport's existing `Bytes` allocation.
+#[derive(Debug, Clone)]
+enum SerializedBytes {
+    Owned(Box<[u8]>),
+    Shared(bytes::Bytes),
+}
+
+impl SerializedBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+
+    fn into_boxed_slice(self) -> Box<[u8]> {
+        match self {
+            Self::Owned(bytes) => bytes,
+            // Received messages normally die after decryption. Preserve the
+            // existing owned-return API for uncommon consumers that extract
+            // their wire representation explicitly.
+            Self::Shared(bytes) => Box::from(bytes.as_ref()),
+        }
+    }
+}
+
+fn subslice_range(parent: &[u8], child: &[u8]) -> Option<Range<usize>> {
+    let start = (child.as_ptr() as usize).checked_sub(parent.as_ptr() as usize)?;
+    let end = start.checked_add(child.len())?;
+    (end <= parent.len()).then_some(start..end)
 }
 
 // Signal's original implementation uses version 4, but WhatsApp Web,
@@ -79,15 +114,15 @@ pub struct SignalMessage {
     sender_ratchet_key: PublicKey,
     counter: u32,
     previous_counter: u32,
-    serialized: Box<[u8]>,
-    ciphertext_cache: OnceLock<Box<[u8]>>,
+    serialized: SerializedBytes,
+    ciphertext_range: OnceLock<Range<usize>>,
 }
 
 impl Clone for SignalMessage {
     fn clone(&self) -> Self {
-        let ciphertext_cache = OnceLock::new();
-        if let Some(ct) = self.ciphertext_cache.get() {
-            let _ = ciphertext_cache.set(ct.clone());
+        let ciphertext_range = OnceLock::new();
+        if let Some(range) = self.ciphertext_range.get() {
+            let _ = ciphertext_range.set(range.clone());
         }
         Self {
             message_version: self.message_version,
@@ -95,7 +130,7 @@ impl Clone for SignalMessage {
             counter: self.counter,
             previous_counter: self.previous_counter,
             serialized: self.serialized.clone(),
-            ciphertext_cache,
+            ciphertext_range,
         }
     }
 }
@@ -138,8 +173,8 @@ impl SignalMessage {
             sender_ratchet_key,
             counter,
             previous_counter,
-            serialized,
-            ciphertext_cache: OnceLock::new(),
+            serialized: SerializedBytes::Owned(serialized),
+            ciphertext_range: OnceLock::new(),
         })
     }
 
@@ -160,26 +195,79 @@ impl SignalMessage {
 
     #[inline]
     pub fn serialized(&self) -> &[u8] {
-        &self.serialized
+        self.serialized.as_slice()
     }
 
     #[inline]
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.serialized
+        self.serialized.into_boxed_slice()
     }
 
     pub fn body(&self) -> Result<&[u8]> {
-        get_or_try_init_bytes(&self.ciphertext_cache, || self.decode_ciphertext())
+        if self.ciphertext_range.get().is_none() {
+            let _ = self.ciphertext_range.set(self.decode_ciphertext_range()?);
+        }
+        let range = self
+            .ciphertext_range
+            .get()
+            .expect("ciphertext range was just initialized");
+        Ok(&self.serialized.as_slice()[range.clone()])
     }
 
-    fn decode_ciphertext(&self) -> Result<Box<[u8]>> {
-        let proto_bytes = &self.serialized[1..self.serialized.len() - Self::MAC_LENGTH];
+    fn decode_ciphertext_range(&self) -> Result<Range<usize>> {
+        let serialized = self.serialized.as_slice();
+        let proto_bytes = &serialized[1..serialized.len() - Self::MAC_LENGTH];
         let view = waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
         match view.ciphertext {
-            Some(ciphertext) => Ok(Box::from(ciphertext)),
+            Some(ciphertext) => subslice_range(serialized, ciphertext)
+                .ok_or(SignalProtocolError::InvalidProtobufEncoding),
             None => Err(SignalProtocolError::InvalidProtobufEncoding),
         }
+    }
+
+    fn try_from_serialized(serialized: SerializedBytes) -> Result<Self> {
+        let value = serialized.as_slice();
+        if value.len() < Self::MAC_LENGTH + 1 {
+            return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
+        }
+        let message_version = value[0] >> 4;
+
+        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&message_version) {
+            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
+                message_version,
+            ));
+        }
+
+        let view = waproto::whatsapp::SignalMessageView::decode_view(
+            &value[1..value.len() - Self::MAC_LENGTH],
+        )
+        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+
+        let Some(sender_ratchet_key) = view.ratchet_key else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let sender_ratchet_key = PublicKey::deserialize(sender_ratchet_key)?;
+        let Some(counter) = view.counter else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let previous_counter = view.previous_counter.unwrap_or(0);
+        let Some(ciphertext) = view.ciphertext else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let ciphertext_range = subslice_range(value, ciphertext)
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let range_cache = OnceLock::new();
+        let _ = range_cache.set(ciphertext_range);
+
+        Ok(Self {
+            message_version,
+            sender_ratchet_key,
+            counter,
+            previous_counter,
+            serialized,
+            ciphertext_range: range_cache,
+        })
     }
 
     pub fn verify_mac(
@@ -188,13 +276,14 @@ impl SignalMessage {
         receiver_identity_key: &IdentityKey,
         mac_key: &[u8],
     ) -> Result<bool> {
+        let serialized = self.serialized.as_slice();
         let our_mac = &Self::compute_mac(
             sender_identity_key,
             receiver_identity_key,
             mac_key,
-            &self.serialized[..self.serialized.len() - Self::MAC_LENGTH],
+            &serialized[..serialized.len() - Self::MAC_LENGTH],
         )?;
-        let their_mac = &self.serialized[self.serialized.len() - Self::MAC_LENGTH..];
+        let their_mac = &serialized[serialized.len() - Self::MAC_LENGTH..];
         let result: bool = our_mac.ct_eq(their_mac).into();
         if !result {
             // A warning instead of an error because we try multiple sessions.
@@ -230,7 +319,7 @@ impl SignalMessage {
 
 impl AsRef<[u8]> for SignalMessage {
     fn as_ref(&self) -> &[u8] {
-        &self.serialized
+        self.serialized.as_slice()
     }
 }
 
@@ -238,46 +327,15 @@ impl TryFrom<&[u8]> for SignalMessage {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
-        if value.len() < SignalMessage::MAC_LENGTH + 1 {
-            return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
-        }
-        let message_version = value[0] >> 4;
+        Self::try_from_serialized(SerializedBytes::Owned(Box::from(value)))
+    }
+}
 
-        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&message_version) {
-            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
-                message_version,
-            ));
-        }
+impl TryFrom<bytes::Bytes> for SignalMessage {
+    type Error = SignalProtocolError;
 
-        let view = waproto::whatsapp::SignalMessageView::decode_view(
-            &value[1..value.len() - SignalMessage::MAC_LENGTH],
-        )
-        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-
-        let Some(sender_ratchet_key) = view.ratchet_key else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let sender_ratchet_key = PublicKey::deserialize(sender_ratchet_key)?;
-        let Some(counter) = view.counter else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let previous_counter = view.previous_counter.unwrap_or(0);
-        let Some(ciphertext) = view.ciphertext else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let ciphertext: Box<[u8]> = Box::from(ciphertext);
-
-        let ciphertext_cache = OnceLock::new();
-        let _ = ciphertext_cache.set(ciphertext);
-
-        Ok(SignalMessage {
-            message_version,
-            sender_ratchet_key,
-            counter,
-            previous_counter,
-            serialized: Box::from(value),
-            ciphertext_cache,
-        })
+    fn try_from(value: bytes::Bytes) -> Result<Self> {
+        Self::try_from_serialized(SerializedBytes::Shared(value))
     }
 }
 
@@ -290,7 +348,7 @@ pub struct PreKeySignalMessage {
     base_key: PublicKey,
     identity_key: IdentityKey,
     message: SignalMessage,
-    serialized: Box<[u8]>,
+    serialized: SerializedBytes,
 }
 
 impl PreKeySignalMessage {
@@ -327,7 +385,7 @@ impl PreKeySignalMessage {
             base_key,
             identity_key,
             message,
-            serialized: serialized.into_boxed_slice(),
+            serialized: SerializedBytes::Owned(serialized.into_boxed_slice()),
         })
     }
 
@@ -368,18 +426,18 @@ impl PreKeySignalMessage {
 
     #[inline]
     pub fn serialized(&self) -> &[u8] {
-        &self.serialized
+        self.serialized.as_slice()
     }
 
     #[inline]
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.serialized
+        self.serialized.into_boxed_slice()
     }
 }
 
 impl AsRef<[u8]> for PreKeySignalMessage {
     fn as_ref(&self) -> &[u8] {
-        &self.serialized
+        self.serialized.as_slice()
     }
 }
 
@@ -387,6 +445,14 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
+        Self::try_from(bytes::Bytes::copy_from_slice(value))
+    }
+}
+
+impl TryFrom<bytes::Bytes> for PreKeySignalMessage {
+    type Error = SignalProtocolError;
+
+    fn try_from(value: bytes::Bytes) -> Result<Self> {
         if value.is_empty() {
             return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
         }
@@ -415,6 +481,8 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
             return Err(SignalProtocolError::InvalidProtobufEncoding);
         };
 
+        let message_range =
+            subslice_range(&value, message).ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
         let base_key = PublicKey::deserialize(base_key)?;
 
         Ok(PreKeySignalMessage {
@@ -424,8 +492,8 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
             signed_pre_key_id: signed_pre_key_id.into(),
             base_key,
             identity_key: IdentityKey::try_from(identity_key)?,
-            message: SignalMessage::try_from(message)?,
-            serialized: Box::from(value),
+            message: SignalMessage::try_from(value.slice(message_range))?,
+            serialized: SerializedBytes::Shared(value),
         })
     }
 }

@@ -1,11 +1,11 @@
 use wacore::appstate::patch_decode::WAPatchName;
-use waproto::whatsapp::message::HistorySyncNotification;
+use wacore::messages::DetachedHistorySyncNotification;
 
 #[derive(Debug)]
 pub enum MajorSyncTask {
     HistorySync {
         message_id: String,
-        notification: Box<HistorySyncNotification>,
+        notification: Box<DetachedHistorySyncNotification>,
     },
     AppStateSync {
         name: WAPatchName,

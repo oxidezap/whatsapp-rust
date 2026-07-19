@@ -613,7 +613,6 @@ impl Client {
         let mut local_identity_reacted = false;
 
         for payload in payloads {
-            let ciphertext = &payload.ciphertext[..];
             let enc_type = payload.enc_type;
             let enc_type_str = enc_type.as_wire_str();
             let padding_version = payload.padding_version;
@@ -622,51 +621,43 @@ impl Client {
             // server retransmits the malformed stanza forever. Mirrors the
             // `handle_decrypt_failure` shape (dispatch event + spawn wire I/O
             // so the session lock isn't held across the send).
-            let parsed_message = if enc_type == EncType::PreKeyMessage {
-                match PreKeySignalMessage::try_from(ciphertext) {
-                    Ok(m) => CiphertextMessage::PreKeySignalMessage(m),
-                    Err(e) => {
-                        log::error!(
-                            "[msg:{}] Failed to parse PreKeySignalMessage from {}: {e:?}. Sending nack.",
-                            info.id,
-                            info.source.sender.observe()
-                        );
-                        // |= so a later dedup'd return (false) can't clobber
-                        // a true set by a prior iteration in this batch.
-                        outcome.had_failure = true;
-                        outcome.undecryptable |= self
-                            .dispatch_undecryptable_event(
-                                Arc::clone(info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
-                                decrypt_fail_mode,
-                            )
-                            .await;
-                        self.spawn_nack(info, NackReason::ParsingError, None);
-                        continue;
-                    }
+            let parsed_message = {
+                #[cfg(feature = "tracing")]
+                let _parse_span = tracing::trace_span!(
+                    "wa.recv.session_parse",
+                    ciphertext_bytes = payload.ciphertext.len() as u64,
+                    enc_type = enc_type_str
+                )
+                .entered();
+                if enc_type == EncType::PreKeyMessage {
+                    PreKeySignalMessage::try_from(payload.ciphertext.clone())
+                        .map(CiphertextMessage::PreKeySignalMessage)
+                } else {
+                    SignalMessage::try_from(payload.ciphertext.clone())
+                        .map(CiphertextMessage::SignalMessage)
                 }
-            } else {
-                match SignalMessage::try_from(ciphertext) {
-                    Ok(m) => CiphertextMessage::SignalMessage(m),
-                    Err(e) => {
-                        log::error!(
-                            "[msg:{}] Failed to parse SignalMessage from {}: {e:?}. Sending nack.",
-                            info.id,
-                            info.source.sender.observe()
-                        );
-                        outcome.had_failure = true;
-                        outcome.undecryptable |= self
-                            .dispatch_undecryptable_event(
-                                Arc::clone(info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
-                                decrypt_fail_mode,
-                            )
-                            .await;
-                        self.spawn_nack(info, NackReason::ParsingError, None);
-                        continue;
-                    }
+            };
+            let parsed_message = match parsed_message {
+                Ok(message) => message,
+                Err(e) => {
+                    log::error!(
+                        "[msg:{}] Failed to parse {enc_type_str} Signal envelope from {}: {e:?}. Sending nack.",
+                        info.id,
+                        info.source.sender.observe()
+                    );
+                    // |= so a later dedup'd return (false) can't clobber a true
+                    // set by a prior iteration in this batch.
+                    outcome.had_failure = true;
+                    outcome.undecryptable |= self
+                        .dispatch_undecryptable_event(
+                            Arc::clone(info),
+                            false,
+                            crate::types::events::UnavailableType::Unknown,
+                            decrypt_fail_mode,
+                        )
+                        .await;
+                    self.spawn_nack(info, NackReason::ParsingError, None);
+                    continue;
                 }
             };
 
@@ -711,8 +702,17 @@ impl Client {
                 &adapter.signed_pre_key_store,
                 &mut rng,
                 UsePQRatchet::No,
-            )
-            .await;
+            );
+            #[cfg(feature = "tracing")]
+            let decrypt_res = tracing::Instrument::instrument(
+                decrypt_res,
+                tracing::trace_span!(
+                    "wa.recv.session_crypto",
+                    ciphertext_bytes = payload.ciphertext.len() as u64,
+                    enc_type = enc_type_str
+                ),
+            );
+            let decrypt_res = decrypt_res.await;
 
             match decrypt_res {
                 Ok(decrypted) => {
@@ -1161,7 +1161,7 @@ impl Client {
         } in deferred
         {
             match self
-                .handle_decrypted_plaintext(enc_type, &plaintext, padding_version, info)
+                .handle_decrypted_plaintext(enc_type, plaintext, padding_version, info)
                 .await
             {
                 Ok(plaintext_outcome) => {
@@ -1249,7 +1249,7 @@ impl Client {
                     if let Err(e) = self
                         .handle_decrypted_plaintext(
                             "skmsg",
-                            &padded_plaintext,
+                            padded_plaintext,
                             padding_version,
                             info,
                         )
@@ -1407,11 +1407,15 @@ impl Client {
     pub(crate) async fn handle_decrypted_plaintext(
         self: &Arc<Self>,
         enc_type: &str,
-        padded_plaintext: &[u8],
+        padded_plaintext: Vec<u8>,
         padding_version: u8,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
-        let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
+        let (original_msg, history_sync_taken) =
+            wacore::messages::decode_plaintext_detached_history_sync(
+                padded_plaintext,
+                padding_version,
+            )?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
@@ -1521,12 +1525,6 @@ impl Client {
         {
             self.handle_pdo_response(pdo_response, info).await;
         }
-
-        // Note: msg might be modified by take() below
-        let history_sync_taken = msg
-            .protocol_message
-            .as_option_mut()
-            .and_then(|pm| pm.history_sync_notification.take());
 
         // history_sync_notification is self-only (our phone drives history sync).
         // A spoofed one from a peer would force a download of attacker-controlled

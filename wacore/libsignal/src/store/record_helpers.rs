@@ -5,6 +5,23 @@ use crate::protocol::{
 use chrono::Utc;
 use waproto::whatsapp as wa;
 
+/// Append a pre-key record directly from the key pair's fixed-size buffers.
+///
+/// The generated protobuf view keeps both key fields borrowed, avoiding the two
+/// temporary `Vec<u8>` allocations performed by [`new_pre_key_record`]. The
+/// schema-generated `ViewEncode` implementation remains the single source of
+/// truth for field numbers and wire types.
+pub fn encode_pre_key_record_to(id: u32, key_pair: &KeyPair, out: &mut Vec<u8>) {
+    use buffa::ViewEncode as _;
+
+    wa::PreKeyRecordStructureView {
+        id: Some(id),
+        public_key: Some(key_pair.public_key.public_key_bytes()),
+        private_key: Some(key_pair.private_key.serialize()),
+    }
+    .encode(out);
+}
+
 pub fn new_pre_key_record(id: u32, key_pair: &KeyPair) -> wa::PreKeyRecordStructure {
     wa::PreKeyRecordStructure {
         id: Some(id),
@@ -101,6 +118,31 @@ mod tests {
     use super::*;
     use crate::protocol::{GenericSignedPreKey, KeyPair, PreKeyRecord};
     use rand::Rng;
+
+    #[test]
+    fn borrowed_prekey_encoder_matches_owned_encoder() {
+        use buffa::Message as _;
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        for id in [1, (1 << 24) - 1, u32::MAX] {
+            let expected = new_pre_key_record(id, &key_pair).encode_to_vec();
+            let mut actual = Vec::with_capacity(expected.len());
+            encode_pre_key_record_to(id, &key_pair, &mut actual);
+            assert_eq!(actual, expected);
+
+            let decoded = wa::PreKeyRecordStructure::decode_from_slice(&actual)
+                .expect("borrowed record should decode");
+            assert_eq!(decoded.id, Some(id));
+            assert_eq!(
+                decoded.public_key.as_deref(),
+                Some(key_pair.public_key.public_key_bytes())
+            );
+            assert_eq!(
+                decoded.private_key.as_deref(),
+                Some(key_pair.private_key.serialize().as_slice())
+            );
+        }
+    }
 
     #[test]
     fn test_prekey_serialization_length() -> Result<(), Box<dyn std::error::Error>> {

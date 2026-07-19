@@ -158,6 +158,24 @@ pub fn parse_jid_fast(s: &str) -> Option<ParsedJidParts<'_>> {
     })
 }
 
+/// Parse the allocation-free JID shapes into the same borrowed type used by
+/// the binary decoder.
+///
+/// Returns `None` when the string needs [`Jid`]'s compatibility fallback or
+/// names an unknown server. Callers that must accept those edge cases can fall
+/// back to `s.parse::<Jid>()`; normal user/group/LID/bot JIDs stay borrowed.
+#[inline]
+pub fn parse_jid_ref(s: &str) -> Option<JidRef<'_>> {
+    let parts = parse_jid_fast(s)?;
+    Some(JidRef {
+        user: NodeStr::Borrowed(parts.user),
+        server: Server::try_from(parts.server).ok()?,
+        agent: parts.agent,
+        device: parts.device,
+        integrator: parts.integrator,
+    })
+}
+
 /// Known WhatsApp server identifiers.
 ///
 /// Maps to the wire protocol's AD_JID domain type (u8) and the `@server` suffix
@@ -707,14 +725,8 @@ impl FromStr for Jid {
     type Err = JidError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Try fast path first for well-formed JIDs
-        if let Some(parts) = parse_jid_fast(s) {
-            return Ok(Jid {
-                user: CompactString::from(parts.user),
-                server: Server::try_from(parts.server)?,
-                agent: parts.agent,
-                device: parts.device,
-                integrator: parts.integrator,
-            });
+        if let Some(jid) = parse_jid_ref(s) {
+            return Ok(jid.to_owned());
         }
 
         // Fallback to original parsing for edge cases and validation
@@ -1147,6 +1159,27 @@ mod tests {
             "Formatted string did not match expected output for {}",
             input
         );
+    }
+
+    #[test]
+    fn borrowed_parser_matches_owned_fast_path_and_bot_classification() {
+        for raw in [
+            "5511999998888:7@s.whatsapp.net",
+            "120363012345678901@g.us",
+            "123456789012345@lid",
+            "assistant@bot",
+            "13135551234@s.whatsapp.net",
+        ] {
+            let borrowed = parse_jid_ref(raw).expect("common JID should stay borrowed");
+            let owned = raw.parse::<Jid>().unwrap();
+
+            assert!(matches!(borrowed.user, NodeStr::Borrowed(_)));
+            assert_eq!(borrowed.to_owned(), owned);
+            assert_eq!(borrowed.is_bot(), owned.is_bot());
+        }
+
+        assert!(parse_jid_ref("g.us").is_none(), "server-only uses fallback");
+        assert!(parse_jid_ref("user@unknown").is_none());
     }
 
     #[test]

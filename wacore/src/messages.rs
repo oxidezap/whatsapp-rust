@@ -376,6 +376,99 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 
+/// History-sync metadata detached from a decoded plaintext while the large
+/// inline blob keeps sharing the decrypt buffer. The generated owned protobuf
+/// type remains the single source for protocol fields; only its byte payload is
+/// represented separately so async processing does not need a megabyte copy.
+#[derive(Debug)]
+pub struct DetachedHistorySyncNotification {
+    pub notification: wa::message::HistorySyncNotification,
+    pub inline_payload: Option<buffa::bytes::Bytes>,
+}
+
+impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotification {
+    fn from(mut notification: wa::message::HistorySyncNotification) -> Self {
+        let inline_payload = notification
+            .initial_hist_bootstrap_inline_payload
+            .take()
+            .map(buffa::bytes::Bytes::from);
+        Self {
+            notification,
+            inline_payload,
+        }
+    }
+}
+
+/// Decode an owned plaintext while detaching an inline history-sync payload as
+/// a zero-copy `Bytes` slice.
+///
+/// The message view is still converted through Buffa's generated
+/// `to_owned_from_source`; clearing only the already-detached history field
+/// preserves every other message/protocol field and unknown-field behavior.
+pub fn decode_plaintext_detached_history_sync(
+    padded_plaintext: Vec<u8>,
+    padding_version: u8,
+) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
+    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
+    let source = buffa::bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
+
+    #[cfg(feature = "tracing")]
+    let decode_span = tracing::trace_span!(
+        "wa.message.decode_plaintext_view",
+        plaintext_bytes = source.len() as u64
+    );
+    #[cfg(feature = "tracing")]
+    let decode_guard = decode_span.enter();
+    let mut view = wa::MessageView::decode_view(&source)
+        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))?;
+    #[cfg(feature = "tracing")]
+    drop(decode_guard);
+
+    let history_view = take_history_sync_notification_view(&mut view);
+    let history_sync = history_view
+        .map(|mut history| {
+            let inline_payload = history
+                .initial_hist_bootstrap_inline_payload
+                .take()
+                .map(|payload| source.slice_ref(payload));
+            let notification = history
+                .to_owned_from_source(Some(&source))
+                .map_err(|e| anyhow::anyhow!("Failed to own history-sync metadata: {e}"))?;
+            Ok::<_, anyhow::Error>(DetachedHistorySyncNotification {
+                notification,
+                inline_payload,
+            })
+        })
+        .transpose()?;
+
+    #[cfg(feature = "tracing")]
+    let materialize_span = tracing::trace_span!(
+        "wa.message.materialize_plaintext",
+        plaintext_bytes = source.len() as u64
+    );
+    #[cfg(feature = "tracing")]
+    let _materialize_guard = materialize_span.enter();
+    let message = view
+        .to_owned_from_source(Some(&source))
+        .map_err(|e| anyhow::anyhow!("Failed to own decrypted plaintext: {e}"))?;
+    Ok((message, history_sync))
+}
+
+fn take_history_sync_notification_view<'a>(
+    message: &mut wa::MessageView<'a>,
+) -> Option<wa::message::HistorySyncNotificationView<'a>> {
+    // Mirror `unwrap_device_sent`: when a valid DSM wrapper exists, only its
+    // inner message is dispatched. Otherwise the top-level message is used.
+    let message = match message.device_sent_message.as_mut() {
+        Some(device_sent) if device_sent.message.is_set() => device_sent.message.as_mut()?,
+        _ => message,
+    };
+    let protocol = message.protocol_message.as_mut()?;
+    let history = protocol.history_sync_notification.as_option()?.clone();
+    protocol.history_sync_notification = buffa::MessageFieldView::unset();
+    Some(history)
+}
+
 /// Use when borrowed fields are enough and a full owned message is avoidable.
 pub fn decode_plaintext_view(
     padded_plaintext: &[u8],
@@ -867,6 +960,27 @@ mod plaintext_view_tests {
         }
     }
 
+    fn history_notification(payload: Vec<u8>) -> wa::message::HistorySyncNotification {
+        wa::message::HistorySyncNotification {
+            file_length: Some(payload.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
+            initial_hist_bootstrap_inline_payload: Some(payload),
+            progress: Some(73),
+            ..Default::default()
+        }
+    }
+
+    fn message_with_history(payload: Vec<u8>, text: &str) -> wa::Message {
+        wa::Message {
+            conversation: Some(text.to_owned()),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                history_sync_notification: buffa::MessageField::some(history_notification(payload)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn decode_plaintext_view_borrows_message_fields() {
         let msg = wa::Message {
@@ -894,6 +1008,65 @@ mod plaintext_view_tests {
 
         assert_eq!(view.conversation(), Some("hello"));
         assert!(view.bytes().len() < padded_len);
+    }
+
+    #[test]
+    fn detached_history_payload_shares_plaintext_and_preserves_message() {
+        let inline_payload = vec![0xA5; 1024];
+        let padded = padded(&message_with_history(inline_payload.clone(), "preserved"));
+        let plaintext_start = padded.as_ptr() as usize;
+        let plaintext_end = plaintext_start + padded.len();
+
+        let (decoded, detached) = decode_plaintext_detached_history_sync(padded, 2)
+            .expect("owned view decode should succeed");
+        let detached = detached.expect("history notification should be detached");
+        let payload = detached
+            .inline_payload
+            .expect("inline history payload should be detached");
+
+        assert_eq!(decoded.conversation.as_deref(), Some("preserved"));
+        assert!(
+            decoded
+                .protocol_message
+                .as_option()
+                .is_some_and(|protocol| !protocol.history_sync_notification.is_set()),
+            "only the detached history field should be cleared"
+        );
+        assert_eq!(detached.notification.file_length, Some(1024));
+        assert_eq!(detached.notification.progress, Some(73));
+        assert_eq!(payload.as_ref(), inline_payload);
+        assert!(
+            (plaintext_start..plaintext_end).contains(&(payload.as_ptr() as usize)),
+            "the detached payload must remain a slice of the original decrypt buffer"
+        );
+    }
+
+    #[test]
+    fn detached_history_follows_device_sent_unwrap_semantics() {
+        let inner_payload = vec![0x11; 64];
+        let inner = message_with_history(inner_payload.clone(), "inner");
+        let mut wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
+        wrapped.protocol_message = buffa::MessageField::some(wa::message::ProtocolMessage {
+            history_sync_notification: buffa::MessageField::some(history_notification(vec![
+                0x22;
+                32
+            ])),
+            ..Default::default()
+        });
+
+        let (decoded, detached) = decode_plaintext_detached_history_sync(padded(&wrapped), 2)
+            .expect("device-sent message should decode");
+        let decoded = unwrap_device_sent(decoded);
+        let detached = detached.expect("inner history notification should be detached");
+
+        assert_eq!(decoded.conversation.as_deref(), Some("inner"));
+        assert!(
+            decoded
+                .protocol_message
+                .as_option()
+                .is_some_and(|protocol| !protocol.history_sync_notification.is_set())
+        );
+        assert_eq!(detached.inline_payload.as_deref(), Some(&inner_payload[..]));
     }
 
     #[test]

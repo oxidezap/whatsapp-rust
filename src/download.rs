@@ -270,13 +270,11 @@ impl Client {
         tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
     )]
     pub async fn download(&self, downloadable: &dyn Downloadable) -> Result<Vec<u8>> {
-        // Stream each attempt into a FRESH in-memory buffer: the CDN read and the
-        // AES/HMAC decrypt interleave in one blocking pass (overlapping network
-        // with CPU, ~halving peak memory vs. fetch-whole-then-decrypt), and a new
-        // buffer per attempt means a failed host that wrote a longer body can't
-        // leave a stale tail behind a shorter successful retry. Pre-size to the
-        // declared plaintext length, capped so a bogus length can't drive a huge
-        // speculative allocation.
+        // Each attempt owns a fresh buffer, so failed hosts cannot leave a stale
+        // tail behind a shorter retry. Streaming clients decrypt directly into a
+        // pre-sized output. Buffered clients already paid for a complete response
+        // Vec, so authenticate and decrypt that allocation in place instead of
+        // keeping a second file-sized output alive beside it.
         let cap = downloadable
             .file_length()
             .unwrap_or(0)
@@ -285,11 +283,15 @@ impl Client {
             |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request| async move {
-                let writer = std::io::Cursor::new(Vec::with_capacity(cap));
-                match self.streaming_download_and_decrypt(&request, writer).await {
-                    Ok((writer, Ok(()))) => Ok(writer.into_inner()),
-                    Ok((_, Err(e))) => Err(e),
-                    Err(e) => Err(DownloadRequestError::other(e)),
+                if self.http_client.supports_streaming() {
+                    let writer = std::io::Cursor::new(Vec::with_capacity(cap));
+                    match self.streaming_download_and_decrypt(&request, writer).await {
+                        Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+                        Ok((_, Err(e))) => Err(e),
+                        Err(e) => Err(DownloadRequestError::other(e)),
+                    }
+                } else {
+                    self.buffered_download_to_vec(&request).await
                 }
             },
         )
@@ -470,69 +472,73 @@ impl Client {
     async fn buffered_download_and_decrypt<W: Write + Seek + Send + 'static>(
         &self,
         request: &wacore::download::DownloadRequest,
-        mut writer: W,
+        writer: W,
     ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
-        let http_request = crate::http::HttpRequest::get(request.url.clone());
-        let resp = match self.http_client.execute(http_request).await {
-            Ok(r) => r,
-            Err(e) => return Ok((writer, Err(DownloadRequestError::other(e)))),
+        let body = match self.buffered_download_to_vec(request).await {
+            Ok(body) => body,
+            Err(err) => return Ok((writer, Err(err))),
         };
 
-        if resp.status_code >= 300 {
-            let err = if is_media_auth_error(resp.status_code) {
-                DownloadRequestError::auth(resp.status_code)
-            } else if matches!(resp.status_code, 404 | 410) {
-                DownloadRequestError::not_found(resp.status_code)
-            } else {
-                DownloadRequestError::other(anyhow!(
-                    "Download failed with status: {}",
-                    resp.status_code
-                ))
-            };
-            return Ok((writer, Err(err)));
-        }
-
-        let decryption = request.decryption.clone();
-
-        // Offload blocking decrypt+write to avoid stalling the async executor
+        // The expensive authentication/decrypt already ran in the helper. Keep
+        // potentially blocking file I/O off the async executor as well.
         Ok(wacore::runtime::blocking(&*self.runtime, move || {
+            let mut writer = writer;
             if let Err(e) = writer.seek(SeekFrom::Start(0)) {
                 return (writer, Err(DownloadRequestError::other(e)));
             }
-
-            let result = (|| -> std::result::Result<(), DownloadRequestError> {
-                let reader = std::io::Cursor::new(resp.body);
-                match &decryption {
-                    MediaDecryption::Encrypted {
-                        media_key,
-                        media_type,
-                    } => {
-                        DownloadUtils::decrypt_stream_to_writer(
-                            reader,
-                            media_key,
-                            *media_type,
-                            &mut writer,
-                        )
-                        .map_err(DownloadRequestError::other)?;
-                    }
-                    MediaDecryption::Plaintext { file_sha256 } => {
-                        DownloadUtils::copy_and_validate_plaintext_to_writer(
-                            reader,
-                            file_sha256,
-                            &mut writer,
-                        )
-                        .map_err(DownloadRequestError::other)?;
-                    }
-                }
-                writer
-                    .seek(SeekFrom::Start(0))
-                    .map_err(DownloadRequestError::other)?;
-                Ok(())
-            })();
+            let result = writer
+                .write_all(&body)
+                .and_then(|()| writer.seek(SeekFrom::Start(0)).map(|_| ()))
+                .map_err(DownloadRequestError::other);
 
             (writer, result)
         })
         .await)
+    }
+
+    /// Execute a non-streaming HTTP download and reuse the response allocation
+    /// for the final plaintext. This is especially important on WASM, where the
+    /// JS `Uint8Array` must already be copied into linear memory at the FFI edge.
+    async fn buffered_download_to_vec(
+        &self,
+        request: &wacore::download::DownloadRequest,
+    ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
+        let http_request = crate::http::HttpRequest::get(request.url.clone());
+        let response = self
+            .http_client
+            .execute(http_request)
+            .await
+            .map_err(DownloadRequestError::other)?;
+        if response.status_code >= 300 {
+            return Err(if is_media_auth_error(response.status_code) {
+                DownloadRequestError::auth(response.status_code)
+            } else if matches!(response.status_code, 404 | 410) {
+                DownloadRequestError::not_found(response.status_code)
+            } else {
+                DownloadRequestError::other(anyhow!(
+                    "Download failed with status: {}",
+                    response.status_code
+                ))
+            });
+        }
+
+        let decryption = request.decryption.clone();
+        wacore::runtime::blocking(&*self.runtime, move || {
+            let mut body = response.body;
+            match &decryption {
+                MediaDecryption::Encrypted {
+                    media_key,
+                    media_type,
+                } => DownloadUtils::verify_and_decrypt_in_place(&mut body, media_key, *media_type)
+                    .map_err(DownloadRequestError::other)?,
+                MediaDecryption::Plaintext { file_sha256 } => {
+                    DownloadUtils::validate_plaintext_sha256(&body, file_sha256)
+                        .map_err(DownloadRequestError::other)?;
+                }
+            }
+            Ok(body)
+        })
+        .await
     }
 }
 
