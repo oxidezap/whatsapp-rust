@@ -671,7 +671,7 @@ impl Client {
                         "sender_jid": sender_encryption_jid.to_string(),
                         "timestamp": info.timestamp,
                         "enc_type": enc_type_str,
-                        "payload_base64": BASE64_STANDARD.encode(ciphertext),
+                        "payload_base64": BASE64_STANDARD.encode(payload.ciphertext.as_ref()),
                     });
 
                     let content_bytes = serde_json::to_vec_pretty(&payload).unwrap_or_default();
