@@ -1188,6 +1188,7 @@ fn decrypt_with_message_keys(
     })
 }
 
+#[must_use = "the deferred sender ratchet must be applied after authenticated decryption succeeds"]
 struct DeferredSenderRatchet {
     receiver_root_key: RootKey,
     previous_counter: u32,
