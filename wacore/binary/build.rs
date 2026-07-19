@@ -18,6 +18,8 @@ struct Tokens {
 fn best_disc_pair(tokens: &[&[u8]], len: usize) -> (u8, u8) {
     let mut best = (usize::MAX, (0u8, 0u8));
     for p1 in 0..len {
+        // p2 == p1 is deliberate: for groups a single byte already splits
+        // best, the pair degenerates to that byte repeated.
         for p2 in p1..len {
             let mut buckets: HashMap<(u8, u8), usize> = HashMap::new();
             let mut worst = 0;

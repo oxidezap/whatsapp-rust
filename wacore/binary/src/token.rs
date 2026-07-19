@@ -30,18 +30,15 @@ pub enum TokenKind {
 
 /// Per-length probe metadata; layout mirrors what build.rs emits.
 struct LenHdr {
-    /// Primary/secondary discriminator byte positions.
     p1: u8,
     p2: u8,
-    /// Smallest p1 byte occurring among this length's tokens.
     d1_min: u8,
-    /// p1-byte span + 1; 0 for lengths with no tokens.
+    /// Stored as span + 1 so 0 doubles as the empty-length sentinel: the
+    /// `idx + 1 >= span_plus_1` check then rejects every probe without a
+    /// separate branch.
     span_plus_1: u16,
-    /// Start of this length's range table in `D1_OFF`.
     d1_table: u16,
-    /// First entry index in `DISC_KEYS`/`KINDS`.
     entry_start: u16,
-    /// First byte of this length's tokens in `BLOB`.
     blob_start: u16,
 }
 
@@ -78,7 +75,7 @@ fn lookup_bytes(key: &[u8]) -> Option<TokenKind> {
     let disc = ((b1 as u16) << 8) | key[h.p2 as usize] as u16;
     let blob_base = h.blob_start as usize;
 
-    // The run shares b1 and is sorted by (b2, bytes); scan with early exit.
+    // Early exit is sound only because build.rs sorts each run by (b2, bytes).
     for i in run_start..run_end {
         if DISC_KEYS[i] > disc {
             break;
