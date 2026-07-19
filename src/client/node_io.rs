@@ -77,7 +77,6 @@ impl Client {
         // instead of hanging silently. The slow path keeps ONE acquire future
         // alive across warn ticks so the waiter never loses its queue position.
         const PERMIT_WAIT_WARN: std::time::Duration = std::time::Duration::from_secs(10);
-        let mut warned = false;
         loop {
             let (generation, semaphore) = self.read_message_semaphore();
             let permit = match semaphore.try_acquire_arc() {
@@ -85,20 +84,16 @@ impl Client {
                 None => {
                     let acquire = semaphore.acquire_arc();
                     futures::pin_mut!(acquire);
-                    loop {
-                        let sleep = self.runtime.sleep(PERMIT_WAIT_WARN);
-                        futures::pin_mut!(sleep);
-                        match futures::future::select(&mut acquire, sleep).await {
-                            futures::future::Either::Left((permit, _)) => break permit,
-                            futures::future::Either::Right(((), _)) => {
-                                if !warned {
-                                    warned = true;
-                                    warn!(
-                                        "Message-processing permit not acquired after {PERMIT_WAIT_WARN:?} (drain_active={}); a stanza worker or drain flush may be stalled",
-                                        self.inbound_commit_batch.is_active()
-                                    );
-                                }
-                            }
+                    let sleep = self.runtime.sleep(PERMIT_WAIT_WARN);
+                    futures::pin_mut!(sleep);
+                    match futures::future::select(&mut acquire, sleep).await {
+                        futures::future::Either::Left((permit, _)) => permit,
+                        futures::future::Either::Right(((), _)) => {
+                            warn!(
+                                "Message-processing permit not acquired after {PERMIT_WAIT_WARN:?} (drain_active={}); a stanza worker or drain flush may be stalled",
+                                self.inbound_commit_batch.is_active()
+                            );
+                            acquire.await
                         }
                     }
                 }
