@@ -853,6 +853,7 @@ pub fn parse_message_info(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod plaintext_view_tests {
     use super::*;
 
@@ -1355,6 +1356,7 @@ mod parse_message_info_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod device_sent_tests {
     use super::*;
 

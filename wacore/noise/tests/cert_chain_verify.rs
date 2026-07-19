@@ -6,6 +6,8 @@
 //! a regular dep without `cfg(test)`, so the real verify actually runs here.
 
 #![cfg(not(feature = "danger-skip-cert-chain-verify"))]
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
 
 use buffa::Message;
 use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};

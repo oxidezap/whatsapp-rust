@@ -1,7 +1,6 @@
 //! Special message types: newsletter, app-state key share, sender-key distribution.
 
 use super::*;
-use buffa::Message as _;
 
 const APP_STATE_KEY_SHARE_SEND_ATTEMPTS: u8 = 3;
 const APP_STATE_KEY_SHARE_SEND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -90,7 +89,9 @@ impl Client {
             Some(KeyComponents {
                 key_id,
                 data,
-                fingerprint_bytes: fingerprint.encode_to_vec(),
+                fingerprint_bytes: waproto::codec::app_state_sync_key_fingerprint_to_vec(
+                    fingerprint,
+                ),
                 timestamp: key_data.timestamp.unwrap_or_default(),
             })
         }
@@ -182,9 +183,7 @@ impl Client {
                 continue;
             };
             let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
-                match wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
-                    &stored.fingerprint,
-                ) {
+                match waproto::codec::app_state_sync_key_fingerprint_decode(&stored.fingerprint) {
                     Ok(fingerprint) => {
                         buffa::MessageField::some(wa::message::AppStateSyncKeyData {
                             key_data: Some(stored.key_data),

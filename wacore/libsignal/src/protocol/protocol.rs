@@ -103,7 +103,9 @@ impl Clone for SignalMessage {
 impl SignalMessage {
     const MAC_LENGTH: usize = 8;
 
-    #[allow(clippy::too_many_arguments)]
+    // Signal wire protos are (de)serialized only in this crate, so direct
+    // buffa calls duplicate nothing; no codec pin needed (here and below).
+    #[allow(clippy::too_many_arguments, clippy::disallowed_methods)]
     pub fn new(
         message_version: u8,
         mac_key: &[u8],
@@ -294,6 +296,7 @@ pub struct PreKeySignalMessage {
 }
 
 impl PreKeySignalMessage {
+    #[allow(clippy::disallowed_methods)]
     pub fn new(
         message_version: u8,
         registration_id: u32,
@@ -460,6 +463,7 @@ impl Clone for SenderKeyMessage {
 impl SenderKeyMessage {
     const SIGNATURE_LEN: usize = 64;
 
+    #[allow(clippy::disallowed_methods)]
     pub fn new<R: CryptoRng + Rng>(
         message_version: u8,
         chain_id: u32,
@@ -635,6 +639,7 @@ pub struct SenderKeyDistributionMessage {
 }
 
 impl SenderKeyDistributionMessage {
+    #[allow(clippy::disallowed_methods)]
     pub fn new(
         message_version: u8,
         chain_id: u32,
@@ -895,6 +900,7 @@ pub struct DecryptionErrorMessage {
 }
 
 impl DecryptionErrorMessage {
+    #[allow(clippy::disallowed_methods)]
     pub fn for_original(
         original_bytes: &[u8],
         original_type: CiphertextMessageType,
@@ -957,6 +963,7 @@ impl DecryptionErrorMessage {
 impl TryFrom<&[u8]> for DecryptionErrorMessage {
     type Error = SignalProtocolError;
 
+    #[allow(clippy::disallowed_methods)]
     fn try_from(value: &[u8]) -> Result<Self> {
         let proto_structure = DecryptionErrorMessageProto::decode_from_slice(value)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
@@ -979,6 +986,7 @@ impl TryFrom<&[u8]> for DecryptionErrorMessage {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

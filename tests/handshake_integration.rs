@@ -21,6 +21,9 @@
 //! second connect both runs without sending three ClientHello bytes
 //! (i.e. it speaks IK shape, not XX shape) AND completes successfully.
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use buffa::Message;
 use bytes::Bytes;

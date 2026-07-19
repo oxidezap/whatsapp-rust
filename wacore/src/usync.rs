@@ -196,6 +196,7 @@ pub fn parse_lid_mappings_from_response(resp_node: &NodeRef<'_>) -> Vec<UsyncLid
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;

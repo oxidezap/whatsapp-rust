@@ -388,9 +388,8 @@ impl Client {
         };
         let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let record = new_pre_key_record(id, &key_pair);
-        use buffa::Message;
         backend
-            .store_prekey(id, &record.encode_to_vec(), false)
+            .store_prekey(id, &waproto::codec::pre_key_record_to_vec(&record), false)
             .await?;
         self.persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
@@ -516,8 +515,6 @@ impl Client {
             // the async executor responsive. Records are encoded into one contiguous
             // buffer with zero-copy Bytes slices instead of an alloc per record.
             let (encoded_batch, generated) = wacore::runtime::blocking(&*self.runtime, move || {
-                use buffa::Message;
-
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -536,7 +533,10 @@ impl Client {
                     let pre_key_id = gen_start + i as u32;
                     let key_pair = KeyPair::generate(&mut rng);
                     let start = buf.len();
-                    new_pre_key_record(pre_key_id, &key_pair).encode(&mut buf);
+                    waproto::codec::pre_key_record_encode_into(
+                        &new_pre_key_record(pre_key_id, &key_pair),
+                        &mut buf,
+                    );
                     offsets.push((pre_key_id, start..buf.len()));
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 }
@@ -1062,6 +1062,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod window_tests {
     use wacore::libsignal::protocol::PublicKey;
 

@@ -3,6 +3,9 @@
 //! decompressed). This is the heaviest single-shot pipeline in the library
 //! and the hottest consumer of the varint scan.
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use buffa::Message;
 use divan::black_box;
 use flate2::{Compression, write::ZlibEncoder};

@@ -623,7 +623,7 @@ pub struct DisappearingModeChanged {
 /// `maybe_*` setter), never an empty-string / zero sentinel. Even the
 /// unit-marker events are empty sealed structs built as
 /// `Connected::builder().build()`, so a new payload must follow the pattern.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[non_exhaustive]
 pub enum Event {
     Connected(Connected),
@@ -877,6 +877,15 @@ impl Event {
     /// `for msg in event.messages()` scan over a mixed event stream).
     pub fn messages(&self) -> impl Iterator<Item = &InboundMessage> {
         self.as_messages().into_iter().flatten()
+    }
+}
+
+// Variant name only, on purpose: Messages/HistorySync transitively contain
+// `wa::Message`, so a derived impl would keep the entire generated proto Debug
+// graph (hundreds of KiB) in the binary. Serialize the event for full contents.
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.kind(), f)
     }
 }
 
@@ -1544,6 +1553,7 @@ pub struct LabelAssociationUpdate {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use buffa::Message;

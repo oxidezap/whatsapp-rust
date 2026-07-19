@@ -8,7 +8,6 @@
 //! the HKDF use-case is `"Enc Reaction"` with empty AAD.
 
 use anyhow::{Result, ensure};
-use buffa::Message;
 use waproto::whatsapp::message::ReactionMessage;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
@@ -52,7 +51,7 @@ pub fn encrypt_reaction_with_secret(
         sender_timestamp_ms: Some(sender_timestamp_ms),
         ..Default::default()
     };
-    let plaintext = inner.encode_to_vec();
+    let plaintext = waproto::codec::reaction_message_to_vec(&inner);
     encrypt_addon(
         &plaintext,
         message_secret,
@@ -83,7 +82,7 @@ pub fn decrypt_reaction_with_secret(
         message_secret,
         &reaction_addon_ctx(parent_msg_id, parent_sender_jid, reactor_jid),
     )?;
-    Ok(ReactionMessage::decode_from_slice(&plaintext[..])?)
+    Ok(waproto::codec::reaction_message_decode(&plaintext)?)
 }
 
 #[cfg(test)]

@@ -1,5 +1,8 @@
 //! Tests for the message receive/decrypt pipeline.
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use crate::store::SqliteStore;
 use crate::store::persistence_manager::PersistenceManager;

@@ -536,6 +536,7 @@ pub fn decrypt_secret_encrypted_with_fallback(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use wacore::message_edit::encrypt_message_edit;

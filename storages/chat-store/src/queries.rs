@@ -4,12 +4,10 @@
 
 use std::str::FromStr;
 
-use buffa::Message as _;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use log::warn;
 use wacore_binary::Jid;
-use waproto::whatsapp as wa;
 
 use crate::error::{Result, db_err};
 use crate::schema;
@@ -114,7 +112,7 @@ struct MessageRow {
 impl From<MessageRow> for StoredMessage {
     fn from(row: MessageRow) -> Self {
         let message = row.proto.as_deref().and_then(|bytes| {
-            match wa::Message::decode_from_slice(bytes) {
+            match waproto::codec::message_decode(bytes) {
                 Ok(msg) => Some(Box::new(msg)),
                 Err(e) => {
                     // Denormalized columns still render; only the proto is lost.

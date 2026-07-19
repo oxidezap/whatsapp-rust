@@ -568,6 +568,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::self_peer_target;
     use wacore::store::Device;

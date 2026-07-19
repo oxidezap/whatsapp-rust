@@ -7,12 +7,10 @@
 
 use crate::client::Client;
 use crate::request::IqError;
-use buffa::Message;
 use wacore::iq::prekeys::RotateSignedPreKeySpec;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wacore::libsignal::store::record_helpers::new_signed_pre_key_record;
 use wacore::store::commands::DeviceCommand;
-use waproto::whatsapp::SignedPreKeyRecordStructure;
 
 /// Rotation cadence. This is the one value NOT grounded in the WA Web bundle
 /// (there it is a persisted background job with a server-tuned schedule), so
@@ -110,7 +108,7 @@ impl Client {
             .map_err(|e| anyhow::anyhow!("failed to load staged signed pre-key: {e}"))?
         {
             Some(bytes) => {
-                let s = SignedPreKeyRecordStructure::decode_from_slice(&bytes)
+                let s = waproto::codec::signed_pre_key_record_decode(&bytes)
                     .map_err(|e| anyhow::anyhow!("staged signed pre-key decode: {e}"))?;
                 let public = PublicKey::from_djb_public_key_bytes(
                     s.public_key
@@ -143,7 +141,10 @@ impl Client {
                 let record =
                     new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
                 backend
-                    .store_signed_prekey(new_id, &record.encode_to_vec())
+                    .store_signed_prekey(
+                        new_id,
+                        &waproto::codec::signed_pre_key_record_to_vec(&record),
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to stage new signed pre-key: {e}"))?;
                 (kp, signature)
@@ -161,7 +162,10 @@ impl Client {
             wacore::time::now_utc(),
         );
         backend
-            .store_signed_prekey(old_id, &old_record.encode_to_vec())
+            .store_signed_prekey(
+                old_id,
+                &waproto::codec::signed_pre_key_record_to_vec(&old_record),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("failed to retain old signed pre-key: {e}"))?;
 

@@ -1,6 +1,9 @@
 //! Integration tests: real SqliteStore (in-memory), real writer task, events
 //! fed through the public handler exactly as the client would.
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

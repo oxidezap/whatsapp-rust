@@ -171,6 +171,7 @@ pub fn collect_key_id_refs_from_patch_list<'a>(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::hash::{generate_content_mac, generate_index_mac};

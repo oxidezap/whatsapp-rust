@@ -11,13 +11,16 @@
 pub use buffa;
 
 pub mod whatsapp {
+    // disallowed_methods: the generated impls call the buffa trait methods on
+    // nested messages; that IS the pinned instantiation.
     #![allow(
         non_camel_case_types,
         non_snake_case,
         unreachable_patterns,
         clippy::derivable_impls,
         clippy::match_single_binding,
-        clippy::needless_else
+        clippy::needless_else,
+        clippy::disallowed_methods
     )]
     #[rustfmt::skip]
     buffa::include_proto!("whatsapp");
@@ -95,6 +98,9 @@ pub mod tags {
 /// Decode helpers take `&[u8]` and decode via `decode_from_slice`, the buffer
 /// shape the rest of the workspace already instantiates, so no second
 /// buffer-type tree exists.
+// The pinning wrappers are the one sanctioned direct-call site (see
+// clippy.toml disallowed-methods).
+#[allow(clippy::disallowed_methods)]
 pub mod codec {
     use crate::whatsapp;
     use buffa::Message as _;
@@ -291,6 +297,13 @@ pub mod codec {
         record.encode_to_vec()
     }
 
+    /// Append the encoded record to `out`; the bulk prekey upload packs many
+    /// records into one shared buffer.
+    #[inline(never)]
+    pub fn pre_key_record_encode_into(record: &whatsapp::PreKeyRecordStructure, out: &mut Vec<u8>) {
+        record.encode(out);
+    }
+
     #[inline(never)]
     pub fn signed_pre_key_record_decode(
         bytes: &[u8],
@@ -404,9 +417,122 @@ pub mod codec {
     ) -> Result<whatsapp::SenderKeyDistributionMessage, buffa::DecodeError> {
         whatsapp::SenderKeyDistributionMessage::decode_from_slice(bytes)
     }
+
+    /// Noise server cert chain, verified once per connection in wacore-noise.
+    #[inline(never)]
+    pub fn cert_chain_decode(bytes: &[u8]) -> Result<whatsapp::CertChain, buffa::DecodeError> {
+        whatsapp::CertChain::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn noise_certificate_details_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::cert_chain::noise_certificate::Details, buffa::DecodeError> {
+        whatsapp::cert_chain::noise_certificate::Details::decode_from_slice(bytes)
+    }
+
+    /// Business verified-name certificates (usync / business profile parsing).
+    #[inline(never)]
+    pub fn verified_name_certificate_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::VerifiedNameCertificate, buffa::DecodeError> {
+        whatsapp::VerifiedNameCertificate::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn verified_name_certificate_details_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::verified_name_certificate::Details, buffa::DecodeError> {
+        whatsapp::verified_name_certificate::Details::decode_from_slice(bytes)
+    }
+
+    /// SHORTCAKE passkey-pairing protos (one flow per device link).
+    #[inline(never)]
+    pub fn companion_ephemeral_identity_to_vec(
+        id: &whatsapp::CompanionEphemeralIdentity,
+    ) -> Vec<u8> {
+        id.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn prologue_payload_to_vec(payload: &whatsapp::ProloguePayload) -> Vec<u8> {
+        payload.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn primary_ephemeral_identity_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::PrimaryEphemeralIdentity, buffa::DecodeError> {
+        whatsapp::PrimaryEphemeralIdentity::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn pairing_request_to_vec(req: &whatsapp::PairingRequest) -> Vec<u8> {
+        req.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn encrypted_pairing_request_to_vec(req: &whatsapp::EncryptedPairingRequest) -> Vec<u8> {
+        req.encode_to_vec()
+    }
+
+    /// Secret-addon payloads (enc reactions, event responses, bot msmsg
+    /// replies) and per-message sidecars; small trees, but wacore and the
+    /// main crate each stamped private copies.
+    #[inline(never)]
+    pub fn reaction_message_to_vec(msg: &whatsapp::message::ReactionMessage) -> Vec<u8> {
+        msg.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn reaction_message_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::message::ReactionMessage, buffa::DecodeError> {
+        whatsapp::message::ReactionMessage::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn event_response_message_to_vec(msg: &whatsapp::message::EventResponseMessage) -> Vec<u8> {
+        msg.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn event_response_message_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::message::EventResponseMessage, buffa::DecodeError> {
+        whatsapp::message::EventResponseMessage::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn message_secret_message_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::MessageSecretMessage, buffa::DecodeError> {
+        whatsapp::MessageSecretMessage::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn server_error_receipt_to_vec(receipt: &whatsapp::ServerErrorReceipt) -> Vec<u8> {
+        receipt.encode_to_vec()
+    }
+
+    /// App-state key-share fingerprints, persisted alongside each sync key.
+    #[inline(never)]
+    pub fn app_state_sync_key_fingerprint_to_vec(
+        fp: &whatsapp::message::AppStateSyncKeyFingerprint,
+    ) -> Vec<u8> {
+        fp.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn app_state_sync_key_fingerprint_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::message::AppStateSyncKeyFingerprint, buffa::DecodeError> {
+        whatsapp::message::AppStateSyncKeyFingerprint::decode_from_slice(bytes)
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::whatsapp as wa;
     use buffa::Message;
