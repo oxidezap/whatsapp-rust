@@ -209,11 +209,7 @@ where
     // (SET) or subtract (REMOVE), so guessing at an unknown op corrupts the
     // hash in a way that only surfaces later as MismatchingLTHash.
     for m in &patch.mutations {
-        if let Some(op) = m.operation
-            && op.is_unknown()
-        {
-            return Err(AppStateError::UnsupportedSyncdOperation(op.to_i32()));
-        }
+        known_op(m.operation)?;
     }
 
     state.version = patch_version;
