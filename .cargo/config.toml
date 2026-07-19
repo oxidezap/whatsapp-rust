@@ -11,9 +11,14 @@
 # lld + ICF: lld lays out the fat-LTO object tighter than BFD ld and folds
 #   byte-identical sections (measured -73 KiB on the stripped demo). Scoped to
 #   this target so wasm and non-Linux builds keep their default linkers.
+#   -Clinker-features=+lld selects the rust-lld bundled with the pinned
+#   toolchain, so contributors need no system lld package. Still
+#   unstable-gated on this nightly, hence -Zunstable-options (the block is
+#   nightly-only anyway; CI's stable job opts out via RUSTFLAGS="").
 rustflags = [
     "-Zshare-generics=y",
-    "-Clink-arg=-fuse-ld=lld",
+    "-Zunstable-options",
+    "-Clinker-features=+lld",
     "-Clink-arg=-Wl,--icf=all",
 ]
 

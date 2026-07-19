@@ -187,9 +187,8 @@ impl HandshakeUtils {
         let intermediate_details_bytes = intermediate.details.as_ref().ok_or_else(|| {
             HandshakeError::CertVerification("Missing intermediate details".into())
         })?;
-        let intermediate_details = waproto::codec::noise_certificate_details_decode(
-            intermediate_details_bytes.as_slice(),
-        )?;
+        let intermediate_details =
+            waproto::codec::noise_certificate_details_decode(intermediate_details_bytes)?;
 
         let issuer_serial = intermediate_details.issuer_serial.unwrap_or(0);
         if i64::from(issuer_serial) != WA_CERT_ISSUER_SERIAL {
@@ -220,8 +219,7 @@ impl HandshakeUtils {
             .details
             .as_ref()
             .ok_or_else(|| HandshakeError::CertVerification("Missing leaf details".into()))?;
-        let leaf_details =
-            waproto::codec::noise_certificate_details_decode(leaf_details_bytes.as_slice())?;
+        let leaf_details = waproto::codec::noise_certificate_details_decode(leaf_details_bytes)?;
 
         if leaf_details.issuer_serial != intermediate_details.serial {
             return Err(HandshakeError::CertVerification(format!(

@@ -150,6 +150,11 @@ jobs:
   test-stable:
     name: Test Stable (no-simd)
     runs-on: ubuntu-latest
+    # .cargo/config.toml sets nightly-only rustflags (-Zshare-generics) for the
+    # x86_64-linux target; a set-but-empty RUSTFLAGS takes precedence over
+    # config rustflags, keeping this stable-toolchain job buildable.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

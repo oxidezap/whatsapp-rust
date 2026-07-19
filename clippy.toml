@@ -14,6 +14,10 @@ disallowed-methods = [
     { path = "buffa::message::Message::decode_from_slice", reason = "use waproto::codec::*_decode (pinned single instantiation; direct calls duplicate the decode tree per crate)" },
     { path = "buffa::message::Message::merge_from_slice", reason = "use waproto::codec::*_merge (pinned single instantiation; direct calls duplicate the decode tree per crate)" },
     { path = "buffa::message::Message::merge_to_limit", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::decode", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::decode_length_delimited", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::encode_length_delimited", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the encode tree per crate)" },
+    { path = "buffa::message::Message::encode_to_bytes", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the encode tree per crate)" },
 ]
 
 # 64-bit atomic *types*: 32-bit targets (Xtensa/ESP32) have no native AtomicU64/

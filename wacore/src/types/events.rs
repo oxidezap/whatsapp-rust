@@ -623,6 +623,10 @@ pub struct DisappearingModeChanged {
 /// `maybe_*` setter), never an empty-string / zero sentinel. Even the
 /// unit-marker events are empty sealed structs built as
 /// `Connected::builder().build()`, so a new payload must follow the pattern.
+///
+/// `Debug` output is intentionally variant-name-only (`{:?}` prints e.g.
+/// `Messages`): a derived impl would drag the entire generated proto `Debug`
+/// graph into the binary. `Serialize` the event when full contents are needed.
 #[derive(Clone, Serialize)]
 #[non_exhaustive]
 pub enum Event {

@@ -284,7 +284,7 @@ impl PreKeyStore for Device {
         match self.backend.load_prekey(prekey_id).await {
             Ok(Some(bytes)) => {
                 // Try new format first (protobuf-encoded PreKeyRecordStructure)
-                if let Ok(record) = waproto::codec::pre_key_record_decode(bytes.as_ref()) {
+                if let Ok(record) = waproto::codec::pre_key_record_decode(&bytes) {
                     return Ok(Some(record));
                 }
 
