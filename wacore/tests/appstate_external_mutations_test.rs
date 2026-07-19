@@ -18,7 +18,7 @@ fn make_mutation(
     value_blob: Option<Vec<u8>>,
 ) -> wa::SyncdMutation {
     wa::SyncdMutation {
-        operation: Some(op),
+        operation: Some(op.into()),
         record: wa::SyncdRecord {
             index: wa::SyncdIndex {
                 blob: Some(index_mac),
@@ -227,11 +227,11 @@ fn test_external_mutations_decode_from_syncd_mutations() {
     assert_eq!(decoded.mutations.len(), 2);
     assert_eq!(
         decoded.mutations[0].operation,
-        Some(wa::syncd_mutation::SyncdOperation::SET)
+        Some(wa::syncd_mutation::SyncdOperation::SET.into())
     );
     assert_eq!(
         decoded.mutations[1].operation,
-        Some(wa::syncd_mutation::SyncdOperation::REMOVE)
+        Some(wa::syncd_mutation::SyncdOperation::REMOVE.into())
     );
 }
 

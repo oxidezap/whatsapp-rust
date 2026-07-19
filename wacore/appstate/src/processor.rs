@@ -14,6 +14,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use waproto::whatsapp as wa;
 
+/// Resolve a mutation's operation to the closed Rust enum. Absent defaults
+/// to SET (proto2 enum default); an unknown wire value is a typed error so
+/// standalone callers stay safe even without process_patch's up-front guard.
+fn known_op(
+    op: Option<buffa::EnumValue<wa::syncd_mutation::SyncdOperation>>,
+) -> Result<wa::syncd_mutation::SyncdOperation, AppStateError> {
+    match op {
+        None => Ok(wa::syncd_mutation::SyncdOperation::SET),
+        Some(v) => v
+            .as_known()
+            .ok_or(AppStateError::UnsupportedSyncdOperation(v.to_i32())),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateMutationMAC {
     pub index_mac: Vec<u8>,
@@ -190,6 +204,14 @@ where
         });
     }
 
+    // SyncdOperation is an open enum: reject unknown operations up front,
+    // before any state is mutated — the LTHash math below can only add
+    // (SET) or subtract (REMOVE), so guessing at an unknown op corrupts the
+    // hash in a way that only surfaces later as MismatchingLTHash.
+    for m in &patch.mutations {
+        known_op(m.operation)?;
+    }
+
     state.version = patch_version;
 
     // index_mac -> most-recent in-patch value MAC tail, filled as we iterate. Replaces a
@@ -203,10 +225,9 @@ where
         // the loop; the in-patch overlay only models SET-overwrite collapse and must
         // never feed a REMOVE (a REMOVE preceded by a SET on the same index would
         // otherwise subtract the in-patch value instead of the store's).
-        let is_remove = matches!(
-            patch.mutations[idx].operation,
-            Some(wa::syncd_mutation::SyncdOperation::REMOVE)
-        );
+        let is_remove = patch.mutations[idx]
+            .operation
+            .is_some_and(|op| op == wa::syncd_mutation::SyncdOperation::REMOVE);
         let prev = if !is_remove && let Some(value_mac) = in_patch.get(index_mac) {
             Some(value_mac.to_vec())
         } else {
@@ -261,9 +282,7 @@ where
 
     for m in &patch.mutations {
         if m.record.is_set() {
-            let op = m
-                .operation
-                .unwrap_or(wa::syncd_mutation::SyncdOperation::SET);
+            let op = known_op(m.operation)?;
 
             let key_id = m
                 .record
@@ -321,9 +340,7 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
         let Some(index_mac) = rec.index.as_option().and_then(|i| i.blob.as_deref()) else {
             continue;
         };
-        let op = m
-            .operation
-            .unwrap_or(wa::syncd_mutation::SyncdOperation::SET);
+        let op = known_op(m.operation)?;
         let seen = match op {
             wa::syncd_mutation::SyncdOperation::SET => &mut seen_set,
             wa::syncd_mutation::SyncdOperation::REMOVE => &mut seen_remove,
@@ -713,7 +730,7 @@ mod tests {
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                 record: buffa::MessageField::some(record),
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -743,6 +760,49 @@ mod tests {
             result.added_macs[0].value_mac
         );
         assert!(result.removed_index_macs.is_empty());
+    }
+
+    /// SyncdOperation is open: a wire value beyond SET/REMOVE must fail the
+    /// patch with a typed error before any hash math, not be folded into SET
+    /// (the closed-enum behavior) and corrupt the LTHash.
+    #[test]
+    fn test_process_patch_rejects_unknown_operation() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index_mac = vec![1; 32];
+
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &index_mac,
+            &keys,
+            &key_id,
+            1234567890,
+        );
+
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
+            mutations: vec![wa::SyncdMutation {
+                operation: Some(buffa::EnumValue::Unknown(7)),
+                record: buffa::MessageField::some(record),
+            }],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let get_prev = |_: &[u8]| Ok(None);
+
+        let mut state = HashState::default();
+        let before = state.hash;
+        let err = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
+            .expect_err("unknown operation must be rejected");
+
+        assert!(matches!(err, AppStateError::UnsupportedSyncdOperation(7)));
+        assert_eq!(state.hash, before, "hash must be untouched on rejection");
+        assert_eq!(state.version, 0, "version must be untouched on rejection");
     }
 
     #[test]
@@ -895,7 +955,7 @@ mod tests {
 
         // Two SET mutations colliding on the same index within one patch.
         let mk = |ts| wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
             record: buffa::MessageField::some(create_encrypted_record(
                 wa::syncd_mutation::SyncdOperation::SET,
                 &index_mac,
@@ -932,7 +992,7 @@ mod tests {
         // SET and REMOVE share an index legitimately: WA Web tracks the two
         // operations in separate sets, so this is not tampering.
         let set = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
             record: buffa::MessageField::some(create_encrypted_record(
                 wa::syncd_mutation::SyncdOperation::SET,
                 &index_mac,
@@ -942,7 +1002,7 @@ mod tests {
             )),
         };
         let remove = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::REMOVE),
+            operation: Some(wa::syncd_mutation::SyncdOperation::REMOVE.into()),
             record: buffa::MessageField::some(create_encrypted_record(
                 wa::syncd_mutation::SyncdOperation::REMOVE,
                 &index_mac,
@@ -978,7 +1038,7 @@ mod tests {
         let key_id = b"test_key_id".to_vec();
 
         let mk = |index: &[u8], ts| wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
             record: buffa::MessageField::some(create_encrypted_record(
                 wa::syncd_mutation::SyncdOperation::SET,
                 index,
@@ -1054,7 +1114,7 @@ mod tests {
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                 record: buffa::MessageField::some(overwrite_record.clone()),
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -1155,11 +1215,11 @@ mod tests {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                     record: buffa::MessageField::some(first),
                 },
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                     record: buffa::MessageField::some(second),
                 },
             ],
@@ -1247,11 +1307,11 @@ mod tests {
             ..Default::default()
         };
         let set_mutation = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
             record: buffa::MessageField::some(set),
         };
         let remove_mutation = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::REMOVE),
+            operation: Some(wa::syncd_mutation::SyncdOperation::REMOVE.into()),
             record: buffa::MessageField::some(remove),
         };
 
@@ -1327,7 +1387,7 @@ mod tests {
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(3) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                 record: buffa::MessageField::some(record),
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -1381,7 +1441,7 @@ mod tests {
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(8) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                 record: buffa::MessageField::some(record),
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -1434,7 +1494,7 @@ mod tests {
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(6) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                 record: buffa::MessageField::some(record),
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -1476,7 +1536,7 @@ mod tests {
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(42) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                 record: buffa::MessageField::some(record),
             }],
             key_id: buffa::MessageField::some(wa::KeyId {

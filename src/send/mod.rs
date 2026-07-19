@@ -1517,7 +1517,6 @@ impl Client {
             }
             return Err(e.into());
         }
-
         if let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),

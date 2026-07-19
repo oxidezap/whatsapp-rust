@@ -362,9 +362,7 @@ impl Client {
                         })
                         .await;
                 }
-                use buffa::Message;
-                let structure =
-                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record)?;
+                let structure = waproto::codec::pre_key_record_decode(&record)?;
                 let record = wacore::libsignal::store::record_helpers::prekey_structure_to_record(
                     structure,
                 )?;
@@ -620,17 +618,15 @@ impl Client {
             // `PreKeyRecordStructure::decode` the consume path runs, so a record
             // accepted here is one this device can later decrypt with. Fresh keys skip
             // decode entirely; their public keys never left memory.
-            use buffa::Message;
             for (id, record) in &leftover_rows {
-                let public_key =
-                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record[..])
-                        .map_err(anyhow::Error::from)
-                        .and_then(|s| {
-                            let raw = s
-                                .public_key
-                                .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                            PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
-                        });
+                let public_key = waproto::codec::pre_key_record_decode(&record[..])
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| {
+                        let raw = s
+                            .public_key
+                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
+                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                    });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
                     Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),

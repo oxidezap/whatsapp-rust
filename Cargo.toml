@@ -59,9 +59,9 @@ zerocopy = { version = "0.8.52", default-features = false, features = ["derive"]
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-buffa = { version = "0.8.1", default-features = false, features = ["json"] }
-buffa-build = { version = "0.8.1", default-features = false }
-buffa-descriptor = { version = "0.8.1", default-features = false }
+buffa = { version = "0.9.0", default-features = false, features = ["json"] }
+buffa-build = { version = "0.9.0", default-features = false }
+buffa-descriptor = { version = "0.9.0", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 bon = { version = "3.9.3", default-features = false, features = ["std"] }

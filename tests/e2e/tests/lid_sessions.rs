@@ -410,6 +410,10 @@ async fn test_own_device_0_has_lid_session_after_login() -> anyhow::Result<()> {
 
     let backend = client.client.persistence_manager().backend();
 
+    // Sessions land in the write-behind Signal cache first; settle before
+    // reading the backend directly (same as the reconnect test above).
+    client.client.flush_pending_signal_state().await?;
+
     // Device 0 is the primary phone — session should exist under LID
     let lid_addr = format!("{}@lid.0", own_lid.user);
     let lid_session = backend.get_session(&lid_addr).await?;

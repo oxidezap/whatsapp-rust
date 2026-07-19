@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
 use async_trait::async_trait;
-use buffa::Message;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
@@ -108,7 +107,7 @@ where
     {
         let data =
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = wa::SyncdSnapshot::decode_from_slice(data.as_slice())
+        let snapshot = waproto::codec::syncd_snapshot_decode(data.as_slice())
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
         pl.snapshot = Some(snapshot);
     }
@@ -122,7 +121,7 @@ where
                 .unwrap_or(0);
             let data = download(ext)
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = wa::SyncdMutations::decode_from_slice(data.as_slice())
+            let ext_mutations = waproto::codec::syncd_mutations_decode(data.as_slice())
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
             patch.mutations = ext_mutations.mutations;
         }
@@ -585,7 +584,7 @@ impl AppStateProcessor {
         patch.patch_mac = Some(patch_mac);
 
         // Encode to protobuf
-        let patch_bytes = patch.encode_to_vec();
+        let patch_bytes = waproto::codec::syncd_patch_to_vec(&patch);
 
         Ok((patch_bytes, base_version))
     }

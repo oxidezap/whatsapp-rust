@@ -3,7 +3,6 @@ use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
 use base64::Engine as _;
 use base64::prelude::*;
-use buffa::Message;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 
@@ -144,7 +143,7 @@ impl PairUtils {
         let bytes = success_node
             .get_optional_child_by_tag(&["client-props"])?
             .content_bytes()?;
-        wa::ClientPairingProps::decode_from_slice(bytes).ok()
+        waproto::codec::client_pairing_props_decode(bytes).ok()
     }
 
     /// Pair-time `lid_migrated` write decision. `Some(true)` whenever the
@@ -169,7 +168,7 @@ impl PairUtils {
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
         // 1. Unmarshal HMAC container and verify HMAC
-        let hmac_container = wa::ADVSignedDeviceIdentityHMAC::decode_from_slice(
+        let hmac_container = waproto::codec::adv_signed_device_identity_hmac_decode(
             device_identity_bytes,
         )
         .map_err(|e| PairCryptoError {
@@ -220,7 +219,7 @@ impl PairUtils {
         })?;
 
         // 2. Unmarshal inner container and verify account signature
-        let mut signed_identity = wa::ADVSignedDeviceIdentity::decode_from_slice(details_bytes)
+        let mut signed_identity = waproto::codec::adv_signed_device_identity_decode(details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
@@ -293,7 +292,7 @@ impl PairUtils {
         signed_identity.device_signature = Some(device_signature.to_vec());
 
         // 4. Unmarshal final details to get key_index
-        let identity_details = wa::ADVDeviceIdentity::decode_from_slice(&inner_details_bytes)
+        let identity_details = waproto::codec::adv_device_identity_decode(&inner_details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
@@ -306,7 +305,8 @@ impl PairUtils {
         })?;
 
         // 5. Marshal the modified signed_identity to send back
-        let self_signed_identity_bytes = signed_identity.encode_to_vec();
+        let self_signed_identity_bytes =
+            waproto::codec::adv_signed_device_identity_to_vec(&signed_identity);
 
         Ok((self_signed_identity_bytes, key_index))
     }
@@ -456,6 +456,7 @@ impl PairUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Message;
     use rand::RngExt;
 
     fn dummy_device_state() -> DeviceState {

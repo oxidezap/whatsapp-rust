@@ -1,7 +1,6 @@
 use crate::socket::NoiseSocket;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::transport::{Transport, TransportEvent};
-use buffa::Message;
 use log::{debug, info, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -247,7 +246,7 @@ async fn run_xx_handshake(
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
 ) -> Result<HandshakeSuccess> {
-    let client_payload = device.get_client_payload().encode_to_vec();
+    let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
     let mut handshake_state =
         XxHandshakeState::new(device.noise_key.clone(), client_payload, &WA_CONN_HEADER)?;
     let mut frame_decoder = wacore::framing::FrameDecoder::new();
@@ -290,7 +289,7 @@ async fn run_ik_handshake(
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     fallback_taken: &mut bool,
 ) -> Result<HandshakeSuccess> {
-    let client_payload = device.get_client_payload().encode_to_vec();
+    let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
     let mut ik = IkHandshakeState::new(
         device.noise_key.clone(),
         server_static_pub,

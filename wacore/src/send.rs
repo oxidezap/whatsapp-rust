@@ -14,7 +14,6 @@ use crate::types::jid::JidExt;
 use crate::types::jid::make_sender_key_name;
 use crate::types::message::PeerMessageOptions;
 use anyhow::{Result, anyhow, bail};
-use buffa::Message as ProtoMessage;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::collections::HashSet;

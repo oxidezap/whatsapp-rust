@@ -680,15 +680,12 @@ impl Client {
         self: &Arc<Self>,
         sync: &waproto::whatsapp::LIDMigrationMappingSyncMessage,
     ) {
-        use buffa::Message as _;
-
         let Some(payload_bytes) = sync.encoded_mapping_payload.as_deref() else {
             log::warn!("lid_migration_mapping_sync without payload");
             return;
         };
-        let payload = match waproto::whatsapp::LIDMigrationMappingSyncPayload::decode_from_slice(
-            payload_bytes,
-        ) {
+        let payload = match waproto::codec::lid_migration_mapping_sync_payload_decode(payload_bytes)
+        {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to decode LID migration mapping payload: {e}");
