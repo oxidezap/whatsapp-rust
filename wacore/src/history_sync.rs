@@ -74,9 +74,45 @@ pub fn process_history_sync(
     own_user: Option<&str>,
     retain_blob: bool,
 ) -> Result<HistorySyncResult, HistorySyncError> {
-    let mut result = process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED)?;
+    process_history_sync_bytes(Bytes::from(compressed_data), own_user, retain_blob)
+}
+
+/// [`process_history_sync`] for callers that already own a shared byte buffer.
+/// Keeping the compressed blob as `Bytes` lets an inline payload remain a view
+/// into its decrypted message until it is handed to the caller's lazy event,
+/// without changing the streaming parser or duplicating protocol logic.
+pub fn process_history_sync_bytes(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+) -> Result<HistorySyncResult, HistorySyncError> {
+    process_history_sync_bytes_filtered(compressed_data, own_user, retain_blob, |_| true)
+}
+
+/// [`process_history_sync_bytes`] with an allocation-free predicate for the
+/// message-secret subset the caller actually intends to retain.
+///
+/// The predicate receives a borrowed view before any owned record is built.
+/// This lets policy-owning callers reject obsolete records without teaching
+/// the generic wire parser about retention rules, while the default APIs keep
+/// their accept-all behaviour.
+pub fn process_history_sync_bytes_filtered<F>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    record_filter: F,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
+    let mut result = process_history_sync_streaming(
+        &compressed_data,
+        own_user,
+        MAX_DECOMPRESSED,
+        record_filter,
+    )?;
     if retain_blob {
-        result.compressed_bytes = Some(Bytes::from(compressed_data));
+        result.compressed_bytes = Some(compressed_data);
     }
     Ok(result)
 }
@@ -264,11 +300,15 @@ impl<'a> FieldWalker<'a> {
 /// secrets, tctokens, pushname and nctSalt as each top-level field is
 /// buffered, so peak memory is bounded by the largest single conversation
 /// rather than the whole blob.
-fn process_history_sync_streaming(
+fn process_history_sync_streaming<F>(
     compressed_data: &[u8],
     own_user: Option<&str>,
     max_decompressed: u64,
-) -> Result<HistorySyncResult, HistorySyncError> {
+    mut record_filter: F,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
     let mut walker = FieldWalker::new(compressed_data, max_decompressed);
     let mut result = HistorySyncResult {
         own_pushname: None,
@@ -294,10 +334,13 @@ fn process_history_sync_streaming(
     // doubling. Extrapolating from the first conversation alone overshot to
     // the clamp on measured blobs (doubling the transient peak), so the
     // sample must first reach RESERVE_SAMPLE_RECORDS; the doubling ladder up
-    // to that point copies only ~2x its own bytes, which is noise. The clamp
-    // bounds over-allocation to ~2 MB.
+    // to that point copies only ~2x its own bytes, which is noise. Give the
+    // projection 12.5% headroom: a tiny tail-ratio underestimate must not leave
+    // capacity just below the real count and make Vec double a multi-megabyte
+    // record buffer near EOF. The clamp still bounds over-allocation to ~2 MB.
     const RESERVE_SAMPLE_RECORDS: usize = 128;
     const RECORD_RESERVE_CAP: usize = 16384;
+    const RESERVE_HEADROOM_DIVISOR: usize = 8;
     let mut density_reserved = false;
 
     while let Some(field) = walker.next_field()? {
@@ -308,10 +351,14 @@ fn process_history_sync_streaming(
         match field.field_number {
             // conversations (repeated)
             tags::history_sync::CONVERSATIONS => {
+                let conversation_index = result.conversations_processed;
                 result.conversations_processed += 1;
-                if let Some(candidate) =
-                    extract_conversation_fields(value, &mut result.msg_secret_records)
-                {
+                if let Some(candidate) = extract_conversation_fields(
+                    value,
+                    conversation_index,
+                    &mut result.msg_secret_records,
+                    &mut record_filter,
+                ) {
                     result.tc_token_candidates.push(candidate);
                 }
                 if !density_reserved && result.msg_secret_records.len() >= RESERVE_SAMPLE_RECORDS {
@@ -320,12 +367,23 @@ fn process_history_sync_streaming(
                     // if nothing decompressed yet, impossible past a record.
                     let parsed = walker.parsed_bytes().max(1);
                     let records = result.msg_secret_records.len();
-                    let estimated = ((records as u64).saturating_mul(walker.estimated_total_out())
+                    let projected = ((records as u64).saturating_mul(walker.estimated_total_out())
                         / parsed) as usize;
-                    let estimated = estimated.min(RECORD_RESERVE_CAP);
-                    result
-                        .msg_secret_records
-                        .reserve(estimated.saturating_sub(records));
+                    let estimated = projected
+                        .saturating_add(projected / RESERVE_HEADROOM_DIVISOR)
+                        .min(RECORD_RESERVE_CAP);
+                    let additional = estimated.saturating_sub(records);
+                    #[cfg(feature = "tracing")]
+                    let _reserve_span = tracing::trace_span!(
+                        "wa.history.reserve_secret_records",
+                        records = records as u64,
+                        projected = projected as u64,
+                        target_capacity = estimated as u64,
+                        capacity_before = result.msg_secret_records.capacity() as u64,
+                        additional = additional as u64,
+                    )
+                    .entered();
+                    result.msg_secret_records.reserve(additional);
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -1380,6 +1438,47 @@ pub struct HistoryMsgSecretRecord {
     pub is_bot_invocation: bool,
 }
 
+/// Borrowed message-secret candidate passed to
+/// [`process_history_sync_bytes_filtered`] before ownership is materialized.
+///
+/// All fields point into the current conversation buffer and are valid only
+/// for the duration of the predicate call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryMsgSecretRecordRef<'a> {
+    /// Zero-based top-level conversation index within this history-sync blob.
+    /// Consecutive candidates with the same index share `chat_id`, allowing
+    /// policy callbacks to cache per-conversation classification without
+    /// copying or hashing the borrowed JID.
+    pub conversation_index: usize,
+    pub chat_id: &'a str,
+    pub from_me: bool,
+    pub key_participant: Option<&'a str>,
+    pub web_msg_participant: Option<&'a str>,
+    pub msg_id: &'a str,
+    pub secret: &'a [u8],
+    pub timestamp: Option<u64>,
+    pub is_poll_or_event: bool,
+    pub is_bot_invocation: bool,
+}
+
+impl HistoryMsgSecretRecordRef<'_> {
+    fn into_owned(self, chat_id_shared: &mut Option<Arc<str>>) -> HistoryMsgSecretRecord {
+        HistoryMsgSecretRecord {
+            chat_id: chat_id_shared
+                .get_or_insert_with(|| Arc::from(self.chat_id))
+                .clone(),
+            from_me: self.from_me,
+            key_participant: self.key_participant.map(str::to_owned),
+            web_msg_participant: self.web_msg_participant.map(str::to_owned),
+            msg_id: CompactString::new(self.msg_id),
+            secret: SecretBytes::from(self.secret),
+            timestamp: self.timestamp,
+            is_poll_or_event: self.is_poll_or_event,
+            is_bot_invocation: self.is_bot_invocation,
+        }
+    }
+}
+
 /// Partial reader for one conversation: walks its protobuf fields directly
 /// (id, messages[], tctoken trio) and decodes each `HistorySyncMsg` ONE AT A
 /// TIME, extracting its secret record and dropping it immediately. This avoids
@@ -1391,10 +1490,15 @@ pub struct HistoryMsgSecretRecord {
 /// tctoken. Decoding the whole conversation as one view (all-or-nothing) would
 /// drop every record + the tctoken on any single bad message, and would also
 /// materialize the entire conversation tree at once.
-fn extract_conversation_fields(
+fn extract_conversation_fields<F>(
     data: &[u8],
+    conversation_index: usize,
     records: &mut Vec<HistoryMsgSecretRecord>,
-) -> Option<TcTokenCandidate> {
+    record_filter: &mut F,
+) -> Option<TcTokenCandidate>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
     let mut pos = 0;
     // Conversation.id precedes messages/tctoken in tag order, so it is
     // captured before any message is processed.
@@ -1449,19 +1553,23 @@ fn extract_conversation_fields(
                     match fast_extract(&data[pos..end]) {
                         FastExtract::NoRecord => {}
                         FastExtract::Record(r) => {
-                            records.push(HistoryMsgSecretRecord {
-                                chat_id: chat_id_shared
-                                    .get_or_insert_with(|| Arc::from(chat_id))
-                                    .clone(),
-                                from_me: r.from_me,
-                                key_participant: r.key_participant.map(str::to_owned),
-                                web_msg_participant: r.web_msg_participant.map(str::to_owned),
-                                msg_id: CompactString::new(r.msg_id),
-                                secret: SecretBytes::from(r.secret),
-                                timestamp: r.timestamp,
-                                is_poll_or_event: r.is_poll_or_event,
-                                is_bot_invocation: r.is_bot_invocation,
-                            });
+                            push_filtered_secret_record(
+                                HistoryMsgSecretRecordRef {
+                                    conversation_index,
+                                    chat_id,
+                                    from_me: r.from_me,
+                                    key_participant: r.key_participant,
+                                    web_msg_participant: r.web_msg_participant,
+                                    msg_id: r.msg_id,
+                                    secret: r.secret,
+                                    timestamp: r.timestamp,
+                                    is_poll_or_event: r.is_poll_or_event,
+                                    is_bot_invocation: r.is_bot_invocation,
+                                },
+                                &mut chat_id_shared,
+                                records,
+                                record_filter,
+                            );
                         }
                         // Rare wire shapes (repeated message-typed fields,
                         // pathological nesting): fall back to full decode.
@@ -1469,7 +1577,14 @@ fn extract_conversation_fields(
                             if let Ok(msg) =
                                 waproto::codec::history_sync_msg_decode(&data[pos..end])
                             {
-                                push_secret_record(chat_id, &mut chat_id_shared, msg, records);
+                                push_secret_record(
+                                    chat_id,
+                                    conversation_index,
+                                    &mut chat_id_shared,
+                                    msg,
+                                    records,
+                                    record_filter,
+                                );
                             }
                         }
                     }
@@ -1530,12 +1645,16 @@ fn extract_conversation_fields(
 /// Extract a single message's secret record (if any) into `out`.
 /// `chat_id_shared` memoizes the conversation id `Arc` so it is allocated only
 /// when the first record is actually pushed.
-fn push_secret_record(
+fn push_secret_record<F>(
     chat_id: &str,
+    conversation_index: usize,
     chat_id_shared: &mut Option<Arc<str>>,
     history_msg: wa::HistorySyncMsg,
     out: &mut Vec<HistoryMsgSecretRecord>,
-) {
+    record_filter: &mut F,
+) where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
     let Some(web_msg) = history_msg.message.as_option() else {
         return;
     };
@@ -1565,19 +1684,37 @@ fn push_secret_record(
     let is_poll_or_event = inner.is_some_and(message_is_poll_or_event);
     let is_bot_invocation = inner.is_some_and(message_invokes_bot);
 
-    out.push(HistoryMsgSecretRecord {
-        chat_id: chat_id_shared
-            .get_or_insert_with(|| Arc::from(chat_id))
-            .clone(),
-        from_me: key.from_me.unwrap_or(false),
-        key_participant: key.participant.clone(),
-        web_msg_participant: web_msg.participant.clone(),
-        msg_id: msg_id.into(),
-        secret: secret.into(),
-        timestamp: web_msg.message_timestamp,
-        is_poll_or_event,
-        is_bot_invocation,
-    });
+    push_filtered_secret_record(
+        HistoryMsgSecretRecordRef {
+            conversation_index,
+            chat_id,
+            from_me: key.from_me.unwrap_or(false),
+            key_participant: key.participant.as_deref(),
+            web_msg_participant: web_msg.participant.as_deref(),
+            msg_id,
+            secret,
+            timestamp: web_msg.message_timestamp,
+            is_poll_or_event,
+            is_bot_invocation,
+        },
+        chat_id_shared,
+        out,
+        record_filter,
+    );
+}
+
+#[inline]
+fn push_filtered_secret_record<F>(
+    candidate: HistoryMsgSecretRecordRef<'_>,
+    chat_id_shared: &mut Option<Arc<str>>,
+    out: &mut Vec<HistoryMsgSecretRecord>,
+    record_filter: &mut F,
+) where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
+    if record_filter(candidate) {
+        out.push(candidate.into_owned(chat_id_shared));
+    }
 }
 
 fn base_message_view(message: &wa::Message) -> &wa::Message {
@@ -1807,8 +1944,16 @@ mod tests {
     fn oracle_records(raw_msg: &[u8]) -> Vec<HistoryMsgSecretRecord> {
         let mut out = Vec::new();
         let mut shared = None;
+        let mut accept_all = |_: HistoryMsgSecretRecordRef<'_>| true;
         if let Ok(msg) = wa::HistorySyncMsg::decode_from_slice(raw_msg) {
-            push_secret_record("5511777776666@s.whatsapp.net", &mut shared, msg, &mut out);
+            push_secret_record(
+                "5511777776666@s.whatsapp.net",
+                0,
+                &mut shared,
+                msg,
+                &mut out,
+                &mut accept_all,
+            );
         }
         out
     }
@@ -2731,6 +2876,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn borrowed_record_filter_runs_before_owned_records_are_collected() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut dropped = keyed("DROP", false, None);
+        dropped.message_secret = Some(vec![0x11; 32]);
+        let mut kept = keyed("KEEP", true, None);
+        kept.message_secret = Some(vec![0x22; 32]);
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: buffa::MessageField::some(dropped),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: buffa::MessageField::some(kept),
+                        ..Default::default()
+                    },
+                ],
+                tc_token: Some(vec![0x33; 8]),
+                tc_token_timestamp: Some(123),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut visited = Vec::new();
+        let result = process_history_sync_bytes_filtered(
+            Bytes::from(encode_and_compress(&hs)),
+            None,
+            false,
+            |record| {
+                assert_eq!(record.conversation_index, 0);
+                assert_eq!(record.chat_id, chat);
+                assert_eq!(record.secret.len(), 32);
+                visited.push(record.msg_id.to_string());
+                record.msg_id == "KEEP"
+            },
+        )
+        .unwrap();
+
+        assert_eq!(visited, ["DROP", "KEEP"]);
+        assert_eq!(result.conversations_processed, 1);
+        assert_eq!(result.tc_token_candidates.len(), 1);
+        assert_eq!(result.msg_secret_records.len(), 1);
+        assert_eq!(result.msg_secret_records[0].msg_id, "KEEP");
+        assert!(result.msg_secret_records[0].from_me);
+    }
+
     /// Regression: a single malformed message inside a conversation must NOT
     /// discard the conversation's other message secrets or its tctoken. The
     /// pre-fix code decoded the whole conversation as one view (all-or-nothing),
@@ -2964,6 +3160,7 @@ mod tests {
     /// independent implementation instead of a second production path.
     fn reference_full_walk(decompressed: &[u8], own_user: Option<&str>) -> HistorySyncResult {
         let mut pos = 0;
+        let mut accept_all = |_: HistoryMsgSecretRecordRef<'_>| true;
         let mut result = HistorySyncResult {
             own_pushname: None,
             nct_salt: None,
@@ -2985,10 +3182,13 @@ mod tests {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
                     let end = checked_end(pos, len, decompressed.len()).unwrap();
+                    let conversation_index = result.conversations_processed;
                     result.conversations_processed += 1;
                     if let Some(candidate) = extract_conversation_fields(
                         &decompressed[pos..end],
+                        conversation_index,
                         &mut result.msg_secret_records,
+                        &mut accept_all,
                     ) {
                         result.tc_token_candidates.push(candidate);
                     }

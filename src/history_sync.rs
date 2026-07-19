@@ -1,24 +1,127 @@
 use crate::types::events::{Event, LazyHistorySync};
+use bytes::Bytes;
 use std::sync::Arc;
-use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
+use wacore::history_sync::{
+    HistoryMsgSecretRecord, HistoryMsgSecretRecordRef, TcTokenCandidate,
+    process_history_sync_bytes_filtered,
+};
+use wacore::messages::DetachedHistorySyncNotification;
+use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
 use wacore::store::traits::MsgSecretEntry;
 use wacore_binary::{Jid, JidExt as _};
-use waproto::whatsapp::message::HistorySyncNotification;
 
 use crate::client::Client;
+
+const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
+/// Immutable seed policy snapshot shared by the streaming filter and the
+/// persistence pass. Keeping one snapshot prevents a long parse from applying
+/// different time boundaries at its two stages.
+#[derive(Clone, Copy)]
+struct HistorySecretSeedConfig {
+    enabled: bool,
+    policy: MsgSecretPolicy,
+    retention: MsgSecretRetention,
+    now: i64,
+}
+
+impl HistorySecretSeedConfig {
+    fn snapshot(config: &crate::cache_config::CacheConfig) -> Self {
+        Self {
+            enabled: config.seed_msg_secrets_from_history,
+            policy: config.msg_secret_policy,
+            retention: config.msg_secret_retention,
+            now: wacore::time::now_secs(),
+        }
+    }
+
+    #[inline]
+    fn accepts_secret(self, secret_len: usize) -> bool {
+        self.enabled && self.policy.persists() && secret_len == HISTORY_MSG_SECRET_SIZE
+    }
+
+    fn retained_class(
+        self,
+        secret_len: usize,
+        chat_is_bot: bool,
+        is_bot_invocation: bool,
+        is_poll_or_event: bool,
+        timestamp: Option<u64>,
+    ) -> Option<RetentionClass> {
+        if !self.accepts_secret(secret_len) {
+            return None;
+        }
+        let class = wacore::msg_secret::classify_from_flags(
+            chat_is_bot || is_bot_invocation,
+            is_poll_or_event,
+        );
+        if self.policy.bot_only() && class != RetentionClass::Bot {
+            return None;
+        }
+        if self.policy.prunes()
+            && !wacore::msg_secret::within_seed_horizon(&self.retention, class, timestamp, self.now)
+        {
+            return None;
+        }
+        Some(class)
+    }
+}
+
+/// Allocation-free adapter around the immutable policy. Common JID shapes use
+/// wacore-binary's borrowed parser and the same [`JidExt`] classification as an
+/// owned [`Jid`]; compatibility-only edge cases retain the owned fallback.
+struct HistorySecretSeedFilter {
+    config: HistorySecretSeedConfig,
+    last_conversation_index: Option<usize>,
+    last_chat_is_bot: Option<bool>,
+}
+
+impl HistorySecretSeedFilter {
+    fn new(config: HistorySecretSeedConfig) -> Self {
+        Self {
+            config,
+            last_conversation_index: None,
+            last_chat_is_bot: None,
+        }
+    }
+
+    fn retain(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> bool {
+        if !self.config.accepts_secret(record.secret.len()) {
+            return false;
+        }
+        if self.last_conversation_index != Some(record.conversation_index) {
+            self.last_conversation_index = Some(record.conversation_index);
+            self.last_chat_is_bot = wacore_binary::jid::parse_jid_ref(record.chat_id)
+                .map(|chat| chat.is_bot())
+                .or_else(|| record.chat_id.parse::<Jid>().ok().map(|chat| chat.is_bot()));
+        }
+        let Some(chat_is_bot) = self.last_chat_is_bot else {
+            return false;
+        };
+        self.config
+            .retained_class(
+                record.secret.len(),
+                chat_is_bot,
+                record.is_bot_invocation,
+                record.is_poll_or_event,
+                record.timestamp,
+            )
+            .is_some()
+    }
+}
 
 impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync", level = "debug", skip_all, fields(msg_id = %message_id)))]
     pub(crate) async fn handle_history_sync(
         self: &Arc<Self>,
         message_id: String,
-        notification: HistorySyncNotification,
+        notification: DetachedHistorySyncNotification,
     ) {
         if self.is_shutting_down() {
             log::debug!(
                 "Dropping history sync {} during shutdown (Type: {:?})",
                 message_id,
-                notification.sync_type
+                notification.notification.sync_type
             );
             return;
         }
@@ -27,7 +130,7 @@ impl Client {
             log::debug!(
                 "Skipping history sync for message {} (Type: {:?})",
                 message_id,
-                notification.sync_type
+                notification.notification.sync_type
             );
             // Send receipt so the phone considers this chunk delivered and stops
             // retrying. This intentionally diverges from WhatsApp Web's AB prop
@@ -65,12 +168,17 @@ impl Client {
     pub(crate) async fn process_history_sync_task(
         self: &Arc<Self>,
         message_id: String,
-        mut notification: HistorySyncNotification,
+        notification: DetachedHistorySyncNotification,
     ) {
         if self.is_shutting_down() {
             log::debug!("Aborting history sync {} before processing", message_id);
             return;
         }
+
+        let DetachedHistorySyncNotification {
+            mut notification,
+            inline_payload,
+        } = notification;
 
         log::info!(
             "Processing history sync for message {} (Size: {}, Type: {:?})",
@@ -94,9 +202,7 @@ impl Client {
         }
 
         // Use take() to avoid cloning large payloads - moves ownership instead
-        let compressed_data = if let Some(inline_payload) =
-            notification.initial_hist_bootstrap_inline_payload.take()
-        {
+        let compressed_data = if let Some(inline_payload) = inline_payload {
             log::info!(
                 "Found inline history sync payload ({} bytes). Using directly.",
                 inline_payload.len()
@@ -111,16 +217,14 @@ impl Client {
                 );
                 return;
             }
-            // Stream-decrypt: reads encrypted chunks (8KB) from the network and
-            // decrypts on the fly into a Vec, avoiding holding the full encrypted
-            // blob in memory alongside the decrypted one.
-            match self
-                .download_to_writer(&notification, std::io::Cursor::new(Vec::new()))
-                .await
-            {
-                Ok(cursor) => {
+            // The native in-memory downloader streams decryption and safely
+            // pre-sizes its fresh retry buffer from the declared file length.
+            // Reuse it here so a ~1 MiB history blob does not climb the Vec
+            // doubling ladder (1 MiB -> 2 MiB) on every successful download.
+            match self.download(&notification).await {
+                Ok(bytes) => {
                     log::info!("Successfully downloaded history sync blob.");
-                    cursor.into_inner()
+                    Bytes::from(bytes)
                 }
                 Err(e) => {
                     if self.is_shutting_down() {
@@ -140,6 +244,7 @@ impl Client {
             let device_snapshot = self.persistence_manager.get_device_snapshot();
             device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
         };
+        let secret_seed_config = HistorySecretSeedConfig::snapshot(&self.cache_config);
 
         // Always carry the compressed input through (a move, no copy or extra
         // inflate); handler interest is evaluated at dispatch time below, so a
@@ -149,15 +254,23 @@ impl Client {
         // Large blobs: use blocking thread to avoid stalling the async runtime.
         const INLINE_THRESHOLD: usize = 256 * 1024;
         let parse_result = if compressed_data.len() < INLINE_THRESHOLD {
-            Some(process_history_sync(
+            let mut secret_filter = HistorySecretSeedFilter::new(secret_seed_config);
+            Some(process_history_sync_bytes_filtered(
                 compressed_data,
                 own_user.as_deref(),
                 true,
+                move |record| secret_filter.retain(record),
             ))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let result = process_history_sync(compressed_data, own_user.as_deref(), true);
+                let mut secret_filter = HistorySecretSeedFilter::new(secret_seed_config);
+                let result = process_history_sync_bytes_filtered(
+                    compressed_data,
+                    own_user.as_deref(),
+                    true,
+                    move |record| secret_filter.retain(record),
+                );
                 let _ = result_tx.send(result);
             }));
             self.runtime
@@ -208,8 +321,11 @@ impl Client {
                     self.store_tc_token_candidate(candidate).await;
                 }
 
-                self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
-                    .await;
+                self.store_history_sync_msg_secrets(
+                    sync_result.msg_secret_records,
+                    secret_seed_config,
+                )
+                .await;
 
                 // Bulk PN-LID identity seed from field 15; persist and migrations
                 // run detached, like the other batch learn paths. `Other`
@@ -264,11 +380,21 @@ impl Client {
         }
     }
 
-    async fn store_history_sync_msg_secrets(&self, records: Vec<HistoryMsgSecretRecord>) -> usize {
-        use wacore::msg_secret::{self, RetentionClass};
-        const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
-
-        if !self.cache_config.seed_msg_secrets_from_history {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.history.secrets.store",
+            level = "debug",
+            skip_all,
+            fields(records = records.len() as u64)
+        )
+    )]
+    async fn store_history_sync_msg_secrets(
+        &self,
+        records: Vec<HistoryMsgSecretRecord>,
+        seed_config: HistorySecretSeedConfig,
+    ) -> usize {
+        if !seed_config.enabled {
             // Opt-out of the pairing-time seed; live capture still runs.
             log::debug!(
                 target: "Client/MsgSecret",
@@ -276,95 +402,97 @@ impl Client {
             );
             return 0;
         }
-        let policy = self.cache_config.msg_secret_policy;
-        if !policy.persists() {
+        if !seed_config.policy.persists() {
             // Disabled: rely on the resolver / app store, seed nothing.
             log::debug!(
                 target: "Client/MsgSecret",
-                "Skipping history-sync msg_secret seed (policy = {policy:?})"
+                "Skipping history-sync msg_secret seed (policy = {:?})",
+                seed_config.policy
             );
             return 0;
         }
-        let retention = &self.cache_config.msg_secret_retention;
-        let now = wacore::time::now_secs();
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
         let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
 
-        let mut entries = Vec::new();
-        for record in records {
-            if record.secret.len() != SECRET_LEN {
-                continue;
-            }
-            let Ok(chat) = record.chat_id.parse::<Jid>() else {
-                continue;
-            };
-            // Same three-way rule as the live path. A group bot prompt is a bot
-            // context via its botMetadata (record.is_bot_invocation), so BotOnly
-            // keeps it and a later bot reply can still decrypt.
-            let class = msg_secret::classify_from_flags(
-                chat.is_bot() || record.is_bot_invocation,
-                record.is_poll_or_event,
-            );
-            // BotOnly seeds only bot-context secrets.
-            if policy.bot_only() && class != RetentionClass::Bot {
-                continue;
-            }
-            // Drop secrets whose parent is already past its retention horizon:
-            // no add-on can still reference them, so seeding is pure waste. Full
-            // skips the filter (prunes() is false) and seeds everything.
-            if policy.prunes()
-                && !msg_secret::within_seed_horizon(retention, class, record.timestamp, now)
-            {
-                continue;
-            }
-            let expires_at =
-                msg_secret::expires_at(policy, retention, class, record.timestamp, now);
-            let message_ts = record
-                .timestamp
-                .and_then(|t| i64::try_from(t).ok())
-                .unwrap_or(0);
+        let entries = {
+            #[cfg(feature = "tracing")]
+            let _build_span = tracing::trace_span!(
+                "wa.history.secrets.build_entries",
+                records = records.len() as u64,
+            )
+            .entered();
+            let mut entries = Vec::new();
+            for record in records {
+                if !seed_config.accepts_secret(record.secret.len()) {
+                    continue;
+                }
+                let Ok(chat) = record.chat_id.parse::<Jid>() else {
+                    continue;
+                };
+                let Some(class) = seed_config.retained_class(
+                    record.secret.len(),
+                    chat.is_bot(),
+                    record.is_bot_invocation,
+                    record.is_poll_or_event,
+                    record.timestamp,
+                ) else {
+                    continue;
+                };
+                let expires_at = wacore::msg_secret::expires_at(
+                    seed_config.policy,
+                    &seed_config.retention,
+                    class,
+                    record.timestamp,
+                    seed_config.now,
+                );
+                let message_ts = record
+                    .timestamp
+                    .and_then(|t| i64::try_from(t).ok())
+                    .unwrap_or(0);
 
-            let mut senders =
-                history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
-            if chat.is_bot()
-                && let Some(lid) = own_lid.as_ref()
-            {
-                push_unique_sender(&mut senders, lid.to_non_ad());
-            }
-            if senders.is_empty() {
-                continue;
-            }
+                let mut senders =
+                    history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
+                if chat.is_bot()
+                    && let Some(lid) = own_lid.as_ref()
+                {
+                    push_unique_sender(&mut senders, lid.to_non_ad());
+                }
+                if senders.is_empty() {
+                    continue;
+                }
 
-            let sender_count = senders.len();
-            let mut chat_id = chat.to_non_ad_string();
-            let mut msg_id = record.msg_id.into_string();
-            let mut secret = record.secret.into_vec();
-            for (idx, sender) in senders.into_iter().enumerate() {
-                let last_sender = idx + 1 == sender_count;
-                entries.push(MsgSecretEntry {
-                    chat: if last_sender {
-                        std::mem::take(&mut chat_id)
-                    } else {
-                        chat_id.clone()
-                    },
-                    sender: sender.to_non_ad_string(),
-                    msg_id: if last_sender {
-                        std::mem::take(&mut msg_id)
-                    } else {
-                        msg_id.clone()
-                    },
-                    secret: if last_sender {
-                        std::mem::take(&mut secret)
-                    } else {
-                        secret.clone()
-                    },
-                    expires_at,
-                    message_ts,
-                });
+                let sender_count = senders.len();
+                let mut chat_id = chat.to_non_ad_string();
+                let mut msg_id = record.msg_id.into_string();
+                let mut secret = record.secret.into_vec();
+                for (idx, sender) in senders.into_iter().enumerate() {
+                    let last_sender = idx + 1 == sender_count;
+                    entries.push(MsgSecretEntry {
+                        chat: if last_sender {
+                            std::mem::take(&mut chat_id)
+                        } else {
+                            chat_id.clone()
+                        },
+                        sender: sender.to_non_ad_string(),
+                        msg_id: if last_sender {
+                            std::mem::take(&mut msg_id)
+                        } else {
+                            msg_id.clone()
+                        },
+                        secret: if last_sender {
+                            std::mem::take(&mut secret)
+                        } else {
+                            secret.clone()
+                        },
+                        expires_at,
+                        message_ts,
+                    });
+                }
             }
-        }
+            entries
+        };
 
         if entries.is_empty() {
             return 0;
@@ -505,6 +633,7 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::Ordering;
     use waproto::whatsapp as wa;
+    use waproto::whatsapp::message::HistorySyncNotification;
 
     fn compress_history_sync(history_sync: &wa::HistorySync) -> Vec<u8> {
         let raw = history_sync.encode_to_vec();
@@ -561,7 +690,7 @@ mod tests {
         };
 
         client
-            .process_history_sync_task("HIST_SYNC_SECRET".to_string(), notification)
+            .process_history_sync_task("HIST_SYNC_SECRET".to_string(), notification.into())
             .await;
 
         let got = client
@@ -595,7 +724,7 @@ mod tests {
         };
 
         client
-            .process_history_sync_task("HIST_SYNC_LID".to_string(), notification)
+            .process_history_sync_task("HIST_SYNC_LID".to_string(), notification.into())
             .await;
 
         assert_eq!(
@@ -638,7 +767,7 @@ mod tests {
         client.core.event_bus.add_handler(handler);
 
         client
-            .process_history_sync_task("HIST_LAZY_EVENT".to_string(), notification)
+            .process_history_sync_task("HIST_LAZY_EVENT".to_string(), notification.into())
             .await;
 
         let event = event_rx.try_recv().expect("HistorySync event dispatched");
@@ -709,7 +838,7 @@ mod tests {
         };
 
         client
-            .process_history_sync_task("HIST_SYNC_BOT_SECRET".to_string(), notification)
+            .process_history_sync_task("HIST_SYNC_BOT_SECRET".to_string(), notification.into())
             .await;
 
         let backend = client.persistence_manager.backend();
@@ -825,7 +954,7 @@ mod tests {
             ],
         );
         client
-            .process_history_sync_task("S1".to_string(), notification)
+            .process_history_sync_task("S1".to_string(), notification.into())
             .await;
 
         let backend = client.persistence_manager.backend();
@@ -860,7 +989,7 @@ mod tests {
             vec![history_msg(chat, "OLD_POLL", &[0x33u8; 32], ts, true)],
         );
         client
-            .process_history_sync_task("S2".to_string(), notification)
+            .process_history_sync_task("S2".to_string(), notification.into())
             .await;
 
         assert_eq!(
@@ -888,7 +1017,7 @@ mod tests {
             vec![history_msg(chat, "ANCIENT", &[0x44u8; 32], old_ts, false)],
         );
         client
-            .process_history_sync_task("S3".to_string(), notification)
+            .process_history_sync_task("S3".to_string(), notification.into())
             .await;
 
         assert_eq!(
@@ -915,7 +1044,7 @@ mod tests {
             vec![history_msg(chat, "ANY", &[0x55u8; 32], now - 60, false)],
         );
         client
-            .process_history_sync_task("S4".to_string(), notification)
+            .process_history_sync_task("S4".to_string(), notification.into())
             .await;
 
         assert_eq!(
@@ -943,7 +1072,7 @@ mod tests {
             vec![history_msg(chat, "RECENT", &[0x66u8; 32], msg_ts, false)],
         );
         client
-            .process_history_sync_task("S5".to_string(), notification)
+            .process_history_sync_task("S5".to_string(), notification.into())
             .await;
 
         let backend = client.persistence_manager.backend();
@@ -1003,7 +1132,7 @@ mod tests {
             vec![history_msg(chat, "RECENT", &[0x77u8; 32], now - 60, false)],
         );
         client
-            .process_history_sync_task("S6".to_string(), notification)
+            .process_history_sync_task("S6".to_string(), notification.into())
             .await;
 
         assert_eq!(
@@ -1091,7 +1220,7 @@ mod tests {
             ],
         );
         client
-            .process_history_sync_task("SB".to_string(), notification)
+            .process_history_sync_task("SB".to_string(), notification.into())
             .await;
 
         let backend = client.persistence_manager.backend();

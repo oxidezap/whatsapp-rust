@@ -72,7 +72,7 @@ const fn forward_jump_limit(is_self: bool) -> usize {
     }
 }
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
-use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
+use crate::protocol::ratchet::{ChainKey, RootKey, UsePQRatchet};
 use crate::protocol::state::{DecryptSnapshot, PreKeyId, SessionState};
 use crate::protocol::{
     CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
@@ -1080,7 +1080,8 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     their_ephemeral: &PublicKey,
     counter: u32,
 ) -> Result<Vec<u8>> {
-    let chain_key = get_or_create_chain_key(state, their_ephemeral, remote_address, csprng)?;
+    let (chain_key, deferred_ratchet) =
+        get_or_create_chain_key(state, their_ephemeral, remote_address)?;
 
     let message_key_gen = get_or_create_message_key(
         state,
@@ -1091,14 +1092,23 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
         counter,
     )?;
 
-    decrypt_with_message_keys(
+    let plaintext = decrypt_with_message_keys(
         current_or_previous,
         state,
         ciphertext,
         original_message_type,
         remote_address,
         message_key_gen,
-    )
+    )?;
+
+    // Generating a new sender ratchet requires fresh entropy and a second DH.
+    // Neither can affect inbound MAC verification, so perform them only after
+    // the candidate session has authenticated the message.
+    if let Some(deferred_ratchet) = deferred_ratchet {
+        deferred_ratchet.apply(state, their_ephemeral, csprng)?;
+    }
+
+    Ok(plaintext)
 }
 
 fn decrypt_with_message_keys(
@@ -1178,14 +1188,38 @@ fn decrypt_with_message_keys(
     })
 }
 
-fn get_or_create_chain_key<R: Rng + CryptoRng>(
+#[must_use = "the deferred sender ratchet must be applied after authenticated decryption succeeds"]
+struct DeferredSenderRatchet {
+    receiver_root_key: RootKey,
+    previous_counter: u32,
+}
+
+impl DeferredSenderRatchet {
+    fn apply<R: Rng + CryptoRng>(
+        self,
+        state: &mut SessionState,
+        their_ephemeral: &PublicKey,
+        csprng: &mut R,
+    ) -> Result<()> {
+        let our_new_ephemeral = KeyPair::generate(csprng);
+        let sender_chain = self
+            .receiver_root_key
+            .create_chain(their_ephemeral, &our_new_ephemeral.private_key)?;
+
+        state.set_root_key(&sender_chain.0);
+        state.set_previous_counter(self.previous_counter);
+        state.set_sender_chain(&our_new_ephemeral, &sender_chain.1);
+        Ok(())
+    }
+}
+
+fn get_or_create_chain_key(
     state: &mut SessionState,
     their_ephemeral: &PublicKey,
     remote_address: &ProtocolAddress,
-    csprng: &mut R,
-) -> Result<ChainKey> {
+) -> Result<(ChainKey, Option<DeferredSenderRatchet>)> {
     if let Some(chain) = state.get_receiver_chain_key(their_ephemeral)? {
-        return Ok(chain);
+        return Ok((chain, None));
     }
 
     log::debug!("{remote_address} creating new chains.");
@@ -1193,24 +1227,15 @@ fn get_or_create_chain_key<R: Rng + CryptoRng>(
     let root_key = state.root_key()?;
     let our_ephemeral = state.sender_ratchet_private_key()?;
     let receiver_chain = root_key.create_chain(their_ephemeral, &our_ephemeral)?;
-    let our_new_ephemeral = KeyPair::generate(csprng);
-    let sender_chain = receiver_chain
-        .0
-        .create_chain(their_ephemeral, &our_new_ephemeral.private_key)?;
-
-    state.set_root_key(&sender_chain.0);
-    state.add_receiver_chain(their_ephemeral, &receiver_chain.1);
 
     let current_index = state.get_sender_chain_key()?.index();
-    let previous_index = if current_index > 0 {
-        current_index - 1
-    } else {
-        0
+    let deferred_ratchet = DeferredSenderRatchet {
+        receiver_root_key: receiver_chain.0,
+        previous_counter: current_index.saturating_sub(1),
     };
-    state.set_previous_counter(previous_index);
-    state.set_sender_chain(&our_new_ephemeral, &sender_chain.1);
+    state.add_receiver_chain(their_ephemeral, &receiver_chain.1);
 
-    Ok(receiver_chain.1)
+    Ok((receiver_chain.1, Some(deferred_ratchet)))
 }
 
 fn get_or_create_message_key(
@@ -2105,13 +2130,22 @@ mod tests {
             let corrupted = SignalMessage::try_from(corrupted_bytes.as_slice())
                 .expect("protobuf is intact, only MAC region is modified");
 
+            // This message carries a fresh inbound ratchet key. Authentication
+            // failure must not generate the deferred outbound ratchet or consume
+            // caller entropy.
+            const DECRYPT_RNG_SEED: u64 = 0xD3FE_22ED;
+            let mut decrypt_rng =
+                <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(DECRYPT_RNG_SEED);
+            let mut untouched_rng =
+                <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(DECRYPT_RNG_SEED);
+
             // Bob tries to decrypt the corrupted message
             let err = message_decrypt_signal(
                 &corrupted,
                 &tp.alice_addr,
                 &mut tp.bob_sessions,
                 &mut tp.bob_identity,
-                &mut rng,
+                &mut decrypt_rng,
             )
             .await
             .expect_err("decryption should fail due to corrupted MAC");
@@ -2121,6 +2155,8 @@ mod tests {
                 matches!(err, SignalProtocolError::BadMac(_)),
                 "expected BadMac, got: {err}"
             );
+            use rand::RngExt as _;
+            assert_eq!(decrypt_rng.random::<u64>(), untouched_rng.random::<u64>());
         });
     }
 

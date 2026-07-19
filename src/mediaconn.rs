@@ -3,6 +3,7 @@
 //! Protocol types are defined in `wacore::iq::mediaconn`.
 
 use crate::client::Client;
+use crate::http::{HTTP_STATUS_FORBIDDEN, HTTP_STATUS_UNAUTHORIZED};
 use crate::request::IqError;
 use std::time::Duration;
 use wacore::iq::mediaconn::MediaConnSpec;
@@ -18,7 +19,10 @@ pub(crate) const MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS: usize = 1;
 /// Returns `true` if the HTTP status code indicates a media auth error
 /// that should trigger a media connection refresh and retry.
 pub(crate) fn is_media_auth_error(status_code: u16) -> bool {
-    matches!(status_code, 401 | 403)
+    matches!(
+        status_code,
+        HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN
+    )
 }
 
 /// Media connection with runtime-specific fields.
