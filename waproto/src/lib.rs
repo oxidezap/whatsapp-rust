@@ -226,6 +226,55 @@ pub mod codec {
     ) -> Result<(), buffa::DecodeError> {
         mci.merge_from_slice(bytes)
     }
+
+    /// App state sync roots. wacore-appstate and wacore each instantiated
+    /// these decode/encode trees themselves (SyncActionData drags in the very
+    /// wide SyncActionValue subtree), and buffa 0.9's larger per-instantiation
+    /// decode codegen made those per-crate copies the dominant .text cost of
+    /// the upgrade; pinning them here keeps one copy, shared across the
+    /// snapshot/patch/mutations paths.
+    #[inline(never)]
+    pub fn syncd_snapshot_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SyncdSnapshot, buffa::DecodeError> {
+        whatsapp::SyncdSnapshot::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn syncd_mutations_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SyncdMutations, buffa::DecodeError> {
+        whatsapp::SyncdMutations::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn syncd_patch_decode(bytes: &[u8]) -> Result<whatsapp::SyncdPatch, buffa::DecodeError> {
+        whatsapp::SyncdPatch::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn syncd_patch_to_vec(patch: &whatsapp::SyncdPatch) -> Vec<u8> {
+        patch.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn external_blob_reference_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ExternalBlobReference, buffa::DecodeError> {
+        whatsapp::ExternalBlobReference::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn sync_action_data_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SyncActionData, buffa::DecodeError> {
+        whatsapp::SyncActionData::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn sync_action_data_to_vec(data: &whatsapp::SyncActionData) -> Vec<u8> {
+        data.encode_to_vec()
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,5 @@
 use crate::hash::generate_content_mac;
 use crate::keys::ExpandedAppStateKeys;
-use buffa::Message;
 use wacore_libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
 use waproto::whatsapp as wa;
 
@@ -31,7 +30,7 @@ pub fn encode_record(
         padding: Some(vec![]),
         version: Some(version),
     };
-    let plaintext = action_data.encode_to_vec();
+    let plaintext = waproto::codec::sync_action_data_to_vec(&action_data);
 
     // 2. AES-256-CBC encrypt
     let mut ciphertext = Vec::new();

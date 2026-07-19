@@ -1,7 +1,6 @@
 use crate::AppStateError;
 use crate::hash::{generate_content_mac, validate_index_mac};
 use crate::keys::ExpandedAppStateKeys;
-use buffa::Message;
 use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
 use waproto::whatsapp as wa;
 
@@ -79,7 +78,8 @@ pub fn decode_record(
     // Owned decode (not a view): the `value` sub-message is needed owned, so a
     // view would parse it once into a view and copy it again into the owned
     // form — two passes over the largest field. Owned decode does it in one.
-    let action = wa::SyncActionData::decode_from_slice(plaintext.as_slice())
+    // Via waproto::codec so this crate doesn't instantiate the decode tree.
+    let action = waproto::codec::sync_action_data_decode(plaintext.as_slice())
         .map_err(|_| AppStateError::DecodeFailed)?;
 
     // WA Web (syncdDecryptMutation) computes the index MAC unconditionally over the
