@@ -38,6 +38,7 @@ enum SerializedBytes {
 }
 
 impl SerializedBytes {
+    #[inline]
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(bytes) => bytes,
@@ -45,6 +46,7 @@ impl SerializedBytes {
         }
     }
 
+    #[inline]
     fn into_boxed_slice(self) -> Box<[u8]> {
         match self {
             Self::Owned(bytes) => bytes,
@@ -203,10 +205,13 @@ impl SignalMessage {
         self.serialized.into_boxed_slice()
     }
 
+    #[inline]
     pub fn body(&self) -> Result<&[u8]> {
-        if self.ciphertext_range.get().is_none() {
-            let _ = self.ciphertext_range.set(self.decode_ciphertext_range()?);
+        if let Some(range) = self.ciphertext_range.get() {
+            return Ok(&self.serialized.as_slice()[range.clone()]);
         }
+
+        let _ = self.ciphertext_range.set(self.decode_ciphertext_range()?);
         let range = self
             .ciphertext_range
             .get()
@@ -214,18 +219,30 @@ impl SignalMessage {
         Ok(&self.serialized.as_slice()[range.clone()])
     }
 
-    fn decode_ciphertext_range(&self) -> Result<Range<usize>> {
-        let serialized = self.serialized.as_slice();
+    #[inline]
+    fn decode_view_from(serialized: &[u8]) -> Result<waproto::whatsapp::SignalMessageView<'_>> {
         let proto_bytes = &serialized[1..serialized.len() - Self::MAC_LENGTH];
-        let view = waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
-            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-        match view.ciphertext {
-            Some(ciphertext) => subslice_range(serialized, ciphertext)
-                .ok_or(SignalProtocolError::InvalidProtobufEncoding),
-            None => Err(SignalProtocolError::InvalidProtobufEncoding),
-        }
+        waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)
     }
 
+    fn ciphertext_range_from(
+        serialized: &[u8],
+        view: &waproto::whatsapp::SignalMessageView<'_>,
+    ) -> Result<Range<usize>> {
+        let ciphertext = view
+            .ciphertext
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        subslice_range(serialized, ciphertext).ok_or(SignalProtocolError::InvalidProtobufEncoding)
+    }
+
+    fn decode_ciphertext_range(&self) -> Result<Range<usize>> {
+        let serialized = self.serialized.as_slice();
+        let view = Self::decode_view_from(serialized)?;
+        Self::ciphertext_range_from(serialized, &view)
+    }
+
+    #[inline]
     fn try_from_serialized(serialized: SerializedBytes) -> Result<Self> {
         let value = serialized.as_slice();
         if value.len() < Self::MAC_LENGTH + 1 {
@@ -239,10 +256,7 @@ impl SignalMessage {
             ));
         }
 
-        let view = waproto::whatsapp::SignalMessageView::decode_view(
-            &value[1..value.len() - Self::MAC_LENGTH],
-        )
-        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        let view = Self::decode_view_from(value)?;
 
         let Some(sender_ratchet_key) = view.ratchet_key else {
             return Err(SignalProtocolError::InvalidProtobufEncoding);
@@ -252,11 +266,7 @@ impl SignalMessage {
             return Err(SignalProtocolError::InvalidProtobufEncoding);
         };
         let previous_counter = view.previous_counter.unwrap_or(0);
-        let Some(ciphertext) = view.ciphertext else {
-            return Err(SignalProtocolError::InvalidProtobufEncoding);
-        };
-        let ciphertext_range = subslice_range(value, ciphertext)
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let ciphertext_range = Self::ciphertext_range_from(value, &view)?;
         let range_cache = OnceLock::new();
         let _ = range_cache.set(ciphertext_range);
 

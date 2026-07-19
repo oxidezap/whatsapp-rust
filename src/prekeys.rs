@@ -13,7 +13,7 @@ use wacore::iq::prekeys::{
     DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
 };
 use wacore::libsignal::protocol::{KeyPair, PreKeyBundle, PublicKey};
-use wacore::libsignal::store::record_helpers::{encode_pre_key_record_to, new_pre_key_record};
+use wacore::libsignal::store::record_helpers::encode_pre_key_record_to;
 use wacore::store::commands::DeviceCommand;
 use wacore_binary::Jid;
 
@@ -387,11 +387,9 @@ impl Client {
             if raw > MAX_PREKEY_ID { 1 } else { raw }
         };
         let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let record = new_pre_key_record(id, &key_pair);
-        use buffa::Message;
-        backend
-            .store_prekey(id, &record.encode_to_vec(), false)
-            .await?;
+        let mut encoded_record = Vec::new();
+        encode_pre_key_record_to(id, &key_pair, &mut encoded_record);
+        backend.store_prekey(id, &encoded_record, false).await?;
         self.persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
                 next_pre_key_id: id.saturating_add(1),

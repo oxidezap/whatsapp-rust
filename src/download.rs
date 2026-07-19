@@ -1,4 +1,7 @@
 use crate::client::Client;
+use crate::http::{
+    HTTP_STATUS_GONE, HTTP_STATUS_NOT_FOUND, HTTP_STATUS_OK, HTTP_STATUS_REDIRECTION_START,
+};
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_auth_error};
 use anyhow::{Result, anyhow};
 use std::io::{Seek, SeekFrom, Write};
@@ -119,6 +122,38 @@ impl DownloadRequestError {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::Auth(err) | Self::NotFound(err) | Self::Other(err) => err,
+        }
+    }
+}
+
+fn validate_download_status(status_code: u16) -> std::result::Result<(), DownloadRequestError> {
+    if status_code < HTTP_STATUS_REDIRECTION_START {
+        return Ok(());
+    }
+
+    let error = if is_media_auth_error(status_code) {
+        DownloadRequestError::auth(status_code)
+    } else if matches!(status_code, HTTP_STATUS_NOT_FOUND | HTTP_STATUS_GONE) {
+        DownloadRequestError::not_found(status_code)
+    } else {
+        DownloadRequestError::other(anyhow!("Download failed with status: {status_code}"))
+    };
+    Err(error)
+}
+
+fn decrypt_or_validate_buffered_body(
+    body: &mut Vec<u8>,
+    decryption: &MediaDecryption,
+) -> std::result::Result<(), DownloadRequestError> {
+    match decryption {
+        MediaDecryption::Encrypted {
+            media_key,
+            media_type,
+        } => DownloadUtils::verify_and_decrypt_in_place(body, media_key, *media_type)
+            .map_err(DownloadRequestError::other),
+        MediaDecryption::Plaintext { file_sha256 } => {
+            DownloadUtils::validate_plaintext_sha256(body, file_sha256)
+                .map_err(DownloadRequestError::other)
         }
     }
 }
@@ -323,7 +358,7 @@ impl Client {
             .execute(crate::http::HttpRequest::get(&url))
             .await
             .map_err(|e| anyhow!("sticker pack request failed: {e}"))?;
-        if response.status_code != 200 {
+        if response.status_code != HTTP_STATUS_OK {
             return Err(anyhow!(
                 "sticker pack endpoint returned status {}",
                 response.status_code
@@ -422,18 +457,7 @@ impl Client {
                     .execute_streaming(http_request)
                     .map_err(DownloadRequestError::other)?;
 
-                if resp.status_code >= 300 {
-                    return Err(if is_media_auth_error(resp.status_code) {
-                        DownloadRequestError::auth(resp.status_code)
-                    } else if matches!(resp.status_code, 404 | 410) {
-                        DownloadRequestError::not_found(resp.status_code)
-                    } else {
-                        DownloadRequestError::other(anyhow!(
-                            "Download failed with status: {}",
-                            resp.status_code
-                        ))
-                    });
-                }
+                validate_download_status(resp.status_code)?;
 
                 match &decryption {
                     MediaDecryption::Encrypted {
@@ -474,32 +498,36 @@ impl Client {
         request: &wacore::download::DownloadRequest,
         writer: W,
     ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
-        let body = match self.buffered_download_to_vec(request).await {
+        let mut body = match self.buffered_download_body(request).await {
             Ok(body) => body,
             Err(err) => return Ok((writer, Err(err))),
         };
+        let decryption = request.decryption.clone();
 
-        // The expensive authentication/decrypt already ran in the helper. Keep
-        // potentially blocking file I/O off the async executor as well.
+        // Keep authentication/decryption and writer I/O in one blocking task so
+        // non-streaming writer downloads pay for a single executor round-trip.
         Ok(wacore::runtime::blocking(&*self.runtime, move || {
             let mut writer = writer;
-            if let Err(e) = writer.seek(SeekFrom::Start(0)) {
-                return (writer, Err(DownloadRequestError::other(e)));
-            }
-            let result = writer
-                .write_all(&body)
-                .and_then(|()| writer.seek(SeekFrom::Start(0)).map(|_| ()))
-                .map_err(DownloadRequestError::other);
+            let result = (|| {
+                decrypt_or_validate_buffered_body(&mut body, &decryption)?;
+                writer
+                    .seek(SeekFrom::Start(0))
+                    .map_err(DownloadRequestError::other)?;
+                writer
+                    .write_all(&body)
+                    .map_err(DownloadRequestError::other)?;
+                writer
+                    .seek(SeekFrom::Start(0))
+                    .map_err(DownloadRequestError::other)?;
+                Ok(())
+            })();
 
             (writer, result)
         })
         .await)
     }
 
-    /// Execute a non-streaming HTTP download and reuse the response allocation
-    /// for the final plaintext. This is especially important on WASM, where the
-    /// JS `Uint8Array` must already be copied into linear memory at the FFI edge.
-    async fn buffered_download_to_vec(
+    async fn buffered_download_body(
         &self,
         request: &wacore::download::DownloadRequest,
     ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
@@ -509,33 +537,21 @@ impl Client {
             .execute(http_request)
             .await
             .map_err(DownloadRequestError::other)?;
-        if response.status_code >= 300 {
-            return Err(if is_media_auth_error(response.status_code) {
-                DownloadRequestError::auth(response.status_code)
-            } else if matches!(response.status_code, 404 | 410) {
-                DownloadRequestError::not_found(response.status_code)
-            } else {
-                DownloadRequestError::other(anyhow!(
-                    "Download failed with status: {}",
-                    response.status_code
-                ))
-            });
-        }
+        validate_download_status(response.status_code)?;
+        Ok(response.body)
+    }
 
+    /// Execute a non-streaming HTTP download and reuse the response allocation
+    /// for the final plaintext. This is especially important on WASM, where the
+    /// JS `Uint8Array` must already be copied into linear memory at the FFI edge.
+    async fn buffered_download_to_vec(
+        &self,
+        request: &wacore::download::DownloadRequest,
+    ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
+        let mut body = self.buffered_download_body(request).await?;
         let decryption = request.decryption.clone();
         wacore::runtime::blocking(&*self.runtime, move || {
-            let mut body = response.body;
-            match &decryption {
-                MediaDecryption::Encrypted {
-                    media_key,
-                    media_type,
-                } => DownloadUtils::verify_and_decrypt_in_place(&mut body, media_key, *media_type)
-                    .map_err(DownloadRequestError::other)?,
-                MediaDecryption::Plaintext { file_sha256 } => {
-                    DownloadUtils::validate_plaintext_sha256(&body, file_sha256)
-                        .map_err(DownloadRequestError::other)?;
-                }
-            }
+            decrypt_or_validate_buffered_body(&mut body, &decryption)?;
             Ok(body)
         })
         .await
@@ -600,6 +616,33 @@ mod tests {
             .expect("hash derivation should succeed")
             .file_sha256
             .to_vec()
+    }
+
+    #[test]
+    fn download_statuses_have_one_shared_classification() {
+        use crate::http::{HTTP_STATUS_FORBIDDEN, HTTP_STATUS_UNAUTHORIZED};
+
+        assert!(validate_download_status(HTTP_STATUS_OK).is_ok());
+        assert!(matches!(
+            validate_download_status(HTTP_STATUS_UNAUTHORIZED),
+            Err(DownloadRequestError::Auth(_))
+        ));
+        assert!(matches!(
+            validate_download_status(HTTP_STATUS_FORBIDDEN),
+            Err(DownloadRequestError::Auth(_))
+        ));
+        assert!(matches!(
+            validate_download_status(HTTP_STATUS_NOT_FOUND),
+            Err(DownloadRequestError::NotFound(_))
+        ));
+        assert!(matches!(
+            validate_download_status(HTTP_STATUS_GONE),
+            Err(DownloadRequestError::NotFound(_))
+        ));
+        assert!(matches!(
+            validate_download_status(HTTP_STATUS_REDIRECTION_START),
+            Err(DownloadRequestError::Other(_))
+        ));
     }
 
     #[test]

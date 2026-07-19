@@ -525,8 +525,10 @@ impl DownloadUtils {
     /// for buffered HTTP clients: the trailing MAC and PKCS#7 padding are removed
     /// by truncating the input vector after CBC decryption.
     ///
-    /// Authentication is completed before any byte is mutated. Consequently an
-    /// invalid MAC leaves `encrypted_payload` unchanged.
+    /// Authentication is completed before any byte is mutated, so an invalid
+    /// MAC leaves `encrypted_payload` unchanged. Errors after successful
+    /// authentication, such as malformed padding, may leave the buffer
+    /// truncated or partially decrypted.
     pub fn verify_and_decrypt_in_place(
         encrypted_payload: &mut Vec<u8>,
         media_key: &[u8],
