@@ -226,17 +226,9 @@ enum StringHint {
     RawBytes,
 }
 
-/// Hints recorded by the size-plan pass in traversal order and replayed by
-/// the encode pass through a cursor, so each string is classified exactly
-/// once per marshal. This only works because both passes visit strings in
-/// the same order (tag, then attr key/value pairs, then content, recursing;
-/// JID user/server nested in place) — `write_string` debug-asserts each
-/// replayed hint against a fresh classification to catch any future
-/// divergence in tests.
-//
-// Inline capacity covers a typical stanza without a heap allocation: the
-// exact-marshal two-pass builds one of these per outgoing stanza, and it
-// lives on the (sync) caller's stack, never in an async frame.
+/// Replay tape: sound only while plan and encode visit strings in the same
+/// (`write_node`) order — `write_string` debug-asserts each replayed hint to
+/// catch divergence. 32 inline keeps a typical stanza off the heap.
 #[derive(Debug, Default)]
 pub(crate) struct StringHintCache {
     hints: smallvec::SmallVec<[StringHint; 32]>,
