@@ -3,7 +3,6 @@ use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
 use base64::Engine as _;
 use base64::prelude::*;
-use buffa::Message;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 
@@ -293,7 +292,7 @@ impl PairUtils {
         signed_identity.device_signature = Some(device_signature.to_vec());
 
         // 4. Unmarshal final details to get key_index
-        let identity_details = wa::ADVDeviceIdentity::decode_from_slice(&inner_details_bytes)
+        let identity_details = waproto::codec::adv_device_identity_decode(&inner_details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
@@ -457,6 +456,7 @@ impl PairUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Message;
     use rand::RngExt;
 
     fn dummy_device_state() -> DeviceState {

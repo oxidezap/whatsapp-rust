@@ -1149,7 +1149,7 @@ impl Client {
             // account bails here, and marking after would abandon a one-time
             // prekey from the upload window without any receipt going out.
             let device_identity_bytes = waproto::codec::adv_signed_device_identity_to_vec(
-                device_snapshot.account.as_ref().ok_or_else(|| {
+                device_snapshot.account.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("Missing device account info for retry receipt")
                 })?,
             );

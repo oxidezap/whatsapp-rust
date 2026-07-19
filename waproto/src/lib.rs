@@ -331,6 +331,13 @@ pub mod codec {
     }
 
     #[inline(never)]
+    pub fn adv_device_identity_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::ADVDeviceIdentity, buffa::DecodeError> {
+        whatsapp::ADVDeviceIdentity::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
     pub fn adv_signed_device_identity_hmac_decode(
         bytes: &[u8],
     ) -> Result<whatsapp::ADVSignedDeviceIdentityHMAC, buffa::DecodeError> {
