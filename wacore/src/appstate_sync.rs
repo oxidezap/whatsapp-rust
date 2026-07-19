@@ -363,8 +363,13 @@ impl AppStateProcessor {
                 )?;
                 Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
             })
-            .await
-            .map_err(|e| anyhow!("{}", e))?;
+            .await;
+            // TEMP-DIAG(#1053): log before `?` so error exits are visible too.
+            log::info!(target: "AppState", "TEMP-DIAG snapshot blocking returned: ok={} for {collection_name}", result.is_ok());
+            if let Err(e) = &result {
+                log::warn!(target: "AppState", "TEMP-DIAG snapshot processing error for {collection_name}: {e}");
+            }
+            let result = result.map_err(|e| anyhow!("{}", e))?;
 
             let (snapshot_result, snapshot_state, snapshot) = result;
             // TEMP-DIAG(#1053)

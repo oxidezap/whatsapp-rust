@@ -342,7 +342,8 @@ impl Client {
                         && attempt == 1
                     {
                         if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
-                            debug!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
+                            // TEMP-DIAG(#1053): raised from debug! so CI shows it.
+                            log::info!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
                             if rt_timeout(
                                 &*self.runtime,
                                 Duration::from_secs(10),
