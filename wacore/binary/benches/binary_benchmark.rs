@@ -188,6 +188,16 @@ fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
         .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
+// The exact (plan + hint replay) strategy is the production send path for
+// message plaintext, so its worst case — many children, JID-heavy — gets its
+// own pin.
+#[divan::bench]
+fn bench_marshal_exact_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+}
+
 // Strategy comparison on one shape.
 #[divan::bench]
 fn bench_marshal_plain_large(bencher: divan::Bencher) {
