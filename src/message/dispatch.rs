@@ -9,6 +9,7 @@ impl Client {
         self: &Arc<Self>,
         msg: wa::Message,
         info: &Arc<MessageInfo>,
+        track_commit: bool,
     ) -> InboundCommitState {
         use wacore::proto_helpers::MessageExt;
         wacore::telemetry::recv("decrypted");
@@ -68,6 +69,7 @@ impl Client {
                 .message(dispatch_msg)
                 .info(info)
                 .build(),
+            track_commit,
         )
         .await
     }

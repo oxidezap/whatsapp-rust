@@ -5675,18 +5675,27 @@ fn decode_frame(index: usize, frame: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn has_message_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> bool {
-    frames.iter().enumerate().skip(start).any(|(index, frame)| {
-        let Some(buf) = decode_frame(index, frame) else {
-            return false;
-        };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
-            return false;
-        };
-        node.tag.as_ref() == "message"
-            && node
-                .get_attr("to")
-                .is_some_and(|value| value.as_str() == to)
-    })
+    message_count_to_after(frames, start, to) != 0
+}
+
+fn message_count_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> usize {
+    frames
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter(|(index, frame)| {
+            let Some(buf) = decode_frame(*index, frame) else {
+                return false;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                return false;
+            };
+            node.tag.as_ref() == "message"
+                && node
+                    .get_attr("to")
+                    .is_some_and(|value| value.as_str() == to)
+        })
+        .count()
 }
 
 async fn decrypt_peer_message_after(
@@ -7937,14 +7946,10 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     };
     let mut info = create_test_message_info(requester_str, "AKR_OFFLINE", requester_str);
     info.source.is_from_me = true;
+    let info = Arc::new(info);
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext(
-            "msg",
-            &MessageUtils::encode_and_pad(&request),
-            2,
-            &Arc::new(info),
-        ),
+        client.handle_decrypted_plaintext("msg", &MessageUtils::encode_and_pad(&request), 2, &info),
     )
     .await
     .expect("the inbound lane must not wait for offline sync")
@@ -7955,6 +7960,18 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
         .flush(&*client.runtime, std::time::Duration::from_secs(1))
         .await;
     let sent_before = transport.sent_count();
+
+    assert!(
+        client.inbound_commit_batch.reset(),
+        "the first request must still be uncommitted"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        client.handle_decrypted_plaintext("msg", &MessageUtils::encode_and_pad(&request), 2, &info),
+    )
+    .await
+    .expect("the redelivery must not wait for offline sync")
+    .expect("handle redelivered key request");
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
@@ -8045,6 +8062,12 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     assert_eq!(shared_key.key_data.as_deref(), Some(&[7; 32][..]));
     assert_eq!(shared_key.fingerprint.as_option(), Some(&fingerprint));
     assert_eq!(shared_key.timestamp, Some(456));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        message_count_to_after(&transport.sent(), sent_before, requester_str),
+        1,
+        "a dropped request and its redelivery must produce one response"
+    );
 }
 
 #[tokio::test]
@@ -8074,7 +8097,7 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
     };
 
     transport.fail_next_sends(1);
-    client.schedule_app_state_sync_key_share(requester, request);
+    client.schedule_app_state_sync_key_share(requester, request, None);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while transport.failed_sends() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -8136,6 +8159,7 @@ async fn app_state_key_share_preparation_failure_is_retried() {
                 key_id: Some(vec![4, 3, 2, 1]),
             }],
         },
+        None,
     );
 
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -8181,7 +8205,7 @@ async fn app_state_key_share_survives_a_closed_flush_scope() {
 
     client.outbound_flush.close();
     let rejected_before = client.outbound_flush.track_rejections();
-    client.schedule_app_state_sync_key_share(requester, request);
+    client.schedule_app_state_sync_key_share(requester, request, None);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while client.outbound_flush.track_rejections() == rejected_before {
             tokio::task::yield_now().await;
@@ -8436,7 +8460,7 @@ async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
     };
     let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8499,7 +8523,7 @@ async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
     // HKDF binds the real author (peer) as both original sender and editor.
     let msg = encrypted_message_edit(target_key, peer, peer, parent_id, &secret, "edited", None);
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8565,7 +8589,7 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
         participant: None,
     };
     let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     collect_event(
         &client,
@@ -8700,7 +8724,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
         None,
     );
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8763,7 +8787,9 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         "first",
         Some(second_secret.to_vec()),
     );
-    client.dispatch_parsed_message(first_msg, &first_info).await;
+    client
+        .dispatch_parsed_message(first_msg, &first_info, false)
+        .await;
     client.msg_secret_buffer.wait_flushed().await;
 
     let stored = client
@@ -8793,7 +8819,7 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         None,
     );
     client
-        .dispatch_parsed_message(second_msg, &second_info)
+        .dispatch_parsed_message(second_msg, &second_info, false)
         .await;
 
     let got = collect_event(
@@ -8871,7 +8897,7 @@ async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
         None,
     );
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8953,7 +8979,9 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         "first",
         Some(second_secret.to_vec()),
     );
-    client.dispatch_parsed_message(first_msg, &first_info).await;
+    client
+        .dispatch_parsed_message(first_msg, &first_info, false)
+        .await;
     client.msg_secret_buffer.wait_flushed().await;
 
     for sender in [sender_lid, sender_pn] {
@@ -8993,7 +9021,7 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         None,
     );
     client
-        .dispatch_parsed_message(second_msg, &second_info)
+        .dispatch_parsed_message(second_msg, &second_info, false)
         .await;
 
     let got = collect_event(
@@ -10876,7 +10904,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         ..Default::default()
     });
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     // Deadline-poll instead of a fixed sleep so a slow CI cannot race the
     // event delivery.

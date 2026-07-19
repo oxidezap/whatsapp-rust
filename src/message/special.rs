@@ -48,7 +48,7 @@ impl Client {
                         info.id,
                         info.source.chat.observe()
                     );
-                    self.dispatch_parsed_message(msg, info).await;
+                    self.dispatch_parsed_message(msg, info, false).await;
                 }
                 Err(e) => {
                     log::warn!(
@@ -213,6 +213,7 @@ impl Client {
         self: &Arc<Self>,
         requester: Jid,
         request: wa::message::AppStateSyncKeyRequest,
+        mut commit_ticket: Option<InboundCommitTicket>,
     ) {
         let weak = Arc::downgrade(self);
         let runtime = self.runtime.clone();
@@ -232,9 +233,22 @@ impl Client {
                             return;
                         };
                         let listener = client.offline_sync_notifier.listen();
-                        let ready = client
-                            .offline_sync_completed
-                            .load(std::sync::atomic::Ordering::Acquire)
+                        let commit_ready = match commit_ticket
+                            .as_ref()
+                            .map(InboundCommitTicket::state)
+                        {
+                            Some(InboundCommitTicketState::Pending) => false,
+                            Some(InboundCommitTicketState::Dropped) => return,
+                            Some(InboundCommitTicketState::Durable) => {
+                                commit_ticket = None;
+                                true
+                            }
+                            None => true,
+                        };
+                        let ready = commit_ready
+                            && client
+                                .offline_sync_completed
+                                .load(std::sync::atomic::Ordering::Acquire)
                             && !client.inbound_commit_batch.is_active()
                             && reconnect_after.is_none_or(|generation| {
                                 client

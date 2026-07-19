@@ -1559,15 +1559,23 @@ impl Client {
                 ..Default::default()
             })
         } else {
-            let commit_state = self.dispatch_parsed_message(msg, info).await;
+            let commit_state = self
+                .dispatch_parsed_message(msg, info, app_state_key_share_job.is_some())
+                .await;
             if let Some((requester, request)) = app_state_key_share_job {
-                if commit_state == InboundCommitState::Failed {
-                    warn!(
-                        "[msg:{}] Deferring app-state key-share recovery to the requester's retry because the inbound request was not durable",
-                        info.id
-                    );
-                } else {
-                    self.schedule_app_state_sync_key_share(requester, request);
+                match commit_state {
+                    InboundCommitState::Durable => {
+                        self.schedule_app_state_sync_key_share(requester, request, None);
+                    }
+                    InboundCommitState::Deferred(Some(ticket)) => {
+                        self.schedule_app_state_sync_key_share(requester, request, Some(ticket));
+                    }
+                    InboundCommitState::Deferred(None) | InboundCommitState::Failed => {
+                        warn!(
+                            "[msg:{}] Deferring app-state key-share recovery to the requester's retry because the inbound request was not durable",
+                            info.id
+                        );
+                    }
                 }
             }
             Ok(PlaintextHandleOutcome {

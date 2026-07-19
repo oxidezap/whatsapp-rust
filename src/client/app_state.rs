@@ -12,6 +12,12 @@ const APP_STATE_KEY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 
+fn initial_app_state_key_retry(timeout: Duration) -> Duration {
+    (timeout / 2)
+        .max(Duration::from_millis(1))
+        .min(APP_STATE_KEY_PARTIAL_RETRY)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppStateKeyRequestDelivery {
     AllPeers,
@@ -797,7 +803,7 @@ impl Client {
         }
         let deadline = wacore::time::Instant::now() + timeout;
         let backend = self.persistence_manager.backend();
-        let mut retry_after = APP_STATE_KEY_PARTIAL_RETRY;
+        let mut retry_after = initial_app_state_key_retry(timeout);
         loop {
             let listener = self.initial_keys_synced_notifier.listen();
             remove_available_app_state_keys(&*backend, &mut missing).await;
@@ -924,7 +930,10 @@ impl Client {
             };
         };
 
-        match self.request_app_state_keys(&to_request).await {
+        match self
+            .request_app_state_keys(&to_request, retry_after.min(APP_STATE_KEY_REQUEST_TIMEOUT))
+            .await
+        {
             Ok(AppStateKeyRequestDelivery::AllPeers) => AppStateKeyRequestSchedule {
                 retry_at: next_retry_at,
                 sent: true,
@@ -954,7 +963,7 @@ impl Client {
                     }
                 }
                 AppStateKeyRequestSchedule {
-                    retry_at: wacore::time::Instant::now() + retry_after,
+                    retry_at: requested_retry_at,
                     sent: false,
                 }
             }
@@ -987,6 +996,7 @@ impl Client {
     async fn request_app_state_keys(
         &self,
         raw_key_ids: &[&[u8]],
+        fanout_timeout: Duration,
     ) -> Result<AppStateKeyRequestDelivery, anyhow::Error> {
         if raw_key_ids.is_empty() {
             return Ok(AppStateKeyRequestDelivery::AllPeers);
@@ -1034,12 +1044,7 @@ impl Client {
             });
         }
 
-        collect_app_state_key_request_results(
-            &*self.runtime,
-            requests,
-            APP_STATE_KEY_REQUEST_TIMEOUT,
-        )
-        .await
+        collect_app_state_key_request_results(&*self.runtime, requests, fanout_timeout).await
     }
 
     /// Send an app state patch to the server for a given collection.
@@ -1328,6 +1333,18 @@ mod tests {
                 .get(key_id.as_slice())
                 .copied(),
             Some(schedule.retry_at)
+        );
+    }
+
+    #[test]
+    fn ordinary_key_wait_leaves_time_for_a_retry() {
+        let retry = initial_app_state_key_retry(APP_STATE_KEY_REQUEST_TIMEOUT);
+
+        assert_eq!(retry, Duration::from_secs(5));
+        assert!(retry < APP_STATE_KEY_REQUEST_TIMEOUT);
+        assert_eq!(
+            initial_app_state_key_retry(Duration::from_secs(180)),
+            APP_STATE_KEY_PARTIAL_RETRY
         );
     }
 }
