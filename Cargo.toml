@@ -345,6 +345,15 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.wnaf]
 opt-level = "z"
+[profile.release.package.x25519-dalek]
+opt-level = "z"
+[profile.release.package.rfc6979]
+opt-level = "z"
+[profile.release.package.pem-rfc7468]
+opt-level = "z"
+# WS handshake accept-key only — one hash per connection.
+[profile.release.package.sha1_smol]
+opt-level = "z"
 # s = data-path framing kept a notch faster than z: low throughput for a chat
 # client, but still touched on every frame/record.
 [profile.release.package.rustls]
