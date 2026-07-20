@@ -136,7 +136,7 @@ pub async fn prepare_dm_stanza(
     let own_other_devices = partitioned_devices.own_other_devices();
     let total_devices = valid_devices.len();
 
-    let phash = MessageUtils::participant_list_hash(valid_devices.iter()).ok();
+    let phash = MessageUtils::participant_list_hash(valid_devices).ok();
 
     // Splice the shared content into the recipient plaintext and, when present, the
     // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an
@@ -206,7 +206,7 @@ pub async fn prepare_dm_stanza(
 
     // All per-device encrypts failed: an empty <participants> would silently
     // drop the message. WA Web's encryptAndSendUserMsg rejects here too.
-    let attempted_devices = recipient_devices.len() + own_other_devices.len();
+    let attempted_devices = total_devices;
     if participant_nodes.is_empty() && attempted_devices > 0 {
         return Err(anyhow!(
             "encryption failed for all {attempted_devices} recipient device(s)"
