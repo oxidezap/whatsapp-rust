@@ -157,6 +157,26 @@ struct SendBranchOutput {
     dm_phash: Option<String>,
 }
 
+/// Keep each branch future out of the shared send frame. In tracing builds the
+/// dedicated span lets allocation profilers distinguish this deliberate box
+/// from work performed while polling the selected branch.
+#[inline]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        name = "wa.send.branch_box",
+        level = "debug",
+        skip_all,
+        fields(future_bytes = std::mem::size_of::<F>())
+    )
+)]
+fn box_send_branch<F>(future: F) -> std::pin::Pin<Box<F>>
+where
+    F: std::future::Future,
+{
+    Box::pin(future)
+}
+
 /// True when every SKDM target belongs to our own account (PN or LID user).
 /// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
 /// `markHasSenderKey`), so an own-only `needs` set is the permanent
@@ -1457,9 +1477,9 @@ impl Client {
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             dm_phash,
         } = if peer && !to.is_group() {
-            Box::pin(self.send_peer_branch(to, message, request_id)).await?
+            box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
-            Box::pin(self.send_group_branch(
+            box_send_branch(self.send_group_branch(
                 to,
                 message,
                 request_id,
@@ -1469,7 +1489,7 @@ impl Client {
             ))
             .await?
         } else {
-            Box::pin(self.send_dm_branch(
+            box_send_branch(self.send_dm_branch(
                 to,
                 message,
                 request_id,
