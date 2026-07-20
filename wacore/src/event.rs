@@ -4,7 +4,6 @@
 //! `EventResponseMessage` proto and the `"Event Response"` use-case.
 
 use anyhow::{Result, ensure};
-use buffa::Message;
 use waproto::whatsapp::message::EventResponseMessage;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
@@ -39,7 +38,7 @@ pub fn encrypt_event_response_with_secret(
         "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
         message_secret.len()
     );
-    let plaintext = response.encode_to_vec();
+    let plaintext = waproto::codec::event_response_message_to_vec(response);
     encrypt_addon(
         &plaintext,
         message_secret,
@@ -71,7 +70,7 @@ pub fn decrypt_event_response_with_secret(
         message_secret,
         &event_response_addon_ctx(stanza_id, event_creator_jid, responder_jid),
     )?;
-    Ok(EventResponseMessage::decode_from_slice(&plaintext[..])?)
+    Ok(waproto::codec::event_response_message_decode(&plaintext)?)
 }
 
 #[cfg(test)]

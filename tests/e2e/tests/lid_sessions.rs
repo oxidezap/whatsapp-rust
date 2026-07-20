@@ -295,14 +295,14 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
     client_a
         .assert_no_event(
             3,
-            |e| matches!(e, Event::UndecryptableMessage(u) if !u.info.source.is_from_me),
+            |e| matches!(e, Event::UndecryptableMessage(_)),
             "A should have no undecryptable messages with stale PN session",
         )
         .await?;
     client_b
         .assert_no_event(
             3,
-            |e| matches!(e, Event::UndecryptableMessage(u) if !u.info.source.is_from_me),
+            |e| matches!(e, Event::UndecryptableMessage(_)),
             "B should have no undecryptable messages with stale PN session",
         )
         .await?;
@@ -410,6 +410,10 @@ async fn test_own_device_0_has_lid_session_after_login() -> anyhow::Result<()> {
 
     let backend = client.client.persistence_manager().backend();
 
+    // Sessions land in the write-behind Signal cache first; settle before
+    // reading the backend directly (same as the reconnect test above).
+    client.client.flush_pending_signal_state().await?;
+
     // Device 0 is the primary phone — session should exist under LID
     let lid_addr = format!("{}@lid.0", own_lid.user);
     let lid_session = backend.get_session(&lid_addr).await?;
@@ -470,14 +474,14 @@ async fn test_no_undecryptable_events_during_messaging() -> anyhow::Result<()> {
     client_a
         .assert_no_event(
             3,
-            |e| matches!(e, Event::UndecryptableMessage(u) if !u.info.source.is_from_me),
+            |e| matches!(e, Event::UndecryptableMessage(_)),
             "A should have no undecryptable messages",
         )
         .await?;
     client_b
         .assert_no_event(
             3,
-            |e| matches!(e, Event::UndecryptableMessage(u) if !u.info.source.is_from_me),
+            |e| matches!(e, Event::UndecryptableMessage(_)),
             "B should have no undecryptable messages",
         )
         .await?;
@@ -581,13 +585,14 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
         .expect("Message should decrypt after on-the-fly PN->LID migration");
     info!("Message decrypted despite PN-only backend state");
 
-    // The peer message must not surface undecryptable. Ignore own self-fanout
-    // (is_from_me): offline self-sync redeliveries can BadMac independently of
-    // the PN→LID migration under test and would flake this assertion.
+    // Event delivery precedes the coalesced Signal flush; inspect durability only
+    // after crossing the same persistence boundary used by production shutdown.
+    client_a.client.flush_pending_signal_state().await?;
+
     client_a
         .assert_no_event(
             3,
-            |e| matches!(e, Event::UndecryptableMessage(u) if !u.info.source.is_from_me),
+            |e| matches!(e, Event::UndecryptableMessage(_)),
             "No undecryptable events after migration",
         )
         .await?;
@@ -695,11 +700,10 @@ async fn test_pn_migration_is_durable_across_followup_messages() -> anyhow::Resu
         backend_a.get_session(&pn_addr).await?.is_none(),
         "stale PN copy stays gone after migration"
     );
-    // Peer messages only; own self-fanout redeliveries are unrelated noise.
     client_a
         .assert_no_event(
             3,
-            |e| matches!(e, Event::UndecryptableMessage(u) if !u.info.source.is_from_me),
+            |e| matches!(e, Event::UndecryptableMessage(_)),
             "no undecryptable after PN→LID migration",
         )
         .await?;

@@ -1422,6 +1422,27 @@ impl IqSpec for LeaveGroupIq {
     }
 }
 
+/// Outlined body for `define_group_participant_iq!` impls, so the generated
+/// types share one instantiation instead of each duplicating it.
+fn build_participant_action_iq(
+    group_jid: &Jid,
+    action: &'static str,
+    participants: &[Jid],
+) -> InfoQuery<'static> {
+    let children: Vec<Node> = participants
+        .iter()
+        .map(|jid| NodeBuilder::new("participant").attr("jid", jid).build())
+        .collect();
+
+    let action_node = NodeBuilder::new(action).children(children).build();
+
+    InfoQuery::set_ref(
+        GROUP_IQ_NAMESPACE,
+        group_jid,
+        Some(NodeContent::Nodes(vec![action_node])),
+    )
+}
+
 /// Macro to generate group participant IQ specs that share the same structure:
 /// a `set` IQ to `{group_jid}` with `<{action}><participant jid="..."/>...</{action}>`.
 macro_rules! define_group_participant_iq {
@@ -1449,23 +1470,7 @@ macro_rules! define_group_participant_iq {
             type Response = Vec<ParticipantChangeResponse>;
 
             fn build_iq(&self) -> InfoQuery<'static> {
-                let children: Vec<Node> = self
-                    .participants
-                    .iter()
-                    .map(|jid| {
-                        NodeBuilder::new("participant")
-                            .attr("jid", jid)
-                            .build()
-                    })
-                    .collect();
-
-                let action_node = NodeBuilder::new($action).children(children).build();
-
-                InfoQuery::set_ref(
-                    GROUP_IQ_NAMESPACE,
-                    &self.group_jid,
-                    Some(NodeContent::Nodes(vec![action_node])),
-                )
+                build_participant_action_iq(&self.group_jid, $action, &self.participants)
             }
 
             fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
@@ -1498,23 +1503,7 @@ macro_rules! define_group_participant_iq {
             type Response = ();
 
             fn build_iq(&self) -> InfoQuery<'static> {
-                let children: Vec<Node> = self
-                    .participants
-                    .iter()
-                    .map(|jid| {
-                        NodeBuilder::new("participant")
-                            .attr("jid", jid)
-                            .build()
-                    })
-                    .collect();
-
-                let action_node = NodeBuilder::new($action).children(children).build();
-
-                InfoQuery::set_ref(
-                    GROUP_IQ_NAMESPACE,
-                    &self.group_jid,
-                    Some(NodeContent::Nodes(vec![action_node])),
-                )
+                build_participant_action_iq(&self.group_jid, $action, &self.participants)
             }
 
             fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
@@ -1717,11 +1706,9 @@ impl IqSpec for SetGroupLockedIq {
     type Response = ();
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let tag = if self.locked { "locked" } else { "unlocked" };
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
+        build_property_toggle_iq(
             &self.group_jid,
-            Some(NodeContent::Nodes(vec![NodeBuilder::new(tag).build()])),
+            if self.locked { "locked" } else { "unlocked" },
         )
     }
 
@@ -1766,15 +1753,13 @@ impl IqSpec for SetGroupAnnouncementIq {
     type Response = ();
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let tag = if self.announce {
-            "announcement"
-        } else {
-            "not_announcement"
-        };
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
+        build_property_toggle_iq(
             &self.group_jid,
-            Some(NodeContent::Nodes(vec![NodeBuilder::new(tag).build()])),
+            if self.announce {
+                "announcement"
+            } else {
+                "not_announcement"
+            },
         )
     }
 
@@ -1928,6 +1913,16 @@ impl IqSpec for SetGroupMembershipApprovalIq {
     }
 }
 
+/// Outlined body for `define_group_property_toggle_iq!` impls, so the generated
+/// types share one instantiation instead of each duplicating it.
+fn build_property_toggle_iq(group_jid: &Jid, tag: &'static str) -> InfoQuery<'static> {
+    InfoQuery::set_ref(
+        GROUP_IQ_NAMESPACE,
+        group_jid,
+        Some(NodeContent::Nodes(vec![NodeBuilder::new(tag).build()])),
+    )
+}
+
 /// Macro for boolean group property toggle IQs (on_tag / off_tag pattern).
 macro_rules! define_group_property_toggle_iq {
     (
@@ -1954,12 +1949,7 @@ macro_rules! define_group_property_toggle_iq {
             type Response = ();
 
             fn build_iq(&self) -> InfoQuery<'static> {
-                let tag = if self.enabled { $on } else { $off };
-                InfoQuery::set_ref(
-                    GROUP_IQ_NAMESPACE,
-                    &self.group_jid,
-                    Some(NodeContent::Nodes(vec![NodeBuilder::new(tag).build()])),
-                )
+                build_property_toggle_iq(&self.group_jid, if self.enabled { $on } else { $off })
             }
 
             fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {

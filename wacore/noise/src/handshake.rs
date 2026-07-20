@@ -1,10 +1,8 @@
 use crate::error::NoiseError;
 use crate::state::{NoiseCipher, NoiseState};
-use buffa::Message;
 use thiserror::Error;
 use wacore_libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
-use waproto::whatsapp::cert_chain::noise_certificate;
-use waproto::whatsapp::{self as wa, CertChain, HandshakeMessage};
+use waproto::whatsapp::{self as wa, HandshakeMessage};
 
 const WA_CERT_ISSUER_SERIAL: i64 = 0;
 
@@ -126,7 +124,7 @@ impl HandshakeUtils {
     pub fn parse_server_hello_body(
         response_bytes: &[u8],
     ) -> Result<wa::handshake_message::ServerHello> {
-        let handshake_response = HandshakeMessage::decode_from_slice(response_bytes)?;
+        let handshake_response = waproto::codec::handshake_message_decode(response_bytes)?;
         let server_hello = handshake_response
             .server_hello
             .into_option()
@@ -175,7 +173,7 @@ impl HandshakeUtils {
         cert_decrypted: &[u8],
         static_decrypted: &[u8; 32],
     ) -> Result<VerifiedServerCertChain> {
-        let cert_chain = CertChain::decode_from_slice(cert_decrypted)?;
+        let cert_chain = waproto::codec::cert_chain_decode(cert_decrypted)?;
 
         let intermediate = cert_chain
             .intermediate
@@ -190,7 +188,7 @@ impl HandshakeUtils {
             HandshakeError::CertVerification("Missing intermediate details".into())
         })?;
         let intermediate_details =
-            noise_certificate::Details::decode_from_slice(intermediate_details_bytes.as_slice())?;
+            waproto::codec::noise_certificate_details_decode(intermediate_details_bytes)?;
 
         let issuer_serial = intermediate_details.issuer_serial.unwrap_or(0);
         if i64::from(issuer_serial) != WA_CERT_ISSUER_SERIAL {
@@ -221,8 +219,7 @@ impl HandshakeUtils {
             .details
             .as_ref()
             .ok_or_else(|| HandshakeError::CertVerification("Missing leaf details".into()))?;
-        let leaf_details =
-            noise_certificate::Details::decode_from_slice(leaf_details_bytes.as_slice())?;
+        let leaf_details = waproto::codec::noise_certificate_details_decode(leaf_details_bytes)?;
 
         if leaf_details.issuer_serial != intermediate_details.serial {
             return Err(HandshakeError::CertVerification(format!(
@@ -424,7 +421,7 @@ impl XxHandshakeState {
     pub fn build_client_hello(&self) -> Result<Vec<u8>> {
         let client_hello =
             HandshakeUtils::build_client_hello(self.ephemeral_kp.public_key.public_key_bytes());
-        Ok(client_hello.encode_to_vec())
+        Ok(waproto::codec::handshake_message_to_vec(&client_hello))
     }
 
     pub fn read_server_hello_and_build_client_finish(
@@ -502,7 +499,7 @@ fn process_xx_server_hello_into(
     let encrypted_payload = noise.encrypt(payload)?;
 
     let client_finish = HandshakeUtils::build_client_finish(encrypted_pubkey, encrypted_payload);
-    Ok(client_finish.encode_to_vec())
+    Ok(waproto::codec::handshake_message_to_vec(&client_finish))
 }
 
 /// Handshake state for **Noise IK** — used on reconnect when the device has a
@@ -585,7 +582,7 @@ impl IkHandshakeState {
             encrypted_static,
             encrypted_payload,
         );
-        Ok(msg.encode_to_vec())
+        Ok(waproto::codec::handshake_message_to_vec(&msg))
     }
 
     /// `serverHello.static.is_some()` signals fallback (server rotated static).
@@ -705,8 +702,10 @@ impl XxFallbackHandshakeState {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message;
     use wacore_binary::consts::WA_CONN_HEADER;
     use waproto::whatsapp as wa;
 

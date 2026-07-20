@@ -113,6 +113,7 @@ impl<'a> Mex<'a> {
         self.execute_request(request).await
     }
 
+    #[inline]
     async fn execute_request<V: Serialize>(
         &self,
         request: MexRequest<V>,
@@ -120,7 +121,12 @@ impl<'a> Mex<'a> {
         // Serialize the variables here so a caller-side serialization error
         // surfaces as MexError::Json instead of a malformed empty request.
         let spec = MexQuerySpec::new(request.doc, &request.variables)?;
+        self.execute_spec(spec).await
+    }
 
+    // Non-generic so the execute/error-handling body instantiates once, not
+    // per variables type.
+    async fn execute_spec(&self, spec: MexQuerySpec) -> Result<MexResponse, MexError> {
         let response = self.client.execute(spec).await?;
 
         // Check for fatal errors (the IqSpec already checks, but we want to return our error type)

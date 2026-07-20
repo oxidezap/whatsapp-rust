@@ -107,6 +107,10 @@ name = "send_receive_benchmark"
 harness = false
 
 [[bench]]
+name = "token_lookup_benchmark"
+harness = false
+
+[[bench]]
 name = "history_sync_benchmark"
 harness = false
 

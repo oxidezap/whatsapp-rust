@@ -11,7 +11,7 @@
 //! WAWebHandleMediaRetryNotification.
 
 use anyhow::{Result, anyhow};
-use buffa::{Message, MessageView};
+use buffa::MessageView;
 use hkdf::Hkdf;
 use rand::Rng;
 use sha2::Sha256;
@@ -72,7 +72,7 @@ pub fn encrypt_media_retry_receipt(
     let receipt = wa::ServerErrorReceipt {
         stanza_id: Some(stanza_id.to_string()),
     };
-    let plaintext = receipt.encode_to_vec();
+    let plaintext = waproto::codec::server_error_receipt_to_vec(&receipt);
 
     let mut ciphertext = Vec::with_capacity(plaintext.len() + 16);
     aes_256_gcm_encrypt(&key, &iv, stanza_id.as_bytes(), &plaintext, &mut ciphertext)

@@ -157,6 +157,18 @@ impl InMemoryBackend {
     pub fn set_fail_sender_key_writes(&self, fail: bool) {
         self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
     }
+
+    /// Lets recovery tests remove only the state needed to trigger a key request.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn remove_sync_key_for_test(&self, key_id: &[u8]) -> bool {
+        self.state.lock().await.sync_keys.remove(key_id).is_some()
+    }
+
+    /// Keeps readiness failures attributable without exposing key material.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn sync_key_count_for_test(&self) -> usize {
+        self.state.lock().await.sync_keys.len()
+    }
 }
 
 impl Default for InMemoryBackend {

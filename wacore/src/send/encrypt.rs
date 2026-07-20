@@ -124,7 +124,7 @@ pub fn needs_device_identity(
     }
     let acc = account
         .ok_or_else(|| anyhow!("pkmsg requires <device-identity> but no ADV account is present"))?;
-    Ok(Some(acc.encode_to_vec()))
+    Ok(Some(waproto::codec::adv_signed_device_identity_to_vec(acc)))
 }
 
 /// Maximum number of concurrent per-device crypto tasks during group send

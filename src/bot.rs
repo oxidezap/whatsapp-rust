@@ -1305,7 +1305,26 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         if let Some(override_) = self.device_props_override
             && !override_.is_empty()
         {
-            info!("Applying device props override: {:?}", override_);
+            // Field-by-field to avoid Debug-formatting waproto types (keeps their
+            // generated Debug impls out of the binary).
+            info!(
+                "Applying device props override: os={:?} version={:?} platform_type={:?} history_sync_config={}",
+                override_.os.as_deref(),
+                override_.version.as_ref().map(|v| {
+                    format!(
+                        "{}.{}.{}",
+                        v.primary.unwrap_or(0),
+                        v.secondary.unwrap_or(0),
+                        v.tertiary.unwrap_or(0)
+                    )
+                }),
+                override_.platform_type.map(|p| p as i32),
+                if override_.history_sync_config.is_some() {
+                    "overridden"
+                } else {
+                    "default"
+                },
+            );
             persistence_manager
                 .process_command(DeviceCommand::SetDeviceProps(override_))
                 .await;

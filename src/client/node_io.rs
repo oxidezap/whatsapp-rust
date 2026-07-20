@@ -72,9 +72,32 @@ impl Client {
     /// processing and the commit batcher: both must serialize on the same
     /// instance for the drain-flush safety argument to hold.
     pub(crate) async fn acquire_message_processing_permit(&self) -> async_lock::SemaphoreGuardArc {
+        // A holder stalling while the drain semaphore is at 1 permit freezes
+        // every lane and sender with no other signal — surface long waits
+        // instead of hanging silently. The slow path keeps ONE acquire future
+        // alive across warn ticks so the waiter never loses its queue position.
+        const PERMIT_WAIT_WARN: std::time::Duration = std::time::Duration::from_secs(10);
         loop {
             let (generation, semaphore) = self.read_message_semaphore();
-            let permit = semaphore.acquire_arc().await;
+            let permit = match semaphore.try_acquire_arc() {
+                Some(permit) => permit,
+                None => {
+                    let acquire = semaphore.acquire_arc();
+                    futures::pin_mut!(acquire);
+                    let sleep = self.runtime.sleep(PERMIT_WAIT_WARN);
+                    futures::pin_mut!(sleep);
+                    match futures::future::select(&mut acquire, sleep).await {
+                        futures::future::Either::Left((permit, _)) => permit,
+                        futures::future::Either::Right(((), _)) => {
+                            warn!(
+                                "Message-processing permit not acquired after {PERMIT_WAIT_WARN:?} (drain_active={}); a stanza worker or drain flush may be stalled",
+                                self.inbound_commit_batch.is_active()
+                            );
+                            acquire.await
+                        }
+                    }
+                }
+            };
             if generation == self.message_semaphore_generation.load(Ordering::SeqCst) {
                 return permit;
             }

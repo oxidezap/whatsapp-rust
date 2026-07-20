@@ -70,8 +70,12 @@ pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
     encoder.write_node(node)?;
     let written = encoder.bytes_written();
-    debug_assert_eq!(written, payload.len(), "plan size mismatch for Node");
-    payload.truncate(written);
+    // Real checks, not debug_asserts: replayed hints are trusted in release,
+    // so a plan/encode traversal divergence must fail the marshal instead of
+    // shipping corrupt bytes. Two integer compares per stanza.
+    if written != payload.len() || !plan.hints.fully_consumed() {
+        return Err(crate::error::BinaryError::PlanMismatch);
+    }
     Ok(payload)
 }
 
@@ -116,8 +120,10 @@ pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
     encoder.write_node(node)?;
     let written = encoder.bytes_written();
-    debug_assert_eq!(written, payload.len(), "plan size mismatch for NodeRef");
-    payload.truncate(written);
+    // Same invariant enforcement as marshal_exact.
+    if written != payload.len() || !plan.hints.fully_consumed() {
+        return Err(crate::error::BinaryError::PlanMismatch);
+    }
     Ok(payload)
 }
 
@@ -306,6 +312,55 @@ mod tests {
         let plan = build_marshaled_node_plan(&node);
         let payload = marshal(&node)?;
         assert_eq!(payload.len(), plan.size);
+        Ok(())
+    }
+
+    // The exact path replays plan-recorded hints by traversal order, so it
+    // must produce byte-identical output to the hint-free vec path for every
+    // string shape (tokens, numerics, hex, JIDs with device/agent/empty user,
+    // long strings, bytes, nesting). A divergence in traversal order shows up
+    // here (and as a debug_assert in write_string) before it can corrupt the
+    // wire.
+    #[test]
+    fn test_exact_matches_plain_for_all_string_shapes() -> TestResult {
+        let mut attrs = Attrs::with_capacity(8);
+        attrs.push("to".to_string(), "15551234567@s.whatsapp.net");
+        attrs.push("from".to_string(), "15550000001:12@s.whatsapp.net");
+        attrs.push("participant".to_string(), "15550000002_1@lid");
+        attrs.push("broadcast".to_string(), "status@broadcast");
+        attrs.push("type".to_string(), "text");
+        attrs.push("count".to_string(), "12345");
+        attrs.push("hexish".to_string(), "0123ABCDEF");
+        attrs.push("plain".to_string(), "not_a_token_value");
+        // Empty-user JID: the one branch that skips a hint entirely.
+        attrs.push("empty_user".to_string(), "@s.whatsapp.net");
+        // Typed JID value: user/server hints with no wrapping string hint.
+        attrs.push(
+            "typed_jid".to_string(),
+            NodeValue::Jid("15550000003:7@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
+        let node = Node::new(
+            "iq",
+            attrs,
+            Some(NodeContent::Nodes(vec![
+                Node::new(
+                    "text",
+                    Attrs::new(),
+                    Some(NodeContent::String("x".repeat(300).into())),
+                ),
+                Node::new("empty", Attrs::new(), Some(NodeContent::String("".into()))),
+                Node::new(
+                    "bin",
+                    Attrs::new(),
+                    Some(NodeContent::Bytes(vec![0xAB; 64])),
+                ),
+                Node::new("leaf", Attrs::new(), None),
+            ])),
+        );
+
+        assert_eq!(marshal(&node)?, marshal_exact(&node)?);
+        let node_ref = node.as_node_ref();
+        assert_eq!(marshal_ref(&node_ref)?, marshal_ref_exact(&node_ref)?);
         Ok(())
     }
 

@@ -30,8 +30,86 @@ pub enum TokenKind {
 
 include!(concat!(env!("OUT_DIR"), "/token_maps.rs"));
 
+/// One open-addressing probe over the build-generated table (layout and
+/// rationale in build.rs). Keys of length <= 4 — the bulk of probe traffic —
+/// are matched exactly by their padded u32; longer keys match a two-load
+/// signature first and byte-verify only on signature hits, so a miss of any
+/// shape costs a handful of instructions and no full compare.
+#[inline]
 pub fn index_of_token(token: &str) -> Option<TokenKind> {
-    hashify_lookup(token.as_bytes())
+    lookup_bytes(token.as_bytes())
+}
+
+#[inline(always)]
+fn decode_kind(kind: u16) -> TokenKind {
+    if kind < SINGLE_BYTE_MAX {
+        TokenKind::Single(kind as u8)
+    } else {
+        TokenKind::Double((kind >> 8) as u8 - 1, kind as u8)
+    }
+}
+
+#[inline(always)]
+fn lookup_bytes(key: &[u8]) -> Option<TokenKind> {
+    let len = key.len();
+    if len == 0 || len > MAX_TOKEN_LEN {
+        return None;
+    }
+    // Key derivation must mirror build.rs exactly. For len <= 4 the padded
+    // word IS the key (tokens are NUL-free, so padding can't collide with
+    // real bytes) and the meta tag pins the exact length; longer keys match
+    // a signature and byte-verify against the length-prefixed blob. In both
+    // loops 0 marks an empty slot (build.rs asserts no key is 0), so most
+    // misses stop on the first load, and a false key match — an alias across
+    // the short/long split or a signature collision — just keeps probing:
+    // the real owner may live further down the chain.
+    if len <= 4 {
+        let x = match *key {
+            [a] => a as u32,
+            [a, b] => u32::from_le_bytes([a, b, 0, 0]),
+            [a, b, c] => u32::from_le_bytes([a, b, c, 0]),
+            _ => u32::from_le_bytes([key[0], key[1], key[2], key[3]]),
+        };
+        let mut h = (x.wrapping_mul(TOK_MUL) >> TOK_SHIFT) as usize;
+        loop {
+            let k = TOK_KEYS[h];
+            if k == 0 {
+                return None;
+            }
+            if k == x {
+                let meta = TOK_META[h];
+                if (meta >> 11) as usize == len - 1 {
+                    return Some(decode_kind(meta & 0x7FF));
+                }
+            }
+            h = (h + 1) & TOK_MASK;
+        }
+    }
+    let head = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+    let tail = u32::from_le_bytes([key[len - 4], key[len - 3], key[len - 2], key[len - 1]]);
+    let x = head.rotate_left(11) ^ tail ^ (len as u32).wrapping_mul(0x9E37_79B1);
+    let mut h = (x.wrapping_mul(TOK_MUL) >> TOK_SHIFT) as usize;
+    loop {
+        let k = TOK_KEYS[h];
+        if k == 0 {
+            return None;
+        }
+        if k == x {
+            let meta = TOK_META[h];
+            if meta >> 11 == 31 {
+                let off = TOK_OFF[h] as usize;
+                if TOK_BLOB[off] as usize == len
+                    && TOK_BLOB[off + 1..off + 1 + len]
+                        .iter()
+                        .zip(key)
+                        .all(|(a, b)| a == b)
+                {
+                    return Some(decode_kind(meta & 0x7FF));
+                }
+            }
+        }
+        h = (h + 1) & TOK_MASK;
+    }
 }
 
 pub fn get_single_token(index: u8) -> Option<&'static str> {
@@ -151,7 +229,7 @@ mod tests {
 
         let check = |bytes: &[u8]| {
             assert_eq!(
-                hashify_lookup(bytes),
+                lookup_bytes(bytes),
                 reference.get(bytes).copied(),
                 "lookup disagrees with reference for {bytes:?}",
             );

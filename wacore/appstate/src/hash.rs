@@ -67,8 +67,9 @@ impl HashState {
         let mut removed_in_patch: Vec<&[u8]> = Vec::new();
         if index_mode {
             for mutation in mutations {
-                if mutation.operation.unwrap_or_default()
-                    == wa::syncd_mutation::SyncdOperation::REMOVE
+                if mutation
+                    .operation
+                    .is_some_and(|op| op == wa::syncd_mutation::SyncdOperation::REMOVE)
                     && let Some(index_mac) = index_mac_of(mutation)
                 {
                     removed_in_patch.push(index_mac);
@@ -82,7 +83,22 @@ impl HashState {
         let mut result = HashUpdateResult::default();
 
         for (i, mutation) in mutations.iter().enumerate() {
-            let op = mutation.operation.unwrap_or_default();
+            // SyncdOperation is an open enum; an unknown op can't be mapped to
+            // add or subtract, so bail before touching the hash.
+            let op = match mutation.operation {
+                None => wa::syncd_mutation::SyncdOperation::SET,
+                Some(v) => {
+                    let Some(op) = v.as_known() else {
+                        return (
+                            result,
+                            Err(anyhow::anyhow!(AppStateError::UnsupportedSyncdOperation(
+                                v.to_i32()
+                            ))),
+                        );
+                    };
+                    op
+                }
+            };
             let is_set = op == wa::syncd_mutation::SyncdOperation::SET;
             if is_set
                 && mutation.record.is_set()
@@ -242,7 +258,7 @@ mod tests {
         };
 
         wa::SyncdMutation {
-            operation: Some(operation),
+            operation: Some(operation.into()),
             record: buffa::MessageField::some(wa::SyncdRecord {
                 index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac),
@@ -469,14 +485,14 @@ mod tests {
             snapshot_mac: Some(snapshot_mac.clone()),
             mutations: vec![
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                     record: buffa::MessageField::some(wa::SyncdRecord {
                         value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob1) }),
                         ..Default::default()
                     }),
                 },
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
                     record: buffa::MessageField::some(wa::SyncdRecord {
                         value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob2) }),
                         ..Default::default()

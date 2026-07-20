@@ -278,14 +278,13 @@ impl PreKeyStore for Device {
         &self,
         prekey_id: u32,
     ) -> Result<Option<PreKeyRecordStructure>, StoreError> {
-        use buffa::Message;
         use wacore::libsignal::protocol::KeyPair;
         use wacore::libsignal::store::record_helpers::new_pre_key_record;
 
         match self.backend.load_prekey(prekey_id).await {
             Ok(Some(bytes)) => {
                 // Try new format first (protobuf-encoded PreKeyRecordStructure)
-                if let Ok(record) = PreKeyRecordStructure::decode_from_slice(bytes.as_ref()) {
+                if let Ok(record) = waproto::codec::pre_key_record_decode(&bytes) {
                     return Ok(Some(record));
                 }
 
@@ -313,8 +312,7 @@ impl PreKeyStore for Device {
         record: PreKeyRecordStructure,
         uploaded: bool,
     ) -> Result<(), StoreError> {
-        use buffa::Message;
-        let bytes = record.encode_to_vec();
+        let bytes = waproto::codec::pre_key_record_to_vec(&record);
         self.backend
             .store_prekey(prekey_id, &bytes, uploaded)
             .await
@@ -354,7 +352,6 @@ impl SignedPreKeyStore for Device {
         }
         // Rotated-out key: a prekey message minted against a previous signed
         // pre-key still names its old id, so fall back to the retained records.
-        use buffa::Message;
         match self
             .backend
             .load_signed_prekey(signed_prekey_id)
@@ -362,7 +359,7 @@ impl SignedPreKeyStore for Device {
             .map_err(|e| Box::new(e) as StoreError)?
         {
             Some(bytes) => {
-                let record = SignedPreKeyRecordStructure::decode_from_slice(&bytes)
+                let record = waproto::codec::signed_pre_key_record_decode(&bytes)
                     .map_err(|e| Box::new(e) as StoreError)?;
                 Ok(Some(record))
             }
@@ -544,6 +541,7 @@ impl SenderKeyStore for Device {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

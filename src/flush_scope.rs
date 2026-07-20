@@ -15,6 +15,8 @@ pub struct FlushScope {
     count: AtomicUsize,
     idle: event_listener::Event,
     closed: std::sync::Mutex<bool>,
+    #[cfg(test)]
+    track_rejections: AtomicUsize,
 }
 
 impl Default for FlushScope {
@@ -29,6 +31,8 @@ impl FlushScope {
             count: AtomicUsize::new(0),
             idle: event_listener::Event::new(),
             closed: std::sync::Mutex::new(false),
+            #[cfg(test)]
+            track_rejections: AtomicUsize::new(0),
         }
     }
 
@@ -48,6 +52,8 @@ impl FlushScope {
         {
             let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
             if *closed {
+                #[cfg(test)]
+                self.track_rejections.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -112,6 +118,11 @@ impl FlushScope {
     #[cfg(test)]
     pub fn pending(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn track_rejections(&self) -> usize {
+        self.track_rejections.load(Ordering::Relaxed)
     }
 }
 

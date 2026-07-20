@@ -1517,7 +1517,6 @@ impl Client {
             }
             return Err(e.into());
         }
-
         if let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),
@@ -2259,6 +2258,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;

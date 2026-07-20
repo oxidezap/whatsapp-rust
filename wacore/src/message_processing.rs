@@ -300,6 +300,7 @@ pub fn process_decrypted_plaintext(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use wacore_binary::{Attrs, Node, NodeContent, NodeValue};

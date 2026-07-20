@@ -484,14 +484,7 @@ impl ClientError {
         match self {
             ClientError::NotConnected => true,
             ClientError::EncryptSend(e) => e.is_transport_unavailable(),
-            // Transport loss can now arrive wrapped in an IQ failure (the base
-            // error gained `Iq`); unwrap it so retry/reconnect still triggers.
-            ClientError::Iq(e) => match e {
-                crate::request::IqError::NotConnected => true,
-                crate::request::IqError::EncryptSend(e) => e.is_transport_unavailable(),
-                crate::request::IqError::ClientState(client) => client.is_transport_unavailable(),
-                _ => false,
-            },
+            ClientError::Iq(e) => e.is_transport_unavailable(),
             _ => false,
         }
     }
@@ -685,7 +678,7 @@ pub struct Client {
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 
     pub(crate) app_state_processor: async_lock::Mutex<Option<Arc<AppStateProcessor>>>,
-    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<String, wacore::time::Instant>>>,
+    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
     pub(crate) app_state_syncing: Arc<Mutex<HashSet<WAPatchName>>>,
@@ -891,6 +884,9 @@ pub struct Client {
     /// until a worker is actually inside the (blocked) flush.
     #[cfg(test)]
     pub(crate) signal_flush_test_in_attempt: AtomicU32,
+    /// Keeps retry regressions deterministic without corrupting the test database.
+    #[cfg(test)]
+    pub(crate) app_state_key_share_prepare_test_failures: AtomicU32,
 
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by

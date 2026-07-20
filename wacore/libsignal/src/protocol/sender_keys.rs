@@ -545,7 +545,7 @@ impl SenderKeyRecord {
         buf: &[u8],
         incarnation: Option<&[u8; 16]>,
     ) -> Result<SenderKeyRecord, SignalProtocolError> {
-        let skr = SenderKeyRecordStructure::decode_from_slice(buf)
+        let skr = waproto::codec::sender_key_record_decode(buf)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
         let mut states = VecDeque::with_capacity(skr.sender_key_states.len());
@@ -726,7 +726,7 @@ impl SenderKeyRecord {
     ) -> Result<Vec<u8>, SignalProtocolError> {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
-        let mut buf = self.as_protobuf().encode_to_vec();
+        let mut buf = waproto::codec::sender_key_record_to_vec(&self.as_protobuf());
         let incarnation = incarnation.filter(|_| self.reserved_iteration > 0);
         let reservation_len = if self.reserved_iteration > 0 {
             2 + varint_len(self.reserved_iteration as u64)
@@ -769,6 +769,7 @@ impl SenderKeyRecord {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocol::KeyPair;

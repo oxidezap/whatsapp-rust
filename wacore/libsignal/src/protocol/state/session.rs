@@ -1002,6 +1002,9 @@ impl SessionRecord {
         self.serialize_into_inner(buf, Some(incarnation));
     }
 
+    // Session storage protos are hand-spliced only here; direct buffa calls
+    // duplicate nothing, so no codec pin.
+    #[allow(clippy::disallowed_methods)]
     fn serialize_into_inner(&self, buf: &mut Vec<u8>, incarnation: Option<&[u8; 16]>) {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
@@ -1199,7 +1202,7 @@ impl SessionRecord {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocol::ratchet::keys::MessageKeyGenerator;

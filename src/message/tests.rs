@@ -1,5 +1,8 @@
 //! Tests for the message receive/decrypt pipeline.
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use crate::store::SqliteStore;
 use crate::store::persistence_manager::PersistenceManager;
@@ -548,7 +551,8 @@ use wacore::libsignal::protocol::{
     PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SenderKeyName,
     SenderKeyRecord, SenderKeyStore as SigSenderKeyStore, SessionRecord,
     SessionStore as SigSessionStore, SignedPreKeyStore as SigSignedPreKeyStore, UsePQRatchet,
-    create_sender_key_distribution_message, group_encrypt, message_encrypt, process_prekey_bundle,
+    create_sender_key_distribution_message, group_encrypt, message_decrypt_signal, message_encrypt,
+    process_prekey_bundle,
 };
 use wacore::libsignal::protocol::{IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError};
 
@@ -697,6 +701,20 @@ impl AlicePeer {
             ..Default::default()
         });
         self.encrypt(bob_addr, &plaintext).await
+    }
+
+    async fn decrypt_signal(&mut self, bob_addr: &ProtocolAddress, ciphertext: &[u8]) -> Vec<u8> {
+        let message = SignalMessage::try_from(ciphertext).expect("signal message");
+        message_decrypt_signal(
+            &message,
+            bob_addr,
+            &mut self.sessions,
+            &mut self.identity,
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+        )
+        .await
+        .expect("decrypt signal message")
+        .plaintext
     }
 
     async fn create_group_skdm(
@@ -5659,6 +5677,70 @@ fn decode_frame(index: usize, frame: &[u8]) -> Option<Vec<u8>> {
     (!buf.is_empty()).then_some(buf)
 }
 
+fn has_message_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> bool {
+    message_count_to_after(frames, start, to) != 0
+}
+
+fn message_count_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> usize {
+    frames
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter(|(index, frame)| {
+            let Some(buf) = decode_frame(*index, frame) else {
+                return false;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                return false;
+            };
+            node.tag.as_ref() == "message"
+                && node
+                    .get_attr("to")
+                    .is_some_and(|value| value.as_str() == to)
+        })
+        .count()
+}
+
+async fn decrypt_peer_message_after(
+    peer: &mut AlicePeer,
+    remote_address: &ProtocolAddress,
+    frames: &[bytes::Bytes],
+    start: usize,
+    to: &str,
+) -> Option<wa::Message> {
+    let (ciphertext, padding_version) =
+        frames
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, frame)| {
+                let buf = decode_frame(index, frame)?;
+                let node = wacore_binary::marshal::unmarshal_ref(&buf[1..]).ok()?;
+                if node.tag.as_ref() != "message"
+                    || !node
+                        .get_attr("to")
+                        .is_some_and(|value| value.as_str() == to)
+                {
+                    return None;
+                }
+                let enc = node.get_optional_child_by_tag(&["enc"])?;
+                if !enc
+                    .get_attr("type")
+                    .is_some_and(|value| value.as_str() == "msg")
+                {
+                    return None;
+                }
+                Some((
+                    enc.content_bytes()?.to_vec(),
+                    enc.get_attr("v")
+                        .and_then(|value| value.as_str().parse().ok())
+                        .unwrap_or(2),
+                ))
+            })?;
+    let plaintext = peer.decrypt_signal(remote_address, &ciphertext).await;
+    wacore::messages::decode_plaintext(&plaintext, padding_version).ok()
+}
+
 /// First `<ack class="message">` on the wire as `(to, recipient)`.
 fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)> {
     for (i, frame) in frames.iter().enumerate() {
@@ -7684,18 +7766,31 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     };
     let padded = MessageUtils::encode_and_pad(&share);
     let backend = client.persistence_manager.backend();
+    client
+        .app_state_key_requests
+        .lock()
+        .await
+        .insert(key_id.clone(), wacore::time::Instant::now());
 
     // Non-self sender: the key share must be dropped.
     let mut info =
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
         .await
         .unwrap();
     assert!(
         backend.get_sync_key(&key_id).await.unwrap().is_none(),
         "app-state sync key from a non-self sender must not be stored"
+    );
+    assert!(
+        client
+            .app_state_key_requests
+            .lock()
+            .await
+            .contains_key(key_id.as_slice()),
+        "a spoofed key share must not clear missing-key tracking"
     );
 
     // Self sender: the key share is honoured and stored.
@@ -7706,13 +7801,435 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
         .await
         .unwrap();
     assert!(
         backend.get_sync_key(&key_id).await.unwrap().is_some(),
         "app-state sync key from self must be stored"
     );
+    assert!(
+        !client
+            .app_state_key_requests
+            .lock()
+            .await
+            .contains_key(key_id.as_slice()),
+        "a stored key must become requestable again if it is later lost"
+    );
+}
+
+#[tokio::test]
+async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
+    use buffa::Message as _;
+
+    let client = crate::test_utils::create_test_client().await;
+    let backend = client.persistence_manager.backend();
+    let known_id = vec![1, 2, 3, 4, 5, 6];
+    let orphan_id = vec![6, 5, 4, 3, 2, 1];
+    let corrupt_id = vec![9, 8, 7, 6, 5, 4];
+    let fingerprint = wa::message::AppStateSyncKeyFingerprint {
+        raw_id: Some(7),
+        current_index: Some(3),
+        device_indexes: vec![0, 3],
+    };
+    backend
+        .set_sync_key(
+            &known_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![9; 32],
+                fingerprint: fingerprint.encode_to_vec(),
+                timestamp: 123,
+            },
+        )
+        .await
+        .unwrap();
+    backend
+        .set_sync_key(
+            &corrupt_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![8; 32],
+                fingerprint: vec![0xff],
+                timestamp: 456,
+            },
+        )
+        .await
+        .unwrap();
+
+    let request = wa::message::AppStateSyncKeyRequest {
+        key_ids: vec![
+            wa::message::AppStateSyncKeyId {
+                key_id: Some(known_id.clone()),
+            },
+            wa::message::AppStateSyncKeyId {
+                key_id: Some(orphan_id.clone()),
+            },
+            wa::message::AppStateSyncKeyId {
+                key_id: Some(corrupt_id.clone()),
+            },
+            wa::message::AppStateSyncKeyId { key_id: None },
+        ],
+    };
+    let share = client
+        .build_app_state_sync_key_share(&request)
+        .await
+        .unwrap();
+
+    assert_eq!(share.keys.len(), 3, "keyless requests must be ignored");
+    let known = &share.keys[0];
+    assert_eq!(
+        known.key_id.as_option().and_then(|id| id.key_id.as_ref()),
+        Some(&known_id)
+    );
+    let known_data = known.key_data.as_option().expect("known key data");
+    assert_eq!(known_data.key_data.as_deref(), Some(&[9; 32][..]));
+    assert_eq!(known_data.fingerprint.as_option(), Some(&fingerprint));
+    assert_eq!(known_data.timestamp, Some(123));
+
+    let orphan = &share.keys[1];
+    assert_eq!(
+        orphan.key_id.as_option().and_then(|id| id.key_id.as_ref()),
+        Some(&orphan_id)
+    );
+    assert!(
+        orphan.key_data.is_unset(),
+        "an unknown ID must be returned without fabricated key data"
+    );
+
+    let corrupt = &share.keys[2];
+    assert_eq!(
+        corrupt.key_id.as_option().and_then(|id| id.key_id.as_ref()),
+        Some(&corrupt_id)
+    );
+    assert!(
+        corrupt.key_data.is_unset(),
+        "an unusable stored key must not suppress valid key shares"
+    );
+}
+
+#[tokio::test]
+async fn app_state_key_share_waits_outside_the_offline_message_lane() {
+    use buffa::Message as _;
+    use std::sync::atomic::Ordering;
+    use wacore::messages::MessageUtils;
+
+    let (client, transport) = capturing_client("appstate_key_share_offline").await;
+    let requester_str = "5511000000001:33@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+
+    client
+        .offline_sync_completed
+        .store(false, Ordering::Release);
+    let _ = client.inbound_commit_batch.reset();
+    client.swap_message_semaphore(1);
+    assert!(client.inbound_commit_batch.is_active());
+    let requested_key_id = vec![1, 2, 3, 4];
+    let request = wa::Message {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+            app_state_sync_key_request: buffa::MessageField::some(
+                wa::message::AppStateSyncKeyRequest {
+                    key_ids: vec![wa::message::AppStateSyncKeyId {
+                        key_id: Some(requested_key_id.clone()),
+                    }],
+                },
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut info = create_test_message_info(requester_str, "AKR_OFFLINE", requester_str);
+    info.source.is_from_me = true;
+    let info = Arc::new(info);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
+    )
+    .await
+    .expect("the inbound lane must not wait for offline sync")
+    .expect("handle key request");
+
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+
+    assert!(
+        client.inbound_commit_batch.reset(),
+        "the first request must still be uncommitted"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
+    )
+    .await
+    .expect("the redelivery must not wait for offline sync")
+    .expect("handle redelivered key request");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        transport.sent_count(),
+        sent_before,
+        "the response must stay deferred while the inbound drain is active"
+    );
+
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    assert!(
+        !client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the injected commit failure must keep the request non-durable"
+    );
+    client.offline_sync_completed.store(true, Ordering::Release);
+    client.offline_sync_notifier.notify(usize::MAX);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !has_message_to_after(&transport.sent(), sent_before, requester_str),
+        "a non-durable request must not put a key share on the wire"
+    );
+
+    let fingerprint = wa::message::AppStateSyncKeyFingerprint {
+        raw_id: Some(42),
+        current_index: Some(1),
+        device_indexes: vec![0, 1],
+    };
+    client
+        .persistence_manager
+        .backend()
+        .set_sync_key(
+            &requested_key_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![7; 32],
+                fingerprint: fingerprint.encode_to_vec(),
+                timestamp: 456,
+            },
+        )
+        .await
+        .expect("store key learned during the offline drain");
+
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(false, Ordering::Release);
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await,
+        "the retried inbound commit must become durable"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut observed = sent_before;
+        loop {
+            let count = transport.sent_count();
+            if count != observed {
+                observed = count;
+                if has_message_to_after(&transport.sent(), sent_before, requester_str) {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred key share should send after the drain");
+
+    let response = decrypt_peer_message_after(
+        &mut peer,
+        &own_address,
+        &transport.sent(),
+        sent_before,
+        requester_str,
+    )
+    .await
+    .expect("decrypt deferred key share");
+    let shared_key = response
+        .protocol_message
+        .as_option()
+        .and_then(|protocol| protocol.app_state_sync_key_share.as_option())
+        .and_then(|share| share.keys.first())
+        .and_then(|key| key.key_data.as_option())
+        .expect("the deferred response must include the key learned during the drain");
+    assert_eq!(shared_key.key_data.as_deref(), Some(&[7; 32][..]));
+    assert_eq!(shared_key.fingerprint.as_option(), Some(&fingerprint));
+    assert_eq!(shared_key.timestamp, Some(456));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        message_count_to_after(&transport.sent(), sent_before, requester_str),
+        1,
+        "a dropped request and its redelivery must produce one response"
+    );
+}
+
+#[tokio::test]
+async fn app_state_key_share_transport_retry_waits_for_reconnect() {
+    let (client, transport) = capturing_client("appstate_key_share_retry").await;
+    let requester_str = "5511000000001:34@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+    let request = wa::message::AppStateSyncKeyRequest {
+        key_ids: vec![wa::message::AppStateSyncKeyId {
+            key_id: Some(vec![4, 3, 2, 1]),
+        }],
+    };
+
+    transport.fail_next_sends(1);
+    client.schedule_app_state_sync_key_share(requester, request, None);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.failed_sends() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("key-share job should observe the transport failure");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        transport.sent_count(),
+        sent_before,
+        "an uncertain transport failure must not retry on the same Noise connection"
+    );
+
+    client
+        .connection_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    client.offline_sync_notifier.notify(usize::MAX);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.sent_count() == sent_before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("key-share job should retry on the new connection generation");
+
+    assert_eq!(transport.failed_sends(), 1);
+    assert!(transport.sent_count() > sent_before);
+}
+
+#[tokio::test]
+async fn app_state_key_share_preparation_failure_is_retried() {
+    let (client, transport) = capturing_client("appstate_key_share_prepare_retry").await;
+    let requester_str = "5511000000001:36@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+    client
+        .app_state_key_share_prepare_test_failures
+        .store(1, std::sync::atomic::Ordering::Release);
+    client.schedule_app_state_sync_key_share(
+        requester,
+        wa::message::AppStateSyncKeyRequest {
+            key_ids: vec![wa::message::AppStateSyncKeyId {
+                key_id: Some(vec![4, 3, 2, 1]),
+            }],
+        },
+        None,
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !has_message_to_after(&transport.sent(), sent_before, requester_str) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a transient preparation failure must keep the response job alive");
+    assert_eq!(
+        client
+            .app_state_key_share_prepare_test_failures
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}
+
+#[tokio::test]
+async fn app_state_key_share_survives_a_closed_flush_scope() {
+    let (client, transport) = capturing_client("appstate_key_share_closed_flush").await;
+    let requester_str = "5511000000001:35@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+
+    client.flush_signal_cache().await.expect("flush session");
+    client
+        .outbound_flush
+        .flush(&*client.runtime, std::time::Duration::from_secs(1))
+        .await;
+    let sent_before = transport.sent_count();
+    let request = wa::message::AppStateSyncKeyRequest {
+        key_ids: vec![wa::message::AppStateSyncKeyId {
+            key_id: Some(vec![4, 3, 2, 1]),
+        }],
+    };
+
+    client.outbound_flush.close();
+    let rejected_before = client.outbound_flush.track_rejections();
+    client.schedule_app_state_sync_key_share(requester, request, None);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while client.outbound_flush.track_rejections() == rejected_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("key-share job should observe the closed scope");
+    assert_eq!(transport.sent_count(), sent_before);
+
+    client
+        .connection_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    client.outbound_flush.reopen();
+    client.offline_sync_notifier.notify(usize::MAX);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.sent_count() == sent_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("key-share job should resume on the new connection");
 }
 
 /// Security regression: the primary's `lid_migration_mapping_sync_message`
@@ -7754,7 +8271,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -7770,7 +8287,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
         .await
         .unwrap();
     assert_eq!(
@@ -7946,7 +8463,7 @@ async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
     };
     let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8009,7 +8526,7 @@ async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
     // HKDF binds the real author (peer) as both original sender and editor.
     let msg = encrypted_message_edit(target_key, peer, peer, parent_id, &secret, "edited", None);
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8075,7 +8592,7 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
         participant: None,
     };
     let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     collect_event(
         &client,
@@ -8210,7 +8727,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
         None,
     );
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8273,7 +8790,9 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         "first",
         Some(second_secret.to_vec()),
     );
-    client.dispatch_parsed_message(first_msg, &first_info).await;
+    client
+        .dispatch_parsed_message(first_msg, &first_info, false)
+        .await;
     client.msg_secret_buffer.wait_flushed().await;
 
     let stored = client
@@ -8303,7 +8822,7 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         None,
     );
     client
-        .dispatch_parsed_message(second_msg, &second_info)
+        .dispatch_parsed_message(second_msg, &second_info, false)
         .await;
 
     let got = collect_event(
@@ -8381,7 +8900,7 @@ async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
         None,
     );
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     let got = collect_event(
         &client,
@@ -8463,7 +8982,9 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         "first",
         Some(second_secret.to_vec()),
     );
-    client.dispatch_parsed_message(first_msg, &first_info).await;
+    client
+        .dispatch_parsed_message(first_msg, &first_info, false)
+        .await;
     client.msg_secret_buffer.wait_flushed().await;
 
     for sender in [sender_lid, sender_pn] {
@@ -8503,7 +9024,7 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         None,
     );
     client
-        .dispatch_parsed_message(second_msg, &second_info)
+        .dispatch_parsed_message(second_msg, &second_info, false)
         .await;
 
     let got = collect_event(
@@ -10386,7 +10907,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         ..Default::default()
     });
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(msg, &info, false).await;
 
     // Deadline-poll instead of a fixed sleep so a slow CI cannot race the
     // event delivery.
