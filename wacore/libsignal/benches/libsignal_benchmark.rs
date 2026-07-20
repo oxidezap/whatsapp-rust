@@ -677,9 +677,9 @@ fn bench_dm_decrypt_owned_subsequent_message(bencher: divan::Bencher) {
             let mut rng = bench_rng();
 
             let plaintext = futures::executor::block_on(async {
-                let message = wacore_libsignal::protocol::SignalMessage::try_from(
-                    ciphertext_bytes.as_slice(),
-                )
+                let message = wacore_libsignal::protocol::SignalMessage::try_from(Bytes::from(
+                    std::mem::take(ciphertext_bytes),
+                ))
                 .unwrap();
                 let mut ciphertext =
                     OwnedCiphertextMessage::from(CiphertextMessage::SignalMessage(message));

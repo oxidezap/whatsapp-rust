@@ -751,6 +751,7 @@ mod tests {
         let entries = collector.into_entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].chat.as_ref(), FIRST_CHAT);
+        assert_eq!(entries[0].sender, entries[0].chat);
         assert_eq!(entries[1].chat.as_ref(), SECOND_CHAT);
         assert_eq!(entries[1].sender, entries[1].chat);
     }
