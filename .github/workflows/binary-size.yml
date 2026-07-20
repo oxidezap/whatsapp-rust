@@ -77,6 +77,10 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo-binary-size
           cache-targets: "true"
+          # RUSTFLAGS is empty when this step computes its key (it's only set at
+          # the measure step), so key the cache on SIZE_RUSTFLAGS instead —
+          # otherwise a flag change restores a stale target dir cargo discards.
+          env-vars: "SIZE_RUSTFLAGS"
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
@@ -221,6 +225,10 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo-binary-size
           cache-targets: "true"
+          # RUSTFLAGS is empty when this step computes its key (it's only set at
+          # the measure step), so key the cache on SIZE_RUSTFLAGS instead —
+          # otherwise a flag change restores a stale target dir cargo discards.
+          env-vars: "SIZE_RUSTFLAGS"
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
