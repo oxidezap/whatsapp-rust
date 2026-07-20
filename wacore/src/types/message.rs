@@ -392,8 +392,16 @@ mod tests {
 
         let serialized = serde_json::to_value(info).expect("serialize message info");
         let root = serialized.as_object().expect("message info object");
-        let source = root["source"].as_object().expect("message source object");
-        let meta = root["meta_info"].as_object().expect("message meta object");
+        let source = root
+            .get("source")
+            .expect("serialized message info should contain source")
+            .as_object()
+            .expect("message source object");
+        let meta = root
+            .get("meta_info")
+            .expect("serialized message info should contain meta_info")
+            .as_object()
+            .expect("message meta object");
 
         assert!(source.contains_key("sender_alt"));
         assert!(!source.contains_key("recipient_alt"));

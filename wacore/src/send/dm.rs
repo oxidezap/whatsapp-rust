@@ -48,6 +48,10 @@ pub(crate) struct PartitionedDmDevices {
 }
 
 impl PartitionedDmDevices {
+    pub(crate) fn valid_devices(&self) -> &[Jid] {
+        &self.devices
+    }
+
     pub(crate) fn recipient_devices(&self) -> &[Jid] {
         &self.devices[..self.recipient_count]
     }
@@ -127,14 +131,12 @@ pub async fn prepare_dm_stanza(
     // Partition first so phash reflects the actual sent set (sender excluded) and so
     // the own-device plaintext can be skipped when there's nothing to send it to.
     let partitioned_devices = partition_dm_devices(all_devices, own_jid, own_lid);
+    let valid_devices = partitioned_devices.valid_devices();
     let recipient_devices = partitioned_devices.recipient_devices();
     let own_other_devices = partitioned_devices.own_other_devices();
-    let total_devices = recipient_devices.len() + own_other_devices.len();
+    let total_devices = valid_devices.len();
 
-    let phash = MessageUtils::participant_list_hash(
-        recipient_devices.iter().chain(own_other_devices.iter()),
-    )
-    .ok();
+    let phash = MessageUtils::participant_list_hash(valid_devices.iter()).ok();
 
     // Splice the shared content into the recipient plaintext and, when present, the
     // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an
@@ -403,6 +405,7 @@ mod partition_tests {
 
         assert_eq!(partitioned.devices.as_ptr(), allocation);
         assert_eq!(partitioned.devices.capacity(), capacity);
+        assert_eq!(partitioned.valid_devices().len(), 3);
         assert_eq!(partitioned.recipient_devices().len(), 2);
         assert_eq!(partitioned.own_other_devices().len(), 1);
         assert!(

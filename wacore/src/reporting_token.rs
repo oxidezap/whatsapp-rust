@@ -259,7 +259,8 @@ const USE_CASE_REPORT_TOKEN: &str = "Report Token";
 
 /// Keeps the normal reporting-token info (`stanza || sender || remote || use-case`)
 /// on the stack. This is a performance threshold, not a protocol limit: longer
-/// inputs transparently use an exactly-sized heap buffer.
+/// inputs transparently use a heap buffer with room for subsequent formatter
+/// writes.
 const REPORTING_TOKEN_INFO_INLINE_CAPACITY: usize = 128;
 
 enum ReportingTokenInfo {
@@ -292,7 +293,10 @@ impl ReportingTokenInfo {
                     return;
                 }
 
-                let mut heap = Vec::with_capacity(end);
+                // JIDs are emitted in multiple `fmt::Write` calls. Keep one
+                // inline buffer's worth of spare capacity so promotion does not
+                // immediately reallocate on the remaining JID/use-case writes.
+                let mut heap = Vec::with_capacity(end + REPORTING_TOKEN_INFO_INLINE_CAPACITY);
                 heap.extend_from_slice(&bytes[..*len]);
                 heap.extend_from_slice(value);
                 *self = Self::Heap(heap);
@@ -899,6 +903,21 @@ mod tests {
                 "only the oversized case should use the heap fallback"
             );
         }
+    }
+
+    #[test]
+    fn heap_promotion_reserves_space_for_follow_up_writes() {
+        let mut info = ReportingTokenInfo::with_capacity(REPORTING_TOKEN_INFO_INLINE_CAPACITY);
+        info.extend_from_slice(&[0; REPORTING_TOKEN_INFO_INLINE_CAPACITY]);
+        info.extend_from_slice(&[1]);
+
+        let ReportingTokenInfo::Heap(bytes) = info else {
+            panic!("overflowing inline reporting info should promote to heap");
+        };
+        assert!(
+            bytes.capacity() >= bytes.len() + REPORTING_TOKEN_INFO_INLINE_CAPACITY,
+            "heap promotion should absorb subsequent formatter writes"
+        );
     }
 
     #[test]
