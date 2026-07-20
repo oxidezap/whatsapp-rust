@@ -311,6 +311,8 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.crypto-bigint]
 opt-level = "z"
+[profile.release.package.crypto-primes]
+opt-level = "z"
 [profile.release.package.p256]
 opt-level = "z"
 [profile.release.package.p384]
