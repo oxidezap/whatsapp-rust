@@ -239,12 +239,13 @@ pub struct MemoryReport {
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
-    /// Queued/running history-sync tasks and their retained compressed-payload
-    /// allocation estimate.
+    /// Queued/running history-sync tasks and their logical compressed-payload
+    /// byte sum. A shared `Bytes` slice may retain a larger backing allocation,
+    /// whose capacity is not exposed by the type.
     pub history_sync_tasks: CollectionStats,
     /// Lifetime high-water mark of queued/running history-sync tasks.
     pub history_sync_tasks_peak: u64,
-    /// Lifetime high-water mark of retained compressed-payload storage.
+    /// Lifetime high-water mark of logical compressed-payload bytes.
     pub history_sync_payload_bytes_peak: u64,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,

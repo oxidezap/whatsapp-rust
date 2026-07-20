@@ -237,14 +237,14 @@ impl Client {
         }
 
         // Enqueue a MajorSyncTask for the dedicated sync worker to consume.
-        let retained_payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
-        self.begin_history_sync_task(retained_payload_bytes);
+        let payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
+        self.begin_history_sync_task(payload_bytes);
         let task = crate::sync_task::MajorSyncTask::HistorySync {
             message_id,
             notification: Box::new(notification),
         };
         if let Err(e) = self.major_sync_task_sender.send(task).await {
-            self.finish_history_sync_task(retained_payload_bytes);
+            self.finish_history_sync_task(payload_bytes);
             if self.is_shutting_down() {
                 log::debug!("Dropping history sync task during shutdown: {e}");
             } else {
@@ -262,9 +262,9 @@ impl Client {
         message_id: String,
         notification: DetachedHistorySyncNotification,
     ) {
-        let retained_payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
-        self.begin_history_sync_task(retained_payload_bytes);
-        let mut tracker = self.track_history_sync_task(retained_payload_bytes);
+        let payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
+        self.begin_history_sync_task(payload_bytes);
+        let mut tracker = self.track_history_sync_task(payload_bytes);
         self.process_history_sync_task_tracked(message_id, notification, &mut tracker)
             .await;
     }
@@ -308,14 +308,13 @@ impl Client {
         }
 
         // Use take() to avoid cloning large payloads - moves ownership instead
-        let (compressed_data, retained_payload_bytes) = if let Some(inline_payload) = inline_payload
-        {
+        let (compressed_data, payload_bytes) = if let Some(inline_payload) = inline_payload {
             log::info!(
                 "Found inline history sync payload ({} bytes). Using directly.",
                 inline_payload.len()
             );
-            let retained_payload_bytes = inline_payload.len();
-            (inline_payload, retained_payload_bytes)
+            let payload_bytes = inline_payload.len();
+            (inline_payload, payload_bytes)
         } else {
             log::info!("Downloading external history sync blob...");
             if self.is_shutting_down() || !self.is_connected() {
@@ -332,8 +331,11 @@ impl Client {
             match self.download(&notification).await {
                 Ok(bytes) => {
                     log::info!("Successfully downloaded history sync blob.");
-                    let retained_payload_bytes = bytes.capacity();
-                    (Bytes::from(bytes), retained_payload_bytes)
+                    // Payload accounting uses logical compressed bytes for
+                    // both owned Vecs and shared Bytes slices. Bytes does not
+                    // expose the capacity of its backing allocation.
+                    let payload_bytes = bytes.len();
+                    (Bytes::from(bytes), payload_bytes)
                 }
                 Err(e) => {
                     if self.is_shutting_down() {
@@ -348,7 +350,7 @@ impl Client {
                 }
             }
         };
-        tracker.set_retained_payload_bytes(retained_payload_bytes);
+        tracker.set_payload_bytes(payload_bytes);
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
@@ -524,6 +526,10 @@ impl Client {
             return 0;
         }
 
+        // This is already the final owned batch. Routing it through the live
+        // write-behind would retain the Vec alongside its keyed Arc map and
+        // flush snapshot; the backend consumes it directly and applies its
+        // own bounded statement batching.
         match self
             .persistence_manager
             .backend()
