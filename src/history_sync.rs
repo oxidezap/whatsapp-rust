@@ -74,7 +74,7 @@ struct HistorySecretSeedCollector {
     config: HistorySecretSeedConfig,
     own_pn: Option<Jid>,
     own_lid: Option<Jid>,
-    last_conversation_index: Option<usize>,
+    last_chat_id: String,
     last_chat_is_bot: Option<bool>,
     last_chat: Option<Jid>,
     last_chat_non_ad_id: Option<Arc<str>>,
@@ -87,7 +87,7 @@ impl HistorySecretSeedCollector {
             config,
             own_pn,
             own_lid,
-            last_conversation_index: None,
+            last_chat_id: String::new(),
             last_chat_is_bot: None,
             last_chat: None,
             last_chat_non_ad_id: None,
@@ -100,8 +100,9 @@ impl HistorySecretSeedCollector {
             return;
         }
 
-        if self.last_conversation_index != Some(record.conversation_index) {
-            self.last_conversation_index = Some(record.conversation_index);
+        if self.last_chat_id != record.chat_id {
+            self.last_chat_id.clear();
+            self.last_chat_id.push_str(record.chat_id);
             self.last_chat = None;
             self.last_chat_non_ad_id = None;
             self.last_chat_is_bot =
@@ -714,6 +715,44 @@ mod tests {
             vec![bot.to_non_ad(), lid.to_non_ad()],
             "incoming bot messages retain the chat and account-LID aliases"
         );
+    }
+
+    #[test]
+    fn collector_refreshes_chat_cache_when_id_changes_within_conversation() {
+        const CONVERSATION_INDEX: usize = 0;
+        const FIRST_CHAT: &str = "15550000001@s.whatsapp.net";
+        const FIRST_MSG_ID: &str = "FIRST";
+        const SECOND_CHAT: &str = "15550000002@s.whatsapp.net";
+        const SECOND_MSG_ID: &str = "SECOND";
+        const SECRET: [u8; HISTORY_MSG_SECRET_SIZE] = [0x5a; HISTORY_MSG_SECRET_SIZE];
+        let config = HistorySecretSeedConfig {
+            enabled: true,
+            policy: MsgSecretPolicy::Full,
+            retention: MsgSecretRetention::default(),
+            now: 0,
+        };
+        let mut collector = HistorySecretSeedCollector::new(config, None, None);
+
+        for (chat_id, msg_id) in [(FIRST_CHAT, FIRST_MSG_ID), (SECOND_CHAT, SECOND_MSG_ID)] {
+            collector.collect(HistoryMsgSecretRecordRef {
+                conversation_index: CONVERSATION_INDEX,
+                chat_id,
+                from_me: false,
+                key_participant: None,
+                web_msg_participant: None,
+                msg_id,
+                secret: &SECRET,
+                timestamp: None,
+                is_poll_or_event: false,
+                is_bot_invocation: false,
+            });
+        }
+
+        let entries = collector.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].chat.as_ref(), FIRST_CHAT);
+        assert_eq!(entries[1].chat.as_ref(), SECOND_CHAT);
+        assert_eq!(entries[1].sender, entries[1].chat);
     }
 
     #[tokio::test]

@@ -159,70 +159,31 @@ impl From<CiphertextMessage> for OwnedCiphertextMessage {
     }
 }
 
-trait SignalDecryptSource {
-    fn signal_message(&self) -> &SignalMessage;
-
-    fn is_available(&self) -> bool;
-
-    fn decrypt(
-        &mut self,
-        key: &[u8],
-        iv: &[u8],
-    ) -> std::result::Result<Vec<u8>, DecryptionErrorCrypto>;
+// Keeping both ownership modes in one concrete type avoids duplicating the
+// decrypt state machine while deferring owned-envelope consumption until MAC
+// authentication succeeds.
+enum SignalDecryptInput<'a> {
+    Borrowed(&'a SignalMessage),
+    Owned(&'a mut OwnedCiphertextMessage),
 }
 
-impl SignalDecryptSource for &SignalMessage {
+impl SignalDecryptInput<'_> {
     #[inline(always)]
     fn signal_message(&self) -> &SignalMessage {
-        self
+        match self {
+            Self::Borrowed(message) => message,
+            Self::Owned(message) => message
+                .signal_message()
+                .expect("owned Signal decrypt input has a Signal envelope"),
+        }
     }
 
     #[inline(always)]
     fn is_available(&self) -> bool {
-        true
-    }
-
-    #[inline(always)]
-    fn decrypt(
-        &mut self,
-        key: &[u8],
-        iv: &[u8],
-    ) -> std::result::Result<Vec<u8>, DecryptionErrorCrypto> {
-        decrypt_borrowed_signal(self, key, iv)
-    }
-}
-
-impl SignalDecryptSource for &PreKeySignalMessage {
-    #[inline(always)]
-    fn signal_message(&self) -> &SignalMessage {
-        self.message()
-    }
-
-    #[inline(always)]
-    fn is_available(&self) -> bool {
-        true
-    }
-
-    #[inline(always)]
-    fn decrypt(
-        &mut self,
-        key: &[u8],
-        iv: &[u8],
-    ) -> std::result::Result<Vec<u8>, DecryptionErrorCrypto> {
-        decrypt_borrowed_signal(self.message(), key, iv)
-    }
-}
-
-impl SignalDecryptSource for &mut OwnedCiphertextMessage {
-    #[inline(always)]
-    fn signal_message(&self) -> &SignalMessage {
-        OwnedCiphertextMessage::signal_message(self)
-            .expect("owned Signal decrypt input has a Signal envelope")
-    }
-
-    #[inline(always)]
-    fn is_available(&self) -> bool {
-        OwnedCiphertextMessage::is_available(self)
+        match self {
+            Self::Borrowed(_) => true,
+            Self::Owned(message) => message.is_available(),
+        }
     }
 
     fn decrypt(
@@ -230,15 +191,20 @@ impl SignalDecryptSource for &mut OwnedCiphertextMessage {
         key: &[u8],
         iv: &[u8],
     ) -> std::result::Result<Vec<u8>, DecryptionErrorCrypto> {
-        let message = self
-            .take_signal_message()
-            .expect("authenticated owned input remains available");
-        match message.try_into_ciphertext_vec() {
-            Ok(mut ciphertext) => {
-                aes_256_cbc_decrypt_in_place(&mut ciphertext, key, iv)?;
-                Ok(ciphertext)
+        match self {
+            Self::Borrowed(message) => decrypt_borrowed_signal(message, key, iv),
+            Self::Owned(message) => {
+                let message = message
+                    .take_signal_message()
+                    .expect("authenticated owned input remains available");
+                match message.try_into_ciphertext_vec() {
+                    Ok(mut ciphertext) => {
+                        aes_256_cbc_decrypt_in_place(&mut ciphertext, key, iv)?;
+                        Ok(ciphertext)
+                    }
+                    Err(shared) => decrypt_borrowed_signal(&shared, key, iv),
+                }
             }
-            Err(shared) => decrypt_borrowed_signal(&shared, key, iv),
         }
     }
 }
@@ -264,22 +230,28 @@ fn decrypt_borrowed_signal(
     })
 }
 
-trait PreKeyDecryptSource: SignalDecryptSource {
-    fn pre_key_message(&self) -> &PreKeySignalMessage;
+enum PreKeyDecryptInput<'a> {
+    Borrowed(&'a PreKeySignalMessage),
+    Owned(&'a mut OwnedCiphertextMessage),
 }
 
-impl PreKeyDecryptSource for &PreKeySignalMessage {
+impl<'a> PreKeyDecryptInput<'a> {
     #[inline]
     fn pre_key_message(&self) -> &PreKeySignalMessage {
-        self
+        match self {
+            Self::Borrowed(message) => message,
+            Self::Owned(message) => message
+                .pre_key_message()
+                .expect("owned PreKey decrypt input has a PreKey envelope"),
+        }
     }
-}
 
-impl PreKeyDecryptSource for &mut OwnedCiphertextMessage {
     #[inline]
-    fn pre_key_message(&self) -> &PreKeySignalMessage {
-        OwnedCiphertextMessage::pre_key_message(self)
-            .expect("owned PreKey decrypt input has a PreKey envelope")
+    fn into_signal_input(self) -> SignalDecryptInput<'a> {
+        match self {
+            Self::Borrowed(message) => SignalDecryptInput::Borrowed(message.message()),
+            Self::Owned(message) => SignalDecryptInput::Owned(message),
+        }
     }
 }
 
@@ -485,7 +457,7 @@ pub async fn message_decrypt_owned<R: Rng + CryptoRng>(
     match ciphertext.message_type() {
         Some(CiphertextMessageType::Whisper) => {
             message_decrypt_signal_input(
-                ciphertext,
+                SignalDecryptInput::Owned(ciphertext),
                 remote_address,
                 session_store,
                 identity_store,
@@ -495,7 +467,7 @@ pub async fn message_decrypt_owned<R: Rng + CryptoRng>(
         }
         Some(CiphertextMessageType::PreKey) => {
             message_decrypt_prekey_input(
-                ciphertext,
+                PreKeyDecryptInput::Owned(ciphertext),
                 remote_address,
                 session_store,
                 identity_store,
@@ -527,7 +499,7 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     use_pq_ratchet: UsePQRatchet,
 ) -> Result<DecryptionResult> {
     message_decrypt_prekey_input(
-        ciphertext,
+        PreKeyDecryptInput::Borrowed(ciphertext),
         remote_address,
         session_store,
         identity_store,
@@ -540,8 +512,8 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn message_decrypt_prekey_input<R, S>(
-    mut ciphertext: S,
+async fn message_decrypt_prekey_input<R: Rng + CryptoRng>(
+    ciphertext: PreKeyDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
@@ -549,16 +521,12 @@ async fn message_decrypt_prekey_input<R, S>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<DecryptionResult>
-where
-    R: Rng + CryptoRng,
-    S: PreKeyDecryptSource,
-{
+) -> Result<DecryptionResult> {
     let mut session = SessionCheckout::load_or_create(session_store, remote_address).await?;
     session.snapshot_for_rollback();
 
     let result = message_decrypt_prekey_inner(
-        &mut ciphertext,
+        ciphertext,
         remote_address,
         session.record_mut(),
         identity_store,
@@ -588,8 +556,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn message_decrypt_prekey_inner<R, S>(
-    ciphertext: &mut S,
+async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
+    ciphertext: PreKeyDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_record: &mut SessionRecord,
     identity_store: &mut dyn IdentityKeyStore,
@@ -597,11 +565,7 @@ async fn message_decrypt_prekey_inner<R, S>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<(Vec<u8>, Option<PreKeyId>, IdentityChange)>
-where
-    R: Rng + CryptoRng,
-    S: PreKeyDecryptSource,
-{
+) -> Result<(Vec<u8>, Option<PreKeyId>, IdentityChange)> {
     let process_prekey_result = session::process_prekey(
         ciphertext.pre_key_message(),
         remote_address,
@@ -631,11 +595,12 @@ where
         }
     };
     let their_identity_key = *identity_to_save.their_identity_key;
+    let mut ciphertext = ciphertext.into_signal_input();
 
     let decrypt = decrypt_message_with_record(
         remote_address,
         session_record,
-        ciphertext,
+        &mut ciphertext,
         CiphertextMessageType::PreKey,
         csprng,
     )?;
@@ -666,7 +631,7 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     csprng: &mut R,
 ) -> Result<DecryptionResult> {
     message_decrypt_signal_input(
-        ciphertext,
+        SignalDecryptInput::Borrowed(ciphertext),
         remote_address,
         session_store,
         identity_store,
@@ -675,17 +640,13 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     .await
 }
 
-async fn message_decrypt_signal_input<R, S>(
-    mut ciphertext: S,
+async fn message_decrypt_signal_input<R: Rng + CryptoRng>(
+    mut ciphertext: SignalDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
-) -> Result<DecryptionResult>
-where
-    R: Rng + CryptoRng,
-    S: SignalDecryptSource,
-{
+) -> Result<DecryptionResult> {
     let mut session = SessionCheckout::load(session_store, remote_address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
@@ -709,17 +670,13 @@ where
     })
 }
 
-async fn message_decrypt_signal_inner<R, S>(
-    ciphertext: &mut S,
+async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
+    ciphertext: &mut SignalDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_record: &mut SessionRecord,
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
-) -> Result<(Vec<u8>, IdentityChange)>
-where
-    R: Rng + CryptoRng,
-    S: SignalDecryptSource,
-{
+) -> Result<(Vec<u8>, IdentityChange)> {
     // A record with no current state and no previous states is degenerate — treat
     // it as missing so the caller gets SessionNotFound and sends a proper retry
     // receipt (with error code 1) instead of attempting decryption that will always
@@ -1014,17 +971,13 @@ impl Drop for RecordDecryptTransaction<'_> {
     }
 }
 
-fn decrypt_message_with_record<'a, R, S>(
+fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
     record: &'a mut SessionRecord,
-    ciphertext: &mut S,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     csprng: &mut R,
-) -> Result<RecordDecrypt<'a>>
-where
-    R: Rng + CryptoRng,
-    S: SignalDecryptSource,
-{
+) -> Result<RecordDecrypt<'a>> {
     debug_assert!(matches!(
         original_message_type,
         CiphertextMessageType::Whisper | CiphertextMessageType::PreKey
@@ -1300,18 +1253,14 @@ impl StateDecryptEffect {
     }
 }
 
-fn decrypt_message_with_state<R, S>(
+fn decrypt_message_with_state<R: Rng + CryptoRng>(
     current_or_previous: CurrentOrPrevious,
     state: &mut SessionState,
-    ciphertext: &mut S,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     csprng: &mut R,
-) -> Result<StateDecryptResult>
-where
-    R: Rng + CryptoRng,
-    S: SignalDecryptSource,
-{
+) -> Result<StateDecryptResult> {
     // Check for a completely empty or invalid session state before we do anything else.
     let _ = state.root_key().map_err(|_| {
         SignalProtocolError::InvalidMessage(
@@ -1320,15 +1269,16 @@ where
         )
     })?;
 
-    let ciphertext_version = ciphertext.signal_message().message_version() as u32;
+    let message = ciphertext.signal_message();
+    let ciphertext_version = message.message_version() as u32;
     if ciphertext_version != state.session_version()? {
         return Err(SignalProtocolError::UnrecognizedMessageVersion(
             ciphertext_version,
         ));
     }
 
-    let their_ephemeral = *ciphertext.signal_message().sender_ratchet_key();
-    let counter = ciphertext.signal_message().counter();
+    let their_ephemeral = *message.sender_ratchet_key();
+    let counter = message.counter();
 
     // Deferring the common in-order advance keeps cancellation rollback free.
     if let Some(chain_key) = state.get_receiver_chain_key(&their_ephemeral)?
@@ -1377,20 +1327,16 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decrypt_with_pending_state<R, S>(
+fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     current_or_previous: CurrentOrPrevious,
     state: &mut SessionState,
-    ciphertext: &mut S,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     csprng: &mut R,
     their_ephemeral: &PublicKey,
     counter: u32,
-) -> Result<Vec<u8>>
-where
-    R: Rng + CryptoRng,
-    S: SignalDecryptSource,
-{
+) -> Result<Vec<u8>> {
     let (chain_key, deferred_ratchet) =
         get_or_create_chain_key(state, their_ephemeral, remote_address)?;
 
@@ -1422,17 +1368,14 @@ where
     Ok(plaintext)
 }
 
-fn decrypt_with_message_keys<S>(
+fn decrypt_with_message_keys(
     current_or_previous: CurrentOrPrevious,
     state: &SessionState,
-    ciphertext: &mut S,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     message_key_gen: MessageKeyGenerator,
-) -> Result<Vec<u8>>
-where
-    S: SignalDecryptSource,
-{
+) -> Result<Vec<u8>> {
     let message_keys = message_key_gen.generate_keys();
 
     let their_identity_key =
