@@ -316,6 +316,7 @@ pub struct MessageInfo {
     pub server_id: MessageServerId,
     pub r#type: String,
     pub push_name: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
     pub timestamp: DateTime<Utc>,
     pub category: MessageCategory,
     pub multicast: bool,
@@ -412,6 +413,10 @@ mod tests {
         assert!(!root.contains_key("verified_name"));
         assert!(!root.contains_key("device_sent_meta"));
         assert!(!root.contains_key("ephemeral_expiration"));
+        assert_eq!(
+            root.get("timestamp").and_then(|value| value.as_i64()),
+            Some(0)
+        );
     }
 
     #[test]
