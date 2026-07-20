@@ -43,11 +43,12 @@ pub use contacts::{
 pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
-    BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription, GroupError,
-    GroupJoinError, GroupMetadata, GroupParticipant, GroupParticipantOptions, GroupProfilePicture,
-    GroupSubject, Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    ParticipantChangeResponse, ParticipantType, PictureType,
+    BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription,
+    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMetadata, GroupParticipant,
+    GroupParticipantOptions, GroupProfilePicture, GroupSubject, Groups, GrowthLockInfo,
+    InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
+    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse, ParticipantType,
+    PictureType,
 };
 
 pub use labels::Labels;

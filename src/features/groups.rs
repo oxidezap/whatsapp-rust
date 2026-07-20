@@ -26,9 +26,9 @@ use wacore_binary::{Jid, JidExt as _};
 
 use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
 pub use wacore::iq::groups::{
-    GroupCreateOptions, GroupDescription, GroupJoinError, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult,
-    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupJoinError,
+    GroupParticipantOptions, GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError,
+    JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
     MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
 };
 
@@ -95,32 +95,38 @@ pub enum BatchGroupResult {
 pub struct GroupMetadata {
     pub id: Jid,
     pub subject: String,
+    pub notify: Option<String>,
     pub participants: Vec<GroupParticipant>,
     pub addressing_mode: AddressingMode,
     /// Group creator JID.
     pub creator: Option<Jid>,
+    pub creator_pn: Option<Jid>,
+    pub creator_username: Option<String>,
+    pub creator_country_code: Option<String>,
     /// Group creation timestamp (Unix seconds).
     pub creation_time: Option<u64>,
     /// Subject modification timestamp (Unix seconds).
     pub subject_time: Option<u64>,
     /// Subject owner JID.
     pub subject_owner: Option<Jid>,
+    pub subject_owner_pn: Option<Jid>,
+    pub subject_owner_username: Option<String>,
     /// Group description body text.
     pub description: Option<String>,
     /// Description ID (for conflict detection when updating).
     pub description_id: Option<String>,
     /// JID of the participant who set the description.
     pub description_owner: Option<Jid>,
+    pub description_owner_pn: Option<Jid>,
+    pub description_owner_username: Option<String>,
     /// Timestamp when the description was set.
     pub description_time: Option<u64>,
     /// Whether the group is locked (only admins can edit group info).
     pub is_locked: bool,
     /// Whether announcement mode is enabled (only admins can send messages).
     pub is_announcement: bool,
-    /// Ephemeral message expiration in seconds (0 = disabled).
-    pub ephemeral_expiration: u32,
-    /// Disappearing mode trigger (from `trigger` attribute on `<ephemeral>`).
-    pub ephemeral_trigger: Option<u32>,
+    /// Disappearing-message settings when the server includes an `<ephemeral>` node.
+    pub ephemeral: Option<GroupEphemeralSettings>,
     /// Whether membership approval is required to join.
     pub membership_approval: bool,
     /// Who can add members to the group.
@@ -163,6 +169,8 @@ pub struct GroupMetadata {
 pub struct GroupParticipant {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
+    pub lid: Option<Jid>,
+    pub username: Option<String>,
     pub participant_type: ParticipantType,
 }
 
@@ -181,6 +189,8 @@ impl From<GroupParticipantResponse> for GroupParticipant {
         Self {
             jid: p.jid,
             phone_number: p.phone_number,
+            lid: p.lid,
+            username: p.username,
             participant_type: p.participant_type,
         }
     }
@@ -191,20 +201,27 @@ impl From<GroupInfoResponse> for GroupMetadata {
         Self {
             id: group.id,
             subject: group.subject.into_string(),
+            notify: group.notify,
             participants: group.participants.into_iter().map(Into::into).collect(),
             addressing_mode: group.addressing_mode,
             creator: group.creator,
+            creator_pn: group.creator_pn,
+            creator_username: group.creator_username,
+            creator_country_code: group.creator_country_code,
             creation_time: group.creation_time,
             subject_time: group.subject_time,
             subject_owner: group.subject_owner,
+            subject_owner_pn: group.subject_owner_pn,
+            subject_owner_username: group.subject_owner_username,
             description: group.description,
             description_id: group.description_id,
             description_owner: group.description_owner,
+            description_owner_pn: group.description_owner_pn,
+            description_owner_username: group.description_owner_username,
             description_time: group.description_time,
             is_locked: group.is_locked,
             is_announcement: group.is_announcement,
-            ephemeral_expiration: group.ephemeral_expiration,
-            ephemeral_trigger: group.ephemeral_trigger,
+            ephemeral: group.ephemeral,
             membership_approval: group.membership_approval,
             member_add_mode: group.member_add_mode,
             member_link_mode: group.member_link_mode,
@@ -1254,6 +1271,8 @@ mod tests {
             participants: vec![GroupParticipant {
                 jid: participant_jid,
                 phone_number: None,
+                lid: None,
+                username: None,
                 participant_type: ParticipantType::Admin,
             }],
             ..Default::default()
@@ -1285,6 +1304,8 @@ mod tests {
             participants: vec![GroupParticipant {
                 jid: Jid::new("26263000000099", Server::Lid),
                 phone_number: None,
+                lid: None,
+                username: None,
                 participant_type: ParticipantType::Member,
             }],
             addressing_mode: AddressingMode::Lid,
@@ -1309,6 +1330,8 @@ mod tests {
             participants: vec![GroupParticipant {
                 jid: Jid::new("5521900000098", Server::Pn),
                 phone_number: None,
+                lid: None,
+                username: None,
                 participant_type: ParticipantType::Member,
             }],
             addressing_mode: AddressingMode::Pn,

@@ -34,10 +34,17 @@ pub enum MembershipRequestMethod {
 pub struct GroupNotification {
     /// Group JID (from `from` attribute)
     pub group_jid: Jid,
+    /// Notification stanza identifier (from `id`).
+    pub notification_id: Option<String>,
     /// Admin/user who triggered the notification (from `participant` attribute)
     pub participant: Option<Jid>,
     /// Phone number JID of the participant (from `participant_pn` attribute, for LID groups)
     pub participant_pn: Option<Jid>,
+    /// Username of the participant (from `participant_username`, when username
+    /// addressing is enabled for the account).
+    pub participant_username: Option<String>,
+    /// ISO country code supplied for the participant on newer group notifications.
+    pub participant_country_code: Option<String>,
     /// Timestamp (from `t` attribute, unix seconds)
     pub timestamp: u64,
     /// Whether the group uses LID addressing mode (from `addressing_mode="lid"`)
@@ -340,8 +347,15 @@ impl GroupNotification {
     pub fn try_from_node_ref(node: &NodeRef<'_>) -> Option<Self> {
         let mut attrs = node.attrs();
         let group_jid = attrs.optional_jid("from")?;
+        let notification_id = attrs.optional_string("id").map(|value| value.into_owned());
         let participant = attrs.optional_jid("participant");
         let participant_pn = attrs.optional_jid("participant_pn");
+        let participant_username = attrs
+            .optional_string("participant_username")
+            .map(|value| value.into_owned());
+        let participant_country_code = attrs
+            .optional_string("participant_country_code")
+            .map(|value| value.into_owned());
         let timestamp = attrs.optional_u64("t").unwrap_or(0);
         let is_lid_addressing_mode = node
             .get_attr("addressing_mode")
@@ -355,8 +369,11 @@ impl GroupNotification {
 
         Some(Self {
             group_jid,
+            notification_id,
             participant,
             participant_pn,
+            participant_username,
+            participant_country_code,
             timestamp,
             is_lid_addressing_mode,
             actions,
@@ -617,7 +634,10 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                             .unwrap_or(GroupParticipantType::Participant),
                     );
                     let lid = attrs.optional_jid("lid");
-                    let username = attrs.optional_string("username").map(|s| s.into_owned());
+                    let username = attrs
+                        .optional_string("participant_username")
+                        .or_else(|| attrs.optional_string("username"))
+                        .map(|s| s.into_owned());
                     let join_time = attrs.optional_u64("join_time");
                     Some(GroupParticipantInfo {
                         jid,
@@ -730,6 +750,31 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_root_participant_identity_attributes() {
+        let participant_pn: Jid = "5511888888888@s.whatsapp.net".parse().unwrap();
+        let node = NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", group_jid())
+            .attr("id", "GP-ROOT-1")
+            .attr("participant", "271060335329480@lid")
+            .attr("participant_pn", participant_pn.clone())
+            .attr("participant_username", "group-admin")
+            .attr("participant_country_code", "BR")
+            .attr("t", "1704067200")
+            .children(vec![NodeBuilder::new("announcement").build()])
+            .build();
+
+        let notification = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        assert_eq!(notification.notification_id.as_deref(), Some("GP-ROOT-1"));
+        assert_eq!(notification.participant_pn, Some(participant_pn));
+        assert_eq!(
+            notification.participant_username.as_deref(),
+            Some("group-admin")
+        );
+        assert_eq!(notification.participant_country_code.as_deref(), Some("BR"));
+    }
+
+    #[test]
     fn test_parse_add_notification() {
         let node = make_notification(vec![
             NodeBuilder::new("add")
@@ -826,7 +871,8 @@ mod tests {
                         .attr("jid", "55510000001@s.whatsapp.net")
                         .attr("type", "admin")
                         .attr("lid", "99900000000001@lid")
-                        .attr("username", "alice")
+                        .attr("participant_username", "alice")
+                        .attr("username", "fallback-alice")
                         .attr("join_time", "1700000000")
                         .build(),
                 ])

@@ -641,8 +641,7 @@ pub enum Event {
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
-    /// One or more decrypted inbound messages, in arrival order (Baileys'
-    /// `messages.upsert` shape). Live traffic arrives as single-message
+    /// One or more decrypted inbound messages, in arrival order. Live traffic arrives as single-message
     /// batches; an offline drain delivers one batch per durable commit, so a
     /// consumer never sees a message that a registered durability hook has
     /// not committed. The `Arc` slice is shared with the hook call — same
@@ -902,8 +901,7 @@ pub struct InboundMessage {
     pub info: Arc<MessageInfo>,
 }
 
-/// How a [`MessageBatch`] was delivered. Mirrors Baileys' `messages.upsert`
-/// `type` field (`notify` / `append`). This describes the delivery shape,
+/// How a [`MessageBatch`] was delivered. This describes the delivery shape,
 /// not a message's provenance: whether a stanza came from the offline queue
 /// is `info.is_offline` on each [`InboundMessage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1388,12 +1386,23 @@ pub struct ContactSyncRequested {
 pub struct GroupUpdate {
     /// The group this update applies to
     pub group_jid: Jid,
+    /// Identifier of the source notification stanza.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
+    /// Zero-based emitted-action index within the source notification.
+    pub action_index: u32,
     /// The admin/user who triggered the change (`participant` attribute)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant: Option<Jid>,
     /// Phone number JID of the participant (for LID-addressed groups)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_pn: Option<Jid>,
+    /// Username of the participant, when supplied by the group notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_username: Option<String>,
+    /// Country code supplied for the participant by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_country_code: Option<String>,
     /// When the change occurred
     pub timestamp: DateTime<Utc>,
     /// Whether the group uses LID addressing mode

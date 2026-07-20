@@ -129,7 +129,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         .and_then(wacore::time::from_secs)
         .unwrap_or_else(wacore::time::now_utc);
 
-    for action in notification.actions {
+    for (action_index, action) in notification.actions.into_iter().enumerate() {
         // Granularly patch group cache instead of invalidating — matches WA Web's
         // addParticipantInfo / removeParticipantInfo pattern and avoids a
         // group metadata IQ round-trip.
@@ -241,8 +241,12 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         client.core.event_bus.dispatch(Event::GroupUpdate(
             GroupUpdate::builder()
                 .group_jid(notification.group_jid.clone())
+                .maybe_notification_id(notification.notification_id.clone())
+                .action_index(u32::try_from(action_index).unwrap_or(u32::MAX))
                 .maybe_participant(notification.participant.clone())
                 .maybe_participant_pn(notification.participant_pn.clone())
+                .maybe_participant_username(notification.participant_username.clone())
+                .maybe_participant_country_code(notification.participant_country_code.clone())
                 .timestamp(timestamp)
                 .is_lid_addressing_mode(notification.is_lid_addressing_mode)
                 .action(action)
