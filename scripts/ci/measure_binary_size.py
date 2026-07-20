@@ -111,6 +111,12 @@ def run_cargo_bloat(env) -> dict:
 
 
 def run_llvm_lines(package: str, env) -> tuple[int, int]:
+    # Measured on identical trees (nightly-2026-06-16): link-arg RUSTFLAGS
+    # inflate the emitted-IR line count ~17% even though linker flags cannot
+    # reach codegen, so a run with SIZE_RUSTFLAGS set is not comparable to a
+    # baseline without it. IR is a pre-link metric — always measure it
+    # flag-free.
+    env = {k: v for k, v in env.items() if k != "RUSTFLAGS"}
     proc = run(
         ["cargo", "llvm-lines", "-p", package, "--lib", "--release"],
         capture_output=True, text=True, env=env,
