@@ -57,6 +57,22 @@ enum PendingInsert {
     Full(MsgSecretEntry),
 }
 
+enum PendingEntries {
+    Batch(std::vec::IntoIter<MsgSecretEntry>),
+    One(Option<MsgSecretEntry>),
+}
+
+impl Iterator for PendingEntries {
+    type Item = MsgSecretEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Batch(entries) => entries.next(),
+            Self::One(entry) => entry.take(),
+        }
+    }
+}
+
 /// Live captures are normally drained long before reaching this point. The
 /// bound keeps a stalled backend from turning the write-behind optimization
 /// into an unbounded allocation source while retaining ample batching room.
@@ -129,16 +145,16 @@ impl MsgSecretWriteBuffer {
         if entries.is_empty() {
             return;
         }
-        self.queue_iter(entries).await;
+        self.queue_iter(PendingEntries::Batch(entries.into_iter()))
+            .await;
     }
 
     /// Single-entry fast path for live sends, avoiding a temporary one-element Vec.
     pub(crate) async fn queue_one(self: &Arc<Self>, entry: MsgSecretEntry) {
-        self.queue_iter(std::iter::once(entry)).await;
+        self.queue_iter(PendingEntries::One(Some(entry))).await;
     }
 
-    async fn queue_iter(self: &Arc<Self>, entries: impl IntoIterator<Item = MsgSecretEntry>) {
-        let mut entries = entries.into_iter();
+    async fn queue_iter(self: &Arc<Self>, mut entries: PendingEntries) {
         let mut blocked_entry = None;
 
         loop {
