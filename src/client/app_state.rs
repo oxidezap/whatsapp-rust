@@ -287,11 +287,11 @@ impl Client {
                 message_id,
                 notification,
             } => {
-                let retained_payload_bytes = notification
+                let payload_bytes = notification
                     .inline_payload
                     .as_ref()
                     .map_or(0, bytes::Bytes::len);
-                let mut tracker = self.track_history_sync_task(retained_payload_bytes);
+                let mut tracker = self.track_history_sync_task(payload_bytes);
                 self.process_history_sync_task_tracked(message_id, *notification, &mut tracker)
                     .await;
             }
