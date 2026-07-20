@@ -93,6 +93,9 @@ struct DeviceRow {
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
 const ID_PARAM_CHUNK: usize = 900;
+/// Eight bound columns per row keep this below SQLite's default 999-parameter
+/// limit while bounding Diesel's temporary insert-expression allocation.
+const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -3366,34 +3369,37 @@ impl MsgSecretStore for SqliteStore {
         }
 
         let device_id = self.device_id;
-        let entries: Arc<[MsgSecretEntry]> = Arc::from(entries);
+        // Keep the caller's Vec allocation intact across retries. Converting a
+        // Vec to Arc<[T]> allocates a second full-size slice and moves every
+        // item, which is especially costly for large seed batches.
+        let entries = Arc::new(entries);
         let now = wacore::time::now_secs();
         self.with_retry("put_msg_secrets", || {
             let entries = Arc::clone(&entries);
             Box::new(move |conn: &mut SqliteConnection| {
-                let records: Vec<_> = entries
-                    .iter()
-                    .map(|entry| {
-                        (
-                            msg_secrets::chat.eq(entry.chat.as_ref()),
-                            msg_secrets::sender.eq(entry.sender.as_ref()),
-                            msg_secrets::msg_id.eq(entry.msg_id.as_ref()),
-                            msg_secrets::secret.eq(entry.secret.as_ref()),
-                            msg_secrets::device_id.eq(device_id),
-                            msg_secrets::created_at.eq(now),
-                            msg_secrets::expires_at.eq(entry.expires_at),
-                            msg_secrets::message_ts.eq(entry.message_ts),
-                        )
-                    })
-                    .collect();
-
-                const CHUNK_SIZE: usize = 100;
-
                 conn.immediate_transaction(|conn| {
                     let mut stored = 0usize;
-                    for chunk in records.chunks(CHUNK_SIZE) {
+                    for entries in entries.chunks(MSG_SECRET_INSERT_CHUNK_SIZE) {
+                        // Materialize only the expressions used by this SQL
+                        // statement. The previous full-batch Vec doubled the
+                        // transient cost before processing these same chunks.
+                        let records: Vec<_> = entries
+                            .iter()
+                            .map(|entry| {
+                                (
+                                    msg_secrets::chat.eq(entry.chat.as_ref()),
+                                    msg_secrets::sender.eq(entry.sender.as_ref()),
+                                    msg_secrets::msg_id.eq(entry.msg_id.as_ref()),
+                                    msg_secrets::secret.eq(entry.secret.as_ref()),
+                                    msg_secrets::device_id.eq(device_id),
+                                    msg_secrets::created_at.eq(now),
+                                    msg_secrets::expires_at.eq(entry.expires_at),
+                                    msg_secrets::message_ts.eq(entry.message_ts),
+                                )
+                            })
+                            .collect();
                         stored += diesel::insert_into(msg_secrets::table)
-                            .values(chunk)
+                            .values(&records)
                             .on_conflict((
                                 msg_secrets::chat,
                                 msg_secrets::sender,
@@ -5009,45 +5015,45 @@ mod tests {
 
     #[tokio::test]
     async fn msg_secret_batch_upserts_in_one_call() {
-        let store = create_test_store().await;
-        let stored = store
-            .put_msg_secrets(vec![
-                MsgSecretEntry {
-                    chat: "c".into(),
-                    sender: "s".into(),
-                    msg_id: "M1".into(),
-                    secret: [1u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
-                    expires_at: 0,
-                    message_ts: 0,
-                },
-                MsgSecretEntry {
-                    chat: "c".into(),
-                    sender: "s".into(),
-                    msg_id: "M2".into(),
-                    secret: [2u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
-                    expires_at: 0,
-                    message_ts: 0,
-                },
-                MsgSecretEntry {
-                    chat: "c".into(),
-                    sender: "s".into(),
-                    msg_id: "M1".into(),
-                    secret: [9u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
-                    expires_at: 0,
-                    message_ts: 0,
-                },
-            ])
-            .await
-            .unwrap();
+        const ORIGINAL_SECRET_BYTE: u8 = 0x5a;
+        const UPDATED_SECRET_BYTE: u8 = 0xa5;
 
-        assert_eq!(stored, 3);
+        let store = create_test_store().await;
+        let mut entries: Vec<_> = (0..=MSG_SECRET_INSERT_CHUNK_SIZE)
+            .map(|index| MsgSecretEntry {
+                chat: "c".into(),
+                sender: "s".into(),
+                msg_id: format!("M{index}").into(),
+                secret: [ORIGINAL_SECRET_BYTE; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 0,
+            })
+            .collect();
+        // Cross the chunk boundary with an update to a row from the first
+        // statement, proving the enclosing transaction preserves merge order.
+        entries.push(MsgSecretEntry {
+            chat: "c".into(),
+            sender: "s".into(),
+            msg_id: "M0".into(),
+            secret: [UPDATED_SECRET_BYTE; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+            expires_at: 0,
+            message_ts: 0,
+        });
+        let expected_stored = entries.len();
+        let stored = store.put_msg_secrets(entries).await.unwrap();
+
+        assert_eq!(stored, expected_stored);
         assert_eq!(
-            store.get_msg_secret("c", "s", "M1").await.unwrap().unwrap(),
-            vec![9u8; 32]
+            store.get_msg_secret("c", "s", "M0").await.unwrap().unwrap(),
+            vec![UPDATED_SECRET_BYTE; wacore::reporting_token::MESSAGE_SECRET_SIZE]
         );
         assert_eq!(
-            store.get_msg_secret("c", "s", "M2").await.unwrap().unwrap(),
-            vec![2u8; 32]
+            store
+                .get_msg_secret("c", "s", &format!("M{MSG_SECRET_INSERT_CHUNK_SIZE}"))
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![ORIGINAL_SECRET_BYTE; wacore::reporting_token::MESSAGE_SECRET_SIZE]
         );
     }
 
