@@ -79,6 +79,10 @@ impl MessageUtils {
     /// the shared bytes are spliced + padded here instead of re-encoding the message.
     /// `content` must be the message's encoding with no reporting context spliced on (the
     /// caller only takes this path when the message has no top-level message_context_info).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.dm_plaintext", level = "debug", skip_all)
+    )]
     pub fn pad_with_context_from_encoded(
         content: &[u8],
         extra_context: Option<&wa::MessageContextInfo>,
@@ -203,6 +207,10 @@ impl MessageUtils {
     /// into `content`. The DM send path reuses the single message encode it also feeds to
     /// the reporting token, so the message is no longer encoded twice per send. `content`
     /// must be the message's encoding with no reporting context spliced on.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.dm_plaintexts", level = "debug", skip_all)
+    )]
     pub fn dm_plaintexts_from_encoded(
         content: &[u8],
         extra_context: Option<&wa::MessageContextInfo>,
@@ -300,6 +308,10 @@ impl MessageUtils {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.participant_hash", level = "debug", skip_all)
+    )]
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
     ) -> Result<String> {

@@ -1055,7 +1055,9 @@ fn test_dm_encryption_excludes_sender_device() {
         Jid::lid_device("987654321".to_string(), 0),          // Recipient
     ];
 
-    let (recipient_devices, own_other_devices) = partition_dm_devices(all_devices, &own_jid, None);
+    let partitioned = partition_dm_devices(all_devices, &own_jid, None);
+    let recipient_devices = partitioned.recipient_devices();
+    let own_other_devices = partitioned.own_other_devices();
 
     // Verifications
 
@@ -1102,8 +1104,9 @@ fn test_dm_encryption_treats_own_lid_devices_as_self() {
         Jid::lid_device("987654321012345".to_string(), 0),  // Recipient
     ];
 
-    let (recipient_devices, own_other_devices) =
-        partition_dm_devices(all_devices, &own_pn, Some(&own_lid));
+    let partitioned = partition_dm_devices(all_devices, &own_pn, Some(&own_lid));
+    let recipient_devices = partitioned.recipient_devices();
+    let own_other_devices = partitioned.own_other_devices();
 
     assert!(
         !own_other_devices

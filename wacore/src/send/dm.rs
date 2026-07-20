@@ -8,27 +8,57 @@ fn is_exact_dm_sender_device(device_jid: &Jid, own_jid: &Jid, own_lid: Option<&J
             .is_some_and(|lid| device_jid.is_same_user_as(lid) && device_jid.device == lid.device)
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.dm_partition", level = "debug", skip_all)
+)]
 pub(crate) fn partition_dm_devices(
-    all_devices: Vec<Jid>,
+    mut all_devices: Vec<Jid>,
     own_jid: &Jid,
     own_lid: Option<&Jid>,
-) -> (Vec<Jid>, Vec<Jid>) {
-    let mut recipient_devices = Vec::with_capacity(all_devices.len());
-    let mut own_other_devices = Vec::with_capacity(4);
-
-    for device_jid in all_devices {
-        if is_exact_dm_sender_device(&device_jid, own_jid, own_lid) {
+) -> PartitionedDmDevices {
+    // Unstable partition is intentional: participant wire order is not
+    // significant and phash sorts independently. Classifying in one pass and
+    // reusing the caller's buffer avoids allocating recipient + own-device
+    // Vecs on every DM send.
+    let mut recipient_count = 0;
+    let mut device_index = 0;
+    while device_index < all_devices.len() {
+        if is_exact_dm_sender_device(&all_devices[device_index], own_jid, own_lid) {
+            all_devices.swap_remove(device_index);
             continue;
         }
 
-        if device_jid.matches_user_or_lid(own_jid, own_lid) {
-            own_other_devices.push(device_jid);
-        } else {
-            recipient_devices.push(device_jid);
+        if !all_devices[device_index].matches_user_or_lid(own_jid, own_lid) {
+            all_devices.swap(device_index, recipient_count);
+            recipient_count += 1;
         }
+        device_index += 1;
     }
 
-    (recipient_devices, own_other_devices)
+    PartitionedDmDevices {
+        devices: all_devices,
+        recipient_count,
+    }
+}
+
+pub(crate) struct PartitionedDmDevices {
+    devices: Vec<Jid>,
+    recipient_count: usize,
+}
+
+impl PartitionedDmDevices {
+    pub(crate) fn valid_devices(&self) -> &[Jid] {
+        &self.devices
+    }
+
+    pub(crate) fn recipient_devices(&self) -> &[Jid] {
+        &self.devices[..self.recipient_count]
+    }
+
+    pub(crate) fn own_other_devices(&self) -> &[Jid] {
+        &self.devices[self.recipient_count..]
+    }
 }
 
 /// Result of `prepare_dm_stanza` — carries the stanza node and the
@@ -100,14 +130,13 @@ pub async fn prepare_dm_stanza(
 
     // Partition first so phash reflects the actual sent set (sender excluded) and so
     // the own-device plaintext can be skipped when there's nothing to send it to.
-    let total_devices = all_devices.len();
-    let (recipient_devices, own_other_devices) =
-        partition_dm_devices(all_devices, own_jid, own_lid);
+    let partitioned_devices = partition_dm_devices(all_devices, own_jid, own_lid);
+    let valid_devices = partitioned_devices.valid_devices();
+    let recipient_devices = partitioned_devices.recipient_devices();
+    let own_other_devices = partitioned_devices.own_other_devices();
+    let total_devices = valid_devices.len();
 
-    let phash = MessageUtils::participant_list_hash(
-        recipient_devices.iter().chain(own_other_devices.iter()),
-    )
-    .ok();
+    let phash = MessageUtils::participant_list_hash(valid_devices).ok();
 
     // Splice the shared content into the recipient plaintext and, when present, the
     // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an
@@ -150,7 +179,7 @@ pub async fn prepare_dm_stanza(
             runtime,
             stores,
             resolver,
-            &recipient_devices,
+            recipient_devices,
             &recipient_plaintext,
             hide_decrypt_fail,
             mediatype,
@@ -165,7 +194,7 @@ pub async fn prepare_dm_stanza(
             runtime,
             stores,
             resolver,
-            &own_other_devices,
+            own_other_devices,
             &own_devices_plaintext,
             hide_decrypt_fail,
             mediatype,
@@ -177,7 +206,7 @@ pub async fn prepare_dm_stanza(
 
     // All per-device encrypts failed: an empty <participants> would silently
     // drop the message. WA Web's encryptAndSendUserMsg rejects here too.
-    let attempted_devices = recipient_devices.len() + own_other_devices.len();
+    let attempted_devices = total_devices;
     if participant_nodes.is_empty() && attempted_devices > 0 {
         return Err(anyhow!(
             "encryption failed for all {attempted_devices} recipient device(s)"
@@ -354,4 +383,37 @@ where
     }
 
     Ok(stanza_builder.children(children).build())
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+
+    #[test]
+    fn partition_dm_devices_reuses_input_allocation() {
+        let own_jid = Jid::lid_device("123456789".to_owned(), 7);
+        let devices = vec![
+            Jid::lid_device("987654321".to_owned(), 0),
+            Jid::lid_device("123456789".to_owned(), 0),
+            own_jid.clone(),
+            Jid::lid_device("987654321".to_owned(), 1),
+        ];
+        let allocation = devices.as_ptr();
+        let capacity = devices.capacity();
+
+        let partitioned = partition_dm_devices(devices, &own_jid, None);
+
+        assert_eq!(partitioned.devices.as_ptr(), allocation);
+        assert_eq!(partitioned.devices.capacity(), capacity);
+        assert_eq!(partitioned.valid_devices().len(), 3);
+        assert_eq!(partitioned.recipient_devices().len(), 2);
+        assert_eq!(partitioned.own_other_devices().len(), 1);
+        assert!(
+            partitioned
+                .recipient_devices()
+                .iter()
+                .all(|device| device.user == "987654321")
+        );
+        assert_eq!(partitioned.own_other_devices()[0].device, 0);
+    }
 }

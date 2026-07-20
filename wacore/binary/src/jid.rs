@@ -655,6 +655,13 @@ impl Jid {
         push_jid_to_string(&self.user, self.server, self.agent, self.device, buf);
     }
 
+    /// Write the Display representation to any [`fmt::Write`] sink without an
+    /// intermediate `String`.
+    #[inline]
+    pub fn write_display_to<W: fmt::Write + ?Sized>(&self, writer: &mut W) -> fmt::Result {
+        write_jid_fallible(writer, &self.user, self.server, self.agent, self.device)
+    }
+
     /// Compare device identity (user, server, device) without allocation.
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
@@ -899,7 +906,7 @@ impl fmt::Write for JidStackWriter {
 }
 
 #[inline]
-fn write_jid_fallible<W: fmt::Write>(
+fn write_jid_fallible<W: fmt::Write + ?Sized>(
     w: &mut W,
     user: &str,
     server: Server,
@@ -912,10 +919,10 @@ fn write_jid_fallible<W: fmt::Write>(
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut w = JidStackWriter::new();
-        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+        if self.write_display_to(&mut w).is_ok() {
             return f.write_str(w.as_str());
         }
-        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
+        self.write_display_to(f)
     }
 }
 
@@ -1701,7 +1708,8 @@ mod tests {
 
     /// Verify that all JID formatting paths produce identical output:
     /// `Jid::Display`, `JidRef::Display`, `push_jid_to_string`, `push_jid_to_compact`,
-    /// and `Jid::push_to`. Exercises the agent-elision rules across server variants.
+    /// `Jid::push_to`, and the generic writer. Exercises the agent-elision rules
+    /// across server variants.
     #[test]
     fn test_jid_format_parity() {
         struct Case {
@@ -1853,6 +1861,10 @@ mod tests {
             let mut push_buf = String::new();
             jid.push_to(&mut push_buf);
 
+            // Generic fmt::Write path.
+            let mut write_buf = String::new();
+            jid.write_display_to(&mut write_buf).unwrap();
+
             assert_eq!(display, ref_display, "case {i}: Display vs JidRef::Display");
             assert_eq!(
                 display, string_buf,
@@ -1864,6 +1876,7 @@ mod tests {
                 "case {i}: Display vs push_jid_to_compact"
             );
             assert_eq!(display, push_buf, "case {i}: Display vs Jid::push_to");
+            assert_eq!(display, write_buf, "case {i}: Display vs generic writer");
         }
     }
 }
