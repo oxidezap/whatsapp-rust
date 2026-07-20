@@ -91,7 +91,10 @@ rand = "0.10"
 # wasm32-unknown-unknown-buildable though — it pulls getrandom 0.2, whose OsRng has
 # no wasm backend (the repo's `wasm_js` cfg only reaches the workspace's getrandom 0.4).
 # Pre-release (0.0.2-alpha); real-server handshake validated, but the dep is still alpha.
-rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
+# No `tls12`: WhatsApp's WSS and media endpoints negotiate TLS 1.3, and the
+# feature cfg-gates all six TLS 1.2 suites plus their PRF/kx glue — dropping it
+# is a size win the provider arrays would otherwise pin through fat LTO.
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "zeroize"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }

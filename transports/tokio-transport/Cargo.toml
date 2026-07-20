@@ -23,10 +23,13 @@ log = { workspace = true }
 # No `ring`: the RustCrypto provider (installed at runtime) supplies all TLS
 # crypto, so rustls/tokio-rustls carry no built-in provider and tokio-websockets
 # needs none (we pass our own connector via `rustls-bring-your-own-connector`).
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+# No `tls12` either: the provider (rustls-rustcrypto without its `tls12`
+# feature) carries only TLS 1.3 suites, so the client is 1.3-only regardless —
+# WhatsApp's WSS and media endpoints negotiate 1.3.
+rustls = { version = "0.23", default-features = false, features = ["std", "logging"] }
 rustls-rustcrypto = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging"] }
 tokio-websockets = { version = "0.13.3", features = [
   "client",
   "rustls-bring-your-own-connector",
