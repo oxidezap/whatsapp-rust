@@ -2871,6 +2871,65 @@ mod mark_full_distribution_list {
         }
     }
 
+    /// An ungated sender-chain advance puts group ciphertext on the wire before
+    /// the advance is durable, so a reload re-derives the same iteration: one
+    /// (key, IV) reused toward every member.
+    #[tokio::test]
+    async fn encrypt_group_message_leases_the_sender_chain() {
+        use crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+        use crate::libsignal::protocol::{KeyPair, SenderKeyRecord};
+
+        let name = SenderKeyName::new("g@g.us".to_string(), "me.0".to_string());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(3, 1, 0, &[7u8; 32], kp.public_key, Some(kp.private_key))
+            .expect("valid sender key state");
+
+        let mut sks = MemSenderKeyStore::default();
+        sks.records.insert(name.clone(), record);
+
+        crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+            .await
+            .expect("group encrypt");
+
+        let stored = sks
+            .load_sender_key(&name)
+            .await
+            .expect("load")
+            .expect("record present");
+        assert_eq!(
+            stored.reserved_iteration(),
+            SENDER_CHAIN_RESERVATION_BATCH,
+            "encrypt_group_message must lease the sender chain"
+        );
+    }
+
+    /// The warm-send recovery downcasts NoSenderKeyState to clear stale device
+    /// tracking and retry with SKDM redistribution, so erasing the concrete
+    /// error type here would silently cost the self-heal.
+    #[tokio::test]
+    async fn encrypt_group_message_preserves_no_sender_key_state() {
+        use crate::libsignal::protocol::SignalProtocolError;
+
+        let name = SenderKeyName::new("g@g.us".to_string(), "me.0".to_string());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        // Empty store: no local SenderKeyRecord for `name`.
+        let mut sks = MemSenderKeyStore::default();
+
+        let err = crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+            .await
+            .expect_err("a missing sender key must error");
+        assert!(
+            matches!(
+                err.downcast_ref::<SignalProtocolError>(),
+                Some(SignalProtocolError::NoSenderKeyState(_))
+            ),
+            "NoSenderKeyState must survive the delegation for the SKDM-redistribution retry, got: {err:#}"
+        );
+    }
+
     // Outgoing group encryption never consumes our own prekeys, and device B
     // has no bundle (so no session is established for it) — these are never
     // called; present only to satisfy the generic bounds.

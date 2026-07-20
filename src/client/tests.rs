@@ -1510,6 +1510,49 @@ async fn cleanup_connection_state_flushes_dirty_sender_key() {
     );
 }
 
+#[tokio::test]
+async fn cleanup_connection_state_does_not_burn_a_clean_sender_key_lease() {
+    use wacore::libsignal::protocol::{KeyPair, SenderKeyRecord};
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    let client = create_offline_sync_test_client().await;
+    let name = SenderKeyName::from_parts("group@g.us", "5550001001@s.whatsapp.net:1");
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let signing_key = KeyPair::generate(&mut rng);
+    let mut record = SenderKeyRecord::new_empty();
+    record
+        .add_sender_key_state(
+            3,
+            12345,
+            0,
+            &[0x42; 32],
+            signing_key.public_key,
+            Some(signing_key.private_key),
+        )
+        .expect("sender key state");
+    record.reserve_iterations(0);
+    client.signal_cache.put_sender_key(&name, record).await;
+
+    client.cleanup_connection_state().await;
+
+    let device = client.persistence_manager.get_device_arc().await;
+    let guard = device.read().await;
+    let reloaded = client
+        .signal_cache
+        .get_sender_key(&name, &*guard.backend)
+        .await
+        .expect("sender key load")
+        .expect("sender key");
+    assert_eq!(
+        reloaded
+            .sender_key_state()
+            .expect("sender key state")
+            .sender_chain_key()
+            .expect("sender chain")
+            .iteration(),
+        0
+    );
+}
+
 /// When the flush itself fails, cleanup must NOT clear the cache, or it would
 /// drop the very state the flush was meant to persist.
 #[tokio::test]
@@ -2743,6 +2786,122 @@ async fn test_custom_cache_config_is_respected() {
     assert!(!client.is_logged_in());
 }
 
+#[tokio::test]
+async fn held_group_distribution_lane_survives_capacity_pressure() {
+    let config = crate::cache_config::CacheConfig {
+        group_distribution_locks_capacity: 1,
+        ..Default::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "group_distribution_eviction",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    let first: Jid = "120363000000000011@g.us".parse().unwrap();
+    let second: Jid = "120363000000000012@g.us".parse().unwrap();
+    let third: Jid = "120363000000000013@g.us".parse().unwrap();
+    let held = client.group_distribution_lock(&first).await;
+
+    drop(client.group_distribution_lock(&second).await);
+    drop(client.group_distribution_lock(&third).await);
+
+    let first_again = client
+        .group_distribution_locks
+        .get(&first)
+        .await
+        .expect("held lane must remain cached");
+    assert!(
+        first_again.try_lock().is_none(),
+        "capacity pressure must not mint a second live lane"
+    );
+    let report = client.memory_report().await;
+    assert_eq!(report.group_distribution_locks, 2);
+    assert_eq!(report.group_distribution_lock_evictions, 1);
+    assert_eq!(report.group_distribution_lock_eviction_blocks, 2);
+    drop(held);
+    assert!(first_again.try_lock().is_some());
+}
+
+#[tokio::test]
+async fn active_chat_lane_survives_capacity_pressure() {
+    fn test_lane() -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
+        let (queue_tx, queue_rx) = async_channel::unbounded();
+        (
+            ChatLane {
+                enqueue_lock: Arc::new(async_lock::Mutex::new(())),
+                queue_tx,
+            },
+            queue_rx,
+        )
+    }
+
+    let config = crate::cache_config::CacheConfig {
+        chat_lanes_capacity: 1,
+        ..Default::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "chat_lane_eviction",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    let first: Jid = "120363000000000021@g.us".parse().unwrap();
+    let second: Jid = "120363000000000022@g.us".parse().unwrap();
+    let (first_lane, first_rx) = test_lane();
+    let first_tx_probe = first_lane.queue_tx.clone();
+    client.chat_lanes.insert(first.clone(), first_lane).await;
+
+    let first_lane = client.chat_lanes.get(&first).await.unwrap();
+    let node = NodeBuilder::new("message")
+        .attr("from", first.clone())
+        .attr("id", "ACTIVE-LANE-1")
+        .build();
+    first_lane.try_enqueue(node_to_owned_ref(node)).unwrap();
+    drop(first_lane);
+    let active_message = first_rx.recv().await.unwrap();
+
+    let (second_lane, _second_rx) = test_lane();
+    client.chat_lanes.insert(second, second_lane).await;
+
+    let first_again = client
+        .chat_lanes
+        .get(&first)
+        .await
+        .expect("an active lane must remain cached");
+    assert!(first_again.queue_tx.same_channel(&first_tx_probe));
+
+    let next_node = NodeBuilder::new("message")
+        .attr("from", first.clone())
+        .attr("id", "ACTIVE-LANE-2")
+        .build();
+    first_again
+        .try_enqueue(node_to_owned_ref(next_node))
+        .unwrap();
+    drop(first_again);
+    drop(active_message);
+    let next_active_message = first_rx.recv().await.unwrap();
+
+    let third: Jid = "120363000000000023@g.us".parse().unwrap();
+    let (third_lane, _third_rx) = test_lane();
+    client.chat_lanes.insert(third, third_lane).await;
+    assert!(
+        client.chat_lanes.get(&first).await.is_some(),
+        "a lane with an in-flight message must not be evicted"
+    );
+
+    drop(next_active_message);
+    let fourth: Jid = "120363000000000024@g.us".parse().unwrap();
+    let (fourth_lane, _fourth_rx) = test_lane();
+    client.chat_lanes.insert(fourth, fourth_lane).await;
+    assert!(
+        client.chat_lanes.get(&first).await.is_none(),
+        "an idle lane must become evictable again"
+    );
+}
+
 /// Proves that `is_connected()` no longer gives false negatives under mutex
 /// contention. Before the fix, `try_lock()` would fail when another task held
 /// the noise_socket mutex, causing `is_connected()` to return `false` even
@@ -3340,6 +3499,9 @@ async fn memory_report_on_fresh_client() {
     let report = client.memory_report().await;
     assert_eq!(report.recent_messages.entries, 0);
     assert_eq!(report.recent_messages.bytes, 0);
+    assert_eq!(report.group_distribution_locks, 0);
+    assert_eq!(report.group_distribution_lock_evictions, 0);
+    assert_eq!(report.group_distribution_lock_eviction_blocks, 0);
     assert_eq!(report.signal_sessions.entries, 0);
     assert_eq!(report.response_waiters, 0);
 

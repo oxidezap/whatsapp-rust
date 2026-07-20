@@ -2,6 +2,9 @@
 //! integration tests. Visible only under `#[cfg(test)]` (this crate) or
 //! when the `test-util` feature is enabled.
 
+// Test fixtures may exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use buffa::Message;
 use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};
 

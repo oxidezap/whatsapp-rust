@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, PreKeyId,
-    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError,
-    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionCheckoutKey, SessionCheckoutStoreResult,
+    SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord,
+    SignedPreKeyStore,
 };
 
 use wacore::libsignal::store::record_helpers as wacore_record;
@@ -101,9 +102,64 @@ impl SessionStore for SessionAdapter {
         let device = self.0.device.read().await;
         self.0
             .cache
-            .get_session(address, &*device.backend)
+            .peek_session(address, &*device.backend)
             .await
+            .map(|record| record.map(|record| (*record).clone()))
             .map_err(signal_err("backend"))
+    }
+
+    async fn load_session_for_update(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Result<(Option<SessionRecord>, Option<SessionCheckoutKey>), SignalProtocolError> {
+        let device = self.0.device.read().await;
+        self.0
+            .cache
+            .checkout_session(address, &*device.backend)
+            .await
+            .map(|(record, checkout)| (record, Some(checkout)))
+            .map_err(signal_err("backend"))
+    }
+
+    fn try_load_session_for_update(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Option<Result<(Option<SessionRecord>, Option<SessionCheckoutKey>), SignalProtocolError>>
+    {
+        self.0.cache.try_checkout_session(address).map(|result| {
+            result
+                .map(|(record, checkout)| (record, Some(checkout)))
+                .map_err(signal_err("backend"))
+        })
+    }
+
+    fn try_store_session_from_checkout(
+        &mut self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+        checkout: Option<SessionCheckoutKey>,
+        had_session: bool,
+    ) -> SessionCheckoutStoreResult {
+        let Some(checkout) = checkout else {
+            return SessionCheckoutStoreResult::Unhandled(record);
+        };
+        self.0
+            .cache
+            .restore_session_from_checkout(address, record, checkout, had_session)
+    }
+
+    fn cancel_session_checkout(
+        &mut self,
+        address: &ProtocolAddress,
+        checkout: Option<SessionCheckoutKey>,
+    ) {
+        if let Some(checkout) = checkout {
+            self.0.cache.cancel_session_checkout(address, checkout);
+        }
+    }
+
+    async fn complete_session_checkout(&mut self) {
+        self.0.cache.complete_session_checkout().await;
     }
 
     // Hand-desugared (see `BoxFut`): a cached answer skips the device lock
@@ -477,6 +533,177 @@ mod tests {
         SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
     }
 
+    struct BlockingIdentityStore {
+        pair: IdentityKeyPair,
+        entered: Arc<async_lock::Barrier>,
+    }
+
+    #[async_trait]
+    impl IdentityKeyStore for BlockingIdentityStore {
+        async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
+            Ok(self.pair.clone())
+        }
+
+        async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
+            Ok(1)
+        }
+
+        async fn save_identity(
+            &mut self,
+            _address: &ProtocolAddress,
+            _identity: &IdentityKey,
+        ) -> Result<IdentityChange, SignalProtocolError> {
+            Ok(IdentityChange::NewOrUnchanged)
+        }
+
+        async fn is_trusted_identity(
+            &self,
+            _address: &ProtocolAddress,
+            _identity: &IdentityKey,
+            _direction: Direction,
+        ) -> Result<bool, SignalProtocolError> {
+            self.entered.wait().await;
+            futures::future::pending().await
+        }
+
+        async fn get_identity(
+            &self,
+            _address: &ProtocolAddress,
+        ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+            Ok(None)
+        }
+    }
+
+    fn outbound_session() -> (SessionRecord, IdentityKeyPair) {
+        use wacore::libsignal::protocol::{
+            AliceSignalProtocolParameters, KeyPair, UsePQRatchet, initialize_alice_session_record,
+        };
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local_identity = IdentityKeyPair::generate(&mut rng);
+        let remote_identity = IdentityKeyPair::generate(&mut rng);
+        let remote_signed_prekey = KeyPair::generate(&mut rng);
+        let parameters = AliceSignalProtocolParameters::new(
+            local_identity.clone(),
+            KeyPair::generate(&mut rng),
+            *remote_identity.identity_key(),
+            remote_signed_prekey.public_key,
+            remote_signed_prekey.public_key,
+            UsePQRatchet::No,
+        );
+        (
+            initialize_alice_session_record(&parameters, &mut rng).expect("valid session"),
+            local_identity,
+        )
+    }
+
+    async fn cancel_encrypt_after_checkout(seed_durable: bool) {
+        use wacore::libsignal::protocol::message_encrypt;
+
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let cache = Arc::new(SignalStoreCache::new());
+        let address = ProtocolAddress::new("15550006666".to_string(), 1.into());
+        let (record, identity_pair) = outbound_session();
+        let expected = record.serialize().expect("serialize session");
+        cache.put_session(&address, record).await;
+        if seed_durable {
+            cache.flush(backend.as_ref()).await.expect("seed flush");
+        }
+        assert_eq!(
+            wacore::store::traits::SignalStore::get_session(backend.as_ref(), address.as_str())
+                .await
+                .expect("backend read")
+                .is_some(),
+            seed_durable,
+        );
+
+        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let mut session_store =
+            SignalProtocolStoreAdapter::new(device, cache.clone()).session_store;
+        let entered = Arc::new(async_lock::Barrier::new(2));
+        let mut identity_store = BlockingIdentityStore {
+            pair: identity_pair,
+            entered: entered.clone(),
+        };
+        let task_address = address.clone();
+        let task = tokio::spawn(async move {
+            message_encrypt(
+                b"cancelled ciphertext",
+                &task_address,
+                &mut session_store,
+                &mut identity_store,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+            .await
+            .expect("encrypt reached identity check");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("task must be cancelled")
+                .is_cancelled()
+        );
+
+        let recovered = cache
+            .get_session(&address, backend.as_ref())
+            .await
+            .expect("cache read")
+            .expect("cancelled checkout restored");
+        assert_eq!(
+            recovered.serialize().expect("serialize recovered session"),
+            expected
+        );
+        cache.put_session(&address, recovered).await;
+        cache.flush(backend.as_ref()).await.expect("recovery flush");
+        assert!(
+            wacore::store::traits::SignalStore::get_session(backend.as_ref(), address.as_str())
+                .await
+                .expect("backend read")
+                .is_some(),
+            "the recovered checkout must remain durably flushable"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_encrypt_restores_a_clean_checkout() {
+        cancel_encrypt_after_checkout(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_encrypt_preserves_a_new_dirty_session() {
+        cancel_encrypt_after_checkout(false).await;
+    }
+
+    #[tokio::test]
+    async fn checkout_commit_fails_closed_across_a_lossy_clear() {
+        use wacore::libsignal::protocol::SessionCheckout;
+
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let cache = Arc::new(SignalStoreCache::new());
+        let device = Arc::new(RwLock::new(Device::new(backend)));
+        let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
+        let address = ProtocolAddress::new("15550005555".to_string(), 1.into());
+        cache
+            .put_session(&address, SessionRecord::new_fresh())
+            .await;
+
+        let checkout = SessionCheckout::load(&mut adapter.session_store, &address)
+            .await
+            .expect("checkout")
+            .expect("session");
+        cache.clear().await;
+        assert!(matches!(
+            checkout.commit().await,
+            Err(SignalProtocolError::InvalidState(
+                "SessionCheckout::commit",
+                _
+            ))
+        ));
+        assert_eq!(cache.try_has_session(&address), None);
+    }
+
     /// The hand-desugared session methods must behave exactly like the trait's
     /// async path: store → visible to has/load, both on cold and warm cache.
     #[tokio::test]
@@ -504,6 +731,15 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "stored session must be loadable"
+        );
+        assert!(
+            adapter
+                .session_store
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .is_some(),
+            "plain loads must not consume the cached session"
         );
     }
 

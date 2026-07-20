@@ -13,7 +13,7 @@ use wacore::iq::prekeys::{
     DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
 };
 use wacore::libsignal::protocol::{KeyPair, PreKeyBundle, PublicKey};
-use wacore::libsignal::store::record_helpers::new_pre_key_record;
+use wacore::libsignal::store::record_helpers::encode_pre_key_record_to;
 use wacore::store::commands::DeviceCommand;
 use wacore_binary::Jid;
 
@@ -362,9 +362,7 @@ impl Client {
                         })
                         .await;
                 }
-                use buffa::Message;
-                let structure =
-                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record)?;
+                let structure = waproto::codec::pre_key_record_decode(&record)?;
                 let record = wacore::libsignal::store::record_helpers::prekey_structure_to_record(
                     structure,
                 )?;
@@ -389,11 +387,9 @@ impl Client {
             if raw > MAX_PREKEY_ID { 1 } else { raw }
         };
         let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let record = new_pre_key_record(id, &key_pair);
-        use buffa::Message;
-        backend
-            .store_prekey(id, &record.encode_to_vec(), false)
-            .await?;
+        let mut encoded_record = Vec::new();
+        encode_pre_key_record_to(id, &key_pair, &mut encoded_record);
+        backend.store_prekey(id, &encoded_record, false).await?;
         self.persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
                 next_pre_key_id: id.saturating_add(1),
@@ -518,8 +514,6 @@ impl Client {
             // the async executor responsive. Records are encoded into one contiguous
             // buffer with zero-copy Bytes slices instead of an alloc per record.
             let (encoded_batch, generated) = wacore::runtime::blocking(&*self.runtime, move || {
-                use buffa::Message;
-
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -538,7 +532,7 @@ impl Client {
                     let pre_key_id = gen_start + i as u32;
                     let key_pair = KeyPair::generate(&mut rng);
                     let start = buf.len();
-                    new_pre_key_record(pre_key_id, &key_pair).encode(&mut buf);
+                    encode_pre_key_record_to(pre_key_id, &key_pair, &mut buf);
                     offsets.push((pre_key_id, start..buf.len()));
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 }
@@ -620,17 +614,15 @@ impl Client {
             // `PreKeyRecordStructure::decode` the consume path runs, so a record
             // accepted here is one this device can later decrypt with. Fresh keys skip
             // decode entirely; their public keys never left memory.
-            use buffa::Message;
             for (id, record) in &leftover_rows {
-                let public_key =
-                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record[..])
-                        .map_err(anyhow::Error::from)
-                        .and_then(|s| {
-                            let raw = s
-                                .public_key
-                                .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                            PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
-                        });
+                let public_key = waproto::codec::pre_key_record_decode(&record[..])
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| {
+                        let raw = s
+                            .public_key
+                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
+                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                    });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
                     Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),
@@ -1066,6 +1058,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod window_tests {
     use wacore::libsignal::protocol::PublicKey;
 

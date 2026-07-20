@@ -156,6 +156,7 @@ impl Client {
             .group_devices_memo
             .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
             .await;
+        let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
 
         // Each count read into a local so no two guards are ever held at once.
         let response_waiters = self.response_waiters_guard().len();
@@ -178,6 +179,9 @@ impl Client {
             pdo_requested: self.pdo_requested.entry_count(),
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
+            group_distribution_locks: group_distribution_locks.entries,
+            group_distribution_lock_evictions: group_distribution_locks.evictions,
+            group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),

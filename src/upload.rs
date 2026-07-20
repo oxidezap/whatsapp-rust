@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use base64::Engine;
 use serde::Deserialize;
 use wacore::download::MediaType;
+use wacore::sync_marker::MaybeSend;
 
 use crate::client::Client;
 use crate::http::{HttpRequest, HttpResponse};
@@ -130,10 +131,47 @@ impl UploadCrypto {
     }
 }
 
+/// Boxed future for the dyn-driven retry loop below. `Send` keeps the upload
+/// futures spawnable on native; on wasm the `HttpClient` futures are `?Send`
+/// (single-threaded runtime), so the bound is dropped there.
+#[cfg(not(target_arch = "wasm32"))]
+type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
+// Only auto traits can join a `dyn Fn` bound, so the wasm variants must spell
+// out the whole alias instead of borrowing `MaybeSend`.
+#[cfg(not(target_arch = "wasm32"))]
+mod dyn_callbacks {
+    use super::*;
+    pub(super) type GetMediaConnDyn<'a> =
+        dyn FnMut(bool) -> BoxFut<'a, Result<crate::mediaconn::MediaConn>> + Send + 'a;
+    pub(super) type InvalidateMediaConnDyn<'a> = dyn FnMut() -> BoxFut<'a, ()> + Send + 'a;
+    pub(super) type ExecuteRequestDyn<'a> =
+        dyn FnMut(HttpRequest) -> BoxFut<'a, Result<HttpResponse>> + Send + 'a;
+    pub(super) type SendBodyDyn<'a> =
+        dyn FnMut(HttpRequest, u64, u64) -> BoxFut<'a, Result<HttpResponse>> + Send + 'a;
+}
+#[cfg(target_arch = "wasm32")]
+mod dyn_callbacks {
+    use super::*;
+    pub(super) type GetMediaConnDyn<'a> =
+        dyn FnMut(bool) -> BoxFut<'a, Result<crate::mediaconn::MediaConn>> + 'a;
+    pub(super) type InvalidateMediaConnDyn<'a> = dyn FnMut() -> BoxFut<'a, ()> + 'a;
+    pub(super) type ExecuteRequestDyn<'a> =
+        dyn FnMut(HttpRequest) -> BoxFut<'a, Result<HttpResponse>> + 'a;
+    pub(super) type SendBodyDyn<'a> =
+        dyn FnMut(HttpRequest, u64, u64) -> BoxFut<'a, Result<HttpResponse>> + 'a;
+}
+use dyn_callbacks::*;
+
 /// Drives host failover, auth refresh, and resumable upload. `file_length` is the
 /// plaintext size (for the response); `ciphertext_len` is the encrypted blob size
 /// (for the resume threshold/offsets). `send_body` transmits the body from a given
 /// offset; `execute_request` serves the body-less resume check.
+///
+/// Thin adapter: boxes the per-call futures so the large driver body
+/// instantiates once instead of per closure combination.
 #[allow(clippy::too_many_arguments)]
 async fn upload_media_with_retry<GMC, GMCFut, IMC, IMCFut, EXR, EXRFut, SB, SBFut>(
     crypto: UploadCrypto,
@@ -147,15 +185,41 @@ async fn upload_media_with_retry<GMC, GMCFut, IMC, IMCFut, EXR, EXRFut, SB, SBFu
     mut send_body: SB,
 ) -> Result<UploadResponse>
 where
-    GMC: FnMut(bool) -> GMCFut,
-    GMCFut: std::future::Future<Output = Result<crate::mediaconn::MediaConn>>,
-    IMC: FnMut() -> IMCFut,
-    IMCFut: std::future::Future<Output = ()>,
-    EXR: FnMut(HttpRequest) -> EXRFut,
-    EXRFut: std::future::Future<Output = Result<HttpResponse>>,
-    SB: FnMut(HttpRequest, u64, u64) -> SBFut,
-    SBFut: std::future::Future<Output = Result<HttpResponse>>,
+    GMC: FnMut(bool) -> GMCFut + MaybeSend,
+    GMCFut: std::future::Future<Output = Result<crate::mediaconn::MediaConn>> + MaybeSend,
+    IMC: FnMut() -> IMCFut + MaybeSend,
+    IMCFut: std::future::Future<Output = ()> + MaybeSend,
+    EXR: FnMut(HttpRequest) -> EXRFut + MaybeSend,
+    EXRFut: std::future::Future<Output = Result<HttpResponse>> + MaybeSend,
+    SB: FnMut(HttpRequest, u64, u64) -> SBFut + MaybeSend,
+    SBFut: std::future::Future<Output = Result<HttpResponse>> + MaybeSend,
 {
+    upload_media_with_retry_dyn(
+        crypto,
+        media_type,
+        file_length,
+        ciphertext_len,
+        media_key_timestamp,
+        &mut |force| Box::pin(get_media_conn(force)),
+        &mut || Box::pin(invalidate_media_conn()),
+        &mut |request| Box::pin(execute_request(request)),
+        &mut |request, offset, remaining| Box::pin(send_body(request, offset, remaining)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_media_with_retry_dyn<'a>(
+    crypto: UploadCrypto,
+    media_type: MediaType,
+    file_length: u64,
+    ciphertext_len: u64,
+    media_key_timestamp: i64,
+    get_media_conn: &mut GetMediaConnDyn<'a>,
+    invalidate_media_conn: &mut InvalidateMediaConnDyn<'a>,
+    execute_request: &mut ExecuteRequestDyn<'a>,
+    send_body: &mut SendBodyDyn<'a>,
+) -> Result<UploadResponse> {
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(crypto.file_enc_sha256);
     let upload_path = media_type.upload_path();
     let mut force_refresh = false;

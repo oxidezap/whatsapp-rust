@@ -3,6 +3,7 @@ use crate::types::events::Event;
 use crate::types::message::MessageInfo;
 use log::{debug, warn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyDistributionMessage;
 use wacore::libsignal::protocol::SenderKeyStore;
@@ -98,6 +99,57 @@ enum MigrationDecryptResult {
 pub(crate) struct PlaintextHandleOutcome {
     dispatched: bool,
     skdm_only: bool,
+}
+
+const INBOUND_COMMIT_PENDING: u8 = 0;
+const INBOUND_COMMIT_DURABLE: u8 = 1;
+const INBOUND_COMMIT_DROPPED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundCommitTicketState {
+    Pending,
+    Durable,
+    Dropped,
+}
+
+#[derive(Clone)]
+pub(crate) struct InboundCommitTicket(Arc<AtomicU8>);
+
+impl InboundCommitTicket {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(INBOUND_COMMIT_PENDING)))
+    }
+
+    fn state(&self) -> InboundCommitTicketState {
+        match self.0.load(Ordering::Acquire) {
+            INBOUND_COMMIT_DURABLE => InboundCommitTicketState::Durable,
+            INBOUND_COMMIT_DROPPED => InboundCommitTicketState::Dropped,
+            _ => InboundCommitTicketState::Pending,
+        }
+    }
+
+    fn resolve(&self, state: u8) {
+        let _ = self.0.compare_exchange(
+            INBOUND_COMMIT_PENDING,
+            state,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn mark_durable(&self) {
+        self.resolve(INBOUND_COMMIT_DURABLE);
+    }
+
+    fn mark_dropped(&self) {
+        self.resolve(INBOUND_COMMIT_DROPPED);
+    }
+}
+
+pub(crate) enum InboundCommitState {
+    Durable,
+    Deferred(Option<InboundCommitTicket>),
+    Failed,
 }
 
 /// A decrypted session plaintext buffered during the locked decrypt loop and

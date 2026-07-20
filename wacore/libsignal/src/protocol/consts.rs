@@ -24,3 +24,19 @@ pub const MAX_SENDER_KEY_STATES: usize = 5;
 /// Eviction only triggers when buffer exceeds MAX_MESSAGE_KEYS + PRUNE_THRESHOLD,
 /// reducing O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
 pub const MESSAGE_KEY_PRUNE_THRESHOLD: usize = 50;
+
+/// Sender-chain counters leased per durable reservation (see
+/// `SessionRecord::reserve_sender_chain_counters`). Message keys and IVs are
+/// derived deterministically from the counter, so an outbound counter must
+/// never repeat across a crash; instead of persisting every advance before it
+/// hits the wire, the record durably reserves this many counters ahead and a
+/// reloaded snapshot fast-forwards past them. Bounds both the sync-flush
+/// amortization (one per this many sends) and the worst-case counter gap a
+/// receiver sees after a crash — keep it well under MAX_FORWARD_JUMPS.
+pub const SENDER_CHAIN_RESERVATION_BATCH: u32 = 64;
+
+/// Upper bound for the reservation fast-forward on load. A legitimate lease
+/// gap is < SENDER_CHAIN_RESERVATION_BATCH; anything past this ceiling means
+/// a corrupt record, and refusing it keeps a bogus reserved index from
+/// turning the load into an unbounded KDF loop.
+pub const MAX_RESERVATION_FAST_FORWARD: u32 = MAX_FORWARD_JUMPS as u32;

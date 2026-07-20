@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::appstate::hash::HashState;
@@ -91,6 +93,26 @@ const MAX_SENT_MESSAGES: usize = 4096;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
+    /// Count of `put_sessions_batch` calls. Test hook (see `test-util`): lets a
+    /// harness prove receive-path flush coalescing (N receives collapse to fewer
+    /// batch writes). Gated so normal builds carry neither the field nor the
+    /// per-call bookkeeping.
+    #[cfg(any(test, feature = "test-util"))]
+    session_batch_writes: AtomicU32,
+    /// Count of `put_sender_keys_batch` calls. Test hook for sender-key lease
+    /// boundaries; absent from normal builds.
+    #[cfg(any(test, feature = "test-util"))]
+    sender_key_batch_writes: AtomicU32,
+    /// When set, `put_sessions_batch` fails. Test hook (see `test-util`): lets a
+    /// harness prove the send path aborts (and never hits the wire) when the
+    /// ratchet advance cannot be persisted.
+    #[cfg(any(test, feature = "test-util"))]
+    fail_session_writes: AtomicBool,
+    /// When set, `put_sender_keys_batch` fails. Test hook: the sender-key
+    /// counterpart of `fail_session_writes` (wire gate must survive a failed
+    /// flush).
+    #[cfg(any(test, feature = "test-util"))]
+    fail_sender_key_writes: AtomicBool,
 }
 
 impl InMemoryBackend {
@@ -99,7 +121,53 @@ impl InMemoryBackend {
         Self {
             state: Mutex::new(InMemoryState::default()),
             next_device_id: AtomicI32::new(1),
+            #[cfg(any(test, feature = "test-util"))]
+            session_batch_writes: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            sender_key_batch_writes: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_session_writes: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_sender_key_writes: AtomicBool::new(false),
         }
+    }
+
+    /// Number of `put_sessions_batch` attempts since construction, including
+    /// injected failures.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn session_batch_write_count(&self) -> u32 {
+        self.session_batch_writes.load(Ordering::Relaxed)
+    }
+
+    /// Number of `put_sender_keys_batch` attempts since construction, including
+    /// injected failures.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn sender_key_batch_write_count(&self) -> u32 {
+        self.sender_key_batch_writes.load(Ordering::Relaxed)
+    }
+
+    /// Make every subsequent `put_sessions_batch` fail (or stop failing).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_session_writes(&self, fail: bool) {
+        self.fail_session_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Make every subsequent `put_sender_keys_batch` fail (or stop failing).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_sender_key_writes(&self, fail: bool) {
+        self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Lets recovery tests remove only the state needed to trigger a key request.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn remove_sync_key_for_test(&self, key_id: &[u8]) -> bool {
+        self.state.lock().await.sync_keys.remove(key_id).is_some()
+    }
+
+    /// Keeps readiness failures attributable without exposing key material.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn sync_key_count_for_test(&self) -> usize {
+        self.state.lock().await.sync_keys.len()
     }
 }
 
@@ -148,6 +216,15 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            self.session_batch_writes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_session_writes.load(Ordering::Relaxed) {
+                return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                    "put_sessions_batch failing (test hook)",
+                )));
+            }
+        }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
         for (address, session) in sessions {
@@ -277,11 +354,42 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_sender_key_writes.load(Ordering::Relaxed) {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "put_sender_key failing (test hook)",
+            )));
+        }
         self.state
             .lock()
             .await
             .sender_keys
             .insert(address.to_string(), record.to_vec());
+        Ok(())
+    }
+
+    async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            self.sender_key_batch_writes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_sender_key_writes.load(Ordering::Relaxed) {
+                return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                    "put_sender_keys_batch failing (test hook)",
+                )));
+            }
+        }
+        let mut state = self.state.lock().await;
+        state.sender_keys.reserve(sender_keys.len());
+        for (address, record) in sender_keys {
+            if let Some(stored) = state.sender_keys.get_mut(address.as_ref()) {
+                stored.clear();
+                stored.extend_from_slice(record);
+            } else {
+                state
+                    .sender_keys
+                    .insert(address.to_string(), record.to_vec());
+            }
+        }
         Ok(())
     }
 

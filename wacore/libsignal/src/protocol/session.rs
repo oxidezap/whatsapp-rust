@@ -9,8 +9,8 @@ use crate::protocol::state::GenericSignedPreKey;
 use crate::protocol::{AliceSignalProtocolParameters, BobSignalProtocolParameters};
 use crate::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionRecord, SessionStore,
-    SignalProtocolError, SignedPreKeyStore, ratchet,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionCheckout, SessionRecord,
+    SessionStore, SignalProtocolError, SignedPreKeyStore, ratchet,
 };
 
 #[derive(Default)]
@@ -136,7 +136,9 @@ async fn process_prekey_impl(
     new_session.set_local_registration_id(identity_store.get_local_registration_id().await?);
     new_session.set_remote_registration_id(message.registration_id());
 
-    session_record.promote_state(new_session);
+    // Fresh random ratchet: no counter on this chain can have been spent, so
+    // the record's inherited lease must not be burned into it.
+    session_record.promote_fresh_state(new_session);
 
     let pre_keys_used = PreKeysUsed {
         pre_key_id: message.pre_key_id(),
@@ -170,13 +172,12 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
         return Err(SignalProtocolError::SignatureValidationFailed);
     }
 
-    let existing = session_store.load_session(remote_address).await?;
-    let had_session = existing.is_some();
-    let mut session_record = existing.unwrap_or_else(SessionRecord::new_fresh);
+    let mut session = SessionCheckout::load_or_create(session_store, remote_address).await?;
+    let had_session = session.had_session();
 
     let result = process_prekey_bundle_inner(
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         bundle,
         their_identity_key,
@@ -186,9 +187,9 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     .await;
 
     if had_session || result.is_ok() {
-        session_store
-            .store_session(remote_address, session_record)
-            .await?;
+        session.commit().await?;
+    } else {
+        session.discard();
     }
 
     result
@@ -244,7 +245,8 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
         .save_identity(remote_address, their_identity_key)
         .await?;
 
-    session_record.promote_state(session);
+    // Fresh random ratchet: see promote_fresh_state.
+    session_record.promote_fresh_state(session);
 
     Ok(identity_change)
 }

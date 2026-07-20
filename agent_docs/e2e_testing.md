@@ -5,12 +5,19 @@ E2E tests live in `tests/e2e/` and run against a mock WhatsApp server. They test
 ## Test Infrastructure
 
 - **`tests/e2e/src/lib.rs`**: `TestClient` helper — connects to mock server, waits for pairing + sync, provides event-based assertions.
-- Each test creates isolated in-memory SQLite DBs (UUID-based), so tests have no shared state.
-- Tests across files run **in parallel**; tests within a file run **sequentially**.
+- Each `TestClient` owns an isolated `InMemoryBackend`; the mock server is shared.
+- Libtest runs tests within a test binary **in parallel** by default. Never rely on test order.
+- Use `unique_push_name()` for server-side account isolation. For a multi-device test,
+  create one unique name and pass it only to that test's related clients.
+- CI pins the mock-server image by digest. Update it deliberately with the matching
+  server change so an unchanged client commit always runs against the same protocol peer.
+- Local runs must start the mock with `CHATSTATE_TTL_SECS=3`; `chatstate_ttl.rs`
+  intentionally uses the same shortened expiry as CI.
 
-## File Organization for Parallelism
+## File Organization
 
-Split test files by domain so they run concurrently. Cargo runs each test binary (file) in parallel, but tests within a binary run sequentially. A single large file becomes the bottleneck.
+Split test files by domain so ownership and failures stay clear. Do not use file boundaries
+as a synchronization mechanism; correctness must not depend on how Cargo schedules test targets.
 
 ```
 tests/e2e/tests/
@@ -19,7 +26,7 @@ tests/e2e/tests/
 ├── groups.rs            # Group CRUD, admin, settings
 ├── media.rs             # Upload, download, send media
 ├── messaging.rs         # Send/receive text messages
-├── chatstate_ttl.rs     # Chatstate TTL expiry (35s sleep — own file for parallelism)
+├── chatstate_ttl.rs     # Chatstate expiry with the CI's 3-second mock TTL
 ├── offline_groups.rs    # Offline group notifications
 ├── offline_messages.rs  # Offline message queuing + delivery
 ├── offline_receipts.rs  # Offline receipt + presence delivery
@@ -30,6 +37,14 @@ tests/e2e/tests/
 ```
 
 When adding new tests, place them in the file matching their domain. If a file grows beyond ~10-15 tests, consider splitting further.
+
+## Recovery and Race Regressions
+
+Make recovery tests deterministic with narrow `test-util` fault hooks, then wait for an
+observable event, stanza, or bounded state transition. Do not depend on CPU load to hit a race, and
+do not raise a readiness timeout to hide a failed bootstrap phase. `app_state.rs`'s missing-key
+test is the reference pattern: remove exactly the required state, trigger a real sync, and
+assert that recovery reaches the wire.
 
 ## Event-Driven Waiting (Preferred)
 

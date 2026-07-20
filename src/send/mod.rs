@@ -828,6 +828,7 @@ impl Client {
 
         let device_store_arc = self.persistence_manager.get_device_arc().await;
         let to_str = to.to_string();
+        let distribution_guard = self.group_distribution_lock(&to).await;
 
         let force_skdm = {
             use wacore::libsignal::store::sender_key_name::SenderKeyName;
@@ -843,6 +844,10 @@ impl Client {
                 .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                 .await?
                 .is_some();
+
+            if !key_exists {
+                self.reset_sender_key_device_tracking(&to_str).await?;
+            }
 
             !key_exists
         };
@@ -916,18 +921,7 @@ impl Client {
                 {
                     log::warn!("No sender key for status broadcast, forcing distribution.");
 
-                    if let Err(e) = self
-                        .persistence_manager
-                        .clear_sender_key_devices(&to_str)
-                        .await
-                    {
-                        log::warn!(
-                            "Failed to clear status SKDM recipients for {}: {:?}",
-                            to_str,
-                            e
-                        );
-                    }
-                    self.sender_key_device_cache.invalidate(&to_str).await;
+                    self.reset_sender_key_device_tracking(&to_str).await?;
 
                     let mut store_adapter_retry =
                         self.signal_adapter_from(device_store_arc.clone());
@@ -962,6 +956,10 @@ impl Client {
             .ensure_status_participants(prepared.node, &group_info)
             .await?;
 
+        // Gate the stanza on the sender-key ratchet advance being durable
+        // (same rule as the DM/group send path); a failure aborts the send.
+        self.persist_signal_state_pre_wire().await?;
+
         let ack = if let Some(phash) = stanza
             .attrs()
             .optional_string("phash")
@@ -986,13 +984,11 @@ impl Client {
 
         self.update_sender_key_devices(&to_str, &prepared.skdm_devices)
             .await;
+        drop(distribution_guard);
 
         for user in &prepared.stale_device_users {
             self.invalidate_device_cache(user).await;
         }
-
-        self.flush_signal_cache_batch_safe_logged("send_status_message", None)
-            .await;
 
         Ok(SendResult {
             message_id: request_id,
@@ -1341,12 +1337,10 @@ impl Client {
         // distribution path. If the clear fails, fall back to deleting the bot's
         // own sender key for the chat — the next send will see `!key_exists` and
         // force_skdm without depending on the tracker.
+        let mut flush_fallback = false;
         if jid.is_group() || jid.is_status_broadcast() {
-            let cleared = self
-                .persistence_manager
-                .clear_sender_key_devices(&jid_str)
-                .await;
-            if let Err(e) = cleared {
+            let distribution_guard = self.group_distribution_lock(jid).await;
+            if let Err(e) = self.reset_sender_key_device_tracking(&jid_str).await {
                 log::warn!(
                     "phash mismatch: clear_sender_key_devices failed: {e} — \
                      deleting own sender key as fallback to force redistribution"
@@ -1359,12 +1353,17 @@ impl Client {
                         SenderKeyName::from_parts(&jid_str, own.to_protocol_address().as_str());
                     self.signal_cache.delete_sender_key(sk.cache_key()).await;
                 }
-                let _ = self
-                    .flush_signal_cache_batch_safe_logged("phash-mismatch-fallback", None)
-                    .await;
+                flush_fallback = true;
             }
+            drop(distribution_guard);
+        } else {
+            self.sender_key_device_cache.invalidate(&jid_str).await;
         }
-        self.sender_key_device_cache.invalidate(&jid_str).await;
+        if flush_fallback {
+            let _ = self
+                .flush_signal_cache_batch_safe_logged("phash-mismatch-fallback", None)
+                .await;
+        }
         if invalidate_group_cache {
             self.get_group_cache().await.invalidate(jid).await;
         }
@@ -1481,6 +1480,15 @@ impl Client {
             .await?
         };
 
+        // The outbound advance must be durable BEFORE the stanza hits the wire:
+        // reusing an outbound counter reuses its message key + IV. Counters are
+        // leased in batches (see `SessionRecord::reserve_sender_chain_counters`),
+        // so most sends are already covered by a durable lease and only
+        // schedule the coalesced write-behind; a send that raised either lease
+        // flushes synchronously, and a persistence failure must abort the send
+        // rather than transmit an advance we couldn't save.
+        self.persist_signal_state_pre_wire().await?;
+
         let ack = if let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
                 .attrs()
@@ -1509,7 +1517,6 @@ impl Client {
             }
             return Err(e.into());
         }
-
         if let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),
@@ -1551,10 +1558,6 @@ impl Client {
         }
         // Warm marking is visible; a waiting cold send may now re-resolve.
         drop(distribution_guard);
-
-        // Flush cached Signal state to DB after encryption
-        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
-            .await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
         // Fire-and-forget so send_message returns without waiting for the IQ
@@ -1707,6 +1710,9 @@ impl Client {
                 distribution_guard = Some(self.group_distribution_lock(&to).await);
                 let (key_exists, needs_rotation) = read_sender_key_state().await?;
                 force_skdm = force_key_distribution || !key_exists || needs_rotation;
+                if !key_exists || needs_rotation {
+                    self.reset_sender_key_device_tracking(&to_str).await?;
+                }
                 if needs_rotation {
                     log::info!(
                         "Periodic sender-key rotation for {} (chain iteration >= {SENDER_KEY_ROTATION_THRESHOLD})",
@@ -1715,14 +1721,6 @@ impl Client {
                     self.signal_cache
                         .delete_sender_key(sender_key_name.cache_key())
                         .await;
-                    if let Err(e) = self
-                        .persistence_manager
-                        .clear_sender_key_devices(&to_str)
-                        .await
-                    {
-                        log::warn!("periodic rotation: clear_sender_key_devices failed: {e}");
-                    }
-                    self.sender_key_device_cache.invalidate(&to_str).await;
                 }
                 if !force_skdm {
                     distribution_guard = None;
@@ -1879,14 +1877,7 @@ impl Client {
                         let (retry_force, retry_targets, retry_all) = match warm_targets {
                             Some((all, needs)) => (false, Some(needs), Some(all)),
                             None => {
-                                if let Err(e) = self
-                                    .persistence_manager
-                                    .clear_sender_key_devices(&to_str)
-                                    .await
-                                {
-                                    log::warn!("Failed to clear SKDM recipients: {:?}", e);
-                                }
-                                self.sender_key_device_cache.invalidate(&to_str).await;
+                                self.reset_sender_key_device_tracking(&to_str).await?;
                                 (true, None, None)
                             }
                         };
@@ -2267,8 +2258,10 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;
 
     #[test]
@@ -2372,6 +2365,55 @@ mod tests {
             msg.contains("reaction_message") || msg.contains("status"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn status_send_waits_for_distribution_guard() {
+        let client = crate::test_utils::create_test_client().await;
+        let own_pn: Jid = "15551234001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(own_pn)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(own_lid)))
+            .await;
+
+        let status = Jid::status_broadcast();
+        let held = client.group_distribution_lock(&status).await;
+        let lock = client
+            .group_distribution_locks
+            .get(&status)
+            .await
+            .expect("cached distribution lock");
+        let lock_refs = std::sync::Arc::strong_count(&lock);
+        let mut task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let recipient: Jid = "100000000000002@lid".parse().unwrap();
+                client
+                    .send_status_message(
+                        wa::Message {
+                            conversation: Some("serialized status".into()),
+                            ..Default::default()
+                        },
+                        std::slice::from_ref(&recipient),
+                        crate::features::status::StatusSendOptions::default(),
+                    )
+                    .await
+            }
+        });
+
+        wait_for_lock_waiter(&lock, lock_refs).await;
+        assert!(!task.is_finished(), "status send must wait for the lane");
+        drop(held);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .expect("status send must resume")
+            .expect("status task");
     }
 
     // A logged-out send goes through send_message_impl, whose internal

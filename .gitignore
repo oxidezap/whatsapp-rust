@@ -2,7 +2,8 @@
 /*.xml
 /*.txt
 /whatsapp_store
-/.cargo
+/.cargo/*
+!/.cargo/config.toml
 /.vscode
 /*.db*
 .env

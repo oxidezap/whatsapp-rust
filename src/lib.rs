@@ -81,6 +81,7 @@ pub mod pair;
 pub mod pair_code;
 pub mod passkey;
 pub mod request;
+pub(crate) mod signal_flush;
 pub use request::IqError;
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
@@ -96,7 +97,7 @@ pub mod socket;
 pub mod store;
 pub mod transport;
 pub mod upload;
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
 pub mod voip;
 pub use upload::UploadOptions;
 

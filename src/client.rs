@@ -177,7 +177,24 @@ type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
 #[derive(Clone)]
 pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<async_lock::Mutex<()>>,
-    pub queue_tx: async_channel::Sender<Arc<wacore_binary::OwnedNodeRef>>,
+    pub queue_tx: async_channel::Sender<QueuedChatMessage>,
+}
+
+impl ChatLane {
+    pub(crate) fn try_enqueue(
+        &self,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+    ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        self.queue_tx.try_send(QueuedChatMessage {
+            node,
+            lane_liveness: Arc::clone(&self.enqueue_lock),
+        })
+    }
+}
+
+pub(crate) struct QueuedChatMessage {
+    pub node: Arc<wacore_binary::OwnedNodeRef>,
+    pub lane_liveness: Arc<async_lock::Mutex<()>>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
@@ -225,6 +242,11 @@ pub struct MemoryReport {
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     pub chat_lanes: u64,
+    pub group_distribution_locks: u64,
+    /// Cumulative capacity evictions; poll successive reports to derive a rate.
+    pub group_distribution_lock_evictions: u64,
+    /// Cumulative attempts that kept a live lane and temporarily exceeded capacity.
+    pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
@@ -295,6 +317,13 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
+        writeln!(
+            f,
+            "  group_dist_locks:       {} (evicted: {}, blocked: {})",
+            self.group_distribution_locks,
+            self.group_distribution_lock_evictions,
+            self.group_distribution_lock_eviction_blocks
+        )?;
         writeln!(
             f,
             "  resend_rl_chats:        {}",
@@ -455,14 +484,7 @@ impl ClientError {
         match self {
             ClientError::NotConnected => true,
             ClientError::EncryptSend(e) => e.is_transport_unavailable(),
-            // Transport loss can now arrive wrapped in an IQ failure (the base
-            // error gained `Iq`); unwrap it so retry/reconnect still triggers.
-            ClientError::Iq(e) => match e {
-                crate::request::IqError::NotConnected => true,
-                crate::request::IqError::EncryptSend(e) => e.is_transport_unavailable(),
-                crate::request::IqError::ClientState(client) => client.is_transport_unavailable(),
-                _ => false,
-            },
+            ClientError::Iq(e) => e.is_transport_unavailable(),
             _ => false,
         }
     }
@@ -560,8 +582,9 @@ pub struct Client {
     pub(crate) unified_session: crate::unified_session::UnifiedSessionManager,
 
     /// In-memory cache for Signal protocol state (sessions, identities, sender keys).
-    /// Matches WhatsApp Web's SignalStoreCache pattern: crypto ops read/write this cache,
-    /// and DB writes are deferred to flush() after each message is processed.
+    /// Matches WhatsApp Web's SignalStoreCache pattern: crypto ops read/write this
+    /// cache, and DB writes are flushed out of it — synchronously on the send path
+    /// and coalesced on the receive path (see `signal_flush.rs`).
     pub(crate) signal_cache: Arc<crate::store::signal_cache::SignalStoreCache>,
 
     /// Limits message processing concurrency (1 permit during offline sync, N after).
@@ -655,7 +678,7 @@ pub struct Client {
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 
     pub(crate) app_state_processor: async_lock::Mutex<Option<Arc<AppStateProcessor>>>,
-    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<String, wacore::time::Instant>>>,
+    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
     pub(crate) app_state_syncing: Arc<Mutex<HashSet<WAPatchName>>>,
@@ -836,6 +859,35 @@ pub struct Client {
     /// Initialized after `Arc::new(this)` in the constructor.
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Client>>,
 
+    /// Single-flight state for the coalesced Signal-cache flush worker:
+    /// `(connection_generation << 2) | RUNNING/DIRTY bits` (see `signal_flush.rs`).
+    pub(crate) signal_flush_state: AtomicU64,
+    /// Barrier between a coalesced-flush worker's backend write and teardown's
+    /// Signal-cache settle. The generation-scoped atomic only orders
+    /// `signal_flush_state`, not the writes themselves: a worker that passed its
+    /// pre-flush generation check could still be mid-flush when teardown settles
+    /// the cache and the next connection's drain dirties it, persisting rowless
+    /// advances out of band. The worker holds this only across the flush (never
+    /// across sleep/backoff) and re-checks the generation under it; teardown
+    /// holds it around the settle. Lock order is always this-gate → processing
+    /// permit / sessions lock, so no inversion.
+    pub(crate) signal_flush_lifecycle: async_lock::Mutex<()>,
+    /// Injected failures for the coalesced flush (consumed one per attempt),
+    /// so tests can exercise the retry/backoff path deterministically.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_failures: AtomicU32,
+    /// Blocks each coalesced flush attempt while set, so a test can hold a
+    /// worker inside the flush and drive a concurrent generation change.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_block: AtomicBool,
+    /// Counts entries into the coalesced flush attempt, so a test can wait
+    /// until a worker is actually inside the (blocked) flush.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_in_attempt: AtomicU32,
+    /// Keeps retry regressions deterministic without corrupting the test database.
+    #[cfg(test)]
+    pub(crate) app_state_key_share_prepare_test_failures: AtomicU32,
+
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by
     /// `Bot::build`; on Client drop (last Arc), the handle drops and the saver
@@ -854,14 +906,14 @@ pub struct Client {
     /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
     /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
     /// `voip` feature: it is populated only by the `voip` media facade.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
 
     /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
     /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
     /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
     /// arrives. Behind the `voip` feature; populated only by the media facade.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     pub(crate) pending_outgoing_calls: Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::voip::facade::PendingOutgoing>>,
     >,

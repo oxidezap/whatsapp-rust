@@ -13,6 +13,11 @@ env:
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
+  # The target dir is restored fresh each run (Swatinem cache), so incremental
+  # state is always cold and only bloats artifacts; worse, sccache refuses to
+  # cache incremental compilations, so leaving it on excludes the workspace
+  # crates from caching entirely.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   wasm:
@@ -25,11 +30,14 @@ jobs:
           toolchain: nightly-2026-06-16
           targets: wasm32-unknown-unknown
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache Rust registry
+        uses: mozilla-actions/sccache-action@v0.0.10
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "false"
+          cache-targets: "true"
       # Mirrors how whatsapp-rust-bridge consumes the crate: lib only (the
       # binary pulls tokio/sqlite), no default features. Guards against code
       # reachable from wasm regressing on tokio/std-only APIs.

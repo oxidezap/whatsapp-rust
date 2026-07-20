@@ -1,7 +1,6 @@
 use crate::client::Client;
 use crate::message::RetryReason;
 use crate::types::events::Receipt;
-use buffa::Message;
 use log::{debug, info, warn};
 use wacore::types::message::MessageCategory;
 
@@ -12,10 +11,10 @@ use wacore::libsignal::protocol::{PreKeyBundle, PublicKey, UsePQRatchet, process
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::JidExt as _;
-use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Jid, OwnedNodeRef};
 #[cfg(test)]
-use wacore_binary::{Node, NodeContent};
+use wacore_binary::NodeContent;
+use wacore_binary::builder::NodeBuilder;
+use wacore_binary::{Jid, Node, OwnedNodeRef};
 use wacore_binary::{NodeContentRef, NodeRef};
 
 /// Helper to extract bytes content from a Node (used in tests).
@@ -379,6 +378,7 @@ impl Client {
         // WA Web rotateKey: unknown device (not in participant list, not LID) →
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
+        let mut rotated_sender_key = false;
         if is_group_or_status && !info.requester.is_lid() && !info.chat.is_status_broadcast() {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
@@ -392,6 +392,7 @@ impl Client {
                     info.requester.observe(),
                     group_jid
                 );
+                let _distribution_guard = self.group_distribution_lock(&info.chat).await;
 
                 // WA Web: deleteGroupSenderKeyInfo(groupWid, ownWid) — delete our own
                 // sender key for forward secrecy. When addressing mode is known,
@@ -425,15 +426,15 @@ impl Client {
 
                 // DB first, then cache invalidate — prevents a concurrent
                 // resolve_skdm_targets from reviving stale cache entries.
-                if let Err(e) = self
-                    .persistence_manager
-                    .clear_sender_key_devices(&group_jid)
-                    .await
-                {
+                if let Err(e) = self.reset_sender_key_device_tracking(&group_jid).await {
                     log::warn!("Failed to clear sender key devices for rotation: {}", e);
                 }
-                self.sender_key_device_cache.invalidate(&group_jid).await;
+                rotated_sender_key = true;
             }
+        }
+        if rotated_sender_key {
+            self.flush_signal_cache_batch_safe_logged("unknown-participant rotation", None)
+                .await;
         }
 
         // Mirror WAWebUpdateLocalSignalSession for all chat types: markForgetSenderKey
@@ -560,12 +561,10 @@ impl Client {
             )
             .await?;
 
-            // The Signal mutation is done; the batch-safe flush acquires the
-            // processing permit, and inbound processing holds that permit
-            // while taking this same session lock — release it first.
+            // The pre-wire gate can take the processing permit, whose holder
+            // may need this session lock.
             drop(_session_guard);
-            self.send_node(stanza).await?;
-            self.flush_signal_cache_batch_safe().await?;
+            self.send_retry_stanza(stanza).await?;
         } else {
             // DM retry: pairwise resend to the requesting device only.
             // Use _resolved variant: resolved_jid is already in the correct
@@ -601,10 +600,15 @@ impl Client {
 
             // Same lock-ordering rule as the group branch above.
             drop(_session_guard);
-            self.send_node(stanza).await?;
-            self.flush_signal_cache_batch_safe().await?;
+            self.send_retry_stanza(stanza).await?;
         }
 
+        Ok(())
+    }
+
+    async fn send_retry_stanza(&self, stanza: Node) -> Result<(), anyhow::Error> {
+        self.persist_signal_state_pre_wire().await?;
+        self.send_node(stanza).await?;
         Ok(())
     }
 
@@ -1144,11 +1148,11 @@ impl Client {
             // Validate the account BEFORE reserving/marking the prekey: a missing
             // account bails here, and marking after would abandon a one-time
             // prekey from the upload window without any receipt going out.
-            let device_identity_bytes = device_snapshot
-                .account
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing device account info for retry receipt"))?
-                .encode_to_vec();
+            let device_identity_bytes = waproto::codec::adv_signed_device_identity_to_vec(
+                device_snapshot.account.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing device account info for retry receipt")
+                })?,
+            );
 
             // markKeyAsUploaded: the retry prekey goes directly to the peer, so
             // it must not also be re-offered to the server pool (a third party
@@ -1315,6 +1319,119 @@ mod tests {
         super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
     }
 
+    async fn attach_mock_noise_socket(client: &Client) {
+        use crate::socket::NoiseSocket;
+        use crate::transport::mock::MockTransport;
+        use wacore::handshake::NoiseCipher;
+
+        let key = [0u8; 32];
+        let socket = NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(MockTransport),
+            NoiseCipher::new(&key).expect("write cipher"),
+            NoiseCipher::new(&key).expect("read cipher"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(socket));
+    }
+
+    async fn seed_retry_lease(
+        client: &Client,
+        address: &wacore::libsignal::protocol::ProtocolAddress,
+        durable: bool,
+    ) {
+        use wacore::libsignal::protocol::SessionRecord;
+
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        client.signal_cache.put_session(address, record).await;
+        if !durable {
+            return;
+        }
+
+        client.flush_signal_cache().await.expect("durable lease");
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let record = client
+            .signal_cache
+            .get_session(address, &*snapshot.backend)
+            .await
+            .expect("session read")
+            .expect("leased session");
+        assert!(record.reserved_sender_chain_index() > 0);
+        client.signal_cache.put_session(address, record).await;
+    }
+
+    #[tokio::test]
+    async fn retry_pre_wire_flush_failure_never_reaches_send_node() {
+        use std::sync::atomic::Ordering;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("retry_pre_wire_failure").await;
+        attach_mock_noise_socket(&client).await;
+        let address = Jid::lid_device("100000000001035".to_string(), 7).to_protocol_address();
+        seed_retry_lease(&client, &address, false).await;
+        assert!(client.signal_cache.needs_pre_wire_flush().await);
+
+        client.inbound_commit_batch.reset();
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+
+        let id = "RETRY_PRE_WIRE_FAILURE";
+        let mut waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
+        let result = client
+            .send_retry_stanza(NodeBuilder::new("message").attr("id", id).build())
+            .await;
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(result.is_err(), "the failed durability gate must abort");
+        assert!(
+            waiter.try_recv().expect("waiter stays live").is_none(),
+            "send_node must not observe a stanza before durability"
+        );
+        assert!(
+            client.signal_cache.needs_pre_wire_flush().await,
+            "the failed reservation must remain gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_inside_durable_lease_skips_synchronous_full_flush() {
+        use std::sync::atomic::Ordering;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("retry_covered_by_lease").await;
+        attach_mock_noise_socket(&client).await;
+        let address = Jid::lid_device("100000000001036".to_string(), 8).to_protocol_address();
+        seed_retry_lease(&client, &address, true).await;
+        assert!(!client.signal_cache.needs_pre_wire_flush().await);
+
+        client.inbound_commit_batch.reset();
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+
+        let id = "RETRY_COVERED_BY_LEASE";
+        let waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
+        let result = client
+            .send_retry_stanza(NodeBuilder::new("message").attr("id", id).build())
+            .await;
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        result.expect("an existing durable lease must not synchronously flush");
+        let sent = waiter.await.expect("retry stanza reached send_node");
+        assert_eq!(sent.attrs().required_string("id").unwrap(), id);
+    }
+
     #[tokio::test]
     async fn recent_message_cache_insert_and_take() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -1360,6 +1477,59 @@ mod tests {
         // Second take should return None
         let taken_again = client.take_recent_message(&chat, &msg_id).await;
         assert!(taken_again.is_none());
+    }
+
+    /// DB-only path (no L1 cache, capacity 0 -- the harness/default): the wave
+    /// that resolves the chat directly and stores the caller's borrowed id must
+    /// still round-trip through the backend, so take_recent_message finds it.
+    #[tokio::test]
+    async fn recent_message_db_only_round_trip() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        // Capacity 0 keeps the L1 cache off, so the store + retrieve goes through
+        // the backend -- exactly the DB-only branch add_recent_message took.
+        let config = crate::cache_config::CacheConfig::default();
+        assert_eq!(
+            config.recent_messages.capacity, 0,
+            "this test asserts the DB-only (capacity 0) path"
+        );
+        let (client, _sync_rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let chat: Jid = "120363021033254949@g.us"
+            .parse()
+            .expect("test JID should be valid");
+        let msg_id = "DBONLY1".to_string();
+        let msg = wa::Message {
+            conversation: Some("db-only".into()),
+            ..Default::default()
+        };
+
+        client.add_recent_message(&chat, &msg_id, &msg, None).await;
+
+        let taken = client.take_recent_message(&chat, &msg_id).await;
+        assert!(
+            taken.is_some(),
+            "a DB-only stored message must be retrievable from the backend"
+        );
+        let (got, _alt) = taken.unwrap();
+        assert_eq!(got.conversation.as_deref(), Some("db-only"));
+
+        let again = client.take_recent_message(&chat, &msg_id).await;
+        assert!(again.is_none(), "take consumes the DB-only message");
     }
 
     #[tokio::test]
@@ -2365,6 +2535,114 @@ mod tests {
             client.pending_retries.lock().unwrap().len(),
             0,
             "the in-progress marker is cleared after the throttled return"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_participant_rotation_is_durable_before_throttled_return() {
+        use wacore::libsignal::protocol::{SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyRecord};
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore_binary::builder::NodeBuilder;
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let own_lid: Jid = "100000000001040:13@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+        let group: Jid = "120363021033254950@g.us".parse().unwrap();
+        let group_id = group.to_string();
+        let sender_key_name =
+            SenderKeyName::from_parts(&group_id, own_lid.to_protocol_address().as_str());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let key_pair = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(
+                SENDERKEY_MESSAGE_CURRENT_VERSION,
+                9,
+                0,
+                &[7; 32],
+                key_pair.public_key,
+                Some(key_pair.private_key),
+            )
+            .unwrap();
+        client
+            .signal_cache
+            .put_sender_key(&sender_key_name, record)
+            .await;
+        client.flush_signal_cache().await.unwrap();
+        assert!(
+            backend
+                .get_sender_key(sender_key_name.cache_key())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let msg_id = "ROTATEFLUSH001";
+        client
+            .add_recent_message(
+                &group,
+                msg_id,
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        client.set_resend_rate_limit(1, 0);
+        assert!(client.resend_rate_limiter.try_acquire(&group).await);
+
+        let requester: Jid = "15551234002@s.whatsapp.net".parse().unwrap();
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", &requester)
+            .children([NodeBuilder::new("retry")
+                .attr("id", msg_id)
+                .attr("count", "1")
+                .build()])
+            .build();
+        let node_ref = crate::test_utils::node_to_owned_ref(&node);
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
+                chat: group.clone(),
+                sender: requester,
+                is_group: true,
+                ..Default::default()
+            })
+            .message_ids(vec![msg_id.to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
+
+        client
+            .handle_retry_receipt(&receipt, &node_ref)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .get_sender_key(sender_key_name.cache_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "early retry return must not leave the retired key durable"
         );
     }
 

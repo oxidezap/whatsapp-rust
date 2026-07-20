@@ -4,8 +4,8 @@
 
 use thiserror::Error;
 use wacore::libsignal::protocol::{
-    CiphertextMessage, PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet,
-    message_decrypt, message_encrypt,
+    CiphertextMessage, PreKeySignalMessage, SenderKeyStore, SignalMessage, SignalProtocolError,
+    UsePQRatchet, message_decrypt, message_encrypt,
 };
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
@@ -70,7 +70,9 @@ impl<'a> Signal<'a> {
         .await?;
 
         drop(_guard);
-        self.client.flush_signal_cache_batch_safe().await?;
+        // Same pre-wire gate as the send path: the caller transmits these
+        // bytes, so a raised lease must be durable before they leave here.
+        self.client.persist_signal_state_pre_wire().await?;
 
         let (_, is_prekey, bytes) = wacore::send::extract_ciphertext(encrypted)
             .ok_or_else(|| SignalError::Unsupported("unexpected ciphertext variant".into()))?;
@@ -208,11 +210,10 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
-        // Chain mutation done; the batch-safe flush acquires the processing
-        // permit, and a permit holder can need this sender-key lock — release
-        // it first.
+        // The durability gate can need the processing permit, whose holder may
+        // need this chain lock.
         drop(_chain_guard);
-        self.client.flush_signal_cache_batch_safe().await?;
+        self.client.persist_signal_state_pre_wire().await?;
 
         Ok((skdm_bytes, ciphertext.into_serialized().into_vec()))
     }
@@ -222,8 +223,7 @@ impl<'a> Signal<'a> {
     /// Returns raw padded plaintext. Use [`MessageUtils::unpad_message_ref`]
     /// with the stanza's `v` attribute if WhatsApp message unpadding is needed.
     ///
-    /// Not safe to call concurrently with `encrypt_group_message` for the
-    /// same group — sender key state is not internally locked.
+    /// Concurrent mutations of the same sender-key chain are serialized.
     pub async fn decrypt_group_message(
         &self,
         group_jid: &Jid,
@@ -234,6 +234,11 @@ impl<'a> Signal<'a> {
             make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
 
         let mut adapter = self.client.signal_adapter().await;
+        let chain_lock = adapter
+            .sender_key_store
+            .sender_key_lock(&sender_key_name)
+            .await;
+        let _chain_guard = chain_lock.lock().await;
 
         let plaintext = wacore::libsignal::protocol::group_decrypt(
             ciphertext,
@@ -242,6 +247,7 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
+        drop(_chain_guard);
         self.client.flush_signal_cache_batch_safe().await?;
 
         Ok(plaintext.to_vec())
@@ -327,7 +333,7 @@ impl<'a> Signal<'a> {
         .await?;
 
         drop(_session_guards);
-        self.client.flush_signal_cache_batch_safe().await?;
+        self.client.persist_signal_state_pre_wire().await?;
 
         Ok((result.participant_nodes, result.includes_prekey_message))
     }
@@ -348,5 +354,135 @@ impl Client {
     /// Access low-level Signal protocol operations.
     pub fn signal(&self) -> Signal<'_> {
         Signal::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use wacore::store::in_memory::InMemoryBackend;
+    use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+    use wacore_binary::Server;
+
+    use crate::test_utils::seed_peer_session;
+
+    async fn memory_client() -> (Arc<Client>, Arc<InMemoryBackend>) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                Jid::new("15550001000", Server::Pn),
+            )))
+            .await;
+        (client, backend)
+    }
+
+    #[tokio::test]
+    async fn group_encrypt_flushes_only_at_sender_key_lease_boundaries() {
+        use wacore::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+
+        let (client, backend) = memory_client().await;
+        let group = Jid::new("120363000000000000", Server::Group);
+
+        let (skdm, _) = client
+            .signal()
+            .encrypt_group_message(&group, b"first")
+            .await
+            .expect("first group encrypt");
+        assert!(skdm.is_some(), "the first encrypt must create an SKDM");
+        assert_eq!(backend.sender_key_batch_write_count(), 1);
+
+        client
+            .signal_flush_test_block
+            .store(true, Ordering::Release);
+        for _ in 1..SENDER_CHAIN_RESERVATION_BATCH {
+            let (skdm, _) = client
+                .signal()
+                .encrypt_group_message(&group, b"warm")
+                .await
+                .expect("lease-covered group encrypt");
+            assert!(skdm.is_none(), "a warm chain must reuse its SKDM");
+        }
+        assert_eq!(
+            backend.sender_key_batch_write_count(),
+            1,
+            "lease-covered iterations must not flush synchronously"
+        );
+
+        client
+            .signal()
+            .encrypt_group_message(&group, b"boundary")
+            .await
+            .expect("boundary group encrypt");
+        assert_eq!(
+            backend.sender_key_batch_write_count(),
+            2,
+            "raising the next lease must flush before returning ciphertext"
+        );
+        client
+            .signal_flush_test_block
+            .store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn participant_fanout_reuses_durable_session_leases() {
+        let (client, backend) = memory_client().await;
+        let recipient = Jid::new("15550002000", Server::Pn);
+        client
+            .update_device_list(DeviceListRecord {
+                user: recipient.user.to_string(),
+                devices: vec![
+                    DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    DeviceInfo {
+                        device_id: 1,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("device registry");
+
+        let devices = [recipient.with_device(0), recipient.with_device(1)];
+        for device in &devices {
+            seed_peer_session(&client, device).await;
+            client
+                .signal()
+                .encrypt_message(device, b"warm lease")
+                .await
+                .expect("lease warmup");
+        }
+        let writes_before = backend.session_batch_write_count();
+
+        client
+            .signal_flush_test_block
+            .store(true, Ordering::Release);
+        let message = waproto::whatsapp::Message {
+            conversation: Some("fanout".into()),
+            ..Default::default()
+        };
+        let (nodes, _) = client
+            .signal()
+            .create_participant_nodes(std::slice::from_ref(&recipient), &message)
+            .await
+            .expect("participant fanout");
+        assert_eq!(nodes.len(), devices.len());
+        assert_eq!(
+            backend.session_batch_write_count(),
+            writes_before,
+            "a warm fanout must not flush durable leases synchronously"
+        );
+        client
+            .signal_flush_test_block
+            .store(false, Ordering::Release);
     }
 }

@@ -45,6 +45,17 @@ impl Drop for ResponseWaiterGuard {
     }
 }
 
+/// Outcome of the per-spec encode/build step in [`Client::execute`]. Owned (no
+/// spec type parameter) so the send/wait tail behind it stays non-generic.
+enum PreparedIq {
+    /// Fully binary-encoded stanza from `encode_iq_direct` (fast path).
+    Encoded(Vec<u8>),
+    /// Fallback: an `InfoQuery` from `build_iq`, still to be marshalled.
+    /// Boxed to keep the enum small (`InfoQuery` is ~200 bytes vs the
+    /// fast-path `Vec`'s 24) — one alloc per fallback IQ, control-plane only.
+    Query(Box<InfoQuery<'static>>),
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IqError {
@@ -79,6 +90,19 @@ pub enum IqError {
     EncodeError(#[source] anyhow::Error),
     #[error("failed to parse IQ response")]
     ParseError(#[from] anyhow::Error),
+}
+
+impl IqError {
+    pub(crate) fn is_transport_unavailable(&self) -> bool {
+        match self {
+            IqError::NotConnected | IqError::Disconnected(_) | IqError::InternalChannelClosed => {
+                true
+            }
+            IqError::EncryptSend(error) => error.is_transport_unavailable(),
+            IqError::ClientState(client) => client.is_transport_unavailable(),
+            _ => false,
+        }
+    }
 }
 
 impl From<wacore::request::IqError> for IqError {
@@ -249,36 +273,51 @@ impl Client {
     where
         S: wacore::iq::spec::IqSpec,
     {
+        // Only the three spec calls live in this generic body; the send/wait
+        // machinery sits behind the non-generic `execute_prepared` so it isn't
+        // re-stamped for every IqSpec instantiation (~55 of them).
         let req_id = self.generate_request_id();
+        let mut buf = Vec::new();
+        let prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
+            Ok(true) => PreparedIq::Encoded(buf),
+            Ok(false) => PreparedIq::Query(Box::new(spec.build_iq())),
+            Err(e) => return Err(IqError::EncodeError(e)),
+        };
 
-        // Direct-encode fast path: skip Node tree for hot IQ specs (e.g. PreKeyUploadSpec)
-        {
-            let mut buf = Vec::new();
-            match spec.encode_iq_direct(&req_id, &mut buf) {
-                Ok(true) => {
-                    let response = self
-                        .send_and_wait_iq(
-                            req_id,
-                            Duration::from_secs(75),
-                            Box::pin(async { self.send_raw_bytes(buf).await }),
-                        )
-                        .await?;
-                    return spec
-                        .parse_response(response.get())
-                        .map_err(IqError::ParseError);
-                }
-                Err(e) => return Err(IqError::EncodeError(e)),
-                Ok(false) => {}
-            }
-        }
-
-        let mut iq = spec.build_iq();
-        if iq.id.is_none() {
-            iq.id = Some(req_id);
-        }
-        let response = self.send_iq(iq).await?;
+        let response = self.execute_prepared(req_id, prepared).await?;
         spec.parse_response(response.get())
             .map_err(IqError::ParseError)
+    }
+
+    /// Non-generic tail of [`Client::execute`]: sends the already-prepared IQ
+    /// and waits for the response node.
+    async fn execute_prepared(
+        &self,
+        req_id: String,
+        prepared: PreparedIq,
+    ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        match prepared {
+            // Direct-encode fast path: skip the Node tree for hot IQ specs
+            // (e.g. PreKeyUploadSpec). Fixed 75s timeout — specs needing a
+            // custom timeout don't opt into this path.
+            PreparedIq::Encoded(buf) => {
+                self.send_and_wait_iq(
+                    req_id,
+                    Duration::from_secs(75),
+                    Box::pin(async { self.send_raw_bytes(buf).await }),
+                )
+                .await
+            }
+            PreparedIq::Query(iq) => {
+                let mut iq = *iq;
+                // Reuse the id already generated for the fast-path attempt so
+                // send_iq doesn't mint a second one.
+                if iq.id.is_none() {
+                    iq.id = Some(req_id);
+                }
+                self.send_iq(iq).await
+            }
+        }
     }
 
     /// Centralizes waiter registration and shutdown/timeout handling.

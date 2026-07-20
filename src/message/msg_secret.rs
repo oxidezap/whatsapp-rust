@@ -464,12 +464,10 @@ impl Client {
         info: &Arc<MessageInfo>,
         payload: EncPayload,
     ) {
-        use buffa::Message as _;
-        use wa::MessageSecretMessage;
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
-        let ms_msg = match MessageSecretMessage::decode_from_slice(&payload.ciphertext) {
+        let ms_msg = match waproto::codec::message_secret_message_decode(&payload.ciphertext) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(
@@ -704,7 +702,7 @@ impl Client {
             info.id,
             info.source.sender.observe()
         );
-        self.dispatch_parsed_message(msg, info).await;
+        self.dispatch_parsed_message(msg, info, false).await;
     }
 
     /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when

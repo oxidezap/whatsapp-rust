@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
 use async_trait::async_trait;
-use buffa::Message;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
@@ -98,17 +97,14 @@ fn lookup_app_state_key(
 /// external fetch and lets the collection error out, rather than applying an empty
 /// patch and advancing the version. Swallowing it here would silently drop the
 /// blob's mutations and still persist the new version, losing that data permanently.
-fn download_external_blobs<FDownload>(pl: &mut PatchList, download: &FDownload) -> Result<()>
-where
-    FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
-{
+fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
     let name = pl.name;
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
         let data =
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = wa::SyncdSnapshot::decode_from_slice(data.as_slice())
+        let snapshot = waproto::codec::syncd_snapshot_decode(data.as_slice())
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
         pl.snapshot = Some(snapshot);
     }
@@ -122,13 +118,18 @@ where
                 .unwrap_or(0);
             let data = download(ext)
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = wa::SyncdMutations::decode_from_slice(data.as_slice())
+            let ext_mutations = waproto::codec::syncd_mutations_decode(data.as_slice())
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
             patch.mutations = ext_mutations.mutations;
         }
     }
     Ok(())
 }
+
+/// External-blob resolver as a trait object, so the large download/decode/apply
+/// bodies below instantiate once instead of per closure type.
+pub type BlobDownloadFn<'a> =
+    dyn Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync + 'a;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -190,15 +191,12 @@ impl AppStateProcessor {
         Ok(())
     }
 
-    pub async fn decode_patch_list_ref<FDownload>(
+    pub async fn decode_patch_list_ref(
         &self,
         stanza_root: &NodeRef<'_>,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let pl = parse_patch_list_ref(stanza_root)?;
         self.process_parsed_patch_list(pl, download, validate_macs)
             .await
@@ -208,42 +206,33 @@ impl AppStateProcessor {
     /// `download`, then decode + apply. Lets a caller that parsed the response for
     /// pre-download avoid re-parsing it. See [`decode_patch_list_ref`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
-    pub async fn process_parsed_patch_list<FDownload>(
+    pub async fn process_parsed_patch_list(
         &self,
         mut pl: PatchList,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
-        download_external_blobs(&mut pl, &download)?;
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        download_external_blobs(&mut pl, download)?;
         self.process_patch_list(pl, validate_macs).await
     }
 
-    pub async fn decode_patch_list<FDownload>(
+    pub async fn decode_patch_list(
         &self,
         stanza_root: &Node,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let pl = parse_patch_list(stanza_root)?;
         self.process_parsed_patch_list(pl, download, validate_macs)
             .await
     }
 
-    pub async fn decode_multi_patch_list_ref<FDownload>(
+    pub async fn decode_multi_patch_list_ref(
         &self,
         stanza_root: &NodeRef<'_>,
-        download: &FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let patch_lists = parse_patch_lists_ref(stanza_root)?;
         self.process_patch_lists(patch_lists, download, validate_macs)
             .await
@@ -251,15 +240,12 @@ impl AppStateProcessor {
 
     /// Decode a multi-collection IQ response into per-collection results.
     /// Each collection is parsed and processed independently.
-    pub async fn decode_multi_patch_list<FDownload>(
+    pub async fn decode_multi_patch_list(
         &self,
         stanza_root: &Node,
-        download: &FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let patch_lists = parse_patch_lists(stanza_root)?;
         self.process_patch_lists(patch_lists, download, validate_macs)
             .await
@@ -269,15 +255,12 @@ impl AppStateProcessor {
     /// `download`. Lets callers that already parsed the IQ response (e.g. to
     /// pre-download blobs) avoid re-parsing it. See [`decode_multi_patch_list_ref`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
-    pub async fn process_patch_lists<FDownload>(
+    pub async fn process_patch_lists(
         &self,
         patch_lists: Vec<PatchList>,
-        download: &FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let mut results = Vec::with_capacity(patch_lists.len());
 
         for mut pl in patch_lists {
@@ -585,7 +568,7 @@ impl AppStateProcessor {
         patch.patch_mac = Some(patch_mac);
 
         // Encode to protobuf
-        let patch_bytes = patch.encode_to_vec();
+        let patch_bytes = waproto::codec::syncd_patch_to_vec(&patch);
 
         Ok((patch_bytes, base_version))
     }
@@ -608,29 +591,25 @@ impl AppStateProcessor {
     /// with `KeyNotFound`. Used by the sync paths to request missing keys up front.
     /// Idempotent: `download_external_blobs` no-ops once the blobs are inlined, and the
     /// supplied `download` closure should read from the already-prefetched cache.
-    pub async fn missing_key_ids_after_inline<FDownload>(
+    pub async fn missing_key_ids_after_inline(
         &self,
         pl: &mut PatchList,
-        download: &FDownload,
-    ) -> Result<Vec<Vec<u8>>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
-    {
+        download: &BlobDownloadFn<'_>,
+    ) -> Result<Vec<Vec<u8>>> {
         download_external_blobs(pl, download)?;
         self.get_missing_key_ids(pl).await
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_collection", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    pub async fn sync_collection<D, FDownload>(
+    pub async fn sync_collection<D>(
         &self,
         driver: &D,
         name: WAPatchName,
         validate_macs: bool,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
     ) -> Result<Vec<Mutation>>
     where
         D: AppStateSyncDriver + Sync,
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
         let mut all = Vec::new();
         // Bound re-fetches so a server that keeps returning a retryable collection
@@ -641,7 +620,7 @@ impl AppStateProcessor {
             let state = self.backend.get_version(name.as_str()).await?;
             let node = driver.fetch_collection(name, state.version).await?;
             let (mut muts, _new_state, list) = self
-                .decode_patch_list(&node, &download, validate_macs)
+                .decode_patch_list(&node, download, validate_macs)
                 .await?;
             all.append(&mut muts);
             // A retryable error (or conflict-with-more) left the version unadvanced;

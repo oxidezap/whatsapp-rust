@@ -11,5 +11,6 @@ mod traits;
 
 pub use traits::{
     Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
-    SessionStore, SignedPreKeyStore,
+    SessionCheckout, SessionCheckoutKey, SessionCheckoutStoreResult, SessionStore,
+    SignedPreKeyStore,
 };

@@ -438,6 +438,34 @@ impl SessionState {
         Ok(())
     }
 
+    /// Advance the sender chain until its next counter is at least `target`,
+    /// discarding the intermediate message keys. Restores the no-counter-reuse
+    /// invariant when this state re-enters service under a durable reservation
+    /// (snapshot reload, archived-state promotion): every counter the lease may
+    /// have already spent becomes underivable. A state without a usable sender
+    /// chain is left untouched — it cannot encrypt, so it has nothing to burn.
+    pub(crate) fn fast_forward_sender_chain(
+        &mut self,
+        target: u32,
+    ) -> Result<(), SignalProtocolError> {
+        let Ok(mut chain_key) = self.get_sender_chain_key() else {
+            return Ok(());
+        };
+        if target.saturating_sub(chain_key.index()) > consts::MAX_RESERVATION_FAST_FORWARD {
+            return Err(SignalProtocolError::InvalidSessionStructure(
+                "reserved sender chain index implausibly far ahead",
+            ));
+        }
+        if chain_key.index() >= target {
+            return Ok(());
+        }
+        while chain_key.index() < target {
+            chain_key = chain_key.next_chain_key()?;
+        }
+        self.set_sender_chain_key(&chain_key)?;
+        Ok(())
+    }
+
     pub fn get_message_keys(
         &mut self,
         sender: &PublicKey,
@@ -632,10 +660,36 @@ impl From<&SessionState> for SessionStructure {
     }
 }
 
+/// Record-level field number carrying the sender-chain counter reservation in
+/// the serialized `RecordStructure`. The upstream (whatspec) proto cannot be
+/// edited to add local fields, so the record encoder — already hand-rolled in
+/// [`SessionRecord::serialize_into`] — writes it directly; the number sits far
+/// above RecordStructure's fields (1, 2) so a future upstream addition cannot
+/// collide. Standard unknown-field skipping keeps old readers compatible.
+///
+/// That compatibility is one-way: a build without lease support silently
+/// ignores this field, so downgrading the library across a crash can resume a
+/// leased chain from its stale snapshot and reuse a counter. Nothing here can
+/// prevent that — already-released readers skip unknown fields by definition —
+/// so it is a release-note constraint, not a code one. Never lower this
+/// number into a range an older reader might interpret.
+const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 = 100;
+
 #[derive(Clone)]
 pub struct SessionRecord {
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<SessionStructure>>,
+    /// Durability lease: ceiling (exclusive) of sender-chain counters this
+    /// record's durable snapshots may already have spent on the wire. Any
+    /// state entering service from such a snapshot must fast-forward its
+    /// sender chain here first — message keys and IVs are derived
+    /// deterministically from the counter, so re-deriving a spent counter
+    /// reuses a (key, IV) pair.
+    reserved_sender_chain_index: u32,
+    /// A reservation was raised but not yet durably flushed. While set, the
+    /// owning ciphertext must not reach the wire; the store layer transfers
+    /// this into its flush gating. Transient — never serialized.
+    pending_reservation: bool,
 }
 
 impl SessionRecord {
@@ -643,6 +697,8 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
         }
     }
 
@@ -650,10 +706,52 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
         }
     }
 
+    pub fn reserved_sender_chain_index(&self) -> u32 {
+        self.reserved_sender_chain_index
+    }
+
+    /// Lease a fresh batch of sender-chain counters after `spent_counter` was
+    /// issued past the current reservation. Marks the record pending: the
+    /// caller's ciphertext must not hit the wire until a flush persists the
+    /// raised ceiling.
+    pub fn reserve_sender_chain_counters(&mut self, spent_counter: u32) {
+        self.reserved_sender_chain_index =
+            spent_counter.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
+        self.pending_reservation = true;
+    }
+
+    pub fn has_pending_reservation(&self) -> bool {
+        self.pending_reservation
+    }
+
+    /// The store layer takes ownership of the wire gate (it tracks the address
+    /// until a successful flush), so the transient flag is dropped here.
+    pub fn clear_pending_reservation(&mut self) {
+        self.pending_reservation = false;
+    }
+
     pub fn deserialize(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
+        Self::deserialize_inner(bytes, None)
+    }
+
+    /// A matching live cache proves this snapshot was not recovered after a crash.
+    #[doc(hidden)]
+    pub fn deserialize_for_store(
+        bytes: &[u8],
+        incarnation: &[u8; 16],
+    ) -> Result<Self, SignalProtocolError> {
+        Self::deserialize_inner(bytes, Some(incarnation))
+    }
+
+    fn deserialize_inner(
+        bytes: &[u8],
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<Self, SignalProtocolError> {
         use waproto::whatsapp::RecordStructureView;
 
         // Decode to a zero-copy view first, then only convert sessions we
@@ -671,7 +769,13 @@ impl SessionRecord {
             .collect::<Result<_, _>>()
             .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))?;
 
-        Ok(Self {
+        let local_fields = crate::protocol::local_field::decode_local_record_fields(
+            bytes,
+            RESERVED_SENDER_CHAIN_INDEX_FIELD,
+            || InvalidSessionError("invalid local session metadata"),
+        )?;
+
+        let mut record = Self {
             current_session: view
                 .current_session
                 .as_option()
@@ -680,7 +784,22 @@ impl SessionRecord {
                 .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
                 .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
-        })
+            reserved_sender_chain_index: local_fields.reservation,
+            pending_reservation: false,
+        };
+
+        let trusted_reload =
+            incarnation.is_some_and(|current| local_fields.incarnation == Some(*current));
+
+        // An untrusted snapshot may predate sends covered by its lease.
+        if !trusted_reload
+            && record.reserved_sender_chain_index > 0
+            && let Some(state) = record.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain(record.reserved_sender_chain_index)?;
+        }
+
+        Ok(record)
     }
 
     /// If there's a session with a matching version and `alice_base_key`, ensures that it is the
@@ -815,9 +934,34 @@ impl SessionRecord {
         self.promote_state(updated_session)
     }
 
+    /// Make `new_state` current. A promoted state may have been current under
+    /// this record's lease before (archived → promoted round trip), so its
+    /// sender chain is fast-forwarded past every counter the lease may have
+    /// spent. States whose chain was never current here (fresh ratchets) go
+    /// through [`Self::promote_fresh_state`] instead, which skips the burn.
     pub fn promote_state(&mut self, new_state: SessionState) {
         self.archive_current_state_inner();
+        let mut state = new_state;
+        if self.reserved_sender_chain_index > 0
+            && let Err(e) = state.fast_forward_sender_chain(self.reserved_sender_chain_index)
+        {
+            // Only reachable with a corrupt reservation (gap beyond the
+            // ceiling); refuse to expose the chain rather than risk reuse.
+            log::error!("dropping promoted sender chain: {e}");
+            state.session.sender_chain = None.into();
+        }
+        self.current_session = Some(state);
+    }
+
+    /// Make a freshly ratcheted state current. Its sender chain key material
+    /// was just generated from a fresh random ephemeral, so no counter on it
+    /// can ever have been spent: the inherited lease is meaningless for it and
+    /// is reset instead of burned. The first send re-reserves durably before
+    /// hitting the wire.
+    pub fn promote_fresh_state(&mut self, new_state: SessionState) {
+        self.archive_current_state_inner();
         self.current_session = Some(new_state);
+        self.reserved_sender_chain_index = 0;
     }
 
     fn archive_current_state_inner(&mut self) -> bool {
@@ -849,6 +993,19 @@ impl SessionRecord {
 
     /// Encode into a caller-supplied buffer (allows reuse across flushes).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+        self.serialize_into_inner(buf, None);
+    }
+
+    /// The incarnation prevents clean reloads from looking like crashes.
+    #[doc(hidden)]
+    pub fn serialize_into_for_store(&self, buf: &mut Vec<u8>, incarnation: &[u8; 16]) {
+        self.serialize_into_inner(buf, Some(incarnation));
+    }
+
+    // Session storage protos are hand-spliced only here; direct buffa calls
+    // duplicate nothing, so no codec pin.
+    #[allow(clippy::disallowed_methods)]
+    fn serialize_into_inner(&self, buf: &mut Vec<u8>, incarnation: Option<&[u8; 16]>) {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
         fn write_len_delimited(
@@ -883,8 +1040,19 @@ impl SessionRecord {
             })
             .sum();
 
+        let reserved = self.reserved_sender_chain_index;
+        let incarnation = incarnation.filter(|_| reserved > 0);
+        let reserved_len = if reserved > 0 {
+            2 + varint_len(reserved as u64)
+        } else {
+            0
+        };
+        let incarnation_len = incarnation
+            .map(|_| crate::protocol::local_field::STORE_INCARNATION_ENCODED_LEN)
+            .unwrap_or(0);
+
         buf.clear();
-        buf.reserve(current_len + previous_len);
+        buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
 
         if let Some(state) = &self.current_session
             && let Some(msg_len) = current_msg_len
@@ -893,6 +1061,13 @@ impl SessionRecord {
         }
         for (session, msg_len) in self.previous_sessions.iter().zip(previous_msg_lens) {
             write_len_delimited(2, session, msg_len, &mut cache, buf);
+        }
+        if reserved > 0 {
+            Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(buf);
+            encode_varint(reserved as u64, buf);
+        }
+        if let Some(incarnation) = incarnation {
+            crate::protocol::local_field::encode_store_incarnation(buf, incarnation);
         }
     }
 
@@ -1027,7 +1202,7 @@ impl SessionRecord {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocol::ratchet::keys::MessageKeyGenerator;
@@ -1073,6 +1248,174 @@ mod tests {
 
         assert_eq!(err.to_string(), "missing sender chain");
         assert!(!state.has_usable_sender_chain().unwrap());
+    }
+
+    /// An archived state promoted back to current may have spent counters
+    /// under the record's lease while it was current before; the promotion
+    /// must burn the whole lease into its chain.
+    #[test]
+    fn promote_state_fast_forwards_past_the_lease() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        let reserved = record.reserved_sender_chain_index();
+        assert_eq!(reserved, consts::SENDER_CHAIN_RESERVATION_BATCH);
+
+        record.promote_state(state);
+        let chain = record
+            .session_state()
+            .unwrap()
+            .get_sender_chain_key()
+            .unwrap();
+        assert_eq!(
+            chain.index(),
+            reserved,
+            "promotion must make every leased counter underivable"
+        );
+    }
+
+    /// A freshly ratcheted chain has never spent a counter, so promoting it
+    /// resets the lease instead of burning it (the first send re-reserves).
+    #[test]
+    fn promote_fresh_state_resets_the_lease() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(500);
+
+        record.promote_fresh_state(state);
+        assert_eq!(record.reserved_sender_chain_index(), 0);
+        let chain = record
+            .session_state()
+            .unwrap()
+            .get_sender_chain_key()
+            .unwrap();
+        assert_eq!(chain.index(), 0, "a fresh chain must not be burned");
+    }
+
+    /// A corrupt reservation absurdly far ahead of the chain must be refused
+    /// instead of turning the load into an unbounded KDF loop.
+    #[test]
+    fn deserialize_rejects_an_implausible_reservation() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let record = SessionRecord::new(create_test_session_state(3, &base_key));
+
+        let mut bytes = record.serialize().unwrap();
+        {
+            use buffa::encoding::{Tag, WireType, encode_varint};
+            Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(&mut bytes);
+            encode_varint(
+                (consts::MAX_RESERVATION_FAST_FORWARD as u64) + 1,
+                &mut bytes,
+            );
+        }
+
+        assert!(
+            SessionRecord::deserialize(&bytes).is_err(),
+            "an implausible lease must fail the load, not fast-forward"
+        );
+    }
+
+    #[test]
+    fn cache_incarnation_separates_clean_reload_from_recovery() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut record = SessionRecord::new(create_test_session_state(3, &base_key));
+        record.reserve_sender_chain_counters(0);
+        let incarnation = [0xA1; 16];
+        let replacement = [0xB2; 16];
+        let mut bytes = Vec::new();
+        record.serialize_into_for_store(&mut bytes, &incarnation);
+
+        let clean = SessionRecord::deserialize_for_store(&bytes, &incarnation).unwrap();
+        assert_eq!(
+            clean
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            0
+        );
+
+        let recovered = SessionRecord::deserialize_for_store(&bytes, &replacement).unwrap();
+        assert_eq!(
+            recovered
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let conservative = SessionRecord::deserialize(&bytes).unwrap();
+        assert_eq!(
+            conservative
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let legacy = record.serialize().unwrap();
+        let migrated = SessionRecord::deserialize_for_store(&legacy, &incarnation).unwrap();
+        assert_eq!(
+            migrated
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    /// A lease field that is unreadable — wrong wire type, or duplicated so
+    /// "last one wins" could pick a lower ceiling — must fail the load. Were
+    /// it skipped, the record would load with reservation 0, silently
+    /// re-enabling every counter the real lease had already spent.
+    #[test]
+    fn deserialize_rejects_a_malformed_or_duplicated_lease_field() {
+        use buffa::encoding::{Tag, WireType, encode_varint};
+
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut record = SessionRecord::new(create_test_session_state(3, &base_key));
+        record.reserve_sender_chain_counters(0);
+        let good = record.serialize().unwrap();
+        assert!(
+            SessionRecord::deserialize(&good).is_ok(),
+            "the well-formed record must still load"
+        );
+
+        // Same field number, non-varint wire type.
+        let mut wrong_type = record.serialize().unwrap();
+        Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::LengthDelimited)
+            .encode(&mut wrong_type);
+        encode_varint(0, &mut wrong_type); // zero-length payload
+        assert!(
+            SessionRecord::deserialize(&wrong_type).is_err(),
+            "a non-varint lease field must fail the load, not be skipped"
+        );
+
+        // Duplicated field: a trailing 0 would win under last-one-wins and
+        // wipe the ceiling.
+        let mut duplicated = record.serialize().unwrap();
+        Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(&mut duplicated);
+        encode_varint(0, &mut duplicated);
+        assert!(
+            SessionRecord::deserialize(&duplicated).is_err(),
+            "a duplicated lease field must fail the load rather than lower the ceiling"
+        );
     }
 
     /// Creates a SessionRecord with N previous sessions for testing.
@@ -1489,6 +1832,8 @@ mod tests {
         let record = SessionRecord {
             current_session: Some(SessionState::from_session_structure(current.clone())),
             previous_sessions: Arc::new(previous_sessions.clone()),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
         };
         let expected = waproto::whatsapp::RecordStructure {
             current_session: MessageField::some(current),

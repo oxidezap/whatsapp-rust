@@ -19,40 +19,363 @@ use futures::future::{Fuse, FusedFuture};
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
+use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
+use crate::voip::h264::VideoFrame;
+use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 
-/// The audio + event channels the driver bridges to the platform. Mic frames in, playout frames out
-/// (dropped on speaker overflow since VoIP is loss tolerant), and engine events out (RelayAllocated,
-/// ForeignAudio) for the shell to act on (e.g. decode a non-MLow frame with a platform codec).
+/// Mid-call video-plane commands from the shell (upgrade / downgrade / peer orientation). Kept out
+/// of the engine so it stays sans-IO; the drive loop translates each into an engine method call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VideoControl {
+    /// RTP clock increment for each access unit. Sent before attaching a source whose cadence is
+    /// different from the 15 fps compatibility default.
+    SetTimestampStride(u32),
+    /// Bring the video plane up with outbound video ALLOWED (a from-start call, an accept, or the
+    /// initiator once the peer accepted the upgrade).
+    Enable,
+    /// Bring the video plane up but hold outbound video off the wire until the peer accepts (the
+    /// initiator of an upgrade). Inbound still decodes. A later `Enable` ungates it.
+    EnableAwaitingAccept,
+    /// Tear the video plane down (downgrade to audio).
+    Disable,
+    /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
+    SetOrientation(u8),
+}
+
+/// State changes stay FIFO so `Disable` performs its purge before a later `Enable`; only the latest
+/// orientation matters while the driver is busy.
+#[derive(Clone)]
+pub struct VideoControlSender {
+    state: async_channel::Sender<VideoControl>,
+    orientation: async_channel::Sender<u8>,
+}
+
+/// Receiving half of [`video_control_channel`].
+pub struct VideoControlReceiver {
+    state: async_channel::Receiver<VideoControl>,
+    orientation: async_channel::Receiver<u8>,
+}
+
+/// Build the control mailbox used by one call driver.
+pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
+    let (state_tx, state_rx) = async_channel::unbounded();
+    let (orientation_tx, orientation_rx) = async_channel::bounded(1);
+    (
+        VideoControlSender {
+            state: state_tx,
+            orientation: orientation_tx,
+        },
+        VideoControlReceiver {
+            state: state_rx,
+            orientation: orientation_rx,
+        },
+    )
+}
+
+impl VideoControlSender {
+    /// Queue a state change, or replace the pending orientation with the newest value.
+    pub fn send(&self, control: VideoControl) -> bool {
+        match control {
+            VideoControl::SetOrientation(orientation) => {
+                self.orientation.force_send(orientation).is_ok()
+            }
+            state => self.state.try_send(state).is_ok(),
+        }
+    }
+}
+
+impl VideoControlReceiver {
+    /// Whether both halves have lost every sender.
+    pub fn is_closed(&self) -> bool {
+        self.state.is_closed() && self.orientation.is_closed()
+    }
+
+    /// Receive a ready state first, otherwise the latest orientation.
+    pub fn try_recv(&self) -> Result<VideoControl, async_channel::TryRecvError> {
+        let state_error = match self.state.try_recv() {
+            Ok(state) => return Ok(state),
+            Err(error) => error,
+        };
+        match self.orientation.try_recv() {
+            Ok(orientation) => Ok(VideoControl::SetOrientation(orientation)),
+            Err(async_channel::TryRecvError::Closed)
+                if state_error == async_channel::TryRecvError::Closed =>
+            {
+                Err(async_channel::TryRecvError::Closed)
+            }
+            Err(_) => Err(async_channel::TryRecvError::Empty),
+        }
+    }
+
+    /// Wait for a state or orientation until every sender is gone.
+    pub async fn recv(&self) -> Result<VideoControl, async_channel::RecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(control) => return Ok(control),
+                Err(async_channel::TryRecvError::Closed) => return self.state.recv().await,
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+
+            match (self.state.is_closed(), self.orientation.is_closed()) {
+                (false, true) => return self.state.recv().await,
+                (true, false) => {
+                    return self
+                        .orientation
+                        .recv()
+                        .await
+                        .map(VideoControl::SetOrientation);
+                }
+                (true, true) => return self.state.recv().await,
+                (false, false) => {
+                    let state = self.state.recv().fuse();
+                    let orientation = self.orientation.recv().fuse();
+                    futures::pin_mut!(state, orientation);
+                    futures::select_biased! {
+                        state = state => match state {
+                            Ok(state) => return Ok(state),
+                            Err(_) => continue,
+                        },
+                        orientation = orientation => match orientation {
+                            Ok(orientation) => return Ok(VideoControl::SetOrientation(orientation)),
+                            Err(_) => continue,
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The audio + video + event channels the driver bridges to the platform. PCM and encoded audio
+/// channels are both present; the call's [`super::audio::AudioIo`] selects which pair is active.
+/// Media outputs shed frames on sink overflow, while lifecycle events use their own bounded queue.
 pub struct CallChannels {
     pub mic: async_channel::Receiver<Vec<i16>>,
     pub speaker: async_channel::Sender<Vec<i16>>,
+    pub encoded_audio_in: async_channel::Receiver<Bytes>,
+    pub encoded_audio_out: async_channel::Sender<EncodedAudioFrame>,
     pub events: async_channel::Sender<CallEvent>,
     /// Caller-only: the answering device's LID, delivered once the callee's `<accept>` is received so
     /// the drive loop can rekey the recv path before media flows. `None` on the callee side and esp32.
     pub rekey: Option<async_channel::Receiver<String>>,
+    /// Outbound video: one pre-encoded H.264 Annex-B access unit per item.
+    pub video_in: async_channel::Receiver<Vec<u8>>,
+    /// Inbound video: reassembled peer access units (dropped on sink overflow, like the speaker).
+    pub video_out: async_channel::Sender<VideoFrame>,
+    /// Mid-call video-plane control (lossless state, coalesced orientation).
+    pub video_ctl: VideoControlReceiver,
 }
 
-/// Depth of the outbound send queue between the drive loop and the concurrent send task. ~2s of RTP
-/// at one 60ms frame per slot; on overflow the oldest is dropped (loss-tolerant), bounding latency.
-const SEND_QUEUE_CAP: usize = 32;
+/// Bound slow relay writes without truncating a complete video access unit.
+const SEND_QUEUE_BATCH_CAP: usize = 64;
+const SEND_QUEUE_BYTE_CAP: usize = 2 * 1024 * 1024;
 
-/// Enforce [`SEND_QUEUE_CAP`] on the outbound queue when a relay write stalls. Media is loss
-/// tolerant, but relay control is not: STUN keepalives and the consent Binding Success replies
-/// share this queue, and shedding one under media backpressure fails relay consent (RFC 7675) and
-/// tears down a still recoverable call. So evict the oldest *media* packet, sparing control; only
-/// if the queue is somehow all control do we drop the oldest to keep the bound.
-fn shed_to_cap(queue: &mut VecDeque<Bytes>) {
-    if queue.len() <= SEND_QUEUE_CAP {
-        return;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBatchKind {
+    Control,
+    Media,
+    Video,
+}
+
+struct SendBatch {
+    packets: VecDeque<Bytes>,
+    bytes: usize,
+    kind: SendBatchKind,
+    started: bool,
+    video_keyframe: bool,
+}
+
+impl SendBatch {
+    fn packet(data: Bytes) -> Self {
+        let kind = if classify_relay_packet(&data) == RelayPacketKind::Stun {
+            SendBatchKind::Control
+        } else {
+            SendBatchKind::Media
+        };
+        Self {
+            bytes: data.len(),
+            packets: VecDeque::from([data]),
+            kind,
+            started: false,
+            video_keyframe: false,
+        }
     }
-    let victim = queue
+
+    fn video(packets: Vec<Bytes>) -> Self {
+        let video_keyframe = packets
+            .first()
+            .and_then(|packet| parse_rtp_header(packet))
+            .and_then(|header| header.video_extension)
+            .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR);
+        Self {
+            bytes: packets.iter().map(Bytes::len).sum(),
+            packets: packets.into(),
+            kind: SendBatchKind::Video,
+            started: false,
+            video_keyframe,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DroppedMedia {
+    video_access_units: u32,
+    packets: u32,
+}
+
+fn record_drop(dropped: &mut DroppedMedia, batch: &SendBatch) {
+    dropped.packets = dropped
+        .packets
+        .saturating_add(batch.packets.len().try_into().unwrap_or(u32::MAX));
+    if batch.kind == SendBatchKind::Video {
+        dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+    }
+}
+
+fn purge_unstarted_video(
+    queue: &mut VecDeque<SendBatch>,
+    awaiting_video_keyframe: &mut bool,
+) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    queue.retain(|batch| {
+        let discard = !batch.started && batch.kind == SendBatchKind::Video;
+        if discard {
+            record_drop(&mut dropped, batch);
+        }
+        !discard
+    });
+    if dropped.video_access_units != 0 {
+        *awaiting_video_keyframe = true;
+    }
+    dropped
+}
+
+fn discard_video_until_keyframe(
+    queue: &mut VecDeque<SendBatch>,
+    dropped: &mut DroppedMedia,
+) -> bool {
+    loop {
+        let Some(index) = queue
+            .iter()
+            .position(|batch| !batch.started && batch.kind == SendBatchKind::Video)
+        else {
+            return true;
+        };
+        if queue[index].video_keyframe {
+            return false;
+        }
+        if let Some(batch) = queue.remove(index) {
+            record_drop(dropped, &batch);
+        }
+    }
+}
+
+fn shed_to_cap(
+    queue: &mut VecDeque<SendBatch>,
+    awaiting_video_keyframe: &mut bool,
+) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    loop {
+        let bytes: usize = queue.iter().map(|batch| batch.bytes).sum();
+        if queue.len() <= SEND_QUEUE_BATCH_CAP && bytes <= SEND_QUEUE_BYTE_CAP {
+            break;
+        }
+        // Never cut an AU after one of its fragments has entered the transport.
+        let victim = queue
+            .iter()
+            .position(|batch| !batch.started && batch.kind == SendBatchKind::Video)
+            .or_else(|| {
+                queue
+                    .iter()
+                    .position(|batch| !batch.started && batch.kind == SendBatchKind::Media)
+            })
+            .or_else(|| queue.iter().position(|batch| !batch.started));
+        let Some(victim) = victim else {
+            break;
+        };
+        let Some(batch) = queue.remove(victim) else {
+            break;
+        };
+        let dropped_video = batch.kind == SendBatchKind::Video;
+        record_drop(&mut dropped, &batch);
+        if dropped_video {
+            *awaiting_video_keyframe = discard_video_until_keyframe(queue, &mut dropped);
+        }
+    }
+    dropped
+}
+
+fn enqueue_batch(
+    queue: &mut VecDeque<SendBatch>,
+    awaiting_video_keyframe: &mut bool,
+    batch: SendBatch,
+) -> DroppedMedia {
+    if batch.kind == SendBatchKind::Video && *awaiting_video_keyframe {
+        if !batch.video_keyframe {
+            let mut dropped = DroppedMedia::default();
+            record_drop(&mut dropped, &batch);
+            return dropped;
+        }
+        *awaiting_video_keyframe = false;
+    }
+    queue.push_back(batch);
+    shed_to_cap(queue, awaiting_video_keyframe)
+}
+
+/// Coalesce every PT-97 packet through the marker into one queue unit, so backpressure keeps or
+/// drops a complete H.264 access unit instead of silently truncating an IDR.
+fn queue_transmit(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+    data: Bytes,
+) -> DroppedMedia {
+    if let Some(header) = parse_rtp_header(&data)
+        && header.payload_type == RTP_PAYLOAD_TYPE_H264
+    {
+        pending_video.push(data);
+        if header.marker {
+            return enqueue_batch(
+                queue,
+                awaiting_video_keyframe,
+                SendBatch::video(std::mem::take(pending_video)),
+            );
+        }
+        return DroppedMedia::default();
+    }
+    let mut dropped = DroppedMedia::default();
+    if !pending_video.is_empty() {
+        dropped = enqueue_batch(
+            queue,
+            awaiting_video_keyframe,
+            SendBatch::video(std::mem::take(pending_video)),
+        );
+    }
+    let more = enqueue_batch(queue, awaiting_video_keyframe, SendBatch::packet(data));
+    dropped.video_access_units = dropped
+        .video_access_units
+        .saturating_add(more.video_access_units);
+    dropped.packets = dropped.packets.saturating_add(more.packets);
+    dropped
+}
+
+fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<Bytes> {
+    let index = queue
         .iter()
-        .position(|p| classify_relay_packet(p) != RelayPacketKind::Stun)
+        .position(|batch| batch.kind == SendBatchKind::Control)
         .unwrap_or(0);
-    queue.remove(victim);
+    let batch = queue.get_mut(index)?;
+    batch.started = true;
+    let packet = batch.packets.pop_front()?;
+    batch.bytes = batch.bytes.saturating_sub(packet.len());
+    if batch.packets.is_empty() {
+        queue.remove(index);
+    }
+    Some(packet)
 }
 
 /// Drive one call to completion: returns when the relay channel disconnects, a send fails, or the
@@ -69,9 +392,16 @@ pub async fn run_call(
     eng: CallEngine,
 ) {
     let epoch = Instant::now();
-    run_call_with_clock(rt, transport, relay_events, channels, eng, move || {
-        epoch.elapsed().as_millis() as u64
-    })
+    let wallclock_ms = crate::time::now_millis().max(0) as u64;
+    run_call_with_clock_and_wallclock(
+        rt,
+        transport,
+        relay_events,
+        channels,
+        eng,
+        move || epoch.elapsed().as_millis() as u64,
+        wallclock_ms,
+    )
     .await;
 }
 
@@ -88,15 +418,37 @@ pub async fn run_call(
         fields(call_id = %eng.call_id())
     )
 )]
+#[cfg(all(test, feature = "voip-mlow"))]
 async fn run_call_with_clock(
+    rt: Arc<dyn Runtime>,
+    transport: Arc<dyn RelayTransport>,
+    relay_events: async_channel::Receiver<RelayTransportEvent>,
+    channels: CallChannels,
+    eng: CallEngine,
+    now_ms: impl Fn() -> engine::Millis,
+) {
+    run_call_with_clock_and_wallclock(
+        rt,
+        transport,
+        relay_events,
+        channels,
+        eng,
+        now_ms,
+        1_700_000_000_000,
+    )
+    .await;
+}
+
+async fn run_call_with_clock_and_wallclock(
     rt: Arc<dyn Runtime>,
     transport: Arc<dyn RelayTransport>,
     relay_events: async_channel::Receiver<RelayTransportEvent>,
     channels: CallChannels,
     mut eng: CallEngine,
     now_ms: impl Fn() -> engine::Millis,
+    wallclock_ms: u64,
 ) {
-    eng.start(now_ms());
+    eng.start(now_ms(), wallclock_ms);
 
     #[cfg(feature = "tracing")]
     let call_id = eng.call_id().to_string();
@@ -104,11 +456,20 @@ async fn run_call_with_clock(
     // The mic feeds outgoing audio only; its liveness must not gate the call. Flipped false when the
     // mic channel closes so we stop polling it without tearing the call down (see the mic arm).
     let mut mic_open = true;
+    let mut encoded_audio_open = true;
 
     // The recv-rekey is one-shot (the first callee `<accept>` picks the answering device). Flipped
     // false after the first event -- a rekey or the sender closing -- so the closed channel's
     // always-ready `Err` doesn't busy-spin the select (the mic arm has the same guard).
     let mut rekey_open = true;
+
+    // Same closed-channel guards for the video arms: a call that never wires a video source/control
+    // sender must not busy-spin on their always-ready `Err`.
+    let mut video_in_open = true;
+    let mut video_ctl_open = true;
+    // Set by a `Disable` to drain the video input queue after the select block (it can't be drained
+    // inside, where the arm futures borrow the channel).
+    let mut drain_video_in = false;
 
     // Decouple sending from receive/playout. Outbound packets are queued and the in-flight send is
     // polled as one arm of the select, CONCURRENTLY with the relay/mic/timer arms -- so a slow or
@@ -117,9 +478,9 @@ async fn run_call_with_clock(
     // the two: a slow send parked the loop, inbound packets queued then arrived in a burst, and the
     // playout tick fired late -- so the jitter buffer overflowed then underran (audible glitching,
     // worst whatsapp-rust<->whatsapp-rust where both ends stalled; the official client decouples them).
-    // The queue is bounded and drops the OLDEST packet on overflow: outbound media is loss tolerant, so
-    // when the link can't keep up, shedding the stalest frame (lowest latency) is correct.
-    let mut send_queue: VecDeque<Bytes> = VecDeque::new();
+    // Video is queued per access unit so overload never leaves half an IDR on the wire.
+    let mut send_queue: VecDeque<SendBatch> = VecDeque::new();
+    let mut awaiting_video_keyframe = false;
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
@@ -127,26 +488,58 @@ async fn run_call_with_clock(
 
     'drive: loop {
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
+        let mut pending_video = Vec::new();
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
                 Output::Transmit(data) => {
-                    send_queue.push_back(data);
-                    shed_to_cap(&mut send_queue);
+                    let dropped = queue_transmit(
+                        &mut send_queue,
+                        &mut pending_video,
+                        &mut awaiting_video_keyframe,
+                        data,
+                    );
+                    if dropped.packets != 0 {
+                        let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                            video_access_units: dropped.video_access_units,
+                            packets: dropped.packets,
+                        });
+                    }
                 }
                 // Loss tolerant: drop the frame if the speaker can't keep up.
                 Output::Playout(pcm) => {
                     let _ = channels.speaker.try_send(pcm);
                 }
+                Output::EncodedAudio(frame) => {
+                    let _ = channels.encoded_audio_out.try_send(frame);
+                }
+                // Same policy for video: a stalled sink sheds frames, never the drive loop.
+                Output::VideoPlayout(frame) => {
+                    let _ = channels.video_out.try_send(frame);
+                }
                 Output::Event(ev) => {
                     let _ = channels.events.try_send(ev);
                 }
-                Output::Timeout(_) => break,
+                Output::Timeout(_) => {
+                    if !pending_video.is_empty() {
+                        let dropped = enqueue_batch(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                            SendBatch::video(std::mem::take(&mut pending_video)),
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                    }
+                    break;
+                }
             }
         }
 
-        // A terminal relay-allocate failure went out via the drain above; tear the call down rather
-        // than keepalive a dead relay (transport.disconnect runs on the exit path below).
+        // The terminal event above must reach the consumer before transport teardown.
         if eng.is_terminated() {
             break 'drive;
         }
@@ -154,7 +547,7 @@ async fn run_call_with_clock(
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
         // `'static` (no borrow of the loop's `transport`).
         if sending.is_terminated()
-            && let Some(data) = send_queue.pop_front()
+            && let Some(data) = pop_next_packet(&mut send_queue)
         {
             let t = transport.clone();
             let fut: BoxFuture<'static, anyhow::Result<()>> =
@@ -193,6 +586,17 @@ async fn run_call_with_clock(
         .fuse();
         futures::pin_mut!(mic_fut);
 
+        let encoded_audio = &channels.encoded_audio_in;
+        let encoded_audio_fut = async move {
+            if encoded_audio_open {
+                encoded_audio.recv().await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(encoded_audio_fut);
+
         // Caller-only recv-rekey: the answering device's LID. Parked (pending) when there is no rekey
         // channel (callee/esp32) or once consumed, mirroring the mic arm so a closed channel can't spin.
         let rekey_live = rekey_open && channels.rekey.is_some();
@@ -206,6 +610,30 @@ async fn run_call_with_clock(
         }
         .fuse();
         futures::pin_mut!(rekey_fut);
+
+        // Video source and control arms, guarded like the mic: a closed channel disables the arm
+        // (a video source EOF must not end the call — audio keeps running after a downgrade).
+        let video_in = &channels.video_in;
+        let video_in_fut = async move {
+            if video_in_open {
+                video_in.recv().await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(video_in_fut);
+
+        let video_ctl = &channels.video_ctl;
+        let video_ctl_fut = async move {
+            if video_ctl_open {
+                video_ctl.recv().await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(video_ctl_fut);
 
         // Wait for exactly one input, then apply it. A dropped (unready) recv future loses nothing:
         // async_channel only dequeues on a ready poll.
@@ -230,6 +658,52 @@ async fn run_call_with_clock(
                     && !eng.rekey_recv(&lid)
                 {
                     break 'drive; // malformed stored call_key (a setup invariant violated)
+                }
+            },
+            // State control before orientation and media, so a Disable always purges before a later
+            // Enable can admit frames from the replacement source.
+            ctl = video_ctl_fut => {
+                match ctl {
+                    Ok(VideoControl::SetTimestampStride(ts_stride)) => {
+                        let _ = eng.set_video_timestamp_stride(ts_stride);
+                    }
+                    Ok(VideoControl::Enable) => {
+                        // False only for a control-only engine or a malformed stored callKey; the
+                        // audio plane already validated the key, so treat it as a no-op not fatal.
+                        let _ = eng.enable_video();
+                    }
+                    Ok(VideoControl::EnableAwaitingAccept) => {
+                        let _ = eng.enable_video_gated();
+                    }
+                    Ok(VideoControl::Disable) => {
+                        eng.disable_video();
+                        let dropped = purge_unstarted_video(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                        // Discard any AUs still queued from the (now-detached) source, so a quick
+                        // re-Enable can't transmit stale frames from the previous session under the
+                        // new negotiation. Drained after the select block (the futures borrow the
+                        // channel).
+                        drain_video_in = true;
+                    }
+                    Ok(VideoControl::SetOrientation(o)) => eng.set_peer_video_orientation(o),
+                    Err(_) => video_ctl_open = false,
+                }
+                // Fire an overdue timer like the other ready arms so a stream of control messages
+                // cannot keep this arm hot and defer the keepalive.
+                let now = now_ms();
+                if let Some(at) = eng.poll_timeout()
+                    && at != engine::NEVER
+                    && now >= at
+                {
+                    eng.handle_input(now, Input::Timeout);
                 }
             },
             ev = relay_events.recv().fuse() => match ev {
@@ -262,7 +736,42 @@ async fn run_call_with_clock(
                 // alive: muting the mic must not hang up the call (see the comment above).
                 Err(_) => mic_open = false,
             },
+            frame = encoded_audio_fut => match frame {
+                Ok(encoded) => {
+                    eng.handle_input(now_ms(), Input::EncodedAudio(&encoded));
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
+                }
+                Err(_) => encoded_audio_open = false,
+            },
+            au = video_in_fut => match au {
+                Ok(au) => {
+                    eng.handle_input(now_ms(), Input::VideoFrame(&au));
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
+                }
+                // Video source gone (encoder EOF / downgrade released it): disable the arm but keep
+                // the call alive, exactly like the mic.
+                Err(_) => video_in_open = false,
+            },
             _ = timer => eng.handle_input(now_ms(), Input::Timeout),
+        }
+
+        // Post-select: the arm futures (which borrow the channels) have been dropped, so it is now
+        // safe to drain the video input queue requested by a Disable above.
+        if drain_video_in {
+            drain_video_in = false;
+            while channels.video_in.try_recv().is_ok() {}
         }
     }
 
@@ -274,7 +783,7 @@ async fn run_call_with_clock(
     transport.disconnect().await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-mlow"))]
 mod tests {
     use super::*;
     use crate::runtime::AbortHandle;
@@ -327,6 +836,46 @@ mod tests {
         async fn disconnect(&self) {}
     }
 
+    #[test]
+    fn video_control_channel_preserves_state_and_coalesces_orientation() {
+        let (tx, rx) = video_control_channel();
+        assert!(tx.send(VideoControl::Disable));
+        for orientation in 0..100u8 {
+            assert!(tx.send(VideoControl::SetOrientation(orientation % 4)));
+        }
+        assert!(tx.send(VideoControl::Enable));
+
+        assert_eq!(rx.try_recv(), Ok(VideoControl::Disable));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// CallChannels with idle video plumbing (senders/receivers dropped immediately), for the
+    /// audio-only driver tests: the closed-channel guards must keep those arms inert.
+    fn test_channels(
+        mic: async_channel::Receiver<Vec<i16>>,
+        speaker: async_channel::Sender<Vec<i16>>,
+        events: async_channel::Sender<CallEvent>,
+    ) -> CallChannels {
+        let (_vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let (_vctl_tx, vctl_rx) = video_control_channel();
+        let (_encoded_tx, encoded_rx) = async_channel::unbounded::<Bytes>();
+        let (encoded_out_tx, _encoded_out_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+        CallChannels {
+            mic,
+            speaker,
+            encoded_audio_in: encoded_rx,
+            encoded_audio_out: encoded_out_tx,
+            events,
+            rekey: None,
+            video_in: vin_rx,
+            video_out: vout_tx,
+            video_ctl: vctl_rx,
+        }
+    }
+
     fn config() -> CallConfig {
         CallConfig {
             call_id: "CID".into(),
@@ -335,13 +884,14 @@ mod tests {
             peer_lid: "222222222222222:0@lid".into(),
             call_key: (0u8..32).collect(),
             ssrc: 0x5741_0001,
-            samples_per_packet: 960,
+            audio: crate::voip::AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
             relay_ip: "203.0.113.7".into(),
             relay_port: 3478,
             integrity_key: b"relay-key".to_vec(),
             warp_mi_tag_len: 4,
             enable_media: true,
+            enable_video: false,
             enable_sframe: false,
         }
     }
@@ -373,12 +923,7 @@ mod tests {
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
-            CallChannels {
-                mic: mic_rx,
-                speaker: spk_tx,
-                events: ev_tx,
-                rekey: None,
-            },
+            test_channels(mic_rx, spk_tx, ev_tx),
             eng,
         ));
 
@@ -452,12 +997,7 @@ mod tests {
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
-            CallChannels {
-                mic: mic_rx,
-                speaker: spk_tx,
-                events: ev_tx,
-                rekey: None,
-            },
+            test_channels(mic_rx, spk_tx, ev_tx),
             eng,
         ));
 
@@ -510,12 +1050,7 @@ mod tests {
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
-            CallChannels {
-                mic: mic_rx,
-                speaker: spk_tx,
-                events: ev_tx,
-                rekey: None,
-            },
+            test_channels(mic_rx, spk_tx, ev_tx),
             eng,
             move || clk.fetch_add(1000, Ordering::Relaxed),
         ));
@@ -583,12 +1118,7 @@ mod tests {
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
-            CallChannels {
-                mic: mic_rx,
-                speaker: spk_tx,
-                events: ev_tx,
-                rekey: None,
-            },
+            test_channels(mic_rx, spk_tx, ev_tx),
             eng,
             move || clk.fetch_add(1000, Ordering::Relaxed),
         ));
@@ -627,12 +1157,7 @@ mod tests {
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
-            CallChannels {
-                mic: mic_rx,
-                speaker: spk_tx,
-                events: ev_tx,
-                rekey: None,
-            },
+            test_channels(mic_rx, spk_tx, ev_tx),
             eng,
         ));
 
@@ -749,7 +1274,7 @@ mod tests {
             self_lid: &cfg.peer_lid,
             peer_lid: &cfg.self_lid,
             ssrc: cfg.ssrc,
-            samples_per_packet: cfg.samples_per_packet,
+            samples_per_packet: cfg.audio.format.rtp_timestamp_step,
             warp_mi_tag_len: cfg.warp_mi_tag_len,
         })
         .unwrap();
@@ -765,7 +1290,7 @@ mod tests {
         });
 
         let (mic_tx, mic_rx) = async_channel::unbounded();
-        let tone: Vec<i16> = (0..cfg.samples_per_packet as usize)
+        let tone: Vec<i16> = (0..cfg.audio.format.samples_per_frame as usize)
             .map(|i| (8000.0 * (i as f32 * 0.1).sin()) as i16)
             .collect();
         mic_tx.try_send(tone).unwrap();
@@ -778,12 +1303,7 @@ mod tests {
             rt,
             relay.clone() as Arc<dyn RelayTransport>,
             relay_rx,
-            CallChannels {
-                mic: mic_rx,
-                speaker: spk_tx,
-                events: ev_tx,
-                rekey: None,
-            },
+            test_channels(mic_rx, spk_tx, ev_tx),
             eng,
             move || clk.load(Ordering::Relaxed),
         ));
@@ -889,7 +1409,7 @@ mod tests {
             self_lid: &cfg.peer_lid,
             peer_lid: &cfg.self_lid,
             ssrc: cfg.ssrc,
-            samples_per_packet: cfg.samples_per_packet,
+            samples_per_packet: cfg.audio.format.rtp_timestamp_step,
             warp_mi_tag_len: cfg.warp_mi_tag_len,
         })
         .unwrap();
@@ -931,12 +1451,7 @@ mod tests {
                 rt,
                 Arc::new(WedgedSend) as Arc<dyn RelayTransport>,
                 relay_rx,
-                CallChannels {
-                    mic: mic_rx,
-                    speaker: spk_tx,
-                    events: ev_tx,
-                    rekey: None,
-                },
+                test_channels(mic_rx, spk_tx, ev_tx),
                 eng,
                 move || clk.load(Ordering::Relaxed),
             ));
@@ -959,6 +1474,116 @@ mod tests {
         );
     }
 
+    // Video through the real drive loop: Enable + orientation via video_ctl (biased ahead of the
+    // media arms), mirrored peer video packets via the relay (reassemble to video_out with the
+    // orientation stamped), one of our own AUs via video_in (fans out to PT-97 FU-A transmits).
+    // Deterministic: queues drain by bias order, then the first timer arm closes the relay.
+    #[test]
+    fn drive_loop_routes_video_both_ways() {
+        use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_TS_STRIDE_15FPS, parse_rtp_header};
+        use crate::voip::session::{VideoPipeline, VideoPipelineParams};
+        use crate::voip::ssrc;
+
+        let sleeps = Arc::new(AtomicUsize::new(0));
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        // The timer arm is only polled once every queue is idle; its first sleep closes the relay,
+        // ending the loop deterministically after all the video work is done.
+        let rt: Arc<dyn Runtime> = Arc::new(CloseRelayOnSleepRuntime {
+            sleeps,
+            relay_tx: relay_tx.clone(),
+            close_after: 1,
+        });
+        let transport = Arc::new(RecordingTransport::default());
+        let cfg = config();
+
+        // Mirrored peer video pipe (its self LID = our peer LID).
+        let mut peer_video = VideoPipeline::new(&VideoPipelineParams {
+            call_key: &cfg.call_key,
+            self_lid: &cfg.peer_lid,
+            peer_lid: &cfg.self_lid,
+            ssrc: ssrc::derive_video_participant_ssrc(
+                &cfg.call_id,
+                &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+            ),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: cfg.warp_mi_tag_len,
+        })
+        .unwrap();
+        let make_au = |len: usize| -> Vec<u8> {
+            let mut au = vec![0, 0, 0, 1, 0x65];
+            au.extend((0..len).map(|i| (i % 251) as u8));
+            au
+        };
+        let peer_au = make_au(2000);
+        for p in peer_video.protect_video(&peer_au) {
+            relay_tx
+                .try_send(RelayTransportEvent::PacketReceived(Bytes::from(p)))
+                .unwrap();
+        }
+
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let (vctl_tx, vctl_rx) = video_control_channel();
+
+        // Control drains first (bias), so cadence, Enable, and orientation land before any AU.
+        assert!(vctl_tx.send(VideoControl::SetTimestampStride(4500)));
+        assert!(vctl_tx.send(VideoControl::Enable));
+        assert!(vctl_tx.send(VideoControl::SetOrientation(1)));
+        let our_au = make_au(3000);
+        vin_tx.try_send(our_au.clone()).unwrap();
+        vin_tx.try_send(our_au).unwrap();
+
+        let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            CallChannels {
+                mic: mic_rx,
+                speaker: spk_tx,
+                encoded_audio_in: async_channel::unbounded::<Bytes>().1,
+                encoded_audio_out: async_channel::unbounded::<EncodedAudioFrame>().0,
+                events: ev_tx,
+                rekey: None,
+                video_in: vin_rx,
+                video_out: vout_tx,
+                video_ctl: vctl_rx,
+            },
+            eng,
+        ));
+
+        // Inbound: the peer AU reassembled to the sink, orientation stamped from the control arm.
+        let frames: Vec<VideoFrame> = std::iter::from_fn(|| vout_rx.try_recv().ok()).collect();
+        assert_eq!(frames.len(), 1, "peer AU must reach video_out exactly once");
+        assert_eq!(frames[0].data, peer_au);
+        assert!(frames[0].keyframe);
+        assert_eq!(
+            frames[0].orientation, 1,
+            "SetOrientation must apply before the inbound AU reassembles"
+        );
+
+        // Outbound: each 3KB AU fans out to four PT-97 packets and the 20 fps stride applies.
+        let sent = transport.sent.lock().unwrap();
+        let video_headers = sent
+            .iter()
+            .filter_map(|packet| {
+                parse_rtp_header(packet).filter(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(video_headers.len(), 8);
+        assert_eq!(
+            video_headers
+                .iter()
+                .filter(|header| header.marker)
+                .map(|header| header.timestamp)
+                .collect::<Vec<_>>(),
+            [0, 4500]
+        );
+    }
+
     // A relay stall backs the queue up past cap: the overflow policy must shed media, never the STUN
     // control (keepalive / consent Binding Success) sharing the queue, or relay consent fails.
     #[test]
@@ -968,36 +1593,189 @@ mod tests {
         // Top two bits zero -> STUN control.
         let control = || Bytes::from(vec![0x00, 0x01]);
 
-        let mut q: VecDeque<Bytes> = VecDeque::new();
-        q.push_back(control()); // oldest, must survive
-        for n in 0..SEND_QUEUE_CAP as u8 {
-            q.push_back(media(n));
-            shed_to_cap(&mut q);
+        let mut q: VecDeque<SendBatch> = VecDeque::new();
+        let mut awaiting_keyframe = false;
+        q.push_back(SendBatch::packet(control())); // oldest, must survive
+        for n in 0..SEND_QUEUE_BATCH_CAP as u8 {
+            q.push_back(SendBatch::packet(media(n)));
+            let _ = shed_to_cap(&mut q, &mut awaiting_keyframe);
         }
 
-        assert_eq!(q.len(), SEND_QUEUE_CAP);
+        assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
         assert_eq!(
-            classify_relay_packet(&q[0]),
-            RelayPacketKind::Stun,
+            q[0].kind,
+            SendBatchKind::Control,
             "the queued control packet must not be evicted by media backpressure"
         );
         // The oldest media (seq 0) is the one shed, not the control at the front.
-        assert_eq!(&q[1][..], &[0x90, 1]);
+        assert_eq!(&q[1].packets[0][..], &[0x90, 1]);
     }
 
     // Pathological: an all-control queue still has to honor the bound, so it falls back to dropping
     // the oldest.
     #[test]
     fn overflow_all_control_drops_oldest() {
-        let mut q: VecDeque<Bytes> = (0..=SEND_QUEUE_CAP as u8)
-            .map(|n| Bytes::from(vec![0x00, n]))
+        let mut q: VecDeque<SendBatch> = (0..=SEND_QUEUE_BATCH_CAP as u8)
+            .map(|n| SendBatch::packet(Bytes::from(vec![0x00, n])))
             .collect();
-        shed_to_cap(&mut q);
-        assert_eq!(q.len(), SEND_QUEUE_CAP);
+        let mut awaiting_keyframe = false;
+        let _ = shed_to_cap(&mut q, &mut awaiting_keyframe);
+        assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
         assert_eq!(
-            &q[0][..],
+            &q[0].packets[0][..],
             &[0x00, 1],
             "oldest control dropped to keep bound"
         );
+    }
+
+    #[test]
+    fn large_video_au_is_queued_atomically() {
+        fn video_packet(seq: u16, marker: bool) -> Bytes {
+            let mut packet = vec![0u8; 16];
+            packet[0] = 0x90; // V=2, X=1
+            packet[1] = ((marker as u8) << 7) | RTP_PAYLOAD_TYPE_H264;
+            packet[2..4].copy_from_slice(&seq.to_be_bytes());
+            packet[12..14].copy_from_slice(&0xdebeu16.to_be_bytes());
+            Bytes::from(packet)
+        }
+
+        // The old 32-datagram queue truncated this AU before its marker.
+        let mut queue = VecDeque::new();
+        let mut pending = Vec::new();
+        let mut awaiting_keyframe = false;
+        for seq in 0..40u16 {
+            let dropped = queue_transmit(
+                &mut queue,
+                &mut pending,
+                &mut awaiting_keyframe,
+                video_packet(seq, seq == 39),
+            );
+            assert_eq!(dropped.packets, 0);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].kind, SendBatchKind::Video);
+        assert_eq!(queue[0].packets.len(), 40);
+
+        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
+            .map(|packet| parse_rtp_header(&packet).unwrap().sequence_number)
+            .collect();
+        assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn oversized_video_is_dropped_as_a_whole_au() {
+        let packets = (0..40)
+            .map(|_| Bytes::from(vec![0x90; 64 * 1024]))
+            .collect();
+        let mut queue = VecDeque::new();
+        let mut awaiting_keyframe = false;
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(packets),
+        );
+        assert_eq!(dropped.video_access_units, 1);
+        assert_eq!(dropped.packets, 40);
+        assert!(queue.is_empty(), "no partial AU may remain queued");
+        assert!(awaiting_keyframe);
+    }
+
+    #[test]
+    fn disabling_purges_only_video_batches_that_have_not_started() {
+        let mut started = SendBatch::video(vec![
+            Bytes::from_static(b"started-1"),
+            Bytes::from_static(b"started-2"),
+        ]);
+        started.started = true;
+        let mut queue = VecDeque::from([
+            SendBatch::packet(Bytes::from_static(&[0x90, 0x01])),
+            started,
+            SendBatch::video(vec![Bytes::from_static(b"stale")]),
+            SendBatch::packet(Bytes::from_static(&[0x00, 0x01])),
+        ]);
+        let mut awaiting_keyframe = false;
+
+        let dropped = purge_unstarted_video(&mut queue, &mut awaiting_keyframe);
+
+        assert_eq!(dropped.video_access_units, 1);
+        assert_eq!(dropped.packets, 1);
+        assert!(awaiting_keyframe);
+        assert_eq!(queue.len(), 3);
+        assert!(queue.iter().any(|batch| {
+            batch.kind == SendBatchKind::Video && batch.started && batch.packets.len() == 2
+        }));
+        assert!(
+            queue
+                .iter()
+                .all(|batch| batch.kind != SendBatchKind::Video || batch.started)
+        );
+    }
+
+    #[test]
+    fn video_backpressure_recovers_at_the_next_keyframe() {
+        fn video_packet(seq: u16, keyframe: bool) -> Bytes {
+            let mut packet = Vec::new();
+            crate::voip::rtp::encode_rtp_header_into(
+                &crate::voip::rtp::RtpHeader {
+                    marker: true,
+                    payload_type: RTP_PAYLOAD_TYPE_H264,
+                    sequence_number: seq,
+                    timestamp: u32::from(seq) * 4500,
+                    ssrc: 0x1122_3344,
+                    extension_word: None,
+                    video_extension: Some(crate::voip::rtp::VideoRtpExtension {
+                        media_frame_info: if keyframe {
+                            VIDEO_MEDIA_FRAME_INFO_IDR
+                        } else {
+                            crate::voip::rtp::VIDEO_MEDIA_FRAME_INFO_DELTA
+                        },
+                        initial_bandwidth: 20_000,
+                        short_offset: 0,
+                        transport_sequence: seq,
+                    }),
+                },
+                &mut packet,
+            );
+            Bytes::from(packet)
+        }
+
+        let mut queue = VecDeque::new();
+        let mut awaiting_keyframe = true;
+
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(vec![video_packet(1, false)]),
+        );
+        assert_eq!(dropped.video_access_units, 1);
+        assert!(queue.is_empty());
+
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(vec![video_packet(2, true)]),
+        );
+        assert_eq!(dropped.video_access_units, 0);
+        assert!(!awaiting_keyframe);
+
+        let dropped = enqueue_batch(
+            &mut queue,
+            &mut awaiting_keyframe,
+            SendBatch::video(vec![video_packet(3, false)]),
+        );
+        assert_eq!(dropped.video_access_units, 0);
+        assert_eq!(queue.len(), 2);
+        assert!(queue[0].video_keyframe);
+        assert!(!queue[1].video_keyframe);
+
+        let mut queued: VecDeque<_> = (0..=SEND_QUEUE_BATCH_CAP as u16)
+            .map(|seq| SendBatch::video(vec![video_packet(seq, seq == 10)]))
+            .collect();
+        let mut awaiting_keyframe = false;
+        let dropped = shed_to_cap(&mut queued, &mut awaiting_keyframe);
+        assert_eq!(dropped.video_access_units, 10);
+        assert!(queued.front().is_some_and(|batch| batch.video_keyframe));
+        assert!(!awaiting_keyframe, "a queued IDR is a valid recovery point");
     }
 }

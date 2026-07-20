@@ -375,6 +375,20 @@ impl RangeEncoder {
         }
     }
 
+    /// Start a new stream while retaining the fixed output allocation.
+    pub(crate) fn reset(&mut self) {
+        self.end_offs = 0;
+        self.end_window = 0;
+        self.nend_bits = 0;
+        self.nbits_total = EC_CODE_BITS as i32 + 1;
+        self.offs = 0;
+        self.rng = EC_CODE_TOP;
+        self.val = 0;
+        self.ext = 0;
+        self.rem = -1;
+        self.err = 0;
+    }
+
     pub(crate) fn err(&self) -> i32 {
         self.err
     }

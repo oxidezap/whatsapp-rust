@@ -16,3 +16,16 @@ impl<T: Send + Sync + ?Sized> MaybeSendSync for T {}
 pub trait MaybeSendSync {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MaybeSendSync for T {}
+
+/// `Send`-only variant for values that cross task boundaries but are never
+/// shared by reference (closures, futures). Same wasm rationale as
+/// [`MaybeSendSync`].
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + ?Sized> MaybeSend for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSend for T {}

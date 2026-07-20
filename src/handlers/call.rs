@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::{debug, warn};
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
 use wacore::stanza::call::{
     TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
-    build_terminate,
+    VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
 };
 use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::types::call::{CallAction, IncomingCall, MissedCall, MissedReason};
-#[cfg(feature = "voip")]
-use wacore::types::call::{CallEndedElsewhere, ElsewhereOutcome};
+#[cfg(feature = "voip-runtime")]
+use wacore::types::call::{CallEndedElsewhere, ElsewhereOutcome, VideoState};
 use wacore::types::events::Event;
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
+use wacore::voip::{CallEvent, VideoControl};
+#[cfg(feature = "voip-runtime")]
 use wacore_binary::Jid;
 use wacore_binary::{OwnedNodeRef, Server};
 
@@ -42,8 +44,11 @@ impl StanzaHandler for CallHandler {
         &self,
         client: Arc<Client>,
         node: Arc<OwnedNodeRef>,
-        _cancelled: &mut bool,
+        cancelled: &mut bool,
     ) -> bool {
+        // Silence the unused-parameter warning on the no-voip build (only the video arm cancels).
+        #[cfg(not(feature = "voip-runtime"))]
+        let _ = &cancelled;
         let nr = node.get();
         match parse_call_stanza(nr) {
             Ok(Some(call)) => {
@@ -80,7 +85,7 @@ impl StanzaHandler for CallHandler {
                     // offer-ack await: <call> stanzas are processed concurrently, so a fast <terminate>
                     // for this offer racing the await must see the ringing flag (else its missed-call
                     // is lost and we'd set a stale flag after the call already ended).
-                    #[cfg(feature = "voip")]
+                    #[cfg(feature = "voip-runtime")]
                     if is_offer {
                         client
                             .call_registry()
@@ -89,11 +94,51 @@ impl StanzaHandler for CallHandler {
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
+                    #[cfg(feature = "voip-runtime")]
+                    if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
+                        &call.action
+                        && !audio.is_empty()
+                        && let Some(expected) = client
+                            .call_registry()
+                            .snapshot(call.action.call_id())
+                            .and_then(|session| session.audio_format)
+                        && !audio.iter().any(|codec| {
+                            codec.enc.eq_ignore_ascii_case("opus")
+                                && codec.rate == expected.signaling_rate
+                        })
+                    {
+                        let received_rates =
+                            audio.iter().map(|codec| codec.rate).collect::<Vec<_>>();
+                        warn!(
+                            "call: peer selected audio rates {received_rates:?}, expected {}",
+                            expected.signaling_rate
+                        );
+                        dismiss_outgoing_siblings(&client, &call).await;
+                        client.call_registry().send_call_event(
+                            call.action.call_id(),
+                            CallEvent::AudioFormatMismatch {
+                                expected_rate: expected.signaling_rate,
+                                received_rates,
+                            },
+                        );
+                        if let Err(e) = client
+                            .voip()
+                            .terminate(
+                                call.action.call_id(),
+                                &call.from,
+                                call.action.call_creator(),
+                            )
+                            .await
+                        {
+                            warn!("call: failed to terminate incompatible audio profile: {e}");
+                        }
+                        return true;
+                    }
                     // Caller-side: key our recv path to the device that actually answered. We dial the
                     // base callee LID, but a companion answers from `:N` and encrypts under its own
                     // device id; without this every inbound frame decrypts to garbage. One-shot, and a
                     // no-op for an incoming call or a call we aren't the caller of (no sender registered).
-                    #[cfg(feature = "voip")]
+                    #[cfg(feature = "voip-runtime")]
                     if let CallAction::Accept { .. } = &call.action {
                         // Record the device that answered so a later <terminate> targets it (call
                         // signaling is addressed per device, not to the bare peer the offer rang).
@@ -106,7 +151,7 @@ impl StanzaHandler for CallHandler {
                     }
                     // Caller-side multi-device dismiss: when one of the callee's devices accepts or
                     // rejects an outbound call of ours, tell the rest to stop ringing.
-                    #[cfg(feature = "voip")]
+                    #[cfg(feature = "voip-runtime")]
                     dismiss_outgoing_siblings(&client, &call).await;
                     // A <terminate> for a call that was still ringing (an incoming offer we never
                     // answered) gets a terminal outcome. We mirror WA Web's
@@ -117,7 +162,7 @@ impl StanzaHandler for CallHandler {
                     // answered, outgoing, or already-terminated call, so we never misfire for our own
                     // outgoing call or a duplicate terminate; it still consumes the flag on any reason.
                     // Decided BEFORE terminate_call below.
-                    #[cfg(feature = "voip")]
+                    #[cfg(feature = "voip-runtime")]
                     if let CallAction::Terminate { reason, .. } = &call.action
                         && client.call_registry().take_ringing(call.action.call_id())
                     {
@@ -153,14 +198,146 @@ impl StanzaHandler for CallHandler {
                             client.core.event_bus.dispatch(outcome);
                         }
                     }
-                    #[cfg(feature = "voip")]
+                    #[cfg(feature = "voip-runtime")]
                     if matches!(
                         &call.action,
                         CallAction::Reject { .. } | CallAction::Terminate { .. }
                     ) {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
-                    client.core.event_bus.dispatch(Event::IncomingCall(call));
+                    #[cfg(feature = "voip-runtime")]
+                    let mut dispatch_call = true;
+                    #[cfg(not(feature = "voip-runtime"))]
+                    let dispatch_call = true;
+                    // In-call <video state> signaling: send the TYPED ack (`type="video"`) and
+                    // suppress the router's generic one — an untyped ack makes the upgrade
+                    // requester assume failure and revert after ~5s. Serialize event publication,
+                    // then expose the state only after that ack commits it.
+                    #[cfg(feature = "voip-runtime")]
+                    if let CallAction::VideoState {
+                        state, orientation, ..
+                    } = &call.action
+                    {
+                        let call_id = call.action.call_id();
+                        let registry = client.call_registry();
+                        let event_permit = registry.reserve_call_event(call_id);
+                        let generation = event_permit.as_ref().map(|permit| permit.generation());
+                        if event_permit.is_none() {
+                            warn!(
+                                "call: video state event queue is unavailable; leaving the transition unacknowledged"
+                            );
+                        }
+                        // A typed ack commits the received transition. Without an event permit,
+                        // leave the generic ack in place so the peer reverts instead.
+                        let acked = if event_permit.is_some() {
+                            match build_call_video_ack(&call, nr) {
+                                Some(ack) => {
+                                    *cancelled = true;
+                                    match client.send_node(ack).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            warn!("call: failed to send typed video ack: {e}");
+                                            false
+                                        }
+                                    }
+                                }
+                                None => {
+                                    warn!(
+                                        "call: video stanza has no id; cannot send the typed ack"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        let mut transition_current = acked
+                            && generation
+                                .is_some_and(|generation| registry.is_current(call_id, generation));
+                        dispatch_call = transition_current;
+                        // Rejection ends our attempted upgrade locally even when its ack cannot get
+                        // out; retaining the camera cannot help a negotiation the peer already ended.
+                        if matches!(state, VideoState::UpgradeReject | VideoState::UpgradeCancel)
+                            && let Some(generation) = generation
+                        {
+                            registry.run_video_teardown(call_id, generation);
+                            registry.set_is_video(call_id, generation, false);
+                        }
+                        // Only drive our local plane once the peer has been acked; see above.
+                        if transition_current && let Some(generation) = generation {
+                            if *state == VideoState::UpgradeAccept
+                                && registry.is_current(call_id, generation)
+                            {
+                                let enabled = build_video_state(&VideoStateParams {
+                                    call_id,
+                                    to: &call.from,
+                                    id: &client.generate_request_id(),
+                                    call_creator: call.action.call_creator(),
+                                    state: VideoState::Enabled,
+                                    dec: None,
+                                    device_orientation: None,
+                                });
+                                if let Err(e) = client.send_node(enabled).await {
+                                    warn!("call: failed to announce accepted video upgrade: {e}");
+                                    if !registry.run_video_teardown(call_id, generation) {
+                                        registry.send_video_ctl(
+                                            call_id,
+                                            generation,
+                                            VideoControl::Disable,
+                                        );
+                                    }
+                                    registry.set_is_video(call_id, generation, false);
+                                    transition_current = false;
+                                }
+                            }
+                            transition_current &= registry.is_current(call_id, generation);
+                            if transition_current {
+                                if let Some(o) = orientation {
+                                    registry.send_video_ctl(
+                                        call_id,
+                                        generation,
+                                        VideoControl::SetOrientation(*o),
+                                    );
+                                }
+                                match state {
+                                    // The peer's video is (about to be) live; make sure our plane decodes
+                                    // it even when the consumer skipped `.video()` and only accepts later
+                                    // — decoding costs nothing until packets arrive.
+                                    VideoState::UpgradeAccept | VideoState::Enabled => {
+                                        registry.set_is_video(call_id, generation, true);
+                                        registry.send_video_ctl(
+                                            call_id,
+                                            generation,
+                                            VideoControl::Enable,
+                                        );
+                                    }
+                                    // The peer stopped ITS video; our outbound is the consumer's call
+                                    // (stop_video), so only the flag is updated here.
+                                    VideoState::Disabled | VideoState::Stopped => {
+                                        registry.set_is_video(call_id, generation, false);
+                                    }
+                                    _ => {}
+                                }
+                                let event_delivered = event_permit.as_ref().is_some_and(|permit| {
+                                    permit.send(CallEvent::VideoStateChanged {
+                                        state: *state,
+                                        orientation: *orientation,
+                                    })
+                                });
+                                if !event_delivered {
+                                    warn!(
+                                        "call: video state event receiver closed after typed ack"
+                                    );
+                                }
+                            }
+                            dispatch_call = transition_current;
+                        }
+                        // Keep the transition serialized through every committed side effect.
+                        drop(event_permit);
+                    }
+                    if dispatch_call {
+                        client.core.event_bus.dispatch(Event::IncomingCall(call));
+                    }
                 }
             }
             Ok(None) => {
@@ -195,7 +372,7 @@ async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow:
 /// duplicate accept/reject can't re-dismiss. No-op for any other action, or a call we aren't the
 /// caller of (inbound call, single-device callee, or one already dismissed). A `Terminate` needs no
 /// handling here: the call ends, its registry entry (and the device set with it) goes away.
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
 async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     let reason = match &call.action {
         CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
@@ -251,7 +428,7 @@ async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
 
 /// Whether two JIDs name the same device: user + server + device id. Excludes `agent`/`integrator`,
 /// representation details that can differ between the usync device-list and a stanza's `from`.
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-runtime")]
 fn same_device(a: &Jid, b: &Jid) -> bool {
     a.user == b.user && a.server == b.server && a.device == b.device
 }
@@ -262,6 +439,8 @@ mod tests {
     use crate::test_utils::node_to_owned_ref;
     use std::sync::Arc;
     use wacore::types::events::{ChannelEventHandler, Event};
+    #[cfg(feature = "voip-runtime")]
+    use wacore::voip::video_control_channel;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
 
@@ -287,6 +466,735 @@ mod tests {
 
     async fn make_client() -> Arc<Client> {
         crate::test_utils::create_test_client().await
+    }
+
+    /// A client whose sends land on a counting transport (so ack sends succeed and can be counted).
+    #[cfg(feature = "voip-runtime")]
+    async fn make_sending_client() -> Arc<Client> {
+        make_sending_client_with_failure_after(None).await.0
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    async fn make_sending_client_with_failure_after(
+        failure_after: Option<usize>,
+    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::handshake::NoiseCipher;
+
+        struct CountingTransport {
+            sends: Arc<AtomicUsize>,
+            failure_after: Option<usize>,
+        }
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl crate::transport::Transport for CountingTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+                let attempt = self.sends.fetch_add(1, Ordering::SeqCst);
+                if self.failure_after.is_some_and(|limit| attempt >= limit) {
+                    return Err(anyhow::anyhow!("injected transport send failure"));
+                }
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let client = make_client().await;
+        let sends = Arc::new(AtomicUsize::new(0));
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(CountingTransport {
+                sends: sends.clone(),
+                failure_after,
+            }) as Arc<dyn crate::transport::Transport>,
+            NoiseCipher::new(&key).expect("valid key"),
+            NoiseCipher::new(&key).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        (client, sends)
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    async fn make_blocking_sending_client() -> (
+        Arc<Client>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        use wacore::handshake::NoiseCipher;
+
+        struct BlockingTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+        }
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl crate::transport::Transport for BlockingTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+                let _ = self.started.try_send(());
+                let _ = self.release.recv().await;
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let client = make_client().await;
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(BlockingTransport {
+                started: started_tx,
+                release: release_rx,
+            }) as Arc<dyn crate::transport::Transport>,
+            NoiseCipher::new(&key).expect("valid key"),
+            NoiseCipher::new(&key).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        (client, started_rx, release_tx)
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn video_stanza(state: &str) -> wacore_binary::Node {
+        NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "STANZA-ID-0002")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("video")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .attr("state", state.to_string())
+                .attr("device_orientation", "1")
+                .build()])
+            .build()
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn audio_selection_stanza(rate: &str) -> wacore_binary::Node {
+        NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "STANZA-ID-AUDIO")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .children([NodeBuilder::new("audio")
+                    .attr("enc", "opus")
+                    .attr("rate", rate.to_string())
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn register_native_opus_call(
+        client: &Client,
+        ring_devices: Vec<Jid>,
+    ) -> async_channel::Receiver<wacore::voip::CallEvent> {
+        use wacore::voip::{AudioFormat, CallEvent};
+
+        let registry = client.call_registry();
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        );
+        session.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        session.ring_devices = ring_devices;
+        let generation = registry.insert(session);
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+        event_rx
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn incompatible_audio_selection_emits_event_and_terminates_call() {
+        use wacore::voip::CallEvent;
+
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let accepting = fake_caller_lid();
+        let event_rx =
+            register_native_opus_call(&client, vec![accepting.clone(), accepting.with_device(1)]);
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("8000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert_eq!(
+            event_rx.try_recv(),
+            Ok(CallEvent::AudioFormatMismatch {
+                expected_rate: 16_000,
+                received_rates: vec![8_000],
+            })
+        );
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(client.call_registry().snapshot("CALL-ID-0001").is_none());
+        assert!(!cancelled);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn compatible_audio_selection_keeps_call_active() {
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let event_rx = register_native_opus_call(&client, Vec::new());
+        let (handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("16000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert!(event_rx.try_recv().is_err());
+        assert!(client.call_registry().snapshot("CALL-ID-0001").is_some());
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            global_rx.try_recv().as_deref(),
+            Ok(Event::IncomingCall(IncomingCall {
+                action: CallAction::Accept { .. },
+                ..
+            }))
+        ));
+        assert!(!cancelled);
+    }
+
+    // A <call><video> must be acked with the TYPED <ack class="call" type="video"> and the
+    // generic router ack suppressed — an untyped ack makes the upgrade requester revert ~5s in.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn video_state_sends_typed_ack_and_cancels_generic() {
+        use wacore::voip::CallEvent;
+
+        let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (event_tx, _event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("ack"));
+
+        let node = node_to_owned_ref(&video_stanza("11"));
+        let mut cancelled = false;
+        assert!(CallHandler.handle(client, node, &mut cancelled).await);
+        assert!(cancelled, "the generic (untyped) ack must be suppressed");
+
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("typed ack must be sent")
+            .expect("waiter");
+        let r = ack.as_node_ref();
+        assert_eq!(r.attrs().optional_string("class").as_deref(), Some("call"));
+        assert_eq!(r.attrs().optional_string("type").as_deref(), Some("video"));
+        assert_eq!(
+            r.attrs().optional_string("id").as_deref(),
+            Some("STANZA-ID-0002")
+        );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn video_state_is_not_visible_before_typed_ack_completes() {
+        use wacore::voip::CallEvent;
+
+        let (client, send_started, release_send) = make_blocking_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx.clone(),
+            control_tx,
+            Box::new(|| {}),
+        );
+
+        let node = node_to_owned_ref(&video_stanza("11"));
+        let mut cancelled = false;
+        let handled = {
+            let handling = CallHandler.handle(client, node, &mut cancelled);
+            tokio::pin!(handling);
+            tokio::select! {
+                started = send_started.recv() => started.expect("typed ack send started"),
+                _ = &mut handling => panic!("handler completed before the blocked ack send"),
+            }
+            assert!(
+                event_rx.is_empty(),
+                "the application must not observe an uncommitted video state"
+            );
+            event_tx
+                .try_send(CallEvent::RelayAllocated)
+                .expect("fill the queue while the typed ack is in flight");
+
+            release_send.send(()).await.expect("release ack send");
+            handling.await
+        };
+        assert!(handled);
+        assert!(cancelled);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::VideoStateChanged { .. })
+        ));
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn video_transition_stays_serialized_through_enabled_announcement() {
+        use wacore::voip::CallEvent;
+
+        let (client, send_started, release_send) = make_blocking_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (event_tx, _event_rx) = async_channel::bounded::<CallEvent>(1);
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+
+        let node = node_to_owned_ref(&video_stanza("4"));
+        let mut cancelled = false;
+        let handled = {
+            let handling = CallHandler.handle(client, node, &mut cancelled);
+            tokio::pin!(handling);
+
+            tokio::select! {
+                started = send_started.recv() => started.expect("typed ack send started"),
+                _ = &mut handling => panic!("handler completed before the typed ack send"),
+            }
+            release_send.send(()).await.expect("release typed ack");
+            tokio::select! {
+                started = send_started.recv() => started.expect("Enabled announcement started"),
+                _ = &mut handling => panic!("handler completed before the Enabled send"),
+            }
+            assert!(
+                registry.reserve_call_event("CALL-ID-0001").is_none(),
+                "the next transition must not overtake committed effects"
+            );
+            release_send.send(()).await.expect("release Enabled send");
+            handling.await
+        };
+        assert!(handled);
+        assert!(cancelled);
+        assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn failed_enabled_announcement_rolls_back_the_video_upgrade() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        assert!(registry.set_is_video("CALL-ID-0001", generation, true));
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, control_rx) = video_control_channel();
+        let teardown_control = control_tx.clone();
+        let teardowns = Arc::new(AtomicUsize::new(0));
+        registry.set_video_channels("CALL-ID-0001", generation, event_tx, control_tx, {
+            let teardowns = teardowns.clone();
+            Box::new(move || {
+                teardowns.fetch_add(1, Ordering::SeqCst);
+                let _ = teardown_control.send(VideoControl::Disable);
+            })
+        });
+
+        let node = node_to_owned_ref(&video_stanza("4"));
+        let mut cancelled = false;
+        assert!(CallHandler.handle(client, node, &mut cancelled).await);
+
+        assert!(
+            cancelled,
+            "the successful typed ack suppresses the generic ack"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert_eq!(teardowns.load(Ordering::SeqCst), 1);
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(control_rx.try_recv(), Ok(VideoControl::Disable));
+        assert!(control_rx.try_recv().is_err());
+        assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
+        assert!(global_rx.try_recv().is_err());
+        assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn video_state_does_not_mutate_a_same_id_replacement_after_ack_await() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::voip::CallEvent;
+
+        let (client, send_started, release_send) = make_blocking_sending_client().await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
+        let registry = client.call_registry();
+        let stale_generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (stale_event_tx, stale_event_rx) = async_channel::unbounded::<CallEvent>();
+        let (stale_control_tx, _stale_control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            stale_generation,
+            stale_event_tx,
+            stale_control_tx,
+            Box::new(|| {}),
+        );
+
+        let node = node_to_owned_ref(&video_stanza("4"));
+        let mut cancelled = false;
+        let replacement_teardowns = Arc::new(AtomicUsize::new(0));
+        let replacement_control_rx = {
+            let handling = CallHandler.handle(client, node, &mut cancelled);
+            tokio::pin!(handling);
+            tokio::select! {
+                started = send_started.recv() => started.expect("typed ack send started"),
+                _ = &mut handling => panic!("handler completed before the typed ack send"),
+            }
+
+            let replacement = registry.insert(wacore::voip::CallSession::new_incoming(
+                "CALL-ID-0001",
+                fake_caller_lid(),
+                fake_caller_lid(),
+            ));
+            let (replacement_event_tx, _replacement_event_rx) =
+                async_channel::unbounded::<CallEvent>();
+            let (replacement_control_tx, replacement_control_rx) = video_control_channel();
+            registry.set_video_channels(
+                "CALL-ID-0001",
+                replacement,
+                replacement_event_tx,
+                replacement_control_tx,
+                {
+                    let replacement_teardowns = replacement_teardowns.clone();
+                    Box::new(move || {
+                        replacement_teardowns.fetch_add(1, Ordering::SeqCst);
+                    })
+                },
+            );
+
+            release_send.send(()).await.expect("release typed ack");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut handling)
+                    .await
+                    .expect("stale handler must not start an Enabled send")
+            );
+            replacement_control_rx
+        };
+        assert!(cancelled);
+        assert!(stale_event_rx.try_recv().is_err());
+        assert!(replacement_control_rx.try_recv().is_err());
+        assert!(
+            !registry
+                .snapshot("CALL-ID-0001")
+                .expect("replacement")
+                .is_video
+        );
+        assert_eq!(replacement_teardowns.load(Ordering::SeqCst), 0);
+        assert!(global_rx.try_recv().is_err());
+    }
+
+    // Non-video call actions keep the generic ack: `cancelled` must stay false.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn non_video_actions_keep_the_generic_ack() {
+        let client = make_sending_client().await;
+        let node = node_to_owned_ref(&offer_stanza());
+        let mut cancelled = false;
+        assert!(CallHandler.handle(client, node, &mut cancelled).await);
+        assert!(!cancelled, "an offer must not cancel the generic ack");
+    }
+
+    // The video state must reach the call's event stream (via the registry hook) with the
+    // orientation, steer the plane (Enable on accept), and update the session's is_video flag.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn video_state_forwards_event_and_steers_the_plane() {
+        use wacore::types::call::VideoState;
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let client = make_sending_client().await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
+        let registry = client.call_registry();
+        let session = wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        );
+        let generation = registry.insert(session);
+        let (ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
+        let enabled_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+
+        let node = node_to_owned_ref(&video_stanza("4")); // UpgradeAccept
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node, &mut cancelled)
+                .await
+        );
+
+        let ev = ev_rx.try_recv().expect("event must be forwarded");
+        assert!(matches!(
+            ev,
+            CallEvent::VideoStateChanged {
+                state: VideoState::UpgradeAccept,
+                orientation: Some(1),
+            }
+        ));
+        let ctls: Vec<VideoControl> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
+        assert!(ctls.contains(&VideoControl::SetOrientation(1)));
+        assert!(
+            ctls.contains(&VideoControl::Enable),
+            "an accept must enable our plane so the peer's video decodes"
+        );
+        assert!(
+            registry.snapshot("CALL-ID-0001").expect("session").is_video,
+            "UpgradeAccept marks the call as video"
+        );
+        assert!(matches!(
+            global_rx.try_recv().as_deref(),
+            Ok(Event::IncomingCall(IncomingCall {
+                action: CallAction::VideoState { .. },
+                ..
+            }))
+        ));
+        let enabled = tokio::time::timeout(std::time::Duration::from_secs(2), enabled_waiter)
+            .await
+            .expect("Enabled stanza must be sent")
+            .expect("waiter");
+        let enabled_ref = enabled.as_node_ref();
+        let children = enabled_ref.children().expect("video child");
+        let video = &children[0];
+        assert_eq!(video.tag, "video");
+        assert_eq!(video.attrs().optional_string("state").as_deref(), Some("1"));
+
+        // The peer stopping its video clears the flag but does NOT disable our plane.
+        let node = node_to_owned_ref(&video_stanza("6"));
+        let mut cancelled = false;
+        assert!(CallHandler.handle(client, node, &mut cancelled).await);
+        assert!(
+            !registry.snapshot("CALL-ID-0001").expect("session").is_video,
+            "Stopped clears the video flag"
+        );
+        let ctls: Vec<VideoControl> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
+        assert!(
+            !ctls.contains(&VideoControl::Disable),
+            "the peer stopping ITS video must not tear our plane down"
+        );
+    }
+
+    // A peer that REJECTS or CANCELS an upgrade we started must fully release our local video: the
+    // registered teardown hook runs (so the camera feed stops) and the session flag clears.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn refused_upgrade_runs_local_video_teardown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::voip::CallEvent;
+
+        for state in ["5", "8"] {
+            // 5 = UpgradeReject, 8 = UpgradeCancel.
+            let client = make_sending_client().await;
+            let registry = client.call_registry();
+            let session = wacore::voip::CallSession::new_outgoing(
+                "CALL-ID-0001",
+                fake_caller_lid(),
+                fake_caller_lid(),
+            );
+            let generation = registry.insert(session);
+            registry.set_is_video("CALL-ID-0001", generation, true);
+            let torn = Arc::new(AtomicUsize::new(0));
+            let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
+            let (ctl_tx, _ctl_rx) = video_control_channel();
+            registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, {
+                let torn = torn.clone();
+                Box::new(move || {
+                    torn.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+
+            let node = node_to_owned_ref(&video_stanza(state));
+            let mut cancelled = false;
+            assert!(CallHandler.handle(client, node, &mut cancelled).await);
+            assert_eq!(
+                torn.load(Ordering::SeqCst),
+                1,
+                "state {state}: a refused upgrade must run the local video teardown"
+            );
+            assert!(
+                !registry.snapshot("CALL-ID-0001").expect("session").is_video,
+                "state {state}: a refused upgrade must clear the video flag"
+            );
+        }
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn refused_upgrade_tears_down_when_typed_ack_send_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wacore::voip::CallEvent;
+
+        let client = make_client().await;
+        let registry = client.call_registry();
+        let session = wacore::voip::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        );
+        let generation = registry.insert(session);
+        registry.set_is_video("CALL-ID-0001", generation, true);
+        let torn = Arc::new(AtomicUsize::new(0));
+        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, {
+            let torn = torn.clone();
+            Box::new(move || {
+                torn.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("5")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(cancelled, "a built typed ack suppresses the generic ack");
+        assert_eq!(torn.load(Ordering::SeqCst), 1);
+        assert!(!registry.snapshot("CALL-ID-0001").expect("session").is_video);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn unacked_video_state_is_not_dispatched_globally() {
+        use wacore::voip::CallEvent;
+
+        let client = make_client().await;
+        let (global_handler, global_rx) = ChannelEventHandler::new();
+        client.register_handler(global_handler);
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("4")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(
+            cancelled,
+            "the attempted typed ack suppresses the generic ack"
+        );
+        assert!(global_rx.try_recv().is_err());
+        assert!(ctl_rx.try_recv().is_err());
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn committed_video_state_supersedes_diagnostics_when_event_queue_is_full() {
+        use wacore::voip::{CallEvent, VideoControl};
+
+        let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(1);
+        ev_tx.try_send(CallEvent::RelayAllocated).expect("prefill");
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("4")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(cancelled, "the typed ack must suppress the generic ack");
+        assert!(registry.snapshot("CALL-ID-0001").expect("session").is_video);
+        assert!(matches!(
+            ev_rx.try_recv(),
+            Ok(CallEvent::VideoStateChanged { .. })
+        ));
+        assert!(
+            std::iter::from_fn(|| ctl_rx.try_recv().ok())
+                .any(|ctl| matches!(ctl, VideoControl::Enable)),
+            "the committed transition must steer the local plane"
+        );
     }
 
     #[tokio::test]
@@ -411,7 +1319,7 @@ mod tests {
     // device gets a per-device `<call to=DEVICE_JID id=..><terminate reason="accepted_elsewhere">`
     // (no <destination> block), and the rung set is consumed one-shot. A two-device callee keeps the
     // assertion to a single dismiss stanza the waiter can capture in full.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn accept_dismisses_other_callee_device() {
         let client = make_client().await;
@@ -476,7 +1384,7 @@ mod tests {
 
     // A peer <terminate> for our call tears it down: the registry entry (and with it the media task)
     // is removed so CallHandle::wait_ended() resolves, instead of leaking until a relay timeout.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn terminate_tears_down_the_call() {
         let client = make_client().await;
@@ -523,12 +1431,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     fn terminate_stanza(from: Jid, call_creator: Jid, call_id: &str) -> wacore_binary::Node {
         terminate_stanza_reason(from, call_creator, call_id, None)
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     fn terminate_stanza_reason(
         from: Jid,
         call_creator: Jid,
@@ -549,7 +1457,7 @@ mod tests {
             .build()
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     fn count_missed(rx: &async_channel::Receiver<Arc<Event>>, call_id: &str) -> usize {
         let mut n = 0;
         while let Ok(ev) = rx.try_recv() {
@@ -566,7 +1474,7 @@ mod tests {
     // An incoming offer that rings and is never answered, then a peer <terminate>, surfaces exactly
     // one MissedCall(Remote) -- WA Web's missed-call outcome. The offer is what marks the call ringing;
     // a terminate with no preceding offer is an ended call, not a missed one.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn unanswered_incoming_terminate_surfaces_missed_call() {
         let client = make_client().await;
@@ -604,7 +1512,7 @@ mod tests {
 
     // A duplicate <terminate> for the same unanswered call must NOT re-fire a missed call: the ringing
     // flag is consumed one-shot by the first terminate.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn duplicate_terminate_does_not_refire_missed_call() {
         let client = make_client().await;
@@ -643,7 +1551,7 @@ mod tests {
     // A <terminate> for an OUTGOING call we placed must NOT surface a missed call: we never rang for
     // it, so it is an ended call, not a missed one. This is the regression the registry-absence gate
     // produced -- our own call's teardown looked identical to an unanswered incoming call.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn outgoing_call_terminate_does_not_surface_missed_call() {
         let client = make_client().await;
@@ -685,7 +1593,7 @@ mod tests {
     // outcome: accepted_elsewhere -> AcceptedElsewhere and rejected_elsewhere -> Rejected, meaning
     // another of our devices took the call. A companion device that rang then receives the caller's
     // elsewhere-dismiss must surface CallEndedElsewhere with the matching outcome, NOT a MissedCall.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn elsewhere_terminate_surfaces_call_ended_elsewhere_not_missed() {
         for (reason, expected) in [
@@ -747,7 +1655,7 @@ mod tests {
 
     // A reason that IS a missed outcome (timeout) on a still-ringing call surfaces the missed call,
     // confirming the reason gate excludes only the elsewhere outcomes, not every reason.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn timeout_terminate_surfaces_missed_call() {
         let client = make_client().await;
@@ -788,7 +1696,7 @@ mod tests {
 
     // A call we locally declined must not later be recorded as missed: reject() consumes the ringing
     // flag, so a caller <terminate> that follows our <reject> reads as ended, not missed.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn local_reject_then_caller_terminate_is_not_missed() {
         use async_trait::async_trait;
@@ -863,7 +1771,7 @@ mod tests {
     // A call we answered must not later be recorded as missed: accepting registers the call (as
     // accept().start() -> spawn_call -> registry.insert does), which consumes the ringing flag, so a
     // caller <terminate> after we picked up reads as ended, not missed.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn answered_call_then_caller_terminate_is_not_missed() {
         let client = make_client().await;

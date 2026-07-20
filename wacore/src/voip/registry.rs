@@ -8,12 +8,14 @@
 //! the portable core to a specific executor.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
+use crate::voip::driver::{VideoControl, VideoControlSender};
+use crate::voip::engine::CallEvent;
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
 
@@ -41,9 +43,51 @@ struct CallEntry {
     /// Caller-only, one-shot: delivers the answering device LID to the drive loop so it can rekey
     /// recv. Taken on first use (a duplicate `<accept>` finds `None`); dropped with the entry.
     rekey_tx: Option<async_channel::Sender<String>>,
+    /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
+    /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
+    event_tx: Option<async_channel::Sender<CallEvent>>,
+    /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
+    video_ctl_tx: Option<VideoControlSender>,
+    /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
+    /// same teardown without keeping codec resources alive through lingering handles.
+    video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Prevents concurrent video transitions from overtaking each other while an ack is in flight.
+    event_publication_reserved: Arc<AtomicBool>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
+}
+
+/// Exclusive publication right for an actionable signaling event awaiting its typed ack.
+pub struct CallEventPermit {
+    tx: async_channel::Sender<CallEvent>,
+    reserved: Arc<AtomicBool>,
+    generation: u64,
+}
+
+impl CallEventPermit {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn send(&self, event: CallEvent) -> bool {
+        // The latest committed state must remain observable even when its consumer is behind.
+        self.tx.force_send(event).is_ok()
+    }
+}
+
+impl Drop for CallEventPermit {
+    fn drop(&mut self) {
+        self.reserved.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for CallEntry {
+    fn drop(&mut self) {
+        if let Some(teardown) = self.video_teardown.take() {
+            teardown();
+        }
+    }
 }
 
 /// Thread-safe map of active calls keyed by call-id.
@@ -61,6 +105,17 @@ pub struct CallRegistry {
 impl CallRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Deliver a signaling event through the call's consumer queue.
+    pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|entry| entry.event_tx.clone());
+        tx.is_some_and(|tx| tx.force_send(event).is_ok())
     }
 
     /// Register a call, returning its generation token. A same-call-id re-offer (retry/glare)
@@ -83,6 +138,10 @@ impl CallRegistry {
                     media_task: None,
                     generation,
                     rekey_tx: None,
+                    event_tx: None,
+                    video_ctl_tx: None,
+                    video_teardown: None,
+                    event_publication_reserved: Arc::new(AtomicBool::new(false)),
                     on_terminal: None,
                 },
             )
@@ -154,6 +213,131 @@ impl CallRegistry {
         {
             entry.rekey_tx = Some(tx);
         }
+    }
+
+    /// Store the call's consumer-facing event sender, video-control sender, and the local-video
+    /// teardown hook, so the signaling handler can surface `<video state>` changes, steer the video
+    /// plane mid-call, and fully release the endpoints on a refused upgrade. Generation-guarded like
+    /// the rekey sender.
+    pub fn set_video_channels(
+        &self,
+        call_id: &str,
+        generation: u64,
+        event_tx: async_channel::Sender<CallEvent>,
+        video_ctl_tx: VideoControlSender,
+        video_teardown: Box<dyn Fn() + Send + Sync>,
+    ) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            && entry.generation == generation
+        {
+            entry.event_tx = Some(event_tx);
+            entry.video_ctl_tx = Some(video_ctl_tx);
+            entry.video_teardown = Some(video_teardown);
+        }
+    }
+
+    /// Replace the one-shot endpoint teardown for the current call generation.
+    pub fn set_video_teardown(
+        &self,
+        call_id: &str,
+        generation: u64,
+        video_teardown: Box<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        entry.video_teardown = Some(video_teardown);
+        true
+    }
+
+    /// Release the local video endpoints once for the current call generation.
+    pub fn run_video_teardown(&self, call_id: &str, generation: u64) -> bool {
+        let hook = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.video_teardown.take());
+        if let Some(hook) = hook {
+            hook();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Serialize an actionable signaling event across its typed ack. The permit force-inserts the
+    /// committed transition, so queue pressure cannot hide peer-visible state from the consumer.
+    pub fn reserve_call_event(&self, call_id: &str) -> Option<CallEventPermit> {
+        let (tx, reserved, generation) = {
+            let map = self.inner.lock().expect("registry lock poisoned");
+            let entry = map.get(call_id)?;
+            (
+                entry.event_tx.clone()?,
+                entry.event_publication_reserved.clone(),
+                entry.generation,
+            )
+        };
+        if tx.is_closed()
+            || reserved
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(CallEventPermit {
+            tx,
+            reserved,
+            generation,
+        })
+    }
+
+    /// Send a mid-call video-plane command to the current drive loop.
+    pub fn send_video_ctl(&self, call_id: &str, generation: u64, ctl: VideoControl) {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|e| e.video_ctl_tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send(ctl);
+        }
+    }
+
+    /// Track whether the call currently has video negotiated (offer `<video>`, upgrade accepted, or
+    /// downgraded back). No-op for an unknown call.
+    pub fn set_is_video(&self, call_id: &str, generation: u64, is_video: bool) -> bool {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            && entry.generation == generation
+        {
+            entry.session.is_video = is_video;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_current(&self, call_id: &str, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .is_some_and(|entry| entry.generation == generation)
     }
 
     /// Caller side: rekey recv to the device that answered. One-shot — the sender is TAKEN, so a
@@ -324,6 +508,7 @@ impl CallRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voip::driver::video_control_channel;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wacore_binary::{Jid, Server};
@@ -362,6 +547,148 @@ mod tests {
             "a stale generation must not read the replacement's device"
         );
         assert_eq!(reg.answering_device_if_current("CID", g2), None);
+    }
+
+    #[test]
+    fn signaling_event_commit_survives_queue_backpressure() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let (event_tx, event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        reg.set_video_channels("CID", generation, event_tx.clone(), ctl_tx, Box::new(|| {}));
+
+        let event = || CallEvent::VideoStateChanged {
+            state: crate::types::call::VideoState::Enabled,
+            orientation: None,
+        };
+        let permit = reg.reserve_call_event("CID").expect("first reservation");
+        assert!(
+            reg.reserve_call_event("CID").is_none(),
+            "only one typed ack may own the signaling slot"
+        );
+        assert!(
+            event_rx.is_empty(),
+            "reservation must not publish the event"
+        );
+        event_tx
+            .try_send(CallEvent::RelayAllocated)
+            .expect("fill the queue while the typed ack is in flight");
+        assert!(permit.send(event()));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::VideoStateChanged { .. })
+        ));
+        assert!(
+            reg.reserve_call_event("CID").is_none(),
+            "publishing must not release the transition before its effects finish"
+        );
+        drop(permit);
+        assert!(reg.reserve_call_event("CID").is_some());
+        assert!(reg.reserve_call_event("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn video_teardown_runs_after_registry_unlock() {
+        let reg = Arc::new(CallRegistry::new());
+        let generation = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, {
+            let reg = reg.clone();
+            let lock_was_free = lock_was_free.clone();
+            Box::new(move || {
+                lock_was_free.store(reg.inner.try_lock().is_ok(), Ordering::SeqCst);
+            })
+        });
+
+        assert!(reg.run_video_teardown("CID", generation));
+        assert!(lock_was_free.load(Ordering::SeqCst));
+        assert!(!reg.run_video_teardown("CID", generation));
+    }
+
+    #[test]
+    fn video_teardown_is_one_shot_until_rearmed() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        let hook = |calls: &Arc<AtomicU64>| {
+            let calls = calls.clone();
+            Box::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }) as Box<dyn Fn() + Send + Sync>
+        };
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, hook(&calls));
+
+        assert!(reg.run_video_teardown("CID", generation));
+        assert!(!reg.run_video_teardown("CID", generation));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        assert!(reg.set_video_teardown("CID", generation, hook(&calls)));
+        assert!(reg.run_video_teardown("CID", generation));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(reg.remove_if_current("CID", generation));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn video_mutations_are_generation_guarded_and_orientation_is_advisory() {
+        let reg = CallRegistry::new();
+        let stale = reg.insert(session("CID"));
+        let current = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        let teardown_calls = Arc::new(AtomicU64::new(0));
+        reg.set_video_channels("CID", current, event_tx, ctl_tx, {
+            let teardown_calls = teardown_calls.clone();
+            Box::new(move || {
+                teardown_calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(reg.set_is_video("CID", current, true));
+        assert!(!reg.set_is_video("CID", stale, false));
+        assert!(reg.snapshot("CID").expect("session").is_video);
+        assert!(!reg.run_video_teardown("CID", stale));
+        assert_eq!(teardown_calls.load(Ordering::SeqCst), 0);
+
+        reg.send_video_ctl("CID", current, VideoControl::Disable);
+        for orientation in 0..100u8 {
+            reg.send_video_ctl(
+                "CID",
+                current,
+                VideoControl::SetOrientation(orientation % 4),
+            );
+        }
+        reg.send_video_ctl("CID", current, VideoControl::Enable);
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+
+        reg.send_video_ctl("CID", stale, VideoControl::Disable);
+        assert!(ctl_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn removal_releases_video_endpoints_after_registry_unlock() {
+        let reg = Arc::new(CallRegistry::new());
+        let generation = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, {
+            let reg = reg.clone();
+            let calls = calls.clone();
+            Box::new(move || {
+                assert!(reg.inner.try_lock().is_ok());
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(reg.remove_if_current("CID", generation));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -59,9 +59,9 @@ zerocopy = { version = "0.8.52", default-features = false, features = ["derive"]
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-buffa = { version = "0.8.1", default-features = false, features = ["json"] }
-buffa-build = { version = "0.8.1", default-features = false }
-buffa-descriptor = { version = "0.8.1", default-features = false }
+buffa = { version = "0.9.0", default-features = false, features = ["json"] }
+buffa-build = { version = "0.9.0", default-features = false }
+buffa-descriptor = { version = "0.9.0", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 bon = { version = "3.9.3", default-features = false, features = ["std"] }
@@ -146,10 +146,8 @@ tokio-runtime = ["dep:tokio"]
 signal = ["tokio-runtime", "tokio/signal"]
 sqlite-storage = ["whatsapp-rust-sqlite-storage"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
-# VoIP calls media plane (opt-in, NOT default): pulls wacore's voip crypto plus the
-# DTLS/SCTP/DataChannel transport (webrtc-rs) and libopus FFI. Not buildable on wasm32/esp32
-# (a compile_error in src/voip/mod.rs enforces this); use wacore's `voip` feature there.
-voip = [
+# Shared native VoIP runtime. Public profiles below select which codec implementation is linked.
+voip-runtime = [
     "wacore/voip",
     "tokio-runtime",
     "tokio/net",
@@ -158,9 +156,16 @@ voip = [
     "dep:webrtc-data",
     "dep:webrtc-util",
     "dep:webrtc-util-011",
-    "dep:opus",
     "dep:rustls",
 ]
+# Backwards-compatible full profile: preserves both codec adapters from the former single feature.
+voip = ["voip-mlow", "voip-libopus"]
+# Codec-bypass profile: raw MLOW/Opus payloads supplied by the application, no codec linked.
+voip-encoded = ["voip-runtime"]
+# Explicit spelling for consumers that assemble feature sets instead of using `voip`.
+voip-mlow = ["voip-runtime", "wacore/voip-mlow"]
+# Optional PCM adapter for standard Opus, including MLOW's CELT escape. Encoded I/O needs no libopus.
+voip-libopus = ["voip-encoded", "dep:opus"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -228,6 +233,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
+wacore = { workspace = true, features = ["test-util"] }
 wacore-noise = { path = "./wacore/noise", features = [
     "test-util",
     "danger-skip-cert-chain-verify",
@@ -345,6 +351,11 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.serde_json]
 opt-level = "s"
+# The bundled SQLite amalgamation (sqlite3.c) — cargo exports OPT_LEVEL to the
+# build script and the cc crate maps it to -Oz. The C core was the one crate
+# the per-package sweep above missed; same I/O-bound tradeoff as diesel.
+[profile.release.package.libsqlite3-sys]
+opt-level = "z"
 
 # Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
 # fast (release uses fat LTO) and debug symbols stay for local profiling.

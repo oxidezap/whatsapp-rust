@@ -51,17 +51,34 @@ pub mod mock {
     /// client wrote to the wire.
     pub struct CapturingMockTransport {
         sent: std::sync::Mutex<Vec<bytes::Bytes>>,
+        remaining_failures: std::sync::atomic::AtomicUsize,
+        failed_sends: std::sync::atomic::AtomicUsize,
     }
 
     impl CapturingMockTransport {
         pub fn new() -> Self {
             Self {
                 sent: std::sync::Mutex::new(Vec::new()),
+                remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+                failed_sends: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         pub fn sent(&self) -> Vec<bytes::Bytes> {
             self.sent.lock().expect("capturing mutex").clone()
+        }
+
+        pub fn sent_count(&self) -> usize {
+            self.sent.lock().expect("capturing mutex").len()
+        }
+
+        pub fn fail_next_sends(&self, count: usize) {
+            self.remaining_failures
+                .store(count, std::sync::atomic::Ordering::Release);
+        }
+
+        pub fn failed_sends(&self) -> usize {
+            self.failed_sends.load(std::sync::atomic::Ordering::Acquire)
         }
     }
 
@@ -75,6 +92,19 @@ pub mod mock {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl Transport for CapturingMockTransport {
         async fn send(&self, data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            if self
+                .remaining_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                self.failed_sends
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(anyhow::anyhow!("injected transport failure"));
+            }
             self.sent.lock().expect("capturing mutex").push(data);
             Ok(())
         }

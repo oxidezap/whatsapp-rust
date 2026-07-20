@@ -25,6 +25,7 @@ hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 log = { workspace = true }
+portable-atomic = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["alloc"] }
 sha1 = { workspace = true }

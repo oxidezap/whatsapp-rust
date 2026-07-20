@@ -241,8 +241,8 @@ pub async fn prepare_dm_stanza(
 ///
 /// `SessionStore::load_session` is take-semantics in production
 /// (`SessionAdapter` → `SignalStoreCache::get_session` marks the slot
-/// `CheckedOut`); the loaded record is put back via `store_session`
-/// so the subsequent `message_encrypt` finds the slot Present.
+/// `CheckedOut`); the checkout guard keeps cancellation from hiding it from
+/// the subsequent `message_encrypt`.
 pub async fn pkmsg_would_be_emitted<S>(
     session_store: &mut S,
     signal_address: &ProtocolAddress,
@@ -250,25 +250,23 @@ pub async fn pkmsg_would_be_emitted<S>(
 where
     S: crate::libsignal::protocol::SessionStore,
 {
-    let loaded = session_store.load_session(signal_address).await?;
+    let loaded =
+        crate::libsignal::protocol::SessionCheckout::load(session_store, signal_address).await?;
     // Conservative read: treat any failure to interrogate the session as
     // "would be pkmsg" so the caller bails. Silently treating Err as false
     // would let message_encrypt run with a corrupt session and potentially
     // burn the sender chain.
-    let needs_pkmsg = match &loaded {
-        None => true,
-        Some(record) => match record.session_state() {
-            None => true,
-            Some(state) => match state.unacknowledged_pre_key_message_items() {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
-                Err(_) => true,
-            },
-        },
+    let needs_pkmsg = if let Some(session) = loaded.as_ref()
+        && let Some(state) = session.record().session_state()
+        && let Ok(None) = state.unacknowledged_pre_key_message_items()
+    {
+        false
+    } else {
+        true
     };
-    if let Some(record) = loaded {
-        session_store
-            .store_session(signal_address, record)
+    if let Some(session) = loaded {
+        session
+            .commit()
             .await
             .map_err(|e| anyhow!("restoring checked-out session after pre-flight: {e}"))?;
     }

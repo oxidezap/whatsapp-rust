@@ -5,11 +5,14 @@
 //! tests pass even when both directions are wrong identically, so known-answer vectors are
 //! the only real guard.
 
+pub mod audio;
 pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
 pub mod engine;
+pub mod h264;
 pub mod hbh_srtp;
+#[cfg(feature = "voip-mlow")]
 pub mod mlow;
 pub mod registry;
 pub mod relay_parse;
@@ -29,17 +32,27 @@ pub mod warp;
 // Curated facade: the headline entry points a consumer reaches for, hoisted to `voip::`.
 // The sub-modules stay `pub` for fine-grained wire helpers (parsers, attr builders), but
 // these are the ones worth surfacing by name.
+pub use audio::{
+    AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
+    OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
+};
 pub use demux::{RelayPacketKind, classify_relay_packet};
-pub use driver::{CallChannels, run_call};
+pub use driver::{
+    CallChannels, VideoControl, VideoControlReceiver, VideoControlSender, run_call,
+    video_control_channel,
+};
 pub use engine::{
     CallConfig, CallEngine, CallEvent, EngineError, Input, Millis, NEVER, Output, SetupError,
     TxIdSource,
 };
+pub use h264::{AnnexBAuSplitter, VideoFrame};
+#[cfg(feature = "voip-mlow")]
 pub use mlow::{MlowDecoder, MlowEncoder};
-// Internal: the inbound router's standard-Opus vs mlow discriminator (engine reaches it via `super`).
-pub(crate) use mlow::is_standard_opus_frame;
 pub use registry::CallRegistry;
-pub use session::{CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams};
+pub use session::{
+    CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
+    VideoPipelineParams,
+};
 pub use transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };

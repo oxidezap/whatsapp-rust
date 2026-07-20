@@ -1,7 +1,6 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
 use crate::types::events::{Event, PairError, PairSuccess};
-use buffa::Message;
 use log::{debug, error, info, warn};
 
 use std::sync::Arc;
@@ -10,7 +9,6 @@ use wacore::companion_reg::companion_web_client_type_for_props;
 use wacore::libsignal::protocol::KeyPair;
 use wacore_binary::NodeRef;
 use wacore_binary::{Jid, SERVER_JID};
-use waproto::whatsapp as wa;
 
 pub use wacore::companion_reg::{CompanionWebClientType, NATIVE_CAMERA_DEEP_LINK_PREFIX};
 pub use wacore::pair::{DeviceState, PairCryptoError, PairUtils};
@@ -234,7 +232,7 @@ async fn handle_pair_success<'a>(
 
     match result {
         Ok((self_signed_identity_bytes, key_index)) => {
-            let signed_identity_for_event = match wa::ADVSignedDeviceIdentity::decode_from_slice(
+            let signed_identity_for_event = match waproto::codec::adv_signed_device_identity_decode(
                 self_signed_identity_bytes.as_slice(),
             ) {
                 Ok(identity) => identity,

@@ -19,6 +19,10 @@ ignored = ["getrandom"]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
 debug-snapshots = []
+# Expose the InMemoryBackend fault-injection / call-count hooks used by the e2e
+# suite. Off by default so normal builds carry no extra fields or per-call
+# bookkeeping. Enabled only from test crates.
+test-util = []
 # Optional observability: emit tracing spans/events. Off by default (no dep).
 tracing = ["dep:tracing"]
 # Optional metrics via the `metrics` facade. Off by default (no dep).
@@ -31,10 +35,10 @@ danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
 # Enable JS-based random number generation for wasm32 targets.
 # Activates getrandom's wasm_js backend so rand works in the browser.
 js = ["getrandom/wasm_js"]
-# VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default:
-# the media plane is opt-in and pulls aes-gcm into the non-dev build. The MLow codec's
-# runtime constant tables are zlib-compressed protobuf (buffa, see tables.proto).
+# VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default.
 voip = ["dep:aes-gcm", "dep:zerocopy"]
+# Built-in PCM/MLOW adapter. Encoded audio transport needs only `voip`.
+voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
 # Dev/profiling only; off by default and not pulled into normal builds.
 dhat-heap = ["dep:dhat"]
@@ -92,7 +96,7 @@ sha2 = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 futures = { workspace = true, features = ["executor", "thread-pool"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [[bench]]
 name = "reporting_token_benchmark"
@@ -100,6 +104,10 @@ harness = false
 
 [[bench]]
 name = "send_receive_benchmark"
+harness = false
+
+[[bench]]
+name = "token_lookup_benchmark"
 harness = false
 
 [[bench]]
@@ -122,11 +130,11 @@ harness = false
 [[bench]]
 name = "voip_benchmark"
 harness = false
-required-features = ["voip"]
+required-features = ["voip-mlow"]
 
 [[example]]
 name = "voip_profile"
-required-features = ["voip"]
+required-features = ["voip-mlow"]
 
 [lints]
 workspace = true

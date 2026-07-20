@@ -1,7 +1,6 @@
 //! Pure event-to-row transforms: what a `wa::Message` means for the tables.
 //! No I/O here so every rule is unit-testable without a database.
 
-use buffa::Message as _;
 use wacore::proto_helpers::MessageExt;
 use waproto::whatsapp as wa;
 
@@ -112,7 +111,7 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
                         target_id,
                         new_text: extract_text(edited_base),
                         new_kind: message_kind(edited_base),
-                        new_proto: edited.encode_to_vec(),
+                        new_proto: waproto::codec::message_to_vec(edited),
                     };
                 }
                 return MessageOp::Ignore;
@@ -154,7 +153,7 @@ fn has_any_content(base: &wa::Message) -> bool {
     probe.message_context_info = Default::default();
     // Encoded emptiness, not PartialEq: presence of an empty submessage still
     // costs wire bytes, while buffa's equality folds it into "absent".
-    !probe.encode_to_vec().is_empty()
+    waproto::codec::message_encoded_len(&probe) > 0
 }
 
 #[cfg(test)]

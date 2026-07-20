@@ -1,4 +1,4 @@
-//! VoIP media-plane hot paths: the per-packet work a live 1:1 call pays 50x/second each way.
+//! VoIP media-plane hot paths: the per-packet work a live 1:1 call pays every 60 ms each way.
 //! Two layers are benched so a regression can be localized: the raw primitives (MLow encode/decode,
 //! E2E-SRTP protect/unprotect, the AES-CTR payload cipher, SFrame) and the full engine inputs that
 //! compose them (`on_mic`, `on_rtp`). `divan::AllocProfiler` is wired as the global allocator so each
@@ -105,13 +105,14 @@ fn config_for(self_lid: &str, peer_lid: &str, ssrc: u32, direction: CallDirectio
         peer_lid: peer_lid.into(),
         call_key: call_key(),
         ssrc,
-        samples_per_packet: SAMPLES as u32,
+        audio: wacore::voip::AudioConfig::MLOW_PCM,
         relay_token: vec![0xAB; 16],
         relay_ip: "203.0.113.7".into(),
         relay_port: 3478,
         integrity_key: b"relay-key".to_vec(),
         warp_mi_tag_len: 4,
         enable_media: true,
+        enable_video: false,
         enable_sframe: false,
     }
 }
@@ -128,7 +129,7 @@ fn started_engine() -> CallEngine {
 
 fn started_engine_from(cfg: CallConfig) -> CallEngine {
     let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-    eng.start(0);
+    eng.start(0, 0);
     drain(&mut eng);
     eng
 }
@@ -160,6 +161,22 @@ fn mlow_encode(bencher: Bencher) {
             let f = &frames[*i % frames.len()];
             *i += 1;
             black_box(enc.encode(black_box(f.as_slice())).unwrap())
+        });
+}
+
+/// The engine path keeps the encoded output allocation for the lifetime of the call.
+#[divan::bench]
+fn mlow_encode_reused_output(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            let frames: Vec<Vec<f32>> = (0..STREAM).map(|i| tone_f32(i * SAMPLES)).collect();
+            (primed_encoder(), frames, 0usize, Vec::with_capacity(2048))
+        })
+        .bench_refs(|(enc, frames, i, output)| {
+            let f = &frames[*i % frames.len()];
+            *i += 1;
+            enc.encode_into(black_box(f.as_slice()), output).unwrap();
+            black_box(output.len())
         });
 }
 
@@ -393,6 +410,7 @@ mod framing {
             timestamp: 0x0009_6000,
             ssrc: 0xDEAD_BEEF,
             extension_word: Some(0x3001_0000),
+            video_extension: None,
         }
     }
 

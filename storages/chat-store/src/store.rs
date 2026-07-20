@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use buffa::Message as _;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
@@ -160,7 +159,7 @@ impl ChatStore {
             .send(WriterMsg::Outgoing {
                 chat: chat.clone(),
                 msg_id: msg_id.into(),
-                proto: message.encode_to_vec(),
+                proto: waproto::codec::message_to_vec(message),
                 kind: message_kind(base),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
@@ -857,7 +856,7 @@ fn apply_inbound(
                     timestamp_ms: ts_ms,
                     kind,
                     text: text.as_deref(),
-                    proto: Some(&inbound.message.encode_to_vec()),
+                    proto: Some(&waproto::codec::message_to_vec(&inbound.message)),
                     status: if info.source.is_from_me {
                         wa::web_message_info::Status::SERVER_ACK as i32
                     } else {
@@ -1519,7 +1518,7 @@ fn apply_history_message(
                         timestamp_ms: ts_ms,
                         kind,
                         text: text.as_deref(),
-                        proto: Some(&message.encode_to_vec()),
+                        proto: Some(&waproto::codec::message_to_vec(message)),
                         status: wmi
                             .status
                             .map(|s| s as i32)

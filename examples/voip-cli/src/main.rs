@@ -3,41 +3,198 @@
 //! Audio is bridged to the system through `cpal` (cross-platform; ALSA on Linux,
 //! CoreAudio on macOS, WASAPI on Windows). `cpal` is a dev-dependency, so it is
 //! linked only for this example and never reaches consumers of the library.
+//! VIDEO is bridged through `ffmpeg`/`ffplay` subprocesses (must be on PATH when
+//! `--video` is used): ffmpeg encodes the webcam / a file / a test pattern to H.264
+//! and ffplay renders the peer's stream — the library only transports encoded AUs.
 //!
-//! Subcommands:
-//!   loopback         Mic → Opus → E2E-SRTP protect → unprotect → Opus → speaker.
-//!                    Exercises the whole media stack locally; NO WhatsApp connection.
-//!                    Run it and you should hear yourself, processed by the voip pipeline.
-//!   listen [accept]  Connect to WhatsApp, print incoming calls; reject (default) or accept.
-//!   call <jid>       Connect, discover the peer's devices, encrypt the callKey per device,
-//!                    and send a `<call><offer>`; logs the signaling flow via raw nodes.
+//! Subcommands (all accept a trailing `--video`):
+//!   loopback [--video]  Mic → Opus → E2E-SRTP protect → unprotect → Opus → speaker.
+//!                       Exercises the whole media stack locally; NO WhatsApp connection.
+//!                       With --video: ffmpeg source → AU splitter → ffplay window instead.
+//!   listen [accept] [--video]  Connect, print incoming calls; reject (default) or accept.
+//!                       With --video an accepted call answers with video media too.
+//!   call <jid> [--video]  Place a call; with --video it is a video call from the start.
 //!
-//!   cargo run --example voip --features "voip sqlite-storage tokio-transport ureq-client tokio-native" -- loopback
+//!   cargo run -p whatsapp-rust-voip-cli --release -- loopback
+//!
+//! During a live call, single-key commands on stdin (terminal only): `v` toggles video
+//! (upgrade / accept a pending peer request / downgrade), `q` hangs up.
+//! Env: `WA_VIDEO_INPUT` = `testsrc` | file/URL | webcam device (default: OS webcam);
+//! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`; optional quality overrides:
+//! `WA_VIDEO_SIZE`, `WA_VIDEO_FPS`, `WA_VIDEO_BITRATE_KBPS`, `WA_VIDEO_SINK_FPS`.
+//! `WA_AUDIO_CODEC` = `mlow` (default when available) | `opus`.
 //!
 //! The inbound MEDIA path is the library facade: `client.voip().accept(&call).audio(mic,
 //! speaker).start()` returns a `CallHandle` and the library owns the callKey decrypt, the relay
 //! socket, the sans-IO engine, and the task lifetime. This example only supplies the cpal audio
-//! device and reacts to engine events.
+//! device / ffmpeg pipes and reacts to engine events.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
-use log::{error, info, warn};
+use anyhow::{Result, anyhow, bail};
+#[cfg(feature = "voip-opus")]
+use bytes::Bytes;
+use log::{debug, error, info, warn};
 use portable_atomic::AtomicU64;
-use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER};
+use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER, CAPABILITY_PREACCEPT};
+#[cfg(feature = "voip-opus")]
+use wacore::stanza::call::{CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_PREACCEPT};
 use wacore::types::call::{CallAction, IncomingCall};
 use wacore::types::events::{Event, EventHandler};
 use wacore::voip::CallEvent;
+#[cfg(all(feature = "voip-opus", feature = "voip-mlow"))]
+use wacore::voip::MlowDecoder;
+#[cfg(all(feature = "voip-opus", feature = "voip-mlow"))]
+use wacore::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use whatsapp_rust::prelude::*;
-use whatsapp_rust::voip::CallHandle;
+#[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
+#[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
+#[cfg(feature = "voip-opus")]
+use whatsapp_rust::voip::{AudioCodec, EncodedAudioFrame};
+use whatsapp_rust::voip::{AudioFormat, CallHandle, VideoState};
+
+mod video;
+use video::VideoOpts;
 
 const FRAME_SAMPLES: usize = 960; // 60 ms @ 16 kHz
 const WA_RATE: u32 = 16_000;
+#[cfg(feature = "voip-opus")]
 const SSRC: u32 = 0x5741_0001;
+
+#[cfg(not(any(feature = "voip-mlow", feature = "voip-opus")))]
+compile_error!("enable at least one of voip-mlow or voip-opus");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioMode {
+    #[cfg(feature = "voip-mlow")]
+    Mlow,
+    #[cfg(feature = "voip-opus")]
+    OpusMlow,
+    #[cfg(feature = "voip-opus")]
+    OpusNative,
+    #[cfg(feature = "voip-opus")]
+    OpusRfc7587,
+}
+
+impl AudioMode {
+    fn from_env() -> Result<Self> {
+        let configured = std::env::var("WA_AUDIO_CODEC").ok();
+        match configured
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            #[cfg(feature = "voip-mlow")]
+            None | Some("mlow") => Ok(Self::Mlow),
+            #[cfg(all(not(feature = "voip-mlow"), feature = "voip-opus"))]
+            None => Self::opus_from_env(),
+            #[cfg(feature = "voip-opus")]
+            Some("opus") => Self::opus_from_env(),
+            #[cfg(feature = "voip-opus")]
+            Some("opus-pt111") => Ok(Self::OpusRfc7587),
+            Some(other) => bail!(
+                "WA_AUDIO_CODEC={other:?} is unavailable in this build; compile the matching \
+                 voip-mlow/voip-opus feature"
+            ),
+        }
+    }
+
+    #[cfg(feature = "voip-opus")]
+    fn opus_from_env() -> Result<Self> {
+        match std::env::var("WA_AUDIO_PROFILE")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("native") | Some("standard") | Some("pt120") => Ok(Self::OpusNative),
+            Some("rfc7587") | Some("pt111") => Ok(Self::OpusRfc7587),
+            Some("mlow") | Some("mlow-escape") => Ok(Self::OpusMlow),
+            Some(other) => {
+                bail!(
+                    "unknown WA_AUDIO_PROFILE={other:?}; expected native (default), rfc7587, or mlow"
+                )
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            #[cfg(feature = "voip-mlow")]
+            Self::Mlow => "mlow",
+            #[cfg(feature = "voip-opus")]
+            Self::OpusMlow => "opus/mlow-escape",
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative => "opus-native/pt120",
+            #[cfg(feature = "voip-opus")]
+            Self::OpusRfc7587 => "opus-rfc7587/pt111",
+        }
+    }
+
+    fn format(self) -> AudioFormat {
+        match self {
+            #[cfg(feature = "voip-mlow")]
+            Self::Mlow => AudioFormat::MLOW_16KHZ_60MS,
+            #[cfg(feature = "voip-opus")]
+            Self::OpusMlow => AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative => AudioFormat::OPUS_16KHZ_60MS,
+            #[cfg(feature = "voip-opus")]
+            Self::OpusRfc7587 => AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+        }
+    }
+
+    fn signaling_rate(self) -> u32 {
+        self.format().signaling_rate
+    }
+
+    fn signaling_rate_wire(self) -> &'static str {
+        match self.signaling_rate() {
+            16_000 => "16000",
+            8_000 => "8000",
+            _ => unreachable!("built-in audio formats use known signaling rates"),
+        }
+    }
+
+    fn preaccept_capability(self, video: bool) -> &'static [u8] {
+        match (self, video) {
+            #[cfg(feature = "voip-opus")]
+            (Self::OpusNative | Self::OpusRfc7587, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
+            #[cfg(feature = "voip-opus")]
+            (Self::OpusNative | Self::OpusRfc7587, false) => &CAPABILITY_STANDARD_OPUS_PREACCEPT,
+            (_, true) => &CAPABILITY_OFFER,
+            (_, false) => &CAPABILITY_PREACCEPT,
+        }
+    }
+
+    fn accept_capability(self) -> &'static [u8] {
+        match self {
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative | Self::OpusRfc7587 => &CAPABILITY_STANDARD_OPUS_OFFER,
+            _ => &CAPABILITY_OFFER,
+        }
+    }
+
+    fn uses_standard_opus(self) -> bool {
+        match self {
+            #[cfg(feature = "voip-opus")]
+            Self::OpusNative | Self::OpusRfc7587 => true,
+            _ => false,
+        }
+    }
+
+    fn uses_48khz_rtp_clock(self) -> bool {
+        match self {
+            #[cfg(feature = "voip-opus")]
+            Self::OpusRfc7587 => true,
+            _ => false,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -77,37 +234,87 @@ async fn main() -> Result<()> {
         }
     }
 
-    // The realtime media path encodes one mlow frame every 60 ms; a debug build makes that encode
-    // ~7-10x slower (measured ~19 ms avg / ~49 ms peak vs ~2.5 ms release), and on a slower machine it
-    // overruns the 60 ms budget so frames back up and the far end breaks up. Run calls in release.
+    // Codec work in a debug build can overrun the 60 ms frame budget on slower machines.
     #[cfg(debug_assertions)]
     warn!(
-        "⚠ debug build: mlow encode is much slower than release and may not keep up with realtime \
-         audio (choppy/inaudible far-end voice). Run VoIP with `cargo run --release` for clean audio."
+        "⚠ debug build: audio encoding may not keep up with realtime. Run VoIP with \
+         `cargo run --release` for clean audio."
     );
 
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("loopback") => run_loopback().await,
-        Some("listen") => {
-            run_bot(Mode::Listen {
-                accept: args.get(2).map(String::as_str) == Some("accept"),
-            })
-            .await
+    let command = parse_cli(&args);
+    if video_source_is_ignored(&command, std::env::var_os("WA_VIDEO_INPUT").is_some()) {
+        warn!(
+            "WA_VIDEO_INPUT is set, but --video is missing; outbound video is disabled. Keep \
+             --video on the same shell command line."
+        );
+    }
+    match command {
+        CliCommand::Loopback { video: true } => {
+            video::run_video_loopback(&VideoOpts::from_env().await?).await
         }
-        Some("call") => {
-            let jid = args
-                .get(2)
-                .context("usage: voip call <jid>")?
-                .parse::<Jid>()
-                .map_err(|e| anyhow!("bad jid: {e}"))?;
-            run_bot(Mode::Call(jid)).await
+        CliCommand::Loopback { video: false } => run_loopback().await,
+        CliCommand::Listen { accept, video } => run_bot(Mode::Listen { accept, video }).await,
+        CliCommand::Call { jid, video } => {
+            let jid = jid.parse::<Jid>().map_err(|e| anyhow!("bad jid: {e}"))?;
+            run_bot(Mode::Call { jid, video }).await
         }
-        _ => {
-            eprintln!("usage: voip <loopback | listen [accept] | call <jid>>");
+        CliCommand::Usage => {
+            eprintln!("usage: voip <loopback | listen [accept] | call <jid>> [--video]");
             Ok(())
         }
     }
+}
+
+/// A parsed CLI invocation. Kept separate from `Mode` (and pure) so the argument classification —
+/// including the `--video`-implies-accept rule that bit a real test run — is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Loopback { video: bool },
+    Listen { accept: bool, video: bool },
+    Call { jid: String, video: bool },
+    Usage,
+}
+
+/// Classify `argv` (including `argv[0]`). `--video` may appear anywhere. On `listen`, `--video`
+/// IMPLIES `accept`: there is no reason to request video while rejecting every call, so
+/// `listen --video` means "accept video calls" rather than silently rejecting them (the footgun a
+/// user hit: the phone showed "no answer" because the reject went out).
+fn parse_cli(argv: &[String]) -> CliCommand {
+    let video = argv.iter().any(|a| a == "--video");
+    let pos: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|a| *a != "--video")
+        .collect();
+    match pos.first().copied() {
+        Some("loopback") => CliCommand::Loopback { video },
+        Some("listen") => CliCommand::Listen {
+            accept: pos.get(1).copied() == Some("accept") || video,
+            video,
+        },
+        Some("call") => match pos.get(1) {
+            Some(jid) => CliCommand::Call {
+                jid: (*jid).to_string(),
+                video,
+            },
+            None => CliCommand::Usage,
+        },
+        _ => CliCommand::Usage,
+    }
+}
+
+fn video_source_is_ignored(command: &CliCommand, video_input_is_set: bool) -> bool {
+    video_input_is_set
+        && matches!(
+            command,
+            CliCommand::Loopback { video: false }
+                | CliCommand::Listen {
+                    accept: false,
+                    video: false,
+                }
+        )
 }
 
 // ===================== cpal audio bridge =====================
@@ -223,7 +430,7 @@ fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
             .unwrap_or_else(|_| "?".into())
     );
 
-    let (tx, rx) = async_channel::bounded::<Vec<i16>>(8);
+    let (tx, rx) = async_channel::bounded::<Vec<i16>>(3);
 
     // ~1 s of native-rate mono headroom: absorbs the callback's bursty deliveries so the drain (and
     // the channel) see a steady 60 ms cadence.
@@ -578,6 +785,7 @@ where
 
 // ===================== loopback (no WhatsApp) =====================
 
+#[cfg(feature = "voip-opus")]
 async fn run_loopback() -> Result<()> {
     info!(
         "voip loopback: mic → Opus → E2E-SRTP protect/unprotect → Opus → speaker. Ctrl+C to stop."
@@ -610,7 +818,7 @@ async fn run_loopback() -> Result<()> {
         // The recv tracker derives the ROC per packet, so this stays correct past a 16-bit wrap.
         if let Some((_, opus_out)) = recv.unprotect_audio(&packet) {
             let out = dec.decode(&opus_out)?;
-            let _ = speaker.send(out).await;
+            let _ = speaker.send(out.to_vec()).await;
         }
         frames += 1;
         if frames.is_multiple_of(100) {
@@ -623,28 +831,133 @@ async fn run_loopback() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "voip-opus"))]
+async fn run_loopback() -> Result<()> {
+    bail!("loopback requires the voip-opus feature")
+}
+
 // ===================== live call / listen =====================
 
+#[cfg(feature = "voip-opus")]
+fn spawn_opus_bridge(
+    mic: async_channel::Receiver<Vec<i16>>,
+    speaker: async_channel::Sender<Vec<i16>>,
+    audio: AudioMode,
+) -> Result<(
+    async_channel::Receiver<Bytes>,
+    async_channel::Sender<EncodedAudioFrame>,
+)> {
+    let mlow_escape = audio == AudioMode::OpusMlow;
+    let mut encoder = if mlow_escape {
+        WaOpusEncoder::new_mlow_escape()?
+    } else {
+        WaOpusEncoder::new()?
+    };
+    let mut decoder = WaOpusDecoder::new()?;
+    let (encoded_tx, encoded_rx) = async_channel::bounded::<Bytes>(3);
+    let (playout_tx, playout_rx) = async_channel::bounded::<EncodedAudioFrame>(3);
+
+    tokio::task::spawn_blocking(move || {
+        while let Ok(pcm) = mic.recv_blocking() {
+            match encoder.encode(&pcm).map(Bytes::from) {
+                Ok(payload) => {
+                    if encoded_tx.send_blocking(payload).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!("Opus encode failed: {error}");
+                }
+            }
+        }
+    });
+    tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "voip-mlow")]
+        let mut mlow_decoder = MlowDecoder::new();
+        #[cfg(not(feature = "voip-mlow"))]
+        let mut mlow_warning_logged = false;
+        while let Ok(frame) = playout_rx.recv_blocking() {
+            match frame.codec {
+                AudioCodec::Opus => match if mlow_escape {
+                    decoder.decode_mlow_escape(&frame.data)
+                } else {
+                    decoder.decode(&frame.data)
+                } {
+                    Ok(pcm) => {
+                        let _ = speaker.try_send(pcm.to_vec());
+                    }
+                    Err(error) => warn!("Opus decode failed: {error}"),
+                },
+                AudioCodec::Mlow => {
+                    #[cfg(feature = "voip-mlow")]
+                    {
+                        mlow_decoder.set_redundancy(i32::from(
+                            frame.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED,
+                        ));
+                        let pcm = mlow_decoder
+                            .decode(&frame.data)
+                            .into_iter()
+                            .map(|sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                            .collect();
+                        let _ = speaker.try_send(pcm);
+                    }
+                    #[cfg(not(feature = "voip-mlow"))]
+                    if !mlow_warning_logged {
+                        warn!(
+                            "peer selected MLOW inbound audio; this Opus-only binary will keep the call but cannot play it"
+                        );
+                        mlow_warning_logged = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok((encoded_rx, playout_tx))
+}
+
+#[cfg(feature = "voip-opus")]
+fn spawn_fallback_opus_decoder(
+    speaker: async_channel::Sender<Vec<i16>>,
+) -> Option<async_channel::Sender<Bytes>> {
+    let mut decoder = match WaOpusDecoder::new() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            error!("failed to initialize fallback Opus decoder: {error}");
+            return None;
+        }
+    };
+    let (payload_tx, payload_rx) = async_channel::bounded::<Bytes>(3);
+    tokio::task::spawn_blocking(move || {
+        while let Ok(payload) = payload_rx.recv_blocking() {
+            match decoder.decode_mlow_escape(&payload) {
+                Ok(pcm) => {
+                    let _ = speaker.try_send(pcm.to_vec());
+                }
+                Err(error) => debug!("failed to decode MLOW escape payload: {error}"),
+            }
+        }
+    });
+    Some(payload_tx)
+}
+
 enum Mode {
-    Listen { accept: bool },
-    Call(Jid),
+    Listen { accept: bool, video: bool },
+    Call { jid: Jid, video: bool },
 }
 
 /// Drives calls off the typed `Event::IncomingCall` (no raw-node forwarding needed): on an offer it
 /// answers signaling then hands the MEDIA plane to the library facade
-/// (`client.voip().accept(..).audio(..).start()`), on a terminate it hangs the matching call up. The
-/// facade owns the relay socket, the callKey decrypt, the engine, and the task lifetime; this only
-/// supplies the PipeWire mic/speaker and remembers the `CallHandle` so a `<terminate>` can stop it.
+/// (`client.voip().accept(..).audio(..).start()`). The facade owns the relay socket, callKey decrypt,
+/// engine, and termination; this example supplies the mic/speaker and keeps handles for its UI.
 struct CallObserver {
     client: Arc<Client>,
     accept: bool,
-    /// Whether this run ever starts a media call (auto-accept inbound OR an outbound `call`), so a
-    /// `<terminate>` racing media startup is worth recording. A pure-reject run starts no media, so it
-    /// must NOT record (the set would grow unbounded with nothing to consume it).
-    manages_media: bool,
-    /// Per-call bookkeeping for the example's terminate-driven hangup. The client's own
-    /// `CallRegistry` already tears every call down on disconnect; this is only so a `<terminate>`
-    /// can stop a specific live call (and so a terminate that races media startup isn't lost).
+    audio: AudioMode,
+    /// `--video`: start/answer calls with video media and auto-accept peer upgrade requests.
+    video: bool,
+    /// Per-call UI bookkeeping. The client's `CallRegistry` owns media termination.
     state: Arc<Mutex<CallState>>,
 }
 
@@ -652,45 +965,92 @@ struct CallObserver {
 struct CallState {
     /// Live calls' handles by call-id.
     handles: HashMap<String, Arc<CallHandle>>,
-    /// Call-ids that were terminated BEFORE their media handle finished starting, so a late
-    /// `start_media()` hangs the call up instead of leaving an orphaned live call.
-    terminated: HashSet<String>,
+    /// Registration order; the last live entry is the stdin UI target.
+    call_order: Vec<String>,
+    /// The stdin `v` toggle's view of each call's video: pending peer request vs our video live.
+    video_ui: HashMap<String, VideoUi>,
+    starting: HashSet<String>,
+    /// Prevents a late startup from resurrecting media after the peer ended the call.
+    terminated_during_startup: HashSet<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VideoUi {
+    /// The peer asked for video (`UpgradeRequestV2`); `v` accepts it.
+    PendingPeerRequest,
+    /// Our video plane is up; `v` downgrades.
+    Active,
 }
 
 impl CallObserver {
-    fn new(client: Arc<Client>, accept: bool, manages_media: bool) -> Self {
+    fn new(client: Arc<Client>, accept: bool, video: bool, audio: AudioMode) -> Self {
         Self {
             client,
             accept,
-            manages_media,
+            audio,
+            video,
             state: Arc::new(Mutex::new(CallState::default())),
         }
     }
 }
 
-/// Register a freshly-started `CallHandle` for terminate-driven hangup. Returns false (and the caller
-/// should hang up) if a `<terminate>` for this call-id already arrived while media was starting. On
-/// success, spawns the wait_ended cleanup that drops the map entry when the call ends on its own.
-/// Shared by the inbound (accept) and outbound (call) paths.
-fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) -> bool {
-    let registered = {
-        let mut st = state.lock().unwrap();
-        if st.terminated.remove(&cid) {
-            false
-        } else {
-            st.handles.insert(cid.clone(), handle.clone());
-            true
-        }
-    };
-    if !registered {
-        return false;
+fn lock_call_state(state: &Mutex<CallState>) -> std::sync::MutexGuard<'_, CallState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn begin_call_startup(state: &Arc<Mutex<CallState>>, call_id: &str) {
+    let mut st = lock_call_state(state);
+    st.starting.insert(call_id.to_string());
+    st.terminated_during_startup.remove(call_id);
+}
+
+fn complete_call_startup(state: &Arc<Mutex<CallState>>, call_id: &str) -> bool {
+    let mut st = lock_call_state(state);
+    st.starting.remove(call_id);
+    st.terminated_during_startup.remove(call_id)
+}
+
+fn record_peer_terminate(state: &Arc<Mutex<CallState>>, call_id: &str) {
+    let mut st = lock_call_state(state);
+    if st.starting.contains(call_id) {
+        st.terminated_during_startup.insert(call_id.to_string());
     }
-    // Drop our map entry once the call ends on its own (no terminate).
+    st.handles.remove(call_id);
+    st.video_ui.remove(call_id);
+    st.call_order.retain(|id| id != call_id);
+}
+
+fn peer_terminated_during_startup(state: &Arc<Mutex<CallState>>, call_id: &str) -> bool {
+    lock_call_state(state)
+        .terminated_during_startup
+        .contains(call_id)
+}
+
+fn mark_call_most_recent(order: &mut Vec<String>, call_id: &str) {
+    order.retain(|id| id != call_id);
+    order.push(call_id.to_string());
+}
+
+/// Register a handle for UI control and remove it when the library-owned call ends.
+async fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) {
+    if complete_call_startup(state, &cid) {
+        // The library also sees the terminate, but this closes a handle created after that teardown.
+        handle.hangup().await;
+        info!("◾ discarded media startup for already-ended call {cid}");
+        return;
+    }
+    {
+        let mut st = lock_call_state(state);
+        st.handles.insert(cid.clone(), handle.clone());
+        mark_call_most_recent(&mut st.call_order, &cid);
+    }
     let state = state.clone();
     tokio::spawn(async move {
         handle.wait_ended().await;
         {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_call_state(&state);
             // Remove only if it is still OUR handle: a same-call-id replacement may now own this slot
             // (its own cleanup will remove it), so we must not delete the live call.
             if st
@@ -699,67 +1059,70 @@ fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallH
                 .is_some_and(|h| Arc::ptr_eq(h, &handle))
             {
                 st.handles.remove(&cid);
+                st.video_ui.remove(&cid);
+                st.call_order.retain(|id| id != &cid);
             }
         }
         info!("◾ call {cid} media ended");
     });
-    true
 }
 
 impl EventHandler for CallObserver {
     fn handle_event(&self, event: Arc<Event>) {
         if let Event::IncomingCall(call) = &*event {
             match &call.action {
-                CallAction::Offer { call_id, .. } => {
+                CallAction::Offer {
+                    call_id, is_video, ..
+                } => {
                     let client = self.client.clone();
                     let call = call.clone();
                     let accept = self.accept;
+                    let audio = self.audio;
+                    // Only answer with video when we're allowed to AND the offer is actually a video
+                    // call; advertising `<video>` on an audio offer would be wrong.
+                    let video = self.video && *is_video;
                     let state = self.state.clone();
                     let cid = call_id.clone();
+                    begin_call_startup(&state, &cid);
                     tokio::spawn(async move {
-                        if let Err(e) = respond_to_offer(&client, &call, accept).await {
+                        if let Err(e) = respond_to_offer(&client, &call, accept, video, audio).await
+                        {
                             error!("call signaling failed: {e}");
+                            complete_call_startup(&state, &cid);
                             return;
                         }
                         if !accept {
+                            complete_call_startup(&state, &cid);
                             return;
                         }
-                        match start_media(&client, &call).await {
-                            Ok(handle) => {
-                                let handle = Arc::new(handle);
-                                // A <terminate> may have arrived while media was starting; if so, hang
-                                // up now instead of registering an orphaned live call.
-                                if !register_handle(&state, cid.clone(), handle.clone()) {
-                                    handle.hangup().await;
-                                    info!("◾ call {cid} terminated during media startup");
+                        match start_media(&client, &call, video, audio, &state).await {
+                            Ok(handle) => register_handle(&state, cid.clone(), handle).await,
+                            Err(e) => {
+                                let peer_ended = peer_terminated_during_startup(&state, &cid);
+                                complete_call_startup(&state, &cid);
+                                if !peer_ended
+                                    && let CallAction::Offer {
+                                        call_id,
+                                        call_creator,
+                                        ..
+                                    } = &call.action
+                                    && let Err(terminate_error) = client
+                                        .voip()
+                                        .terminate(call_id, &call.from, call_creator)
+                                        .await
+                                {
+                                    warn!(
+                                        "failed to terminate incomplete inbound call: {terminate_error}"
+                                    );
                                 }
+                                warn!("inbound media failed: {e}");
                             }
-                            Err(e) => warn!("inbound media failed: {e}"),
                         }
                     });
                 }
                 CallAction::Terminate { call_id, .. } => {
-                    info!("◀ terminate for {call_id} — hanging up");
-                    // If the handle is registered, hang it up. If not, the offer is still starting
-                    // media: record the call-id so that path hangs up on completion (no orphan).
-                    let handle = {
-                        let mut st = self.state.lock().unwrap();
-                        match st.handles.remove(call_id) {
-                            Some(h) => Some(h),
-                            // Only track a pre-registration terminate when this run starts media
-                            // (inbound accept OR an outbound call); otherwise there is no call to
-                            // orphan and the set would grow unbounded.
-                            None => {
-                                if self.manages_media {
-                                    st.terminated.insert(call_id.clone());
-                                }
-                                None
-                            }
-                        }
-                    };
-                    if let Some(handle) = handle {
-                        tokio::spawn(async move { handle.hangup().await });
-                    }
+                    info!("◀ peer ended call {call_id}");
+                    record_peer_terminate(&self.state, call_id);
                 }
                 _ => {}
             }
@@ -773,58 +1136,143 @@ impl EventHandler for CallObserver {
     }
 }
 
-/// Drive the inbound MEDIA plane through the library facade: PipeWire mic in, PipeWire speaker out,
-/// the engine/relay/decrypt all internal. Replaces the ~180-line hand-rolled `run_inbound_media`.
-async fn start_media(client: &Arc<Client>, call: &IncomingCall) -> Result<CallHandle> {
+/// Drive the inbound MEDIA plane through the library facade: cpal mic in, cpal speaker out,
+/// the engine/relay/decrypt all internal. With `video`, ffmpeg/ffplay ride along as the codec.
+async fn start_media(
+    client: &Arc<Client>,
+    call: &IncomingCall,
+    video: bool,
+    audio: AudioMode,
+    state: &Arc<Mutex<CallState>>,
+) -> Result<Arc<CallHandle>> {
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
+    let event_speaker = speaker.clone();
     info!("🔌 connecting media via client.voip().accept(..)…");
-    let handle = client
-        .voip()
-        .accept(call)
-        .audio(mic, speaker.clone())
+    let video_endpoints = if video {
+        let opts = VideoOpts::from_env().await?;
+        let cid = call.action.call_id();
+        Some((
+            video::spawn_video_source(&opts).await?,
+            video::spawn_video_sink(&opts, cid).await?,
+        ))
+    } else {
+        None
+    };
+    if peer_terminated_during_startup(state, call.action.call_id()) {
+        bail!("peer ended the call during media preparation");
+    }
+    send_final_accept(client, call, video, audio).await?;
+    let voip = client.voip();
+    let mut builder = match audio {
+        #[cfg(feature = "voip-mlow")]
+        AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
+        #[cfg(feature = "voip-opus")]
+        AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
+            let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
+            voip.accept(call)
+                .encoded_audio(audio.format(), source, sink)
+        }
+    };
+    if let Some((source, sink)) = video_endpoints {
+        builder = builder.video(source, sink);
+    }
+    let handle = builder
         .start()
         .await
         .map_err(|e| anyhow!("accept media: {e}"))?;
     info!(
-        "🎙  media flow live for call {} — speak into the mic.",
-        handle.call_id()
+        "🎙  {} media flow live for call {} — speak into the mic.{}",
+        audio.name(),
+        handle.call_id(),
+        if video { " 🎥 video on." } else { "" }
     );
-    spawn_call_event_listener(&handle, speaker);
+    let handle = Arc::new(handle);
+    if video {
+        mark_video(state, handle.call_id(), Some(VideoUi::Active));
+    }
+    spawn_call_event_listener(handle.clone(), event_speaker, video, state.clone());
     Ok(handle)
 }
 
-/// Place an outgoing 1:1 call through the library facade: PipeWire mic/speaker, the device discovery,
+/// Place an outgoing 1:1 call through the library facade: cpal mic/speaker, the device discovery,
 /// callKey encrypt, offer send, ack-driven relay connect, engine, and task lifetime all internal. The
 /// returned handle is dormant until the server hands back the relay (live); the facade attaches the
 /// engine then. Mirrors `start_media` for the outbound direction.
-async fn place_outgoing_call(client: &Arc<Client>, peer: &Jid) -> Result<CallHandle> {
+async fn place_outgoing_call(
+    client: &Arc<Client>,
+    peer: &Jid,
+    video: bool,
+    audio: AudioMode,
+    state: &Arc<Mutex<CallState>>,
+) -> Result<Arc<CallHandle>> {
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
+    let event_speaker = speaker.clone();
     info!("📞 placing call to {peer} via client.voip().call(..)…");
-    let handle = client
-        .voip()
-        .call(peer)
-        .audio(mic, speaker.clone())
+    let voip = client.voip();
+    let mut builder = match audio {
+        #[cfg(feature = "voip-mlow")]
+        AudioMode::Mlow => voip.call(peer).audio(mic, speaker),
+        #[cfg(feature = "voip-opus")]
+        AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
+            let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
+            voip.call(peer).encoded_audio(audio.format(), source, sink)
+        }
+    };
+    if video {
+        let opts = VideoOpts::from_env().await?;
+        builder = builder.video(
+            video::spawn_video_source(&opts).await?,
+            video::spawn_video_sink(&opts, "outgoing").await?,
+        );
+    }
+    let handle = builder
         .start()
         .await
         .map_err(|e| anyhow!("place call: {e}"))?;
     info!(
-        "☎  offer sent for call {} — waiting for the peer's relay to connect media.",
-        handle.call_id()
+        "☎  {} offer sent for call {} — waiting for the peer's relay to connect media.{}",
+        audio.name(),
+        handle.call_id(),
+        if video { " 🎥 video call." } else { "" }
     );
-    spawn_call_event_listener(&handle, speaker);
+    let handle = Arc::new(handle);
+    if video {
+        mark_video(state, handle.call_id(), Some(VideoUi::Active));
+    }
+    spawn_call_event_listener(handle.clone(), event_speaker, video, state.clone());
     Ok(handle)
 }
 
-/// Surface the call's engine events: log relay-allocate outcomes, and decode any non-MLow (standard
-/// Opus) frame the core hands back and play it. The real peer is MLow-only, so ForeignAudio is a
-/// rare/diagnostic path; MLow audio is decoded inside the engine and arrives as playout on the
-/// speaker channel directly.
-fn spawn_call_event_listener(handle: &CallHandle, speaker: async_channel::Sender<Vec<i16>>) {
+/// Update (or clear) the stdin toggle's view of a call's video state.
+fn mark_video(state: &Arc<Mutex<CallState>>, call_id: &str, ui: Option<VideoUi>) {
+    let mut st = lock_call_state(state);
+    match ui {
+        Some(ui) => {
+            st.video_ui.insert(call_id.to_string(), ui);
+        }
+        None => {
+            st.video_ui.remove(call_id);
+        }
+    }
+}
+
+/// Surface call diagnostics and drive the video upgrade handshake.
+fn spawn_call_event_listener(
+    handle: Arc<CallHandle>,
+    speaker: async_channel::Sender<Vec<i16>>,
+    auto_video: bool,
+    state: Arc<Mutex<CallState>>,
+) {
     let events = handle.events();
+    #[cfg(feature = "voip-opus")]
+    let fallback_opus_tx = spawn_fallback_opus_decoder(speaker.clone());
     tokio::spawn(async move {
-        let mut opus = WaOpusDecoder::new().ok();
+        #[cfg(not(feature = "voip-opus"))]
+        let mut fallback_warning_logged = false;
+        let mut peer_video_receiver_confirmed = false;
+        let mut peer_keyframe_request_logged = false;
         while let Ok(ev) = events.recv().await {
             match ev {
                 CallEvent::RelayAllocated => {
@@ -837,22 +1285,151 @@ fn spawn_call_event_listener(handle: &CallHandle, speaker: async_channel::Sender
                     warn!("relay never acked the allocate (wedged relay) — media never came up")
                 }
                 CallEvent::ForeignAudio(payload) => {
-                    if let Some(dec) = opus.as_mut()
-                        && let Ok(pcm) = dec.decode(&payload)
-                    {
-                        let _ = speaker.try_send(pcm);
+                    #[cfg(feature = "voip-opus")]
+                    if let Some(fallback_opus_tx) = &fallback_opus_tx {
+                        let _ = fallback_opus_tx.try_send(payload);
+                    }
+                    #[cfg(not(feature = "voip-opus"))]
+                    if !fallback_warning_logged {
+                        warn!(
+                            "peer sent a {}-byte MLOW embedded Opus fallback, but this binary has \
+                             no Opus decoder",
+                            payload.len()
+                        );
+                        let _ = &speaker;
+                        fallback_warning_logged = true;
                     }
                 }
+                CallEvent::AudioFormatMismatch {
+                    expected_rate,
+                    received_rates,
+                } => {
+                    error!(
+                        "peer selected incompatible audio rates {received_rates:?}; expected \
+                         {expected_rate}"
+                    );
+                }
+                CallEvent::RtcpReceived {
+                    packet_types,
+                    sender_ssrc,
+                    referenced_ssrcs,
+                    reports_audio,
+                    reports_video,
+                    report_blocks,
+                    feedback,
+                } => {
+                    let requests_keyframe = feedback
+                        .iter()
+                        .any(|item| item.packet_type == 206 && matches!(item.fmt, 1 | 4));
+                    let blocks = report_blocks
+                        .iter()
+                        .map(|report| {
+                            format!(
+                                "{:#010x}:loss={}/{} highest={} jitter={} lsr={:#010x} dlsr={} ext={}B",
+                                report.ssrc,
+                                report.fraction_lost,
+                                report.cumulative_lost,
+                                report.extended_highest_sequence,
+                                report.jitter,
+                                report.last_sender_report,
+                                report.delay_since_last_sender_report,
+                                report.profile_extension.len(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let feedback = feedback
+                        .iter()
+                        .map(|item| {
+                            let kind = match (item.packet_type, item.fmt) {
+                                (205, 1) => "NACK",
+                                (206, 1) => "PLI",
+                                (206, 4) => "FIR",
+                                (206, 15) => "AFB",
+                                _ => "unknown",
+                            };
+                            format!(
+                                "{kind}:sender={:#010x}/media={:#010x}/fci={}B:{}",
+                                item.sender_ssrc,
+                                item.media_ssrc,
+                                item.fci.len(),
+                                hex::encode(&item.fci),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    if reports_video && !peer_video_receiver_confirmed {
+                        info!(
+                            "🎥 peer RTCP confirms receipt of our outbound video stream: blocks=[{blocks}] feedback=[{feedback}]"
+                        );
+                        peer_video_receiver_confirmed = true;
+                    }
+                    if requests_keyframe && !peer_keyframe_request_logged {
+                        info!("🎥 peer requests an outbound keyframe: [{feedback}]");
+                        peer_keyframe_request_logged = true;
+                    }
+                    debug!(
+                        "📊 peer RTCP PT={packet_types:?} sender={sender_ssrc:#010x} refs={referenced_ssrcs:x?} reports_audio={reports_audio} reports_video={reports_video} blocks=[{blocks}] feedback=[{feedback}]"
+                    );
+                }
+                CallEvent::OutboundMediaDropped {
+                    video_access_units,
+                    packets,
+                } => {
+                    warn!(
+                        "🎥 relay-send backpressure: dropped {video_access_units} complete video AUs / {packets} packets"
+                    );
+                }
+                CallEvent::VideoStateChanged { state: vs, .. } => match vs {
+                    VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
+                        if auto_video {
+                            info!("🎥 peer asked for video — auto-accepting (--video)");
+                            if let Err(e) = accept_peer_video(&handle).await {
+                                warn!("accepting peer video failed: {e}");
+                            } else {
+                                mark_video(&state, handle.call_id(), Some(VideoUi::Active));
+                            }
+                        } else {
+                            info!("🎥 peer asked for video — press `v` + Enter to accept");
+                            mark_video(&state, handle.call_id(), Some(VideoUi::PendingPeerRequest));
+                        }
+                    }
+                    VideoState::UpgradeAccept | VideoState::Enabled => {
+                        info!("🎥 peer video {vs:?} — inbound video should start flowing");
+                    }
+                    VideoState::Stopped | VideoState::Disabled => {
+                        info!("🎥 peer stopped its video");
+                    }
+                    other => info!("🎥 peer video state: {other:?}"),
+                },
                 // CallEvent is #[non_exhaustive]: ignore variants newer core versions may add.
                 _ => {}
             }
         }
     });
 }
-async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: bool) -> Result<()> {
+
+/// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
+async fn accept_peer_video(handle: &CallHandle) -> Result<()> {
+    let opts = VideoOpts::from_env().await?;
+    let src = video::spawn_video_source(&opts).await?;
+    let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
+    handle
+        .accept_video(src, sink)
+        .await
+        .map_err(|e| anyhow!("accept_video: {e}"))
+}
+async fn respond_to_offer(
+    client: &Arc<Client>,
+    call: &IncomingCall,
+    accept: bool,
+    video: bool,
+    audio: AudioMode,
+) -> Result<()> {
     let CallAction::Offer {
         call_id,
         call_creator,
+        audio: offered_audio,
         ..
     } = &call.action
     else {
@@ -871,28 +1448,61 @@ async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: boo
             .map_err(|e| anyhow!("send reject: {e}"))?;
         return Ok(());
     }
-    // Callee flow: preaccept immediately, then accept (signaling). Relay/media follow once
-    // the live transport orchestration lands.
-    // Codec-steering experiment: VOIP_FORCE_RFC_8K=1 advertises only 8 kHz, trying to push the
-    // caller off Meta's 16 kHz mlow onto plain RFC Opus NB (which our stock libopus can decode).
-    // Default keeps 16 kHz (mlow, garbled inbound until a real mlow decoder lands).
-    let force_rfc_8k = std::env::var_os("VOIP_FORCE_RFC_8K").is_some();
-    let audio_rates: &[&str] = if force_rfc_8k { &["8000"] } else { &["16000"] };
-    if force_rfc_8k {
-        info!("🧪 VOIP_FORCE_RFC_8K set — advertising only <audio rate=8000> to dodge mlow");
+    if !offered_audio.is_empty()
+        && !offered_audio.iter().any(|codec| {
+            codec.enc.eq_ignore_ascii_case("opus") && codec.rate == audio.signaling_rate()
+        })
+    {
+        client
+            .voip()
+            .reject(call)
+            .await
+            .map_err(|e| anyhow!("reject incompatible audio offer: {e}"))?;
+        bail!(
+            "peer did not offer {} signaling rate {}",
+            audio.name(),
+            audio.signaling_rate()
+        );
     }
+    // Callee flow: preaccept immediately; final accept waits for ready media.
+    let audio_rates = &[audio.signaling_rate_wire()];
     let pre_id = hex::encode(rand::random::<[u8; 8]>());
     client
-        .send_node(stanza::build_preaccept(
+        .send_node(stanza::build_preaccept_with_capability(
             call_id,
             &call.from,
             call_creator,
             &pre_id,
             audio_rates,
+            audio.preaccept_capability(video),
+            // The video node is capture-matched; standard Opus only clears the MLOW capability bit.
+            video,
         ))
         .await
         .map_err(|e| anyhow!("send preaccept: {e}"))?;
+    Ok(())
+}
+
+async fn send_final_accept(
+    client: &Arc<Client>,
+    call: &IncomingCall,
+    video: bool,
+    audio: AudioMode,
+) -> Result<()> {
+    let CallAction::Offer {
+        call_id,
+        call_creator,
+        ..
+    } = &call.action
+    else {
+        return Ok(());
+    };
+    let audio_rates = &[audio.signaling_rate_wire()];
     let accept_id = hex::encode(rand::random::<[u8; 8]>());
+    let metadata = if video { call.media.as_deref() } else { None };
+    let voip_settings = audio
+        .uses_standard_opus()
+        .then(|| stanza::standard_opus_voip_settings(audio.uses_48khz_rtp_clock()));
     let accept_node = stanza::build_accept(&stanza::AcceptParams {
         call_id,
         to: &call.from,
@@ -901,8 +1511,18 @@ async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: boo
         audio_rates,
         relay_te: None,
         rte: None,
-        voip_settings: None,
-        capability: Some(&CAPABILITY_OFFER),
+        voip_settings,
+        // A real from-start video accept carries NO <capability> (just audio/video/net/encopt); the
+        // audio path keeps advertising it.
+        capability: if video {
+            None
+        } else {
+            Some(audio.accept_capability())
+        },
+        video,
+        peer_abtest_bucket: metadata.and_then(|media| media.peer_abtest_bucket.as_deref()),
+        peer_abtest_bucket_id_list: metadata
+            .and_then(|media| media.peer_abtest_bucket_id_list.as_deref()),
     });
     client
         .send_node(accept_node)
@@ -911,13 +1531,115 @@ async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: boo
     Ok(())
 }
 
+/// Single-key commands on stdin during a live call: `v` toggles video (start an upgrade / accept a
+/// pending peer request / downgrade), `q` hangs up. Skipped when stdin is not a terminal (CI /
+/// piped input would EOF-spin).
+fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    info!("⌨  during a call: `v` + Enter toggles video, `q` + Enter hangs up");
+    // Read stdin on a DETACHED std thread, not `tokio::io::stdin()`: the latter reads via a runtime
+    // blocking thread parked in `read()`, and the runtime drop on Ctrl+C waits for it forever — the
+    // process would never exit. A plain std thread is killed when the process exits, so shutdown
+    // stays clean; lines are forwarded over an async channel the cancellable UI task consumes.
+    let (line_tx, line_rx) = async_channel::unbounded::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line_tx.send_blocking(line).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(line) = line_rx.recv().await {
+            // The most recent live call is the toggle's target (this demo runs one call at a time).
+            let picked = {
+                let st = lock_call_state(&state);
+                st.call_order.iter().rev().find_map(|cid| {
+                    st.handles
+                        .get(cid)
+                        .map(|h| (cid.clone(), h.clone(), st.video_ui.get(cid).copied()))
+                })
+            };
+            let Some((cid, handle, ui)) = picked else {
+                info!("⌨  no live call");
+                continue;
+            };
+            match line.trim() {
+                "v" => match ui {
+                    Some(VideoUi::Active) => {
+                        info!("🎥 stopping video (downgrade to audio)");
+                        if let Err(e) = handle.stop_video().await {
+                            warn!("stop_video failed: {e}");
+                        } else {
+                            mark_video(&state, &cid, None);
+                        }
+                    }
+                    Some(VideoUi::PendingPeerRequest) => {
+                        info!("🎥 accepting the peer's video request");
+                        if let Err(e) = accept_peer_video(&handle).await {
+                            warn!("accept_video failed: {e}");
+                        } else {
+                            mark_video(&state, &cid, Some(VideoUi::Active));
+                        }
+                    }
+                    None => {
+                        info!("🎥 requesting video upgrade");
+                        let started = async {
+                            let opts = VideoOpts::from_env().await?;
+                            let src = video::spawn_video_source(&opts).await?;
+                            let sink = video::spawn_video_sink(&opts, &cid).await?;
+                            handle
+                                .start_video(src, sink)
+                                .await
+                                .map_err(|e| anyhow!("start_video: {e}"))
+                        }
+                        .await;
+                        match started {
+                            Ok(()) => mark_video(&state, &cid, Some(VideoUi::Active)),
+                            Err(e) => warn!("video upgrade failed: {e}"),
+                        }
+                    }
+                },
+                "q" => {
+                    info!("⌨  hanging up {cid}");
+                    // Signal the peer with a <terminate> (which also tears our media down), so it
+                    // sees a normal hangup instead of waiting for the transport to time out. Fall
+                    // back to a local-only hangup if the send fails.
+                    if let Err(e) = client
+                        .voip()
+                        .terminate(&cid, &handle.peer_jid(), handle.call_creator())
+                        .await
+                    {
+                        warn!("⌨  terminate failed ({e}); tearing down locally");
+                        handle.hangup().await;
+                    }
+                }
+                "" => {}
+                other => info!("⌨  unknown command {other:?} — `v` toggles video, `q` hangs up"),
+            }
+        }
+    });
+}
+
 async fn run_bot(mode: Mode) -> Result<()> {
+    let audio = AudioMode::from_env()?;
+    info!(
+        "🔊 selected {} audio (signaling rate {})",
+        audio.name(),
+        audio.signaling_rate()
+    );
     let store = SqliteStore::new("whatsapp.db")
         .await
         .map_err(|e| anyhow!("sqlite: {e}"))?;
-    let (accept, target) = match mode {
-        Mode::Listen { accept } => (accept, None),
-        Mode::Call(jid) => (false, Some(jid)),
+    let (accept, target, video) = match mode {
+        Mode::Listen { accept, video } => (accept, None, video),
+        Mode::Call { jid, video } => (false, Some(jid), video),
     };
 
     let builder = Bot::builder()
@@ -936,17 +1658,13 @@ async fn run_bot(mode: Mode) -> Result<()> {
     let client = bot.client();
     // The structured `Event::IncomingCall` (which now carries the offer's <enc>/<relay>) drives the
     // accept flow, so the raw-node-forwarding crutch the old hand-rolled inbound path needed is gone.
-    let observer = Arc::new(CallObserver::new(
-        client.clone(),
-        accept,
-        accept || target.is_some(),
-    ));
+    let manages_media = accept || target.is_some();
+    let observer = Arc::new(CallObserver::new(client.clone(), accept, video, audio));
     client.register_handler(observer.clone());
 
     if let Some(peer) = target {
         let client2 = client.clone();
-        // Share the observer's call state so a peer `<terminate>` for our outgoing call can hang it up
-        // (the same bookkeeping the inbound path uses).
+        // Share UI state with the inbound path.
         let state = observer.state.clone();
         tokio::spawn(async move {
             // Wait until the socket is up before placing the call; if it never connects, don't dial.
@@ -957,23 +1675,25 @@ async fn run_bot(mode: Mode) -> Result<()> {
                 warn!("not connected within 60s, skipping outgoing call: {e}");
                 return;
             }
-            match place_outgoing_call(&client2, &peer).await {
+            match place_outgoing_call(&client2, &peer, video, audio, &state).await {
                 Ok(handle) => {
                     let cid = handle.call_id().to_string();
-                    let handle = Arc::new(handle);
-                    if !register_handle(&state, cid.clone(), handle.clone()) {
-                        handle.hangup().await;
-                        info!("◾ call {cid} terminated during startup");
-                    }
+                    register_handle(&state, cid, handle).await;
                 }
                 Err(e) => error!("call failed: {e}"),
             }
         });
     } else {
         warn!(
-            "listening for calls ({}). Ctrl+C to exit.",
-            if accept { "auto-accept" } else { "auto-reject" }
+            "listening for calls ({}, {}{}). Ctrl+C to exit.",
+            if accept { "auto-accept" } else { "auto-reject" },
+            audio.name(),
+            if video { ", video" } else { "" }
         );
+    }
+
+    if manages_media {
+        spawn_stdin_ui(client.clone(), observer.state.clone());
     }
 
     tokio::select! {
@@ -982,4 +1702,202 @@ async fn run_bot(mode: Mode) -> Result<()> {
         _ = whatsapp_rust::shutdown_signal() => { info!("shutting down"); }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "voip-opus")]
+    use super::{
+        AudioMode, FRAME_SAMPLES, WaOpusEncoder, spawn_fallback_opus_decoder, spawn_opus_bridge,
+    };
+    use super::{
+        CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
+        parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
+    };
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("voip")
+            .chain(parts.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn listen_video_implies_accept() {
+        // The footgun that showed "no answer" on the phone: `listen --video` must ACCEPT (video is
+        // meaningless while rejecting), not silently reject.
+        assert_eq!(
+            parse_cli(&argv(&["listen", "--video"])),
+            CliCommand::Listen {
+                accept: true,
+                video: true
+            }
+        );
+    }
+
+    #[test]
+    fn listen_modes() {
+        assert_eq!(
+            parse_cli(&argv(&["listen"])),
+            CliCommand::Listen {
+                accept: false,
+                video: false
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["listen", "accept"])),
+            CliCommand::Listen {
+                accept: true,
+                video: false
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["listen", "accept", "--video"])),
+            CliCommand::Listen {
+                accept: true,
+                video: true
+            }
+        );
+        // `--video` may appear before the subcommand.
+        assert_eq!(
+            parse_cli(&argv(&["--video", "listen", "accept"])),
+            CliCommand::Listen {
+                accept: true,
+                video: true
+            }
+        );
+    }
+
+    #[test]
+    fn loopback_and_call_and_usage() {
+        assert_eq!(
+            parse_cli(&argv(&["loopback"])),
+            CliCommand::Loopback { video: false }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["loopback", "--video"])),
+            CliCommand::Loopback { video: true }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["call", "123@lid", "--video"])),
+            CliCommand::Call {
+                jid: "123@lid".into(),
+                video: true
+            }
+        );
+        // `call` with no jid, and unknown/empty commands, are usage errors.
+        assert_eq!(parse_cli(&argv(&["call"])), CliCommand::Usage);
+        assert_eq!(parse_cli(&argv(&["bogus"])), CliCommand::Usage);
+        assert_eq!(parse_cli(&argv(&[])), CliCommand::Usage);
+    }
+
+    #[test]
+    fn warns_when_video_input_cannot_be_used() {
+        let loopback = parse_cli(&argv(&["loopback"]));
+        let rejecting = parse_cli(&argv(&["listen"]));
+        let accepting = parse_cli(&argv(&["listen", "accept"]));
+        let calling = parse_cli(&argv(&["call", "15550001111@lid"]));
+        let video = parse_cli(&argv(&["listen", "accept", "--video"]));
+
+        assert!(video_source_is_ignored(&loopback, true));
+        assert!(video_source_is_ignored(&rejecting, true));
+        assert!(!video_source_is_ignored(&accepting, true));
+        assert!(!video_source_is_ignored(&calling, true));
+        assert!(!video_source_is_ignored(&loopback, false));
+        assert!(!video_source_is_ignored(&video, true));
+        assert!(!video_source_is_ignored(&CliCommand::Usage, true));
+    }
+
+    #[test]
+    fn peer_terminate_tombstones_in_progress_media_startup() {
+        let state = Arc::new(Mutex::new(CallState::default()));
+        begin_call_startup(&state, "CALL-ID-STARTING");
+        record_peer_terminate(&state, "CALL-ID-STARTING");
+        assert!(peer_terminated_during_startup(&state, "CALL-ID-STARTING"));
+        assert!(complete_call_startup(&state, "CALL-ID-STARTING"));
+
+        let st = state.lock().unwrap();
+        assert!(st.starting.is_empty());
+        assert!(st.terminated_during_startup.is_empty());
+    }
+
+    #[test]
+    fn stdin_ui_order_tracks_the_most_recent_call() {
+        let mut order = Vec::new();
+        mark_call_most_recent(&mut order, "CALL-A");
+        mark_call_most_recent(&mut order, "CALL-B");
+        mark_call_most_recent(&mut order, "CALL-A");
+        assert_eq!(order, ["CALL-B", "CALL-A"]);
+    }
+
+    #[cfg(feature = "voip-opus")]
+    #[test]
+    fn native_opus_mode_keeps_codec_and_clock_negotiation_aligned() {
+        use wacore::stanza::call::{
+            CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_PREACCEPT,
+        };
+        use wacore::voip::rtp::{RTP_PAYLOAD_TYPE_OPUS, RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO};
+
+        let native = AudioMode::OpusNative;
+        assert_eq!(
+            native.format().rtp_payload_type,
+            RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO
+        );
+        assert_eq!(native.format().rtp_clock_rate, 16_000);
+        assert_eq!(
+            native.preaccept_capability(false),
+            &CAPABILITY_STANDARD_OPUS_PREACCEPT
+        );
+        assert_eq!(native.accept_capability(), &CAPABILITY_STANDARD_OPUS_OFFER);
+        assert!(native.uses_standard_opus());
+        assert!(!native.uses_48khz_rtp_clock());
+
+        let rfc7587 = AudioMode::OpusRfc7587;
+        assert_eq!(rfc7587.format().rtp_payload_type, RTP_PAYLOAD_TYPE_OPUS);
+        assert_eq!(rfc7587.format().rtp_clock_rate, 48_000);
+        assert!(rfc7587.uses_48khz_rtp_clock());
+    }
+
+    #[cfg(feature = "voip-opus")]
+    #[tokio::test]
+    async fn opus_bridge_recovers_after_bad_input_frame() {
+        let (mic_tx, mic_rx) = async_channel::bounded(2);
+        let (speaker_tx, _speaker_rx) = async_channel::bounded(2);
+        let (encoded_rx, _playout_tx) =
+            spawn_opus_bridge(mic_rx, speaker_tx, AudioMode::OpusNative).unwrap();
+
+        mic_tx.send(vec![0; FRAME_SAMPLES - 1]).await.unwrap();
+        mic_tx.send(vec![0; FRAME_SAMPLES]).await.unwrap();
+
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), encoded_rx.recv())
+            .await
+            .expect("encoder worker must continue")
+            .unwrap();
+        assert!(!payload.is_empty());
+    }
+
+    #[cfg(feature = "voip-opus")]
+    #[tokio::test]
+    async fn fallback_opus_decoder_delivers_pcm() {
+        let mut encoder = WaOpusEncoder::new_mlow_escape().unwrap();
+        let voice = (0..FRAME_SAMPLES)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                (16_000.0 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()) as i16
+            })
+            .collect::<Vec<_>>();
+        let payload = bytes::Bytes::from(encoder.encode(&voice).unwrap());
+        let (speaker_tx, speaker_rx) = async_channel::bounded(2);
+        let fallback_tx = spawn_fallback_opus_decoder(speaker_tx).unwrap();
+
+        fallback_tx.send(payload).await.unwrap();
+
+        let pcm = tokio::time::timeout(std::time::Duration::from_secs(2), speaker_rx.recv())
+            .await
+            .expect("decoder worker must respond")
+            .unwrap();
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
+    }
 }

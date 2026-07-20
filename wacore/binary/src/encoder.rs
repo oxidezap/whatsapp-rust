@@ -204,28 +204,15 @@ impl EncodeNode for NodeRef<'_> {
     }
 }
 
+// u8 offsets keep StringHint small — the hint tape stores one per string —
+// and always fit: classify_string_hint only treats strings <= 48 bytes as
+// JID candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedJidMeta {
-    user_end: usize,
-    server_start: usize,
+    user_end: u8,
+    server_start: u8,
     domain_type: u8,
     device: Option<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct StrKey {
-    ptr: usize,
-    len: usize,
-}
-
-impl StrKey {
-    #[inline]
-    fn from_str(s: &str) -> Self {
-        Self {
-            ptr: s.as_ptr() as usize,
-            len: s.len(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,56 +226,48 @@ enum StringHint {
     RawBytes,
 }
 
-#[derive(Debug)]
+/// Replay tape: sound only while plan and encode visit strings in the same
+/// (`write_node`) order — `write_string` debug-asserts each replayed hint to
+/// catch divergence. 32 inline keeps a typical stanza off the heap.
+#[derive(Debug, Default)]
 pub(crate) struct StringHintCache {
-    // Keys use (ptr, len) identity, so this cache is only valid while encoding
-    // the same immutable node/strings it was built from.
-    //
-    // Inline capacity covers a typical stanza's distinct strings without a
-    // heap allocation: the exact-marshal two-pass builds one of these per
-    // outgoing stanza, and it lives on the (sync) caller's stack, never in
-    // an async frame. Larger stanzas spill to the heap transparently.
-    hints: smallvec::SmallVec<[(StrKey, StringHint); 32]>,
-}
-
-impl Default for StringHintCache {
-    fn default() -> Self {
-        Self {
-            hints: smallvec::SmallVec::new(),
-        }
-    }
+    hints: smallvec::SmallVec<[StringHint; 32]>,
+    cursor: std::cell::Cell<usize>,
 }
 
 impl StringHintCache {
-    const MAX_HINT_ENTRIES: usize = 96;
-
+    /// Plan side: classify once and append to the tape.
     #[inline]
-    fn hint_for(&self, s: &str) -> Option<StringHint> {
-        let key = StrKey::from_str(s);
-        self.hints
-            .iter()
-            .find_map(|(cached_key, hint)| (*cached_key == key).then_some(*hint))
+    fn record(&mut self, s: &str) -> StringHint {
+        // Strings longer than PACKED_MAX (127) can't be protocol tokens
+        // (max 48), packed nibble/hex, or JIDs — skip classification.
+        let hint = if s.len() > token::PACKED_MAX as usize {
+            StringHint::RawBytes
+        } else {
+            classify_string_hint(s)
+        };
+        self.hints.push(hint);
+        hint
     }
 
+    /// Encode side: consume the next recorded hint.
     #[inline]
-    fn hint_or_insert(&mut self, s: &str) -> StringHint {
-        if s.len() > token::PACKED_MAX as usize {
-            return StringHint::RawBytes;
+    fn next(&self) -> Option<StringHint> {
+        let i = self.cursor.get();
+        let hint = self.hints.get(i).copied();
+        if hint.is_some() {
+            self.cursor.set(i + 1);
         }
-        let key = StrKey::from_str(s);
-        if let Some(existing) = self
-            .hints
-            .iter()
-            .find_map(|(cached_key, hint)| (*cached_key == key).then_some(*hint))
-        {
-            existing
-        } else {
-            let hint = classify_string_hint(s);
-            if self.hints.len() < Self::MAX_HINT_ENTRIES {
-                self.hints.push((key, hint));
-            }
-            hint
-        }
+        hint
+    }
+
+    /// The exact-marshal fns require this after encoding: a leftover hint
+    /// means plan and encode diverged, and the output can't be trusted.
+    /// (Reusing an exhausted tape for a second encode is merely slow, not
+    /// wrong — `next` returns None and `write_string` classifies inline.)
+    #[inline]
+    pub(crate) fn fully_consumed(&self) -> bool {
+        self.cursor.get() == self.hints.len()
     }
 }
 
@@ -304,24 +283,18 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
     let server = &input[server_start..];
     let user_combined = &input[..sep_idx];
 
-    let (user_agent, device) = if let Some(colon_idx) = user_combined.find(':') {
-        let device_part = &user_combined[colon_idx + 1..];
-        if let Ok(parsed_device) = device_part.parse::<u8>() {
-            (&user_combined[..colon_idx], Some(parsed_device))
-        } else {
-            (user_combined, None)
-        }
+    let (user_agent, device) = if let Some(colon_idx) = user_combined.find(':')
+        && let Ok(parsed_device) = user_combined[colon_idx + 1..].parse::<u8>()
+    {
+        (&user_combined[..colon_idx], Some(parsed_device))
     } else {
         (user_combined, None)
     };
 
-    let user_end = if let Some(underscore_idx) = user_agent.find('_') {
-        let agent_part = &user_agent[underscore_idx + 1..];
-        if agent_part.parse::<u8>().is_ok() {
-            underscore_idx
-        } else {
-            user_agent.len()
-        }
+    let user_end = if let Some(underscore_idx) = user_agent.find('_')
+        && user_agent[underscore_idx + 1..].parse::<u8>().is_ok()
+    {
+        underscore_idx
     } else {
         user_agent.len()
     };
@@ -343,8 +316,8 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         .and(device);
 
     Some(ParsedJidMeta {
-        user_end,
-        server_start,
+        user_end: u8::try_from(user_end).ok()?,
+        server_start: u8::try_from(server_start).ok()?,
         domain_type,
         device,
     })
@@ -352,7 +325,10 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
 
 #[inline]
 fn split_jid_from_meta(input: &str, meta: ParsedJidMeta) -> (&str, &str) {
-    (&input[..meta.user_end], &input[meta.server_start..])
+    (
+        &input[..meta.user_end as usize],
+        &input[meta.server_start as usize..],
+    )
 }
 
 /// Map a JID server string to the AD_JID domain_type byte.
@@ -463,23 +439,25 @@ fn packed_encoded_size(value_len: usize) -> usize {
     2 + value_len.div_ceil(2)
 }
 
+// Statement order below matters: hints are recorded for replay, so strings
+// must be visited exactly as write_node emits them — tag, then each attr's
+// key then value, then content.
 fn node_encoded_size_with_cache(node: &Node, hints: &mut StringHintCache) -> usize {
     let content_len = usize::from(node.content.is_some());
     let list_len = 1 + (node.attrs.len() * 2) + content_len;
 
-    let attrs_size: usize = node
-        .attrs
-        .iter()
-        .map(|(k, v)| {
-            let value_size = match v {
-                NodeValue::String(s) => string_encoded_size_with_cache(s, hints),
-                NodeValue::Jid(jid) => owned_jid_encoded_size_with_cache(jid, hints),
-            };
-            string_encoded_size_with_cache(k, hints) + value_size
-        })
-        .sum();
+    let mut size =
+        list_start_encoded_size(list_len) + string_encoded_size_with_cache(&node.tag, hints);
 
-    let content_size = match &node.content {
+    for (k, v) in &node.attrs {
+        size += string_encoded_size_with_cache(k, hints);
+        size += match v {
+            NodeValue::String(s) => string_encoded_size_with_cache(s, hints),
+            NodeValue::Jid(jid) => owned_jid_encoded_size_with_cache(jid, hints),
+        };
+    }
+
+    size += match &node.content {
         Some(NodeContent::String(s)) => string_encoded_size_with_cache(s, hints),
         Some(NodeContent::Bytes(b)) => bytes_with_len_encoded_size(b.len()),
         Some(NodeContent::Nodes(nodes)) => {
@@ -491,30 +469,26 @@ fn node_encoded_size_with_cache(node: &Node, hints: &mut StringHintCache) -> usi
         }
         None => 0,
     };
-
-    list_start_encoded_size(list_len)
-        + string_encoded_size_with_cache(&node.tag, hints)
-        + attrs_size
-        + content_size
+    size
 }
 
+// Same statement-order constraint as node_encoded_size_with_cache.
 fn node_ref_encoded_size_with_cache(node: &NodeRef<'_>, hints: &mut StringHintCache) -> usize {
     let content_len = usize::from(node.content.is_some());
     let list_len = 1 + (node.attrs.len() * 2) + content_len;
 
-    let attrs_size: usize = node
-        .attrs
-        .iter()
-        .map(|(k, v)| {
-            let value_size = match v {
-                ValueRef::String(s) => string_encoded_size_with_cache(s, hints),
-                ValueRef::Jid(jid) => jid_ref_encoded_size_with_cache(jid, hints),
-            };
-            string_encoded_size_with_cache(k, hints) + value_size
-        })
-        .sum();
+    let mut size = list_start_encoded_size(list_len)
+        + string_encoded_size_with_cache(node.tag.as_ref(), hints);
 
-    let content_size = match node.content.as_deref() {
+    for (k, v) in node.attrs.iter() {
+        size += string_encoded_size_with_cache(k, hints);
+        size += match v {
+            ValueRef::String(s) => string_encoded_size_with_cache(s, hints),
+            ValueRef::Jid(jid) => jid_ref_encoded_size_with_cache(jid, hints),
+        };
+    }
+
+    size += match node.content.as_deref() {
         Some(NodeContentRef::String(s)) => string_encoded_size_with_cache(s, hints),
         Some(NodeContentRef::Bytes(b)) => bytes_with_len_encoded_size(b.len()),
         Some(NodeContentRef::Nodes(nodes)) => {
@@ -526,16 +500,12 @@ fn node_ref_encoded_size_with_cache(node: &NodeRef<'_>, hints: &mut StringHintCa
         }
         None => 0,
     };
-
-    list_start_encoded_size(list_len)
-        + string_encoded_size_with_cache(node.tag.as_ref(), hints)
-        + attrs_size
-        + content_size
+    size
 }
 
 #[inline]
 fn string_encoded_size_with_cache(s: &str, hints: &mut StringHintCache) -> usize {
-    let hint = hints.hint_or_insert(s);
+    let hint = hints.record(s);
     string_encoded_size_from_hint_with_cache(s, hint, hints)
 }
 
@@ -721,8 +691,18 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
     #[inline(always)]
     pub fn write_string(&mut self, s: &str) -> Result<()> {
         if let Some(string_hints) = self.string_hints
-            && let Some(hint) = string_hints.hint_for(s)
+            && let Some(hint) = string_hints.next()
         {
+            debug_assert_eq!(
+                hint,
+                if s.len() > token::PACKED_MAX as usize {
+                    StringHint::RawBytes
+                } else {
+                    classify_string_hint(s)
+                },
+                "hint tape misaligned at {s:?}: plan and encode no longer \
+                 traverse strings in the same order"
+            );
             return self.write_string_with_hint(s, hint);
         }
         self.write_string_uncached(s)

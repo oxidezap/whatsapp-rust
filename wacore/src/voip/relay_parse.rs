@@ -104,7 +104,7 @@ fn node_content_bytes(node: &NodeRef<'_>) -> Option<Vec<u8>> {
     node.content_str().map(|s| s.as_bytes().to_vec())
 }
 
-/// Decode `<hbh_key>` to 30 bytes (16B master_key + 14B master_salt); handles double-base64.
+/// Decode `<hbh_key>` to its 14B salt seed + 16B key seed; handles double-base64.
 pub fn decode_hbh_key(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.is_empty() {
         return None;

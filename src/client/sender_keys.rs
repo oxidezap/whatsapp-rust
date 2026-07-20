@@ -83,6 +83,49 @@ impl Client {
         Ok(())
     }
 
+    /// Redistribution must not inherit delivery marks from an earlier pass.
+    pub(crate) async fn reset_sender_key_device_tracking(&self, group_jid: &str) -> Result<()> {
+        if let Err(clear_error) = self
+            .persistence_manager
+            .clear_sender_key_devices(group_jid)
+            .await
+        {
+            // Cold marks preserve the reset when row deletion is unavailable.
+            let rows = self
+                .persistence_manager
+                .get_sender_key_devices(group_jid)
+                .await
+                .map_err(|fallback_error| {
+                    anyhow::anyhow!(
+                        "sender-key tracker clear failed ({clear_error}); \
+                         fallback read failed: {fallback_error}"
+                    )
+                })?;
+            if !rows.is_empty() {
+                let entries: Vec<(&str, bool)> = rows
+                    .iter()
+                    .map(|(device_jid, _)| (device_jid.as_str(), false))
+                    .collect();
+                self.persistence_manager
+                    .set_sender_key_status(group_jid, &entries)
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "sender-key tracker clear failed ({clear_error}); \
+                             cold-mark fallback failed: {fallback_error}"
+                        )
+                    })?;
+            }
+            log::warn!(
+                "reset_sender_key_device_tracking: clear failed for {group_jid}; \
+                 marked {} existing rows cold: {clear_error}",
+                rows.len()
+            );
+        }
+        self.sender_key_device_cache.invalidate(group_jid).await;
+        Ok(())
+    }
+
     /// Forward-secrecy rotation when participants leave a group. Mirrors WA
     /// Web's `removeParticipantInfo` (`GroupParticipantHelpers.js`): if any
     /// removed user had `has_key=true`, delete the bot's own sender key for
@@ -92,18 +135,20 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.rotate_sender_key_on_remove", level = "debug", skip_all, fields(removed = removed_user_ids.len())))]
     pub(crate) async fn rotate_sender_key_on_participant_remove(
         &self,
-        group_jid: &str,
+        group_jid: &Jid,
         removed_user_ids: &[&str],
     ) {
         if removed_user_ids.is_empty() {
             return;
         }
+        let group_id = group_jid.to_string();
+        let distribution_guard = self.group_distribution_lock(group_jid).await;
 
         // Read failure → rotate anyway. Better to pay the redistribute cost
         // than leave the sender key in place after a removal we couldn't audit.
         let (rows, read_failed) = match self
             .persistence_manager
-            .get_sender_key_devices(group_jid)
+            .get_sender_key_devices(&group_id)
             .await
         {
             Ok(r) => (r, false),
@@ -127,7 +172,10 @@ impl Client {
             return;
         }
 
-        self.force_rotate_own_sender_key(group_jid).await;
+        self.rotate_own_sender_key_state(&group_id).await;
+        drop(distribution_guard);
+        self.flush_signal_cache_batch_safe_logged("rotate_on_participant_remove", None)
+            .await;
     }
 
     /// Unconditional forward-secrecy rotation: delete the bot's own sender key
@@ -143,28 +191,32 @@ impl Client {
             skip_all
         )
     )]
-    pub(crate) async fn force_rotate_own_sender_key(&self, group_jid: &str) {
+    pub(crate) async fn force_rotate_own_sender_key(&self, group_jid: &Jid) {
+        let group_id = group_jid.to_string();
+        let distribution_guard = self.group_distribution_lock(group_jid).await;
+        self.rotate_own_sender_key_state(&group_id).await;
+        drop(distribution_guard);
+
+        self.flush_signal_cache_batch_safe_logged("force_rotate_own_sender_key", None)
+            .await;
+    }
+
+    /// A send must not publish a new distribution between the audit and reset.
+    async fn rotate_own_sender_key_state(&self, group_id: &str) {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
             let sk_name =
-                SenderKeyName::from_parts(group_jid, own_jid.to_protocol_address().as_str());
+                SenderKeyName::from_parts(group_id, own_jid.to_protocol_address().as_str());
             self.signal_cache
                 .delete_sender_key(sk_name.cache_key())
                 .await;
         }
-        self.flush_signal_cache_batch_safe_logged("force_rotate_own_sender_key", None)
-            .await;
 
-        if let Err(e) = self
-            .persistence_manager
-            .clear_sender_key_devices(group_jid)
-            .await
-        {
-            log::warn!("force_rotate_own_sender_key: clear DB failed: {e}");
+        if let Err(e) = self.reset_sender_key_device_tracking(group_id).await {
+            log::warn!("rotate_own_sender_key_state: reset failed for {group_id}: {e}");
         }
-        self.sender_key_device_cache.invalidate(group_jid).await;
     }
 
     /// Take a sent message for retry handling. Checks L1 cache first (if enabled),
@@ -343,7 +395,6 @@ impl Client {
         // Avoids re-encoding when the send path already serialized `msg`.
         encoded: Option<std::sync::Arc<Vec<u8>>>,
     ) {
-        let key = self.make_chat_message_id(to, id).await;
         let shared =
             encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(msg)));
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
@@ -352,6 +403,7 @@ impl Client {
             // L1 cache serves reads immediately; DB write can be backgrounded.
             // Share the serialized bytes via Arc so the cache and the DB task
             // hold the same buffer instead of memcpy-ing the whole message.
+            let key = self.make_chat_message_id(to, id).await;
             let chat_str = key.chat.to_string();
             let msg_id = key.id.clone();
             self.recent_messages
@@ -369,12 +421,16 @@ impl Client {
                 }))
                 .detach();
         } else {
-            // DB-only mode: await to guarantee the row exists before returning
-            let chat_str = key.chat.to_string();
+            // DB-only mode: await to guarantee the row exists before returning.
+            // Only chat + id are borrowed here, so resolve the chat directly and
+            // pass the caller's `id`, skipping make_chat_message_id's owned
+            // ChatMessageId whose id.to_owned() would just be borrowed away.
+            let chat = self.resolve_encryption_jid(to).await;
+            let chat_str = chat.to_string();
             if let Err(e) = self
                 .persistence_manager
                 .backend()
-                .store_sent_message(&chat_str, &key.id, &shared)
+                .store_sent_message(&chat_str, id, &shared)
                 .await
             {
                 log::warn!("Failed to store sent message to DB: {e}");
@@ -528,6 +584,80 @@ mod tests {
             map.device_has_key("888000888000888", 5),
             None,
             "our own companion is never memoized"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_failure_uses_durable_cold_mark_fallback() {
+        let client = create_test_client().await;
+        let group = "120363000000000005@g.us";
+        let device = "111000111000112:0@lid";
+        client
+            .persistence_manager
+            .set_sender_key_status(group, &[(device, true)])
+            .await
+            .unwrap();
+
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let cached = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&rows))
+            })
+            .await;
+
+        client
+            .persistence_manager
+            .fail_sender_key_device_clears_for_tests(true);
+        client
+            .persistence_manager
+            .fail_sender_key_device_status_writes_for_tests(true);
+        assert!(
+            client
+                .reset_sender_key_device_tracking(group)
+                .await
+                .is_err()
+        );
+        let after_failure = client
+            .sender_key_device_cache
+            .get_or_init(group, async { panic!("failed clear must not invalidate") })
+            .await;
+        assert!(Arc::ptr_eq(&cached, &after_failure));
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap(),
+            vec![(device.to_string(), true)]
+        );
+
+        client
+            .persistence_manager
+            .fail_sender_key_device_status_writes_for_tests(false);
+        client
+            .reset_sender_key_device_tracking(group)
+            .await
+            .unwrap();
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let after_fallback = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&rows))
+            })
+            .await;
+        assert!(!Arc::ptr_eq(&cached, &after_fallback));
+        assert_eq!(
+            after_fallback.device_has_key("111000111000112", 0),
+            Some(false)
         );
     }
 

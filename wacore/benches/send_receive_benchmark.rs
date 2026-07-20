@@ -1,5 +1,8 @@
 //! Full send/receive pipeline benchmarks using real `prepare_*_stanza` functions.
 
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use buffa::Message as ProtoMessage;
 use std::collections::HashMap;

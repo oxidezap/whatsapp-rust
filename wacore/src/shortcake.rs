@@ -31,7 +31,7 @@
 use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use crate::pair_code::PairCodeUtils;
-use buffa::{Enumeration, Message};
+use buffa::Enumeration;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as _, Mac};
 use rand::RngExt;
@@ -93,12 +93,11 @@ impl ShortcakeUtils {
         device_type: wa::device_props::PlatformType,
         ref_str: &str,
     ) -> Vec<u8> {
-        wa::CompanionEphemeralIdentity {
+        waproto::codec::companion_ephemeral_identity_to_vec(&wa::CompanionEphemeralIdentity {
             public_key: Some(public_key.to_vec()),
             device_type: Some(device_type),
             r#ref: Some(ref_str.to_string()),
-        }
-        .encode_to_vec()
+        })
     }
 
     /// commitment = SHA256(companionEphemeralIdentityBytes ‖ companionNonce).
@@ -118,13 +117,12 @@ impl ShortcakeUtils {
         companion_ephemeral_identity: &[u8],
         commitment_hash: &[u8; 32],
     ) -> Vec<u8> {
-        wa::ProloguePayload {
+        waproto::codec::prologue_payload_to_vec(&wa::ProloguePayload {
             companion_ephemeral_identity: Some(companion_ephemeral_identity.to_vec()),
             commitment: buffa::MessageField::some(wa::CompanionCommitment {
                 hash: Some(commitment_hash.to_vec()),
             }),
-        }
-        .encode_to_vec()
+        })
     }
 
     /// Decode + length-validate the `PrimaryEphemeralIdentity` protobuf from the
@@ -134,7 +132,7 @@ impl ShortcakeUtils {
     pub fn parse_primary_ephemeral_identity(
         bytes: &[u8],
     ) -> Result<PrimaryEphemeralIdentity, ShortcakeError> {
-        let parsed = wa::PrimaryEphemeralIdentity::decode_from_slice(bytes)
+        let parsed = waproto::codec::primary_ephemeral_identity_decode(bytes)
             .map_err(|_| ShortcakeError::Decode("primary_ephemeral_identity"))?;
         let pk = parsed.public_key.unwrap_or_default();
         let nc = parsed.nonce.unwrap_or_default();
@@ -218,12 +216,11 @@ impl ShortcakeUtils {
         companion_identity_key: &[u8; 32],
         adv_secret: &[u8; 32],
     ) -> Vec<u8> {
-        wa::PairingRequest {
+        waproto::codec::pairing_request_to_vec(&wa::PairingRequest {
             companion_public_key: Some(companion_public_key.to_vec()),
             companion_identity_key: Some(companion_identity_key.to_vec()),
             adv_secret: Some(adv_secret.to_vec()),
-        }
-        .encode_to_vec()
+        })
     }
 
     /// AES-256-GCM encrypt the pairing-request plaintext with a fresh 12-byte IV,
@@ -245,11 +242,10 @@ impl ShortcakeUtils {
 
     /// Encode the `EncryptedPairingRequest` protobuf sent in the final IQ.
     pub fn build_encrypted_pairing_request(enc: &EncryptedPairing) -> Vec<u8> {
-        wa::EncryptedPairingRequest {
+        waproto::codec::encrypted_pairing_request_to_vec(&wa::EncryptedPairingRequest {
             encrypted_payload: Some(enc.encrypted_payload.clone()),
             iv: Some(enc.iv.to_vec()),
-        }
-        .encode_to_vec()
+        })
     }
 
     /// Derive the pairing-handoff HMAC key from a PRIOR session's 32-byte ADV
@@ -291,8 +287,10 @@ impl ShortcakeUtils {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message;
 
     // Deterministic vectors guard the bug-prone concat/XOR/label details the RE flagged.
 

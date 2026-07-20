@@ -10,8 +10,9 @@ use crate::protocol::sender_keys::SenderKeyRecord;
 use crate::protocol::state::{
     PreKeyId, PreKeyRecord, SessionRecord, SignedPreKeyId, SignedPreKeyRecord,
 };
-use crate::protocol::{IdentityKey, IdentityKeyPair, ProtocolAddress};
+use crate::protocol::{IdentityKey, IdentityKeyPair, ProtocolAddress, SignalProtocolError};
 use crate::store::sender_key_name::SenderKeyName;
+use core::num::NonZeroU64;
 
 /// Each Signal message can be considered to have exactly two participants, a sender and receiver.
 ///
@@ -130,10 +131,31 @@ pub trait SignedPreKeyStore: ThreadSafe {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait SessionStore: ThreadSafe {
-    /// Takes the session for `address`. Implementations with caches should
-    /// treat this as a logical checkout; callers must always call
-    /// [`store_session`] to return the record, even on error paths.
+    /// Loads the session for `address` without removing it from the store.
+    /// Destructive cache checkouts belong in [`load_session_for_update`].
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
+
+    /// Loads a mutation copy and optionally marks it as destructively checked out.
+    ///
+    /// `None` is an assertion that [`load_session`] was non-destructive. A store
+    /// returning a generation must also implement
+    /// [`try_store_session_from_checkout`] so cancellation can restore the record.
+    #[doc(hidden)]
+    async fn load_session_for_update(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Result<(Option<SessionRecord>, Option<SessionCheckoutKey>)> {
+        Ok((self.load_session(address).await?, None))
+    }
+
+    /// Avoids boxing the async fallback when a destructive store can answer immediately.
+    #[doc(hidden)]
+    fn try_load_session_for_update(
+        &self,
+        _address: &ProtocolAddress,
+    ) -> Option<Result<(Option<SessionRecord>, Option<SessionCheckoutKey>)>> {
+        None
+    }
 
     /// Non-destructive existence check (must not consume the cached entry).
     async fn has_session(&self, address: &ProtocolAddress) -> Result<bool>;
@@ -144,6 +166,248 @@ pub trait SessionStore: ThreadSafe {
         address: &ProtocolAddress,
         record: SessionRecord,
     ) -> Result<()>;
+
+    /// Gives destructive stores a synchronous recovery path before an async
+    /// owner can be cancelled again.
+    #[doc(hidden)]
+    fn try_store_session_from_checkout(
+        &mut self,
+        _address: &ProtocolAddress,
+        record: SessionRecord,
+        _checkout: Option<SessionCheckoutKey>,
+        _had_session: bool,
+    ) -> SessionCheckoutStoreResult {
+        SessionCheckoutStoreResult::Unhandled(record)
+    }
+
+    /// Releases an empty reservation made by a destructive update load.
+    #[doc(hidden)]
+    fn cancel_session_checkout(
+        &mut self,
+        _address: &ProtocolAddress,
+        _checkout: Option<SessionCheckoutKey>,
+    ) {
+    }
+
+    /// Drives a queued synchronous return once the contended store is available.
+    #[doc(hidden)]
+    async fn complete_session_checkout(&mut self) {}
+}
+
+/// Result of returning a record from a cancellation-safe checkout.
+#[doc(hidden)]
+pub enum SessionCheckoutStoreResult {
+    Stored,
+    Rejected,
+    Pending(std::sync::Arc<portable_atomic::AtomicBool>),
+    Unhandled(SessionRecord),
+}
+
+/// Identifies one cache checkout within a lossy-reset generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct SessionCheckoutKey {
+    generation: u64,
+    token: NonZeroU64,
+}
+
+impl SessionCheckoutKey {
+    pub const fn new(generation: u64, token: NonZeroU64) -> Self {
+        Self { generation, token }
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn token(self) -> NonZeroU64 {
+        self.token
+    }
+}
+
+/// Keeps an owned session recoverable while an async protocol operation can be cancelled.
+pub struct SessionCheckout<'a> {
+    store: &'a mut dyn SessionStore,
+    address: &'a ProtocolAddress,
+    record: Option<SessionRecord>,
+    checkout: Option<SessionCheckoutKey>,
+    had_session: bool,
+    drop_recovery: CheckoutDropRecovery,
+}
+
+enum CheckoutDropRecovery {
+    Working,
+    Restore(Box<SessionRecord>),
+    Discard,
+}
+
+impl<'a> SessionCheckout<'a> {
+    /// Loads an existing session and arms cancellation recovery.
+    pub async fn load(
+        store: &'a mut dyn SessionStore,
+        address: &'a ProtocolAddress,
+    ) -> Result<Option<Self>> {
+        let (record, checkout) = match store.try_load_session_for_update(address) {
+            Some(result) => result?,
+            None => store.load_session_for_update(address).await?,
+        };
+        let Some(record) = record else {
+            store.cancel_session_checkout(address, checkout);
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            store,
+            address,
+            record: Some(record),
+            checkout,
+            had_session: true,
+            drop_recovery: CheckoutDropRecovery::Working,
+        }))
+    }
+
+    /// Creates an empty working record if the store has no session yet.
+    pub async fn load_or_create(
+        store: &'a mut dyn SessionStore,
+        address: &'a ProtocolAddress,
+    ) -> Result<Self> {
+        let (record, checkout) = match store.try_load_session_for_update(address) {
+            Some(result) => result?,
+            None => store.load_session_for_update(address).await?,
+        };
+        let had_session = record.is_some();
+        Ok(Self {
+            store,
+            address,
+            record: Some(record.unwrap_or_else(SessionRecord::new_fresh)),
+            checkout,
+            had_session,
+            drop_recovery: CheckoutDropRecovery::Working,
+        })
+    }
+
+    /// Reports whether the store supplied the working record.
+    pub fn had_session(&self) -> bool {
+        self.had_session
+    }
+
+    /// Borrows the working record.
+    pub fn record(&self) -> &SessionRecord {
+        self.record
+            .as_ref()
+            .expect("a live checkout always owns its record")
+    }
+
+    /// Mutably borrows the working record.
+    pub fn record_mut(&mut self) -> &mut SessionRecord {
+        self.record
+            .as_mut()
+            .expect("a live checkout always owns its record")
+    }
+
+    /// A prekey promotion must not survive cancellation before identity persistence.
+    pub(crate) fn snapshot_for_rollback(&mut self) {
+        self.drop_recovery = if self.had_session {
+            CheckoutDropRecovery::Restore(Box::new(self.record().clone()))
+        } else {
+            CheckoutDropRecovery::Discard
+        };
+    }
+
+    /// Restores the snapshot armed by [`Self::snapshot_for_rollback`].
+    pub(crate) async fn rollback(mut self) -> Result<()> {
+        match std::mem::replace(&mut self.drop_recovery, CheckoutDropRecovery::Working) {
+            CheckoutDropRecovery::Restore(snapshot) => {
+                self.record = Some(*snapshot);
+                self.commit().await
+            }
+            CheckoutDropRecovery::Discard => {
+                self.record.take();
+                self.store
+                    .cancel_session_checkout(self.address, self.checkout);
+                Ok(())
+            }
+            CheckoutDropRecovery::Working => self.commit().await,
+        }
+    }
+
+    /// Prevents a deliberately rejected fresh session from being recovered.
+    pub fn discard(mut self) {
+        debug_assert!(!self.had_session, "only a fresh checkout can be discarded");
+        if self.had_session {
+            return;
+        }
+        self.record.take();
+        self.store
+            .cancel_session_checkout(self.address, self.checkout);
+    }
+
+    /// Returns the record by move without a cancellation gap on take-style stores.
+    pub async fn commit(mut self) -> Result<()> {
+        let record = self
+            .record
+            .take()
+            .expect("a live checkout always owns its record");
+        match self.store.try_store_session_from_checkout(
+            self.address,
+            record,
+            self.checkout,
+            self.had_session,
+        ) {
+            SessionCheckoutStoreResult::Stored => Ok(()),
+            SessionCheckoutStoreResult::Rejected => Err(checkout_rejected()),
+            SessionCheckoutStoreResult::Pending(completion) => {
+                self.store.complete_session_checkout().await;
+                if completion.load(portable_atomic::Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(checkout_rejected())
+                }
+            }
+            SessionCheckoutStoreResult::Unhandled(record) => {
+                self.store.store_session(self.address, record).await
+            }
+        }
+    }
+}
+
+fn checkout_rejected() -> SignalProtocolError {
+    SignalProtocolError::InvalidState(
+        "SessionCheckout::commit",
+        "session changed during mutation".to_string(),
+    )
+}
+
+impl Drop for SessionCheckout<'_> {
+    fn drop(&mut self) {
+        let Some(mut record) = self.record.take() else {
+            return;
+        };
+        match std::mem::replace(&mut self.drop_recovery, CheckoutDropRecovery::Working) {
+            CheckoutDropRecovery::Working => {}
+            CheckoutDropRecovery::Restore(snapshot) => record = *snapshot,
+            CheckoutDropRecovery::Discard => {
+                self.store
+                    .cancel_session_checkout(self.address, self.checkout);
+                return;
+            }
+        }
+        if self.had_session || record.session_state().is_some() {
+            match self.store.try_store_session_from_checkout(
+                self.address,
+                record,
+                self.checkout,
+                self.had_session,
+            ) {
+                SessionCheckoutStoreResult::Stored
+                | SessionCheckoutStoreResult::Rejected
+                | SessionCheckoutStoreResult::Pending(_) => {}
+                SessionCheckoutStoreResult::Unhandled(_) => {}
+            }
+        } else {
+            self.store
+                .cancel_session_checkout(self.address, self.checkout);
+        }
+    }
 }
 
 /// Interface for storing sender key records, allowing multiple keys per user.
@@ -163,9 +427,9 @@ pub trait SenderKeyStore: ThreadSafe {
         sender_key_name: &SenderKeyName,
     ) -> Result<Option<SenderKeyRecord>>;
 
-    /// Serializes the load/advance/store of one sender-key chain so concurrent
-    /// encrypts to the same `(group, sender)` can't reuse a chain iteration.
-    /// Default is uncontended; stores over shared state override it.
+    /// Serializes every load/mutate/store of one sender-key chain so concurrent
+    /// encrypt, decrypt, distribution and rotation operations cannot overwrite
+    /// each other. Default is uncontended; stores over shared state override it.
     async fn sender_key_lock(
         &self,
         _sender_key_name: &SenderKeyName,

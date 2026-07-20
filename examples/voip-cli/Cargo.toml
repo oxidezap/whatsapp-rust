@@ -10,9 +10,15 @@ edition = "2024"
 license = "MIT"
 publish = false
 
+[features]
+default = ["voip-mlow", "voip-opus"]
+voip-mlow = ["whatsapp-rust/voip-mlow"]
+voip-opus = ["whatsapp-rust/voip-encoded", "whatsapp-rust/voip-libopus"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-channel = { workspace = true }
+bytes = { workspace = true }
 cpal = "0.18"
 env_logger = { workspace = true }
 hex = { workspace = true }
@@ -23,7 +29,6 @@ ringbuf = "0.5"
 tokio = { workspace = true, features = ["full"] }
 wacore = { path = "../../wacore", features = ["voip"] }
 whatsapp-rust = { path = "../..", features = [
-    "voip",
     "sqlite-storage",
     "tokio-transport",
     "ureq-client",

@@ -166,6 +166,7 @@ impl Client {
                 .build(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
+                .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
                 .build(),
             lid_pn_cache: Arc::new(LidPnCache::with_config(
                 &cache_config.lid_pn_cache,
@@ -240,6 +241,16 @@ impl Client {
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
+            signal_flush_state: AtomicU64::new(0),
+            signal_flush_lifecycle: async_lock::Mutex::new(()),
+            #[cfg(test)]
+            signal_flush_test_failures: AtomicU32::new(0),
+            #[cfg(test)]
+            signal_flush_test_block: AtomicBool::new(false),
+            #[cfg(test)]
+            signal_flush_test_in_attempt: AtomicU32::new(0),
+            #[cfg(test)]
+            app_state_key_share_prepare_test_failures: AtomicU32::new(0),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
@@ -259,12 +270,10 @@ impl Client {
             group_devices_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),
-            // Evicting a lock whose guard is still held only lets one extra
-            // send re-run that group's fan-out (the pre-single-flight
-            // behavior); the sender-key chain lock still guarantees ratchet
-            // correctness.
+            // A live lane also protects recipient-tracker reset/update ordering.
             group_distribution_locks: Cache::builder()
                 .max_capacity(cache_config.group_distribution_locks_capacity.max(1))
+                .evict_guard(|m| Arc::strong_count(m) <= 1)
                 .build(),
             skdm_warm_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
@@ -280,9 +289,9 @@ impl Client {
             saver_handle: std::sync::OnceLock::new(),
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicBool::new(false),
-            #[cfg(feature = "voip")]
+            #[cfg(feature = "voip-runtime")]
             call_registry: std::sync::Arc::new(wacore::voip::CallRegistry::new()),
-            #[cfg(feature = "voip")]
+            #[cfg(feature = "voip-runtime")]
             pending_outgoing_calls: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -764,6 +773,9 @@ impl Client {
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
         self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        // The coalesced-flush scheduler needs no explicit reset: its state is
+        // generation-scoped, so the bump above already hands ownership to the
+        // next connection's first request and retires any stale worker.
         // Note: node_waiters are intentionally NOT cleared here — they are
         // cross-connection (callers may register a waiter before an action that
         // completes on a subsequent connection, e.g. after 515 reconnect).
@@ -779,7 +791,7 @@ impl Client {
         self.is_connected.store(false, Ordering::Release);
         // Tear down every in-flight VoIP call: the relay socket and signaling are connection-scoped,
         // so a call can't survive a disconnect/reconnect. Aborts each media task and clears the map.
-        #[cfg(feature = "voip")]
+        #[cfg(feature = "voip-runtime")]
         {
             self.call_registry.abort_all();
             // Dormant outgoing calls (relay never arrived) live in pending_outgoing_calls, not the
@@ -830,6 +842,13 @@ impl Client {
         // the durable hook commit is what matters. Reached on every teardown
         // path, including the run loop's unexpected read-loop exit, which
         // never goes through disconnect().
+        //
+        // Hold the coalesced-flush barrier across the whole settle: a stale flush
+        // worker that already passed its generation check must not interleave a
+        // backend write between our commit and the next connection's drain, or it
+        // could persist that drain's rowless advances. The worker re-checks the
+        // generation (bumped above) once it gets the gate, so it stands down.
+        let flush_gate = self.signal_flush_lifecycle.lock().await;
         if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
             client
                 .teardown_inbound_commits_bounded(std::time::Duration::from_secs(5))
@@ -864,6 +883,8 @@ impl Client {
             );
             self.signal_cache.clear().await;
         }
+        // Cache is settled and any dropped entries cleared; a worker may run again.
+        drop(flush_gate);
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active
@@ -973,7 +994,7 @@ impl Client {
 
     /// Force the connected flag (tests only): the facade's connect path now gates on `is_connected`,
     /// so a unit test driving `spawn_call`/`place_call` must mark the client connected first.
-    #[cfg(all(test, feature = "voip"))]
+    #[cfg(all(test, feature = "voip-runtime"))]
     pub(crate) fn set_connected_for_test(&self, connected: bool) {
         self.is_connected.store(connected, Ordering::Release);
     }

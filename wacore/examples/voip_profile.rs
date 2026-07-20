@@ -1,5 +1,5 @@
 //! Minimal MLow codec hot-loop driver for an unbiased profiler pass (callgrind for CPU + malloc
-//! attribution). Not a benchmark -- no timing, no sampling: it just runs `encode` or `decode` N
+//! attribution). Not a benchmark -- no timing, no sampling: it runs `encode`, `encode-into`, or `decode` N
 //! times over a small stream so an external profiler can attribute instructions and allocations to
 //! the real per-stage functions.
 //!
@@ -34,6 +34,16 @@ fn hot_encode(enc: &mut MlowEncoder, frames: &[Vec<f32>], n: usize) {
 }
 
 #[inline(never)]
+fn hot_encode_into(enc: &mut MlowEncoder, frames: &[Vec<f32>], n: usize) {
+    let mut output = Vec::with_capacity(2048);
+    for k in 0..n {
+        enc.encode_into(black_box(&frames[k % frames.len()]), &mut output)
+            .unwrap();
+        black_box(output.as_slice());
+    }
+}
+
+#[inline(never)]
 fn hot_decode(dec: &mut MlowDecoder, packets: &[Vec<u8>], n: usize) {
     for k in 0..n {
         black_box(dec.decode(black_box(&packets[k % packets.len()])));
@@ -55,6 +65,11 @@ fn main() {
             let _ = enc.encode(&frames[0]); // prime past the first-frame path
             hot_encode(&mut enc, &frames, n);
         }
+        "encode-into" => {
+            let mut enc = MlowEncoder::new();
+            let _ = enc.encode(&frames[0]);
+            hot_encode_into(&mut enc, &frames, n);
+        }
         "decode" => {
             let mut enc = MlowEncoder::new();
             let _ = enc.encode(&frames[0]);
@@ -63,6 +78,6 @@ fn main() {
             let _ = dec.decode(&packets[0]); // prime
             hot_decode(&mut dec, &packets, n);
         }
-        other => eprintln!("usage: voip_profile <encode|decode> <n>; got {other:?}"),
+        other => eprintln!("usage: voip_profile <encode|encode-into|decode> <n>; got {other:?}"),
     }
 }
