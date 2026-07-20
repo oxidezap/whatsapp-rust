@@ -7,6 +7,8 @@
 //! secret of the stanza just processed always finds it), while the backend
 //! upsert happens on a detached drain task that coalesces a burst of captures
 //! into one batched `put_msg_secrets` transaction.
+//! A fixed high-water mark bounds unique pending keys; reaching it waits for
+//! the in-flight batch instead of allowing a slow backend to grow the map.
 //!
 //! Entries leave the buffer only after the backend write returns, so a reader
 //! sees every secret either in the buffer or in the store, never neither. A
@@ -49,10 +51,25 @@ impl Equivalent<Key> for KeyRef<'_> {
 
 type Pending = HashMap<Key, Arc<MsgSecretEntry>, RandomState>;
 
+enum PendingInsert {
+    Buffered,
+    ReachedLimit,
+    Full(MsgSecretEntry),
+}
+
+/// Live captures are normally drained long before reaching this point. The
+/// bound keeps a stalled backend from turning the write-behind optimization
+/// into an unbounded allocation source while retaining ample batching room.
+const MAX_PENDING_MSG_SECRETS: usize = 4_096;
+
 pub(crate) struct MsgSecretWriteBuffer {
     // Values are Arc so the flush snapshot is a refcount bump. Materializing
     // the backend-owned batch later copies only Arc handles and inline bytes.
     pending: Mutex<Pending>,
+    pending_limit: usize,
+    /// Registered while holding `pending`, so a removal notification cannot
+    /// race between a full-capacity check and the producer starting to wait.
+    capacity_available: event_listener::Event,
     /// Set by the terminal disconnect. A sealed buffer writes every queue
     /// inline (the old synchronous semantics), so a lane worker still
     /// draining its backlog after the shutdown flush cannot strand a secret
@@ -77,8 +94,22 @@ impl MsgSecretWriteBuffer {
         backend: Arc<dyn crate::store::traits::Backend>,
         runtime: Arc<dyn wacore::runtime::Runtime>,
     ) -> Arc<Self> {
+        Self::with_pending_limit(backend, runtime, MAX_PENDING_MSG_SECRETS)
+    }
+
+    fn with_pending_limit(
+        backend: Arc<dyn crate::store::traits::Backend>,
+        runtime: Arc<dyn wacore::runtime::Runtime>,
+        pending_limit: usize,
+    ) -> Arc<Self> {
+        assert!(
+            pending_limit > 0,
+            "pending message-secret limit must be positive"
+        );
         Arc::new(Self {
             pending: Mutex::new(HashMap::with_hasher(RandomState::new())),
+            pending_limit,
+            capacity_available: event_listener::Event::new(),
             sealed: AtomicBool::new(false),
             write_lock: async_lock::Mutex::new(()),
             drain_in_flight: AtomicBool::new(false),
@@ -91,31 +122,66 @@ impl MsgSecretWriteBuffer {
     /// Make `entries` immediately visible to readers and schedule the durable
     /// write. The insert itself is synchronous, so the per-chat lane orders it
     /// before the ack and before any later message in the chat is processed;
-    /// the await is a no-op flag check unless the buffer is sealed, in which
-    /// case the write happens inline before returning.
+    /// the await is a no-op flag check unless the buffer is sealed or reaches
+    /// its high-water mark. A full buffer backpressures producers until the
+    /// in-flight write releases capacity.
     pub(crate) async fn queue(self: &Arc<Self>, entries: Vec<MsgSecretEntry>) {
         if entries.is_empty() {
             return;
         }
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            for entry in entries {
-                Self::insert_pending(&mut pending, entry);
-            }
-        }
-        self.schedule_or_flush().await;
+        self.queue_iter(entries).await;
     }
 
     /// Single-entry fast path for live sends, avoiding a temporary one-element Vec.
     pub(crate) async fn queue_one(self: &Arc<Self>, entry: MsgSecretEntry) {
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            Self::insert_pending(&mut pending, entry);
+        self.queue_iter(std::iter::once(entry)).await;
+    }
+
+    async fn queue_iter(self: &Arc<Self>, entries: impl IntoIterator<Item = MsgSecretEntry>) {
+        let mut entries = entries.into_iter();
+        let mut blocked_entry = None;
+
+        loop {
+            let capacity_wait = {
+                let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+                let mut next = blocked_entry.take().or_else(|| entries.next());
+
+                loop {
+                    let Some(entry) = next else {
+                        break None;
+                    };
+                    match Self::try_insert_pending(&mut pending, entry, self.pending_limit) {
+                        PendingInsert::ReachedLimit => {
+                            // Register before dropping the mutex: finish_batch
+                            // takes the same mutex before notifying waiters.
+                            break Some(self.capacity_available.listen());
+                        }
+                        PendingInsert::Buffered => next = entries.next(),
+                        PendingInsert::Full(entry) => {
+                            blocked_entry = Some(entry);
+                            break Some(self.capacity_available.listen());
+                        }
+                    }
+                }
+            };
+
+            let Some(capacity_wait) = capacity_wait else {
+                break;
+            };
+            self.schedule_or_flush().await;
+            capacity_wait.await;
         }
+
         self.schedule_or_flush().await;
     }
 
-    fn insert_pending(pending: &mut Pending, mut entry: MsgSecretEntry) {
+    /// Insert without exceeding `pending_limit`. Replacing the same logical key
+    /// is always allowed because it consumes no additional buffer capacity.
+    fn try_insert_pending(
+        pending: &mut Pending,
+        mut entry: MsgSecretEntry,
+        pending_limit: usize,
+    ) -> PendingInsert {
         use wacore::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
 
         let key = Key {
@@ -124,13 +190,23 @@ impl MsgSecretWriteBuffer {
             msg_id: entry.msg_id.clone(),
         };
         // Coalesced captures merge retention metadata like sequential backend writes.
-        if let Some(existing) = pending.get(&key) {
+        if let Some(existing) = pending.get_mut(&key) {
             entry.expires_at = merge_msg_secret_expiry(existing.expires_at, entry.expires_at);
             entry.message_ts = merge_msg_secret_message_ts(existing.message_ts, entry.message_ts);
+            // Always a fresh Arc: finish_batch tells a recaptured entry from the
+            // one it wrote by pointer identity, so this must not use Arc::make_mut.
+            *existing = Arc::new(entry);
+            return PendingInsert::Buffered;
         }
-        // Always a fresh Arc: finish_batch tells a recaptured entry from the one
-        // it wrote by pointer identity, so this must not switch to Arc::make_mut.
+        if pending.len() >= pending_limit {
+            return PendingInsert::Full(entry);
+        }
         pending.insert(key, Arc::new(entry));
+        if pending.len() == pending_limit {
+            PendingInsert::ReachedLimit
+        } else {
+            PendingInsert::Buffered
+        }
     }
 
     async fn schedule_or_flush(self: &Arc<Self>) {
@@ -199,7 +275,7 @@ impl MsgSecretWriteBuffer {
     /// harmlessly and [`Self::finish_batch`] only removes what was written.
     async fn flush_pending_once(&self) -> bool {
         let _write_guard = self.write_lock.lock().await;
-        let batch: Vec<Arc<MsgSecretEntry>> = {
+        let mut batch: Vec<Arc<MsgSecretEntry>> = {
             let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.values().cloned().collect()
         };
@@ -215,7 +291,7 @@ impl MsgSecretWriteBuffer {
             log::warn!("failed to persist messageSecrets: {e:?}");
         }
         self.flushed_batches.fetch_add(1, Ordering::Relaxed);
-        self.finish_batch(&batch);
+        self.finish_batch(&mut batch);
         true
     }
 
@@ -230,17 +306,34 @@ impl MsgSecretWriteBuffer {
     /// the one that was written: an edit recapture stores a NEW secret under
     /// the same (chat, sender, id), so a refresh queued while its predecessor
     /// was in flight must survive for the next drain iteration.
-    fn finish_batch(&self, written: &[Arc<MsgSecretEntry>]) {
+    fn finish_batch(&self, written: &mut [Arc<MsgSecretEntry>]) {
         // Remove a written entry only where pending still holds the exact Arc we
         // snapshotted. A recapture during the flush replaces the value with a
-        // fresh Arc (insert_pending always allocates a new one), so pointer
+        // fresh Arc (try_insert_pending always allocates a new one), so pointer
         // identity separates "written and untouched" from "superseded, must
         // survive" without rebuilding the (chat, sender, id) key or deep-comparing
-        // the secret per entry. Relies on insert_pending storing a NEW Arc on
-        // every insert; if that ever mutates in place (Arc::make_mut), this must
-        // return to a content comparison.
+        // the secret per entry. Sorting pointers in place makes cleanup
+        // O(n log n) without allocating an auxiliary set; the previous nested
+        // scan was quadratic at the high-water mark. Relies on
+        // try_insert_pending storing a NEW Arc on every replacement; if that
+        // ever mutates in place (Arc::make_mut), this must return to a content
+        // comparison.
+        written.sort_unstable_by_key(Arc::as_ptr);
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        pending.retain(|_key, current| !written.iter().any(|w| Arc::ptr_eq(current, w)));
+        let previous_len = pending.len();
+        pending.retain(|_key, current| {
+            written
+                .binary_search_by_key(&Arc::as_ptr(current), Arc::as_ptr)
+                .is_err()
+        });
+        let removed = previous_len - pending.len();
+        drop(pending);
+        if removed > 0 {
+            // Wake all waiters: some are producers that filled the final slot
+            // and need no new capacity, while others have entries left to add.
+            // Every woken producer rechecks the bound under `pending`.
+            self.capacity_available.notify(usize::MAX);
+        }
     }
 
     #[cfg(test)]
@@ -278,6 +371,15 @@ mod tests {
     async fn buffer() -> Arc<MsgSecretWriteBuffer> {
         let backend = crate::test_utils::create_test_backend().await;
         MsgSecretWriteBuffer::new(backend, Arc::new(crate::runtime_impl::TokioRuntime))
+    }
+
+    async fn buffer_with_pending_limit(pending_limit: usize) -> Arc<MsgSecretWriteBuffer> {
+        let backend = crate::test_utils::create_test_backend().await;
+        MsgSecretWriteBuffer::with_pending_limit(
+            backend,
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pending_limit,
+        )
     }
 
     /// The point of the buffer: a queued secret is readable BEFORE any flush
@@ -346,6 +448,89 @@ mod tests {
         assert_eq!(min_delta, 0, "an entry clone must not allocate");
     }
 
+    /// A stalled backend must cap the pending map exactly at the configured
+    /// high-water mark. The producer that fills the final slot and every
+    /// concurrent producer wait until a completed flush releases capacity.
+    #[tokio::test]
+    async fn high_water_mark_backpressures_concurrent_producers() {
+        const PENDING_LIMIT: usize = 2;
+        const CONCURRENT_PRODUCERS: usize = 8;
+        const REFRESHED_SECRET: u8 = 0xfe;
+
+        let buf = buffer_with_pending_limit(PENDING_LIMIT).await;
+        let write_guard = buf.write_lock.lock().await;
+
+        // The first insert schedules a drain, which remains blocked on the
+        // write lock while producers contend for the two pending slots.
+        buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "M0", 0))
+            .await;
+        let mut producers = Vec::with_capacity(CONCURRENT_PRODUCERS);
+        for index in 1..=CONCURRENT_PRODUCERS {
+            let producer_buf = Arc::clone(&buf);
+            producers.push(tokio::spawn(async move {
+                let secret = u8::try_from(index).expect("test index fits in a byte");
+                producer_buf
+                    .queue_one(entry(
+                        "g@g.us",
+                        "a@s.whatsapp.net",
+                        &format!("M{index}"),
+                        secret,
+                    ))
+                    .await;
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while buf.pending_len() < PENDING_LIMIT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a producer must fill the final pending slot");
+        for _ in 0..CONCURRENT_PRODUCERS {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            buf.pending_len(),
+            PENDING_LIMIT,
+            "concurrent producers must not bypass the bound"
+        );
+        assert!(
+            producers.iter().all(|producer| !producer.is_finished()),
+            "the producer filling the limit must backpressure with its peers"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "M0", REFRESHED_SECRET)),
+        )
+        .await
+        .expect("refreshing an existing key must not require new capacity");
+        assert_eq!(
+            buf.lookup("g@g.us", "a@s.whatsapp.net", "M0"),
+            Some((vec![REFRESHED_SECRET; 32], 7))
+        );
+
+        drop(write_guard);
+        for producer in producers {
+            producer.await.expect("producer task");
+        }
+        buf.wait_flushed().await;
+
+        for index in 0..=CONCURRENT_PRODUCERS {
+            let secret = if index == 0 {
+                REFRESHED_SECRET
+            } else {
+                u8::try_from(index).expect("test index fits in a byte")
+            };
+            let stored = buf
+                .backend
+                .get_msg_secret("g@g.us", "a@s.whatsapp.net", &format!("M{index}"))
+                .await
+                .expect("backend read");
+            assert_eq!(stored.as_deref(), Some(&[secret; 32][..]));
+        }
+    }
+
     /// A burst of captures queued before the drain task gets polled must land
     /// in ONE batched put_msg_secrets transaction, not one per message.
     #[tokio::test]
@@ -383,11 +568,16 @@ mod tests {
     #[tokio::test]
     async fn refresh_queued_during_flush_survives_removal() {
         let buf = buffer().await;
-        let stale = Arc::new(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11));
+        let mut stale = [Arc::new(entry(
+            "g@g.us",
+            "a@s.whatsapp.net",
+            "PARENT",
+            0x11,
+        ))];
         // Simulate the drain having snapshotted `stale` while a refresh lands.
         buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22)])
             .await;
-        buf.finish_batch(std::slice::from_ref(&stale));
+        buf.finish_batch(&mut stale);
         assert_eq!(
             buf.lookup("g@g.us", "a@s.whatsapp.net", "PARENT"),
             Some((vec![0x22; 32], 7)),
@@ -412,11 +602,16 @@ mod tests {
     #[tokio::test]
     async fn metadata_refresh_during_flush_survives_removal() {
         let buf = buffer().await;
-        let stale = Arc::new(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11));
+        let mut stale = [Arc::new(entry(
+            "g@g.us",
+            "a@s.whatsapp.net",
+            "PARENT",
+            0x11,
+        ))];
         let mut refreshed = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
         refreshed.expires_at = 999;
         buf.queue(vec![refreshed]).await;
-        buf.finish_batch(std::slice::from_ref(&stale));
+        buf.finish_batch(&mut stale);
         assert_eq!(
             buf.pending_len(),
             1,
@@ -435,13 +630,13 @@ mod tests {
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11))
             .await;
         // The Arc a drain iteration would carry into put + finish_batch.
-        let snapshot: Vec<Arc<MsgSecretEntry>> =
+        let mut snapshot: Vec<Arc<MsgSecretEntry>> =
             buf.pending.lock().unwrap().values().cloned().collect();
-        // Recapture the same key with a new secret; insert_pending stores a fresh Arc.
+        // Recapture the same key with a new secret; try_insert_pending stores a fresh Arc.
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22))
             .await;
         // The stale batch's cleanup must leave the refresh in place.
-        buf.finish_batch(&snapshot);
+        buf.finish_batch(&mut snapshot);
         assert_eq!(
             buf.lookup("g@g.us", "a@s.whatsapp.net", "PARENT"),
             Some((vec![0x22; 32], 7)),
@@ -460,7 +655,7 @@ mod tests {
         );
     }
 
-    /// The invariant finish_batch relies on: insert_pending stores a NEW Arc on
+    /// The invariant finish_batch relies on: try_insert_pending stores a NEW Arc on
     /// every insert, so even a byte-identical recapture is a distinct allocation
     /// and pointer identity (not content) decides removal. A regression that
     /// reused/mutated the Arc in place would fail here.
@@ -469,7 +664,7 @@ mod tests {
         let buf = buffer().await;
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "K", 0x33))
             .await;
-        let snapshot: Vec<Arc<MsgSecretEntry>> =
+        let mut snapshot: Vec<Arc<MsgSecretEntry>> =
             buf.pending.lock().unwrap().values().cloned().collect();
         // Re-queue byte-identical content.
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "K", 0x33))
@@ -491,7 +686,7 @@ mod tests {
             "an identical-content recapture must be a fresh Arc"
         );
         // Therefore the stale batch does not remove it.
-        buf.finish_batch(&snapshot);
+        buf.finish_batch(&mut snapshot);
         assert_eq!(
             buf.pending_len(),
             1,
