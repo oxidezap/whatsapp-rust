@@ -28,11 +28,12 @@ fn main() {
 use wacore_libsignal::protocol::{
     ChainKey, CiphertextMessage, CiphertextMessageType, Direction, GenericSignedPreKey,
     IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair, MessageKeyGenerator,
-    PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, RootKey,
-    SenderKeyDistributionMessage, SenderKeyRecord, SenderKeyStore, SessionRecord, SessionState,
-    SessionStore, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet,
-    consts, create_sender_key_distribution_message, group_decrypt, group_encrypt, message_decrypt,
-    message_encrypt, process_prekey_bundle, process_sender_key_distribution_message,
+    OwnedCiphertextMessage, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress,
+    RootKey, SenderKeyDistributionMessage, SenderKeyRecord, SenderKeyStore, SessionRecord,
+    SessionState, SessionStore, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    UsePQRatchet, consts, create_sender_key_distribution_message, group_decrypt, group_encrypt,
+    message_decrypt, message_decrypt_owned, message_encrypt, process_prekey_bundle,
+    process_sender_key_distribution_message,
 };
 use wacore_libsignal::store::sender_key_name::SenderKeyName;
 
@@ -651,6 +652,39 @@ fn bench_dm_decrypt_subsequent_message(bencher: divan::Bencher) {
                 );
                 message_decrypt(
                     &ciphertext,
+                    &alice.address,
+                    &mut bob.session_store,
+                    &mut bob.identity_store,
+                    &mut bob.prekey_store,
+                    &bob.signed_prekey_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decryption")
+            });
+
+            black_box(plaintext);
+        });
+}
+
+#[divan::bench]
+fn bench_dm_decrypt_owned_subsequent_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_dm_with_inorder_subsequent_message)
+        .bench_refs(|data| {
+            let (alice, bob, ciphertext_bytes) = data;
+            let mut rng = bench_rng();
+
+            let plaintext = futures::executor::block_on(async {
+                let message = wacore_libsignal::protocol::SignalMessage::try_from(Bytes::from(
+                    std::mem::take(ciphertext_bytes),
+                ))
+                .unwrap();
+                let mut ciphertext =
+                    OwnedCiphertextMessage::from(CiphertextMessage::SignalMessage(message));
+                message_decrypt_owned(
+                    &mut ciphertext,
                     &alice.address,
                     &mut bob.session_store,
                     &mut bob.identity_store,

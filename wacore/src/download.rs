@@ -1,6 +1,6 @@
 use crate::libsignal::crypto::{
-    CryptographicMac, DecryptionError as AesCbcDecryptionError, Error as CryptoError,
-    aes_256_cbc_decrypt_into,
+    DecryptionError as AesCbcDecryptionError, Error as CryptoError, aes_256_cbc_decrypt_in_place,
+    aes_256_cbc_decrypt_into, hmac_sha256_two_part,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
@@ -534,9 +534,6 @@ impl DownloadUtils {
         media_key: &[u8],
         media_type: MediaType,
     ) -> std::result::Result<(), MediaDecryptionError> {
-        use aes::Aes256;
-        use aes::cipher::{Block, BlockCipherDecrypt, KeyInit};
-
         if encrypted_payload.len() <= MEDIA_MAC_SIZE {
             return Err(MediaDecryptionError::PayloadTooShort);
         }
@@ -547,13 +544,8 @@ impl DownloadUtils {
             .map_err(|_| MediaDecryptionError::PayloadTooShort)?;
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, media_type)?;
 
-        let computed_mac_full = {
-            let mut mac =
-                CryptographicMac::new("HmacSha256", &mac_key).map_err(MediaDecryptionError::Mac)?;
-            mac.update(&iv);
-            mac.update(&encrypted_payload[..ciphertext_len]);
-            mac.finalize()
-        };
+        let computed_mac_full =
+            hmac_sha256_two_part(&mac_key, &iv, &encrypted_payload[..ciphertext_len]);
         if subtle::ConstantTimeEq::ct_eq(&computed_mac_full[..MEDIA_MAC_SIZE], &received_mac)
             .unwrap_u8()
             == 0
@@ -567,42 +559,8 @@ impl DownloadUtils {
         }
 
         encrypted_payload.truncate(ciphertext_len);
-        let cipher = Aes256::new_from_slice(&cipher_key)
-            .map_err(|_| MediaDecryptionError::Decryption(AesCbcDecryptionError::BadKeyOrIv))?;
-        let mut previous = iv;
-        for ciphertext_block in encrypted_payload.chunks_exact_mut(AES_BLOCK_SIZE) {
-            let current: [u8; AES_BLOCK_SIZE] = (&*ciphertext_block).try_into().map_err(|_| {
-                MediaDecryptionError::Decryption(AesCbcDecryptionError::BadCiphertext(
-                    "invalid ciphertext block",
-                ))
-            })?;
-            let mut plaintext_block: Block<Aes256> = current.into();
-            cipher.decrypt_block(&mut plaintext_block);
-            for (byte, previous_byte) in plaintext_block.iter_mut().zip(previous) {
-                *byte ^= previous_byte;
-            }
-            ciphertext_block.copy_from_slice(&plaintext_block);
-            previous = current;
-        }
-
-        let padding_len = encrypted_payload
-            .last()
-            .copied()
-            .map(usize::from)
-            .unwrap_or_default();
-        if padding_len == 0
-            || padding_len > AES_BLOCK_SIZE
-            || padding_len > encrypted_payload.len()
-            || !encrypted_payload[encrypted_payload.len() - padding_len..]
-                .iter()
-                .all(|byte| usize::from(*byte) == padding_len)
-        {
-            return Err(MediaDecryptionError::Decryption(
-                AesCbcDecryptionError::BadCiphertext("invalid padding"),
-            ));
-        }
-        encrypted_payload.truncate(encrypted_payload.len() - padding_len);
-        Ok(())
+        aes_256_cbc_decrypt_in_place(encrypted_payload, &cipher_key, &iv)
+            .map_err(MediaDecryptionError::Decryption)
     }
 }
 
@@ -662,7 +620,7 @@ mod tests {
         media_key: &[u8],
         media_type: MediaType,
     ) -> Vec<u8> {
-        use crate::libsignal::crypto::aes_256_cbc_encrypt_into;
+        use crate::libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
 
         let (iv, cipher_key, mac_key) =
             DownloadUtils::get_media_keys(media_key, media_type).unwrap();

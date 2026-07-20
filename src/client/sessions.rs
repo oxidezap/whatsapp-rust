@@ -213,25 +213,11 @@ impl Client {
         }
     }
 
-    pub(crate) fn begin_history_sync_task(&self) {
-        self.history_sync_tasks_in_flight
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn finish_history_sync_task(&self) {
-        // The `previous <= 1` clamp is also the underflow guard: a detached task
-        // that finishes after cleanup_connection_state() reset the counter to 0
-        // hits fetch_sub-from-0, which momentarily wraps the stored value to
-        // usize::MAX — but previous == 0 takes this branch and stores 0, so the
-        // wrap never sticks (and it never leaves the idle waiter blocked).
-        let previous = self
-            .history_sync_tasks_in_flight
-            .fetch_sub(1, Ordering::Relaxed);
-        if previous <= 1 {
-            self.history_sync_tasks_in_flight
-                .store(0, Ordering::Relaxed);
-            self.history_sync_idle_notifier.notify(usize::MAX);
-        }
+    pub(crate) fn begin_history_sync_task(
+        &self,
+        payload_bytes: usize,
+    ) -> crate::sync_task::HistorySyncTaskTracker {
+        self.history_sync_activity.begin(payload_bytes)
     }
 
     pub async fn wait_for_startup_sync(&self, timeout: std::time::Duration) -> Result<()> {
@@ -251,8 +237,8 @@ impl Client {
         }
 
         loop {
-            let history_fut = self.history_sync_idle_notifier.listen();
-            if self.history_sync_tasks_in_flight.load(Ordering::Relaxed) == 0 {
+            let history_fut = self.history_sync_activity.listen();
+            if self.history_sync_activity.tasks() == 0 {
                 return Ok(());
             }
 

@@ -286,10 +286,10 @@ impl Client {
             crate::sync_task::MajorSyncTask::HistorySync {
                 message_id,
                 notification,
+                mut tracker,
             } => {
-                self.process_history_sync_task(message_id, *notification)
+                self.process_history_sync_task_tracked(message_id, *notification, &mut tracker)
                     .await;
-                self.finish_history_sync_task();
             }
             crate::sync_task::MajorSyncTask::AppStateSync { name, full_sync } => {
                 if let Err(e) = self.process_app_state_sync_task(name, full_sync).await {

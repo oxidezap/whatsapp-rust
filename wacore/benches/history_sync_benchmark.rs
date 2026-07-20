@@ -7,10 +7,15 @@
 #![allow(clippy::disallowed_methods)]
 
 use buffa::Message;
+use bytes::Bytes;
 use divan::black_box;
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write;
+use std::sync::OnceLock;
 use waproto::whatsapp as wa;
+
+const HISTORY_CONVERSATIONS: usize = 500;
+const MESSAGES_PER_CONVERSATION: usize = 40;
 
 fn main() {
     divan::main();
@@ -97,10 +102,18 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
     enc.finish().unwrap()
 }
 
-fn setup_history_sync_blob() -> Vec<u8> {
+fn setup_history_sync_blob() -> Bytes {
     // ~500 conversations x 40 messages = 20k messages, a realistic
     // mid-size InitialBootstrap (multi-MB decompressed).
-    build_realistic_history_sync(500, 40)
+    static COMPRESSED: OnceLock<Bytes> = OnceLock::new();
+    COMPRESSED
+        .get_or_init(|| {
+            Bytes::from(build_realistic_history_sync(
+                HISTORY_CONVERSATIONS,
+                MESSAGES_PER_CONVERSATION,
+            ))
+        })
+        .clone()
 }
 
 #[divan::bench(sample_count = 5)]
@@ -111,11 +124,33 @@ fn bench_process_history_sync(bencher: divan::Bencher) {
             // retain_blob = true also hands the compressed input back. The
             // result (records + retained blob) is returned so the harness
             // drops it outside the measured window, like a consumer would.
-            black_box(wacore::history_sync::process_history_sync(
+            black_box(wacore::history_sync::process_history_sync_bytes(
                 black_box(blob),
                 None,
                 true,
             ))
+        });
+}
+
+/// Translation-oriented consumer path: observe each borrowed message-secret
+/// record without first materializing the core's owned record vector.
+#[divan::bench(sample_count = 5)]
+fn bench_process_history_sync_visit_records(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_history_sync_blob)
+        .bench_values(|blob| {
+            let mut records = 0usize;
+            let result = wacore::history_sync::process_history_sync_bytes_with_record_visitor(
+                black_box(blob),
+                None,
+                true,
+                |record| {
+                    records += 1;
+                    black_box(record);
+                },
+            )
+            .unwrap();
+            black_box((result, records))
         });
 }
 
@@ -137,5 +172,55 @@ fn bench_history_sync_stream_drain(bencher: divan::Bencher) {
                 messages += conversation.messages.len();
             }
             black_box((messages, stream.remainder().unwrap()))
+        });
+}
+
+/// Consumer-side wire path: frame every conversation without decoding an
+/// owned Rust protobuf. This isolates the second inflate + wire walk from the
+/// host's protobuf decoder and from `Conversation` allocation reuse.
+#[divan::bench(sample_count = 5)]
+fn bench_history_sync_wire_stream_drain(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_history_sync_blob)
+        .bench_values(|blob| {
+            let mut stream = wacore::history_sync::HistorySyncStream::new(
+                black_box(&blob),
+                wacore::history_sync::MAX_DECOMPRESSED,
+            );
+            let mut conversations = 0usize;
+            let mut wire_bytes = 0usize;
+            while let Some(conversation) = stream.next_conversation_bytes().unwrap() {
+                conversations += 1;
+                wire_bytes += conversation.len();
+            }
+            black_box((conversations, wire_bytes, stream.remainder().unwrap()))
+        });
+}
+
+/// End-to-end core cost paid when internal extraction retains a lazy event and
+/// a wire-oriented consumer subsequently drains it. Keeping this composition
+/// beside the component benches makes a one-pass design's maximum possible
+/// win explicit without conflating it with host-side decoding.
+#[divan::bench(sample_count = 5)]
+fn bench_history_sync_extract_then_wire_drain(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_history_sync_blob)
+        .bench_values(|blob| {
+            let result =
+                wacore::history_sync::process_history_sync_bytes(black_box(blob), None, true)
+                    .unwrap();
+            let compressed = result.compressed_bytes.as_ref().unwrap();
+            let mut stream = wacore::history_sync::HistorySyncStream::new(
+                compressed,
+                result.decompressed_size as u64,
+            );
+            let mut conversations = 0usize;
+            let mut wire_bytes = 0usize;
+            while let Some(conversation) = stream.next_conversation_bytes().unwrap() {
+                conversations += 1;
+                wire_bytes += conversation.len();
+            }
+            let remainder = stream.remainder().unwrap();
+            black_box((result, conversations, wire_bytes, remainder))
         });
 }

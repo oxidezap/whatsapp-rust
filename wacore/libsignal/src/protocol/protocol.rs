@@ -428,6 +428,24 @@ impl SignalMessage {
         Ok(Self::from_parsed(serialized, parsed))
     }
 
+    /// Recover a uniquely-owned wire allocation as a ciphertext-only `Vec`.
+    /// Shared envelopes keep using the reusable decrypt scratch path instead.
+    #[inline]
+    pub(super) fn try_into_ciphertext_vec(self) -> std::result::Result<Vec<u8>, Self> {
+        if !self.storage.serialized.is_unique() {
+            return Err(self);
+        }
+
+        let SignalStorage {
+            serialized,
+            ciphertext_range,
+        } = self.storage;
+        let ciphertext = serialized.slice(ciphertext_range);
+        drop(serialized);
+        debug_assert!(ciphertext.is_unique());
+        Ok(Vec::from(ciphertext))
+    }
+
     pub fn verify_mac(
         &self,
         sender_identity_key: &IdentityKey,
@@ -645,6 +663,20 @@ impl PreKeySignalMessage {
     #[inline]
     pub fn serialized(&self) -> &[u8] {
         self.serialized.as_ref()
+    }
+
+    /// Consume the outer PreKey envelope and release its shared handle, leaving
+    /// the nested Signal message as the sole owner when no other wire slices
+    /// exist. Used by the owned decrypt path after all PreKey metadata is read.
+    #[inline]
+    pub(super) fn into_message(self) -> SignalMessage {
+        let Self {
+            message,
+            serialized,
+            ..
+        } = self;
+        drop(serialized);
+        message
     }
 
     #[inline]
@@ -1468,6 +1500,53 @@ mod tests {
         let pre_key_ptr = pre_key.serialized().as_ptr();
         let pre_key_wire = pre_key.into_serialized();
         assert_eq!(pre_key_wire.as_ptr(), pre_key_ptr);
+    }
+
+    #[test]
+    fn consuming_unique_signal_body_reuses_the_wire_allocation() {
+        let expected = [0x5a; 256];
+        let signal = test_signal_message(1, 0, &expected);
+        let wire_ptr = signal.serialized().as_ptr();
+
+        let ciphertext = signal
+            .try_into_ciphertext_vec()
+            .expect("unique Signal wire must be consumable");
+
+        assert_eq!(ciphertext, expected);
+        assert_eq!(ciphertext.as_ptr(), wire_ptr);
+    }
+
+    #[test]
+    fn nested_pre_key_signal_becomes_consumable_after_outer_envelope_is_dropped() {
+        let expected = [0x6b; 256];
+        let signal_wire = generated_signal_wire(1, 0, &expected);
+        let pre_key = PreKeySignalMessage::new(
+            TEST_MESSAGE_VERSION,
+            1,
+            Some(1.into()),
+            1.into(),
+            public_key_from_seed(TEST_BASE_KEY_SEED),
+            IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED)),
+            SignalMessage::try_from(signal_wire.as_slice()).expect("nested SignalMessage"),
+        )
+        .expect("test PreKeySignalMessage");
+
+        let ciphertext = pre_key
+            .into_message()
+            .try_into_ciphertext_vec()
+            .expect("dropping the outer PreKey view must make its nested Signal wire unique");
+
+        assert_eq!(ciphertext, expected);
+    }
+
+    #[test]
+    fn shared_signal_wire_is_preserved_for_borrowed_fallback() {
+        let wire = Bytes::from(test_signal_message(1, 0, b"shared").into_serialized());
+        let retained_owner = wire.clone();
+        let signal = SignalMessage::try_from(wire).expect("shared SignalMessage");
+
+        assert!(signal.try_into_ciphertext_vec().is_err());
+        assert!(!retained_owner.is_empty());
     }
 
     #[test]
