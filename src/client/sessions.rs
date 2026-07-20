@@ -213,19 +213,11 @@ impl Client {
         }
     }
 
-    pub(crate) fn begin_history_sync_task(&self, payload_bytes: usize) {
-        self.history_sync_activity.begin(payload_bytes);
-    }
-
-    pub(crate) fn track_history_sync_task(
+    pub(crate) fn begin_history_sync_task(
         &self,
         payload_bytes: usize,
     ) -> crate::sync_task::HistorySyncTaskTracker {
-        self.history_sync_activity.tracker(payload_bytes)
-    }
-
-    pub(crate) fn finish_history_sync_task(&self, payload_bytes: usize) {
-        drop(self.track_history_sync_task(payload_bytes));
+        self.history_sync_activity.begin(payload_bytes)
     }
 
     pub async fn wait_for_startup_sync(&self, timeout: std::time::Duration) -> Result<()> {

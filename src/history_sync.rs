@@ -238,13 +238,13 @@ impl Client {
 
         // Enqueue a MajorSyncTask for the dedicated sync worker to consume.
         let payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
-        self.begin_history_sync_task(payload_bytes);
+        let tracker = self.begin_history_sync_task(payload_bytes);
         let task = crate::sync_task::MajorSyncTask::HistorySync {
             message_id,
             notification: Box::new(notification),
+            tracker,
         };
         if let Err(e) = self.major_sync_task_sender.send(task).await {
-            self.finish_history_sync_task(payload_bytes);
             if self.is_shutting_down() {
                 log::debug!("Dropping history sync task during shutdown: {e}");
             } else {
@@ -263,8 +263,7 @@ impl Client {
         notification: DetachedHistorySyncNotification,
     ) {
         let payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
-        self.begin_history_sync_task(payload_bytes);
-        let mut tracker = self.track_history_sync_task(payload_bytes);
+        let mut tracker = self.begin_history_sync_task(payload_bytes);
         self.process_history_sync_task_tracked(message_id, notification, &mut tracker)
             .await;
     }

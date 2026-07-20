@@ -39,16 +39,14 @@ impl HistorySyncActivity {
         }
     }
 
-    pub(crate) fn begin(&self, payload_bytes: usize) {
+    pub(crate) fn begin(self: &Arc<Self>, payload_bytes: usize) -> HistorySyncTaskTracker {
         let mut state = self.state_guard();
+        let generation = state.generation;
         state.tasks = state.tasks.saturating_add(1);
         state.tasks_peak = state.tasks_peak.max(state.tasks);
         state.payload_bytes = state.payload_bytes.saturating_add(payload_bytes);
         state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
-    }
-
-    pub(crate) fn tracker(self: &Arc<Self>, payload_bytes: usize) -> HistorySyncTaskTracker {
-        let generation = self.state_guard().generation;
+        drop(state);
         HistorySyncTaskTracker {
             activity: Arc::clone(self),
             generation,
@@ -104,7 +102,8 @@ impl HistorySyncActivity {
     }
 }
 
-pub(crate) struct HistorySyncTaskTracker {
+#[doc(hidden)]
+pub struct HistorySyncTaskTracker {
     activity: Arc<HistorySyncActivity>,
     generation: HistorySyncGeneration,
     payload_bytes: usize,
@@ -153,6 +152,7 @@ pub enum MajorSyncTask {
     HistorySync {
         message_id: String,
         notification: Box<DetachedHistorySyncNotification>,
+        tracker: HistorySyncTaskTracker,
     },
     AppStateSync {
         name: WAPatchName,
@@ -167,10 +167,8 @@ mod tests {
     #[test]
     fn history_sync_tracker_updates_payload_peaks_and_releases_exactly_once() {
         let activity = Arc::new(HistorySyncActivity::new());
-        activity.begin(100);
-        let mut first = activity.tracker(100);
-        activity.begin(200);
-        let second = activity.tracker(200);
+        let mut first = activity.begin(100);
+        let second = activity.begin(200);
 
         first.set_payload_bytes(150);
         assert_eq!(
@@ -200,13 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_history_sync_tracker_cannot_release_current_generation() {
+    fn queued_history_sync_tracker_cannot_release_current_generation() {
         let activity = Arc::new(HistorySyncActivity::new());
-        activity.begin(1024);
-        let mut stale_tracker = activity.tracker(1024);
+        let mut stale_tracker = activity.begin(1024);
         activity.reset();
-        activity.begin(2048);
-        let current_tracker = activity.tracker(2048);
+        let current_tracker = activity.begin(2048);
 
         stale_tracker.set_payload_bytes(4096);
         drop(stale_tracker);
