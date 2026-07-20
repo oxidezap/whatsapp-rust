@@ -2173,10 +2173,10 @@ impl Client {
             now,
         );
         let entry = wacore::store::traits::MsgSecretEntry {
-            chat: chat.to_non_ad_string(),
-            sender: sender.to_non_ad_string(),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
+            chat: chat.to_non_ad_string().into(),
+            sender: sender.to_non_ad_string().into(),
+            msg_id: msg_id.into(),
+            secret: Box::new(*secret),
             expires_at,
             message_ts: now,
         };

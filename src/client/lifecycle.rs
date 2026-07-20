@@ -228,8 +228,7 @@ impl Client {
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
-            history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
-            history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
+            history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(async_lock::Mutex::new(HashSet::new())),
@@ -899,9 +898,7 @@ impl Client {
             Ok(mut guard) => *guard = None,
             Err(poison) => *poison.into_inner() = None,
         }
-        self.history_sync_tasks_in_flight
-            .store(0, Ordering::Relaxed);
-        self.history_sync_idle_notifier.notify(usize::MAX);
+        self.history_sync_activity.reset();
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
         // Scoped so the sync guard is dropped before the awaits below (a

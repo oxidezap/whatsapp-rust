@@ -59,8 +59,8 @@ pub use ratchet::{
 pub use sender_keys::{SenderKeyRecord, SenderKeyState};
 pub use session::{process_prekey, process_prekey_bundle};
 pub use session_cipher::{
-    DecryptionResult, message_decrypt, message_decrypt_prekey, message_decrypt_signal,
-    message_encrypt,
+    DecryptionResult, OwnedCiphertextMessage, message_decrypt, message_decrypt_owned,
+    message_decrypt_prekey, message_decrypt_signal, message_encrypt,
 };
 pub use state::{
     GenericSignedPreKey, PreKeyBundle, PreKeyBundleContent, PreKeyId, PreKeyRecord, SessionRecord,

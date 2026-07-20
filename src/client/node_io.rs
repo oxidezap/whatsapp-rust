@@ -490,40 +490,49 @@ impl Client {
             return;
         }
 
+        // Most messages do not need a transport <ack> from this generic gate.
+        // Move those nodes into their chat lane instead of retaining a second
+        // Arc in this dispatcher while decryption starts. Besides removing an
+        // atomic refcount pair, this lets a large uniquely-owned pkmsg donate
+        // its receive buffer to authenticated in-place decryption. Newsletter
+        // and status messages keep the extra owner until their deferred ack is
+        // encoded, preserving the existing acknowledgement semantics.
+        let should_ack = self.should_ack(nr);
+        let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
+
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
-        let handled = match nr.tag.as_ref() {
+        match nr.tag.as_ref() {
             "ack" => {
                 self.handle_ack_response_arc(&node);
-                true
             }
             "receipt" => {
                 self.handle_receipt_inline(Arc::clone(&node));
-                true
             }
             "message" => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
-                    Arc::clone(&node),
+                    node,
                     &mut cancelled,
                 )
-                .await
+                .await;
             }
             _ => {
-                self.stanza_router
+                let handled = self
+                    .stanza_router
                     .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
-                    .await
+                    .await;
+                if !handled {
+                    warn!(
+                        "Received unknown top-level node: {}",
+                        DisplayableNodeRef(node.get())
+                    );
+                }
             }
-        };
-        if !handled {
-            warn!(
-                "Received unknown top-level node: {}",
-                DisplayableNodeRef(nr)
-            );
         }
 
         // Send the deferred ACK if applicable and not cancelled by handler
-        if self.should_ack(nr) && !cancelled {
+        if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }
     }

@@ -51,6 +51,9 @@ figures come from the `wacore::stats::HeapSize` trait:
   `LidPnEntry`, `ResolvedGroupDevices`, ...).
 - Store-backed caches (Redis etc.) report `bytes: 0` — their entries are not
   process memory.
+- In-flight history sync reports queued/running task count, retained compressed
+  payload storage, and lifetime peaks. Inline payloads count while queued;
+  external payloads contribute their `Vec` capacity once materialized.
 
 Semantics: honest estimates for attribution and leak detection, not
 byte-exact accounting. The e2e `memory_soak.rs` logs the byte totals next to

@@ -2,8 +2,8 @@ use crate::types::events::{Event, LazyHistorySync};
 use bytes::Bytes;
 use std::sync::Arc;
 use wacore::history_sync::{
-    HistoryMsgSecretRecord, HistoryMsgSecretRecordRef, TcTokenCandidate,
-    process_history_sync_bytes_filtered,
+    HistoryMsgSecretRecordRef, HistoryMsgSecretRecordVisitor, TcTokenCandidate,
+    process_history_sync_bytes_with_record_sink,
 };
 use wacore::messages::DetachedHistorySyncNotification;
 use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
@@ -67,46 +67,141 @@ impl HistorySecretSeedConfig {
     }
 }
 
-/// Allocation-free adapter around the immutable policy. Common JID shapes use
-/// wacore-binary's borrowed parser and the same [`JidExt`] classification as an
-/// owned [`Jid`]; compatibility-only edge cases retain the owned fallback.
-struct HistorySecretSeedFilter {
+/// Builds the store's final representation directly from each borrowed core
+/// record. The parsed chat is cached per conversation; valid history syncs no
+/// longer allocate an intermediate record or parse the same JID per message.
+struct HistorySecretSeedCollector {
     config: HistorySecretSeedConfig,
+    own_pn: Option<Jid>,
+    own_lid: Option<Jid>,
     last_conversation_index: Option<usize>,
     last_chat_is_bot: Option<bool>,
+    last_chat: Option<Jid>,
+    last_chat_non_ad_id: Option<Arc<str>>,
+    entries: Vec<MsgSecretEntry>,
 }
 
-impl HistorySecretSeedFilter {
-    fn new(config: HistorySecretSeedConfig) -> Self {
+impl HistorySecretSeedCollector {
+    fn new(config: HistorySecretSeedConfig, own_pn: Option<Jid>, own_lid: Option<Jid>) -> Self {
         Self {
             config,
+            own_pn,
+            own_lid,
             last_conversation_index: None,
             last_chat_is_bot: None,
+            last_chat: None,
+            last_chat_non_ad_id: None,
+            entries: Vec::new(),
         }
     }
 
-    fn retain(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> bool {
+    fn collect(&mut self, record: HistoryMsgSecretRecordRef<'_>) {
         if !self.config.accepts_secret(record.secret.len()) {
-            return false;
+            return;
         }
+
         if self.last_conversation_index != Some(record.conversation_index) {
             self.last_conversation_index = Some(record.conversation_index);
-            self.last_chat_is_bot = wacore_binary::jid::parse_jid_ref(record.chat_id)
-                .map(|chat| chat.is_bot())
-                .or_else(|| record.chat_id.parse::<Jid>().ok().map(|chat| chat.is_bot()));
+            self.last_chat = None;
+            self.last_chat_non_ad_id = None;
+            self.last_chat_is_bot =
+                wacore_binary::jid::parse_jid_ref(record.chat_id).map(|chat| chat.is_bot());
+            if self.last_chat_is_bot.is_none()
+                && let Ok(chat) = record.chat_id.parse::<Jid>()
+            {
+                self.last_chat_is_bot = Some(chat.is_bot());
+                self.last_chat_non_ad_id = Some(Arc::from(chat.to_non_ad_string()));
+                self.last_chat = Some(chat);
+            }
         }
-        let Some(chat_is_bot) = self.last_chat_is_bot else {
-            return false;
+
+        let Some(class) = self.config.retained_class(
+            record.secret.len(),
+            self.last_chat_is_bot.unwrap_or(false),
+            record.is_bot_invocation,
+            record.is_poll_or_event,
+            record.timestamp,
+        ) else {
+            return;
         };
-        self.config
-            .retained_class(
-                record.secret.len(),
-                chat_is_bot,
-                record.is_bot_invocation,
-                record.is_poll_or_event,
-                record.timestamp,
-            )
-            .is_some()
+        let expires_at = wacore::msg_secret::expires_at(
+            self.config.policy,
+            &self.config.retention,
+            class,
+            record.timestamp,
+            self.config.now,
+        );
+        let message_ts = record
+            .timestamp
+            .and_then(|timestamp| i64::try_from(timestamp).ok())
+            .unwrap_or(0);
+
+        if self.last_chat.is_none() {
+            let Ok(chat) = record.chat_id.parse::<Jid>() else {
+                return;
+            };
+            self.last_chat_is_bot = Some(chat.is_bot());
+            self.last_chat_non_ad_id = Some(Arc::from(chat.to_non_ad_string()));
+            self.last_chat = Some(chat);
+        }
+        let (Some(chat), Some(chat_non_ad_id)) =
+            (self.last_chat.as_ref(), self.last_chat_non_ad_id.as_ref())
+        else {
+            return;
+        };
+
+        let mut senders =
+            history_msg_secret_senders(chat, record, self.own_pn.as_ref(), self.own_lid.as_ref());
+        if chat.is_bot()
+            && let Some(lid) = self.own_lid.as_ref()
+        {
+            push_unique_sender(&mut senders, lid.to_non_ad());
+        }
+        if senders.iter().all(Option::is_none) {
+            return;
+        }
+
+        let chat_id = Arc::clone(chat_non_ad_id);
+        let msg_id: Arc<str> = Arc::from(record.msg_id);
+        let secret = match <&[u8; HISTORY_MSG_SECRET_SIZE]>::try_from(record.secret) {
+            Ok(secret) => *secret,
+            Err(_) => return,
+        };
+        for sender in senders.into_iter().flatten() {
+            let sender_id = if sender.is_same_chat_as(chat) {
+                Arc::clone(&chat_id)
+            } else {
+                Arc::from(sender.to_non_ad_string())
+            };
+            self.entries.push(MsgSecretEntry {
+                chat: Arc::clone(&chat_id),
+                sender: sender_id,
+                msg_id: Arc::clone(&msg_id),
+                secret: Box::new(secret),
+                expires_at,
+                message_ts,
+            });
+        }
+    }
+
+    fn into_entries(self) -> Vec<MsgSecretEntry> {
+        self.entries
+    }
+}
+
+impl HistoryMsgSecretRecordVisitor for &mut HistorySecretSeedCollector {
+    fn visit(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> usize {
+        let previous_len = self.entries.len();
+        self.collect(record);
+        self.entries.len() - previous_len
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+    }
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(std::mem::size_of::<MsgSecretEntry>())
     }
 }
 
@@ -146,13 +241,14 @@ impl Client {
         }
 
         // Enqueue a MajorSyncTask for the dedicated sync worker to consume.
-        self.begin_history_sync_task();
+        let retained_payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
+        self.begin_history_sync_task(retained_payload_bytes);
         let task = crate::sync_task::MajorSyncTask::HistorySync {
             message_id,
             notification: Box::new(notification),
         };
         if let Err(e) = self.major_sync_task_sender.send(task).await {
-            self.finish_history_sync_task();
+            self.finish_history_sync_task(retained_payload_bytes);
             if self.is_shutting_down() {
                 log::debug!("Dropping history sync task during shutdown: {e}");
             } else {
@@ -164,11 +260,25 @@ impl Client {
     /// Process history sync: decompress, extract internal data (tctokens,
     /// pushname, nct_salt), then dispatch a single `Event::HistorySync`
     /// with the full decompressed blob for on-demand consumer decoding.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync_task", level = "debug", skip_all, fields(msg_id = %message_id)))]
+    #[cfg(test)]
     pub(crate) async fn process_history_sync_task(
         self: &Arc<Self>,
         message_id: String,
         notification: DetachedHistorySyncNotification,
+    ) {
+        let retained_payload_bytes = notification.inline_payload.as_ref().map_or(0, Bytes::len);
+        self.begin_history_sync_task(retained_payload_bytes);
+        let mut tracker = self.track_history_sync_task(retained_payload_bytes);
+        self.process_history_sync_task_tracked(message_id, notification, &mut tracker)
+            .await;
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync_task", level = "debug", skip_all, fields(msg_id = %message_id)))]
+    pub(crate) async fn process_history_sync_task_tracked(
+        self: &Arc<Self>,
+        message_id: String,
+        notification: DetachedHistorySyncNotification,
+        tracker: &mut crate::sync_task::HistorySyncTaskTracker,
     ) {
         if self.is_shutting_down() {
             log::debug!("Aborting history sync {} before processing", message_id);
@@ -202,12 +312,14 @@ impl Client {
         }
 
         // Use take() to avoid cloning large payloads - moves ownership instead
-        let compressed_data = if let Some(inline_payload) = inline_payload {
+        let (compressed_data, retained_payload_bytes) = if let Some(inline_payload) = inline_payload
+        {
             log::info!(
                 "Found inline history sync payload ({} bytes). Using directly.",
                 inline_payload.len()
             );
-            inline_payload
+            let retained_payload_bytes = inline_payload.len();
+            (inline_payload, retained_payload_bytes)
         } else {
             log::info!("Downloading external history sync blob...");
             if self.is_shutting_down() || !self.is_connected() {
@@ -224,7 +336,8 @@ impl Client {
             match self.download(&notification).await {
                 Ok(bytes) => {
                     log::info!("Successfully downloaded history sync blob.");
-                    Bytes::from(bytes)
+                    let retained_payload_bytes = bytes.capacity();
+                    (Bytes::from(bytes), retained_payload_bytes)
                 }
                 Err(e) => {
                     if self.is_shutting_down() {
@@ -239,12 +352,15 @@ impl Client {
                 }
             }
         };
+        tracker.set_retained_payload_bytes(retained_payload_bytes);
 
-        let own_user = {
-            let device_snapshot = self.persistence_manager.get_device_snapshot();
-            device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
-        };
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let own_pn = device_snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
+        let own_lid = device_snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
+        let own_user = own_pn.as_ref().map(|jid| jid.user.clone());
         let secret_seed_config = HistorySecretSeedConfig::snapshot(&self.cache_config);
+        let mut secret_collector =
+            HistorySecretSeedCollector::new(secret_seed_config, own_pn, own_lid);
 
         // Always carry the compressed input through (a move, no copy or extra
         // inflate); handler interest is evaluated at dispatch time below, so a
@@ -254,24 +370,23 @@ impl Client {
         // Large blobs: use blocking thread to avoid stalling the async runtime.
         const INLINE_THRESHOLD: usize = 256 * 1024;
         let parse_result = if compressed_data.len() < INLINE_THRESHOLD {
-            let mut secret_filter = HistorySecretSeedFilter::new(secret_seed_config);
-            Some(process_history_sync_bytes_filtered(
+            let result = process_history_sync_bytes_with_record_sink(
                 compressed_data,
                 own_user.as_deref(),
                 true,
-                move |record| secret_filter.retain(record),
-            ))
+                &mut secret_collector,
+            );
+            Some((result, secret_collector.into_entries()))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let mut secret_filter = HistorySecretSeedFilter::new(secret_seed_config);
-                let result = process_history_sync_bytes_filtered(
+                let result = process_history_sync_bytes_with_record_sink(
                     compressed_data,
                     own_user.as_deref(),
                     true,
-                    move |record| secret_filter.retain(record),
+                    &mut secret_collector,
                 );
-                let _ = result_tx.send(result);
+                let _ = result_tx.send((result, secret_collector.into_entries()));
             }));
             self.runtime
                 .spawn(Box::pin(async move {
@@ -290,7 +405,7 @@ impl Client {
         }
 
         match parse_result {
-            Some(Ok(sync_result)) => {
+            Some((Ok(sync_result), secret_entries)) => {
                 log::info!(
                     "Successfully processed HistorySync (message {message_id}); {} conversations",
                     sync_result.conversations_processed
@@ -321,11 +436,8 @@ impl Client {
                     self.store_tc_token_candidate(candidate).await;
                 }
 
-                self.store_history_sync_msg_secrets(
-                    sync_result.msg_secret_records,
-                    secret_seed_config,
-                )
-                .await;
+                self.store_history_sync_msg_secret_entries(secret_entries, secret_seed_config)
+                    .await;
 
                 // Bulk PN-LID identity seed from field 15; persist and migrations
                 // run detached, like the other batch learn paths. `Other`
@@ -371,7 +483,7 @@ impl Client {
                         .dispatch(Event::HistorySync(Box::new(lazy_hs)));
                 }
             }
-            Some(Err(e)) => {
+            Some((Err(e), _)) => {
                 log::error!("Failed to process HistorySync data: {:?}", e);
             }
             None => {
@@ -386,12 +498,12 @@ impl Client {
             name = "wa.history.secrets.store",
             level = "debug",
             skip_all,
-            fields(records = records.len() as u64)
+            fields(entries = entries.len() as u64)
         )
     )]
-    async fn store_history_sync_msg_secrets(
+    async fn store_history_sync_msg_secret_entries(
         &self,
-        records: Vec<HistoryMsgSecretRecord>,
+        entries: Vec<MsgSecretEntry>,
         seed_config: HistorySecretSeedConfig,
     ) -> usize {
         if !seed_config.enabled {
@@ -411,88 +523,6 @@ impl Client {
             );
             return 0;
         }
-
-        let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
-        let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
-
-        let entries = {
-            #[cfg(feature = "tracing")]
-            let _build_span = tracing::trace_span!(
-                "wa.history.secrets.build_entries",
-                records = records.len() as u64,
-            )
-            .entered();
-            let mut entries = Vec::new();
-            for record in records {
-                if !seed_config.accepts_secret(record.secret.len()) {
-                    continue;
-                }
-                let Ok(chat) = record.chat_id.parse::<Jid>() else {
-                    continue;
-                };
-                let Some(class) = seed_config.retained_class(
-                    record.secret.len(),
-                    chat.is_bot(),
-                    record.is_bot_invocation,
-                    record.is_poll_or_event,
-                    record.timestamp,
-                ) else {
-                    continue;
-                };
-                let expires_at = wacore::msg_secret::expires_at(
-                    seed_config.policy,
-                    &seed_config.retention,
-                    class,
-                    record.timestamp,
-                    seed_config.now,
-                );
-                let message_ts = record
-                    .timestamp
-                    .and_then(|t| i64::try_from(t).ok())
-                    .unwrap_or(0);
-
-                let mut senders =
-                    history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
-                if chat.is_bot()
-                    && let Some(lid) = own_lid.as_ref()
-                {
-                    push_unique_sender(&mut senders, lid.to_non_ad());
-                }
-                if senders.is_empty() {
-                    continue;
-                }
-
-                let sender_count = senders.len();
-                let mut chat_id = chat.to_non_ad_string();
-                let mut msg_id = record.msg_id.into_string();
-                let mut secret = record.secret.into_vec();
-                for (idx, sender) in senders.into_iter().enumerate() {
-                    let last_sender = idx + 1 == sender_count;
-                    entries.push(MsgSecretEntry {
-                        chat: if last_sender {
-                            std::mem::take(&mut chat_id)
-                        } else {
-                            chat_id.clone()
-                        },
-                        sender: sender.to_non_ad_string(),
-                        msg_id: if last_sender {
-                            std::mem::take(&mut msg_id)
-                        } else {
-                            msg_id.clone()
-                        },
-                        secret: if last_sender {
-                            std::mem::take(&mut secret)
-                        } else {
-                            secret.clone()
-                        },
-                        expires_at,
-                        message_ts,
-                    });
-                }
-            }
-            entries
-        };
 
         if entries.is_empty() {
             return 0;
@@ -583,13 +613,18 @@ impl Client {
     }
 }
 
+/// At most two aliases are persisted for one secret: the account's PN/LID
+/// pair for an outgoing message, or a bot chat plus the account LID.
+const MAX_HISTORY_SECRET_SENDERS: usize = 2;
+type HistorySecretSenders = [Option<Jid>; MAX_HISTORY_SECRET_SENDERS];
+
 fn history_msg_secret_senders(
     chat: &Jid,
-    record: &HistoryMsgSecretRecord,
+    record: HistoryMsgSecretRecordRef<'_>,
     own_pn: Option<&Jid>,
     own_lid: Option<&Jid>,
-) -> Vec<Jid> {
-    let mut senders = Vec::with_capacity(2);
+) -> HistorySecretSenders {
+    let mut senders = std::array::from_fn(|_| None);
 
     if record.from_me {
         if let Some(lid) = own_lid {
@@ -602,25 +637,27 @@ fn history_msg_secret_senders(
     }
 
     if chat.is_pn() || chat.is_lid() || chat.is_bot() {
-        senders.push(chat.to_non_ad());
+        push_unique_sender(&mut senders, chat.to_non_ad());
         return senders;
     }
 
-    if let Some(raw_sender) = record
-        .key_participant
-        .as_deref()
-        .or(record.web_msg_participant.as_deref())
+    if let Some(raw_sender) = record.key_participant.or(record.web_msg_participant)
         && let Ok(sender) = raw_sender.parse::<Jid>()
     {
-        senders.push(sender.to_non_ad());
+        push_unique_sender(&mut senders, sender.to_non_ad());
     }
 
     senders
 }
 
-fn push_unique_sender(senders: &mut Vec<Jid>, sender: Jid) {
-    if !senders.contains(&sender) {
-        senders.push(sender);
+fn push_unique_sender(senders: &mut HistorySecretSenders, sender: Jid) {
+    if senders.iter().flatten().any(|existing| existing == &sender) {
+        return;
+    }
+    let empty = senders.iter_mut().find(|slot| slot.is_none());
+    debug_assert!(empty.is_some(), "history secret sender capacity exhausted");
+    if let Some(slot) = empty {
+        *slot = Some(sender);
     }
 }
 

@@ -105,16 +105,73 @@ pub fn process_history_sync_bytes_filtered<F>(
 where
     F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
 {
-    let mut result = process_history_sync_streaming(
-        &compressed_data,
-        own_user,
-        MAX_DECOMPRESSED,
-        record_filter,
-    )?;
+    let sink = FilteredRecordSink(record_filter);
+    process_history_sync_bytes_with_sink(compressed_data, own_user, retain_blob, sink)
+}
+
+fn process_history_sync_bytes_with_sink<S>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    sink: S,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    S: HistoryMsgSecretRecordSink,
+{
+    let mut result =
+        process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED, sink)?;
     if retain_blob {
         result.compressed_bytes = Some(compressed_data);
     }
     Ok(result)
+}
+
+/// [`process_history_sync_bytes`] with a borrowed visitor for every message
+/// secret candidate found while the conversation is still in the inflate
+/// window.
+///
+/// The visitor runs synchronously in wire order and the returned result does
+/// not retain [`HistoryMsgSecretRecord`] values. Consumers that immediately
+/// translate records into another owned representation can therefore avoid an
+/// otherwise redundant intermediate allocation without duplicating any wire
+/// parsing logic.
+pub fn process_history_sync_bytes_with_record_visitor<F>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    visitor: F,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>),
+{
+    process_history_sync_bytes_with_record_sink(
+        compressed_data,
+        own_user,
+        retain_blob,
+        VisitOnly(visitor),
+    )
+}
+
+/// Capacity-aware counterpart to
+/// [`process_history_sync_bytes_with_record_visitor`].
+///
+/// This keeps the visit-only closure API source-compatible while allowing
+/// collectors to share the streaming parser's bounded density estimator.
+pub fn process_history_sync_bytes_with_record_sink<V>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    visitor: V,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    V: HistoryMsgSecretRecordVisitor,
+{
+    process_history_sync_bytes_with_sink(
+        compressed_data,
+        own_user,
+        retain_blob,
+        VisitingRecordSink::new(visitor),
+    )
 }
 
 /// One top-level protobuf field, borrowed from the walker's inflate window.
@@ -300,14 +357,83 @@ impl<'a> FieldWalker<'a> {
 /// secrets, tctokens, pushname and nctSalt as each top-level field is
 /// buffered, so peak memory is bounded by the largest single conversation
 /// rather than the whole blob.
-fn process_history_sync_streaming<F>(
+trait HistoryMsgSecretRecordSink {
+    fn retain(&mut self, candidate: HistoryMsgSecretRecordRef<'_>) -> bool;
+
+    fn retained_len(&self, owned_records: &[HistoryMsgSecretRecord]) -> usize;
+
+    fn reserve(&mut self, owned_records: &mut Vec<HistoryMsgSecretRecord>, additional: usize);
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize>;
+}
+
+struct FilteredRecordSink<F>(F);
+
+impl<F> HistoryMsgSecretRecordSink for FilteredRecordSink<F>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
+    fn retain(&mut self, candidate: HistoryMsgSecretRecordRef<'_>) -> bool {
+        self.0(candidate)
+    }
+
+    fn retained_len(&self, owned_records: &[HistoryMsgSecretRecord]) -> usize {
+        owned_records.len()
+    }
+
+    fn reserve(&mut self, owned_records: &mut Vec<HistoryMsgSecretRecord>, additional: usize) {
+        owned_records.reserve(additional);
+    }
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(std::mem::size_of::<HistoryMsgSecretRecord>())
+    }
+}
+
+struct VisitingRecordSink<V> {
+    visitor: V,
+    retained: usize,
+}
+
+impl<V> VisitingRecordSink<V> {
+    fn new(visitor: V) -> Self {
+        Self {
+            visitor,
+            retained: 0,
+        }
+    }
+}
+
+impl<V> HistoryMsgSecretRecordSink for VisitingRecordSink<V>
+where
+    V: HistoryMsgSecretRecordVisitor,
+{
+    fn retain(&mut self, candidate: HistoryMsgSecretRecordRef<'_>) -> bool {
+        self.retained = self.retained.saturating_add(self.visitor.visit(candidate));
+        false
+    }
+
+    fn retained_len(&self, _owned_records: &[HistoryMsgSecretRecord]) -> usize {
+        self.retained
+    }
+
+    fn reserve(&mut self, _owned_records: &mut Vec<HistoryMsgSecretRecord>, additional: usize) {
+        self.visitor.reserve(additional);
+    }
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        self.visitor.retained_item_size()
+    }
+}
+
+fn process_history_sync_streaming<S>(
     compressed_data: &[u8],
     own_user: Option<&str>,
     max_decompressed: u64,
-    mut record_filter: F,
+    mut record_sink: S,
 ) -> Result<HistorySyncResult, HistorySyncError>
 where
-    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+    S: HistoryMsgSecretRecordSink,
 {
     let mut walker = FieldWalker::new(compressed_data, max_decompressed);
     let mut result = HistorySyncResult {
@@ -339,7 +465,7 @@ where
     // capacity just below the real count and make Vec double a multi-megabyte
     // record buffer near EOF. The clamp still bounds over-allocation to ~2 MB.
     const RESERVE_SAMPLE_RECORDS: usize = 128;
-    const RECORD_RESERVE_CAP: usize = 16384;
+    const RECORD_RESERVE_BYTE_CAP: usize = 2 * 1024 * 1024;
     const RESERVE_HEADROOM_DIVISOR: usize = 8;
     let mut density_reserved = false;
 
@@ -357,21 +483,26 @@ where
                     value,
                     conversation_index,
                     &mut result.msg_secret_records,
-                    &mut record_filter,
+                    &mut record_sink,
                 ) {
                     result.tc_token_candidates.push(candidate);
                 }
-                if !density_reserved && result.msg_secret_records.len() >= RESERVE_SAMPLE_RECORDS {
+                let retained_records = record_sink.retained_len(&result.msg_secret_records);
+                if !density_reserved && retained_records >= RESERVE_SAMPLE_RECORDS {
                     density_reserved = true;
                     // max(1) makes the division safe; parsed_bytes is only 0
                     // if nothing decompressed yet, impossible past a record.
                     let parsed = walker.parsed_bytes().max(1);
-                    let records = result.msg_secret_records.len();
+                    let records = retained_records;
                     let projected = ((records as u64).saturating_mul(walker.estimated_total_out())
                         / parsed) as usize;
+                    let reserve_cap = record_sink
+                        .retained_item_size()
+                        .map(|item_size| RECORD_RESERVE_BYTE_CAP / item_size.get())
+                        .unwrap_or(0);
                     let estimated = projected
                         .saturating_add(projected / RESERVE_HEADROOM_DIVISOR)
-                        .min(RECORD_RESERVE_CAP);
+                        .min(reserve_cap);
                     let additional = estimated.saturating_sub(records);
                     #[cfg(feature = "tracing")]
                     let _reserve_span = tracing::trace_span!(
@@ -383,7 +514,7 @@ where
                         additional = additional as u64,
                     )
                     .entered();
-                    result.msg_secret_records.reserve(additional);
+                    record_sink.reserve(&mut result.msg_secret_records, additional);
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -936,6 +1067,7 @@ struct FastRecord<'a> {
 /// Carrier slots inspected by the forwarded check; mirrors the
 /// `is_forwarded` chain of `MessageInternalFields`.
 const N_CARRIERS: usize = 27;
+const _: () = assert!(N_CARRIERS <= u32::BITS as usize);
 
 /// Map a `Message` field tag to its forwarded-carrier slot and the
 /// `contextInfo` tag inside that carrier. A `match` so the dispatch compiles
@@ -1134,7 +1266,16 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
     let mut from_me = false;
     let mut msg_id: Option<&str> = None;
     let mut key_participant: Option<&str> = None;
+    // A normal WebMessageInfo contains one key. Keep that wire slice borrowed
+    // until a messageSecret is actually found, so the overwhelmingly common
+    // no-record path skips its nested walk and UTF-8 validation entirely.
+    // If malformed/merged wire data repeats the key, materialize both in order
+    // and continue merging subsequent occurrences exactly like prost.
+    let mut deferred_key: Option<&[u8]> = None;
+    let mut key_materialized = false;
+    let mut deferred_web_msg_participant: Option<&[u8]> = None;
     let mut web_msg_participant: Option<&str> = None;
+    let mut web_msg_participant_materialized = false;
     let mut timestamp: Option<u64> = None;
     let mut top_secret: Option<&[u8]> = None;
     let mut msg_slice: Option<&[u8]> = None;
@@ -1159,32 +1300,29 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
                         let Some(key) = f.value else {
                             return FastExtract::NoRecord;
                         };
-                        for item in FieldIter::new(key) {
-                            let f = match item {
-                                Ok(f) => f,
-                                Err(stop) => return stop.into(),
-                            };
-                            match f.field {
-                                tags::message_key::FROM_ME => {
-                                    if f.wt != wire_type::VARINT {
-                                        return FastExtract::NoRecord;
-                                    }
-                                    from_me = f.varint != 0;
+                        if let Some(first_key) = deferred_key.take() {
+                            for key in [first_key, key] {
+                                if let Err(stop) = merge_message_key_fields(
+                                    key,
+                                    &mut from_me,
+                                    &mut msg_id,
+                                    &mut key_participant,
+                                ) {
+                                    return stop.into();
                                 }
-                                tags::message_key::ID => {
-                                    let Some(s) = f.value.and_then(smoothutf8::from_utf8) else {
-                                        return FastExtract::NoRecord;
-                                    };
-                                    msg_id = Some(s);
-                                }
-                                tags::message_key::PARTICIPANT => {
-                                    let Some(s) = f.value.and_then(smoothutf8::from_utf8) else {
-                                        return FastExtract::NoRecord;
-                                    };
-                                    key_participant = Some(s);
-                                }
-                                _ => {}
                             }
+                            key_materialized = true;
+                        } else if key_materialized {
+                            if let Err(stop) = merge_message_key_fields(
+                                key,
+                                &mut from_me,
+                                &mut msg_id,
+                                &mut key_participant,
+                            ) {
+                                return stop.into();
+                            }
+                        } else {
+                            deferred_key = Some(key);
                         }
                     }
                     tags::web_message_info::MESSAGE => {
@@ -1205,10 +1343,26 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
                         timestamp = Some(f.varint);
                     }
                     tags::web_message_info::PARTICIPANT => {
-                        let Some(s) = f.value.and_then(smoothutf8::from_utf8) else {
+                        let Some(participant) = f.value else {
                             return FastExtract::NoRecord;
                         };
-                        web_msg_participant = Some(s);
+                        if let Some(first_participant) = deferred_web_msg_participant.take() {
+                            if smoothutf8::from_utf8(first_participant).is_none() {
+                                return FastExtract::NoRecord;
+                            }
+                            let Some(participant) = smoothutf8::from_utf8(participant) else {
+                                return FastExtract::NoRecord;
+                            };
+                            web_msg_participant = Some(participant);
+                            web_msg_participant_materialized = true;
+                        } else if web_msg_participant_materialized {
+                            let Some(participant) = smoothutf8::from_utf8(participant) else {
+                                return FastExtract::NoRecord;
+                            };
+                            web_msg_participant = Some(participant);
+                        } else {
+                            deferred_web_msg_participant = Some(participant);
+                        }
                     }
                     tags::web_message_info::MESSAGE_SECRET => {
                         let Some(secret) = f.value else {
@@ -1234,6 +1388,20 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
     let Some(secret) = top_secret.or(context_secret) else {
         return FastExtract::NoRecord;
     };
+
+    if !key_materialized
+        && let Some(key) = deferred_key
+        && let Err(stop) =
+            merge_message_key_fields(key, &mut from_me, &mut msg_id, &mut key_participant)
+    {
+        return stop.into();
+    }
+    if !web_msg_participant_materialized && let Some(participant) = deferred_web_msg_participant {
+        let Some(participant) = smoothutf8::from_utf8(participant) else {
+            return FastExtract::NoRecord;
+        };
+        web_msg_participant = Some(participant);
+    }
     let Some(msg_id) = msg_id else {
         return FastExtract::NoRecord;
     };
@@ -1247,7 +1415,7 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
             Ok(base) => base,
             Err(stop) => return stop.into(),
         };
-        if base.forwarded.contains(&Some(true)) {
+        if base.forwarded_carriers != 0 {
             return FastExtract::NoRecord;
         }
         is_poll_or_event = base.is_poll_or_event;
@@ -1266,6 +1434,44 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
     })
 }
 
+/// Merge one MessageKey occurrence into the borrowed fast-path state. Kept
+/// separate so the outer scan can defer this nested work until a secret makes
+/// the record observable, while repeated keys retain protobuf merge order.
+fn merge_message_key_fields<'a>(
+    key: &'a [u8],
+    from_me: &mut bool,
+    msg_id: &mut Option<&'a str>,
+    participant: &mut Option<&'a str>,
+) -> Result<(), WalkStop> {
+    for item in FieldIter::new(key) {
+        let f = item?;
+        match f.field {
+            tags::message_key::FROM_ME => {
+                if f.wt != wire_type::VARINT {
+                    return Err(WalkStop::Malformed);
+                }
+                *from_me = f.varint != 0;
+            }
+            tags::message_key::ID => {
+                *msg_id = Some(
+                    f.value
+                        .and_then(smoothutf8::from_utf8)
+                        .ok_or(WalkStop::Malformed)?,
+                );
+            }
+            tags::message_key::PARTICIPANT => {
+                *participant = Some(
+                    f.value
+                        .and_then(smoothutf8::from_utf8)
+                        .ok_or(WalkStop::Malformed)?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl From<WalkStop> for FastExtract<'_> {
     fn from(stop: WalkStop) -> Self {
         match stop {
@@ -1281,8 +1487,8 @@ struct MsgLevel<'a> {
     context_secret: Option<&'a [u8]>,
     has_bot_metadata: bool,
     is_poll_or_event: bool,
-    /// Final merged `context_info.is_forwarded` per carrier slot.
-    forwarded: [Option<bool>; N_CARRIERS],
+    /// Carrier slots whose final merged `context_info.is_forwarded` is true.
+    forwarded_carriers: u32,
     /// Wrapper payloads found at this level, by priority slot.
     wrappers: [Option<&'a [u8]>; N_WRAPPERS],
 }
@@ -1294,7 +1500,7 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
         context_secret: None,
         has_bot_metadata: false,
         is_poll_or_event: false,
-        forwarded: [None; N_CARRIERS],
+        forwarded_carriers: 0,
         wrappers: [None; N_WRAPPERS],
     };
 
@@ -1340,7 +1546,12 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
                             if f.wt != wire_type::VARINT {
                                 return Err(WalkStop::Malformed);
                             }
-                            level.forwarded[slot] = Some(f.varint != 0);
+                            let carrier_bit = 1_u32 << slot;
+                            if f.varint != 0 {
+                                level.forwarded_carriers |= carrier_bit;
+                            } else {
+                                level.forwarded_carriers &= !carrier_bit;
+                            }
                         }
                     }
                 }
@@ -1461,6 +1672,40 @@ pub struct HistoryMsgSecretRecordRef<'a> {
     pub is_bot_invocation: bool,
 }
 
+/// Consumer for borrowed history-sync message-secret candidates.
+///
+/// [`visit`](Self::visit) returns how many consumer-side records were retained
+/// from a candidate. Consumers that also report their retained item size can
+/// receive a one-shot, density-based [`reserve`](Self::reserve) hint. The hint
+/// uses the same bounded estimator as the built-in owned-record path, avoiding
+/// both a full pre-count pass and a separate sizing heuristic in each caller.
+pub trait HistoryMsgSecretRecordVisitor {
+    /// Visit one borrowed candidate and return the number of retained output
+    /// items it produced.
+    fn visit(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> usize;
+
+    /// Reserve room for `additional` retained output items.
+    fn reserve(&mut self, _additional: usize) {}
+
+    /// Size of one retained output item. Returning `None` disables reserve
+    /// hints while preserving record visitation.
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        None
+    }
+}
+
+struct VisitOnly<F>(F);
+
+impl<F> HistoryMsgSecretRecordVisitor for VisitOnly<F>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>),
+{
+    fn visit(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> usize {
+        self.0(record);
+        0
+    }
+}
+
 impl HistoryMsgSecretRecordRef<'_> {
     fn into_owned(self, chat_id_shared: &mut Option<Arc<str>>) -> HistoryMsgSecretRecord {
         HistoryMsgSecretRecord {
@@ -1490,14 +1735,14 @@ impl HistoryMsgSecretRecordRef<'_> {
 /// tctoken. Decoding the whole conversation as one view (all-or-nothing) would
 /// drop every record + the tctoken on any single bad message, and would also
 /// materialize the entire conversation tree at once.
-fn extract_conversation_fields<F>(
+fn extract_conversation_fields<S>(
     data: &[u8],
     conversation_index: usize,
     records: &mut Vec<HistoryMsgSecretRecord>,
-    record_filter: &mut F,
+    record_sink: &mut S,
 ) -> Option<TcTokenCandidate>
 where
-    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+    S: HistoryMsgSecretRecordSink,
 {
     let mut pos = 0;
     // Conversation.id precedes messages/tctoken in tag order, so it is
@@ -1568,7 +1813,7 @@ where
                                 },
                                 &mut chat_id_shared,
                                 records,
-                                record_filter,
+                                record_sink,
                             );
                         }
                         // Rare wire shapes (repeated message-typed fields,
@@ -1583,7 +1828,7 @@ where
                                     &mut chat_id_shared,
                                     msg,
                                     records,
-                                    record_filter,
+                                    record_sink,
                                 );
                             }
                         }
@@ -1645,15 +1890,15 @@ where
 /// Extract a single message's secret record (if any) into `out`.
 /// `chat_id_shared` memoizes the conversation id `Arc` so it is allocated only
 /// when the first record is actually pushed.
-fn push_secret_record<F>(
+fn push_secret_record<S>(
     chat_id: &str,
     conversation_index: usize,
     chat_id_shared: &mut Option<Arc<str>>,
     history_msg: wa::HistorySyncMsg,
     out: &mut Vec<HistoryMsgSecretRecord>,
-    record_filter: &mut F,
+    record_sink: &mut S,
 ) where
-    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+    S: HistoryMsgSecretRecordSink,
 {
     let Some(web_msg) = history_msg.message.as_option() else {
         return;
@@ -1699,20 +1944,20 @@ fn push_secret_record<F>(
         },
         chat_id_shared,
         out,
-        record_filter,
+        record_sink,
     );
 }
 
 #[inline]
-fn push_filtered_secret_record<F>(
+fn push_filtered_secret_record<S>(
     candidate: HistoryMsgSecretRecordRef<'_>,
     chat_id_shared: &mut Option<Arc<str>>,
     out: &mut Vec<HistoryMsgSecretRecord>,
-    record_filter: &mut F,
+    record_sink: &mut S,
 ) where
-    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+    S: HistoryMsgSecretRecordSink,
 {
-    if record_filter(candidate) {
+    if record_sink.retain(candidate) {
         out.push(candidate.into_owned(chat_id_shared));
     }
 }
@@ -1944,7 +2189,7 @@ mod tests {
     fn oracle_records(raw_msg: &[u8]) -> Vec<HistoryMsgSecretRecord> {
         let mut out = Vec::new();
         let mut shared = None;
-        let mut accept_all = |_: HistoryMsgSecretRecordRef<'_>| true;
+        let mut accept_all = FilteredRecordSink(|_: HistoryMsgSecretRecordRef<'_>| true);
         if let Ok(msg) = wa::HistorySyncMsg::decode_from_slice(raw_msg) {
             push_secret_record(
                 "5511777776666@s.whatsapp.net",
@@ -2311,6 +2556,19 @@ mod tests {
         let mut raw = Vec::new();
         emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
         add("invalid UTF-8 in key id", raw);
+
+        let mut web = Vec::new();
+        emit(&mut web, tags::web_message_info::KEY, &key_a12);
+        emit(&mut web, tags::web_message_info::PARTICIPANT, &[0xFF, 0xFE]);
+        emit(
+            &mut web,
+            tags::web_message_info::PARTICIPANT,
+            b"5511888887777@s.whatsapp.net",
+        );
+        emit(&mut web, tags::web_message_info::MESSAGE_SECRET, &secret);
+        let mut raw = Vec::new();
+        emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
+        add("invalid UTF-8 in overwritten web participant", raw);
 
         let mut web = Vec::new();
         emit(&mut web, tags::web_message_info::KEY, &key_a12);
@@ -2927,6 +3185,98 @@ mod tests {
         assert!(result.msg_secret_records[0].from_me);
     }
 
+    #[test]
+    fn borrowed_record_visitor_avoids_owned_record_collection() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut message = keyed("VISIT", false, None);
+        message.message_secret = Some(vec![0x44; 32]);
+        let hs = wa::HistorySync {
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: buffa::MessageField::some(message),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut visited = Vec::new();
+        let result = process_history_sync_bytes_with_record_visitor(
+            Bytes::from(encode_and_compress(&hs)),
+            None,
+            false,
+            |record| visited.push((record.chat_id.to_owned(), record.msg_id.to_owned())),
+        )
+        .unwrap();
+
+        assert_eq!(visited, [(chat.to_owned(), "VISIT".to_owned())]);
+        assert!(result.msg_secret_records.is_empty());
+    }
+
+    #[test]
+    fn borrowed_record_visitor_receives_bounded_capacity_hint() {
+        const RECORD_COUNT: usize = 256;
+
+        struct ReservingVisitor {
+            visits: std::rc::Rc<std::cell::Cell<usize>>,
+            largest_reserve: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl HistoryMsgSecretRecordVisitor for ReservingVisitor {
+            fn visit(&mut self, _record: HistoryMsgSecretRecordRef<'_>) -> usize {
+                self.visits.set(self.visits.get() + 1);
+                1
+            }
+
+            fn reserve(&mut self, additional: usize) {
+                self.largest_reserve
+                    .set(self.largest_reserve.get().max(additional));
+            }
+
+            fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+                std::num::NonZeroUsize::new(std::mem::size_of::<u64>())
+            }
+        }
+
+        let messages = (0..RECORD_COUNT)
+            .map(|index| {
+                let mut message = keyed(&format!("VISIT_{index}"), false, None);
+                message.message_secret = Some(vec![0x44; 32]);
+                wa::HistorySyncMsg {
+                    message: buffa::MessageField::some(message),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let hs = wa::HistorySync {
+            conversations: vec![wa::Conversation {
+                id: "5511777776666@s.whatsapp.net".to_string(),
+                messages,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let visits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let largest_reserve = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let result = process_history_sync_bytes_with_record_sink(
+            Bytes::from(encode_and_compress(&hs)),
+            None,
+            false,
+            ReservingVisitor {
+                visits: std::rc::Rc::clone(&visits),
+                largest_reserve: std::rc::Rc::clone(&largest_reserve),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(visits.get(), RECORD_COUNT);
+        assert!(largest_reserve.get() > 0);
+        assert!(result.msg_secret_records.is_empty());
+    }
+
     /// Regression: a single malformed message inside a conversation must NOT
     /// discard the conversation's other message secrets or its tctoken. The
     /// pre-fix code decoded the whole conversation as one view (all-or-nothing),
@@ -3160,7 +3510,7 @@ mod tests {
     /// independent implementation instead of a second production path.
     fn reference_full_walk(decompressed: &[u8], own_user: Option<&str>) -> HistorySyncResult {
         let mut pos = 0;
-        let mut accept_all = |_: HistoryMsgSecretRecordRef<'_>| true;
+        let mut accept_all = FilteredRecordSink(|_: HistoryMsgSecretRecordRef<'_>| true);
         let mut result = HistorySyncResult {
             own_pushname: None,
             nct_salt: None,

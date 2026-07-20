@@ -142,7 +142,16 @@ impl FrameDecoder {
 
         if self.buffer.len() >= FRAME_LENGTH_SIZE + frame_len {
             self.buffer.advance(FRAME_LENGTH_SIZE);
-            let frame_data = self.buffer.split_to(frame_len);
+            let frame_data = if self.buffer.len() == frame_len {
+                // Steady-state transport reads contain one complete frame. Move
+                // its allocation out of the decoder instead of leaving an empty
+                // BytesMut view behind: downstream parsing can then preserve
+                // unique ownership all the way to in-place authenticated
+                // decryption of large payloads.
+                std::mem::take(&mut self.buffer)
+            } else {
+                self.buffer.split_to(frame_len)
+            };
             trace!("<-- Decoded frame: {} bytes", frame_data.len());
             Some(frame_data)
         } else {
@@ -245,6 +254,10 @@ mod tests {
         // Zero-copy: the frame points into the original allocation, offset by
         // the 3-byte length prefix.
         assert_eq!(frame.as_ptr() as usize, payload_addr + FRAME_LENGTH_SIZE);
+        assert!(
+            frame.freeze().is_unique(),
+            "a fully drained decoder must not retain an empty shared view"
+        );
     }
 
     #[test]

@@ -37,7 +37,8 @@ struct PreKeyEntry {
 type BaseKeyKey = (String, String);
 
 /// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
-type MsgSecretRow = (Vec<u8>, i64, i64);
+type MsgSecretRow = (MessageSecret, i64, i64);
+type MsgSecretKey = (Arc<str>, Arc<str>, Arc<str>);
 
 /// Inner state protected by the mutex.
 #[derive(Default)]
@@ -73,7 +74,7 @@ struct InMemoryState {
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
     /// event time is unknown. The keepalive cleanup prunes expired rows.
-    msg_secrets: HashMap<(String, String, String), MsgSecretRow>,
+    msg_secrets: HashMap<MsgSecretKey, MsgSecretRow>,
 
     // --- Device ---
     device: Option<Device>,
@@ -910,8 +911,8 @@ impl MsgSecretStore for InMemoryBackend {
             .lock()
             .await
             .msg_secrets
-            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _, message_ts)| (secret.clone(), *message_ts)))
+            .get(&(Arc::from(chat), Arc::from(sender), Arc::from(msg_id)))
+            .map(|(secret, _, message_ts)| (secret.to_vec(), *message_ts)))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -1200,7 +1201,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
-                    secret: vec![1u8; 32],
+                    secret: Box::new([1u8; crate::reporting_token::MESSAGE_SECRET_SIZE]),
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1208,7 +1209,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M2".into(),
-                    secret: vec![2u8; 32],
+                    secret: Box::new([2u8; crate::reporting_token::MESSAGE_SECRET_SIZE]),
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1216,7 +1217,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
-                    secret: vec![9u8; 32],
+                    secret: Box::new([9u8; crate::reporting_token::MESSAGE_SECRET_SIZE]),
                     expires_at: 0,
                     message_ts: 0,
                 },

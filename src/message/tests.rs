@@ -339,7 +339,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
 
     let outcome = client
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &sender_jid,
             crate::types::events::DecryptFailMode::Show,
@@ -413,7 +413,7 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
 
     let outcome = client
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &sender_jid,
             crate::types::events::DecryptFailMode::Show,
@@ -504,7 +504,7 @@ async fn test_empty_session_record_treated_as_session_not_found() {
     let outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &sender_jid,
             crate::types::events::DecryptFailMode::Show,
@@ -862,7 +862,7 @@ async fn submit_and_check_session(
     let outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             peer_jid,
             crate::types::events::DecryptFailMode::Show,
@@ -1005,7 +1005,7 @@ async fn migration_plaintext_failure_nacks_without_signal_retry() {
     let outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &alice_lid,
             crate::types::events::DecryptFailMode::Show,
@@ -1139,7 +1139,7 @@ async fn test_badmac_preserves_session() {
     let outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &alice.jid,
             crate::types::events::DecryptFailMode::Show,
@@ -1303,7 +1303,7 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
     let _outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &alice.jid,
             crate::types::events::DecryptFailMode::Show,
@@ -2272,7 +2272,7 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
     // This should handle any errors gracefully without panicking
     let outcome = client
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &sender_jid,
             crate::types::events::DecryptFailMode::Show,
@@ -2361,7 +2361,7 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
     // Should handle all errors gracefully without stopping at first error
     let outcome = client
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &sender_jid,
             crate::types::events::DecryptFailMode::Show,
@@ -2436,7 +2436,7 @@ async fn test_untrusted_identity_in_group_context() {
     // Should handle errors gracefully in group context
     let outcome = client
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &sender_phone,
             crate::types::events::DecryptFailMode::Show,
@@ -5588,7 +5588,7 @@ async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
     };
 
     let outcome = client
-        .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
+        .process_session_enc_batch(vec![bad_payload], &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     assert!(!outcome.decrypted);
@@ -5631,7 +5631,7 @@ async fn signal_message_parse_error_dispatches_parsing_error_nack() {
     };
 
     let outcome = client
-        .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
+        .process_session_enc_batch(vec![bad_payload], &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     assert!(outcome.undecryptable);
@@ -8564,10 +8564,10 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
         .persistence_manager
         .backend()
         .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
-            chat: chat.to_string(),
-            sender: chat.to_string(),
-            msg_id: parent_id.to_string(),
-            secret: secret.to_vec(),
+            chat: chat.into(),
+            sender: chat.into(),
+            msg_id: parent_id.into(),
+            secret: Box::new(secret),
             expires_at: 0,
             message_ts: parent_ts,
         }])
@@ -10755,10 +10755,10 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
         .persistence_manager
         .backend()
         .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
-            chat: group.to_non_ad_string(),
-            sender: author.to_non_ad_string(),
-            msg_id: PARENT_ID.to_string(),
-            secret: secret.to_vec(),
+            chat: group.to_non_ad_string().into(),
+            sender: author.to_non_ad_string().into(),
+            msg_id: PARENT_ID.into(),
+            secret: Box::new(secret),
             expires_at: 0,
             message_ts: 0,
         }])
@@ -10847,10 +10847,10 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         .persistence_manager
         .backend()
         .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
-            chat: group.to_non_ad_string(),
-            sender: author.to_non_ad_string(),
-            msg_id: PARENT_ID.to_string(),
-            secret: secret.to_vec(),
+            chat: group.to_non_ad_string().into(),
+            sender: author.to_non_ad_string().into(),
+            msg_id: PARENT_ID.into(),
+            secret: Box::new(secret),
             expires_at: 0,
             message_ts: 0,
         }])
@@ -11070,7 +11070,7 @@ async fn bench_feed(
     let outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             peer,
             crate::types::events::DecryptFailMode::Show,
@@ -11279,7 +11279,7 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
     let outcome = client
         .clone()
         .process_session_enc_batch(
-            &payloads,
+            payloads,
             &info,
             &alice.jid,
             crate::types::events::DecryptFailMode::Show,

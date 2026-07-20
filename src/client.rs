@@ -239,6 +239,13 @@ pub struct MemoryReport {
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
+    /// Queued/running history-sync tasks and their retained compressed-payload
+    /// allocation estimate.
+    pub history_sync_tasks: CollectionStats,
+    /// Lifetime high-water mark of queued/running history-sync tasks.
+    pub history_sync_tasks_peak: u64,
+    /// Lifetime high-water mark of retained compressed-payload storage.
+    pub history_sync_payload_bytes_peak: u64,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     pub chat_lanes: u64,
@@ -267,7 +274,7 @@ impl MemoryReport {
     /// Every byte-carrying collection with its display name — the single list
     /// [`Self::total_estimated_bytes`] and `Display` derive from, so a new
     /// collection cannot be summed but not shown (or vice versa).
-    fn collections(&self) -> [(&'static str, &CollectionStats); 10] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 11] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -279,6 +286,7 @@ impl MemoryReport {
             ("signal_sessions:", &self.signal_sessions),
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
+            ("history_sync_tasks:", &self.history_sync_tasks),
         ]
     }
 
@@ -298,8 +306,10 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
-        // caches; the rest are the Signal store caches.
+        // caches; the next SIGNAL_CACHES are Signal store caches. The final
+        // entry is transient history-sync retention.
         const TTL_BOUNDED: usize = 7;
+        const SIGNAL_CACHES: usize = 3;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
@@ -345,9 +355,25 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         writeln!(f, "--- Signal store caches ---")?;
-        for (name, c) in &collections[TTL_BOUNDED..] {
+        for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
         }
+        writeln!(f, "--- In-flight history sync ---")?;
+        line(
+            f,
+            collections[TTL_BOUNDED + SIGNAL_CACHES].0,
+            &self.history_sync_tasks,
+        )?;
+        writeln!(
+            f,
+            "  peak tasks:             {}",
+            self.history_sync_tasks_peak
+        )?;
+        writeln!(
+            f,
+            "  peak payload storage:   {} B",
+            self.history_sync_payload_bytes_peak
+        )?;
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
@@ -706,10 +732,9 @@ pub struct Client {
     /// Empty (zero capacity) outside the offline window.
     pub(crate) offline_receipt_buffer:
         std::sync::Mutex<Vec<Arc<crate::types::message::MessageInfo>>>,
-    /// Number of history sync tasks currently queued or running.
-    pub(crate) history_sync_tasks_in_flight: Arc<AtomicUsize>,
-    /// Notifier triggered when history sync work becomes idle.
-    pub(crate) history_sync_idle_notifier: Arc<event_listener::Event>,
+    /// Task count, retained payload storage, peaks, and idle notification for
+    /// history sync work.
+    pub(crate) history_sync_activity: Arc<crate::sync_task::HistorySyncActivity>,
     /// Flushed by `disconnect()`/`reconnect()` before tearing down the transport
     /// so in-flight delivery receipts aren't dropped with `NotConnected`
     /// (issue #571).

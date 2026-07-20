@@ -12,7 +12,8 @@ pub(crate) mod aes_gcm;
 mod provider;
 
 pub use aes_cbc::{
-    DecryptionError, EncryptionError, aes_256_cbc_decrypt_into, aes_256_cbc_encrypt_into,
+    DecryptionError, EncryptionError, aes_256_cbc_decrypt_in_place, aes_256_cbc_decrypt_into,
+    aes_256_cbc_encrypt_into,
 };
 pub use aes_ctr::Aes256Ctr32;
 pub use aes_gcm::{Aes256GcmDecryption, Aes256GcmEncryption, Aes256GcmKey};
@@ -65,6 +66,12 @@ pub fn aes_256_gcm_decrypt(
 #[inline]
 pub fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; 32] {
     provider::provider().hmac_sha256(key, input)
+}
+
+/// HMAC-SHA256 over two logical input slices without concatenating them.
+#[inline]
+pub fn hmac_sha256_two_part(key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32] {
+    provider::provider().hmac_sha256_two_part(key, first, second)
 }
 
 /// In-place AES-256-GCM seal. On entry `buffer` holds the plaintext; on return

@@ -23,11 +23,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use portable_atomic::AtomicU64;
 use wacore::store::traits::MsgSecretEntry;
 
-type Key = (String, String, String);
+type Key = (Arc<str>, Arc<str>, Arc<str>);
 
 pub(crate) struct MsgSecretWriteBuffer {
-    // Values are Arc so the flush snapshot (values().cloned()) is a refcount bump
-    // instead of a full deep clone of every pending entry (3 Strings + a Vec each).
+    // Values are Arc so the flush snapshot is a refcount bump instead of a
+    // deep clone of every entry and its fixed-size secret allocation.
     pending: Mutex<HashMap<Key, Arc<MsgSecretEntry>>>,
     /// Set by the terminal disconnect. A sealed buffer writes every queue
     /// inline (the old synchronous semantics), so a lane worker still
@@ -130,8 +130,8 @@ impl MsgSecretWriteBuffer {
     pub(crate) fn lookup(&self, chat: &str, sender: &str, msg_id: &str) -> Option<(Vec<u8>, i64)> {
         let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending
-            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|e| (e.secret.clone(), e.message_ts))
+            .get(&(Arc::from(chat), Arc::from(sender), Arc::from(msg_id)))
+            .map(|e| (e.secret.to_vec(), e.message_ts))
     }
 
     fn schedule_drain(self: &Arc<Self>) {
@@ -238,10 +238,10 @@ mod tests {
 
     fn entry(chat: &str, sender: &str, id: &str, secret: u8) -> MsgSecretEntry {
         MsgSecretEntry {
-            chat: chat.to_string(),
-            sender: sender.to_string(),
-            msg_id: id.to_string(),
-            secret: vec![secret; 32],
+            chat: Arc::from(chat),
+            sender: Arc::from(sender),
+            msg_id: Arc::from(id),
+            secret: Box::new([secret; wacore::reporting_token::MESSAGE_SECRET_SIZE]),
             expires_at: 0,
             message_ts: 7,
         }
@@ -407,9 +407,9 @@ mod tests {
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "K", 0x33))
             .await;
         let key = (
-            "g@g.us".to_string(),
-            "a@s.whatsapp.net".to_string(),
-            "K".to_string(),
+            Arc::from("g@g.us"),
+            Arc::from("a@s.whatsapp.net"),
+            Arc::from("K"),
         );
         let current = buf
             .pending
@@ -452,9 +452,9 @@ mod tests {
             .lock()
             .unwrap()
             .get(&(
-                "g@g.us".to_string(),
-                "a@s.whatsapp.net".to_string(),
-                "PARENT".to_string(),
+                Arc::from("g@g.us"),
+                Arc::from("a@s.whatsapp.net"),
+                Arc::from("PARENT"),
             ))
             .cloned()
             .expect("entry pending");

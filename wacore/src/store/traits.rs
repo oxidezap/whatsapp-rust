@@ -12,7 +12,13 @@ use crate::store::error::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use wacore_appstate::processor::AppStateMutationMAC;
+
+/// Heap-backed, protocol-sized message secret. The thin `Box` keeps
+/// [`MsgSecretEntry`] compact inside large batches while making invalid secret
+/// lengths unrepresentable.
+pub type MessageSecret = Box<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>;
 
 /// App state synchronization key for WhatsApp's app state protocol.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,10 +59,15 @@ pub struct TcTokenEntry {
 /// Message-secret write entry keyed by chat, sender, and message ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsgSecretEntry {
-    pub chat: String,
-    pub sender: String,
-    pub msg_id: String,
-    pub secret: Vec<u8>,
+    /// Canonical non-AD chat JID. Shared across entries from the same history
+    /// conversation instead of allocating one identical string per message.
+    pub chat: Arc<str>,
+    /// Canonical non-AD sender JID. Often aliases `chat` for direct messages.
+    pub sender: Arc<str>,
+    /// Message identifier. `Arc<str>` keeps entry clones used by buffered
+    /// persistence cheap without changing the serialized representation.
+    pub msg_id: Arc<str>,
+    pub secret: MessageSecret,
     /// Absolute unix-seconds retention deadline. `0` means never expire.
     /// Computed by the caller from the parent message's event time plus a
     /// per-add-on-kind horizon (see `MsgSecretRetention`). The store prunes
@@ -687,7 +698,7 @@ pub trait DeviceStore: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MsgSecretStore: Send + Sync {
-    /// Persist `secret` (typically 32 bytes) under the composite key with NO
+    /// Persist the protocol-sized `secret` under the composite key with NO
     /// expiry (`expires_at = 0`). Convenience wrapper over [`put_msg_secrets`].
     /// `chat`, `sender`, and `msg_id` are JID strings / message ID strings;
     /// callers should pass non-AD (no-device) form for the JIDs so lookups
@@ -702,13 +713,13 @@ pub trait MsgSecretStore: Send + Sync {
         chat: &str,
         sender: &str,
         msg_id: &str,
-        secret: &[u8],
+        secret: &[u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
     ) -> Result<()> {
         self.put_msg_secrets(vec![MsgSecretEntry {
-            chat: chat.to_string(),
-            sender: sender.to_string(),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
+            chat: Arc::from(chat),
+            sender: Arc::from(sender),
+            msg_id: Arc::from(msg_id),
+            secret: Box::new(*secret),
             expires_at: 0,
             message_ts: 0,
         }])
