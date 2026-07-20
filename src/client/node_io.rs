@@ -507,7 +507,7 @@ impl Client {
                 self.handle_ack_response_arc(&node);
             }
             "receipt" => {
-                self.handle_receipt_inline(Arc::clone(&node));
+                self.handle_receipt_inline(node);
             }
             "message" => {
                 crate::handlers::message::MessageHandler::handle_inline(
@@ -531,7 +531,6 @@ impl Client {
             }
         }
 
-        // Send the deferred ACK if applicable and not cancelled by handler
         if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }

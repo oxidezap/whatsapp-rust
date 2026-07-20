@@ -15,10 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use wacore_appstate::processor::AppStateMutationMAC;
 
-/// Heap-backed, protocol-sized message secret. The thin `Box` keeps
-/// [`MsgSecretEntry`] compact inside large batches while making invalid secret
-/// lengths unrepresentable.
-pub type MessageSecret = Box<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>;
+/// Inline protocol-sized message secret. The array makes invalid lengths
+/// unrepresentable without a heap allocation or pointer indirection per row.
+pub type MessageSecret = [u8; crate::reporting_token::MESSAGE_SECRET_SIZE];
 
 /// App state synchronization key for WhatsApp's app state protocol.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -719,7 +718,7 @@ pub trait MsgSecretStore: Send + Sync {
             chat: Arc::from(chat),
             sender: Arc::from(sender),
             msg_id: Arc::from(msg_id),
-            secret: Box::new(*secret),
+            secret: *secret,
             expires_at: 0,
             message_ts: 0,
         }])

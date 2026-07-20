@@ -826,6 +826,7 @@ impl Client {
     /// like [`ChatActions`] and [`Labels`](crate::Labels) wrap it.
     ///
     /// ```no_run
+    /// # #![recursion_limit = "512"]
     /// # async fn ex(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
     /// use whatsapp_rust::schemas;
     /// use whatsapp_rust::waproto::whatsapp as wa;

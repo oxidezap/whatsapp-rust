@@ -8567,7 +8567,7 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
             chat: chat.into(),
             sender: chat.into(),
             msg_id: parent_id.into(),
-            secret: Box::new(secret),
+            secret,
             expires_at: 0,
             message_ts: parent_ts,
         }])
@@ -10758,7 +10758,7 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
             chat: group.to_non_ad_string().into(),
             sender: author.to_non_ad_string().into(),
             msg_id: PARENT_ID.into(),
-            secret: Box::new(secret),
+            secret,
             expires_at: 0,
             message_ts: 0,
         }])
@@ -10850,7 +10850,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             chat: group.to_non_ad_string().into(),
             sender: author.to_non_ad_string().into(),
             msg_id: PARENT_ID.into(),
-            secret: Box::new(secret),
+            secret,
             expires_at: 0,
             message_ts: 0,
         }])

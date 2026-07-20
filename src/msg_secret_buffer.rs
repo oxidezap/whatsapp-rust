@@ -15,7 +15,9 @@
 //! between ack and flush: a process crash inside it loses those secrets, which
 //! matches WA Web (IndexedDB persistence is asynchronous there too).
 
-use std::collections::HashMap;
+use hashbrown::{Equivalent, HashMap};
+use std::collections::hash_map::RandomState;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,12 +25,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use portable_atomic::AtomicU64;
 use wacore::store::traits::MsgSecretEntry;
 
-type Key = (Arc<str>, Arc<str>, Arc<str>);
+#[derive(Eq, Hash, PartialEq)]
+struct Key {
+    chat: Arc<str>,
+    sender: Arc<str>,
+    msg_id: Arc<str>,
+}
+
+#[derive(Hash)]
+struct KeyRef<'a> {
+    chat: &'a str,
+    sender: &'a str,
+    msg_id: &'a str,
+}
+
+impl Equivalent<Key> for KeyRef<'_> {
+    fn equivalent(&self, key: &Key) -> bool {
+        self.chat == key.chat.as_ref()
+            && self.sender == key.sender.as_ref()
+            && self.msg_id == key.msg_id.as_ref()
+    }
+}
+
+type Pending = HashMap<Key, Arc<MsgSecretEntry>, RandomState>;
 
 pub(crate) struct MsgSecretWriteBuffer {
-    // Values are Arc so the flush snapshot is a refcount bump instead of a
-    // deep clone of every entry and its fixed-size secret allocation.
-    pending: Mutex<HashMap<Key, Arc<MsgSecretEntry>>>,
+    // Values are Arc so the flush snapshot is a refcount bump. Materializing
+    // the backend-owned batch later copies only Arc handles and inline bytes.
+    pending: Mutex<Pending>,
     /// Set by the terminal disconnect. A sealed buffer writes every queue
     /// inline (the old synchronous semantics), so a lane worker still
     /// draining its backlog after the shutdown flush cannot strand a secret
@@ -54,7 +78,7 @@ impl MsgSecretWriteBuffer {
         runtime: Arc<dyn wacore::runtime::Runtime>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::with_hasher(RandomState::new())),
             sealed: AtomicBool::new(false),
             write_lock: async_lock::Mutex::new(()),
             drain_in_flight: AtomicBool::new(false),
@@ -91,14 +115,14 @@ impl MsgSecretWriteBuffer {
         self.schedule_or_flush().await;
     }
 
-    fn insert_pending(pending: &mut HashMap<Key, Arc<MsgSecretEntry>>, mut entry: MsgSecretEntry) {
+    fn insert_pending(pending: &mut Pending, mut entry: MsgSecretEntry) {
         use wacore::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
 
-        let key = (
-            entry.chat.clone(),
-            entry.sender.clone(),
-            entry.msg_id.clone(),
-        );
+        let key = Key {
+            chat: entry.chat.clone(),
+            sender: entry.sender.clone(),
+            msg_id: entry.msg_id.clone(),
+        };
         // Coalesced captures merge retention metadata like sequential backend writes.
         if let Some(existing) = pending.get(&key) {
             entry.expires_at = merge_msg_secret_expiry(existing.expires_at, entry.expires_at);
@@ -130,7 +154,11 @@ impl MsgSecretWriteBuffer {
     pub(crate) fn lookup(&self, chat: &str, sender: &str, msg_id: &str) -> Option<(Vec<u8>, i64)> {
         let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending
-            .get(&(Arc::from(chat), Arc::from(sender), Arc::from(msg_id)))
+            .get(&KeyRef {
+                chat,
+                sender,
+                msg_id,
+            })
             .map(|e| (e.secret.to_vec(), e.message_ts))
     }
 
@@ -178,9 +206,9 @@ impl MsgSecretWriteBuffer {
         if batch.is_empty() {
             return false;
         }
-        // put_msg_secrets owns its Vec; unwrap the Arcs once here. The owned-map
-        // version deep-cloned the whole batch twice (snapshot + the put clone);
-        // now the snapshot is a refcount bump and only this unwrap deep-copies.
+        // put_msg_secrets owns its Vec; materialize it once here. Entry clones
+        // only bump the three Arc handles and copy the inline fixed-size data,
+        // with no per-entry heap allocation.
         let owned: Vec<MsgSecretEntry> = batch.iter().map(|e| (**e).clone()).collect();
         if let Err(e) = self.backend.put_msg_secrets(owned).await {
             // Same semantics as the previously awaited write: warn + drop.
@@ -241,7 +269,7 @@ mod tests {
             chat: Arc::from(chat),
             sender: Arc::from(sender),
             msg_id: Arc::from(id),
-            secret: Box::new([secret; wacore::reporting_token::MESSAGE_SECRET_SIZE]),
+            secret: [secret; wacore::reporting_token::MESSAGE_SECRET_SIZE],
             expires_at: 0,
             message_ts: 7,
         }
@@ -276,6 +304,46 @@ mod tests {
             .await
             .expect("backend read");
         assert_eq!(stored.as_deref(), Some(&[0x11u8; 32][..]));
+    }
+
+    /// A buffered lookup allocates only the returned `Vec<u8>`; hashing and
+    /// comparing the three borrowed key components must remain allocation-free.
+    #[tokio::test]
+    async fn lookup_borrows_composite_key_without_allocating() {
+        let buf = buffer().await;
+        buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11))
+            .await;
+
+        // Sibling tests share the process-wide counter, so take the minimum of
+        // repeated windows. The result Vec costs exactly one allocation; an
+        // owned lookup key would add one allocation per component every time.
+        let mut min_delta = u64::MAX;
+        for _ in 0..100 {
+            let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+            let result = buf.lookup("g@g.us", "a@s.whatsapp.net", "M1");
+            std::hint::black_box(&result);
+            let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+            min_delta = min_delta.min(after - before);
+        }
+        assert_eq!(min_delta, 1, "only the returned secret Vec may allocate");
+
+        buf.wait_flushed().await;
+    }
+
+    /// Cloning a buffered entry must stay allocation-free: identifiers share
+    /// their Arc allocations and the protocol-sized secret lives inline.
+    #[test]
+    fn entry_clone_does_not_heap_allocate() {
+        let entry = entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11);
+        let mut min_delta = u64::MAX;
+        for _ in 0..100 {
+            let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+            let cloned = std::hint::black_box(&entry).clone();
+            std::hint::black_box(cloned);
+            let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+            min_delta = min_delta.min(after - before);
+        }
+        assert_eq!(min_delta, 0, "an entry clone must not allocate");
     }
 
     /// A burst of captures queued before the drain task gets polled must land
@@ -406,11 +474,11 @@ mod tests {
         // Re-queue byte-identical content.
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "K", 0x33))
             .await;
-        let key = (
-            Arc::from("g@g.us"),
-            Arc::from("a@s.whatsapp.net"),
-            Arc::from("K"),
-        );
+        let key = KeyRef {
+            chat: "g@g.us",
+            sender: "a@s.whatsapp.net",
+            msg_id: "K",
+        };
         let current = buf
             .pending
             .lock()
@@ -451,11 +519,11 @@ mod tests {
             .pending
             .lock()
             .unwrap()
-            .get(&(
-                Arc::from("g@g.us"),
-                Arc::from("a@s.whatsapp.net"),
-                Arc::from("PARENT"),
-            ))
+            .get(&KeyRef {
+                chat: "g@g.us",
+                sender: "a@s.whatsapp.net",
+                msg_id: "PARENT",
+            })
             .cloned()
             .expect("entry pending");
         assert_eq!(pending.expires_at, 0, "never-expire must win");

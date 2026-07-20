@@ -150,13 +150,8 @@ impl HistorySecretSeedCollector {
             return;
         };
 
-        let mut senders =
+        let senders =
             history_msg_secret_senders(chat, record, self.own_pn.as_ref(), self.own_lid.as_ref());
-        if chat.is_bot()
-            && let Some(lid) = self.own_lid.as_ref()
-        {
-            push_unique_sender(&mut senders, lid.to_non_ad());
-        }
         if senders.iter().all(Option::is_none) {
             return;
         }
@@ -177,7 +172,7 @@ impl HistorySecretSeedCollector {
                 chat: Arc::clone(&chat_id),
                 sender: sender_id,
                 msg_id: Arc::clone(&msg_id),
-                secret: Box::new(secret),
+                secret,
                 expires_at,
                 message_ts,
             });
@@ -614,7 +609,7 @@ impl Client {
 }
 
 /// At most two aliases are persisted for one secret: the account's PN/LID
-/// pair for an outgoing message, or a bot chat plus the account LID.
+/// pair for an outgoing message, or an incoming bot chat plus the account LID.
 const MAX_HISTORY_SECRET_SENDERS: usize = 2;
 type HistorySecretSenders = [Option<Jid>; MAX_HISTORY_SECRET_SENDERS];
 
@@ -638,6 +633,11 @@ fn history_msg_secret_senders(
 
     if chat.is_pn() || chat.is_lid() || chat.is_bot() {
         push_unique_sender(&mut senders, chat.to_non_ad());
+        if chat.is_bot()
+            && let Some(lid) = own_lid
+        {
+            push_unique_sender(&mut senders, lid.to_non_ad());
+        }
         return senders;
     }
 
@@ -677,6 +677,43 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&raw).expect("zlib write");
         encoder.finish().expect("zlib finish")
+    }
+
+    fn sender_record(from_me: bool) -> HistoryMsgSecretRecordRef<'static> {
+        HistoryMsgSecretRecordRef {
+            conversation_index: 0,
+            chat_id: "",
+            from_me,
+            key_participant: None,
+            web_msg_participant: None,
+            msg_id: "M",
+            secret: &[],
+            timestamp: None,
+            is_poll_or_event: false,
+            is_bot_invocation: false,
+        }
+    }
+
+    #[test]
+    fn fixed_sender_capacity_covers_outgoing_and_incoming_bot_aliases() {
+        let pn: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
+        let lid: Jid = "111222333444555@lid".parse().unwrap();
+        let bot: Jid = "867051314767696@bot".parse().unwrap();
+
+        let outgoing = history_msg_secret_senders(&bot, sender_record(true), Some(&pn), Some(&lid));
+        assert_eq!(
+            outgoing.into_iter().flatten().collect::<Vec<_>>(),
+            vec![lid.to_non_ad(), pn.to_non_ad()],
+            "outgoing messages return before the chat-alias branch"
+        );
+
+        let incoming =
+            history_msg_secret_senders(&bot, sender_record(false), Some(&pn), Some(&lid));
+        assert_eq!(
+            incoming.into_iter().flatten().collect::<Vec<_>>(),
+            vec![bot.to_non_ad(), lid.to_non_ad()],
+            "incoming bot messages retain the chat and account-LID aliases"
+        );
     }
 
     #[tokio::test]

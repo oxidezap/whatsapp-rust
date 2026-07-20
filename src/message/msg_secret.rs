@@ -96,7 +96,7 @@ impl Client {
             chat: chat.to_non_ad_string().into(),
             sender: sender.to_non_ad_string().into(),
             msg_id: msg_id.into(),
-            secret: Box::new(*secret),
+            secret: *secret,
             expires_at,
             message_ts: message_ts.and_then(|t| i64::try_from(t).ok()).unwrap_or(0),
         })
