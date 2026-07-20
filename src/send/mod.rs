@@ -3956,8 +3956,7 @@ mod tests {
         }
 
         /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
-        /// order matters — this is the shape the upstream Baileys
-        /// reproducer emits.
+        /// order matters because it is part of the wire shape.
         #[test]
         fn dm_emits_bot_before_biz() {
             let nodes = build_extra_stanza_nodes(

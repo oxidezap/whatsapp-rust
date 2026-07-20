@@ -750,7 +750,7 @@ impl Client {
     /// Force-refresh the server's one-time pre-key pool with a fresh batch.
     ///
     /// Intended for callers that just restored a device from an external source
-    /// (e.g., migrating a Baileys session into an `InMemoryBackend`). The server
+    /// into an `InMemoryBackend`. The server
     /// may still hold pre-key IDs whose private key material the caller cannot
     /// reconstruct; any `pkmsg` referencing those IDs will fail forever with
     /// `InvalidPreKeyId`. Uploading a fresh batch gives the server new IDs the

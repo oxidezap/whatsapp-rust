@@ -288,7 +288,7 @@ pub enum EventDelivery {
     Concurrent,
     /// Events are delivered to the callbacks strictly in arrival order through a
     /// single bounded mailbox drained by one task — the ordered `messages.upsert`
-    /// contract of WA Web (`preserveOrder`), whatsmeow and Baileys. Bounds
+    /// contract used by interoperable clients. Bounds
     /// memory: when the mailbox is full the event is dropped and counted in
     /// [`StatsSnapshot::events_dropped`](wacore::stats::StatsSnapshot::events_dropped)
     /// instead of blocking the receive pipeline or growing without limit.
@@ -1059,8 +1059,8 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 
     /// Choose how registered callbacks receive events. Defaults to
     /// [`EventDelivery::Concurrent`]; use [`EventDelivery::Ordered`] for
-    /// in-arrival-order, bounded delivery (the WA Web / whatsmeow / Baileys
-    /// contract). Only affects the closure-based callbacks, not raw
+    /// in-arrival-order, bounded delivery. Only affects the closure-based
+    /// callbacks, not raw
     /// [`with_event_handler`](Self::with_event_handler) handlers, which always
     /// run inline on the dispatch path.
     pub fn with_event_delivery(mut self, delivery: EventDelivery) -> Self {
@@ -1465,8 +1465,7 @@ mod tests {
     }
 
     /// `EventDelivery::Ordered` delivers events to a callback in arrival order —
-    /// the WA Web / whatsmeow / Baileys contract the concurrent default can't
-    /// promise.
+    /// the ordered consumer contract the concurrent default can't promise.
     #[tokio::test]
     async fn ordered_delivery_preserves_arrival_order() {
         let client = test_client().await;
