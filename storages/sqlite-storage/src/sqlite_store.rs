@@ -3379,11 +3379,11 @@ impl MsgSecretStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.immediate_transaction(|conn| {
                     let mut stored = 0usize;
-                    for entries in entries.chunks(MSG_SECRET_INSERT_CHUNK_SIZE) {
+                    for chunk in entries.chunks(MSG_SECRET_INSERT_CHUNK_SIZE) {
                         // Materialize only the expressions used by this SQL
                         // statement. The previous full-batch Vec doubled the
                         // transient cost before processing these same chunks.
-                        let records: Vec<_> = entries
+                        let records: Vec<_> = chunk
                             .iter()
                             .map(|entry| {
                                 (
