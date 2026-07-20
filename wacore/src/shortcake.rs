@@ -32,6 +32,7 @@ use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use crate::pair_code::PairCodeUtils;
 use buffa::Enumeration;
+#[cfg(test)]
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as _, Mac};
 use rand::RngExt;
@@ -186,10 +187,14 @@ impl ShortcakeUtils {
             "Companion Pairing {} with ref {ref_str}",
             device_type.to_i32()
         );
-        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), shared_secret);
         let mut key = [0u8; 32];
-        hk.expand(ENC_KEY_INFO, &mut key)
-            .map_err(|_| ShortcakeError::Hkdf("encryption_key"))?;
+        crate::crypto::hkdf_sha256_into(
+            shared_secret,
+            Some(salt.as_bytes()),
+            ENC_KEY_INFO,
+            &mut key,
+        )
+        .map_err(|_| ShortcakeError::Hkdf("encryption_key"))?;
         Ok(key)
     }
 
@@ -253,9 +258,8 @@ impl ShortcakeUtils {
     pub fn derive_pairing_handoff_hmac_key(
         prior_adv_secret: &[u8; 32],
     ) -> Result<[u8; 32], ShortcakeError> {
-        let hk = Hkdf::<Sha256>::new(None, prior_adv_secret);
         let mut key = [0u8; 32];
-        hk.expand(HANDOFF_INFO, &mut key)
+        crate::crypto::hkdf_sha256_into(prior_adv_secret, None, HANDOFF_INFO, &mut key)
             .map_err(|_| ShortcakeError::Hkdf("handoff_key"))?;
         Ok(key)
     }

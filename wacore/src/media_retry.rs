@@ -12,9 +12,7 @@
 
 use anyhow::{Result, anyhow};
 use buffa::MessageView;
-use hkdf::Hkdf;
 use rand::Rng;
-use sha2::Sha256;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeContentRef, NodeRef};
@@ -40,9 +38,8 @@ pub enum MediaRetryResult {
 ///
 /// WA Web: `WACryptoHkdf.extractAndExpand(mediaKey, "WhatsApp Media Retry Notification", 32)`
 fn derive_media_retry_key(media_key: &[u8]) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(None, media_key);
     let mut key = [0u8; 32];
-    hk.expand(MEDIA_RETRY_HKDF_INFO.as_bytes(), &mut key)
+    crate::crypto::hkdf_sha256_into(media_key, None, MEDIA_RETRY_HKDF_INFO.as_bytes(), &mut key)
         .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
     Ok(key)
 }

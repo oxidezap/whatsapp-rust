@@ -3,7 +3,6 @@ use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
 use base64::Engine as _;
 use base64::prelude::*;
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 
 use sha2::Sha256;
@@ -409,8 +408,7 @@ impl PairUtils {
 
         // Encrypt the final message
         let mut encryption_key = [0u8; 32];
-        Hkdf::<Sha256>::new(None, &shared_secret)
-            .expand(b"WA-Ads-Key", &mut encryption_key)
+        crate::crypto::hkdf_sha256_into(&shared_secret, None, b"WA-Ads-Key", &mut encryption_key)
             .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
         let nonce = [0u8; 12];
         let mut encrypted = Vec::with_capacity(final_message.len() + 16);

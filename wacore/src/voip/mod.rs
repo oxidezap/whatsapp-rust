@@ -62,18 +62,11 @@ pub use transport::{
 // from these would silently produce a broken (or insecure) stack. They stay reachable only as
 // `#[doc(hidden)]` in their source modules so the in-tree benchmark crate can drive them.
 
-use hkdf::Hkdf;
-use sha2::Sha256;
-
 /// HKDF-SHA256 (extract with `salt`, expand with `info`): the one KDF shape all of
 /// WhatsApp's VoIP key derivations reduce to.
 pub(crate) fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     debug_assert!(len <= 255 * 32, "HKDF-SHA256 max output is 8160 bytes");
-    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    let mut okm = vec![0u8; len];
-    hk.expand(info, &mut okm)
-        .expect("HKDF length within bounds");
-    okm
+    crate::crypto::hkdf_sha256(ikm, len, Some(salt), info).expect("HKDF length within bounds")
 }
 
 /// Device-qualified participant id used as HKDF `info` for both E2E-SRTP and SFrame: strip the

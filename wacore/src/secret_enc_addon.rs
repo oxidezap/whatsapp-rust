@@ -22,8 +22,6 @@
 //! - everything else (edits, reactions, comments, poll add option) → empty
 
 use anyhow::{Result, anyhow};
-use hkdf::Hkdf;
-use sha2::Sha256;
 
 use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 
@@ -117,9 +115,8 @@ pub fn derive_use_case_secret(
     info.extend_from_slice(ctx.modification_sender.as_bytes());
     info.extend_from_slice(ctx.modification_type.as_str().as_bytes());
 
-    let hk = Hkdf::<Sha256>::new(None, message_secret);
     let mut key = [0u8; KEY_SIZE];
-    hk.expand(&info, &mut key)
+    crate::crypto::hkdf_sha256_into(message_secret, None, &info, &mut key)
         .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
     Ok(key)
 }
