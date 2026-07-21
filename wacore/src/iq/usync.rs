@@ -69,6 +69,11 @@ mod query;
 
 pub use query::*;
 
+const USYNC_ERROR_PREFIX: &str = "usync ";
+const USYNC_ERROR_CODE_SEPARATOR: &str = " error ";
+const USYNC_ERROR_TEXT_SEPARATOR: &str = ": ";
+const UNKNOWN_ERROR_CODE: &str = "unknown";
+
 /// Usync mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum UsyncMode {
@@ -118,12 +123,27 @@ pub struct UsyncSubprotocolError {
 }
 
 fn usync_subprotocol_error_message(tag: &str, error: &UsyncSubprotocolError) -> String {
+    let mut code_buffer = itoa::Buffer::new();
     let code = error
         .code
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let text = error.text.as_deref().unwrap_or("");
-    format!("usync {tag} error {code}: {text}")
+        .map(|code| code_buffer.format(code))
+        .unwrap_or(UNKNOWN_ERROR_CODE);
+    let text = error.text.as_deref().filter(|text| !text.is_empty());
+    let capacity = USYNC_ERROR_PREFIX.len()
+        + tag.len()
+        + USYNC_ERROR_CODE_SEPARATOR.len()
+        + code.len()
+        + text.map_or(0, |text| USYNC_ERROR_TEXT_SEPARATOR.len() + text.len());
+    let mut message = String::with_capacity(capacity);
+    message.push_str(USYNC_ERROR_PREFIX);
+    message.push_str(tag);
+    message.push_str(USYNC_ERROR_CODE_SEPARATOR);
+    message.push_str(code);
+    if let Some(text) = text {
+        message.push_str(USYNC_ERROR_TEXT_SEPARATOR);
+        message.push_str(text);
+    }
+    message
 }
 
 #[derive(Debug, Clone)]
@@ -1237,6 +1257,28 @@ mod tests {
 
         let err = spec.parse_response(&response.as_node_ref()).unwrap_err();
         assert!(err.to_string().contains("usync status error 403: blocked"));
+    }
+
+    #[test]
+    fn subprotocol_error_message_omits_empty_text_separator() {
+        let error = |text| UsyncSubprotocolError {
+            code: Some(401),
+            text,
+            backoff: None,
+        };
+
+        assert_eq!(
+            usync_subprotocol_error_message("status", &error(None)),
+            "usync status error 401"
+        );
+        assert_eq!(
+            usync_subprotocol_error_message("status", &error(Some(String::new()))),
+            "usync status error 401"
+        );
+        assert_eq!(
+            usync_subprotocol_error_message("status", &error(Some("blocked".to_owned()))),
+            "usync status error 401: blocked"
+        );
     }
 
     #[test]
