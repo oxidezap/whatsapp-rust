@@ -14,6 +14,7 @@ members = [
     ".",
     "examples/voip-cli",
     "http_clients/ureq-client",
+    "plugins/metrics",
     "storages/chat-store",
     "storages/sqlite-storage",
     "tests/bench-integration",

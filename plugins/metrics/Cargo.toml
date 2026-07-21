@@ -1,0 +1,24 @@
+[package]
+name = "whatsapp-rust-plugin-metrics"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Reference external metrics plugin for whatsapp-rust"
+
+[dependencies]
+anyhow = { workspace = true }
+bon = { workspace = true }
+portable-atomic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+whatsapp-rust = { path = "../..", default-features = false, features = ["plugins"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+whatsapp-rust = { path = "../..", default-features = false, features = [
+    "plugins",
+    "tokio-runtime",
+] }
+
+[lints]
+workspace = true

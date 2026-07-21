@@ -139,25 +139,29 @@ impl PluginManifest {
     }
 }
 
+/// Target-correct future returned by native plugin entry points.
+pub type PluginFuture<'a, T> = BoxFuture<'a, T>;
+
 /// A trusted native plugin installed exactly once while the client is still inert.
 /// Capabilities shape the handles it receives; they are not an in-process sandbox.
+/// A plugin value belongs to one client installation, even when registered through an `Arc`.
 pub trait ClientPlugin: MaybeSendSync + 'static {
     type Api: MaybeSendSync + 'static;
 
     fn manifest(&self) -> PluginManifest;
 
-    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>>;
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, anyhow::Result<Arc<Self::Api>>>;
 
-    fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_ready(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn on_closed(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Release plugin-owned state. This may run after `install` began but returned an error.
-    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -329,6 +333,17 @@ impl PluginTasks {
 
     pub fn shutdown_signal(&self) -> ShutdownSignal {
         self.resources.shutdown.subscribe()
+    }
+
+    /// Sleep through the configured runtime, returning promptly when this plugin shuts down.
+    pub async fn sleep(&self, duration: Duration) -> Result<(), PluginResourceError> {
+        self.resources.ensure_active()?;
+        let shutdown = self.resources.shutdown.subscribe();
+        let cancelled = Box::pin(wait_for_shutdown(&shutdown));
+        match futures::future::select(cancelled, self.runtime.sleep(duration)).await {
+            futures::future::Either::Left(_) => Err(PluginResourceError::ShuttingDown),
+            futures::future::Either::Right(_) => self.resources.ensure_active(),
+        }
     }
 }
 
@@ -505,6 +520,22 @@ impl PluginConnectionTasks {
         }
         spawn_until_cancelled(&self.runtime, self.scope.cancellation_signal(), future);
         Ok(())
+    }
+
+    /// Sleep through the configured runtime, returning promptly when this generation retires.
+    pub async fn sleep(&self, duration: Duration) -> Result<(), PluginResourceError> {
+        if self.scope.is_cancelled() {
+            return Err(PluginResourceError::ShuttingDown);
+        }
+        let cancellation = self.scope.cancellation_signal();
+        let cancelled = Box::pin(wait_for_shutdown(&cancellation));
+        match futures::future::select(cancelled, self.runtime.sleep(duration)).await {
+            futures::future::Either::Left(_) => Err(PluginResourceError::ShuttingDown),
+            futures::future::Either::Right(_) if self.scope.is_cancelled() => {
+                Err(PluginResourceError::ShuttingDown)
+            }
+            futures::future::Either::Right(_) => Ok(()),
+        }
     }
 }
 
@@ -2212,6 +2243,44 @@ mod tests {
             tasks.spawn(async {}),
             Err(PluginResourceError::ShuttingDown)
         ));
+    }
+
+    #[tokio::test]
+    async fn task_sleeps_return_when_their_owner_is_cancelled() {
+        let resources = PluginResources::new();
+        resources.activate();
+        let install_tasks = PluginTasks {
+            runtime: Arc::new(TokioRuntime),
+            resources: resources.clone(),
+        };
+        let install_sleeper =
+            tokio::spawn(async move { install_tasks.sleep(Duration::from_secs(60)).await });
+        tokio::task::yield_now().await;
+        resources.close();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), install_sleeper)
+                .await
+                .expect("install sleep cancellation")
+                .expect("install sleeper task"),
+            Err(PluginResourceError::ShuttingDown)
+        );
+
+        let scope = ConnectionScope::new(91);
+        let connection_tasks = PluginConnectionTasks {
+            runtime: Arc::new(TokioRuntime),
+            scope: scope.clone(),
+        };
+        let connection_sleeper =
+            tokio::spawn(async move { connection_tasks.sleep(Duration::from_secs(60)).await });
+        tokio::task::yield_now().await;
+        scope.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), connection_sleeper)
+                .await
+                .expect("connection sleep cancellation")
+                .expect("connection sleeper task"),
+            Err(PluginResourceError::ShuttingDown)
+        );
     }
 
     struct UpstreamLifecycle {
