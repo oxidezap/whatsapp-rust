@@ -702,6 +702,19 @@ mod tests {
         }
     }
 
+    struct PanickingDisconnect;
+
+    #[async_trait]
+    impl crate::transport::Transport for PanickingDisconnect {
+        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            panic!("injected disconnect panic");
+        }
+    }
+
     struct BlockingReadyLifecycle {
         ready_started: async_channel::Sender<()>,
         release_ready: async_channel::Receiver<()>,
@@ -1127,6 +1140,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_last_client_owner_signals_standalone_lifecycle() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let lifecycle = Arc::new(EarlyShutdownLifecycle::default());
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle_arc(lifecycle.clone())
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+        let weak = Arc::downgrade(&client);
+
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background services released the client");
+        assert!(lifecycle.signalled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn cancellation_does_not_wait_for_a_running_callback() {
         let persistence_manager = Arc::new(
             PersistenceManager::new(crate::test_utils::create_test_backend().await)
@@ -1461,6 +1506,38 @@ mod tests {
             lifecycle.events(),
             vec!["install", "ready:37", "closed:37", "shutdown"]
         );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn detached_cleanup_propagates_panics_to_its_waiter() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle(RecordingLifecycle::default())
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+        *client.transport.lock().await = Some(Arc::new(PanickingDisconnect));
+
+        let cleanup_client = Arc::clone(&client);
+        let cleanup = tokio::spawn(async move {
+            cleanup_client.cleanup_connection_state().await;
+        });
+        let panic = tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .expect("cleanup waiter did not hang")
+            .expect_err("cleanup panic should reach its waiter");
+
+        assert!(panic.is_panic());
         client.signal_shutdown_sync();
     }
 

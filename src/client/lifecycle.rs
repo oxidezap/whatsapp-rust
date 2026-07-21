@@ -6,6 +6,12 @@ use super::*;
 /// accounts in more groups; an evicted entry just recomputes on next send.
 const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.signal_shutdown_sync();
+    }
+}
+
 impl Client {
     /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
     /// long is the reconnect backoff counter reset to its base.
@@ -387,10 +393,10 @@ impl Client {
             }))
             .detach();
 
-        let cleanup_arc = self.clone();
+        let cleanup_shutdown = self.shutdown_signal();
         self.runtime
             .spawn(Box::pin(async move {
-                cleanup_arc.device_registry_cleanup_loop().await;
+                Client::device_registry_cleanup_loop(cleanup_shutdown).await;
             }))
             .detach();
     }
@@ -843,16 +849,21 @@ impl Client {
         }
 
         // Scope closure must survive a caller dropping its cleanup waiter.
-        let completed = wacore::runtime::ShutdownNotifier::new();
-        let completion = completed.subscribe();
+        let (completed, completion) = futures::channel::oneshot::channel();
         let client = Arc::clone(self);
         self.runtime
             .spawn(Box::pin(async move {
-                client.cleanup_connection_state_inner().await;
-                completed.notify();
+                let result = std::panic::AssertUnwindSafe(client.cleanup_connection_state_inner())
+                    .catch_unwind()
+                    .await;
+                let _ = completed.send(result);
             }))
             .detach();
-        wacore::runtime::wait_for_shutdown(&completion).await;
+        match completion.await {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => error!("Detached connection cleanup stopped before completion"),
+        }
     }
 
     async fn cleanup_connection_state_inner(&self) {
