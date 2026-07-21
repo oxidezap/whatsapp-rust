@@ -1,5 +1,15 @@
 //! Build-time client plugins and their capability-scoped host.
 
+mod events;
+
+pub use events::{
+    PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
+    PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,
+    PluginEventReceiveError, PluginEventRouteError, PluginEventRouter, PluginEventSelector,
+    PluginEventSubscribeError, PluginEventSubscription, PluginEventTopic,
+    PluginEventTryReceiveError, PluginEvents,
+};
+
 use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -9,6 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use futures::FutureExt;
+use portable_atomic::AtomicU64;
 use thiserror::Error;
 use wacore::iq::spec::IqSpec;
 use wacore::runtime::{
@@ -29,6 +40,7 @@ const CAP_CORE_EVENTS: u8 = 1 << 0;
 const CAP_TASKS: u8 = 1 << 1;
 const CAP_MESSAGING: u8 = 1 << 2;
 const CAP_IQ: u8 = 1 << 3;
+const CAP_PLUGIN_EVENTS: u8 = 1 << 4;
 const PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A capability a plugin asks the host to expose during installation.
@@ -39,6 +51,7 @@ pub enum PluginCapability {
     Tasks,
     Messaging,
     Iq,
+    PluginEvents,
 }
 
 impl PluginCapability {
@@ -48,6 +61,7 @@ impl PluginCapability {
             Self::Tasks => "tasks.spawn",
             Self::Messaging => "messaging.send",
             Self::Iq => "iq.execute",
+            Self::PluginEvents => "events.plugin.publish",
         }
     }
 
@@ -57,6 +71,7 @@ impl PluginCapability {
             Self::Tasks => CAP_TASKS,
             Self::Messaging => CAP_MESSAGING,
             Self::Iq => CAP_IQ,
+            Self::PluginEvents => CAP_PLUGIN_EVENTS,
         }
     }
 }
@@ -408,6 +423,7 @@ pub struct PluginContext {
     tasks: Option<PluginTasks>,
     messaging: Option<PluginMessaging>,
     iq: Option<PluginIq>,
+    plugin_events: Option<PluginEvents>,
 }
 
 impl PluginContext {
@@ -436,6 +452,10 @@ impl PluginContext {
 
     pub fn iq(&self) -> Option<&PluginIq> {
         self.iq.as_ref()
+    }
+
+    pub fn plugin_events(&self) -> Option<&PluginEvents> {
+        self.plugin_events.as_ref()
     }
 }
 
@@ -887,6 +907,7 @@ pub(crate) struct PluginHost {
     installed: OnceLock<Vec<InstalledPlugin>>,
     apis: OnceLock<HashMap<TypeId, ErasedApi>>,
     runtime: OnceLock<Arc<dyn Runtime>>,
+    event_router: Option<PluginEventRouter>,
     callback_timeout: Duration,
 }
 
@@ -904,7 +925,18 @@ impl PluginHost {
             .ordered
             .iter()
             .map(|plugin| plugin.manifest.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        let event_publishers = manifests
+            .iter()
+            .filter(|manifest| {
+                manifest
+                    .capabilities
+                    .contains(PluginCapability::PluginEvents)
+            })
+            .map(|manifest| manifest.id.clone())
+            .collect::<Vec<_>>();
+        let event_router =
+            (!event_publishers.is_empty()).then(|| PluginEventRouter::new(event_publishers));
         Arc::new(Self {
             ordered: plan.ordered,
             manifests,
@@ -912,6 +944,7 @@ impl PluginHost {
             installed: OnceLock::new(),
             apis: OnceLock::new(),
             runtime: OnceLock::new(),
+            event_router,
             callback_timeout,
         })
     }
@@ -934,16 +967,17 @@ impl PluginHost {
     fn context(
         &self,
         client: &Weak<Client>,
-        manifest: &PluginManifest,
-        dependency_markers: &[TypeId],
+        planned: &PlannedPlugin,
         resources: Arc<PluginResources>,
         apis: Arc<ApiRegistry>,
         runtime: Arc<dyn Runtime>,
+        connection_generation: Arc<AtomicU64>,
     ) -> PluginContext {
+        let manifest = &planned.manifest;
         let capabilities = manifest.capabilities;
         PluginContext {
             plugin_id: manifest.id.clone(),
-            dependencies: apis.dependency_view(dependency_markers),
+            dependencies: apis.dependency_view(&planned.dependency_markers),
             core_events: capabilities
                 .contains(PluginCapability::CoreEvents)
                 .then(|| PluginCoreEvents {
@@ -967,6 +1001,18 @@ impl PluginHost {
                 .then(|| PluginIq {
                     client: client.clone(),
                     resources: Arc::clone(&resources),
+                }),
+            plugin_events: self
+                .event_router
+                .as_ref()
+                .filter(|_| capabilities.contains(PluginCapability::PluginEvents))
+                .map(|router| {
+                    events::publisher(
+                        &manifest.id,
+                        router.clone(),
+                        Arc::clone(&resources),
+                        connection_generation,
+                    )
                 }),
         }
     }
@@ -993,6 +1039,7 @@ impl PluginHost {
             anyhow::bail!("client was dropped during plugin installation");
         };
         let runtime = strong_client.runtime.clone();
+        let connection_generation = strong_client.connection_generation.clone();
         drop(strong_client);
         self.runtime
             .set(runtime.clone())
@@ -1012,11 +1059,11 @@ impl PluginHost {
             let resources = PluginResources::new();
             let context = self.context(
                 &client,
-                &planned.manifest,
-                &planned.dependency_markers,
+                planned,
                 Arc::clone(&resources),
                 Arc::clone(&staging),
                 runtime.clone(),
+                connection_generation.clone(),
             );
             rollback.current = Some(InstalledPlugin {
                 plugin: planned.plugin.clone(),
@@ -1119,6 +1166,9 @@ impl ClientLifecycle for PluginHost {
     }
 
     fn signal_shutdown(&self) {
+        if let Some(router) = &self.event_router {
+            router.close();
+        }
         for plugin in self.installed.get().into_iter().flatten().rev() {
             plugin.resources.close();
         }
@@ -1246,12 +1296,23 @@ impl Client {
             .map(|host| host.manifests())
             .unwrap_or_default()
     }
+
+    /// Subscribe to custom events emitted by installed plugins.
+    ///
+    /// Returns `None` when no manifest requested custom-event publication.
+    pub fn plugin_event_router(&self) -> Option<PluginEventRouter> {
+        self.plugin_host
+            .as_ref()
+            .and_then(|host| host.event_router.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+
+    use bytes::Bytes;
 
     use super::*;
     use crate::client::{ClientBuilder, ClientBuilderError};
@@ -2508,7 +2569,7 @@ mod tests {
     struct CapabilityProbe;
 
     impl ClientPlugin for CapabilityProbe {
-        type Api = [bool; 4];
+        type Api = [bool; 5];
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("capability-probe", "0.1.0")
@@ -2522,6 +2583,7 @@ mod tests {
                     context.tasks().is_some(),
                     context.messaging().is_some(),
                     context.iq().is_some(),
+                    context.plugin_events().is_some(),
                 ]))
             })
         }
@@ -2538,8 +2600,117 @@ mod tests {
         let client = build.into_client();
         assert_eq!(
             client.plugin::<CapabilityProbe>().as_deref(),
-            Some(&[false, false, true, false])
+            Some(&[false, false, true, false, false])
         );
+        assert!(client.plugin_event_router().is_none());
         client.disconnect().await;
+    }
+
+    struct PluginEventPublisher;
+
+    impl ClientPlugin for PluginEventPublisher {
+        type Api = PluginEvents;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("event-publisher", "0.1.0")
+                .with_capability(PluginCapability::PluginEvents)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                context
+                    .plugin_events()
+                    .cloned()
+                    .map(Arc::new)
+                    .ok_or_else(|| anyhow::anyhow!("plugin events capability missing"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_plugin_api_publishes_only_to_exact_bounded_routes() {
+        let client = complete_builder()
+            .await
+            .with_plugin(PluginEventPublisher)
+            .with_plugin(CapabilityProbe)
+            .build()
+            .await
+            .expect("plugin event publisher")
+            .into_client();
+        let publisher = client
+            .plugin::<PluginEventPublisher>()
+            .expect("typed publisher API");
+        let router = client.plugin_event_router().expect("plugin event router");
+        let tick = PluginEventTopic::new("tick").expect("valid topic");
+        let silent_selector =
+            PluginEventSelector::new("capability-probe", tick.clone()).expect("valid selector");
+        assert!(matches!(
+            router.subscribe(
+                [silent_selector],
+                PluginEventEndpointConfig::new(1, PluginEventOverflow::DropNewest),
+            ),
+            Err(PluginEventSubscribeError::UnknownPublisher { .. })
+        ));
+        let selector = publisher.selector(&tick);
+        let subscription = router
+            .subscribe(
+                [selector.clone()],
+                PluginEventEndpointConfig::new(1, PluginEventOverflow::DropNewest),
+            )
+            .expect("bounded event endpoint");
+
+        assert!(publisher.has_subscribers(&tick));
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert_eq!(
+            publisher
+                .publish(
+                    &tick,
+                    2,
+                    PluginEventPayloadEncoding::Json,
+                    r#"{"messages":1}"#,
+                )
+                .expect("publish tick"),
+            PluginEventPublishReport {
+                matched: 1,
+                enqueued: 1,
+                dropped: 0,
+                closed: 0,
+            }
+        );
+        let event = subscription.recv().await.expect("routed tick");
+        assert_eq!(&*event.plugin_id, "event-publisher");
+        assert_eq!(event.topic, tick);
+        assert_eq!(event.schema_version, 2);
+        assert_eq!(event.payload_encoding, PluginEventPayloadEncoding::Json);
+        assert_eq!(event.payload, Bytes::from_static(br#"{"messages":1}"#));
+        assert_eq!(event.connection_generation, generation);
+        assert_eq!(event.sequence, 1);
+
+        let next_generation = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        publisher
+            .publish(&tick, 2, PluginEventPayloadEncoding::Json, Bytes::new())
+            .expect("publish after generation change");
+        let event = subscription.recv().await.expect("next generation tick");
+        assert_eq!(event.connection_generation, next_generation);
+        assert_eq!(event.sequence, 2);
+
+        client.disconnect().await;
+        assert!(matches!(
+            publisher.publish(&tick, 2, PluginEventPayloadEncoding::Json, Bytes::new(),),
+            Err(PluginEventPublishError::Resource(
+                PluginResourceError::ShuttingDown
+            ))
+        ));
+        assert!(matches!(
+            subscription.recv().await,
+            Err(PluginEventReceiveError)
+        ));
+        assert!(matches!(
+            router.subscribe(
+                [selector],
+                PluginEventEndpointConfig::new(1, PluginEventOverflow::DropNewest),
+            ),
+            Err(PluginEventSubscribeError::Closed)
+        ));
     }
 }
