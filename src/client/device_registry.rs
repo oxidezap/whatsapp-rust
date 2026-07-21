@@ -576,6 +576,7 @@ impl Client {
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) {
         let device_id = device.device_id();
+        let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
 
         let Some(mut record) = self.load_device_record(user).await else {
             return;
@@ -610,18 +611,18 @@ impl Client {
                 if !record.devices.iter().any(|d| d.device_id == device_id)
                     && wacore::adv::is_key_index_valid(device.key_index, &decoded)
                 {
-                    record.devices.push(wacore::store::traits::DeviceInfo {
-                        device_id,
-                        key_index: device.key_index,
-                    });
+                    record.devices.push(
+                        wacore::store::traits::DeviceInfo::new(device_id, device.key_index)
+                            .with_hosting(is_hosted),
+                    );
                 }
             } else {
                 warn!("patch_device_add: failed to decode key-index-list for user {user}");
-                self.append_device_if_new(&mut record, device_id, device.key_index);
+                self.append_device_if_new(&mut record, device_id, device.key_index, is_hosted);
             }
         } else {
             // No signed bytes — fall back to simple append
-            self.append_device_if_new(&mut record, device_id, device.key_index);
+            self.append_device_if_new(&mut record, device_id, device.key_index, is_hosted);
         }
 
         // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
@@ -635,10 +636,9 @@ impl Client {
         // device 0 regardless and `is_key_index_valid` is not applied to it), so store
         // `None` to match how device 0 is recorded everywhere else.
         if !record.devices.iter().any(|d| d.device_id == 0) {
-            record.devices.push(wacore::store::traits::DeviceInfo {
-                device_id: 0,
-                key_index: None,
-            });
+            record
+                .devices
+                .push(wacore::store::traits::DeviceInfo::new(0, None));
         }
 
         // New devices are picked up automatically by `resolve_skdm_targets`:
@@ -656,12 +656,13 @@ impl Client {
         record: &mut wacore::store::traits::DeviceListRecord,
         device_id: u32,
         key_index: Option<u32>,
+        is_hosted: bool,
     ) {
         if !record.devices.iter().any(|d| d.device_id == device_id) {
-            record.devices.push(wacore::store::traits::DeviceInfo {
-                device_id,
-                key_index,
-            });
+            record.devices.push(
+                wacore::store::traits::DeviceInfo::new(device_id, key_index)
+                    .with_hosting(is_hosted),
+            );
         }
     }
 
@@ -934,14 +935,13 @@ impl Client {
     }
 
     /// Reconstruct `Vec<Jid>` from a `DeviceListRecord`, using the query JID's
-    /// user part and server type. This ensures that a PN-typed query always
-    /// returns PN-typed device JIDs even if the record is stored under a LID key
-    /// (and vice versa), which matters after PN-to-LID migration.
+    /// user part and addressing family while honoring each device's hosted bit.
+    /// This keeps PN/LID selection independent from the registry's storage key.
     fn reconstruct_device_jids(
         query_jid: &Jid,
         record: &wacore::store::traits::DeviceListRecord,
     ) -> Vec<Jid> {
-        let user = &query_jid.user;
+        let base = query_jid.to_non_ad();
         record
             .devices
             .iter()
@@ -951,12 +951,7 @@ impl Client {
                     "device_id {} overflows u16",
                     d.device_id
                 );
-                let device = d.device_id as u16;
-                if query_jid.is_lid() {
-                    Jid::lid_device(user.clone(), device)
-                } else {
-                    Jid::pn_device(user.clone(), device)
-                }
+                base.with_device_hosting(d.device_id as u16, d.is_hosted)
             })
             .collect()
     }
@@ -1051,10 +1046,7 @@ mod tests {
             user: user.into(),
             devices: device_ids
                 .iter()
-                .map(|&id| wacore::store::traits::DeviceInfo {
-                    device_id: id,
-                    key_index: None,
-                })
+                .map(|&id| wacore::store::traits::DeviceInfo::new(id, None))
                 .collect(),
             timestamp: wacore::time::now_secs(),
             phash: None,
@@ -1355,10 +1347,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: pn.into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1380,14 +1369,8 @@ mod tests {
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: lid.into(),
                 devices: vec![
-                    wacore::store::traits::DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    },
-                    wacore::store::traits::DeviceInfo {
-                        device_id: 11,
-                        key_index: None,
-                    },
+                    wacore::store::traits::DeviceInfo::new(0, None),
+                    wacore::store::traits::DeviceInfo::new(11, None),
                 ],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
@@ -1419,10 +1402,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990003".into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1438,10 +1418,7 @@ mod tests {
         client
             .update_device_lists(vec![wacore::store::traits::DeviceListRecord {
                 user: "5511999990004".into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1479,10 +1456,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990005".into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1799,14 +1773,8 @@ mod tests {
         let record = wacore::store::traits::DeviceListRecord {
             user: "15551234567".to_string(),
             devices: vec![
-                wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                wacore::store::traits::DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(1),
-                },
+                wacore::store::traits::DeviceInfo::new(0, None),
+                wacore::store::traits::DeviceInfo::new(3, Some(1)),
             ],
             timestamp: 1000,
             phash: None,
@@ -1885,9 +1853,8 @@ mod tests {
             user: user.into(),
             devices: device_ids
                 .iter()
-                .map(|&id| wacore::store::traits::DeviceInfo {
-                    device_id: id,
-                    key_index: if id == 0 { None } else { Some(7) },
+                .map(|&id| {
+                    wacore::store::traits::DeviceInfo::new(id, if id == 0 { None } else { Some(7) })
                 })
                 .collect(),
             timestamp: 1000,
@@ -1998,16 +1965,7 @@ mod tests {
         // Store device list under PN in backend
         let record = DeviceListRecord {
             user: pn.to_string(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 39,
-                    key_index: Some(25),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2115,10 +2073,7 @@ mod tests {
         // Seed backend DB directly (bypassing the in-process cache)
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![DeviceInfo {
-                device_id: 0,
-                key_index: None,
-            }],
+            devices: vec![DeviceInfo::new(0, None)],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2171,16 +2126,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(5),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2255,16 +2201,7 @@ mod tests {
         // Pre-populate device registry with device 0 AND device 3
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(5),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2358,10 +2295,7 @@ mod tests {
         backend
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 5,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(5, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2376,10 +2310,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 7,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(7, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2411,10 +2342,7 @@ mod tests {
         backend
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2455,10 +2383,7 @@ mod tests {
             backend
                 .update_device_list(DeviceListRecord {
                     user: user.to_string(),
-                    devices: vec![DeviceInfo {
-                        device_id: 1,
-                        key_index: None,
-                    }],
+                    devices: vec![DeviceInfo::new(1, None)],
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -2513,10 +2438,7 @@ mod tests {
 
         let legacy = DeviceListRecord {
             user: pn.to_string(),
-            devices: vec![DeviceInfo {
-                device_id: 9,
-                key_index: None,
-            }],
+            devices: vec![DeviceInfo::new(9, None)],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2534,10 +2456,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 10,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(10, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,

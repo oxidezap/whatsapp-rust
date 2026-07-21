@@ -560,6 +560,23 @@ impl Jid {
         }
     }
 
+    /// Construct a device JID and select the hosted variant of PN/LID when
+    /// indicated by a device-list entry.
+    ///
+    /// Non-user namespaces are left unchanged because they have no hosted
+    /// counterpart on the wire.
+    pub fn with_device_hosting(&self, device_id: u16, is_hosted: bool) -> Self {
+        let mut jid = self.with_device(device_id);
+        jid.server = match (jid.server, is_hosted) {
+            (Server::Pn | Server::Hosted, true) => Server::Hosted,
+            (Server::Pn | Server::Hosted, false) => Server::Pn,
+            (Server::Lid | Server::HostedLid, true) => Server::HostedLid,
+            (Server::Lid | Server::HostedLid, false) => Server::Lid,
+            (server, _) => server,
+        };
+        jid
+    }
+
     pub fn to_non_ad(&self) -> Self {
         Self {
             user: self.user.clone(),
@@ -1592,6 +1609,27 @@ mod tests {
         assert_eq!(jid.device, 33);
         assert!(jid.is_lid());
         assert!(jid.is_ad());
+    }
+
+    #[test]
+    fn with_device_hosting_preserves_addressing_family() {
+        let hosted_pn = Jid::pn("1234567890").with_device_hosting(7, true);
+        assert_eq!(hosted_pn.server, Server::Hosted);
+        assert_eq!(hosted_pn.device, 7);
+
+        let hosted_lid = Jid::lid("100000012345678").with_device_hosting(8, true);
+        assert_eq!(hosted_lid.server, Server::HostedLid);
+        assert_eq!(hosted_lid.device, 8);
+
+        let regular = Jid::pn("1234567890").with_device_hosting(9, false);
+        assert_eq!(regular.server, Server::Pn);
+
+        let regular_from_hosted =
+            Jid::new("1234567890", Server::Hosted).with_device_hosting(9, false);
+        assert_eq!(regular_from_hosted.server, Server::Pn);
+
+        let group = Jid::group("123-456").with_device_hosting(10, true);
+        assert_eq!(group.server, Server::Group);
     }
 
     #[test]

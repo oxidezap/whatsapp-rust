@@ -2093,10 +2093,7 @@ mod tests {
         backend
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 3,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(3, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
