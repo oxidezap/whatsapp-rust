@@ -812,7 +812,26 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
     )]
-    pub(crate) async fn cleanup_connection_state(&self) {
+    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
+        if self.lifecycle.is_none() {
+            self.cleanup_connection_state_inner().await;
+            return;
+        }
+
+        // Scope closure must survive a caller dropping its cleanup waiter.
+        let completed = wacore::runtime::ShutdownNotifier::new();
+        let completion = completed.subscribe();
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.cleanup_connection_state_inner().await;
+                completed.notify();
+            }))
+            .detach();
+        wacore::runtime::wait_for_shutdown(&completion).await;
+    }
+
+    async fn cleanup_connection_state_inner(&self) {
         // Bump the generation FIRST: it is the "this connection is over"
         // signal every per-connection loop already polls. Chat-lane workers
         // stop draining their queues (their remaining stanzas were never

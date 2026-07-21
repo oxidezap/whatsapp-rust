@@ -304,9 +304,13 @@ impl LifecycleRegistration {
     }
 
     pub(super) fn close_scope(self: &Arc<Self>, generation: u64) {
-        let scope = {
+        self.close_scope_with(generation, || {});
+    }
+
+    fn close_scope_with(self: &Arc<Self>, generation: u64, after_remove: impl FnOnce()) {
+        let should_spawn = {
             let mut scopes = self.scopes();
-            if scopes
+            let scope = if scopes
                 .active
                 .as_ref()
                 .is_some_and(|scope| scope.generation() == generation)
@@ -318,15 +322,32 @@ impl LifecycleRegistration {
                     .iter()
                     .position(|scope| scope.generation() == generation)
                     .map(|position| scopes.retired.remove(position))
+            };
+            let Some(scope) = scope else {
+                return;
+            };
+
+            scope.close();
+            after_remove();
+
+            // Publish closure before exposing an empty registry so terminal
+            // shutdown cannot overtake the final on_closed callback.
+            let no_open_scopes = scopes.active.is_none() && scopes.retired.is_empty();
+            let mut queue = self.callback_queue();
+            queue.pending.push_back(LifecycleCallback::Closed(scope));
+            if no_open_scopes && queue.shutdown_requested && !queue.shutdown_enqueued {
+                queue.shutdown_enqueued = true;
+                queue.pending.push_back(LifecycleCallback::Shutdown);
+            }
+            if queue.drain_scheduled {
+                false
+            } else {
+                queue.drain_scheduled = true;
+                true
             }
         };
-        let Some(scope) = scope else {
-            return;
-        };
 
-        scope.close();
-        self.enqueue_callback(LifecycleCallback::Closed(scope));
-        self.enqueue_shutdown_if_ready();
+        self.spawn_callback_driver(should_spawn);
     }
 
     pub(super) async fn shutdown(self: &Arc<Self>) {
@@ -416,16 +437,18 @@ impl LifecycleRegistration {
 
             match callback {
                 LifecycleCallback::Ready { scope, done } => {
-                    self.run_callback("on_ready", self.handler.on_ready(scope.clone()))
+                    let callback_scope = scope.clone();
+                    self.run_callback("on_ready", move |handler| handler.on_ready(callback_scope))
                         .await;
                     let _ = done.try_send(!scope.is_cancelled());
                 }
                 LifecycleCallback::Closed(scope) => {
-                    self.run_callback("on_closed", self.handler.on_closed(scope))
+                    self.run_callback("on_closed", move |handler| handler.on_closed(scope))
                         .await;
                 }
                 LifecycleCallback::Shutdown => {
-                    self.run_callback("shutdown", self.handler.shutdown()).await;
+                    self.run_callback("shutdown", |handler| handler.shutdown())
+                        .await;
                     self.shutdown_complete.store(true, Ordering::Release);
                     self.shutdown_notifier.notify();
                 }
@@ -433,11 +456,19 @@ impl LifecycleRegistration {
         }
     }
 
-    async fn run_callback(
-        &self,
+    async fn run_callback<'a>(
+        &'a self,
         name: &'static str,
-        mut callback: BoxFuture<'_, anyhow::Result<()>>,
+        create: impl FnOnce(&'a dyn ClientLifecycle) -> BoxFuture<'a, anyhow::Result<()>>,
     ) {
+        let callback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _callback_context = CallbackContextGuard::enter(self);
+            create(&*self.handler)
+        }));
+        let Ok(mut callback) = callback else {
+            log::warn!("Client lifecycle {name} panicked");
+            return;
+        };
         let callback = std::future::poll_fn(|context| {
             let _callback_context = CallbackContextGuard::enter(self);
             callback.as_mut().poll(context)
@@ -662,6 +693,30 @@ mod tests {
                 self.completed.store(true, Ordering::Release);
                 Ok(())
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct SynchronousPanicLifecycle {
+        ready_calls: AtomicUsize,
+        closed_calls: AtomicUsize,
+        shutdown_calls: AtomicUsize,
+    }
+
+    impl ClientLifecycle for SynchronousPanicLifecycle {
+        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+            self.ready_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("synchronous on_ready panic");
+        }
+
+        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+            self.closed_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("synchronous on_closed panic");
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("synchronous shutdown panic");
         }
     }
 
@@ -1019,6 +1074,127 @@ mod tests {
 
         assert!(lifecycle.completed.load(Ordering::Acquire));
         assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn synchronous_callback_panics_do_not_strand_the_driver() {
+        let lifecycle = Arc::new(SynchronousPanicLifecycle::default());
+        let registration = Arc::new(LifecycleRegistration::new(
+            lifecycle.clone(),
+            Arc::new(TokioRuntime),
+        ));
+        const GENERATION: u64 = 23;
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+
+        assert!(registration.ready(GENERATION).await);
+        registration.close_scope(GENERATION);
+        tokio::time::timeout(std::time::Duration::from_secs(2), registration.shutdown())
+            .await
+            .expect("callback driver recovered from synchronous panics");
+
+        assert_eq!(lifecycle.ready_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.closed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.shutdown_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_scope_closure_is_published_before_shutdown() {
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let registration = Arc::new(LifecycleRegistration::new(
+            lifecycle.clone(),
+            Arc::new(TokioRuntime),
+        ));
+        const GENERATION: u64 = 29;
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+
+        let removed = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let close_registration = Arc::clone(&registration);
+        let close_removed = Arc::clone(&removed);
+        let close_release = Arc::clone(&release);
+        let close = tokio::task::spawn_blocking(move || {
+            close_registration.close_scope_with(GENERATION, || {
+                close_removed.wait();
+                close_release.wait();
+            });
+        });
+
+        removed.wait();
+        let shutdown_registration = Arc::clone(&registration);
+        let shutdown = tokio::spawn(async move { shutdown_registration.shutdown().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!shutdown.is_finished());
+
+        release.wait();
+        close.await.expect("scope close task");
+        shutdown.await.expect("shutdown task");
+        assert_eq!(
+            lifecycle.events(),
+            vec!["closed:29".to_string(), "shutdown".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_waiter_does_not_strand_its_scope() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle_arc(lifecycle.clone())
+            .build()
+            .await
+            .expect("client build")
+            .client();
+        const GENERATION: u64 = 37;
+        client
+            .connection_generation
+            .store(GENERATION, Ordering::SeqCst);
+        let registration = client.lifecycle.as_ref().expect("lifecycle registration");
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+        client.dispatch_connected().await;
+        let scope = registration
+            .scope_for(GENERATION)
+            .expect("connection scope");
+
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        *client.transport.lock().await = Some(Arc::new(BlockingDisconnect {
+            started: started_tx,
+            release: release_rx,
+        }));
+
+        let cleanup_client = Arc::clone(&client);
+        let cleanup = tokio::spawn(async move {
+            cleanup_client.cleanup_connection_state().await;
+        });
+        started_rx.recv().await.expect("cleanup reached transport");
+        cleanup.abort();
+        let _ = cleanup.await;
+        assert_eq!(scope.state(), ConnectionScopeState::Cancelled);
+
+        release_tx.send(()).await.expect("release cleanup");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while scope.state() != ConnectionScopeState::Closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup closed the scope");
+        assert!(registration.scope_for(GENERATION).is_none());
+
+        registration.shutdown().await;
+        assert_eq!(
+            lifecycle.events(),
+            vec!["install", "ready:37", "closed:37", "shutdown"]
+        );
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]
