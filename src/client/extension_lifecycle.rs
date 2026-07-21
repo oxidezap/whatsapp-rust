@@ -19,6 +19,7 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 std::thread_local! {
     static ACTIVE_CALLBACK: Cell<*const LifecycleRegistration> = const { Cell::new(std::ptr::null()) };
+    static ACTIVE_READY_PUBLICATION: Cell<*const LifecycleRegistration> = const { Cell::new(std::ptr::null()) };
 }
 
 /// Observable state of one authenticated connection generation.
@@ -158,6 +159,7 @@ pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
 pub(super) struct LifecycleRegistration {
     handler: Arc<dyn ClientLifecycle>,
     runtime: Arc<dyn Runtime>,
+    ready_publication: std::sync::Mutex<()>,
     scopes: std::sync::Mutex<ScopeRegistry>,
     callback_queue: std::sync::Mutex<CallbackQueue>,
     shutdown_complete: AtomicBool,
@@ -193,6 +195,23 @@ struct CallbackContextGuard {
     previous: *const LifecycleRegistration,
 }
 
+struct ReadyPublicationGuard {
+    previous: *const LifecycleRegistration,
+}
+
+impl ReadyPublicationGuard {
+    fn enter(registration: &LifecycleRegistration) -> Self {
+        let previous = ACTIVE_READY_PUBLICATION.replace(registration);
+        Self { previous }
+    }
+}
+
+impl Drop for ReadyPublicationGuard {
+    fn drop(&mut self) {
+        ACTIVE_READY_PUBLICATION.set(self.previous);
+    }
+}
+
 impl CallbackContextGuard {
     fn enter(registration: &LifecycleRegistration) -> Self {
         let previous = ACTIVE_CALLBACK.replace(registration);
@@ -210,6 +229,10 @@ fn callback_context_active(registration: &LifecycleRegistration) -> bool {
     ACTIVE_CALLBACK.with(|active| std::ptr::eq(active.get(), registration))
 }
 
+fn ready_publication_active(registration: &LifecycleRegistration) -> bool {
+    ACTIVE_READY_PUBLICATION.with(|active| std::ptr::eq(active.get(), registration))
+}
+
 impl LifecycleRegistration {
     pub(super) fn new(handler: Arc<dyn ClientLifecycle>, runtime: Arc<dyn Runtime>) -> Self {
         Self::new_with_timeout(handler, runtime, CALLBACK_TIMEOUT)
@@ -223,6 +246,7 @@ impl LifecycleRegistration {
         Self {
             handler,
             runtime,
+            ready_publication: std::sync::Mutex::new(()),
             scopes: std::sync::Mutex::new(ScopeRegistry::default()),
             callback_queue: std::sync::Mutex::new(CallbackQueue::default()),
             shutdown_complete: AtomicBool::new(false),
@@ -300,19 +324,29 @@ impl LifecycleRegistration {
         done_rx.recv().await.unwrap_or(false) && !scope.is_cancelled()
     }
 
-    pub(super) fn cancel_scope(&self, generation: u64) {
-        if let Some(scope) = self.scope_for(generation) {
-            scope.cancel();
+    pub(super) fn publish_ready(&self, generation: u64, publish: impl FnOnce()) -> bool {
+        let _publication = self.ready_publication();
+        if self.terminal.load(Ordering::Acquire) {
+            return false;
         }
+        let Some(scope) = self.scope_for(generation) else {
+            return false;
+        };
+        if scope.state() != ConnectionScopeState::Ready {
+            return false;
+        }
+
+        let _publication_context = ReadyPublicationGuard::enter(self);
+        publish();
+        true
     }
 
-    pub(super) fn cancel_active_scope(&self) {
-        let scopes = self.scopes();
-        if let Some(scope) = &scopes.active {
-            scope.cancel();
-        }
-        for scope in &scopes.retired {
-            scope.cancel();
+    pub(super) fn cancel_scope(&self, generation: u64) {
+        if ready_publication_active(self) {
+            self.cancel_scope_inner(generation);
+        } else {
+            let _publication = self.ready_publication();
+            self.cancel_scope_inner(generation);
         }
     }
 
@@ -388,8 +422,12 @@ impl LifecycleRegistration {
     }
 
     pub(super) fn signal_shutdown_sync(&self) {
-        let first_signal = !self.terminal.swap(true, Ordering::AcqRel);
-        self.cancel_active_scope();
+        let first_signal = if ready_publication_active(self) {
+            self.mark_terminal_and_cancel_scopes()
+        } else {
+            let _publication = self.ready_publication();
+            self.mark_terminal_and_cancel_scopes()
+        };
         if first_signal
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.handler.signal_shutdown();
@@ -528,6 +566,30 @@ impl LifecycleRegistration {
         self.callback_queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn ready_publication(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.ready_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cancel_scope_inner(&self, generation: u64) {
+        if let Some(scope) = self.scope_for(generation) {
+            scope.cancel();
+        }
+    }
+
+    fn mark_terminal_and_cancel_scopes(&self) -> bool {
+        let first_signal = !self.terminal.swap(true, Ordering::AcqRel);
+        let scopes = self.scopes();
+        if let Some(scope) = &scopes.active {
+            scope.cancel();
+        }
+        for scope in &scopes.retired {
+            scope.cancel();
+        }
+        first_signal
     }
 
     fn scope_for(&self, generation: u64) -> Option<ConnectionScope> {
@@ -836,6 +898,115 @@ mod tests {
         scope.cancel();
         scope.close();
         assert_eq!(scope.state(), ConnectionScopeState::Closed);
+    }
+
+    #[tokio::test]
+    async fn terminal_signal_rejects_ready_publication() {
+        let registration = Arc::new(LifecycleRegistration::new(
+            Arc::new(RecordingLifecycle::default()),
+            Arc::new(TokioRuntime),
+        ));
+        const GENERATION: u64 = 43;
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+        assert!(registration.ready(GENERATION).await);
+        registration.signal_shutdown_sync();
+
+        let published = AtomicBool::new(false);
+        assert!(!registration.publish_ready(GENERATION, || {
+            published.store(true, Ordering::Release);
+        }));
+        assert!(!published.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_cancellation_waits_for_ready_publication() {
+        let registration = Arc::new(LifecycleRegistration::new(
+            Arc::new(RecordingLifecycle::default()),
+            Arc::new(TokioRuntime),
+        ));
+        const GENERATION: u64 = 47;
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+        assert!(registration.ready(GENERATION).await);
+        let scope = registration
+            .scope_for(GENERATION)
+            .expect("ready connection scope");
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let publish_registration = registration.clone();
+        let publish = std::thread::spawn(move || {
+            let published = publish_registration.publish_ready(GENERATION, || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let _ = published_tx.send(published);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready publication started");
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_registration = registration.clone();
+        let cancel = std::thread::spawn(move || {
+            let _ = attempted_tx.send(());
+            cancel_registration.signal_shutdown_sync();
+            let _ = cancelled_tx.send(());
+        });
+        attempted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal cancellation attempted");
+        assert!(
+            cancelled_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        release_tx.send(()).expect("release ready publication");
+        assert!(
+            published_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ready publication completed")
+        );
+        cancelled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal cancellation completed");
+        publish.join().expect("publication thread");
+        cancel.join().expect("cancellation thread");
+        assert_eq!(scope.state(), ConnectionScopeState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn ready_publication_allows_reentrant_terminal_signal() {
+        let registration = Arc::new(LifecycleRegistration::new(
+            Arc::new(RecordingLifecycle::default()),
+            Arc::new(TokioRuntime),
+        ));
+        const GENERATION: u64 = 53;
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+        assert!(registration.ready(GENERATION).await);
+        let scope = registration
+            .scope_for(GENERATION)
+            .expect("ready connection scope");
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let publish_registration = registration.clone();
+        let signal_registration = registration.clone();
+        let publish = std::thread::spawn(move || {
+            let published = publish_registration.publish_ready(GENERATION, || {
+                signal_registration.signal_shutdown_sync();
+            });
+            let _ = completed_tx.send(published);
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reentrant terminal signal completed")
+        );
+        publish.join().expect("publication thread");
+        assert_eq!(scope.state(), ConnectionScopeState::Cancelled);
     }
 
     #[tokio::test]

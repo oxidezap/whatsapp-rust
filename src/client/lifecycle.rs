@@ -86,7 +86,16 @@ impl Client {
                 debug!("Skipping Connected dispatch after generation changed");
                 return;
             }
+            if !lifecycle.publish_ready(generation, || self.publish_connected()) {
+                debug!("Skipping Connected dispatch after lifecycle cancellation");
+            }
+            return;
         }
+
+        self.publish_connected();
+    }
+
+    fn publish_connected(&self) {
         self.is_ready.store(true, Ordering::Relaxed);
         wacore::telemetry::set_connected(true);
         self.core.event_bus.dispatch(Event::Connected(

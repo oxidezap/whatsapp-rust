@@ -252,19 +252,28 @@ impl PluginResources {
         subscription: Subscription,
         raw_node_lease: Option<RawNodeLease>,
     ) -> Result<(), PluginResourceError> {
-        let mut subscriptions = self
-            .subscriptions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.closed.load(Ordering::Acquire) {
-            drop(subscription);
-            return Err(PluginResourceError::ShuttingDown);
-        }
-        subscriptions.push(PluginCoreEventSubscription {
+        let registration = PluginCoreEventSubscription {
             _subscription: subscription,
             _raw_node_lease: raw_node_lease,
-        });
-        Ok(())
+        };
+        let rejected = {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Some(registration)
+            } else {
+                subscriptions.push(registration);
+                None
+            }
+        };
+        if let Some(rejected) = rejected {
+            drop(rejected);
+            Err(PluginResourceError::ShuttingDown)
+        } else {
+            Ok(())
+        }
     }
 
     fn close(&self) {
@@ -394,8 +403,7 @@ impl PluginIq {
 /// Capabilities and already-installed dependencies visible during installation.
 pub struct PluginContext {
     plugin_id: String,
-    apis: Arc<ApiRegistry>,
-    dependency_markers: Vec<TypeId>,
+    dependencies: HashMap<TypeId, WeakErasedApi>,
     core_events: Option<PluginCoreEvents>,
     tasks: Option<PluginTasks>,
     messaging: Option<PluginMessaging>,
@@ -407,11 +415,11 @@ impl PluginContext {
         &self.plugin_id
     }
 
+    /// Return a declared dependency without making retained contexts own it.
+    /// Clone the returned API during installation if it must outlive this call.
     pub fn plugin<P: ClientPlugin>(&self) -> Option<Arc<P::Api>> {
-        if !self.dependency_markers.contains(&TypeId::of::<P>()) {
-            return None;
-        }
-        self.apis.get::<P>()
+        let api = self.dependencies.get(&TypeId::of::<P>())?.upgrade()?;
+        downcast_api::<P::Api>(&api)
     }
 
     pub fn core_events(&self) -> Option<&PluginCoreEvents> {
@@ -532,6 +540,7 @@ impl<T: MaybeSendSync + 'static> ErasedApiValue for TypedApi<T> {
 }
 
 type ErasedApi = Arc<dyn ErasedApiValue>;
+type WeakErasedApi = Weak<dyn ErasedApiValue>;
 
 #[derive(Default)]
 struct ApiRegistry {
@@ -553,12 +562,15 @@ impl ApiRegistry {
             .clone()
     }
 
-    fn get<P: ClientPlugin>(&self) -> Option<Arc<P::Api>> {
+    fn dependency_view(&self, markers: &[TypeId]) -> HashMap<TypeId, WeakErasedApi> {
         let values = self
             .values
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        downcast_api::<P::Api>(values.get(&TypeId::of::<P>())?)
+        markers
+            .iter()
+            .filter_map(|marker| values.get(marker).map(|api| (*marker, Arc::downgrade(api))))
+            .collect()
     }
 }
 
@@ -931,8 +943,7 @@ impl PluginHost {
         let capabilities = manifest.capabilities;
         PluginContext {
             plugin_id: manifest.id.clone(),
-            apis,
-            dependency_markers: dependency_markers.to_vec(),
+            dependencies: apis.dependency_view(dependency_markers),
             core_events: capabilities
                 .contains(PluginCapability::CoreEvents)
                 .then(|| PluginCoreEvents {
@@ -1578,6 +1589,58 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    struct ContextRetainingApi {
+        _context: PluginContext,
+        _drop_flag: DropFlag,
+    }
+
+    struct ContextRetainingPlugin {
+        api_dropped: Arc<AtomicBool>,
+    }
+
+    impl ClientPlugin for ContextRetainingPlugin {
+        type Api = ContextRetainingApi;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("context-retaining", "0.1.0")
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            let api_dropped = self.api_dropped.clone();
+            Box::pin(async move {
+                Ok(Arc::new(ContextRetainingApi {
+                    _context: context,
+                    _drop_flag: DropFlag(api_dropped),
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_context_does_not_cycle_with_the_api_registry() {
+        let api_dropped = Arc::new(AtomicBool::new(false));
+        let build = complete_builder()
+            .await
+            .with_plugin(ContextRetainingPlugin {
+                api_dropped: api_dropped.clone(),
+            })
+            .build()
+            .await
+            .expect("context-retaining plugin");
+        let (client, sync_tasks) = build.into_parts();
+        drop(sync_tasks);
+        let api = client
+            .plugin::<ContextRetainingPlugin>()
+            .expect("retained-context API");
+        let weak_api = Arc::downgrade(&api);
+        drop(api);
+
+        client.disconnect().await;
+        drop(client);
+        wait_for_flag(&api_dropped).await;
+        assert!(weak_api.upgrade().is_none());
     }
 
     struct RollbackPlugin {
@@ -2305,7 +2368,7 @@ mod tests {
     struct ReentrantSubscriptionPlugin;
 
     impl ClientPlugin for ReentrantSubscriptionPlugin {
-        type Api = ();
+        type Api = PluginCoreEvents;
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("reentrant-subscription", "0.1.0")
@@ -2324,7 +2387,7 @@ mod tests {
                         events: events.clone(),
                     }),
                 )?;
-                Ok(Arc::new(()))
+                Ok(Arc::new(events))
             })
         }
     }
@@ -2376,6 +2439,40 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("reentrant handler teardown must not deadlock");
         shutdown.join().expect("shutdown thread");
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_subscription_drops_reentrant_handler_outside_the_subscription_lock() {
+        let client = complete_builder()
+            .await
+            .with_plugin(ReentrantSubscriptionPlugin)
+            .build()
+            .await
+            .expect("reentrant subscription plugin")
+            .into_client();
+        let events = client
+            .plugin::<ReentrantSubscriptionPlugin>()
+            .expect("plugin event API");
+        client.signal_shutdown_sync();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let subscribe_events = events.clone();
+        let subscribe = std::thread::spawn(move || {
+            let result = subscribe_events.subscribe(
+                EventInterest::of(&[EventKind::Connected]),
+                Arc::new(ReentrantSubscriptionHandler {
+                    events: (*subscribe_events).clone(),
+                }),
+            );
+            let _ = completed_tx.send(result);
+        });
+
+        let result = completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rejected reentrant subscription must not deadlock");
+        assert!(matches!(result, Err(PluginResourceError::ShuttingDown)));
+        subscribe.join().expect("subscription thread");
         client.disconnect().await;
     }
 
