@@ -365,12 +365,7 @@ impl LifecycleRegistration {
     }
 
     pub(super) async fn shutdown(self: &Arc<Self>) {
-        self.signal_shutdown_sync();
-        {
-            let mut queue = self.callback_queue();
-            queue.shutdown_requested = true;
-        }
-        self.enqueue_shutdown_if_ready();
+        self.request_shutdown();
 
         if self.shutdown_complete.load(Ordering::Acquire) || callback_context_active(self) {
             return;
@@ -381,6 +376,15 @@ impl LifecycleRegistration {
             return;
         }
         wacore::runtime::wait_for_shutdown(&completed).await;
+    }
+
+    pub(super) fn request_shutdown(self: &Arc<Self>) {
+        self.signal_shutdown_sync();
+        {
+            let mut queue = self.callback_queue();
+            queue.shutdown_requested = true;
+        }
+        self.enqueue_shutdown_if_ready();
     }
 
     pub(super) fn signal_shutdown_sync(&self) {
@@ -723,6 +727,26 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct EarlyShutdownLifecycle {
+        signalled: AtomicBool,
+        shutdowns: AtomicUsize,
+    }
+
+    impl ClientLifecycle for EarlyShutdownLifecycle {
+        fn signal_shutdown(&self) {
+            self.signalled.store(true, Ordering::Release);
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async move {
+                assert!(self.signalled.load(Ordering::Acquire));
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct SynchronousPanicLifecycle {
         ready_calls: AtomicUsize,
         closed_calls: AtomicUsize,
@@ -883,6 +907,52 @@ mod tests {
             vec!["install", "ready:9", "closed:9", "shutdown"]
         );
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn disconnect_requests_lifecycle_shutdown_before_cancellable_io() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let lifecycle = Arc::new(EarlyShutdownLifecycle::default());
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle_arc(lifecycle.clone())
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
+        *client.transport.lock().await = Some(Arc::new(BlockingDisconnect {
+            started: started_tx,
+            release: release_rx,
+        }));
+
+        let disconnect_client = Arc::clone(&client);
+        let disconnect = tokio::spawn(async move {
+            disconnect_client.disconnect().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("disconnect reached cancellable transport I/O")
+            .expect("transport remained alive");
+        assert!(lifecycle.signalled.load(Ordering::Acquire));
+
+        disconnect.abort();
+        let _ = disconnect.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lifecycle.shutdowns.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached lifecycle shutdown completed");
     }
 
     #[tokio::test]

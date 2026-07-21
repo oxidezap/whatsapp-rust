@@ -807,13 +807,41 @@ impl PluginInstallRollback {
         }
     }
 
-    async fn rollback(&mut self) {
+    fn schedule_rollback(&mut self) -> Option<ShutdownSignal> {
+        if !self.armed {
+            return None;
+        }
         self.close_resources();
         let current = self.current.take();
         let installed = std::mem::take(&mut self.installed);
         let upstream = self.upstream.take();
         self.armed = false;
-        shutdown_staged_plugins(self.runtime.clone(), current, installed, upstream).await;
+        if current.is_none() && installed.is_empty() && upstream.is_none() {
+            return None;
+        }
+        if let Some(upstream) = &upstream
+            && std::panic::catch_unwind(AssertUnwindSafe(|| upstream.signal_shutdown())).is_err()
+        {
+            log::warn!("Upstream lifecycle rollback shutdown signal panicked");
+        }
+
+        let completed = ShutdownNotifier::new();
+        let completion = completed.subscribe();
+        let runtime = self.runtime.clone();
+        let cleanup_runtime = runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                shutdown_staged_plugins(cleanup_runtime, current, installed, upstream).await;
+                completed.notify();
+            }))
+            .detach();
+        Some(completion)
+    }
+
+    async fn rollback(&mut self) {
+        if let Some(completion) = self.schedule_rollback() {
+            wait_for_shutdown(&completion).await;
+        }
     }
 
     fn take_installed(&mut self) -> Vec<InstalledPlugin> {
@@ -832,23 +860,7 @@ impl PluginInstallRollback {
 
 impl Drop for PluginInstallRollback {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.close_resources();
-        let current = self.current.take();
-        let installed = std::mem::take(&mut self.installed);
-        let upstream = self.upstream.take();
-        if current.is_none() && installed.is_empty() && upstream.is_none() {
-            return;
-        }
-        let runtime = self.runtime.clone();
-        let cleanup_runtime = runtime.clone();
-        runtime
-            .spawn(Box::pin(async move {
-                shutdown_staged_plugins(cleanup_runtime, current, installed, upstream).await;
-            }))
-            .detach();
+        let _ = self.schedule_rollback();
     }
 }
 
@@ -1667,6 +1679,144 @@ mod tests {
         })
         .await
         .expect("rollback aborted the install-scoped task");
+    }
+
+    struct BlockingFailingPlugin {
+        log: Log,
+        started: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    impl ClientPlugin for BlockingFailingPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("blocking-failure", "0.1.0").with_dependency("rollback")
+        }
+
+        fn install(
+            &self,
+            _context: PluginContext,
+        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            let log = self.log.clone();
+            Box::pin(async move {
+                record(&log, "install:blocking-failure");
+                anyhow::bail!("injected failure")
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let log = self.log.clone();
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                record(&log, "shutdown:blocking-failure-started");
+                let _ = started.try_send(());
+                let _ = release.recv().await;
+                record(&log, "shutdown:blocking-failure-finished");
+                Ok(())
+            })
+        }
+    }
+
+    struct SignalAwareUpstream {
+        log: Log,
+        signalled: Arc<AtomicBool>,
+        shutdown_saw_signal: Arc<AtomicBool>,
+    }
+
+    impl ClientLifecycle for SignalAwareUpstream {
+        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+            let log = self.log.clone();
+            Box::pin(async move {
+                record(&log, "install:upstream");
+                Ok(())
+            })
+        }
+
+        fn signal_shutdown(&self) {
+            if !self.signalled.swap(true, Ordering::AcqRel) {
+                record(&self.log, "signal:upstream");
+            }
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let log = self.log.clone();
+            let signalled = self.signalled.clone();
+            let shutdown_saw_signal = self.shutdown_saw_signal.clone();
+            Box::pin(async move {
+                shutdown_saw_signal.store(signalled.load(Ordering::Acquire), Ordering::Release);
+                record(&log, "shutdown:upstream");
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_explicit_rollback_finishes_detached_and_signals_upstream() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let signalled = Arc::new(AtomicBool::new(false));
+        let shutdown_saw_signal = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let builder = complete_builder()
+            .await
+            .with_lifecycle(SignalAwareUpstream {
+                log: log.clone(),
+                signalled: signalled.clone(),
+                shutdown_saw_signal: shutdown_saw_signal.clone(),
+            })
+            .with_plugin(BlockingFailingPlugin {
+                log: log.clone(),
+                started: started_tx,
+                release: release_rx,
+            })
+            .with_plugin(RollbackPlugin {
+                log: log.clone(),
+                task_dropped: task_dropped.clone(),
+            });
+
+        let build = tokio::spawn(async move { builder.build().await });
+        started_rx
+            .recv()
+            .await
+            .expect("failed plugin rollback started");
+        assert!(signalled.load(Ordering::Acquire));
+        build.abort();
+        let _ = build.await;
+        release_tx.send(()).await.expect("release rollback hook");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let complete = log
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last()
+                    .is_some_and(|entry| entry == "shutdown:upstream");
+                if complete && task_dropped.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached rollback completed after build cancellation");
+
+        assert!(shutdown_saw_signal.load(Ordering::Acquire));
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                "install:upstream",
+                "install:rollback",
+                "install:blocking-failure",
+                "signal:upstream",
+                "shutdown:blocking-failure-started",
+                "shutdown:blocking-failure-finished",
+                "shutdown:rollback",
+                "shutdown:upstream"
+            ]
+        );
     }
 
     struct BlockingInstallPlugin {

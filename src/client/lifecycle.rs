@@ -101,6 +101,12 @@ impl Client {
         }
     }
 
+    fn request_lifecycle_shutdown(&self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.request_shutdown();
+        }
+    }
+
     /// Create a new `Client` with default cache configuration.
     ///
     /// This is the standard constructor. Use [`Client::new_with_cache_config`]
@@ -684,6 +690,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        self.request_lifecycle_shutdown();
 
         // Drain buffered offline receipts into the flush window before
         // closing it, so a disconnect mid-offline-sync still acks the
