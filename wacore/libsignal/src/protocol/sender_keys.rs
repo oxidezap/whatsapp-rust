@@ -536,11 +536,14 @@ impl SenderKeyRecord {
     /// Builds a record from validated protocol components.
     ///
     /// Components do not carry process-local durability metadata, so the
-    /// imported current chain starts a fresh reservation lifecycle.
+    /// imported current chain starts a fresh reservation lifecycle. Historical
+    /// states are bounded to the same limit enforced by record mutation and
+    /// deserialization.
     pub fn from_components(value: SenderKeyRecordComponents) -> Result<Self, SignalProtocolError> {
         let states = value
             .states
             .into_iter()
+            .take(consts::MAX_SENDER_KEY_STATES)
             .map(sender_state_structure_from_components)
             .map(|state| state.map(SenderKeyState::from_protobuf))
             .collect::<Result<VecDeque<_>, _>>()?;
@@ -612,8 +615,16 @@ impl SenderKeyRecord {
         let skr = waproto::codec::sender_key_record_decode(buf)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
-        let mut states = VecDeque::with_capacity(skr.sender_key_states.len());
-        for state in skr.sender_key_states {
+        let mut states = VecDeque::with_capacity(
+            skr.sender_key_states
+                .len()
+                .min(consts::MAX_SENDER_KEY_STATES),
+        );
+        for state in skr
+            .sender_key_states
+            .into_iter()
+            .take(consts::MAX_SENDER_KEY_STATES)
+        {
             // Validate seeds eagerly so callers get a clear error on corrupt data.
             if let Some(sender_chain) = state.sender_chain_key.as_option() {
                 let _ = seed_to_array(sender_chain.seed.as_ref())?;
@@ -1438,6 +1449,23 @@ mod tests {
         // Should not have more than MAX_SENDER_KEY_STATES
         let chain_ids: Vec<u32> = record.chain_ids_for_logging().collect();
         assert!(chain_ids.len() <= consts::MAX_SENDER_KEY_STATES);
+    }
+
+    #[test]
+    fn test_sender_key_record_deserialize_bounds_state_history() {
+        let mut state = record_with_state(12345, 0x42).as_protobuf();
+        let state = state.sender_key_states.pop().expect("test state");
+        let encoded = SenderKeyRecordStructure {
+            sender_key_states: vec![state; consts::MAX_SENDER_KEY_STATES + 1],
+        }
+        .encode_to_vec();
+
+        let record = SenderKeyRecord::deserialize(&encoded).expect("valid record");
+
+        assert_eq!(
+            record.chain_ids_for_logging().len(),
+            consts::MAX_SENDER_KEY_STATES
+        );
     }
 
     /// Test SenderKeyRecord chain ID lookup

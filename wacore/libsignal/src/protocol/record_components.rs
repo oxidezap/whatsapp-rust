@@ -933,6 +933,23 @@ mod tests {
     }
 
     #[test]
+    fn sender_key_components_bound_state_history() {
+        let mut components = sender_key_record();
+        let state = components.states[0].clone();
+        components.states = vec![state; crate::protocol::consts::MAX_SENDER_KEY_STATES + 1];
+
+        let actual = SenderKeyRecord::from_components(components)
+            .expect("valid components")
+            .into_components()
+            .expect("project record");
+
+        assert_eq!(
+            actual.states.len(),
+            crate::protocol::consts::MAX_SENDER_KEY_STATES
+        );
+    }
+
+    #[test]
     fn sender_key_handoff_burns_the_reserved_iteration_range() {
         let mut record =
             SenderKeyRecord::from_components(sender_key_record()).expect("valid record");
