@@ -48,6 +48,10 @@ pub struct SessionComponents {
 }
 
 /// A sender or receiver ratchet chain and its skipped message keys.
+///
+/// Imported sender chains must be structurally complete. Imported receiver
+/// chains must not carry private material; persisted receiver private fields
+/// are ignored for compatibility with the canonical reader.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct SessionChainComponents {
     pub sender_ratchet_key: Option<Vec<u8>>,
@@ -257,6 +261,10 @@ fn optional_public_key(value: Option<Vec<u8>>, field: &'static str) -> Result<Op
         .transpose()
 }
 
+fn required_public_key(value: Option<Vec<u8>>, field: &'static str) -> Result<Vec<u8>> {
+    normalize_public_key(value.ok_or_else(|| invalid(field, "present"))?, field)
+}
+
 fn exact_bytes(value: Vec<u8>, length: usize, field: &'static str) -> Result<Vec<u8>> {
     if value.len() == length {
         Ok(value)
@@ -275,6 +283,18 @@ fn optional_exact_bytes(
     value
         .map(|value| exact_bytes(value, length, field))
         .transpose()
+}
+
+fn required_exact_bytes(
+    value: Option<Vec<u8>>,
+    length: usize,
+    field: &'static str,
+) -> Result<Vec<u8>> {
+    exact_bytes(
+        value.ok_or_else(|| invalid(field, "present"))?,
+        length,
+        field,
+    )
 }
 
 impl SessionMessageKeyComponents {
@@ -365,20 +385,76 @@ impl SessionChainKeyComponents {
             )?,
         })
     }
+
+    fn into_required_structure(self) -> Result<session_structure::chain::ChainKey> {
+        Ok(session_structure::chain::ChainKey {
+            index: Some(
+                self.index
+                    .ok_or_else(|| invalid("sender chain-key index", "present"))?,
+            ),
+            key: Some(Bytes::from(required_exact_bytes(
+                self.key,
+                SYMMETRIC_KEY_BYTES,
+                "sender chain key",
+            )?)),
+        })
+    }
+
+    fn from_required_structure(value: session_structure::chain::ChainKey) -> Result<Self> {
+        Ok(Self {
+            index: Some(
+                value
+                    .index
+                    .ok_or_else(|| invalid("sender chain-key index", "present"))?,
+            ),
+            key: Some(required_exact_bytes(
+                value.key.map(|value| value.to_vec()),
+                SYMMETRIC_KEY_BYTES,
+                "sender chain key",
+            )?),
+        })
+    }
 }
 
 impl SessionChainComponents {
-    fn into_structure(self) -> Result<session_structure::Chain> {
+    fn into_sender_structure(self) -> Result<session_structure::Chain> {
+        Ok(session_structure::Chain {
+            sender_ratchet_key: Some(required_public_key(
+                self.sender_ratchet_key,
+                "sender ratchet public key",
+            )?),
+            sender_ratchet_key_private: Some(required_exact_bytes(
+                self.sender_ratchet_key_private,
+                PRIVATE_KEY_BYTES,
+                "sender ratchet private key",
+            )?),
+            chain_key: MessageField::some(
+                self.chain_key
+                    .ok_or_else(|| invalid("sender chain key", "present"))?
+                    .into_required_structure()?,
+            ),
+            message_keys: self
+                .message_keys
+                .into_iter()
+                .map(SessionMessageKeyComponents::into_structure)
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn into_receiver_structure(self) -> Result<session_structure::Chain> {
+        if self.sender_ratchet_key_private.is_some() {
+            return Err(invalid(
+                "receiver ratchet private key",
+                "absent from receiver chains",
+            ));
+        }
+
         Ok(session_structure::Chain {
             sender_ratchet_key: optional_public_key(
                 self.sender_ratchet_key,
-                "session ratchet public key",
+                "receiver ratchet public key",
             )?,
-            sender_ratchet_key_private: optional_exact_bytes(
-                self.sender_ratchet_key_private,
-                PRIVATE_KEY_BYTES,
-                "session ratchet private key",
-            )?,
+            sender_ratchet_key_private: None,
             chain_key: self
                 .chain_key
                 .map(SessionChainKeyComponents::into_structure)
@@ -392,17 +468,41 @@ impl SessionChainComponents {
         })
     }
 
-    fn from_structure(mut value: session_structure::Chain) -> Result<Self> {
+    fn from_sender_structure(mut value: session_structure::Chain) -> Result<Self> {
+        Ok(Self {
+            sender_ratchet_key: Some(required_public_key(
+                value.sender_ratchet_key,
+                "sender ratchet public key",
+            )?),
+            sender_ratchet_key_private: Some(required_exact_bytes(
+                value.sender_ratchet_key_private,
+                PRIVATE_KEY_BYTES,
+                "sender ratchet private key",
+            )?),
+            chain_key: Some(SessionChainKeyComponents::from_required_structure(
+                value
+                    .chain_key
+                    .take()
+                    .ok_or_else(|| invalid("sender chain key", "present"))?,
+            )?),
+            message_keys: value
+                .message_keys
+                .into_iter()
+                .map(SessionMessageKeyComponents::from_structure)
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn from_receiver_structure(mut value: session_structure::Chain) -> Result<Self> {
+        // The official reader ignores this field for receiver chains, including
+        // historical non-canonical values.
+        value.sender_ratchet_key_private = None;
         Ok(Self {
             sender_ratchet_key: optional_public_key(
                 value.sender_ratchet_key,
-                "session ratchet public key",
+                "receiver ratchet public key",
             )?,
-            sender_ratchet_key_private: optional_exact_bytes(
-                value.sender_ratchet_key_private,
-                PRIVATE_KEY_BYTES,
-                "session ratchet private key",
-            )?,
+            sender_ratchet_key_private: None,
             chain_key: value
                 .chain_key
                 .take()
@@ -414,19 +514,6 @@ impl SessionChainComponents {
                 .map(SessionMessageKeyComponents::from_structure)
                 .collect::<Result<_>>()?,
         })
-    }
-
-    fn from_receiver_structure(mut value: session_structure::Chain) -> Result<Self> {
-        // Receiver chains never own the remote ratchet's private key. The
-        // canonical session writer persists that absence as `Some([])`.
-        if value
-            .sender_ratchet_key_private
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-        {
-            value.sender_ratchet_key_private = None;
-        }
-        Self::from_structure(value)
     }
 }
 
@@ -531,13 +618,13 @@ pub(crate) fn session_structure_from_components(
         previous_counter: value.previous_counter,
         sender_chain: value
             .sender_chain
-            .map(SessionChainComponents::into_structure)
+            .map(SessionChainComponents::into_sender_structure)
             .transpose()?
             .into(),
         receiver_chains: value
             .receiver_chains
             .into_iter()
-            .map(SessionChainComponents::into_structure)
+            .map(SessionChainComponents::into_receiver_structure)
             .collect::<Result<_>>()?,
         pending_key_exchange: value
             .pending_key_exchange
@@ -574,7 +661,7 @@ pub(crate) fn session_components_from_structure(
         sender_chain: value
             .sender_chain
             .take()
-            .map(SessionChainComponents::from_structure)
+            .map(SessionChainComponents::from_sender_structure)
             .transpose()?,
         receiver_chains: value
             .receiver_chains
@@ -706,13 +793,125 @@ pub(crate) fn sender_state_components_from_structure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ChainKey, SenderKeyRecord, SessionRecord};
+    use crate::protocol::{
+        ChainKey, IdentityKey, KeyPair, RootKey, SenderKeyRecord, SessionRecord, SessionState,
+    };
+
+    #[derive(Debug, Clone, Copy)]
+    enum SenderChainFault {
+        MissingPrivateKey,
+        PrivateKeyLength(usize),
+        MissingPublicKey,
+        MissingChainKey,
+        MissingChainKeyIndex,
+        MissingChainKeySecret,
+    }
 
     fn public_key(seed: u8) -> Vec<u8> {
         PublicKey::from_djb_public_key_bytes(&[seed; PublicKey::RAW_KEY_LEN])
             .expect("valid test key")
             .serialize()
             .to_vec()
+    }
+
+    fn canonical_session_state() -> SessionState {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local_identity = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let remote_identity = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let base_key = KeyPair::generate(&mut rng).public_key;
+        let mut state = SessionState::new(
+            3,
+            &local_identity,
+            &remote_identity,
+            &RootKey::new([3; SYMMETRIC_KEY_BYTES]),
+            &base_key,
+        );
+        state.set_sender_chain(
+            &KeyPair::generate(&mut rng),
+            &ChainKey::new([4; SYMMETRIC_KEY_BYTES], 5),
+        );
+        state.add_receiver_chain(
+            &KeyPair::generate(&mut rng).public_key,
+            &ChainKey::new([6; SYMMETRIC_KEY_BYTES], 7),
+        );
+        state
+    }
+
+    fn canonical_session_components() -> SessionRecordComponents {
+        SessionRecord::new(canonical_session_state())
+            .into_components()
+            .expect("canonical session projects")
+    }
+
+    fn sender_chain_faults() -> [SenderChainFault; 8] {
+        [
+            SenderChainFault::MissingPrivateKey,
+            SenderChainFault::PrivateKeyLength(0),
+            SenderChainFault::PrivateKeyLength(PRIVATE_KEY_BYTES - 1),
+            SenderChainFault::PrivateKeyLength(PRIVATE_KEY_BYTES + 1),
+            SenderChainFault::MissingPublicKey,
+            SenderChainFault::MissingChainKey,
+            SenderChainFault::MissingChainKeyIndex,
+            SenderChainFault::MissingChainKeySecret,
+        ]
+    }
+
+    fn corrupt_sender_components(
+        components: &mut SessionRecordComponents,
+        fault: SenderChainFault,
+    ) {
+        let sender = components
+            .current_session
+            .as_mut()
+            .and_then(|session| session.sender_chain.as_mut())
+            .expect("canonical sender chain");
+        match fault {
+            SenderChainFault::MissingPrivateKey => sender.sender_ratchet_key_private = None,
+            SenderChainFault::PrivateKeyLength(length) => {
+                sender.sender_ratchet_key_private = Some(vec![0; length]);
+            }
+            SenderChainFault::MissingPublicKey => sender.sender_ratchet_key = None,
+            SenderChainFault::MissingChainKey => sender.chain_key = None,
+            SenderChainFault::MissingChainKeyIndex => {
+                sender
+                    .chain_key
+                    .as_mut()
+                    .expect("canonical chain key")
+                    .index = None;
+            }
+            SenderChainFault::MissingChainKeySecret => {
+                sender.chain_key.as_mut().expect("canonical chain key").key = None;
+            }
+        }
+    }
+
+    fn corrupt_persisted_sender(session: &mut SessionStructure, fault: SenderChainFault) {
+        let sender = session
+            .sender_chain
+            .as_option_mut()
+            .expect("canonical sender chain");
+        match fault {
+            SenderChainFault::MissingPrivateKey => sender.sender_ratchet_key_private = None,
+            SenderChainFault::PrivateKeyLength(length) => {
+                sender.sender_ratchet_key_private = Some(vec![0; length]);
+            }
+            SenderChainFault::MissingPublicKey => sender.sender_ratchet_key = None,
+            SenderChainFault::MissingChainKey => sender.chain_key = MessageField::none(),
+            SenderChainFault::MissingChainKeyIndex => {
+                sender
+                    .chain_key
+                    .as_option_mut()
+                    .expect("canonical chain key")
+                    .index = None;
+            }
+            SenderChainFault::MissingChainKeySecret => {
+                sender
+                    .chain_key
+                    .as_option_mut()
+                    .expect("canonical chain key")
+                    .key = None;
+            }
+        }
     }
 
     fn session_record() -> SessionRecordComponents {
@@ -880,22 +1079,25 @@ mod tests {
     }
 
     #[test]
-    fn canonical_receiver_chain_private_key_sentinel_round_trips() {
-        let mut components = session_record();
-        components
-            .current_session
-            .as_mut()
-            .expect("test session is present")
-            .receiver_chains
-            .clear();
-        let mut record = SessionRecord::from_components(components).expect("valid record");
-        let receiver_key = PublicKey::deserialize(&public_key(34)).expect("valid receiver key");
-        record
-            .session_state_mut()
-            .expect("test session is present")
-            .add_receiver_chain(&receiver_key, &ChainKey::new([35; SYMMETRIC_KEY_BYTES], 0));
+    fn canonical_session_api_round_trips_through_components() {
+        let state = canonical_session_state();
+        let structure = SessionStructure::from(&state);
+        assert_eq!(
+            structure.receiver_chains[0].sender_ratchet_key_private,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            structure
+                .sender_chain
+                .as_option()
+                .and_then(|chain| chain.sender_ratchet_key_private.as_ref())
+                .map(Vec::len),
+            Some(PRIVATE_KEY_BYTES)
+        );
 
-        let persisted = record.serialize().expect("serialize record");
+        let persisted = SessionRecord::new(state)
+            .serialize()
+            .expect("serialize canonical record");
         let projected = SessionRecord::deserialize(&persisted)
             .expect("deserialize canonical record")
             .into_components()
@@ -926,33 +1128,89 @@ mod tests {
     }
 
     #[test]
-    fn malformed_receiver_private_key_is_still_rejected() {
-        let session = session_record()
-            .current_session
-            .expect("test session is present");
-        let mut persisted = session_structure_from_components(session).expect("valid session");
-        persisted.receiver_chains[0].sender_ratchet_key_private =
-            Some(vec![0; PRIVATE_KEY_BYTES - 1]);
-        let error =
-            session_components_from_structure(persisted).expect_err("short private key must fail");
+    fn persisted_receiver_private_material_is_ignored() {
+        for (case, private_key) in [
+            ("absent", None),
+            ("empty", Some(Vec::new())),
+            ("one byte", Some(vec![0; 1])),
+            ("short key", Some(vec![0; PRIVATE_KEY_BYTES - 1])),
+            ("key-sized", Some(vec![0; PRIVATE_KEY_BYTES])),
+            ("long key", Some(vec![0; PRIVATE_KEY_BYTES + 1])),
+        ] {
+            let mut persisted = SessionStructure::from(canonical_session_state());
+            persisted.receiver_chains[0].sender_ratchet_key_private = private_key;
 
-        assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
+            let projected = session_components_from_structure(persisted).unwrap_or_else(|error| {
+                panic!("{case} receiver material must be ignored: {error}")
+            });
+            assert_eq!(
+                projected.receiver_chains[0].sender_ratchet_key_private, None,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn component_import_rejects_empty_private_key() {
-        let mut components = session_record();
+    fn receiver_component_import_rejects_private_material() {
+        for private_key in [Vec::new(), vec![0; PRIVATE_KEY_BYTES]] {
+            let mut components = canonical_session_components();
+            components
+                .current_session
+                .as_mut()
+                .expect("canonical session")
+                .receiver_chains[0]
+                .sender_ratchet_key_private = Some(private_key);
+
+            let error = SessionRecord::from_components(components)
+                .err()
+                .expect("receiver components must not carry private material");
+            assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
+        }
+    }
+
+    #[test]
+    fn sender_component_import_requires_a_complete_chain() {
+        for fault in sender_chain_faults() {
+            let mut components = canonical_session_components();
+            corrupt_sender_components(&mut components, fault);
+
+            let error = SessionRecord::from_components(components)
+                .err()
+                .unwrap_or_else(|| panic!("sender fault {fault:?} must fail"));
+            assert!(
+                matches!(error, SignalProtocolError::InvalidArgument(_)),
+                "{fault:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_sender_projection_requires_a_complete_chain() {
+        for fault in sender_chain_faults() {
+            let mut persisted = SessionStructure::from(canonical_session_state());
+            corrupt_persisted_sender(&mut persisted, fault);
+
+            let error = session_components_from_structure(persisted)
+                .err()
+                .unwrap_or_else(|| panic!("persisted sender fault {fault:?} must fail"));
+            assert!(
+                matches!(error, SignalProtocolError::InvalidArgument(_)),
+                "{fault:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn component_import_allows_an_absent_sender_chain() {
+        let mut components = canonical_session_components();
         components
             .current_session
             .as_mut()
-            .expect("test session is present")
-            .receiver_chains[0]
-            .sender_ratchet_key_private = Some(Vec::new());
+            .expect("canonical session")
+            .sender_chain = None;
 
-        let error = SessionRecord::from_components(components)
-            .err()
-            .expect("component key material must remain strict");
-        assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
+        SessionRecord::from_components(components)
+            .expect("intermediate state without sender chain");
     }
 
     #[test]
