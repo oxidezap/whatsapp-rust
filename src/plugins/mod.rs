@@ -469,7 +469,17 @@ impl PluginResources {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *subscriptions)
         };
-        drop(subscriptions);
+        for subscription in subscriptions {
+            if std::panic::catch_unwind(AssertUnwindSafe(|| drop(subscription))).is_err() {
+                log::warn!("Plugin core-event subscription panicked while being dropped");
+            }
+        }
+    }
+}
+
+fn close_plugin_resources(plugin_id: &str, resources: &PluginResources) {
+    if std::panic::catch_unwind(AssertUnwindSafe(|| resources.close())).is_err() {
+        log::warn!("Plugin `{plugin_id}` resource closure panicked");
     }
 }
 
@@ -1049,10 +1059,10 @@ impl PluginInstallRollback {
 
     fn close_resources(&self) {
         if let Some(current) = &self.current {
-            current.resources.close();
+            close_plugin_resources(&current.manifest.id, &current.resources);
         }
         for plugin in self.installed.iter().rev() {
-            plugin.resources.close();
+            close_plugin_resources(&plugin.manifest.id, &plugin.resources);
         }
     }
 
@@ -1406,7 +1416,9 @@ impl PluginHost {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.terminal.load(Ordering::Acquire) {
             drop(installing);
-            resources.close();
+            if std::panic::catch_unwind(AssertUnwindSafe(|| resources.close())).is_err() {
+                log::warn!("Installing plugin resource closure panicked");
+            }
             return false;
         }
         installing.push(Arc::downgrade(resources));
@@ -1422,7 +1434,9 @@ impl PluginHost {
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         for resources in resources {
-            resources.close();
+            if std::panic::catch_unwind(AssertUnwindSafe(|| resources.close())).is_err() {
+                log::warn!("Installing plugin resource closure panicked");
+            }
         }
     }
 
@@ -1444,7 +1458,7 @@ impl PluginHost {
 
     fn close_installed_resources(&self) {
         for plugin in self.installed.get().into_iter().flatten().rev() {
-            plugin.resources.close();
+            close_plugin_resources(&plugin.manifest.id, &plugin.resources);
         }
     }
 
@@ -3097,6 +3111,70 @@ mod tests {
 
     struct EventSubscriptionPlugin;
 
+    struct PanickingDropEventHandler;
+
+    impl EventHandler for PanickingDropEventHandler {
+        fn handle_event(&self, _event: Arc<wacore::types::events::Event>) {}
+    }
+
+    impl Drop for PanickingDropEventHandler {
+        fn drop(&mut self) {
+            panic!("injected event handler drop panic");
+        }
+    }
+
+    struct PanickingSubscriptionPlugin;
+
+    impl ClientPlugin for PanickingSubscriptionPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("panicking-subscription", "0.1.0")
+                .with_capability(PluginCapability::CoreEvents)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                context
+                    .core_events()
+                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
+                    .subscribe(
+                        EventInterest::of(&[EventKind::Connected]),
+                        Arc::new(PanickingDropEventHandler),
+                    )?;
+                Ok(Arc::new(()))
+            })
+        }
+    }
+
+    struct ShutdownSignalPlugin;
+
+    impl ClientPlugin for ShutdownSignalPlugin {
+        type Api = ShutdownSignal;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("shutdown-signal", "0.1.0").with_capability(PluginCapability::Tasks)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                context
+                    .tasks()
+                    .map(PluginTasks::shutdown_signal)
+                    .map(Arc::new)
+                    .ok_or_else(|| anyhow::anyhow!("tasks capability missing"))
+            })
+        }
+    }
+
+    struct ShutdownSignalLifecycle(Arc<AtomicBool>);
+
+    impl ClientLifecycle for ShutdownSignalLifecycle {
+        fn signal_shutdown(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     impl ClientPlugin for EventSubscriptionPlugin {
         type Api = ();
 
@@ -3188,6 +3266,30 @@ mod tests {
                 .has_handler_for(wacore::types::events::EventKind::Connected)
         );
         assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    #[tokio::test]
+    async fn panicking_handler_drop_does_not_strand_later_plugins_or_upstream() {
+        let upstream_signalled = Arc::new(AtomicBool::new(false));
+        let client = complete_builder()
+            .await
+            .with_lifecycle(ShutdownSignalLifecycle(upstream_signalled.clone()))
+            .with_plugin(ShutdownSignalPlugin)
+            .with_plugin(PanickingSubscriptionPlugin)
+            .build()
+            .await
+            .expect("panicking subscription client")
+            .into_client();
+        let plugin_shutdown = client
+            .plugin::<ShutdownSignalPlugin>()
+            .expect("shutdown signal API");
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| client.signal_shutdown_sync()));
+
+        assert!(result.is_ok());
+        assert!(plugin_shutdown.is_fired());
+        assert!(upstream_signalled.load(Ordering::Acquire));
+        client.disconnect().await;
     }
 
     #[tokio::test]
