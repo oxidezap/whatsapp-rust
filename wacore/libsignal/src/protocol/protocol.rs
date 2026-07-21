@@ -106,7 +106,7 @@ fn decode_message_version(version_byte: u8) -> u8 {
 }
 
 // Signal's original implementation uses version 4, but WhatsApp Web,
-// Baileys (libsignal-node), and whatsmeow all use version 3.
+// Interoperable Signal implementations use version 3.
 pub const CIPHERTEXT_MESSAGE_CURRENT_VERSION: u8 = 3;
 pub const SENDERKEY_MESSAGE_CURRENT_VERSION: u8 = 3;
 

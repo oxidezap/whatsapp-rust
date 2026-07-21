@@ -11,6 +11,10 @@ use hmac::{HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::protocol::crypto::hmac_sha256;
+use crate::protocol::record_components::{
+    SenderKeyRecordComponents, sender_state_components_from_structure,
+    sender_state_structure_from_components,
+};
 use crate::protocol::stores::{
     SenderKeyRecordStructure, SenderKeyStateStructure, sender_key_state_structure,
 };
@@ -438,6 +442,27 @@ impl SenderKeyState {
         state
     }
 
+    fn into_protobuf(mut self) -> SenderKeyStateStructure {
+        debug_assert!(
+            self.state.sender_message_keys.is_empty()
+                && self.state.sender_chain_key.as_option().is_none(),
+            "backlog and chain key must have a single in-memory owner"
+        );
+        let message_keys = std::sync::Arc::try_unwrap(self.message_keys)
+            .unwrap_or_else(|shared| shared.as_ref().clone());
+        self.state.sender_message_keys = message_keys
+            .iter()
+            .map(StoredMessageKey::as_protobuf)
+            .collect();
+        self.state.sender_chain_key = self
+            .sender_chain
+            .as_ref()
+            .map_or_else(MessageField::none, |chain| {
+                MessageField::some(chain.as_protobuf())
+            });
+        self.state
+    }
+
     pub fn add_sender_message_key(&mut self, sender_message_key: &SenderMessageKey) {
         let keys = std::sync::Arc::make_mut(&mut self.message_keys);
         keys.push(StoredMessageKey {
@@ -506,6 +531,45 @@ impl SenderKeyRecord {
             wire_gated: false,
             reserved_iteration: 0,
         }
+    }
+
+    /// Builds a record from validated protocol components.
+    ///
+    /// Components do not carry process-local durability metadata, so the
+    /// imported current chain starts a fresh reservation lifecycle.
+    pub fn from_components(value: SenderKeyRecordComponents) -> Result<Self, SignalProtocolError> {
+        let states = value
+            .states
+            .into_iter()
+            .map(sender_state_structure_from_components)
+            .map(|state| state.map(SenderKeyState::from_protobuf))
+            .collect::<Result<VecDeque<_>, _>>()?;
+
+        Ok(Self {
+            states,
+            wire_gated: false,
+            reserved_iteration: 0,
+        })
+    }
+
+    /// Consumes the record and projects its protocol components.
+    ///
+    /// Any durably reserved sender range is advanced to its exclusive ceiling
+    /// before export so rebuilding the record cannot derive a possibly spent
+    /// message key again.
+    pub fn into_components(mut self) -> Result<SenderKeyRecordComponents, SignalProtocolError> {
+        if self.reserved_iteration > 0
+            && let Some(state) = self.states.front_mut()
+        {
+            state.fast_forward_sender_chain(self.reserved_iteration)?;
+        }
+        let states = self
+            .states
+            .into_iter()
+            .map(SenderKeyState::into_protobuf)
+            .map(sender_state_components_from_structure)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SenderKeyRecordComponents { states })
     }
 
     pub fn is_empty(&self) -> bool {

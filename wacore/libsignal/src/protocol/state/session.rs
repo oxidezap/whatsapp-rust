@@ -13,6 +13,9 @@ use subtle::ConstantTimeEq;
 use crate::core::curve::KeyType;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
+use crate::protocol::record_components::{
+    SessionRecordComponents, session_components_from_structure, session_structure_from_components,
+};
 use crate::protocol::state::{PreKeyId, SignedPreKeyId};
 use crate::protocol::stores::SessionStructure;
 use crate::protocol::stores::session_structure::{self};
@@ -710,6 +713,59 @@ impl SessionRecord {
             reserved_sender_chain_index: 0,
             pending_reservation: false,
         }
+    }
+
+    /// Builds a record from validated protocol components.
+    ///
+    /// Components do not carry process-local durability metadata. The imported
+    /// chain therefore starts a fresh reservation lifecycle, while archived
+    /// sessions are bounded to the same limit used by record deserialization.
+    pub fn from_components(value: SessionRecordComponents) -> Result<Self, SignalProtocolError> {
+        let current_session = value
+            .current_session
+            .map(session_structure_from_components)
+            .transpose()?
+            .map(SessionState::from_session_structure);
+        let previous_sessions = value
+            .previous_sessions
+            .into_iter()
+            .take(consts::ARCHIVED_STATES_MAX_LENGTH)
+            .map(session_structure_from_components)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            current_session,
+            previous_sessions: Arc::new(previous_sessions),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
+        })
+    }
+
+    /// Consumes the record and projects its protocol components.
+    ///
+    /// Any durably reserved sender range is advanced to its exclusive ceiling
+    /// before export so rebuilding the record cannot derive a possibly spent
+    /// message key again.
+    pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
+        if self.reserved_sender_chain_index > 0
+            && let Some(state) = self.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain(self.reserved_sender_chain_index)?;
+        }
+        let current_session = self
+            .current_session
+            .map(|state| session_components_from_structure(state.session))
+            .transpose()?;
+        let previous_sessions = Arc::try_unwrap(self.previous_sessions)
+            .unwrap_or_else(|shared| shared.as_ref().clone())
+            .into_iter()
+            .map(session_components_from_structure)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(SessionRecordComponents {
+            current_session,
+            previous_sessions,
+        })
     }
 
     pub fn reserved_sender_chain_index(&self) -> u32 {
