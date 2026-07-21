@@ -5,9 +5,9 @@ mod events;
 pub use events::{
     PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
     PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,
-    PluginEventReceiveError, PluginEventRouteError, PluginEventRouter, PluginEventSelector,
-    PluginEventSubscribeError, PluginEventSubscription, PluginEventTopic,
-    PluginEventTryReceiveError, PluginEvents,
+    PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
+    PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
+    PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
 };
 
 use std::any::{Any, TypeId};
@@ -226,6 +226,60 @@ pub enum PluginIqError {
     Iq(#[from] IqError),
 }
 
+/// Lifecycle state of one installed plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginState {
+    Installing,
+    Active,
+    ShuttingDown,
+    /// The bounded shutdown attempt completed; health and task counts show incomplete cleanup.
+    Stopped,
+}
+
+/// Sticky health derived from cumulative host and event-router failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginHealth {
+    Healthy,
+    Degraded,
+}
+
+/// On-demand runtime snapshot for one plugin, identified only by its public manifest ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PluginStats {
+    pub plugin_id: String,
+    pub state: PluginState,
+    pub health: PluginHealth,
+    /// Lifecycle hooks that returned successfully.
+    pub callbacks_completed: u64,
+    /// Lifecycle hook errors and isolated panics.
+    pub callback_failures: u64,
+    pub callback_timeouts: u64,
+    pub task_drain_timeouts: u64,
+    /// Core-event handler calls that returned without panicking.
+    pub core_events_delivered: u64,
+    /// Panics isolated before they could unwind through the client's event dispatcher.
+    pub core_event_panics: u64,
+    pub resource_teardown_panics: u64,
+    pub install_tasks: u64,
+    pub connection_tasks: u64,
+    pub connection_generations: u64,
+    pub core_event_subscriptions: u64,
+    pub events: Option<PluginEventPublisherStats>,
+}
+
+/// On-demand aggregate for the native plugin host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PluginHostStats {
+    pub terminal: bool,
+    pub health: PluginHealth,
+    pub plugins: Vec<PluginStats>,
+    pub event_router: Option<PluginEventRouterStats>,
+}
+
 struct PluginResources {
     active: AtomicBool,
     closed: AtomicBool,
@@ -234,6 +288,7 @@ struct PluginResources {
     install_tasks: Arc<TaskTracker>,
     connection_tasks: Mutex<ConnectionTaskRegistry>,
     subscriptions: Mutex<Vec<PluginCoreEventSubscription>>,
+    teardown_panics: AtomicU64,
 }
 
 #[derive(Default)]
@@ -301,6 +356,13 @@ impl TaskTracker {
     fn completion_signal(&self) -> ShutdownSignal {
         self.idle.subscribe()
     }
+
+    fn active(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+    }
 }
 
 struct TaskLease {
@@ -339,6 +401,7 @@ impl PluginResources {
             install_tasks: TaskTracker::new(),
             connection_tasks: Mutex::new(ConnectionTaskRegistry::default()),
             subscriptions: Mutex::new(Vec::new()),
+            teardown_panics: AtomicU64::new(0),
         })
     }
 
@@ -494,6 +557,7 @@ impl PluginResources {
         };
         for subscription in subscriptions {
             if std::panic::catch_unwind(AssertUnwindSafe(|| drop(subscription))).is_err() {
+                self.teardown_panics.fetch_add(1, Ordering::Relaxed);
                 log::warn!("Plugin core-event subscription panicked while being dropped");
             }
         }
@@ -502,7 +566,174 @@ impl PluginResources {
 
 fn close_plugin_resources(plugin_id: &str, resources: &PluginResources) {
     if std::panic::catch_unwind(AssertUnwindSafe(|| resources.close())).is_err() {
+        resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
         log::warn!("Plugin `{plugin_id}` resource closure panicked");
+    }
+}
+
+impl PluginResources {
+    fn stats(&self) -> PluginResourceStats {
+        let (connection_generations, connection_trackers) = {
+            let registry = self
+                .connection_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                registry.trackers.len(),
+                registry.trackers.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let connection_tasks = connection_trackers.iter().fold(0usize, |total, tracker| {
+            total.saturating_add(tracker.active())
+        });
+        PluginResourceStats {
+            active: self.active.load(Ordering::Acquire),
+            closed: self.closed.load(Ordering::Acquire),
+            install_tasks: self.install_tasks.active(),
+            connection_tasks,
+            connection_generations,
+            core_event_subscriptions: self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            teardown_panics: self.teardown_panics.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PluginResourceStats {
+    active: bool,
+    closed: bool,
+    install_tasks: usize,
+    connection_tasks: usize,
+    connection_generations: usize,
+    core_event_subscriptions: usize,
+    teardown_panics: u64,
+}
+
+struct PluginDiagnostics {
+    resources: Mutex<Weak<PluginResources>>,
+    callbacks_completed: AtomicU64,
+    callback_failures: AtomicU64,
+    callback_timeouts: AtomicU64,
+    task_drain_timeouts: AtomicU64,
+    core_events_delivered: AtomicU64,
+    core_event_panics: AtomicU64,
+    shutdown_complete: AtomicBool,
+}
+
+impl PluginDiagnostics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            resources: Mutex::new(Weak::new()),
+            callbacks_completed: AtomicU64::new(0),
+            callback_failures: AtomicU64::new(0),
+            callback_timeouts: AtomicU64::new(0),
+            task_drain_timeouts: AtomicU64::new(0),
+            core_events_delivered: AtomicU64::new(0),
+            core_event_panics: AtomicU64::new(0),
+            shutdown_complete: AtomicBool::new(false),
+        })
+    }
+
+    fn attach_resources(&self, resources: &Arc<PluginResources>) {
+        *self
+            .resources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(resources);
+    }
+
+    fn record_callback(&self, result: &Result<(), PluginCallbackError>) {
+        match result {
+            Ok(()) => {
+                self.callbacks_completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PluginCallbackError::Timeout { .. }) => {
+                self.callback_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PluginCallbackError::TimeoutCancellationPanic { .. }) => {
+                self.callback_timeouts.fetch_add(1, Ordering::Relaxed);
+                self.callback_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PluginCallbackError::Callback(_)) => {
+                self.callback_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_task_drain(&self, result: &Result<(), PluginTaskDrainError>) {
+        if matches!(result, Err(PluginTaskDrainError::Timeout { .. })) {
+            self.task_drain_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_stopped(&self) {
+        self.shutdown_complete.store(true, Ordering::Release);
+    }
+
+    fn snapshot(
+        &self,
+        plugin_id: &str,
+        terminal: bool,
+        events: Option<PluginEventPublisherStats>,
+    ) -> PluginStats {
+        let resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+            .map(|resources| resources.stats())
+            .unwrap_or_default();
+        let callbacks_completed = self.callbacks_completed.load(Ordering::Relaxed);
+        let callback_failures = self.callback_failures.load(Ordering::Relaxed);
+        let callback_timeouts = self.callback_timeouts.load(Ordering::Relaxed);
+        let task_drain_timeouts = self.task_drain_timeouts.load(Ordering::Relaxed);
+        let core_events_delivered = self.core_events_delivered.load(Ordering::Relaxed);
+        let core_event_panics = self.core_event_panics.load(Ordering::Relaxed);
+        let state = if self.shutdown_complete.load(Ordering::Acquire) {
+            PluginState::Stopped
+        } else if resources.closed || terminal {
+            PluginState::ShuttingDown
+        } else if resources.active {
+            PluginState::Active
+        } else {
+            PluginState::Installing
+        };
+        let event_degraded = events
+            .as_ref()
+            .is_some_and(|events| events.publish_failures > 0 || events.dropped > 0);
+        let health = if callback_failures > 0
+            || callback_timeouts > 0
+            || task_drain_timeouts > 0
+            || core_event_panics > 0
+            || resources.teardown_panics > 0
+            || event_degraded
+        {
+            PluginHealth::Degraded
+        } else {
+            PluginHealth::Healthy
+        };
+        PluginStats {
+            plugin_id: plugin_id.to_string(),
+            state,
+            health,
+            callbacks_completed,
+            callback_failures,
+            callback_timeouts,
+            task_drain_timeouts,
+            core_events_delivered,
+            core_event_panics,
+            resource_teardown_panics: resources.teardown_panics,
+            install_tasks: u64::try_from(resources.install_tasks).unwrap_or(u64::MAX),
+            connection_tasks: u64::try_from(resources.connection_tasks).unwrap_or(u64::MAX),
+            connection_generations: u64::try_from(resources.connection_generations)
+                .unwrap_or(u64::MAX),
+            core_event_subscriptions: u64::try_from(resources.core_event_subscriptions)
+                .unwrap_or(u64::MAX),
+            events,
+        }
     }
 }
 
@@ -549,6 +780,49 @@ impl PluginTasks {
 pub struct PluginCoreEvents {
     client: Weak<Client>,
     resources: Arc<PluginResources>,
+    plugin_id: Arc<str>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
+struct PluginCoreEventHandler {
+    plugin_id: Arc<str>,
+    inner: Option<Arc<dyn EventHandler>>,
+    resources: Weak<PluginResources>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
+impl EventHandler for PluginCoreEventHandler {
+    fn handle_event(&self, event: Arc<wacore::types::events::Event>) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if std::panic::catch_unwind(AssertUnwindSafe(|| inner.handle_event(event))).is_err() {
+            self.diagnostics
+                .core_event_panics
+                .fetch_add(1, Ordering::Relaxed);
+            log::warn!("Plugin `{}` core-event handler panicked", self.plugin_id);
+        } else {
+            self.diagnostics
+                .core_events_delivered
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PluginCoreEventHandler {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take()
+            && std::panic::catch_unwind(AssertUnwindSafe(|| drop(inner))).is_err()
+        {
+            if let Some(resources) = self.resources.upgrade() {
+                resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            log::warn!(
+                "Plugin `{}` core-event handler panicked while being dropped",
+                self.plugin_id
+            );
+        }
+    }
 }
 
 impl PluginCoreEvents {
@@ -564,6 +838,12 @@ impl PluginCoreEvents {
         let raw_node_lease = interest
             .wants(EventKind::RawNode)
             .then(|| client.acquire_raw_node_forwarding());
+        let handler = Arc::new(PluginCoreEventHandler {
+            plugin_id: Arc::clone(&self.plugin_id),
+            inner: Some(handler),
+            resources: Arc::downgrade(&self.resources),
+            diagnostics: Arc::clone(&self.diagnostics),
+        });
         let subscription = client.subscribe(interest, handler);
         self.resources
             .retain_subscription(subscription, raw_node_lease)
@@ -1057,6 +1337,7 @@ struct InstalledPlugin {
     plugin: Arc<dyn ErasedClientPlugin>,
     manifest: PluginManifest,
     resources: Arc<PluginResources>,
+    diagnostics: Arc<PluginDiagnostics>,
 }
 
 struct PluginInstallRollback {
@@ -1159,9 +1440,18 @@ impl Drop for PluginInstallRollback {
     }
 }
 
+struct PluginContextParts {
+    resources: Arc<PluginResources>,
+    apis: Arc<ApiRegistry>,
+    runtime: Arc<dyn Runtime>,
+    connection_generation: Arc<AtomicU64>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
 pub(crate) struct PluginHost {
     ordered: Vec<PlannedPlugin>,
     manifests: Vec<PluginManifest>,
+    diagnostics: Vec<Arc<PluginDiagnostics>>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
     installed: OnceLock<Vec<InstalledPlugin>>,
     apis: OnceLock<HashMap<TypeId, ErasedApi>>,
@@ -1199,9 +1489,13 @@ impl PluginHost {
             .collect::<Vec<_>>();
         let event_router =
             (!event_publishers.is_empty()).then(|| PluginEventRouter::new(event_publishers));
+        let diagnostics = (0..manifests.len())
+            .map(|_| PluginDiagnostics::new())
+            .collect();
         Arc::new(Self {
             ordered: plan.ordered,
             manifests,
+            diagnostics,
             upstream,
             installed: OnceLock::new(),
             apis: OnceLock::new(),
@@ -1220,6 +1514,36 @@ impl PluginHost {
 
     pub(crate) fn manifests(&self) -> &[PluginManifest] {
         &self.manifests
+    }
+
+    pub(crate) fn stats(&self) -> PluginHostStats {
+        let terminal = self.terminal.load(Ordering::Acquire);
+        let plugins = self
+            .manifests
+            .iter()
+            .zip(&self.diagnostics)
+            .map(|(manifest, diagnostics)| {
+                let events = self
+                    .event_router
+                    .as_ref()
+                    .and_then(|router| router.publisher_stats(&manifest.id));
+                diagnostics.snapshot(&manifest.id, terminal, events)
+            })
+            .collect::<Vec<_>>();
+        let health = if plugins
+            .iter()
+            .any(|plugin| plugin.health == PluginHealth::Degraded)
+        {
+            PluginHealth::Degraded
+        } else {
+            PluginHealth::Healthy
+        };
+        PluginHostStats {
+            terminal,
+            health,
+            plugins,
+            event_router: self.event_router.as_ref().map(PluginEventRouter::stats),
+        }
     }
 
     pub(crate) fn lifecycle_callback_timeout(&self) -> Duration {
@@ -1243,11 +1567,15 @@ impl PluginHost {
         &self,
         client: &Weak<Client>,
         planned: &PlannedPlugin,
-        resources: Arc<PluginResources>,
-        apis: Arc<ApiRegistry>,
-        runtime: Arc<dyn Runtime>,
-        connection_generation: Arc<AtomicU64>,
+        parts: PluginContextParts,
     ) -> PluginContext {
+        let PluginContextParts {
+            resources,
+            apis,
+            runtime,
+            connection_generation,
+            diagnostics,
+        } = parts;
         let manifest = &planned.manifest;
         let capabilities = manifest.capabilities;
         PluginContext {
@@ -1258,6 +1586,8 @@ impl PluginHost {
                 .then(|| PluginCoreEvents {
                     client: client.clone(),
                     resources: Arc::clone(&resources),
+                    plugin_id: Arc::from(manifest.id.as_str()),
+                    diagnostics: Arc::clone(&diagnostics),
                 }),
             tasks: capabilities
                 .contains(PluginCapability::Tasks)
@@ -1281,7 +1611,7 @@ impl PluginHost {
                 .event_router
                 .as_ref()
                 .filter(|_| capabilities.contains(PluginCapability::PluginEvents))
-                .map(|router| {
+                .and_then(|router| {
                     events::publisher(
                         &manifest.id,
                         router.clone(),
@@ -1314,11 +1644,14 @@ impl PluginHost {
         PluginConnectionScope { scope, tasks }
     }
 
-    async fn wait_for_tasks(&self, completion_signals: Vec<ShutdownSignal>) -> anyhow::Result<()> {
+    async fn wait_for_tasks(
+        &self,
+        completion_signals: Vec<ShutdownSignal>,
+    ) -> Result<(), PluginTaskDrainError> {
         let runtime = self
             .runtime
             .get()
-            .ok_or_else(|| anyhow::anyhow!("plugin runtime is unavailable"))?;
+            .ok_or(PluginTaskDrainError::RuntimeUnavailable)?;
         wait_for_plugin_tasks(&**runtime, self.callback_timeout, completion_signals).await
     }
 
@@ -1353,21 +1686,26 @@ impl PluginHost {
 
         let staging = Arc::new(ApiRegistry::default());
         rollback.staged_apis = Some(Arc::clone(&staging));
-        for planned in &self.ordered {
+        for (planned, diagnostics) in self.ordered.iter().zip(&self.diagnostics) {
             self.abort_install_if_terminal(&mut rollback).await?;
             let resources = PluginResources::new();
+            diagnostics.attach_resources(&resources);
             let context = self.context(
                 &client,
                 planned,
-                Arc::clone(&resources),
-                Arc::clone(&staging),
-                runtime.clone(),
-                connection_generation.clone(),
+                PluginContextParts {
+                    resources: Arc::clone(&resources),
+                    apis: Arc::clone(&staging),
+                    runtime: runtime.clone(),
+                    connection_generation: connection_generation.clone(),
+                    diagnostics: Arc::clone(diagnostics),
+                },
             );
             rollback.current = Some(InstalledPlugin {
                 plugin: planned.plugin.clone(),
                 manifest: planned.manifest.clone(),
                 resources: Arc::clone(&resources),
+                diagnostics: Arc::clone(diagnostics),
             });
             if !self.track_installing_resources(&resources) {
                 rollback.rollback().await;
@@ -1440,6 +1778,7 @@ impl PluginHost {
         if self.terminal.load(Ordering::Acquire) {
             drop(installing);
             if std::panic::catch_unwind(AssertUnwindSafe(|| resources.close())).is_err() {
+                resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
                 log::warn!("Installing plugin resource closure panicked");
             }
             return false;
@@ -1458,6 +1797,7 @@ impl PluginHost {
             .collect::<Vec<_>>();
         for resources in resources {
             if std::panic::catch_unwind(AssertUnwindSafe(|| resources.close())).is_err() {
+                resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
                 log::warn!("Installing plugin resource closure panicked");
             }
         }
@@ -1488,11 +1828,10 @@ impl PluginHost {
     async fn run_callback<'a>(
         &'a self,
         make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
-    ) -> anyhow::Result<()> {
-        let runtime = self
-            .runtime
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("plugin runtime is unavailable"))?;
+    ) -> Result<(), PluginCallbackError> {
+        let runtime = self.runtime.get().ok_or_else(|| {
+            PluginCallbackError::Callback(anyhow::anyhow!("plugin runtime is unavailable"))
+        })?;
         bounded_plugin_callback(&**runtime, self.callback_timeout, make_future).await
     }
 }
@@ -1530,10 +1869,11 @@ impl ClientLifecycle for PluginHost {
                     });
                 let plugin_scope =
                     self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
-                if let Err(error) = self
+                let result = self
                     .run_callback(|| plugin.plugin.on_ready(plugin_scope))
-                    .await
-                {
+                    .await;
+                plugin.diagnostics.record_callback(&result);
+                if let Err(error) = result {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
@@ -1551,10 +1891,11 @@ impl ClientLifecycle for PluginHost {
                     .contains(PluginCapability::Tasks)
                     .then(|| plugin.resources.close_connection_tasks(scope.generation()));
                 if let Some(task_tracker) = &task_tracker {
-                    match self
+                    let result = self
                         .wait_for_tasks(vec![task_tracker.completion_signal()])
-                        .await
-                    {
+                        .await;
+                    plugin.diagnostics.record_task_drain(&result);
+                    match result {
                         Ok(()) => plugin
                             .resources
                             .forget_connection_tasks(scope.generation(), task_tracker),
@@ -1565,10 +1906,11 @@ impl ClientLifecycle for PluginHost {
                 }
                 let plugin_scope =
                     self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
-                if let Err(error) = self
+                let result = self
                     .run_callback(|| plugin.plugin.on_closed(plugin_scope))
-                    .await
-                {
+                    .await;
+                plugin.diagnostics.record_callback(&result);
+                if let Err(error) = result {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
@@ -1601,13 +1943,17 @@ impl ClientLifecycle for PluginHost {
             let mut failures = Vec::new();
             self.signal_shutdown();
             for plugin in self.installed.get().into_iter().flatten().rev() {
-                if let Err(error) = self
+                let task_result = self
                     .wait_for_tasks(plugin.resources.task_completion_signals())
-                    .await
-                {
+                    .await;
+                plugin.diagnostics.record_task_drain(&task_result);
+                if let Err(error) = task_result {
                     failures.push(format!("{} tasks: {error:#}", plugin.manifest.id));
                 }
-                if let Err(error) = self.run_callback(|| plugin.plugin.shutdown()).await {
+                let callback_result = self.run_callback(|| plugin.plugin.shutdown()).await;
+                plugin.diagnostics.record_callback(&callback_result);
+                plugin.diagnostics.mark_stopped();
+                if let Err(error) = callback_result {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
@@ -1627,6 +1973,26 @@ impl Drop for PluginHost {
     }
 }
 
+#[derive(Debug, Error)]
+enum PluginCallbackError {
+    #[error("callback timed out after {timeout_seconds:.3} seconds")]
+    Timeout { timeout_seconds: f64 },
+    #[error(
+        "callback timed out after {timeout_seconds:.3} seconds and panicked while being cancelled"
+    )]
+    TimeoutCancellationPanic { timeout_seconds: f64 },
+    #[error(transparent)]
+    Callback(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Error)]
+enum PluginTaskDrainError {
+    #[error("plugin runtime is unavailable")]
+    RuntimeUnavailable,
+    #[error("plugin tasks did not stop within {timeout_seconds:.3} seconds")]
+    Timeout { timeout_seconds: f64 },
+}
+
 async fn shutdown_staged_plugins(
     runtime: Arc<dyn Runtime>,
     current: Option<InstalledPlugin>,
@@ -1635,23 +2001,26 @@ async fn shutdown_staged_plugins(
     staged_apis: Option<Arc<ApiRegistry>>,
 ) {
     if let Some(plugin) = current {
-        if let Err(error) = wait_for_plugin_tasks(
+        let task_result = wait_for_plugin_tasks(
             &*runtime,
             PLUGIN_CALLBACK_TIMEOUT,
             plugin.resources.task_completion_signals(),
         )
-        .await
-        {
+        .await;
+        plugin.diagnostics.record_task_drain(&task_result);
+        if let Err(error) = task_result {
             log::warn!(
                 "Plugin `{}` failed-install task cleanup failed: {error:#}",
                 plugin.manifest.id
             );
         }
-        if let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+        let callback_result = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
             plugin.plugin.shutdown()
         })
-        .await
-        {
+        .await;
+        plugin.diagnostics.record_callback(&callback_result);
+        plugin.diagnostics.mark_stopped();
+        if let Err(error) = callback_result {
             log::warn!(
                 "Plugin `{}` failed-install rollback failed: {error:#}",
                 plugin.manifest.id
@@ -1659,23 +2028,26 @@ async fn shutdown_staged_plugins(
         }
     }
     while let Some(plugin) = installed.pop() {
-        if let Err(error) = wait_for_plugin_tasks(
+        let task_result = wait_for_plugin_tasks(
             &*runtime,
             PLUGIN_CALLBACK_TIMEOUT,
             plugin.resources.task_completion_signals(),
         )
-        .await
-        {
+        .await;
+        plugin.diagnostics.record_task_drain(&task_result);
+        if let Err(error) = task_result {
             log::warn!(
                 "Plugin `{}` rollback task cleanup failed: {error:#}",
                 plugin.manifest.id
             );
         }
-        if let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+        let callback_result = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
             plugin.plugin.shutdown()
         })
-        .await
-        {
+        .await;
+        plugin.diagnostics.record_callback(&callback_result);
+        plugin.diagnostics.mark_stopped();
+        if let Err(error) = callback_result {
             log::warn!("Plugin `{}` rollback failed: {error:#}", plugin.manifest.id);
         }
     }
@@ -1695,7 +2067,7 @@ async fn wait_for_plugin_tasks(
     runtime: &dyn Runtime,
     timeout: Duration,
     completion_signals: Vec<ShutdownSignal>,
-) -> anyhow::Result<()> {
+) -> Result<(), PluginTaskDrainError> {
     let wait_for_all = async move {
         for signal in completion_signals {
             wait_for_shutdown(&signal).await;
@@ -1703,11 +2075,8 @@ async fn wait_for_plugin_tasks(
     };
     runtime_timeout(runtime, timeout, wait_for_all)
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "plugin tasks did not stop within {:.3} seconds",
-                timeout.as_secs_f64()
-            )
+        .map_err(|_| PluginTaskDrainError::Timeout {
+            timeout_seconds: timeout.as_secs_f64(),
         })
 }
 
@@ -1715,23 +2084,21 @@ async fn bounded_plugin_callback<'a>(
     runtime: &dyn Runtime,
     timeout: Duration,
     make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
-) -> anyhow::Result<()> {
+) -> Result<(), PluginCallbackError> {
     let callback = Box::pin(plugin_callback(make_future));
     match futures::future::select(callback, runtime.sleep(timeout)).await {
-        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Left((result, _)) => result.map_err(PluginCallbackError::Callback),
         futures::future::Either::Right(((), callback)) => {
             let cancellation_panicked =
                 std::panic::catch_unwind(AssertUnwindSafe(|| drop(callback))).is_err();
             if cancellation_panicked {
-                anyhow::bail!(
-                    "callback timed out after {:.3} seconds and panicked while being cancelled",
-                    timeout.as_secs_f64()
-                );
+                return Err(PluginCallbackError::TimeoutCancellationPanic {
+                    timeout_seconds: timeout.as_secs_f64(),
+                });
             }
-            anyhow::bail!(
-                "callback timed out after {:.3} seconds",
-                timeout.as_secs_f64()
-            )
+            Err(PluginCallbackError::Timeout {
+                timeout_seconds: timeout.as_secs_f64(),
+            })
         }
     }
 }
@@ -1792,6 +2159,11 @@ impl Client {
             .as_ref()
             .map(|host| host.manifests())
             .unwrap_or_default()
+    }
+
+    /// Snapshot lifecycle, task, subscription, and custom-event health for installed plugins.
+    pub fn plugin_stats(&self) -> Option<PluginHostStats> {
+        self.plugin_host.as_ref().map(|host| host.stats())
     }
 
     /// Subscribe to custom events emitted by installed plugins.
@@ -2322,6 +2694,7 @@ mod tests {
             plugin: erased_plugin,
             manifest,
             resources,
+            diagnostics: PluginDiagnostics::new(),
         });
         rollback.staged_apis = Some(registry);
 
@@ -2903,12 +3276,22 @@ mod tests {
         wait_for_flag(&install_started).await;
         let host = client.plugin_host.as_ref().expect("plugin host").clone();
         let resources = Arc::clone(&host.installed.get().expect("installed plugins")[0].resources);
+        let stats = client.plugin_stats().expect("plugin stats");
+        assert_eq!(stats.health, PluginHealth::Healthy);
+        assert_eq!(stats.plugins[0].state, PluginState::Active);
+        assert_eq!(stats.plugins[0].install_tasks, 1);
+        assert_eq!(stats.plugins[0].connection_tasks, 0);
 
         let scope = ConnectionScope::new(88);
         host.on_ready(scope.clone())
             .await
             .expect("plugin ready callback");
         wait_for_flag(&connection_started).await;
+        let stats = client.plugin_stats().expect("ready plugin stats");
+        assert_eq!(stats.plugins[0].install_tasks, 1);
+        assert_eq!(stats.plugins[0].connection_tasks, 1);
+        assert_eq!(stats.plugins[0].connection_generations, 1);
+        assert_eq!(stats.plugins[0].callbacks_completed, 1);
         scope.cancel();
         wait_for_flag(&connection_dropped).await;
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2931,10 +3314,18 @@ mod tests {
         assert!(connection_dropped.load(Ordering::Acquire));
         assert!(closed_after_task.load(Ordering::Acquire));
         assert!(!install_dropped.load(Ordering::Acquire));
+        let stats = client.plugin_stats().expect("closed plugin stats");
+        assert_eq!(stats.plugins[0].connection_tasks, 0);
+        assert_eq!(stats.plugins[0].connection_generations, 0);
+        assert_eq!(stats.plugins[0].callbacks_completed, 2);
 
         client.disconnect().await;
         assert!(install_dropped.load(Ordering::Acquire));
         assert!(shutdown_after_task.load(Ordering::Acquire));
+        let stats = client.plugin_stats().expect("stopped plugin stats");
+        assert_eq!(stats.plugins[0].state, PluginState::Stopped);
+        assert_eq!(stats.plugins[0].install_tasks, 0);
+        assert_eq!(stats.plugins[0].callbacks_completed, 3);
     }
 
     #[tokio::test]
@@ -3184,6 +3575,23 @@ mod tests {
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec!["ready:stalling-ready", "ready:following-ready"]
         );
+        let stats = host.stats();
+        assert_eq!(stats.health, PluginHealth::Degraded);
+        let stalling = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "stalling-ready")
+            .expect("stalling plugin stats");
+        assert_eq!(stalling.health, PluginHealth::Degraded);
+        assert_eq!(stalling.callback_timeouts, 1);
+        assert_eq!(stalling.callback_failures, 0);
+        let following = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "following-ready")
+            .expect("following plugin stats");
+        assert_eq!(following.health, PluginHealth::Healthy);
+        assert_eq!(following.callbacks_completed, 1);
         client.disconnect().await;
     }
 
@@ -3216,6 +3624,22 @@ mod tests {
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec!["ready:drop-panicking-ready", "ready:following-drop-panic"]
         );
+        let stats = host.stats();
+        let panicking = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "drop-panicking-ready")
+            .expect("drop-panicking plugin stats");
+        assert_eq!(panicking.health, PluginHealth::Degraded);
+        assert_eq!(panicking.callback_timeouts, 1);
+        assert_eq!(panicking.callback_failures, 1);
+        let following = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "following-drop-panic")
+            .expect("following plugin stats");
+        assert_eq!(following.health, PluginHealth::Healthy);
+        assert_eq!(following.callbacks_completed, 1);
         client.disconnect().await;
     }
 
@@ -3264,6 +3688,38 @@ mod tests {
     impl Drop for PanickingDropEventHandler {
         fn drop(&mut self) {
             panic!("injected event handler drop panic");
+        }
+    }
+
+    struct PanickingCoreEventHandler;
+
+    impl EventHandler for PanickingCoreEventHandler {
+        fn handle_event(&self, _event: Arc<wacore::types::events::Event>) {
+            panic!("injected core-event handler panic");
+        }
+    }
+
+    struct PanickingCoreEventPlugin;
+
+    impl ClientPlugin for PanickingCoreEventPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("panicking-core-event", "0.1.0")
+                .with_capability(PluginCapability::CoreEvents)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                context
+                    .core_events()
+                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
+                    .subscribe(
+                        EventInterest::of(&[EventKind::Connected]),
+                        Arc::new(PanickingCoreEventHandler),
+                    )?;
+                Ok(Arc::new(()))
+            })
         }
     }
 
@@ -3413,6 +3869,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panicking_core_event_handler_is_isolated_and_degrades_only_its_plugin() {
+        let client = complete_builder()
+            .await
+            .with_plugin(PanickingCoreEventPlugin)
+            .with_plugin(ShutdownSignalPlugin)
+            .build()
+            .await
+            .expect("panicking core-event client")
+            .into_client();
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            client
+                .core
+                .event_bus
+                .dispatch(wacore::types::events::Event::Connected(
+                    wacore::types::events::Connected::builder().build(),
+                ));
+        }));
+
+        assert!(result.is_ok());
+        let stats = client.plugin_stats().expect("plugin stats");
+        assert_eq!(stats.health, PluginHealth::Degraded);
+        let panicking = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "panicking-core-event")
+            .expect("panicking plugin stats");
+        assert_eq!(panicking.health, PluginHealth::Degraded);
+        assert_eq!(panicking.core_event_panics, 1);
+        assert_eq!(panicking.core_events_delivered, 0);
+        let unaffected = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "shutdown-signal")
+            .expect("unaffected plugin stats");
+        assert_eq!(unaffected.health, PluginHealth::Healthy);
+        client.disconnect().await;
+    }
+
+    #[test]
+    fn delayed_plugin_handler_drop_is_isolated_and_counted() {
+        let resources = PluginResources::new();
+        let diagnostics = PluginDiagnostics::new();
+        diagnostics.attach_resources(&resources);
+        let handler = Arc::new(PluginCoreEventHandler {
+            plugin_id: Arc::from("delayed-drop"),
+            inner: Some(Arc::new(PanickingDropEventHandler)),
+            resources: Arc::downgrade(&resources),
+            diagnostics,
+        });
+        let delayed_snapshot = handler.clone();
+        drop(handler);
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| drop(delayed_snapshot)));
+
+        assert!(result.is_ok());
+        assert_eq!(resources.stats().teardown_panics, 1);
+    }
+
+    #[tokio::test]
     async fn panicking_handler_drop_does_not_strand_later_plugins_or_upstream() {
         let upstream_signalled = Arc::new(AtomicBool::new(false));
         let client = complete_builder()
@@ -3433,6 +3949,14 @@ mod tests {
         assert!(result.is_ok());
         assert!(plugin_shutdown.is_fired());
         assert!(upstream_signalled.load(Ordering::Acquire));
+        let stats = client.plugin_stats().expect("plugin stats");
+        let panicking = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "panicking-subscription")
+            .expect("panicking plugin stats");
+        assert_eq!(panicking.health, PluginHealth::Degraded);
+        assert_eq!(panicking.resource_teardown_panics, 1);
         client.disconnect().await;
     }
 
@@ -3617,6 +4141,7 @@ mod tests {
             .expect("bounded event endpoint");
 
         assert!(publisher.has_subscribers(&tick));
+        const TICK_PAYLOAD: &[u8] = br#"{"messages":1}"#;
         let generation = client.connection_generation.load(Ordering::Acquire);
         assert_eq!(
             publisher
@@ -3624,7 +4149,7 @@ mod tests {
                     &tick,
                     2,
                     PluginEventPayloadEncoding::Json,
-                    r#"{"messages":1}"#,
+                    Bytes::from_static(TICK_PAYLOAD),
                 )
                 .expect("publish tick"),
             PluginEventPublishReport {
@@ -3634,12 +4159,31 @@ mod tests {
                 closed: 0,
             }
         );
+        let stats = client.plugin_stats().expect("plugin host stats");
+        assert_eq!(stats.health, PluginHealth::Healthy);
+        let publisher_stats = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "event-publisher")
+            .expect("publisher stats");
+        assert_eq!(publisher_stats.state, PluginState::Active);
+        assert_eq!(publisher_stats.events.expect("event stats").published, 1);
+        let memory = client.memory_report().await;
+        assert_eq!(memory.plugins, 2);
+        assert_eq!(memory.plugin_event_endpoints, 1);
+        assert_eq!(memory.plugin_event_endpoint_capacity, 1);
+        assert_eq!(memory.plugin_event_queue.entries, 1);
+        assert_eq!(
+            memory.plugin_event_queue.bytes,
+            u64::try_from(TICK_PAYLOAD.len()).expect("payload length")
+        );
+        assert!(memory.total_estimated_bytes() >= memory.plugin_event_queue.bytes);
         let event = subscription.recv().await.expect("routed tick");
         assert_eq!(&*event.plugin_id, "event-publisher");
         assert_eq!(event.topic, tick);
         assert_eq!(event.schema_version, 2);
         assert_eq!(event.payload_encoding, PluginEventPayloadEncoding::Json);
-        assert_eq!(event.payload, Bytes::from_static(br#"{"messages":1}"#));
+        assert_eq!(event.payload, Bytes::from_static(TICK_PAYLOAD));
         assert_eq!(event.connection_generation, generation);
         assert_eq!(event.sequence, 1);
 
@@ -3669,5 +4213,30 @@ mod tests {
             ),
             Err(PluginEventSubscribeError::Closed)
         ));
+        let stats = client.plugin_stats().expect("terminal plugin stats");
+        assert_eq!(stats.health, PluginHealth::Degraded);
+        let publisher_stats = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == "event-publisher")
+            .expect("terminal publisher stats");
+        assert_eq!(publisher_stats.state, PluginState::Stopped);
+        assert_eq!(publisher_stats.health, PluginHealth::Degraded);
+        assert_eq!(
+            publisher_stats.events,
+            Some(PluginEventPublisherStats {
+                published: 2,
+                publish_failures: 1,
+                matched: 2,
+                enqueued: 2,
+                delivered: 2,
+                dropped: 0,
+                closed: 0,
+            })
+        );
+        let router_stats = stats.event_router.expect("terminal router stats");
+        assert_eq!(router_stats.active_endpoints, 0);
+        assert_eq!(router_stats.queued_events, 0);
+        assert_eq!(router_stats.delivered, 2);
     }
 }

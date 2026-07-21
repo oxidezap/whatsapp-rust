@@ -295,15 +295,31 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
+    #[cfg(feature = "plugins")]
+    pub plugins: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_install_tasks: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_connection_tasks: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_connection_generations: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_core_event_subscriptions: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_event_endpoints: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_event_endpoint_capacity: u64,
+    /// Unique custom-event envelopes and payload bytes still retained in endpoint queues.
+    #[cfg(feature = "plugins")]
+    pub plugin_event_queue: CollectionStats,
     // -- Misc --
     pub chatstate_handlers: usize,
     pub custom_enc_handlers: usize,
 }
 
 impl MemoryReport {
-    /// Every byte-carrying collection with its display name — the single list
-    /// [`Self::total_estimated_bytes`] and `Display` derive from, so a new
-    /// collection cannot be summed but not shown (or vice versa).
+    /// Common byte-carrying collections used by both totals and `Display`.
+    /// Feature-specific collections stay beside their gated report section.
     fn collections(&self) -> [(&'static str, &CollectionStats); 11] {
         [
             ("group_cache:", &self.group_cache),
@@ -322,7 +338,10 @@ impl MemoryReport {
 
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
-        self.collections().iter().map(|(_, c)| c.bytes).sum()
+        let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
+        #[cfg(feature = "plugins")]
+        let total = total.saturating_add(self.plugin_event_queue.bytes);
+        total
     }
 }
 
@@ -404,6 +423,28 @@ impl std::fmt::Display for MemoryReport {
             "  peak payload storage:   {} B",
             self.history_sync_payload_bytes_peak
         )?;
+        #[cfg(feature = "plugins")]
+        {
+            writeln!(f, "--- Plugins ---")?;
+            writeln!(f, "  installed:              {}", self.plugins)?;
+            writeln!(f, "  install tasks:          {}", self.plugin_install_tasks)?;
+            writeln!(
+                f,
+                "  connection tasks:       {} (generations: {})",
+                self.plugin_connection_tasks, self.plugin_connection_generations
+            )?;
+            writeln!(
+                f,
+                "  core subscriptions:     {}",
+                self.plugin_core_event_subscriptions
+            )?;
+            writeln!(
+                f,
+                "  event endpoints:        {} (capacity: {})",
+                self.plugin_event_endpoints, self.plugin_event_endpoint_capacity
+            )?;
+            line(f, "event_queue:", &self.plugin_event_queue)?;
+        }
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;

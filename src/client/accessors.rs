@@ -193,6 +193,43 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
+        #[cfg(feature = "plugins")]
+        let plugin_stats = self.plugin_stats();
+        #[cfg(feature = "plugins")]
+        let (
+            plugins,
+            plugin_install_tasks,
+            plugin_connection_tasks,
+            plugin_connection_generations,
+            plugin_core_event_subscriptions,
+        ) = plugin_stats
+            .as_ref()
+            .map(|host| {
+                host.plugins.iter().fold(
+                    (
+                        u64::try_from(host.plugins.len()).unwrap_or(u64::MAX),
+                        0u64,
+                        0u64,
+                        0u64,
+                        0u64,
+                    ),
+                    |(plugins, install, connection, generations, subscriptions), plugin| {
+                        (
+                            plugins,
+                            install.saturating_add(plugin.install_tasks),
+                            connection.saturating_add(plugin.connection_tasks),
+                            generations.saturating_add(plugin.connection_generations),
+                            subscriptions.saturating_add(plugin.core_event_subscriptions),
+                        )
+                    },
+                )
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "plugins")]
+        let plugin_event_router = plugin_stats
+            .as_ref()
+            .and_then(|host| host.event_router)
+            .unwrap_or_default();
 
         MemoryReport {
             group_cache,
@@ -224,6 +261,25 @@ impl Client {
             signal_sessions,
             signal_identities,
             signal_sender_keys,
+            #[cfg(feature = "plugins")]
+            plugins,
+            #[cfg(feature = "plugins")]
+            plugin_install_tasks,
+            #[cfg(feature = "plugins")]
+            plugin_connection_tasks,
+            #[cfg(feature = "plugins")]
+            plugin_connection_generations,
+            #[cfg(feature = "plugins")]
+            plugin_core_event_subscriptions,
+            #[cfg(feature = "plugins")]
+            plugin_event_endpoints: plugin_event_router.active_endpoints,
+            #[cfg(feature = "plugins")]
+            plugin_event_endpoint_capacity: plugin_event_router.endpoint_capacity,
+            #[cfg(feature = "plugins")]
+            plugin_event_queue: CollectionStats::new(
+                plugin_event_router.queued_events,
+                plugin_event_router.queued_payload_bytes,
+            ),
             chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
         }

@@ -215,6 +215,46 @@ pub struct PluginEventEndpointStats {
     pub capacity: usize,
 }
 
+/// Cumulative publication and fanout counters for one plugin namespace.
+///
+/// `published` counts successful calls, including calls with no subscriber. Fanout fields count
+/// endpoint outcomes; `delivered` advances only when a receiver removes an envelope from its queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PluginEventPublisherStats {
+    pub published: u64,
+    pub publish_failures: u64,
+    pub matched: u64,
+    pub enqueued: u64,
+    pub delivered: u64,
+    pub dropped: u64,
+    pub closed: u64,
+}
+
+/// On-demand aggregate for the custom-event router.
+///
+/// Current occupancy may move while a concurrent snapshot is being assembled; cumulative counters
+/// remain monotonic but are not an atomic cross-publisher transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PluginEventRouterStats {
+    pub registered_publishers: u64,
+    pub active_routes: u64,
+    pub active_endpoints: u64,
+    pub endpoint_capacity: u64,
+    /// Unique event envelopes retained by at least one endpoint queue.
+    pub queued_events: u64,
+    /// Payload bytes retained by those unique queued envelopes.
+    pub queued_payload_bytes: u64,
+    pub published: u64,
+    pub publish_failures: u64,
+    pub matched: u64,
+    pub enqueued: u64,
+    pub delivered: u64,
+    pub dropped: u64,
+    pub closed: u64,
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[error("the plugin event endpoint is closed")]
@@ -236,9 +276,98 @@ enum EnqueueOutcome {
     Closed,
 }
 
+struct PluginEventPublication {
+    schema_version: u32,
+    payload_encoding: PluginEventPayloadEncoding,
+    payload: Bytes,
+    connection_generation: u64,
+}
+
+#[derive(Default)]
+struct PublisherCounters {
+    published: AtomicU64,
+    publish_failures: AtomicU64,
+    matched: AtomicU64,
+    enqueued: AtomicU64,
+    delivered: AtomicU64,
+    dropped: AtomicU64,
+    closed: AtomicU64,
+}
+
+impl PublisherCounters {
+    fn record_publish(&self, result: &Result<PluginEventPublishReport, PluginEventPublishError>) {
+        match result {
+            Ok(report) => {
+                self.published.fetch_add(1, Ordering::Relaxed);
+                self.matched.fetch_add(report.matched, Ordering::Relaxed);
+                self.enqueued.fetch_add(report.enqueued, Ordering::Relaxed);
+                self.dropped.fetch_add(report.dropped, Ordering::Relaxed);
+                self.closed.fetch_add(report.closed, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.publish_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PluginEventPublisherStats {
+        PluginEventPublisherStats {
+            published: self.published.load(Ordering::Relaxed),
+            publish_failures: self.publish_failures.load(Ordering::Relaxed),
+            matched: self.matched.load(Ordering::Relaxed),
+            enqueued: self.enqueued.load(Ordering::Relaxed),
+            delivered: self.delivered.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct QueueMemory {
+    events: AtomicU64,
+    payload_bytes: AtomicU64,
+}
+
+struct QueuedPluginEvent {
+    envelope: Arc<PluginEventEnvelope>,
+    publisher: Arc<PublisherCounters>,
+    memory: Arc<QueueMemory>,
+    payload_bytes: u64,
+}
+
+impl QueuedPluginEvent {
+    fn new(
+        envelope: Arc<PluginEventEnvelope>,
+        publisher: Arc<PublisherCounters>,
+        memory: Arc<QueueMemory>,
+    ) -> Arc<Self> {
+        let payload_bytes = u64::try_from(envelope.payload.len()).unwrap_or(u64::MAX);
+        memory.events.fetch_add(1, Ordering::Relaxed);
+        memory
+            .payload_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
+        Arc::new(Self {
+            envelope,
+            publisher,
+            memory,
+            payload_bytes,
+        })
+    }
+}
+
+impl Drop for QueuedPluginEvent {
+    fn drop(&mut self) {
+        self.memory.events.fetch_sub(1, Ordering::Relaxed);
+        self.memory
+            .payload_bytes
+            .fetch_sub(self.payload_bytes, Ordering::Relaxed);
+    }
+}
+
 struct EventEndpoint {
     id: u64,
-    sender: Sender<Arc<PluginEventEnvelope>>,
+    sender: Sender<Arc<QueuedPluginEvent>>,
     overflow: PluginEventOverflow,
     capacity: usize,
     enqueued: AtomicU64,
@@ -247,7 +376,7 @@ struct EventEndpoint {
 }
 
 impl EventEndpoint {
-    fn enqueue(&self, event: Arc<PluginEventEnvelope>) -> EnqueueOutcome {
+    fn enqueue(&self, event: Arc<QueuedPluginEvent>) -> EnqueueOutcome {
         match self.overflow {
             PluginEventOverflow::DropNewest => match self.sender.try_send(event) {
                 Ok(()) => {
@@ -306,7 +435,8 @@ struct RouterState {
 }
 
 struct PluginEventRouterInner {
-    plugin_ids: HashSet<Arc<str>>,
+    publishers: HashMap<Arc<str>, Arc<PublisherCounters>>,
+    queue_memory: Arc<QueueMemory>,
     state: RwLock<RouterState>,
     next_endpoint_id: AtomicU64,
     closed: AtomicBool,
@@ -373,9 +503,14 @@ pub struct PluginEventRouter {
 
 impl PluginEventRouter {
     pub(super) fn new(plugin_ids: impl IntoIterator<Item = String>) -> Self {
+        let publishers = plugin_ids
+            .into_iter()
+            .map(|plugin_id| (Arc::from(plugin_id), Arc::new(PublisherCounters::default())))
+            .collect();
         Self {
             inner: Arc::new(PluginEventRouterInner {
-                plugin_ids: plugin_ids.into_iter().map(Arc::from).collect(),
+                publishers,
+                queue_memory: Arc::new(QueueMemory::default()),
                 state: RwLock::new(RouterState::default()),
                 next_endpoint_id: AtomicU64::new(1),
                 closed: AtomicBool::new(false),
@@ -394,6 +529,59 @@ impl PluginEventRouter {
             .routes
             .get(&selector.route)
             .is_some_and(|route| !route.endpoints.is_empty())
+    }
+
+    /// Cumulative counters for one registered publisher.
+    pub fn publisher_stats(&self, plugin_id: &str) -> Option<PluginEventPublisherStats> {
+        self.inner
+            .publishers
+            .get(plugin_id)
+            .map(|stats| stats.snapshot())
+    }
+
+    /// Aggregate counters and current queue occupancy.
+    pub fn stats(&self) -> PluginEventRouterStats {
+        let (active_routes, active_endpoints, endpoint_capacity) = {
+            let state = self
+                .inner
+                .state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let endpoint_capacity = state.endpoints.values().fold(0u64, |total, endpoint| {
+                total.saturating_add(u64::try_from(endpoint.capacity).unwrap_or(u64::MAX))
+            });
+            (
+                u64::try_from(state.routes.len()).unwrap_or(u64::MAX),
+                u64::try_from(state.endpoints.len()).unwrap_or(u64::MAX),
+                endpoint_capacity,
+            )
+        };
+        let mut snapshot = PluginEventRouterStats {
+            registered_publishers: u64::try_from(self.inner.publishers.len()).unwrap_or(u64::MAX),
+            active_routes,
+            active_endpoints,
+            endpoint_capacity,
+            queued_events: self.inner.queue_memory.events.load(Ordering::Relaxed),
+            queued_payload_bytes: self
+                .inner
+                .queue_memory
+                .payload_bytes
+                .load(Ordering::Relaxed),
+            ..PluginEventRouterStats::default()
+        };
+        for publisher in self.inner.publishers.values() {
+            let publisher = publisher.snapshot();
+            snapshot.published = snapshot.published.saturating_add(publisher.published);
+            snapshot.publish_failures = snapshot
+                .publish_failures
+                .saturating_add(publisher.publish_failures);
+            snapshot.matched = snapshot.matched.saturating_add(publisher.matched);
+            snapshot.enqueued = snapshot.enqueued.saturating_add(publisher.enqueued);
+            snapshot.delivered = snapshot.delivered.saturating_add(publisher.delivered);
+            snapshot.dropped = snapshot.dropped.saturating_add(publisher.dropped);
+            snapshot.closed = snapshot.closed.saturating_add(publisher.closed);
+        }
+        snapshot
     }
 
     pub fn subscribe(
@@ -429,7 +617,7 @@ impl PluginEventRouter {
             return Err(PluginEventSubscribeError::EmptySelectors);
         }
         for selector in &selectors {
-            if !self.inner.plugin_ids.contains(selector.plugin_id()) {
+            if !self.inner.publishers.contains_key(selector.plugin_id()) {
                 return Err(PluginEventSubscribeError::UnknownPublisher {
                     plugin_id: selector.plugin_id().to_string(),
                 });
@@ -492,14 +680,24 @@ impl PluginEventRouter {
 
     fn publish(
         &self,
+        publisher: Arc<PublisherCounters>,
         plugin_id: &Arc<str>,
         topic: &PluginEventTopic,
-        schema_version: u32,
-        payload_encoding: PluginEventPayloadEncoding,
-        payload: Bytes,
-        connection_generation: u64,
+        publication: PluginEventPublication,
     ) -> Result<PluginEventPublishReport, PluginEventPublishError> {
-        if schema_version == 0 {
+        let result = self.publish_inner(Arc::clone(&publisher), plugin_id, topic, publication);
+        publisher.record_publish(&result);
+        result
+    }
+
+    fn publish_inner(
+        &self,
+        publisher: Arc<PublisherCounters>,
+        plugin_id: &Arc<str>,
+        topic: &PluginEventTopic,
+        publication: PluginEventPublication,
+    ) -> Result<PluginEventPublishReport, PluginEventPublishError> {
+        if publication.schema_version == 0 {
             return Err(PluginEventPublishError::InvalidSchemaVersion);
         }
         if self.inner.closed.load(Ordering::Acquire) {
@@ -530,17 +728,19 @@ impl PluginEventRouter {
             .checked_add(1)
             .ok_or(PluginEventPublishError::SequenceExhausted)?;
         *sequence = next_sequence;
-        let event = Arc::new(
+        let envelope = Arc::new(
             PluginEventEnvelope::builder()
                 .plugin_id(plugin_id.clone())
                 .topic(topic.clone())
-                .schema_version(schema_version)
-                .payload_encoding(payload_encoding)
-                .payload(payload)
-                .connection_generation(connection_generation)
+                .schema_version(publication.schema_version)
+                .payload_encoding(publication.payload_encoding)
+                .payload(publication.payload)
+                .connection_generation(publication.connection_generation)
                 .sequence(next_sequence)
                 .build(),
         );
+        let event =
+            QueuedPluginEvent::new(envelope, publisher, Arc::clone(&self.inner.queue_memory));
 
         let mut report = PluginEventPublishReport {
             matched: u64::try_from(endpoints.len()).unwrap_or(u64::MAX),
@@ -570,7 +770,7 @@ impl PluginEventRouter {
 pub struct PluginEventSubscription {
     router: PluginEventRouter,
     endpoint: Arc<EventEndpoint>,
-    receiver: Receiver<Arc<PluginEventEnvelope>>,
+    receiver: Receiver<Arc<QueuedPluginEvent>>,
     selectors: Vec<PluginEventSelector>,
 }
 
@@ -594,7 +794,8 @@ impl PluginEventSubscription {
             .await
             .map_err(|_| PluginEventReceiveError)?;
         self.endpoint.delivered.fetch_add(1, Ordering::Relaxed);
-        Ok(event)
+        event.publisher.delivered.fetch_add(1, Ordering::Relaxed);
+        Ok(event.envelope.clone())
     }
 
     pub fn try_recv(&self) -> Result<Arc<PluginEventEnvelope>, PluginEventTryReceiveError> {
@@ -603,7 +804,8 @@ impl PluginEventSubscription {
             TryRecvError::Closed => PluginEventTryReceiveError::Closed,
         })?;
         self.endpoint.delivered.fetch_add(1, Ordering::Relaxed);
-        Ok(event)
+        event.publisher.delivered.fetch_add(1, Ordering::Relaxed);
+        Ok(event.envelope.clone())
     }
 }
 
@@ -623,6 +825,7 @@ impl Drop for PluginEventSubscription {
 pub struct PluginEvents {
     plugin_id: Arc<str>,
     router: PluginEventRouter,
+    stats: Arc<PublisherCounters>,
     resources: Arc<PluginResources>,
     connection_generation: Arc<AtomicU64>,
 }
@@ -641,6 +844,10 @@ impl PluginEvents {
         self.router.has_subscribers(&self.selector(topic))
     }
 
+    pub fn stats(&self) -> PluginEventPublisherStats {
+        self.stats.snapshot()
+    }
+
     pub fn publish(
         &self,
         topic: &PluginEventTopic,
@@ -648,14 +855,20 @@ impl PluginEvents {
         payload_encoding: PluginEventPayloadEncoding,
         payload: impl Into<Bytes>,
     ) -> Result<PluginEventPublishReport, PluginEventPublishError> {
-        self.resources.ensure_active()?;
+        if let Err(error) = self.resources.ensure_active() {
+            self.stats.publish_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(error.into());
+        }
         self.router.publish(
+            Arc::clone(&self.stats),
             &self.plugin_id,
             topic,
-            schema_version,
-            payload_encoding,
-            payload.into(),
-            self.connection_generation.load(Ordering::Acquire),
+            PluginEventPublication {
+                schema_version,
+                payload_encoding,
+                payload: payload.into(),
+                connection_generation: self.connection_generation.load(Ordering::Acquire),
+            },
         )
     }
 }
@@ -665,13 +878,15 @@ pub(super) fn publisher(
     router: PluginEventRouter,
     resources: Arc<PluginResources>,
     connection_generation: Arc<AtomicU64>,
-) -> PluginEvents {
-    PluginEvents {
+) -> Option<PluginEvents> {
+    let stats = router.inner.publishers.get(plugin_id)?.clone();
+    Some(PluginEvents {
         plugin_id: Arc::from(plugin_id),
         router,
+        stats,
         resources,
         connection_generation,
-    }
+    })
 }
 
 fn valid_topic(topic: &str) -> bool {
@@ -698,16 +913,88 @@ mod tests {
         topic: &PluginEventTopic,
         value: u32,
     ) -> PluginEventPublishReport {
+        let publisher = router
+            .inner
+            .publishers
+            .get(plugin_id)
+            .cloned()
+            .expect("registered publisher");
         router
             .publish(
+                publisher,
                 &Arc::from(plugin_id),
                 topic,
-                1,
-                PluginEventPayloadEncoding::Binary,
-                Bytes::copy_from_slice(&value.to_be_bytes()),
-                7,
+                PluginEventPublication {
+                    schema_version: 1,
+                    payload_encoding: PluginEventPayloadEncoding::Binary,
+                    payload: Bytes::copy_from_slice(&value.to_be_bytes()),
+                    connection_generation: 7,
+                },
             )
             .expect("event publication")
+    }
+
+    #[test]
+    fn router_stats_count_shared_queue_payload_once_and_keep_cumulative_totals() {
+        let router = PluginEventRouter::new(["metrics".to_string()]);
+        let tick = topic("tick");
+        let first = router
+            .subscribe(
+                [selector("metrics", &tick)],
+                PluginEventEndpointConfig::new(2, PluginEventOverflow::DropNewest),
+            )
+            .expect("first endpoint");
+        let second = router
+            .subscribe(
+                [selector("metrics", &tick)],
+                PluginEventEndpointConfig::new(3, PluginEventOverflow::DropNewest),
+            )
+            .expect("second endpoint");
+
+        assert_eq!(publish(&router, "metrics", &tick, 1).enqueued, 2);
+        assert_eq!(
+            router.stats(),
+            PluginEventRouterStats {
+                registered_publishers: 1,
+                active_routes: 1,
+                active_endpoints: 2,
+                endpoint_capacity: 5,
+                queued_events: 1,
+                queued_payload_bytes: 4,
+                published: 1,
+                publish_failures: 0,
+                matched: 2,
+                enqueued: 2,
+                delivered: 0,
+                dropped: 0,
+                closed: 0,
+            }
+        );
+
+        first.try_recv().expect("first delivery");
+        assert_eq!(router.stats().queued_events, 1);
+        second.try_recv().expect("second delivery");
+        assert_eq!(router.stats().queued_events, 0);
+        assert_eq!(router.stats().queued_payload_bytes, 0);
+        assert_eq!(router.stats().delivered, 2);
+
+        drop(first);
+        drop(second);
+        let stats = router.stats();
+        assert_eq!(stats.active_routes, 0);
+        assert_eq!(stats.active_endpoints, 0);
+        assert_eq!(stats.published, 1);
+        assert_eq!(stats.delivered, 2);
+        assert_eq!(
+            router.publisher_stats("metrics"),
+            Some(PluginEventPublisherStats {
+                published: 1,
+                matched: 2,
+                enqueued: 2,
+                delivered: 2,
+                ..PluginEventPublisherStats::default()
+            })
+        );
     }
 
     #[test]
@@ -764,6 +1051,17 @@ mod tests {
                 capacity: 2,
             }
         );
+        assert_eq!(
+            router.publisher_stats("metrics"),
+            Some(PluginEventPublisherStats {
+                published: 4,
+                matched: 4,
+                enqueued: 2,
+                delivered: 2,
+                dropped: 2,
+                ..PluginEventPublisherStats::default()
+            })
+        );
     }
 
     #[test]
@@ -785,6 +1083,8 @@ mod tests {
         assert_eq!(subscription.try_recv().expect("fourth").sequence, 4);
         assert_eq!(subscription.stats().enqueued, 4);
         assert_eq!(subscription.stats().dropped, 2);
+        assert_eq!(router.stats().dropped, 2);
+        assert_eq!(router.stats().delivered, 2);
     }
 
     #[test]

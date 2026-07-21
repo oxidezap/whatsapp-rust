@@ -359,7 +359,7 @@ mod tests {
     use whatsapp_rust::wacore::store::InMemoryBackend;
     use whatsapp_rust::{
         Client, PluginEventEndpointConfig, PluginEventOverflow, PluginEventSubscribeError,
-        TokioRuntime,
+        PluginHealth, TokioRuntime,
     };
 
     use super::*;
@@ -469,6 +469,14 @@ mod tests {
         .await
         .expect("bounded endpoint reports pressure");
         assert!(api.snapshot().install_ticks >= payload.install_ticks);
+        let stats = client.plugin_stats().expect("plugin host stats");
+        let metrics = stats
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin_id == METRICS_PLUGIN_ID)
+            .expect("metrics plugin stats");
+        assert_eq!(metrics.health, PluginHealth::Degraded);
+        assert!(metrics.events.expect("metrics event stats").dropped > 0);
 
         client.disconnect().await;
         assert!(api.snapshot().shutdown);

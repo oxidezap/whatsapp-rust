@@ -58,10 +58,30 @@ figures come from the `wacore::stats::HeapSize` trait:
 Semantics: honest estimates for attribution and leak detection, not
 byte-exact accounting. The e2e `memory_soak.rs` logs the byte totals next to
 RSS; its growth-bound assertions are on entry counts.
-When a new cache is added to `Client`, add it to `memory_report()` (the
-`MemoryReport::collections()` list keeps the total and `Display` in sync) and
-— if it can dominate memory — implement `HeapSize` for its value type next to
-that type's definition.
+When a new cache is added to `Client`, add it to `memory_report()` (the common
+`MemoryReport::collections()` list or its feature-gated report section) and —
+if it can dominate memory — implement `HeapSize` for its value type next to that
+type's definition.
+
+With the opt-in `plugins` feature, the report also includes installed plugins,
+active install/connection tasks, retained connection generations, core-event
+subscriptions, custom-event endpoints, and unique queued payload bytes. Fanout
+shares one envelope, so queued payload memory is counted once even when several
+endpoints retain it.
+
+### Plugin host snapshots (opt-in)
+
+`Client::plugin_stats()` is computed only when called and returns lifecycle,
+health, task, subscription, and custom-event counters keyed by public manifest
+ID. `PluginEventRouter::stats()` provides endpoint capacity, current unique
+queue retention, and cumulative delivery/backpressure totals; publishers can
+read their own totals through `PluginEvents::stats()`.
+
+Health is sticky for the lifetime of the host: lifecycle errors/panics,
+timeouts, task-drain timeouts, isolated core-event panics, resource teardown
+panics, publication failures, and queue drops mark only the responsible plugin
+as degraded. Concurrent snapshots are intentionally approximate, and carry no
+message content, JIDs, or phone numbers.
 
 ### 3. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
 

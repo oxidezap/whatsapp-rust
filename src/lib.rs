@@ -117,11 +117,12 @@ pub use plugins::{
     ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
     PluginConnectionTasks, PluginContext, PluginCoreEvents, PluginEventEndpointConfig,
     PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow, PluginEventPayloadEncoding,
-    PluginEventPublishError, PluginEventPublishReport, PluginEventReceiveError,
-    PluginEventRouteError, PluginEventRouter, PluginEventSelector, PluginEventSubscribeError,
-    PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
-    PluginFuture, PluginIq, PluginIqError, PluginManifest, PluginMessaging, PluginMessagingError,
-    PluginPlanError, PluginResourceError, PluginTasks,
+    PluginEventPublishError, PluginEventPublishReport, PluginEventPublisherStats,
+    PluginEventReceiveError, PluginEventRouteError, PluginEventRouter, PluginEventRouterStats,
+    PluginEventSelector, PluginEventSubscribeError, PluginEventSubscription, PluginEventTopic,
+    PluginEventTryReceiveError, PluginEvents, PluginFuture, PluginHealth, PluginHostStats,
+    PluginIq, PluginIqError, PluginManifest, PluginMessaging, PluginMessagingError,
+    PluginPlanError, PluginResourceError, PluginState, PluginStats, PluginTasks,
 };
 pub mod request;
 pub(crate) mod signal_flush;
