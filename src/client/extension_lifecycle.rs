@@ -307,6 +307,7 @@ impl LifecycleRegistration {
         self.close_scope_with(generation, || {});
     }
 
+    /// Non-noop hooks are test-only, must run off-executor, and must not re-enter lifecycle APIs.
     fn close_scope_with(self: &Arc<Self>, generation: u64, after_remove: impl FnOnce()) {
         let should_spawn = {
             let mut scopes = self.scopes();
