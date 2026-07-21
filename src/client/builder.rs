@@ -432,6 +432,7 @@ impl ClientBuilder {
             },
         );
         let client = assembly.client();
+        let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 
         if !self.custom_enc_handlers.is_empty() {
             let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
@@ -471,9 +472,31 @@ impl ClientBuilder {
             let _ = build.client.saver_handle.set(saver_handle);
         }
         #[cfg(feature = "plugins")]
-        if let Some(plugin_host) = &client.plugin_host {
-            plugin_host.activate();
+        if let Some(plugin_host) = &client.plugin_host
+            && !plugin_host.activate()
+        {
+            client.signal_shutdown_sync();
+            client.shutdown_lifecycle().await;
+            return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
+                "client shutdown began before plugin activation"
+            )));
         }
+        if let Some(lifecycle) = &client.lifecycle
+            && !lifecycle.activate()
+        {
+            client.signal_shutdown_sync();
+            client.shutdown_lifecycle().await;
+            #[cfg(feature = "plugins")]
+            if client.plugin_host.is_some() {
+                return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
+                    "client shutdown raced plugin activation"
+                )));
+            }
+            return Err(ClientBuilderError::LifecycleInstall(anyhow::anyhow!(
+                "client shutdown raced lifecycle activation"
+            )));
+        }
+        construction.disarm();
         Ok(build)
     }
 }
@@ -522,6 +545,32 @@ pub(super) struct ClientAssembly {
     sync_task_receiver: async_channel::Receiver<MajorSyncTask>,
 }
 
+struct ClientConstructionGuard {
+    client: Arc<Client>,
+    armed: bool,
+}
+
+impl ClientConstructionGuard {
+    fn new(client: Arc<Client>) -> Self {
+        Self {
+            client,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClientConstructionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.client.signal_shutdown_sync();
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ClientExtensions {
     pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,
@@ -566,6 +615,43 @@ mod tests {
     struct FailingLifecycle {
         spawns: Arc<AtomicUsize>,
         installed_client: std::sync::Mutex<Option<std::sync::Weak<Client>>>,
+    }
+
+    struct RunDuringInstallLifecycle {
+        client: async_channel::Sender<Arc<Client>>,
+        release: async_channel::Receiver<()>,
+        run_finished: async_channel::Sender<()>,
+    }
+
+    impl ClientLifecycle for RunDuringInstallLifecycle {
+        fn install<'a>(
+            &'a self,
+            client: std::sync::Weak<Client>,
+        ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                let client = client
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("client unavailable during install"))?;
+                let run_client = client.clone();
+                let run_finished = self.run_finished.clone();
+                client
+                    .runtime
+                    .spawn(Box::pin(async move {
+                        run_client.run().await;
+                        let _ = run_finished.send(()).await;
+                    }))
+                    .detach();
+                self.client
+                    .send(client)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test client receiver closed"))?;
+                self.release
+                    .recv()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test install release closed"))?;
+                Ok(())
+            })
+        }
     }
 
     impl ClientLifecycle for FailingLifecycle {
@@ -690,6 +776,77 @@ mod tests {
         let build = assembly.start();
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
         build.into_client().signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn run_leaked_during_install_waits_for_complete_construction() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let (run_finished_tx, run_finished_rx) = async_channel::bounded(1);
+        let builder = complete_builder()
+            .await
+            .with_lifecycle(RunDuringInstallLifecycle {
+                client: client_tx,
+                release: release_rx,
+                run_finished: run_finished_tx,
+            });
+        let build = tokio::spawn(async move { builder.build().await });
+        let leaked_client = client_rx
+            .recv()
+            .await
+            .expect("client leaked during install");
+        tokio::task::yield_now().await;
+        assert!(!leaked_client.is_running.load(Ordering::Acquire));
+
+        release_tx.send(()).await.expect("release installation");
+        let client = build
+            .await
+            .expect("builder task")
+            .expect("successful build")
+            .into_client();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.is_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run released after activation");
+        client.signal_shutdown_sync();
+        tokio::time::timeout(Duration::from_secs(5), run_finished_rx.recv())
+            .await
+            .expect("run stop timeout")
+            .expect("run stopped");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_install_rejects_leaked_run_and_the_build() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let (run_finished_tx, run_finished_rx) = async_channel::bounded(1);
+        let builder = complete_builder()
+            .await
+            .with_lifecycle(RunDuringInstallLifecycle {
+                client: client_tx,
+                release: release_rx,
+                run_finished: run_finished_tx,
+            });
+        let build = tokio::spawn(async move { builder.build().await });
+        let leaked_client = client_rx
+            .recv()
+            .await
+            .expect("client leaked during install");
+        leaked_client.signal_shutdown_sync();
+        release_tx.send(()).await.expect("release installation");
+
+        assert!(matches!(
+            build.await.expect("builder task"),
+            Err(ClientBuilderError::LifecycleInstall(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(5), run_finished_rx.recv())
+            .await
+            .expect("rejected run stop timeout")
+            .expect("rejected run stopped");
+        assert!(!leaked_client.is_running.load(Ordering::Acquire));
     }
 
     #[tokio::test]

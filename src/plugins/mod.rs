@@ -1031,6 +1031,7 @@ struct PluginInstallRollback {
     installed: Vec<InstalledPlugin>,
     current: Option<InstalledPlugin>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
+    staged_apis: Option<Arc<ApiRegistry>>,
     armed: bool,
 }
 
@@ -1041,6 +1042,7 @@ impl PluginInstallRollback {
             installed: Vec::with_capacity(capacity),
             current: None,
             upstream: None,
+            staged_apis: None,
             armed: true,
         }
     }
@@ -1062,6 +1064,7 @@ impl PluginInstallRollback {
         let current = self.current.take();
         let installed = std::mem::take(&mut self.installed);
         let upstream = self.upstream.take();
+        let staged_apis = self.staged_apis.take();
         self.armed = false;
         if current.is_none() && installed.is_empty() && upstream.is_none() {
             return None;
@@ -1078,7 +1081,8 @@ impl PluginInstallRollback {
         let cleanup_runtime = runtime.clone();
         runtime
             .spawn(Box::pin(async move {
-                shutdown_staged_plugins(cleanup_runtime, current, installed, upstream).await;
+                shutdown_staged_plugins(cleanup_runtime, current, installed, upstream, staged_apis)
+                    .await;
                 completed.notify();
             }))
             .detach();
@@ -1102,6 +1106,7 @@ impl PluginInstallRollback {
     fn disarm(&mut self) {
         self.armed = false;
         self.upstream = None;
+        self.staged_apis = None;
     }
 }
 
@@ -1120,6 +1125,7 @@ pub(crate) struct PluginHost {
     runtime: OnceLock<Arc<dyn Runtime>>,
     event_router: Option<PluginEventRouter>,
     callback_timeout: Duration,
+    terminal: AtomicBool,
 }
 
 impl PluginHost {
@@ -1157,6 +1163,7 @@ impl PluginHost {
             runtime: OnceLock::new(),
             event_router,
             callback_timeout,
+            terminal: AtomicBool::new(false),
         })
     }
 
@@ -1280,16 +1287,20 @@ impl PluginHost {
             .map_err(|_| anyhow::anyhow!("plugin host was installed more than once"))?;
 
         let mut rollback = PluginInstallRollback::new(runtime.clone(), self.ordered.len());
+        self.abort_install_if_terminal(&mut rollback).await?;
         if let Some(upstream) = &self.upstream {
             if let Err(error) = plugin_callback(|| upstream.install(client.clone())).await {
                 rollback.disarm();
                 return Err(error);
             }
             rollback.upstream = Some(upstream.clone());
+            self.abort_install_if_terminal(&mut rollback).await?;
         }
 
         let staging = Arc::new(ApiRegistry::default());
+        rollback.staged_apis = Some(Arc::clone(&staging));
         for planned in &self.ordered {
+            self.abort_install_if_terminal(&mut rollback).await?;
             let resources = PluginResources::new();
             let context = self.context(
                 &client,
@@ -1315,12 +1326,14 @@ impl PluginHost {
                 }
             };
             staging.insert(planned.plugin.marker_type_id(), api);
+            self.abort_install_if_terminal(&mut rollback).await?;
             let Some(installed) = rollback.current.take() else {
                 rollback.rollback().await;
                 anyhow::bail!("plugin installation rollback state was lost");
             };
             rollback.installed.push(installed);
         }
+        self.abort_install_if_terminal(&mut rollback).await?;
 
         self.apis
             .set(staging.snapshot())
@@ -1334,9 +1347,36 @@ impl PluginHost {
         Ok(())
     }
 
-    pub(crate) fn activate(&self) {
+    async fn abort_install_if_terminal(
+        &self,
+        rollback: &mut PluginInstallRollback,
+    ) -> anyhow::Result<()> {
+        if !self.terminal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        rollback.rollback().await;
+        anyhow::bail!("plugin host shut down during installation")
+    }
+
+    pub(crate) fn activate(&self) -> bool {
+        if self.terminal.load(Ordering::Acquire) {
+            self.close_installed_resources();
+            return false;
+        }
         for plugin in self.installed.get().into_iter().flatten() {
             plugin.resources.activate();
+        }
+        if self.terminal.load(Ordering::Acquire) {
+            self.close_installed_resources();
+            false
+        } else {
+            true
+        }
+    }
+
+    fn close_installed_resources(&self) {
+        for plugin in self.installed.get().into_iter().flatten().rev() {
+            plugin.resources.close();
         }
     }
 
@@ -1425,12 +1465,11 @@ impl ClientLifecycle for PluginHost {
     }
 
     fn signal_shutdown(&self) {
+        self.terminal.store(true, Ordering::Release);
         if let Some(router) = &self.event_router {
             router.close();
         }
-        for plugin in self.installed.get().into_iter().flatten().rev() {
-            plugin.resources.close();
-        }
+        self.close_installed_resources();
         if let Some(upstream) = &self.upstream
             && std::panic::catch_unwind(AssertUnwindSafe(|| upstream.signal_shutdown())).is_err()
         {
@@ -1474,6 +1513,7 @@ async fn shutdown_staged_plugins(
     current: Option<InstalledPlugin>,
     mut installed: Vec<InstalledPlugin>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
+    staged_apis: Option<Arc<ApiRegistry>>,
 ) {
     if let Some(plugin) = current {
         if let Err(error) = wait_for_plugin_tasks(
@@ -1527,6 +1567,7 @@ async fn shutdown_staged_plugins(
     {
         log::warn!("Upstream lifecycle rollback failed: {error:#}");
     }
+    drop(staged_apis);
 }
 
 async fn wait_for_plugin_tasks(
@@ -1656,6 +1697,20 @@ mod tests {
         log: Log,
     }
 
+    struct ShutdownDuringPluginInstall;
+
+    impl ClientLifecycle for ShutdownDuringPluginInstall {
+        fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async move {
+                client
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("client unavailable during install"))?
+                    .signal_shutdown_sync();
+                Ok(())
+            })
+        }
+    }
+
     impl ClientPlugin for FoundationPlugin {
         type Api = String;
 
@@ -1681,6 +1736,24 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_upstream_install_prevents_plugin_installation() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let result = complete_builder()
+            .await
+            .with_lifecycle(ShutdownDuringPluginInstall)
+            .with_plugin(FoundationPlugin { log: log.clone() })
+            .build()
+            .await;
+
+        assert!(matches!(result, Err(ClientBuilderError::PluginInstall(_))));
+        assert!(
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 
     struct DependentPlugin {
@@ -2017,10 +2090,15 @@ mod tests {
     struct RollbackPlugin {
         log: Log,
         task_dropped: Arc<AtomicBool>,
+        api_dropped: Arc<AtomicBool>,
+    }
+
+    struct RollbackApi {
+        _drop_flag: DropFlag,
     }
 
     impl ClientPlugin for RollbackPlugin {
-        type Api = ();
+        type Api = RollbackApi;
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("rollback", "0.1.0").with_capability(PluginCapability::Tasks)
@@ -2029,6 +2107,7 @@ mod tests {
         fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
             let log = self.log.clone();
             let task_dropped = self.task_dropped.clone();
+            let api_dropped = self.api_dropped.clone();
             Box::pin(async move {
                 record(&log, "install:rollback");
                 let guard = DropFlag(task_dropped);
@@ -2039,17 +2118,24 @@ mod tests {
                         let _guard = guard;
                         futures::future::pending::<()>().await;
                     })?;
-                Ok(Arc::new(()))
+                Ok(Arc::new(RollbackApi {
+                    _drop_flag: DropFlag(api_dropped),
+                }))
             })
         }
 
         fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
             let log = self.log.clone();
             let task_dropped = self.task_dropped.clone();
+            let api_dropped = self.api_dropped.clone();
             Box::pin(async move {
                 anyhow::ensure!(
                     task_dropped.load(Ordering::Acquire),
                     "rollback task still running during shutdown"
+                );
+                anyhow::ensure!(
+                    !api_dropped.load(Ordering::Acquire),
+                    "rollback API dropped before shutdown"
                 );
                 record(&log, "shutdown:rollback");
                 Ok(())
@@ -2092,6 +2178,7 @@ mod tests {
     async fn install_failure_rolls_back_resources_and_plugins_in_lifo_order() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let task_dropped = Arc::new(AtomicBool::new(false));
+        let api_dropped = Arc::new(AtomicBool::new(false));
         let result = complete_builder()
             .await
             .with_lifecycle(UpstreamLifecycle { log: log.clone() })
@@ -2099,6 +2186,7 @@ mod tests {
             .with_plugin(RollbackPlugin {
                 log: log.clone(),
                 task_dropped: task_dropped.clone(),
+                api_dropped: api_dropped.clone(),
             })
             .build()
             .await;
@@ -2122,6 +2210,7 @@ mod tests {
         })
         .await
         .expect("rollback aborted the install-scoped task");
+        assert!(api_dropped.load(Ordering::Acquire));
     }
 
     struct BlockingFailingPlugin {
@@ -2199,6 +2288,7 @@ mod tests {
     async fn cancelled_explicit_rollback_finishes_detached_and_signals_upstream() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let task_dropped = Arc::new(AtomicBool::new(false));
+        let api_dropped = Arc::new(AtomicBool::new(false));
         let signalled = Arc::new(AtomicBool::new(false));
         let shutdown_saw_signal = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = async_channel::bounded(1);
@@ -2218,6 +2308,7 @@ mod tests {
             .with_plugin(RollbackPlugin {
                 log: log.clone(),
                 task_dropped: task_dropped.clone(),
+                api_dropped: api_dropped.clone(),
             });
 
         let build = tokio::spawn(async move { builder.build().await });
@@ -2237,7 +2328,10 @@ mod tests {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .last()
                     .is_some_and(|entry| entry == "shutdown:upstream");
-                if complete && task_dropped.load(Ordering::Acquire) {
+                if complete
+                    && task_dropped.load(Ordering::Acquire)
+                    && api_dropped.load(Ordering::Acquire)
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2303,6 +2397,7 @@ mod tests {
     async fn cancelled_build_closes_resources_and_schedules_lifo_rollback() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let task_dropped = Arc::new(AtomicBool::new(false));
+        let api_dropped = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = async_channel::bounded(1);
         let (_release_tx, release_rx) = async_channel::bounded(1);
         let builder = complete_builder()
@@ -2315,6 +2410,7 @@ mod tests {
             .with_plugin(RollbackPlugin {
                 log: log.clone(),
                 task_dropped: task_dropped.clone(),
+                api_dropped: api_dropped.clone(),
             });
 
         let build = tokio::spawn(async move { builder.build().await });
@@ -2329,7 +2425,10 @@ mod tests {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .last()
                     .is_some_and(|entry| entry == "shutdown:rollback");
-                if complete && task_dropped.load(Ordering::Acquire) {
+                if complete
+                    && task_dropped.load(Ordering::Acquire)
+                    && api_dropped.load(Ordering::Acquire)
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2386,6 +2485,7 @@ mod tests {
             .with_plugin(RollbackPlugin {
                 log: log.clone(),
                 task_dropped: Arc::new(AtomicBool::new(false)),
+                api_dropped: Arc::new(AtomicBool::new(false)),
             })
             .build()
             .await;
@@ -2933,6 +3033,7 @@ mod tests {
             .with_plugin(RollbackPlugin {
                 log: Arc::new(Mutex::new(Vec::new())),
                 task_dropped: task_dropped.clone(),
+                api_dropped: Arc::new(AtomicBool::new(false)),
             })
             .with_plugin(EventSubscriptionPlugin)
             .build()

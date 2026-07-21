@@ -15,6 +15,9 @@ const SCOPE_OPEN: u8 = 0;
 const SCOPE_READY: u8 = 1;
 const SCOPE_CANCELLED: u8 = 2;
 const SCOPE_CLOSED: u8 = 3;
+const CONSTRUCTION_INSTALLING: u8 = 0;
+const CONSTRUCTION_ACTIVE: u8 = 1;
+const CONSTRUCTION_REJECTED: u8 = 2;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const CALLBACK_QUEUE_CAPACITY: usize = 64;
 
@@ -167,6 +170,8 @@ pub(super) struct LifecycleRegistration {
     shutdown_notifier: ShutdownNotifier,
     callback_timeout: Duration,
     terminal: AtomicBool,
+    construction_state: AtomicU8,
+    construction_notifier: ShutdownNotifier,
 }
 
 #[derive(Default)]
@@ -285,6 +290,8 @@ impl LifecycleRegistration {
             shutdown_notifier: ShutdownNotifier::new(),
             callback_timeout,
             terminal: AtomicBool::new(false),
+            construction_state: AtomicU8::new(CONSTRUCTION_INSTALLING),
+            construction_notifier: ShutdownNotifier::new(),
         }
     }
 
@@ -293,10 +300,48 @@ impl LifecycleRegistration {
             self.handler.install(client)
         }))
         .map_err(|_| anyhow::anyhow!("lifecycle install panicked before returning a future"))?;
-        std::panic::AssertUnwindSafe(install)
+        let result = std::panic::AssertUnwindSafe(install)
             .catch_unwind()
             .await
-            .map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?
+            .map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?;
+        if result.is_ok()
+            && self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_REJECTED
+        {
+            return Err(anyhow::anyhow!(
+                "client shutdown began during lifecycle installation"
+            ));
+        }
+        result
+    }
+
+    pub(super) fn activate(&self) -> bool {
+        if self.terminal.load(Ordering::Acquire) {
+            self.reject_construction();
+            return false;
+        }
+        match self.construction_state.compare_exchange(
+            CONSTRUCTION_INSTALLING,
+            CONSTRUCTION_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => self.construction_notifier.notify(),
+            Err(CONSTRUCTION_ACTIVE) => {}
+            Err(_) => return false,
+        }
+        !self.terminal.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn wait_until_active(&self) -> bool {
+        let activated = self.construction_notifier.subscribe();
+        match self.construction_state.load(Ordering::Acquire) {
+            CONSTRUCTION_ACTIVE => return !self.terminal.load(Ordering::Acquire),
+            CONSTRUCTION_REJECTED => return false,
+            _ => {}
+        }
+        wacore::runtime::wait_for_shutdown(&activated).await;
+        self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_ACTIVE
+            && !self.terminal.load(Ordering::Acquire)
     }
 
     pub(super) fn begin_scope_if_current(
@@ -467,6 +512,7 @@ impl LifecycleRegistration {
     }
 
     pub(super) fn signal_shutdown_sync(&self) {
+        self.reject_construction();
         let first_signal = if ready_publication_active(self) {
             self.mark_terminal_and_cancel_scopes()
         } else {
@@ -622,6 +668,21 @@ impl LifecycleRegistration {
     fn cancel_scope_inner(&self, generation: u64) {
         if let Some(scope) = self.scope_for(generation) {
             scope.cancel();
+        }
+    }
+
+    fn reject_construction(&self) {
+        if self
+            .construction_state
+            .compare_exchange(
+                CONSTRUCTION_INSTALLING,
+                CONSTRUCTION_REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.construction_notifier.notify();
         }
     }
 

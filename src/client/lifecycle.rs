@@ -406,8 +406,23 @@ impl Client {
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
     // per-operation spans (send/request), which record it themselves.
     pub async fn run(self: &Arc<Self>) {
+        if let Some(lifecycle) = &self.lifecycle
+            && !lifecycle.wait_until_active().await
+        {
+            warn!("Client `run` rejected before construction completed.");
+            return;
+        }
+        let shutdown = self.shutdown_signal();
+        if shutdown.is_fired() {
+            warn!("Client `run` called after shutdown.");
+            return;
+        }
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
+            return;
+        }
+        if shutdown.is_fired() {
+            self.is_running.store(false, Ordering::SeqCst);
             return;
         }
         // Reconnects are counted at iteration start: every pass after the
