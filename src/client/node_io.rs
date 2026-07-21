@@ -701,6 +701,7 @@ impl Client {
         // Increment connection generation to invalidate any stale post-login tasks
         // from previous connections (e.g., during 515 reconnect cycles).
         let current_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             let opened = lifecycle.begin_scope_if_current(current_generation, || {
                 self.connection_generation.load(Ordering::SeqCst) == current_generation

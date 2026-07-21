@@ -36,6 +36,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.signal_shutdown_sync();
         }
@@ -82,20 +83,23 @@ impl Client {
 
     /// Dispatch the Connected event and notify waiters.
     pub(crate) async fn dispatch_connected(&self) {
-        let generation = self.connection_generation.load(Ordering::SeqCst);
-        if let Some(lifecycle) = &self.lifecycle {
-            if !lifecycle.ready(generation).await {
-                debug!("Skipping Connected dispatch for retired generation {generation}");
+        #[cfg(feature = "client-lifecycle")]
+        {
+            let generation = self.connection_generation.load(Ordering::SeqCst);
+            if let Some(lifecycle) = &self.lifecycle {
+                if !lifecycle.ready(generation).await {
+                    debug!("Skipping Connected dispatch for retired generation {generation}");
+                    return;
+                }
+                if self.connection_generation.load(Ordering::SeqCst) != generation {
+                    debug!("Skipping Connected dispatch after generation changed");
+                    return;
+                }
+                if !lifecycle.publish_ready(generation, || self.publish_connected()) {
+                    debug!("Skipping Connected dispatch after lifecycle cancellation");
+                }
                 return;
             }
-            if self.connection_generation.load(Ordering::SeqCst) != generation {
-                debug!("Skipping Connected dispatch after generation changed");
-                return;
-            }
-            if !lifecycle.publish_ready(generation, || self.publish_connected()) {
-                debug!("Skipping Connected dispatch after lifecycle cancellation");
-            }
-            return;
         }
 
         self.publish_connected();
@@ -110,12 +114,14 @@ impl Client {
         self.connected_notifier.notify(usize::MAX);
     }
 
+    #[cfg(feature = "client-lifecycle")]
     pub(super) async fn shutdown_lifecycle(&self) {
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.shutdown().await;
         }
     }
 
+    #[cfg(feature = "client-lifecycle")]
     fn request_lifecycle_shutdown(&self) {
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.request_shutdown();
@@ -176,6 +182,7 @@ impl Client {
         extensions: ClientExtensions,
     ) -> ClientAssembly {
         let ClientExtensions {
+            #[cfg(feature = "client-lifecycle")]
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
@@ -207,6 +214,7 @@ impl Client {
             ik_handshake_failures: Arc::new(AtomicU32::new(0)),
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
+            #[cfg(feature = "client-lifecycle")]
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
@@ -406,6 +414,7 @@ impl Client {
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
     // per-operation spans (send/request), which record it themselves.
     pub async fn run(self: &Arc<Self>) {
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
         {
@@ -536,6 +545,7 @@ impl Client {
             );
             self.runtime.sleep(delay).await;
         }
+        #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
         info!("Client run loop has shut down.");
     }
@@ -721,6 +731,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        #[cfg(feature = "client-lifecycle")]
         self.request_lifecycle_shutdown();
 
         // Drain buffered offline receipts into the flush window before
@@ -768,6 +779,7 @@ impl Client {
         // final flush below and then be acked.
         self.msg_secret_buffer.seal();
         self.msg_secret_buffer.flush().await;
+        #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
     }
 
@@ -797,6 +809,7 @@ impl Client {
     )]
     pub async fn reconnect(self: &Arc<Self>) {
         info!("Reconnecting: dropping transport for auto-reconnect.");
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_active_scope();
         }
@@ -836,6 +849,7 @@ impl Client {
     )]
     pub async fn reconnect_immediately(self: &Arc<Self>) {
         info!("Reconnecting immediately (expected disconnect).");
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_active_scope();
         }
@@ -863,6 +877,16 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
     )]
+    #[cfg(not(feature = "client-lifecycle"))]
+    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
+        self.cleanup_connection_state_inner().await;
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
+    )]
+    #[cfg(feature = "client-lifecycle")]
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
         if self.lifecycle.is_none() {
             self.cleanup_connection_state_inner().await;
@@ -900,7 +924,11 @@ impl Client {
         // process_classified_message — no decrypt can START after the
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
+        #[cfg(feature = "client-lifecycle")]
         let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        #[cfg(not(feature = "client-lifecycle"))]
+        self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_scope(closed_generation);
         }
@@ -1060,6 +1088,7 @@ impl Client {
         if let Some(proc) = self.app_state_processor.lock().await.as_ref() {
             proc.clear_key_cache().await;
         }
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.close_scope(closed_generation);
         }

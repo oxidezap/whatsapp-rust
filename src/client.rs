@@ -5,6 +5,7 @@ mod builder;
 mod context_impl;
 mod device_registry;
 pub(crate) mod device_topology;
+#[cfg(feature = "client-lifecycle")]
 mod extension_lifecycle;
 mod iq_ops;
 mod lid_pn;
@@ -17,7 +18,9 @@ mod sessions;
 mod voip;
 use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+#[cfg(feature = "client-lifecycle")]
 use extension_lifecycle::LifecycleRegistration;
+#[cfg(feature = "client-lifecycle")]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use voip::{CallError, Voip};
 
@@ -689,6 +692,7 @@ pub struct Client {
     /// (keepalive, request waiters, read loop, offline flush) observe this.
     pub(crate) connection_shutdown: std::sync::Mutex<wacore::runtime::ShutdownNotifier>,
     /// Allocated only when an extension host installs lifecycle callbacks.
+    #[cfg(feature = "client-lifecycle")]
     lifecycle: Option<Arc<LifecycleRegistration>>,
     /// Allocated only when at least one build-time plugin is registered.
     #[cfg(feature = "plugins")]

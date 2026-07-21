@@ -93,10 +93,9 @@ pub use client::{
     StatsSnapshot, StorageResourceReport, TransportResourceReport,
 };
 pub use client::{CallError, Voip};
-pub use client::{
-    Client, ClientBuild, ClientBuilder, ClientBuilderError, ClientLifecycle, ConnectionScope,
-    ConnectionScopeState, RawNodeLease,
-};
+pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError, RawNodeLease};
+#[cfg(feature = "client-lifecycle")]
+pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
@@ -192,10 +191,9 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
-    pub use crate::client::{
-        Client, ClientBuilder, ClientBuilderError, ClientError, ClientLifecycle, ConnectionScope,
-        ConnectionScopeState, RawNodeLease,
-    };
+    pub use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientError, RawNodeLease};
+    #[cfg(feature = "client-lifecycle")]
+    pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     #[cfg(feature = "plugins")]
     pub use crate::plugins::{
         ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext,

@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use super::{Client, ClientLifecycle, LifecycleRegistration};
+use super::Client;
+#[cfg(feature = "client-lifecycle")]
+use super::{ClientLifecycle, LifecycleRegistration};
 use crate::cache_config::CacheConfig;
 use crate::http::HttpClient;
 #[cfg(feature = "plugins")]
@@ -67,6 +69,7 @@ pub enum ClientBuilderError {
     InvalidBackgroundSaverInterval,
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
+    #[cfg(feature = "client-lifecycle")]
     #[error("client lifecycle installation failed: {0}")]
     LifecycleInstall(#[source] anyhow::Error),
     #[cfg(feature = "plugins")]
@@ -97,6 +100,7 @@ pub struct ClientBuilder {
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     background_saver_interval: Option<Duration>,
+    #[cfg(feature = "client-lifecycle")]
     lifecycle: Option<Arc<dyn ClientLifecycle>>,
     #[cfg(feature = "plugins")]
     plugins: Vec<PluginRegistration>,
@@ -126,6 +130,7 @@ impl ClientBuilder {
             task_instrument: None,
             alloc_meter: None,
             background_saver_interval: None,
+            #[cfg(feature = "client-lifecycle")]
             lifecycle: None,
             #[cfg(feature = "plugins")]
             plugins: Vec::new(),
@@ -278,6 +283,7 @@ impl ClientBuilder {
     }
 
     /// Install the aggregate lifecycle used by extensions of this client.
+    #[cfg(feature = "client-lifecycle")]
     pub fn with_lifecycle<L>(mut self, lifecycle: L) -> Self
     where
         L: ClientLifecycle + 'static,
@@ -287,6 +293,7 @@ impl ClientBuilder {
     }
 
     /// Install an already-shared aggregate lifecycle.
+    #[cfg(feature = "client-lifecycle")]
     pub fn with_lifecycle_arc(mut self, lifecycle: Arc<dyn ClientLifecycle>) -> Self {
         self.lifecycle = Some(lifecycle);
         self
@@ -396,6 +403,7 @@ impl ClientBuilder {
             None => runtime,
         };
 
+        #[cfg(feature = "client-lifecycle")]
         let lifecycle_handler = self.lifecycle;
         #[cfg(feature = "plugins")]
         let (lifecycle_handler, plugin_host) = {
@@ -407,6 +415,7 @@ impl ClientBuilder {
             });
             (lifecycle_handler, plugin_host)
         };
+        #[cfg(feature = "client-lifecycle")]
         let lifecycle = lifecycle_handler.map(|handler| {
             #[cfg(feature = "plugins")]
             if let Some(plugin_host) = &plugin_host {
@@ -426,12 +435,14 @@ impl ClientBuilder {
             self.override_version,
             self.cache_config,
             ClientExtensions {
+                #[cfg(feature = "client-lifecycle")]
                 lifecycle,
                 #[cfg(feature = "plugins")]
                 plugin_host,
             },
         );
         let client = assembly.client();
+        #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 
         if !self.custom_enc_handlers.is_empty() {
@@ -452,6 +463,7 @@ impl ClientBuilder {
         if let Some(meter) = self.alloc_meter {
             let _ = client.alloc_meter.set(meter);
         }
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &client.lifecycle
             && let Err(error) = lifecycle.install(Arc::downgrade(&client)).await
         {
@@ -481,6 +493,7 @@ impl ClientBuilder {
                 "client shutdown began before plugin activation"
             )));
         }
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &client.lifecycle
             && !lifecycle.activate()
         {
@@ -496,6 +509,7 @@ impl ClientBuilder {
                 "client shutdown raced lifecycle activation"
             )));
         }
+        #[cfg(feature = "client-lifecycle")]
         construction.disarm();
         Ok(build)
     }
@@ -545,11 +559,13 @@ pub(super) struct ClientAssembly {
     sync_task_receiver: async_channel::Receiver<MajorSyncTask>,
 }
 
+#[cfg(feature = "client-lifecycle")]
 struct ClientConstructionGuard {
     client: Arc<Client>,
     armed: bool,
 }
 
+#[cfg(feature = "client-lifecycle")]
 impl ClientConstructionGuard {
     fn new(client: Arc<Client>) -> Self {
         Self {
@@ -563,6 +579,7 @@ impl ClientConstructionGuard {
     }
 }
 
+#[cfg(feature = "client-lifecycle")]
 impl Drop for ClientConstructionGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -573,6 +590,7 @@ impl Drop for ClientConstructionGuard {
 
 #[derive(Default)]
 pub(super) struct ClientExtensions {
+    #[cfg(feature = "client-lifecycle")]
     pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
@@ -612,17 +630,20 @@ mod tests {
     use crate::transport::mock::MockTransportFactory;
     use wacore::runtime::AbortHandle;
 
+    #[cfg(feature = "client-lifecycle")]
     struct FailingLifecycle {
         spawns: Arc<AtomicUsize>,
         installed_client: std::sync::Mutex<Option<std::sync::Weak<Client>>>,
     }
 
+    #[cfg(feature = "client-lifecycle")]
     struct RunDuringInstallLifecycle {
         client: async_channel::Sender<Arc<Client>>,
         release: async_channel::Receiver<()>,
         run_finished: async_channel::Sender<()>,
     }
 
+    #[cfg(feature = "client-lifecycle")]
     impl ClientLifecycle for RunDuringInstallLifecycle {
         fn install<'a>(
             &'a self,
@@ -654,6 +675,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "client-lifecycle")]
     impl ClientLifecycle for FailingLifecycle {
         fn install<'a>(
             &'a self,
@@ -779,6 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "client-lifecycle")]
     async fn run_leaked_during_install_waits_for_complete_construction() {
         let (client_tx, client_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
@@ -819,6 +842,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "client-lifecycle")]
     async fn shutdown_during_install_rejects_leaked_run_and_the_build() {
         let (client_tx, client_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
@@ -915,10 +939,12 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "client-lifecycle")]
     struct PanickingInstallLifecycle {
         when_polled: bool,
     }
 
+    #[cfg(feature = "client-lifecycle")]
     impl ClientLifecycle for PanickingInstallLifecycle {
         fn install(
             &self,
@@ -932,6 +958,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "client-lifecycle")]
     async fn lifecycle_install_panics_are_typed_build_errors() {
         for when_polled in [false, true] {
             let result = complete_builder()
@@ -947,6 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "client-lifecycle")]
     async fn lifecycle_install_failure_publishes_nothing_and_starts_no_tasks() {
         let persistence_manager = Arc::new(
             PersistenceManager::new(crate::test_utils::create_test_backend().await)

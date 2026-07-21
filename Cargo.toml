@@ -113,9 +113,12 @@ zlib-rs = { version = "0.6.5", default-features = false, features = ["std", "rus
 
 [features]
 debug-snapshots = ["wacore/debug-snapshots"]
+# Generation-scoped extension lifecycle. Kept opt-in so ordinary clients do not
+# retain lifecycle state or branches when no extension host is present.
+client-lifecycle = []
 # Build-time native plugin host. Kept opt-in so clients that do not use plugins
 # retain the pre-host binary footprint.
-plugins = ["dep:bon"]
+plugins = ["client-lifecycle", "dep:bon"]
 # Optional observability. Off by default: no `tracing` dep, zero overhead.
 # Emits tracing spans/events only; the application installs the subscriber
 # (and any OpenTelemetry bridge). See examples/observability.rs.
