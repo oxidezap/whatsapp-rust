@@ -471,6 +471,13 @@ impl SessionState {
         Ok(())
     }
 
+    fn fast_forward_sender_chain_or_drop(&mut self, target: u32) {
+        if let Err(error) = self.fast_forward_sender_chain(target) {
+            log::error!("dropping unusable sender chain: {error}");
+            self.session.sender_chain = MessageField::none();
+        }
+    }
+
     pub fn get_message_keys(
         &mut self,
         sender: &PublicKey,
@@ -767,7 +774,7 @@ impl SessionRecord {
                     return session_components_from_structure(session);
                 }
                 let mut state = SessionState::from_session_structure(session);
-                state.fast_forward_sender_chain(reserved_sender_chain_index)?;
+                state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
                 session_components_from_structure(state.session)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1009,13 +1016,8 @@ impl SessionRecord {
     pub fn promote_state(&mut self, new_state: SessionState) {
         self.archive_current_state_inner();
         let mut state = new_state;
-        if self.reserved_sender_chain_index > 0
-            && let Err(e) = state.fast_forward_sender_chain(self.reserved_sender_chain_index)
-        {
-            // Only reachable with a corrupt reservation (gap beyond the
-            // ceiling); refuse to expose the chain rather than risk reuse.
-            log::error!("dropping promoted sender chain: {e}");
-            state.session.sender_chain = None.into();
+        if self.reserved_sender_chain_index > 0 {
+            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
         }
         self.current_session = Some(state);
     }
@@ -1412,6 +1414,39 @@ mod tests {
             reserved,
             "promotion must make every leased counter underivable"
         );
+    }
+
+    #[test]
+    fn component_handoff_drops_a_stale_archived_sender_chain() {
+        let mut csprng = rng();
+        let archived_base_key = KeyPair::generate(&mut csprng).public_key;
+        let archived = create_test_session_state(3, &archived_base_key);
+        let current_base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut current = create_test_session_state(3, &current_base_key);
+        let spent_counter = consts::MAX_RESERVATION_FAST_FORWARD + 1;
+        current
+            .set_sender_chain_key(&ChainKey::new([9; 32], spent_counter))
+            .expect("current sender chain");
+
+        let mut record = SessionRecord::new(archived);
+        record.promote_fresh_state(current);
+        record.reserve_sender_chain_counters(spent_counter);
+        let reserved = record.reserved_sender_chain_index();
+
+        let components = record
+            .into_components()
+            .expect("stale archive must not block handoff");
+        assert_eq!(
+            components
+                .current_session
+                .as_ref()
+                .and_then(|session| session.sender_chain.as_ref())
+                .and_then(|chain| chain.chain_key.as_ref())
+                .and_then(|chain_key| chain_key.index),
+            Some(reserved)
+        );
+        assert_eq!(components.previous_sessions.len(), 1);
+        assert!(components.previous_sessions[0].sender_chain.is_none());
     }
 
     /// A freshly ratcheted chain has never spent a counter, so promoting it
