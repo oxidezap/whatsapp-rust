@@ -22,6 +22,7 @@ A high-performance, async Rust library for the WhatsApp Web API. Inspired by [wh
 - **Profile** — Set push name, status text, profile picture
 - **Privacy** — Fetch/set privacy settings, disappearing messages
 - **Modular** — Pluggable storage, transport, HTTP client, and async runtime; SQLite, Tokio WebSocket, and ureq ship as the defaults, swap any of them with `default-features = false`
+- **Native plugins** — Build-time, type-safe extensions with scoped capabilities and lifecycle ownership behind the `plugins` feature
 - **Runtime agnostic** — Bring your own async runtime via the `Runtime` trait (Tokio included by default)
 
 For the full API reference and guides, see the **[documentation](https://whatsapp-rust.jlucaso.com)**.
@@ -59,6 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The default cargo features wire up the Tokio WebSocket transport, the ureq HTTP client, the SQLite store, and the Tokio runtime; only the storage backend has to be chosen explicitly. Every piece is replaceable through the builder (`with_transport_factory`, `with_http_client`, `with_runtime`) for custom environments such as wasm or embedded targets.
+
+Native plugin APIs are opt-in: use `features = ["plugins"]` when implementing a
+plugin in the application. Published plugin crates can enable that feature in
+their own `whatsapp-rust` dependency, and Cargo feature unification activates it
+for the consumer. See [`agent_docs/plugin_architecture.md`](agent_docs/plugin_architecture.md)
+for the host contract and type-safe API example.
 
 ### One dependency is enough
 

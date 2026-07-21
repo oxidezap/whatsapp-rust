@@ -21,6 +21,7 @@ pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
 #[cfg(feature = "client-lifecycle")]
 use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use voip::{CallError, Voip};
 

@@ -1,6 +1,7 @@
 // Compile-checks the README examples as doctests, so the advertised quick
 // start can never silently rot.
 #![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Instrumenting large async fns (e.g. process_sync_task) wraps them in deep
 // `Instrumented` future types; the default depth limit overflows when the
 // `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
@@ -95,6 +96,7 @@ pub use client::{
 pub use client::{CallError, Voip};
 pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError, RawNodeLease};
 #[cfg(feature = "client-lifecycle")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
@@ -111,8 +113,10 @@ pub mod pair;
 pub mod pair_code;
 pub mod passkey;
 #[cfg(feature = "plugins")]
+#[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
 pub mod plugins;
 #[cfg(feature = "plugins")]
+#[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
 pub use plugins::{
     ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
     PluginConnectionTasks, PluginContext, PluginCoreEvents, PluginEventEndpointConfig,
@@ -194,8 +198,10 @@ pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
     pub use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientError, RawNodeLease};
     #[cfg(feature = "client-lifecycle")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub use crate::plugins::{
         ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext,
         PluginEventEndpointConfig, PluginEventOverflow, PluginEventPayloadEncoding,

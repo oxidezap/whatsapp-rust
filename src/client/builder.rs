@@ -70,12 +70,15 @@ pub enum ClientBuilderError {
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
     #[cfg(feature = "client-lifecycle")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     #[error("client lifecycle installation failed: {0}")]
     LifecycleInstall(#[source] anyhow::Error),
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     #[error("plugin host installation failed: {0}")]
     PluginInstall(#[source] anyhow::Error),
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     #[error("invalid plugin plan: {0}")]
     PluginPlan(#[from] PluginPlanError),
 }
@@ -284,6 +287,7 @@ impl ClientBuilder {
 
     /// Install the aggregate lifecycle used by extensions of this client.
     #[cfg(feature = "client-lifecycle")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub fn with_lifecycle<L>(mut self, lifecycle: L) -> Self
     where
         L: ClientLifecycle + 'static,
@@ -294,6 +298,7 @@ impl ClientBuilder {
 
     /// Install an already-shared aggregate lifecycle.
     #[cfg(feature = "client-lifecycle")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub fn with_lifecycle_arc(mut self, lifecycle: Arc<dyn ClientLifecycle>) -> Self {
         self.lifecycle = Some(lifecycle);
         self
@@ -301,6 +306,7 @@ impl ClientBuilder {
 
     /// Register a native plugin for transactional installation before services start.
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
         self.plugins.push(PluginRegistration::new(plugin));
         self
@@ -308,6 +314,7 @@ impl ClientBuilder {
 
     /// Register an already-shared native plugin without changing its marker type.
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
         self.plugins.push(PluginRegistration::new_arc(plugin));
         self

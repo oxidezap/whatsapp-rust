@@ -27,6 +27,15 @@ high-level client operations and lifecycle coordination. It is enabled by the
 opt-in `plugins` feature, which enables `client-lifecycle`. A default build has
 neither plugin/lifecycle fields nor their runtime branches.
 
+The public feature surface stays intentionally small: `plugins` is the normal
+opt-in and `client-lifecycle` is the advanced low-level seam for hosts that need
+lifecycle integration without the native plugin host. Capabilities and
+individual plugins do not become Cargo features. An external plugin crate can
+enable `whatsapp-rust/plugins` in its own dependency, so Cargo feature unification
+activates the host for its consumer. The host remains opt-in because LTO is not
+a compatibility guarantee for client layout, reachable branches, dependencies,
+compile time, or final binary size.
+
 ## Construction boundary
 
 `ClientBuilder` is the canonical low-level construction path. It validates
@@ -165,16 +174,20 @@ install once
 - `on_ready` runs in dependency order after authentication for that generation.
 - scope cancellation is synchronous when a reconnect or terminal teardown
   starts.
-- generation tasks drain before `on_closed`; `on_closed` runs in reverse
-  dependency order after authoritative cleanup.
-- install tasks drain before terminal `shutdown`; shutdown hooks run in reverse
-  dependency order.
+- generation task cancellation is signalled before `on_closed`; the host waits
+  for the drain up to its configured timeout, then continues in reverse
+  dependency order and marks the plugin degraded if work remains.
+- install task cancellation follows the same bounded drain before terminal
+  `shutdown`; shutdown hooks run in reverse dependency order.
 - the separately configured upstream lifecycle wraps the plugin order: it is
   readied first and closed/shut down last.
 
-`PluginTasks` survives reconnects and ends only on rollback or terminal
-shutdown. `PluginConnectionTasks` is tied to one generation and must not leak
-work into a later connection.
+`PluginTasks` survives reconnects and receives cancellation only on rollback or
+terminal shutdown. `PluginConnectionTasks` is tied to one generation:
+cancellation is signalled synchronously, while actual future destruction is
+cooperative at executor poll boundaries. Plugin tasks must not block an executor
+thread or detach untracked work. A non-cooperative task may outlive the bounded
+drain, in which case teardown proceeds and diagnostics remain degraded.
 
 Callbacks are serialized, bounded by timeouts, and isolated from panics,
 including panics while constructing, polling, cancelling, or destroying their
@@ -224,10 +237,12 @@ already queued envelopes.
 ## Diagnostics
 
 `Client::plugin_stats()` reports per-plugin lifecycle state, sticky health,
-callback/task failures, active task scopes, subscriptions, and publisher
-counters. `PluginEventRouter::stats()` and `PluginEvents::stats()` expose queue
-and backpressure totals. `Client::memory_report()` includes plugin resources
-and counts a shared queued payload once across fanout.
+callback failures, spawned-task panics, drain timeouts, active task scopes,
+subscriptions, and publisher counters. Spawned task panics are isolated during
+polling and cancellation so a dead worker cannot remain falsely healthy.
+`PluginEventRouter::stats()` and `PluginEvents::stats()` expose queue and
+backpressure totals. `Client::memory_report()` includes plugin resources and
+counts a shared queued payload once across fanout.
 
 Snapshots are on-demand, approximate under concurrency, and contain no JIDs,
 phone numbers, or message bodies. See `observability.md` for accounting rules.

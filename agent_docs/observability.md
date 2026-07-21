@@ -78,10 +78,10 @@ queue retention, and cumulative delivery/backpressure totals; publishers can
 read their own totals through `PluginEvents::stats()`.
 
 Health is sticky for the lifetime of the host: lifecycle errors/panics,
-timeouts, task-drain timeouts, isolated core-event panics, resource teardown
-panics, publication failures, and queue drops mark only the responsible plugin
-as degraded. Concurrent snapshots are intentionally approximate, and carry no
-message content, JIDs, or phone numbers.
+timeouts, spawned-task panics, task-drain timeouts, isolated core-event panics,
+resource teardown panics, publication failures, and queue drops mark only the
+responsible plugin as degraded. Concurrent snapshots are intentionally
+approximate, and carry no message content, JIDs, or phone numbers.
 
 ### 3. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
 

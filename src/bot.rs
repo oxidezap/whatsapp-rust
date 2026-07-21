@@ -815,6 +815,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 
     /// Register a native plugin without changing the builder's typestate.
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
         self.plugins.push(PluginRegistration::new(plugin));
         self
@@ -822,6 +823,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 
     /// Register an already-shared native plugin without changing its marker type.
     #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
         self.plugins.push(PluginRegistration::new_arc(plugin));
         self

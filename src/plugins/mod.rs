@@ -995,7 +995,7 @@ impl PluginConnectionScope {
     }
 }
 
-/// Task capability whose work is aborted synchronously when its generation retires.
+/// Task capability whose cancellation is signalled synchronously when its generation retires.
 #[derive(Clone)]
 pub struct PluginConnectionTasks {
     runtime: Arc<dyn Runtime>,

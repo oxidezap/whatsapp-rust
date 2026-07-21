@@ -9,6 +9,10 @@ repository = "https://github.com/jlucaso1/whatsapp-rust"
 readme = "README.md"
 description = "Rust client for WhatsApp Web"
 
+[package.metadata.docs.rs]
+features = ["plugins"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [workspace]
 members = [
     ".",
@@ -49,6 +53,9 @@ disallowed_methods = "deny"
 # Ban std 64-bit atomic types: absent on 32-bit targets (Xtensa/ESP32). Use
 # portable_atomic. Host-only test/bench counters carry an inline allow.
 disallowed_types = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
 
 [workspace.dependencies]
 # Shared dependencies
