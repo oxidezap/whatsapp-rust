@@ -709,6 +709,12 @@ impl Jid {
         write_jid_fallible(writer, &self.user, self.server, self.agent, self.device)
     }
 
+    /// Compare the display representation with `other` without allocating.
+    #[inline]
+    pub fn display_eq(&self, other: &str) -> bool {
+        jid_display_eq(&self.user, self.server, self.agent, self.device, other)
+    }
+
     /// Compare device identity (user, server, device) without allocation.
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
@@ -758,6 +764,12 @@ impl<'a> JidRef<'a> {
             device: self.device,
             integrator: self.integrator,
         }
+    }
+
+    /// Compare the display representation with `other` without allocating.
+    #[inline]
+    pub fn display_eq(&self, other: &str) -> bool {
+        jid_display_eq(&self.user, self.server, self.agent, self.device, other)
     }
 }
 
@@ -963,6 +975,38 @@ fn write_jid_fallible<W: fmt::Write + ?Sized>(
     write_jid!(fallible w, user, server, agent, device)
 }
 
+struct StrEqWriter<'a> {
+    target: &'a [u8],
+    position: usize,
+    matches: bool,
+}
+
+impl fmt::Write for StrEqWriter<'_> {
+    #[inline]
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.matches {
+            let bytes = value.as_bytes();
+            let end = self.position + bytes.len();
+            if end > self.target.len() || self.target[self.position..end] != *bytes {
+                self.matches = false;
+            }
+            self.position = end;
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn jid_display_eq(user: &str, server: Server, agent: u8, device: u16, other: &str) -> bool {
+    let mut writer = StrEqWriter {
+        target: other.as_bytes(),
+        position: 0,
+        matches: true,
+    };
+    let written = write_jid_fallible(&mut writer, user, server, agent, device).is_ok();
+    written && writer.matches && writer.position == other.len()
+}
+
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut w = JidStackWriter::new();
@@ -1113,6 +1157,24 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn display_eq_matches_owned_and_borrowed_jids_without_normalizing() {
+        let canonical = "123456789.4:17@interop";
+        let owned = Jid::from_str(canonical).unwrap();
+        let borrowed = parse_jid_ref(canonical).unwrap();
+
+        for value in [canonical, "123456789.4:16@interop", "123456789@interop", ""] {
+            assert_eq!(owned.display_eq(value), value == canonical);
+            assert_eq!(borrowed.display_eq(value), value == canonical);
+        }
+
+        let long_user = "a".repeat(128);
+        let long_value = format!("{long_user}@lid");
+        let long_jid = Jid::lid(long_user);
+        assert!(long_jid.display_eq(&long_value));
+        assert!(!long_jid.display_eq(&format!("{long_value}x")));
+    }
 
     #[cfg(feature = "serde")]
     #[test]

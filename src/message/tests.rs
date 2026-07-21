@@ -3602,10 +3602,6 @@ async fn test_retry_cache_key_format() {
 }
 
 /// Test concurrent retry increments are properly serialized.
-///
-/// The increment operation uses get+insert which is not fully atomic,
-/// but is sufficient since message retry processing is serialized per key
-/// by the per-chat lock. At most 5 increments should succeed.
 #[tokio::test]
 async fn test_concurrent_retry_increments() {
     use tokio::task::JoinSet;
@@ -5564,8 +5560,593 @@ async fn capturing_client(
     (client, transport)
 }
 
+#[tokio::test]
+async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
+    let (client, transport) = capturing_client("explicit_stanza_responses").await;
+
+    let message = NodeBuilder::new("message")
+        .attr("id", "EXPLICIT-ACK")
+        .attr("from", "15551234567:7@s.whatsapp.net")
+        .attr("recipient", "5511000000001@s.whatsapp.net")
+        .attr("type", "text")
+        .build();
+    client
+        .acknowledge_stanza(&message.as_node_ref())
+        .await
+        .expect("complete message should be acknowledged");
+
+    let receipt = NodeBuilder::new("receipt")
+        .attr("id", "EXPLICIT-NACK")
+        .attr("from", "120363021033254949@g.us")
+        .attr("participant", "15551234567:7@s.whatsapp.net")
+        .attr("type", "retry")
+        .build();
+    client
+        .reject_stanza(
+            &receipt.as_node_ref(),
+            crate::features::StanzaRejection::invalid_protobuf(Some(42)),
+        )
+        .await
+        .expect("complete receipt should be rejected");
+
+    let frames = transport.sent();
+    assert_eq!(frames.len(), 2);
+
+    let ack_bytes = decode_frame(0, &frames[0]).expect("ack frame should decrypt");
+    let ack =
+        wacore_binary::marshal::unmarshal_ref(&ack_bytes[1..]).expect("ack frame should decode");
+    assert_eq!(ack.tag.as_ref(), "ack");
+    assert!(
+        ack.get_attr("id")
+            .is_some_and(|value| value.as_str() == "EXPLICIT-ACK")
+    );
+    assert!(
+        ack.get_attr("class")
+            .is_some_and(|value| value.as_str() == "message")
+    );
+    assert!(
+        ack.get_attr("to")
+            .is_some_and(|value| value.as_str() == "15551234567:7@s.whatsapp.net")
+    );
+    assert!(
+        ack.get_attr("from")
+            .is_some_and(|value| value.as_str() == "5511000000001@s.whatsapp.net")
+    );
+    assert!(ack.get_attr("type").is_none());
+
+    let nack_bytes = decode_frame(1, &frames[1]).expect("nack frame should decrypt");
+    let nack =
+        wacore_binary::marshal::unmarshal_ref(&nack_bytes[1..]).expect("nack frame should decode");
+    assert_eq!(nack.tag.as_ref(), "ack");
+    assert!(
+        nack.get_attr("id")
+            .is_some_and(|value| value.as_str() == "EXPLICIT-NACK")
+    );
+    assert!(
+        nack.get_attr("class")
+            .is_some_and(|value| value.as_str() == "receipt")
+    );
+    assert!(
+        nack.get_attr("error")
+            .is_some_and(|value| value.as_str() == "491")
+    );
+    assert!(
+        nack.get_attr("participant")
+            .is_some_and(|value| value.as_str() == "15551234567:7@s.whatsapp.net")
+    );
+    let meta = nack
+        .get_optional_child("meta")
+        .expect("InvalidProtobuf should carry its failure detail");
+    assert!(
+        meta.get_attr("failure_reason")
+            .is_some_and(|value| value.as_str() == "42")
+    );
+}
+
+#[tokio::test]
+async fn explicit_stanza_responses_reject_incomplete_input_without_sending() {
+    use std::error::Error as _;
+
+    let (client, transport) = capturing_client("explicit_stanza_invalid").await;
+
+    let ack_without_id = NodeBuilder::new("receipt")
+        .attr("from", "15551234567@s.whatsapp.net")
+        .build();
+    assert!(matches!(
+        client
+            .acknowledge_stanza(&ack_without_id.as_node_ref())
+            .await,
+        Err(crate::features::StanzaResponseError::MissingAttribute("id"))
+    ));
+
+    let nack_without_from = NodeBuilder::new("message").attr("id", "NO-FROM").build();
+    assert!(matches!(
+        client
+            .reject_stanza(
+                &nack_without_from.as_node_ref(),
+                crate::features::StanzaRejection::new(NackReason::ParsingError),
+            )
+            .await,
+        Err(crate::features::StanzaResponseError::MissingAttribute(
+            "from"
+        ))
+    ));
+
+    assert_eq!(transport.sent_count(), 0);
+
+    transport.fail_next_sends(1);
+    let valid_receipt = NodeBuilder::new("receipt")
+        .attr("id", "TRANSPORT-FAILURE")
+        .attr("from", "15551234567@s.whatsapp.net")
+        .build();
+    let error = client
+        .acknowledge_stanza(&valid_receipt.as_node_ref())
+        .await
+        .expect_err("transport failure must reach the caller");
+    let mut source = error.source();
+    let mut found_injected_failure = false;
+    while let Some(current) = source {
+        found_injected_failure |= current.to_string().contains("injected transport failure");
+        source = current.source();
+    }
+    assert!(
+        found_injected_failure,
+        "response error lost its cause: {error:?}"
+    );
+    assert_eq!(transport.failed_sends(), 1);
+}
+
+fn retry_request_stanza(id: &'static str) -> wacore_binary::Node {
+    NodeBuilder::new("message")
+        .attr("id", id)
+        .attr("from", "15551234567:7@s.whatsapp.net")
+        .attr("t", "1")
+        .attr("type", "text")
+        .build()
+}
+
+#[tokio::test]
+async fn explicit_retry_sends_only_the_retry_receipt() {
+    let (client, transport) = capturing_client("explicit_retry").await;
+    let stanza = retry_request_stanza("EXPLICIT-RETRY");
+
+    let outcome = client
+        .request_message_retry(
+            &stanza.as_node_ref(),
+            crate::features::RetryRequestOptions::new().with_reason(RetryReason::BadMac),
+        )
+        .await
+        .expect("retry receipt should send");
+    assert_eq!(
+        outcome,
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: false,
+        }
+    );
+
+    let frames = transport.sent();
+    assert_eq!(message_acks_for(&frames, "EXPLICIT-RETRY"), 0);
+    let mut found_retry = false;
+    for (index, frame) in frames.iter().enumerate() {
+        let Some(bytes) = decode_frame(index, frame) else {
+            continue;
+        };
+        let Ok(receipt) = wacore_binary::marshal::unmarshal_ref(&bytes[1..]) else {
+            continue;
+        };
+        if receipt.tag.as_ref() != "receipt"
+            || !receipt
+                .get_attr("id")
+                .is_some_and(|value| value.as_str() == "EXPLICIT-RETRY")
+        {
+            continue;
+        }
+        assert!(
+            receipt
+                .get_attr("type")
+                .is_some_and(|value| value.as_str() == "retry")
+        );
+        assert!(receipt.get_optional_child("keys").is_none());
+        let retry = receipt
+            .get_optional_child("retry")
+            .expect("retry receipt should have retry metadata");
+        assert!(
+            retry
+                .get_attr("count")
+                .is_some_and(|value| value.as_str() == "1")
+        );
+        assert!(
+            retry
+                .get_attr("error")
+                .is_some_and(|value| value.as_str() == "7")
+        );
+        found_retry = true;
+    }
+    assert!(found_retry, "manual operation must emit a retry receipt");
+}
+
+#[tokio::test]
+async fn explicit_retry_force_includes_keys_on_first_attempt() {
+    let (client, transport) = capturing_client("explicit_retry_force").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    let before = client.persistence_manager.get_device_snapshot();
+    let stanza = retry_request_stanza("EXPLICIT-RETRY-FORCE");
+
+    let outcome = client
+        .request_message_retry(
+            &stanza.as_node_ref(),
+            crate::features::RetryRequestOptions::new().with_force_include_keys(true),
+        )
+        .await
+        .expect("forced first retry should send its key bundle");
+    assert_eq!(
+        outcome,
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: true,
+        }
+    );
+
+    let frames = transport.sent();
+    let mut found_keys = false;
+    for (index, frame) in frames.iter().enumerate() {
+        let Some(bytes) = decode_frame(index, frame) else {
+            continue;
+        };
+        let Ok(receipt) = wacore_binary::marshal::unmarshal_ref(&bytes[1..]) else {
+            continue;
+        };
+        if receipt.tag.as_ref() == "receipt"
+            && receipt
+                .get_attr("id")
+                .is_some_and(|value| value.as_str() == "EXPLICIT-RETRY-FORCE")
+        {
+            found_keys = receipt.get_optional_child("keys").is_some();
+        }
+    }
+    assert!(
+        found_keys,
+        "force_include_keys must affect the first wire request"
+    );
+    assert_eq!(message_acks_for(&frames, "EXPLICIT-RETRY-FORCE"), 0);
+
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_ne!(after.next_pre_key_id, before.next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id, after.next_pre_key_id,
+        "the directly distributed prekey must leave the upload window"
+    );
+}
+
+#[tokio::test]
+async fn explicit_retry_includes_keys_at_the_normal_threshold() {
+    let (client, _transport) = capturing_client("explicit_retry_threshold").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    let stanza = retry_request_stanza("EXPLICIT-RETRY-THRESHOLD");
+
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("first retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: false,
+        }
+    );
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("second retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 2,
+            included_keys: true,
+        }
+    );
+}
+
+#[tokio::test]
+async fn explicit_retry_preserves_canonical_routing_shapes() {
+    let (client, transport) = capturing_client("explicit_retry_routing").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+
+    let group = NodeBuilder::new("message")
+        .attr("id", "RETRY-GROUP")
+        .attr("from", "120363021033254949@g.us")
+        .attr("participant", "15551234567:7@s.whatsapp.net")
+        .attr("t", "1")
+        .build();
+    assert_eq!(
+        client
+            .request_message_retry(
+                &group.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("group retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: false,
+        }
+    );
+    let group_receipt =
+        find_receipt_details(&transport.sent(), "RETRY-GROUP").expect("group retry receipt");
+    assert_eq!(group_receipt.to, "120363021033254949@g.us");
+    assert_eq!(
+        group_receipt.participant.as_deref(),
+        Some("15551234567:7@s.whatsapp.net")
+    );
+    assert_eq!(group_receipt.recipient, None);
+    assert_eq!(group_receipt.category, None);
+
+    let status = NodeBuilder::new("message")
+        .attr("id", "RETRY-STATUS")
+        .attr("from", "status@broadcast")
+        .attr("participant", "15551234567:7@s.whatsapp.net")
+        .attr("t", "1")
+        .build();
+    client
+        .request_message_retry(
+            &status.as_node_ref(),
+            crate::features::RetryRequestOptions::default(),
+        )
+        .await
+        .expect("status retry should send");
+    let status_receipt =
+        find_receipt_details(&transport.sent(), "RETRY-STATUS").expect("status retry receipt");
+    assert_eq!(status_receipt.to, "status@broadcast");
+    assert_eq!(
+        status_receipt.participant.as_deref(),
+        Some("15551234567:7@s.whatsapp.net")
+    );
+
+    let peer = NodeBuilder::new("message")
+        .attr("id", "RETRY-PEER")
+        .attr("from", "5511000000001:9@s.whatsapp.net")
+        .attr("recipient", "15551234567@s.whatsapp.net")
+        .attr("category", "peer")
+        .attr("t", "1")
+        .build();
+    client
+        .request_message_retry(
+            &peer.as_node_ref(),
+            crate::features::RetryRequestOptions::default(),
+        )
+        .await
+        .expect("peer retry should send");
+    let peer_receipt =
+        find_receipt_details(&transport.sent(), "RETRY-PEER").expect("peer retry receipt");
+    assert_eq!(peer_receipt.to, "5511000000001:9@s.whatsapp.net");
+    assert_eq!(peer_receipt.category.as_deref(), Some("peer"));
+    assert_eq!(peer_receipt.recipient, None);
+
+    let self_fanout = NodeBuilder::new("message")
+        .attr("id", "RETRY-SELF")
+        .attr("from", "5511000000001:9@s.whatsapp.net")
+        .attr("recipient", "15551234567@s.whatsapp.net")
+        .attr("t", "1")
+        .build();
+    client
+        .request_message_retry(
+            &self_fanout.as_node_ref(),
+            crate::features::RetryRequestOptions::default(),
+        )
+        .await
+        .expect("self-fanout retry should send");
+    let self_receipt =
+        find_receipt_details(&transport.sent(), "RETRY-SELF").expect("self retry receipt");
+    assert_eq!(self_receipt.to, "5511000000001:9@s.whatsapp.net");
+    assert_eq!(
+        self_receipt.recipient.as_deref(),
+        Some("15551234567@s.whatsapp.net")
+    );
+    assert_eq!(self_receipt.category, None);
+
+    let hosted = NodeBuilder::new("message")
+        .attr("id", "RETRY-HOSTED")
+        .attr("from", "15551234567:7@hosted")
+        .attr("t", "1")
+        .build();
+    assert_eq!(
+        client
+            .request_message_retry(
+                &hosted.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("stateless retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: true,
+        }
+    );
+    let hosted_receipt =
+        find_receipt_details(&transport.sent(), "RETRY-HOSTED").expect("hosted retry receipt");
+    assert_eq!(hosted_receipt.to, "15551234567:7@hosted");
+    assert!(hosted_receipt.has_keys);
+
+    let bot_dm = NodeBuilder::new("message")
+        .attr("id", "RETRY-BOT-DM")
+        .attr("from", "200000000000002@bot")
+        .attr("t", "1")
+        .build();
+    client
+        .request_message_retry(
+            &bot_dm.as_node_ref(),
+            crate::features::RetryRequestOptions::default(),
+        )
+        .await
+        .expect("bot DM retry should send");
+    let bot_receipt =
+        find_receipt_details(&transport.sent(), "RETRY-BOT-DM").expect("bot retry receipt");
+    assert_eq!(bot_receipt.to, "200000000000002@bot");
+    assert_eq!(bot_receipt.participant, None);
+
+    let bot_group = NodeBuilder::new("message")
+        .attr("id", "RETRY-BOT-GROUP")
+        .attr("from", "120363021033254949@g.us")
+        .attr("participant", "200000000000002@bot")
+        .attr("t", "1")
+        .build();
+    assert_eq!(
+        client
+            .request_message_retry(
+                &bot_group.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("suppression is an explicit outcome"),
+        crate::features::RetryRequestOutcome::Suppressed { retry_count: 1 }
+    );
+    assert!(find_receipt_details(&transport.sent(), "RETRY-BOT-GROUP").is_none());
+
+    for id in [
+        "RETRY-GROUP",
+        "RETRY-STATUS",
+        "RETRY-PEER",
+        "RETRY-SELF",
+        "RETRY-HOSTED",
+        "RETRY-BOT-DM",
+        "RETRY-BOT-GROUP",
+    ] {
+        assert_eq!(message_acks_for(&transport.sent(), id), 0);
+    }
+}
+
+#[tokio::test]
+async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
+    let (client, transport) = capturing_client("explicit_retry_validation").await;
+
+    let receipt = NodeBuilder::new("receipt")
+        .attr("id", "WRONG-CLASS")
+        .attr("from", "15551234567@s.whatsapp.net")
+        .build();
+    assert!(matches!(
+        client
+            .request_message_retry(
+                &receipt.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await,
+        Err(crate::features::RetryRequestError::UnsupportedStanzaClass)
+    ));
+
+    let missing_id = NodeBuilder::new("message")
+        .attr("from", "15551234567@s.whatsapp.net")
+        .build();
+    assert!(matches!(
+        client
+            .request_message_retry(
+                &missing_id.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await,
+        Err(crate::features::RetryRequestError::MissingAttribute("id"))
+    ));
+
+    let missing_from = NodeBuilder::new("message")
+        .attr("id", "MISSING-FROM")
+        .build();
+    assert!(matches!(
+        client
+            .request_message_retry(
+                &missing_from.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await,
+        Err(crate::features::RetryRequestError::MissingAttribute("from"))
+    ));
+
+    let stanza = retry_request_stanza("RETRY-LIMIT");
+    let sender: Jid = "15551234567:7@s.whatsapp.net".parse().expect("sender");
+    let chat = sender.to_non_ad();
+    let cache_key = client
+        .make_retry_cache_key(&chat, "RETRY-LIMIT", &sender)
+        .await;
+    client
+        .message_retry_counts
+        .insert(cache_key, (MAX_DECRYPT_RETRIES, None))
+        .await;
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("reaching the retry limit is an explicit outcome"),
+        crate::features::RetryRequestOutcome::LimitReached
+    );
+    assert_eq!(transport.sent_count(), 0);
+}
+
+#[tokio::test]
+async fn explicit_retry_preserves_transport_error_chain() {
+    use std::error::Error as _;
+
+    let (client, transport) = capturing_client("explicit_retry_error").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    let before = client.persistence_manager.get_device_snapshot();
+    transport.fail_next_sends(1);
+    let stanza = retry_request_stanza("EXPLICIT-RETRY-ERROR");
+    let error = client
+        .request_message_retry(
+            &stanza.as_node_ref(),
+            crate::features::RetryRequestOptions::new().with_force_include_keys(true),
+        )
+        .await
+        .expect_err("transport failure must reach the caller");
+
+    let mut source = error.source();
+    let mut found_injected_failure = false;
+    while let Some(current) = source {
+        found_injected_failure |= current.to_string().contains("injected transport failure");
+        source = current.source();
+    }
+    assert!(
+        found_injected_failure,
+        "typed retry error must preserve the original transport cause: {error:?}"
+    );
+    assert_eq!(transport.sent_count(), 0);
+
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_ne!(after.next_pre_key_id, before.next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id, after.next_pre_key_id,
+        "a possibly delivered direct-distribution key must not be offered again"
+    );
+}
+
 /// Regression: a malformed pkmsg used to fall through silently. Now
-/// it dispatches the consumer event AND emits a nack on the wire so
+/// it dispatches the undecryptable event AND emits a nack on the wire so
 /// the server stops retransmitting.
 #[tokio::test]
 async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
@@ -5795,6 +6376,8 @@ struct SentReceipt {
     recipient: Option<String>,
     participant: Option<String>,
     context: Option<String>,
+    category: Option<String>,
+    has_keys: bool,
 }
 
 fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt> {
@@ -5815,6 +6398,8 @@ fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt
                 recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
                 participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
                 context: node.get_attr("context").map(|v| v.as_str().to_string()),
+                category: node.get_attr("category").map(|v| v.as_str().to_string()),
+                has_keys: node.get_optional_child("keys").is_some(),
             });
         }
     }
@@ -6136,8 +6721,7 @@ async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
 }
 
 /// If the resend request fails to send, the stanza must NOT be acked, so the
-/// server keeps it queued for another try. Here NoSession needs keys, which
-/// need a device account this harness lacks, so send_retry_receipt errors.
+/// server keeps it queued for another try.
 #[tokio::test]
 async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
     let (client, transport) = capturing_client("retry_fail_no_ack").await;
@@ -6151,14 +6735,21 @@ async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
         },
         ..Default::default()
     });
+    transport.fail_next_sends(1);
     client
         .handle_decrypt_failure(
             &info,
-            RetryReason::NoSession,
+            RetryReason::BadMac,
             crate::types::events::DecryptFailMode::Show,
         )
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.failed_sends() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry receipt should reach the failing transport");
     assert!(
         find_message_ack(&transport.sent()).is_none(),
         "must not ack when the resend request failed to send"

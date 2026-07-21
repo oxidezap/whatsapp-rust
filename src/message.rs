@@ -20,9 +20,7 @@ use wacore_binary::JidExt as _;
 use wacore_binary::{NodeRef, OwnedNodeRef};
 use waproto::whatsapp::{self as wa};
 
-/// Maximum retry attempts per message (matches WhatsApp Web's MAX_RETRY = 5).
-/// After this many retries, we stop sending retry receipts and rely solely on PDO.
-const MAX_DECRYPT_RETRIES: u8 = 5;
+use wacore::protocol::retry::MAX_RETRY_COUNT as MAX_DECRYPT_RETRIES;
 
 /// Pre-extracted enc node payload. Holds owned copies of the fields needed for
 /// decryption so the async decrypt phase doesn't borrow the original NodeRef tree.

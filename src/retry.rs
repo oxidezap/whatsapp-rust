@@ -1,4 +1,5 @@
 use crate::client::Client;
+use crate::features::RetryRequestError;
 use crate::message::RetryReason;
 use crate::types::events::Receipt;
 use log::{debug, info, warn};
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
 use wacore::libsignal::protocol::{PreKeyBundle, PublicKey};
 use wacore::protocol::ProtocolNode;
+use wacore::protocol::retry::{MAX_RETRY_COUNT, MIN_RETRY_FOR_BASE_KEY_CHECK};
 use wacore::types::jid::JidExt;
 use wacore_binary::JidExt as _;
 #[cfg(test)]
@@ -34,17 +36,14 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
     }
 }
 
-/// Maximum retry attempts we'll honor (matches WhatsApp Web's MAX_RETRY = 5).
-/// We refuse to resend if the requester has already retried this many times.
-const MAX_RETRY_COUNT: u8 = 5;
-
-/// Minimum retry count before we start tracking base keys.
-/// WhatsApp Web saves base key on retry 2, checks on retry > 2.
-const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
-
 /// Throttle for the "no-keys + retry≥2" forced-recreate fallback. Mirrors
 /// whatsmeow's `recreateSessionTimeout` (`retry.go:156`).
 const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+pub(crate) enum RetryReceiptSendOutcome {
+    Sent { included_keys: bool },
+    Suppressed,
+}
 
 /// Separated chat and requester JIDs for retry receipt handling.
 /// Mirrors WAWebHandleRetryRequest `getActualChatInfo` + `getTargetChat`.
@@ -1078,7 +1077,8 @@ impl Client {
         info: &crate::types::message::MessageInfo,
         retry_count: u8,
         reason: RetryReason,
-    ) -> Result<(), anyhow::Error> {
+        force_include_keys: bool,
+    ) -> Result<RetryReceiptSendOutcome, RetryRequestError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         // WA Web's sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`,
@@ -1092,7 +1092,7 @@ impl Client {
                 info.source.sender.observe(),
                 info.source.chat.observe()
             );
-            return Ok(());
+            return Ok(RetryReceiptSendOutcome::Suppressed);
         }
 
         debug!(
@@ -1124,7 +1124,18 @@ impl Client {
             .bytes(registration_id_bytes)
             .build();
 
-        let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
+        let receipt_to = if info.source.is_group {
+            &info.source.chat
+        } else {
+            &info.source.sender
+        };
+        let include_keys = wacore::protocol::retry::should_include_keys_with_policy(
+            retry_count,
+            force_include_keys,
+            receipt_to.is_hosted(),
+        );
+
+        let keys_node = if include_keys {
             // Validate the account BEFORE reserving/marking the prekey: a missing
             // account bails here, and marking after would abandon a one-time
             // prekey from the upload window without any receipt going out.
@@ -1156,12 +1167,6 @@ impl Client {
             ))
         } else {
             None
-        };
-
-        let receipt_to = if info.source.is_group {
-            &info.source.chat
-        } else {
-            &info.source.sender
         };
 
         // Build the receipt node. For group messages, include the participant attribute
@@ -1202,7 +1207,8 @@ impl Client {
             }
         }
 
-        // Build children list - keys are only included when retryCount >= 2
+        // Build the final child list after the policy has decided whether this
+        // request carries key material.
         let receipt_node = if let Some(keys) = keys_node {
             builder
                 .children([retry_node, registration_node, keys])
@@ -1211,8 +1217,11 @@ impl Client {
             builder.children([retry_node, registration_node]).build()
         };
 
+        drop(device_snapshot);
         self.send_node(receipt_node).await?;
-        Ok(())
+        Ok(RetryReceiptSendOutcome::Sent {
+            included_keys: include_keys,
+        })
     }
 
     /// Sends an `enc_rekey_retry` receipt for VoIP call encryption re-keying.
@@ -2900,205 +2909,22 @@ mod tests {
         assert!(!(dm.is_group() || dm.is_status_broadcast()));
     }
 
-    /// Test that verifies the key inclusion optimization:
-    /// - Keys should be included on retry#1 for NoSession errors (the optimization)
-    /// - Keys should NOT be included on retry#1 for other error types
-    /// - Keys should be included on retry#2+ for ALL error types
+    /// The key-bundle policy is driven only by explicit force, stateless routing,
+    /// and the retry threshold. The diagnostic reason must not change the wire
+    /// shape of a first retry.
     #[test]
-    fn keys_inclusion_optimization_for_no_session_errors() {
-        use crate::message::RetryReason;
+    fn retry_key_inclusion_matches_canonical_policy() {
+        use wacore::protocol::retry::{should_include_keys, should_include_keys_with_policy};
 
-        // Test cases: (retry_count, reason, should_include_keys)
-        let test_cases = [
-            // NoSession errors - optimization kicks in at retry#1
-            (
-                1,
-                RetryReason::NoSession,
-                true,
-                "NoSession at retry#1 should include keys (optimization)",
-            ),
-            (
-                2,
-                RetryReason::NoSession,
-                true,
-                "NoSession at retry#2 should include keys",
-            ),
-            (
-                3,
-                RetryReason::NoSession,
-                true,
-                "NoSession at retry#3 should include keys",
-            ),
-            // InvalidMessage errors - no keys at retry#1, keys at retry#2+
-            (
-                1,
-                RetryReason::InvalidMessage,
-                false,
-                "InvalidMessage at retry#1 should NOT include keys",
-            ),
-            (
-                2,
-                RetryReason::InvalidMessage,
-                true,
-                "InvalidMessage at retry#2 should include keys",
-            ),
-            (
-                3,
-                RetryReason::InvalidMessage,
-                true,
-                "InvalidMessage at retry#3 should include keys",
-            ),
-            // BadMac errors - same as InvalidMessage
-            (
-                1,
-                RetryReason::BadMac,
-                false,
-                "BadMac at retry#1 should NOT include keys",
-            ),
-            (
-                2,
-                RetryReason::BadMac,
-                true,
-                "BadMac at retry#2 should include keys",
-            ),
-            // UnknownError - no keys at retry#1
-            (
-                1,
-                RetryReason::UnknownError,
-                false,
-                "UnknownError at retry#1 should NOT include keys",
-            ),
-            (
-                2,
-                RetryReason::UnknownError,
-                true,
-                "UnknownError at retry#2 should include keys",
-            ),
-        ];
-
-        for (retry_count, reason, should_include_keys, description) in test_cases {
-            // Replicate the logic from send_retry_receipt
-            let would_include_keys =
-                wacore::protocol::retry::should_include_keys(retry_count, reason);
-
-            assert_eq!(
-                would_include_keys, should_include_keys,
-                "Failed: {description}. retry_count={retry_count}, reason={reason:?}"
-            );
-        }
-    }
-
-    /// Integration test simulating high concurrent offline message scenarios.
-    /// This tests the scenario where many skmsg-only messages arrive before SKDM,
-    /// causing NoSession errors that need retry with keys.
-    #[tokio::test]
-    async fn concurrent_offline_messages_retry_key_optimization() {
-        use crate::message::RetryReason;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Barrier;
-
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        // Simulate processing multiple concurrent skmsg failures
-        // Each represents a skmsg-only message from the same sender that failed with NoSession
-        let num_messages = 50;
-        let barrier = Arc::new(Barrier::new(num_messages));
-
-        // Track how many would include keys on retry#1
-        let keys_included_count = Arc::new(AtomicUsize::new(0));
-        let no_keys_count = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::new();
-
-        for i in 0..num_messages {
-            let barrier = barrier.clone();
-            let keys_included = keys_included_count.clone();
-            let no_keys = no_keys_count.clone();
-
-            handles.push(tokio::spawn(async move {
-                // Simulate concurrent message processing
-                barrier.wait().await;
-
-                // Each message is a skmsg-only message that fails with NoSession
-                // (simulating burst of group messages before SKDM arrives)
-                let retry_count = 1; // First retry
-                let reason = if i % 5 == 0 {
-                    // Some messages have MAC failure (pkmsg failed)
-                    RetryReason::InvalidMessage
-                } else {
-                    // Most are skmsg-only NoSession failures
-                    RetryReason::NoSession
-                };
-
-                let would_include_keys =
-                    wacore::protocol::retry::should_include_keys(retry_count, reason);
-
-                if would_include_keys {
-                    keys_included.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    no_keys.fetch_add(1, Ordering::SeqCst);
-                }
-            }));
-        }
-
-        // Wait for all tasks to complete
-        for handle in handles {
-            handle.await.expect("task should complete");
-        }
-
-        let total_keys_included = keys_included_count.load(Ordering::SeqCst);
-        let total_no_keys = no_keys_count.load(Ordering::SeqCst);
-
-        // With our optimization:
-        // - 80% (40/50) are NoSession → keys included on retry#1
-        // - 20% (10/50) are InvalidMessage → no keys on retry#1
-        assert_eq!(
-            total_keys_included, 40,
-            "Expected 40 messages to include keys (NoSession), got {total_keys_included}"
-        );
-        assert_eq!(
-            total_no_keys, 10,
-            "Expected 10 messages to NOT include keys (InvalidMessage), got {total_no_keys}"
-        );
-
-        // Verify the optimization reduces round-trips
-        // Without optimization: ALL 50 would need retry#2 for keys
-        // With optimization: Only 10 need retry#2 for keys (80% improvement for NoSession)
-        let optimization_benefit = (total_keys_included as f64 / num_messages as f64) * 100.0;
-        assert!(
-            optimization_benefit >= 80.0,
-            "Optimization should benefit at least 80% of NoSession messages, got {optimization_benefit:.1}%"
-        );
-    }
-
-    /// Test that the retry optimization correctly handles the edge case where
-    /// a sender device is removed mid-retry (cannot respond to retry receipts).
-    /// This tests our ability to handle the root cause of permanent failures.
-    #[test]
-    fn retry_optimization_with_removed_device_scenario() {
-        use crate::message::RetryReason;
-
-        // Simulate the scenario from the log:
-        // 1. skmsg arrives → NoSession error → retry#1 with keys (optimization)
-        // 2. Device is removed → no response to retry
-        // 3. Message is permanently lost (expected behavior)
-
-        let retry_count = 1;
-        let reason = RetryReason::NoSession;
-
-        // With optimization, we include keys on retry#1
-        let would_include_keys = wacore::protocol::retry::should_include_keys(retry_count, reason);
-
-        assert!(
-            would_include_keys,
-            "NoSession should include keys on retry#1 to give sender best chance to respond"
-        );
-
-        // Even if sender device is removed, we tried our best by including keys early
-        // This reduces the window for message loss from:
-        // - Before: retry#1 (no keys) → sender can't establish session → retry#2 (keys) → device removed
-        // - After: retry#1 (keys) → sender can establish session immediately → device removed before response
-        // The optimization gives the sender one fewer round-trip to respond.
+        assert!(!should_include_keys(1, RetryReason::NoSession));
+        assert!(!should_include_keys(
+            1,
+            RetryReason::UnknownCompanionNoPrekey
+        ));
+        assert!(should_include_keys_with_policy(1, true, false));
+        assert!(should_include_keys_with_policy(1, false, true));
+        assert!(should_include_keys(2, RetryReason::InvalidMessage));
+        assert!(should_include_keys(3, RetryReason::BadMac));
     }
 
     /// Helper to build a DM Receipt for testing resolve_retry_chat_info.

@@ -205,6 +205,15 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
         info!("    {name}: {fv} -> {lv}");
     }
 
+    #[cfg(feature = "dhat-heap")]
+    {
+        let heap_growth = last.heap_bytes.saturating_sub(first.heap_bytes);
+        info!(
+            "  Tracked heap: {}B -> {}B (delta: +{}B)",
+            first.heap_bytes, last.heap_bytes, heap_growth
+        );
+    }
+
     // RSS growth: warn if RSS grew more than 50 MiB (not a hard fail, just FYI)
     let rss_growth_kib = last.rss_kib.saturating_sub(first.rss_kib);
     info!(

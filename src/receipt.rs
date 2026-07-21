@@ -7,7 +7,7 @@ use std::sync::Arc;
 use wacore::protocol::nack::NackReason;
 use wacore::types::message::MessageCategory;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Jid, JidExt as _};
+use wacore_binary::{Jid, JidExt as _, NodeRef, NodeValue};
 
 use wacore_binary::OwnedNodeRef;
 
@@ -287,41 +287,109 @@ fn build_aggregate_delivery_receipt_nodes(
         .collect()
 }
 
-/// `<ack class="message" error=N>` builder, mirrors WA Web's
-/// `Handle/MsgSendAck.js::sendNack`. `failure_reason` is only emitted
-/// for `InvalidProtobuf` (as `<meta failure_reason=N>` child).
-fn build_nack_node(
-    info: &MessageInfo,
+trait NackSource {
+    fn class(&self, reason: NackReason) -> Result<&str, crate::features::StanzaResponseError>;
+    fn id(&self) -> Result<NodeValue, crate::features::StanzaResponseError>;
+    fn to(&self) -> Result<NodeValue, crate::features::StanzaResponseError>;
+    fn participant(&self) -> Option<NodeValue>;
+    fn stanza_type(&self) -> Option<NodeValue>;
+}
+
+impl NackSource for NodeRef<'_> {
+    fn class(&self, reason: NackReason) -> Result<&str, crate::features::StanzaResponseError> {
+        if reason == NackReason::UnrecognizedStanza
+            || matches!(self.tag.as_ref(), "message" | "notification" | "receipt")
+        {
+            Ok(self.tag.as_ref())
+        } else {
+            Err(crate::features::StanzaResponseError::UnsupportedStanzaClass)
+        }
+    }
+
+    fn id(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
+        self.get_attr("id")
+            .map(|value| value.to_node_value())
+            .ok_or(crate::features::StanzaResponseError::MissingAttribute("id"))
+    }
+
+    fn to(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
+        self.get_attr("from")
+            .map(|value| value.to_node_value())
+            .ok_or(crate::features::StanzaResponseError::MissingAttribute(
+                "from",
+            ))
+    }
+
+    fn participant(&self) -> Option<NodeValue> {
+        self.get_attr("participant")
+            .map(|value| value.to_node_value())
+    }
+
+    fn stanza_type(&self) -> Option<NodeValue> {
+        self.get_attr("type").map(|value| value.to_node_value())
+    }
+}
+
+impl NackSource for MessageInfo {
+    fn class(&self, _reason: NackReason) -> Result<&str, crate::features::StanzaResponseError> {
+        Ok("message")
+    }
+
+    fn id(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
+        if self.id.is_empty() {
+            Err(crate::features::StanzaResponseError::MissingAttribute("id"))
+        } else {
+            Ok(NodeValue::from(&self.id))
+        }
+    }
+
+    fn to(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
+        Ok(NodeValue::from(&self.source.chat))
+    }
+
+    fn participant(&self) -> Option<NodeValue> {
+        (self.source.is_group || self.source.chat.is_status_broadcast())
+            .then(|| NodeValue::from(&self.source.sender))
+    }
+
+    fn stanza_type(&self) -> Option<NodeValue> {
+        (!self.r#type.is_empty()).then(|| NodeValue::from(&self.r#type))
+    }
+}
+
+/// Build the canonical rejection for either an original stanza or parsed
+/// message metadata. `failure_reason` is valid only for `InvalidProtobuf`.
+fn build_nack_node<S: NackSource + ?Sized>(
+    source: &S,
     own_pn: &Jid,
     reason: NackReason,
     failure_reason: Option<i32>,
-) -> wacore_binary::Node {
+) -> Result<wacore_binary::Node, crate::features::StanzaResponseError> {
     let mut builder = NodeBuilder::new("ack")
-        .attr("class", "message")
-        .attr("id", &info.id)
+        .attr("class", source.class(reason)?)
+        .attr("id", source.id()?)
         .attr("from", own_pn)
-        .attr("to", &info.source.chat)
-        .attr("error", reason.code().to_string());
+        .attr("to", source.to()?)
+        .attr("error", reason.code());
 
-    let is_status = info.source.chat.is_status_broadcast();
-    if info.source.is_group || is_status {
-        builder = builder.attr("participant", &info.source.sender);
+    if let Some(participant) = source.participant() {
+        builder = builder.attr("participant", participant);
     }
 
-    if !info.r#type.is_empty() {
-        builder = builder.attr("type", &info.r#type);
+    if let Some(stanza_type) = source.stanza_type() {
+        builder = builder.attr("type", stanza_type);
     }
 
     if reason == NackReason::InvalidProtobuf
         && let Some(code) = failure_reason
     {
         let meta = NodeBuilder::new("meta")
-            .attr("failure_reason", code.to_string())
+            .attr("failure_reason", code)
             .build();
         builder = builder.children(vec![meta]);
     }
 
-    builder.build()
+    Ok(builder.build())
 }
 
 impl Client {
@@ -688,7 +756,8 @@ impl Client {
         if info.id.is_empty() {
             return;
         }
-        let Some(own_pn) = self.get_pn() else {
+        let device = self.persistence_manager.get_device_snapshot();
+        let Some(own_pn) = device.pn.as_ref() else {
             log::debug!(
                 "[msg:{}] Skipping nack ({:?}): own PN not yet set",
                 info.id,
@@ -697,7 +766,15 @@ impl Client {
             return;
         };
 
-        let nack = build_nack_node(info, &own_pn, reason, failure_reason);
+        let nack = match build_nack_node(info, own_pn, reason, failure_reason) {
+            Ok(nack) => nack,
+            Err(error) => {
+                log::warn!(target: "Client/Receipt",
+                    "Failed to build nack for message {}: {error}", info.id);
+                return;
+            }
+        };
+        drop(device);
         debug!(target: "Client/Receipt",
             "Sending nack (reason={:?}, code={}) for message {} from {}",
             reason, reason.code(), info.id, info.source.sender.observe());
@@ -708,6 +785,37 @@ impl Client {
             log::warn!(target: "Client/Receipt",
                 "Failed to send nack for message {}: {:?}", info.id, e);
         }
+    }
+
+    /// Reject a received stanza using its original borrowed representation.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.receipt.reject_stanza",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
+    pub async fn reject_stanza(
+        &self,
+        stanza: &NodeRef<'_>,
+        rejection: crate::features::StanzaRejection,
+    ) -> Result<(), crate::features::StanzaResponseError> {
+        let device = self.persistence_manager.get_device_snapshot();
+        let own_pn = device
+            .pn
+            .as_ref()
+            .ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?;
+        let nack = build_nack_node(
+            stanza,
+            own_pn,
+            rejection.reason(),
+            rejection.failure_reason(),
+        )?;
+        drop(device);
+        self.send_node(nack).await?;
+        Ok(())
     }
 
     /// Sends read receipts for one or more messages.
@@ -1264,9 +1372,175 @@ mod tests {
     }
 
     #[test]
+    fn nack_from_original_stanza_preserves_each_supported_class() {
+        for tag in ["message", "receipt", "notification"] {
+            let stanza = NodeBuilder::new(tag)
+                .attr("id", "STANZA-ID")
+                .attr("from", "120363021033254949@g.us")
+                .attr("participant", "15551234567:4@s.whatsapp.net")
+                .attr("type", "test-type")
+                .build();
+            let nack = build_nack_node(
+                &stanza.as_node_ref(),
+                &own_pn(),
+                NackReason::ParsingError,
+                None,
+            )
+            .expect("supported stanza should produce a nack");
+
+            assert_eq!(
+                nack.attrs
+                    .get("class")
+                    .map(|value| value.as_str())
+                    .as_deref(),
+                Some(tag)
+            );
+            assert_eq!(
+                nack.attrs.get("id").map(|value| value.as_str()).as_deref(),
+                Some("STANZA-ID")
+            );
+            assert_eq!(
+                nack.attrs.get("to").map(|value| value.as_str()).as_deref(),
+                Some("120363021033254949@g.us")
+            );
+            assert_eq!(
+                nack.attrs
+                    .get("participant")
+                    .map(|value| value.as_str())
+                    .as_deref(),
+                Some("15551234567:4@s.whatsapp.net")
+            );
+            assert_eq!(
+                nack.attrs
+                    .get("type")
+                    .map(|value| value.as_str())
+                    .as_deref(),
+                Some("test-type")
+            );
+            assert_eq!(
+                nack.attrs
+                    .get("from")
+                    .map(|value| value.as_str())
+                    .as_deref(),
+                Some("5511000000001@s.whatsapp.net")
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_stanza_rejection_preserves_custom_class() {
+        let stanza = NodeBuilder::new("future-stanza")
+            .attr("id", "FUTURE-ID")
+            .attr("from", "15551234567@s.whatsapp.net")
+            .build();
+        let nack = build_nack_node(
+            &stanza.as_node_ref(),
+            &own_pn(),
+            NackReason::UnrecognizedStanza,
+            None,
+        )
+        .expect("unrecognized stanza reason supports arbitrary classes");
+
+        assert_eq!(
+            nack.attrs
+                .get("class")
+                .map(|value| value.as_str())
+                .as_deref(),
+            Some("future-stanza")
+        );
+        assert!(matches!(
+            build_nack_node(
+                &stanza.as_node_ref(),
+                &own_pn(),
+                NackReason::ParsingError,
+                None
+            ),
+            Err(crate::features::StanzaResponseError::UnsupportedStanzaClass)
+        ));
+    }
+
+    #[test]
+    fn nack_does_not_apply_the_receipt_ack_participant_rule() {
+        let stanza = NodeBuilder::new("receipt")
+            .attr("id", "NACK-DUPLICATE-PARTICIPANT")
+            .attr("from", "15551234567@s.whatsapp.net")
+            .attr("participant", "15551234567@s.whatsapp.net")
+            .build();
+        let nack = build_nack_node(
+            &stanza.as_node_ref(),
+            &own_pn(),
+            NackReason::ParsingError,
+            None,
+        )
+        .expect("supported stanza should produce a nack");
+
+        assert!(
+            nack.attrs
+                .get("participant")
+                .is_some_and(|value| value == "15551234567@s.whatsapp.net"),
+            "nack must preserve participant even when a receipt ack would omit it"
+        );
+    }
+
+    #[test]
+    fn nack_from_original_stanza_requires_id_and_from() {
+        let without_id = NodeBuilder::new("message")
+            .attr("from", "15551234567@s.whatsapp.net")
+            .build();
+        assert!(matches!(
+            build_nack_node(
+                &without_id.as_node_ref(),
+                &own_pn(),
+                NackReason::ParsingError,
+                None
+            ),
+            Err(crate::features::StanzaResponseError::MissingAttribute("id"))
+        ));
+
+        let without_from = NodeBuilder::new("message")
+            .attr("id", "MISSING-FROM")
+            .build();
+        assert!(matches!(
+            build_nack_node(
+                &without_from.as_node_ref(),
+                &own_pn(),
+                NackReason::ParsingError,
+                None
+            ),
+            Err(crate::features::StanzaResponseError::MissingAttribute(
+                "from"
+            ))
+        ));
+    }
+
+    #[test]
+    fn nack_preserves_unknown_numeric_reason() {
+        let stanza = NodeBuilder::new("message")
+            .attr("id", "UNKNOWN-REASON")
+            .attr("from", "15551234567@s.whatsapp.net")
+            .build();
+        let nack = build_nack_node(
+            &stanza.as_node_ref(),
+            &own_pn(),
+            NackReason::Unknown(599),
+            None,
+        )
+        .expect("known stanza supports unknown future error codes");
+
+        assert_eq!(
+            nack.attrs
+                .get("error")
+                .map(|value| value.as_str())
+                .as_deref(),
+            Some("599")
+        );
+    }
+
+    #[test]
     fn nack_for_dm_carries_class_message_and_error_code() {
         let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None)
+            .expect("valid DM should produce a nack");
 
         assert_eq!(node.tag, "ack");
         assert_eq!(
@@ -1293,7 +1567,8 @@ mod tests {
             "15551234567@s.whatsapp.net",
             true,
         );
-        let node = build_nack_node(&info, &own_pn(), NackReason::UnhandledError, None);
+        let node = build_nack_node(&info, &own_pn(), NackReason::UnhandledError, None)
+            .expect("valid group message should produce a nack");
 
         assert_eq!(
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
@@ -1308,7 +1583,8 @@ mod tests {
     #[test]
     fn nack_for_status_broadcast_carries_participant() {
         let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
-        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None)
+            .expect("valid status message should produce a nack");
 
         assert_eq!(
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
@@ -1319,7 +1595,8 @@ mod tests {
     #[test]
     fn nack_invalid_protobuf_includes_meta_failure_reason() {
         let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        let node = build_nack_node(&info, &own_pn(), NackReason::InvalidProtobuf, Some(42));
+        let node = build_nack_node(&info, &own_pn(), NackReason::InvalidProtobuf, Some(42))
+            .expect("valid message should produce a nack");
 
         assert_eq!(
             node.attrs.get("error").map(|v| v.as_str()).as_deref(),
@@ -1340,7 +1617,8 @@ mod tests {
     #[test]
     fn nack_invalid_protobuf_without_failure_reason_omits_meta() {
         let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        let node = build_nack_node(&info, &own_pn(), NackReason::InvalidProtobuf, None);
+        let node = build_nack_node(&info, &own_pn(), NackReason::InvalidProtobuf, None)
+            .expect("valid message should produce a nack");
         assert!(node.get_optional_child("meta").is_none());
     }
 
@@ -1348,7 +1626,8 @@ mod tests {
     #[test]
     fn nack_omits_meta_for_non_invalid_protobuf_even_with_failure_reason() {
         let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, Some(99));
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, Some(99))
+            .expect("valid message should produce a nack");
         assert!(node.get_optional_child("meta").is_none());
     }
 
@@ -1356,7 +1635,8 @@ mod tests {
     fn nack_includes_type_when_present() {
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
         info.r#type = "text".to_string();
-        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None)
+            .expect("valid message should produce a nack");
         assert_eq!(
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("text")
@@ -1367,7 +1647,8 @@ mod tests {
     fn nack_omits_type_when_empty() {
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
         info.r#type = String::new();
-        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None)
+            .expect("valid message should produce a nack");
         assert!(node.attrs.get("type").is_none());
     }
 

@@ -184,37 +184,7 @@ impl PartialEq<str> for NodeValue {
     fn eq(&self, other: &str) -> bool {
         match self {
             NodeValue::String(s) => s == other,
-            // Compare JID to string without heap allocation by streaming the
-            // Display output through a writer that checks byte-by-byte.
-            NodeValue::Jid(j) => {
-                use std::fmt::Write;
-                struct EqCheck<'a> {
-                    target: &'a [u8],
-                    pos: usize,
-                    matches: bool,
-                }
-                impl fmt::Write for EqCheck<'_> {
-                    fn write_str(&mut self, s: &str) -> fmt::Result {
-                        if !self.matches {
-                            return Ok(());
-                        }
-                        let bytes = s.as_bytes();
-                        let end = self.pos + bytes.len();
-                        if end > self.target.len() || self.target[self.pos..end] != *bytes {
-                            self.matches = false;
-                        }
-                        self.pos = end;
-                        Ok(())
-                    }
-                }
-                let mut check = EqCheck {
-                    target: other.as_bytes(),
-                    pos: 0,
-                    matches: true,
-                };
-                let _ = write!(check, "{}", j);
-                check.matches && check.pos == other.len()
-            }
+            NodeValue::Jid(j) => j.display_eq(other),
         }
     }
 }
@@ -579,6 +549,30 @@ impl<'a> ValueRef<'a> {
             ValueRef::String(s) => NodeValue::String(s.to_compact_string()),
             ValueRef::Jid(j) => NodeValue::Jid(j.to_owned()),
         }
+    }
+}
+
+impl PartialEq<str> for ValueRef<'_> {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            ValueRef::String(value) => value == other,
+            ValueRef::Jid(value) => value.display_eq(other),
+        }
+    }
+}
+
+impl PartialEq<&str> for ValueRef<'_> {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<String> for ValueRef<'_> {
+    #[inline]
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
     }
 }
 
@@ -1024,6 +1018,29 @@ impl serde::Serialize for OwnedNodeRef {
 impl std::fmt::Debug for OwnedNodeRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.get().fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod value_ref_tests {
+    use super::*;
+    use crate::jid::Server;
+
+    #[test]
+    fn value_ref_compares_string_and_jid_display_without_conversion() {
+        let string = ValueRef::String(NodeStr::Borrowed("encrypt"));
+        assert!(string == "encrypt");
+        assert!(string != "other");
+
+        let jid = ValueRef::Jid(JidRef {
+            user: NodeStr::Borrowed("15551234567"),
+            server: Server::Pn,
+            agent: 0,
+            device: 7,
+            integrator: 0,
+        });
+        assert!(jid == "15551234567:7@s.whatsapp.net");
+        assert!(jid != "15551234567@s.whatsapp.net");
     }
 }
 

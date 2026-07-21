@@ -1044,6 +1044,22 @@ fn build_pong(to: String, id: Option<&str>) -> wacore_binary::Node {
     builder.build()
 }
 
+/// Compare decoded attribute values by their wire display without allocating.
+#[inline]
+fn value_refs_display_equal(
+    left: &wacore_binary::node::ValueRef<'_>,
+    right: &wacore_binary::node::ValueRef<'_>,
+) -> bool {
+    use wacore_binary::node::ValueRef;
+
+    match (left, right) {
+        (ValueRef::String(left), ValueRef::String(right)) => left == right,
+        (ValueRef::Jid(left), ValueRef::Jid(right)) => left == right,
+        (ValueRef::String(left), ValueRef::Jid(right)) => right.display_eq(left),
+        (ValueRef::Jid(left), ValueRef::String(right)) => left.display_eq(right),
+    }
+}
+
 /// Build an `<ack/>` for the given stanza, matching WA Web / whatsmeow behavior:
 ///
 /// - `class` = original stanza tag
@@ -1056,32 +1072,37 @@ fn build_pong(to: String, id: Option<&str>) -> wacore_binary::Node {
 /// `ackString = maybeAttrString("type")` — so `type` is only included when
 /// explicitly present on the incoming receipt (delivery receipts normally
 /// have no type attribute, meaning the ack also has no type).
+///
 /// Encode an ack stanza directly to bytes, bypassing Node + marshal_auto.
 /// Acks are the most frequent outbound stanza (~1 per inbound message).
 fn encode_ack_bytes(
     node: &wacore_binary::NodeRef<'_>,
     own_device_pn: Option<&Jid>,
-) -> Result<Option<Vec<u8>>, wacore_binary::error::BinaryError> {
+) -> Result<Vec<u8>, crate::features::StanzaResponseError> {
     use wacore_binary::encoder::{ByteWriter, EncodeNode, Encoder};
 
-    let Some(id_val) = node.get_attr("id") else {
-        return Ok(None);
-    };
-    let Some(from_val) = node.get_attr("from") else {
-        return Ok(None);
-    };
+    let id_val = node
+        .get_attr("id")
+        .ok_or(crate::features::StanzaResponseError::MissingAttribute("id"))?;
+    let from_val =
+        node.get_attr("from")
+            .ok_or(crate::features::StanzaResponseError::MissingAttribute(
+                "from",
+            ))?;
+    let tag = node.tag.as_ref();
     // WAWebReceiptAck: `participant: r && r !== e ? DEVICE_JID(r) : DROP_ATTR`.
-    // Drop the attribute when it would duplicate `to` (which is the flipped `from`).
-    let participant_val = node.get_attr("participant").filter(|p| {
-        let p_str = p.as_str();
-        let from_str = from_val.as_str();
-        p_str.as_ref() != from_str.as_ref()
+    // This is specific to the specialized receipt ACK. Generic ACKs and NACKs
+    // preserve participant even when it duplicates the destination.
+    let participant_val = node.get_attr("participant").filter(|participant| {
+        if tag != "receipt" {
+            return true;
+        }
+        !value_refs_display_equal(participant, from_val)
     });
     // Server expects `recipient` echoed back so it can route the ack to the
     // origin companion/device (hosted-companion, peer, LID-routed stanzas).
     // Dropping it makes the server close the stream with `<stream:error><ack/>`.
     let recipient_val = node.get_attr("recipient");
-    let tag = node.tag.as_ref();
 
     let typ_val = if tag != "message" && !is_encrypt_identity_notification(node) {
         node.get_attr("type")
@@ -1089,11 +1110,15 @@ fn encode_ack_bytes(
         None
     };
 
-    let include_from = tag == "message" && own_device_pn.is_some();
+    let own_device_pn = if tag == "message" {
+        Some(own_device_pn.ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?)
+    } else {
+        None
+    };
 
     // Count attrs: class + id + to + optional(from, participant, recipient, type)
     let attr_count = 3
-        + usize::from(include_from)
+        + usize::from(own_device_pn.is_some())
         + usize::from(participant_val.is_some())
         + usize::from(recipient_val.is_some())
         + usize::from(typ_val.is_some());
@@ -1161,7 +1186,7 @@ fn encode_ack_bytes(
         participant: participant_val,
         recipient: recipient_val,
         typ: typ_val,
-        own_pn: if include_from { own_device_pn } else { None },
+        own_pn: own_device_pn,
         tag_str: tag,
         attr_count,
     };
@@ -1169,7 +1194,7 @@ fn encode_ack_bytes(
     let mut buf = Vec::with_capacity(64);
     let mut encoder = Encoder::new_vec(&mut buf)?;
     encoder.write_node(&ack)?;
-    Ok(Some(buf))
+    Ok(buf)
 }
 
 /// Minimal `<message>` stanza carrying the attrs `encode_ack_bytes` needs,
@@ -1201,13 +1226,14 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
     let id = node.get_attr("id")?.to_node_value();
     let from_ref = node.get_attr("from")?;
     let from = from_ref.to_node_value();
-    // Drop participant when it duplicates `to` (the flipped `from`).
+    let tag = node.tag.as_ref();
+    // Only the specialized receipt ACK drops a participant that duplicates
+    // `to` (the flipped `from`).
     let participant = node
         .get_attr("participant")
-        .filter(|p| p.as_str().as_ref() != from_ref.as_str().as_ref())
+        .filter(|participant| tag != "receipt" || !value_refs_display_equal(participant, from_ref))
         .map(|v| v.to_node_value());
     let recipient = node.get_attr("recipient").map(|v| v.to_node_value());
-    let tag = node.tag.as_ref();
     let typ = if tag != "message" && !is_encrypt_identity_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())
     } else {
@@ -1243,7 +1269,7 @@ fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
     node.tag == "notification"
         && node
             .get_attr("type")
-            .is_some_and(|v| v.as_str() == "encrypt")
+            .is_some_and(|value| value == "encrypt")
         && node.get_optional_child("identity").is_some()
 }
 
