@@ -17,7 +17,7 @@ const CONSTRUCTION_INSTALLING: u8 = 0;
 const CONSTRUCTION_ACTIVE: u8 = 1;
 const CONSTRUCTION_REJECTED: u8 = 2;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
-const CALLBACK_QUEUE_CAPACITY: usize = 64;
+const CALLBACK_QUEUE_TARGET_CAPACITY: usize = 64;
 
 std::thread_local! {
     static ACTIVE_CALLBACK: Cell<*const LifecycleRegistration> = const { Cell::new(std::ptr::null()) };
@@ -130,10 +130,11 @@ impl fmt::Debug for ConnectionScope {
 /// Aggregate lifecycle seam installed during [`Client`](super::Client) construction.
 ///
 /// Implementations must make `install` transactional. Connection callbacks are
-/// serialized and bounded; connection cleanup only schedules `on_closed` so a
-/// stalled extension cannot block reconnect. A future plugin host owns
-/// per-plugin ordering and isolation behind this client-level seam. `install`
-/// receives a weak client reference so retaining it cannot create a cycle.
+/// serialized, with bounded ready work; connection cleanup only schedules
+/// `on_closed` so a stalled extension cannot block reconnect. Closure callbacks
+/// are lossless and may temporarily exceed the target capacity. A future plugin
+/// host owns per-plugin ordering and isolation behind this client-level seam.
+/// `install` receives a weak client reference so retaining it cannot create a cycle.
 /// `signal_shutdown` is the non-blocking boundary for resources that must stop
 /// even when an FFI host cannot await `shutdown`.
 pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
@@ -197,31 +198,49 @@ struct CallbackQueue {
 }
 
 impl CallbackQueue {
-    fn push_bounded(&mut self, callback: LifecycleCallback) -> Option<LifecycleCallback> {
-        let dropped = (self.pending.len() >= CALLBACK_QUEUE_CAPACITY)
-            .then(|| self.pending.pop_front())
-            .flatten();
-        self.overflowed |= dropped.is_some();
-        self.pending.push_back(callback);
-        dropped
+    fn push_with_pressure_policy(
+        &mut self,
+        callback: LifecycleCallback,
+    ) -> Option<LifecycleCallback> {
+        if self.pending.len() < CALLBACK_QUEUE_TARGET_CAPACITY {
+            self.pending.push_back(callback);
+            return None;
+        }
+
+        self.overflowed = true;
+        let ready_position = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, LifecycleCallback::Ready { .. }));
+        match (callback, ready_position) {
+            (callback @ LifecycleCallback::Ready { .. }, None) => Some(callback),
+            (callback, Some(position)) => {
+                let dropped = self.pending.remove(position);
+                self.pending.push_back(callback);
+                dropped
+            }
+            (callback, None) => {
+                // Every closed scope must reach the extension even when a callback stalls.
+                self.pending.push_back(callback);
+                None
+            }
+        }
     }
 
-    fn compact_for_shutdown(&mut self, keep_last_closed: bool) -> Vec<LifecycleCallback> {
+    fn compact_for_shutdown(&mut self) -> Vec<LifecycleCallback> {
         if !self.overflowed {
             return Vec::new();
         }
-        let last_closed = keep_last_closed
-            .then(|| {
-                self.pending
-                    .iter()
-                    .rposition(|callback| matches!(callback, LifecycleCallback::Closed(_)))
-            })
-            .flatten()
-            .and_then(|position| self.pending.remove(position));
-        let dropped = self.pending.drain(..).collect::<Vec<_>>();
-        if let Some(last_closed) = last_closed {
-            self.pending.push_back(last_closed);
+
+        let mut retained = VecDeque::with_capacity(self.pending.len());
+        let mut dropped = Vec::new();
+        for callback in self.pending.drain(..) {
+            match callback {
+                callback @ LifecycleCallback::Closed(_) => retained.push_back(callback),
+                callback => dropped.push(callback),
+            }
         }
+        self.pending = retained;
         dropped
     }
 }
@@ -495,14 +514,14 @@ impl LifecycleRegistration {
             let mut queue = self.callback_queue();
             let mut dropped = Vec::new();
             if queue.shutdown_requested {
-                dropped.extend(queue.push_bounded(LifecycleCallback::Closed(scope)));
-                dropped.extend(queue.compact_for_shutdown(no_open_scopes));
+                dropped.extend(queue.push_with_pressure_policy(LifecycleCallback::Closed(scope)));
+                dropped.extend(queue.compact_for_shutdown());
                 if no_open_scopes && !queue.shutdown_enqueued {
                     queue.shutdown_enqueued = true;
                     queue.pending.push_back(LifecycleCallback::Shutdown);
                 }
             } else {
-                dropped.extend(queue.push_bounded(LifecycleCallback::Closed(scope)));
+                dropped.extend(queue.push_with_pressure_policy(LifecycleCallback::Closed(scope)));
             }
             let should_spawn = !queue.pending.is_empty() && !queue.drain_scheduled;
             queue.drain_scheduled |= should_spawn;
@@ -560,7 +579,7 @@ impl LifecycleRegistration {
             if queue.shutdown_requested || self.terminal.load(Ordering::Acquire) {
                 (false, Some(callback))
             } else {
-                let dropped = queue.push_bounded(callback);
+                let dropped = queue.push_with_pressure_policy(callback);
                 let should_spawn = !queue.drain_scheduled;
                 queue.drain_scheduled = true;
                 (should_spawn, dropped)
@@ -580,7 +599,7 @@ impl LifecycleRegistration {
             if !queue.shutdown_requested || queue.shutdown_enqueued {
                 return;
             }
-            let dropped = queue.compact_for_shutdown(no_open_scopes);
+            let dropped = queue.compact_for_shutdown();
             if no_open_scopes {
                 queue.shutdown_enqueued = true;
                 queue.pending.push_back(LifecycleCallback::Shutdown);
@@ -1708,7 +1727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_queue_is_bounded_and_terminal_shutdown_compacts_backlog() {
+    async fn callback_queue_preserves_every_scope_closure_before_shutdown() {
         let (ready_started_tx, ready_started_rx) = async_channel::bounded(1);
         let (release_ready_tx, release_ready_rx) = async_channel::bounded(1);
         let lifecycle = Arc::new(QueuePressureLifecycle {
@@ -1735,14 +1754,21 @@ mod tests {
             .await
             .expect("ready callback started");
 
-        for generation in 2..(CALLBACK_QUEUE_CAPACITY as u64 * 4) {
+        let closed_callbacks = CALLBACK_QUEUE_TARGET_CAPACITY as u64 * 4 - 2;
+        for generation in 2..(CALLBACK_QUEUE_TARGET_CAPACITY as u64 * 4) {
             let scope = ConnectionScope::new(generation);
             scope.close();
             registration.enqueue_callback(LifecycleCallback::Closed(scope));
+
+            let (done, _done_rx) = async_channel::bounded(1);
+            registration.enqueue_callback(LifecycleCallback::Ready {
+                scope: ConnectionScope::new(generation + closed_callbacks),
+                done,
+            });
         }
         assert_eq!(
             registration.callback_queue().pending.len(),
-            CALLBACK_QUEUE_CAPACITY
+            usize::try_from(closed_callbacks).expect("closure count fits usize")
         );
 
         let shutdown_registration = registration.clone();
@@ -1752,7 +1778,11 @@ mod tests {
                 let compacted = {
                     let queue = registration.callback_queue();
                     if queue.shutdown_enqueued {
-                        assert_eq!(queue.pending.len(), 2);
+                        assert_eq!(
+                            queue.pending.len(),
+                            usize::try_from(closed_callbacks + 1)
+                                .expect("terminal callback count fits usize")
+                        );
                         true
                     } else {
                         false
@@ -1772,7 +1802,10 @@ mod tests {
             .await
             .expect("release ready callback");
         shutdown.await.expect("bounded terminal shutdown");
-        assert_eq!(lifecycle.closed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lifecycle.closed_calls.load(Ordering::SeqCst),
+            usize::try_from(closed_callbacks).expect("closure count fits usize")
+        );
         assert_eq!(lifecycle.shutdown_calls.load(Ordering::SeqCst), 1);
     }
 
