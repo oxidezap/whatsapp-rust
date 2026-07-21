@@ -26,6 +26,7 @@ mod local_field;
 #[allow(clippy::module_inception)]
 mod protocol;
 mod ratchet;
+mod record_components;
 mod sender_keys;
 pub mod session;
 mod session_cipher;
@@ -55,6 +56,13 @@ pub use ratchet::{
     AliceSignalProtocolParameters, BobSignalProtocolParameters, ChainKey, MessageKeyGenerator,
     RootKey, UsePQRatchet, derive_keys, initialize_alice_session_record, initialize_bob_session,
     initialize_bob_session_record,
+};
+pub use record_components::{
+    PendingKeyExchangeComponents, PendingPreKeyComponents, SenderChainKeyComponents,
+    SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
+    SenderSigningKeyComponents, SessionChainComponents, SessionChainKeyComponents,
+    SessionComponents, SessionMessageKeyComponents, SessionMessageKeyMaterial,
+    SessionRecordComponents,
 };
 pub use sender_keys::{SenderKeyRecord, SenderKeyState};
 pub use session::{process_prekey, process_prekey_bundle};
