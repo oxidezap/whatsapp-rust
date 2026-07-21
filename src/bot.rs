@@ -590,14 +590,15 @@ impl Bot {
             client
                 .core
                 .event_bus
-                .add_handler(Arc::new(CallbackBusAdapter::new(
+                .subscribe_handler(Arc::new(CallbackBusAdapter::new(
                     client.clone(),
                     event_handlers,
                     event_delivery,
-                )));
+                )))
+                .detach();
         }
         for handler in raw_handlers {
-            client.core.event_bus.add_handler(handler);
+            client.core.event_bus.subscribe_handler(handler).detach();
         }
 
         // If pair code options are set, spawn a task to request pair code after socket is ready

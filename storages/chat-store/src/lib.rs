@@ -21,7 +21,7 @@
 //!
 //! ```ignore
 //! let chat_store = ChatStore::new(&sqlite_store).await?;
-//! client.register_handler(chat_store.handler());
+//! let _chat_subscription = client.subscribe_handler(chat_store.handler());
 //!
 //! let chats = chat_store.chats(false, 50).await?;
 //! let page = chat_store.messages(&chats[0].jid, None, 40).await?;

@@ -842,7 +842,7 @@ mod tests {
     async fn refresh_code_matching_ref_dispatches_event() {
         let client = create_test_client().await;
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let pairing_ref = vec![5, 6, 7, 8];
         set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
@@ -867,7 +867,7 @@ mod tests {
     async fn refresh_code_without_force_manual_defaults_false() {
         let client = create_test_client().await;
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let pairing_ref = vec![5, 6, 7, 8];
         set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
@@ -891,7 +891,7 @@ mod tests {
     async fn refresh_code_mismatched_ref_is_ignored() {
         let client = create_test_client().await;
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         set_waiting(&client, vec![5, 6, 7, 8], wacore::time::now_secs(), 0).await;
 

@@ -1708,7 +1708,7 @@ mod tests {
         .await;
 
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
         (client, collector)
     }
 

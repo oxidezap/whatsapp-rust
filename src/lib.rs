@@ -191,7 +191,10 @@ pub mod prelude {
     pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
     pub use crate::store::SqliteStore;
-    pub use crate::types::events::{BatchOrigin, Event, EventKind, InboundMessage, MessageBatch};
+    pub use crate::types::events::{
+        BatchOrigin, ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
+        InboundMessage, MessageBatch, Subscription,
+    };
     pub use crate::types::message::MessageInfo;
     pub use crate::{Jid, Server};
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};

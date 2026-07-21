@@ -27,9 +27,21 @@ impl Client {
         cache
     }
 
-    /// Registers an external event handler to the core event bus.
-    pub fn register_handler(&self, handler: Arc<dyn wacore::types::events::EventHandler>) {
-        self.core.event_bus.add_handler(handler);
+    /// Subscribe an external event handler with an explicit event filter.
+    pub fn subscribe(
+        &self,
+        interest: wacore::types::events::EventInterest,
+        handler: Arc<dyn wacore::types::events::EventHandler>,
+    ) -> wacore::types::events::Subscription {
+        self.core.event_bus.subscribe(interest, handler)
+    }
+
+    /// Subscribe using the handler's current registration-time interest hint.
+    pub fn subscribe_handler(
+        &self,
+        handler: Arc<dyn wacore::types::events::EventHandler>,
+    ) -> wacore::types::events::Subscription {
+        self.core.event_bus.subscribe_handler(handler)
     }
 
     /// Enable or disable raw node forwarding.

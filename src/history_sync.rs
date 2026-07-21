@@ -883,7 +883,7 @@ mod tests {
 
         // Register a handler BEFORE the task so retain_blob is true.
         let (handler, event_rx) = wacore::types::events::ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
 
         client
             .process_history_sync_task("HIST_LAZY_EVENT".to_string(), notification.into())

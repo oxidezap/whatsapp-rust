@@ -1127,9 +1127,11 @@ mod tests {
             .await
             .expect("client build")
             .client();
-        client.register_handler(Arc::new(LogoutOrderHandler {
-            lifecycle: lifecycle.clone(),
-        }));
+        client
+            .subscribe_handler(Arc::new(LogoutOrderHandler {
+                lifecycle: lifecycle.clone(),
+            }))
+            .detach();
 
         client.logout().await.expect("client logout");
 

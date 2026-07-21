@@ -469,7 +469,7 @@ mod tests {
     async fn test_contacts_update_dispatches_contact_updated_event() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -500,7 +500,7 @@ mod tests {
         // Creates two mappings: old_lid→old_pn AND new_lid→new_pn.
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -554,7 +554,7 @@ mod tests {
     async fn test_contacts_modify_without_lid_skips_mapping() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -576,7 +576,7 @@ mod tests {
     async fn test_contacts_sync_dispatches_contact_sync_requested_event() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -602,7 +602,7 @@ mod tests {
     async fn test_contacts_add_remove_do_not_dispatch_events() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         for tag in ["add", "remove"] {
             let node = NodeBuilder::new("notification")
@@ -624,7 +624,7 @@ mod tests {
     async fn test_contacts_empty_notification_ignored() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         // No child element
         let node = NodeBuilder::new("notification")
@@ -648,7 +648,7 @@ mod tests {
     async fn test_contacts_modify_same_jid_still_dispatches() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -704,7 +704,7 @@ mod tests {
     async fn test_contacts_modify_missing_new_attr_drops_event() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -728,7 +728,7 @@ mod tests {
     async fn test_group_change_number_dispatches_with_new_owner_and_suggestions() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "w:gp2")
@@ -858,7 +858,7 @@ mod tests {
         // We don't maintain a userhash index, so this should be a no-op.
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "contacts")
@@ -879,7 +879,7 @@ mod tests {
     async fn test_identity_change_dispatches_event_and_invalidates_cache() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         // Pre-populate device registry so clear_device_record has something to clear
         let record = wacore::store::traits::DeviceListRecord {
@@ -942,7 +942,7 @@ mod tests {
     async fn test_identity_change_ignores_self_primary() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         // Set our own JID so the self-check works
         client
@@ -971,7 +971,7 @@ mod tests {
     async fn test_identity_change_ignores_companion_device() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let node = NodeBuilder::new("notification")
             .attr("type", "encrypt")
@@ -991,7 +991,7 @@ mod tests {
     async fn test_local_identity_change_dispatches_implicit_event() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let sender: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
         handle_local_identity_change(&client, sender).await;
@@ -1018,7 +1018,7 @@ mod tests {
     async fn test_local_identity_change_skips_self() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         client
             .persistence_manager
@@ -1040,7 +1040,7 @@ mod tests {
     async fn test_local_identity_change_skips_companion_device() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let sender: Jid = "5511777777777:5@s.whatsapp.net".parse().unwrap();
         handle_local_identity_change(&client, sender).await;
@@ -1151,7 +1151,7 @@ mod tests {
         use wacore::types::jid::JidExt;
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         // Prior identity present so the gate runs (the offline attr only defers the
         // eager session re-establishment, not the change notification).
@@ -1189,7 +1189,7 @@ mod tests {
         use wacore::types::jid::JidExt;
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let target: Jid = "5511666666666@s.whatsapp.net".parse().unwrap();
         let addr = target.to_protocol_address();
@@ -1280,7 +1280,7 @@ mod tests {
         use wacore::types::jid::JidExt;
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         let pn = "5511555555555";
         let lid = "100000000000055";
@@ -1338,7 +1338,7 @@ mod tests {
         use wacore::types::jid::JidExt;
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        client.subscribe_handler(collector.clone()).detach();
 
         // Cold cache: no PN->LID mapping, so resolve_encryption_jid(PN) returns PN.
         let pn_jid: Jid = "5511444444444@s.whatsapp.net".parse().unwrap();

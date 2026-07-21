@@ -653,7 +653,7 @@ mod tests {
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let event_rx = register_native_opus_call(&client, Vec::new());
         let (handler, global_rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let mut cancelled = false;
         assert!(
@@ -829,7 +829,7 @@ mod tests {
 
         let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
-        client.register_handler(global_handler);
+        client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
         let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
             "CALL-ID-0001",
@@ -875,7 +875,7 @@ mod tests {
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
-        client.register_handler(global_handler);
+        client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
         let stale_generation = registry.insert(wacore::voip::CallSession::new_incoming(
             "CALL-ID-0001",
@@ -966,7 +966,7 @@ mod tests {
 
         let client = make_sending_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
-        client.register_handler(global_handler);
+        client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
         let session = wacore::voip::CallSession::new_incoming(
             "CALL-ID-0001",
@@ -1128,7 +1128,7 @@ mod tests {
 
         let client = make_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
-        client.register_handler(global_handler);
+        client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
         let generation = registry.insert(wacore::voip::CallSession::new_incoming(
             "CALL-ID-0001",
@@ -1201,7 +1201,7 @@ mod tests {
     async fn offer_dispatches_event() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let node = node_to_owned_ref(&offer_stanza());
         let mut cancelled = false;
@@ -1222,7 +1222,7 @@ mod tests {
     async fn unrecognized_action_does_not_dispatch() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let node = node_to_owned_ref(
             &NodeBuilder::new("call")
@@ -1296,7 +1296,7 @@ mod tests {
     async fn malformed_stanza_does_not_error_or_dispatch() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let node = node_to_owned_ref(
             &NodeBuilder::new("call")
@@ -1479,7 +1479,7 @@ mod tests {
     async fn unanswered_incoming_terminate_surfaces_missed_call() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let mut cancelled = false;
         // The offer rings (marks the call ringing).
@@ -1517,7 +1517,7 @@ mod tests {
     async fn duplicate_terminate_does_not_refire_missed_call() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let mut cancelled = false;
         assert!(
@@ -1556,7 +1556,7 @@ mod tests {
     async fn outgoing_call_terminate_does_not_surface_missed_call() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let peer = Jid::new("222222222222222", Server::Lid);
         let creator = Jid::new("111111111111111", Server::Lid); // us, the caller
@@ -1602,7 +1602,7 @@ mod tests {
         ] {
             let client = make_client().await;
             let (handler, rx) = ChannelEventHandler::new();
-            client.register_handler(handler);
+            client.subscribe_handler(handler).detach();
 
             let mut cancelled = false;
             assert!(
@@ -1660,7 +1660,7 @@ mod tests {
     async fn timeout_terminate_surfaces_missed_call() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let mut cancelled = false;
         assert!(
@@ -1725,7 +1725,7 @@ mod tests {
         *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
 
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let mut cancelled = false;
         // The offer rings.
@@ -1776,7 +1776,7 @@ mod tests {
     async fn answered_call_then_caller_terminate_is_not_missed() {
         let client = make_client().await;
         let (handler, rx) = ChannelEventHandler::new();
-        client.register_handler(handler);
+        client.subscribe_handler(handler).detach();
 
         let mut cancelled = false;
         // The offer rings.

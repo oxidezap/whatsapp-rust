@@ -213,7 +213,7 @@ impl TestClient {
         if push_name_pre_seeded {
             client.set_force_active_delivery_receipts(true);
         }
-        client.register_handler(event_handler);
+        client.subscribe_handler(event_handler).detach();
 
         // The mock server no longer auto-pairs (legacy timer is off by
         // default). Spawn an out-of-process "phone" that POSTs the first
@@ -222,7 +222,7 @@ impl TestClient {
         // Uses its own ChannelEventHandler because async_channel is MPMC:
         // sharing event_rx would steal events from wait_for_event below.
         let (qr_handler, qr_rx) = ChannelEventHandler::new();
-        client.register_handler(qr_handler);
+        client.subscribe_handler(qr_handler).detach();
         let _qr_responder = spawn_qr_autoresponder_http(qr_rx);
 
         let run_handle = bot.spawn();
