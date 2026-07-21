@@ -415,6 +415,19 @@ impl SessionChainComponents {
                 .collect::<Result<_>>()?,
         })
     }
+
+    fn from_receiver_structure(mut value: session_structure::Chain) -> Result<Self> {
+        // Receiver chains never own the remote ratchet's private key. The
+        // canonical session writer persists that absence as `Some([])`.
+        if value
+            .sender_ratchet_key_private
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            value.sender_ratchet_key_private = None;
+        }
+        Self::from_structure(value)
+    }
 }
 
 impl PendingKeyExchangeComponents {
@@ -566,7 +579,7 @@ pub(crate) fn session_components_from_structure(
         receiver_chains: value
             .receiver_chains
             .into_iter()
-            .map(SessionChainComponents::from_structure)
+            .map(SessionChainComponents::from_receiver_structure)
             .collect::<Result<_>>()?,
         pending_key_exchange: value
             .pending_key_exchange
@@ -693,7 +706,7 @@ pub(crate) fn sender_state_components_from_structure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{SenderKeyRecord, SessionRecord};
+    use crate::protocol::{ChainKey, SenderKeyRecord, SessionRecord};
 
     fn public_key(seed: u8) -> Vec<u8> {
         PublicKey::from_djb_public_key_bytes(&[seed; PublicKey::RAW_KEY_LEN])
@@ -863,6 +876,82 @@ mod tests {
         .into_structure()
         .expect_err("short seed must fail");
 
+        assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn canonical_receiver_chain_private_key_sentinel_round_trips() {
+        let mut components = session_record();
+        components
+            .current_session
+            .as_mut()
+            .expect("test session is present")
+            .receiver_chains
+            .clear();
+        let mut record = SessionRecord::from_components(components).expect("valid record");
+        let receiver_key = PublicKey::deserialize(&public_key(34)).expect("valid receiver key");
+        record
+            .session_state_mut()
+            .expect("test session is present")
+            .add_receiver_chain(&receiver_key, &ChainKey::new([35; SYMMETRIC_KEY_BYTES], 0));
+
+        let persisted = record.serialize().expect("serialize record");
+        let projected = SessionRecord::deserialize(&persisted)
+            .expect("deserialize canonical record")
+            .into_components()
+            .expect("project canonical record");
+        let session = projected
+            .current_session
+            .as_ref()
+            .expect("test session is present");
+        assert_eq!(session.receiver_chains[0].sender_ratchet_key_private, None);
+        assert_eq!(
+            session
+                .sender_chain
+                .as_ref()
+                .and_then(|chain| chain.sender_ratchet_key_private.as_ref())
+                .map(Vec::len),
+            Some(PRIVATE_KEY_BYTES)
+        );
+
+        let rebuilt = SessionRecord::from_components(projected.clone())
+            .expect("rebuild canonical record")
+            .serialize()
+            .expect("serialize rebuilt record");
+        let reprojected = SessionRecord::deserialize(&rebuilt)
+            .expect("deserialize rebuilt record")
+            .into_components()
+            .expect("project rebuilt record");
+        assert_eq!(reprojected, projected);
+    }
+
+    #[test]
+    fn malformed_receiver_private_key_is_still_rejected() {
+        let session = session_record()
+            .current_session
+            .expect("test session is present");
+        let mut persisted = session_structure_from_components(session).expect("valid session");
+        persisted.receiver_chains[0].sender_ratchet_key_private =
+            Some(vec![0; PRIVATE_KEY_BYTES - 1]);
+        let error =
+            session_components_from_structure(persisted).expect_err("short private key must fail");
+
+        assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn component_import_rejects_empty_private_key() {
+        let mut components = session_record();
+        components
+            .current_session
+            .as_mut()
+            .expect("test session is present")
+            .receiver_chains[0]
+            .sender_ratchet_key_private = Some(Vec::new());
+
+        let error = SessionRecord::from_components(components)
+            .err()
+            .expect("component key material must remain strict");
         assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
     }
 

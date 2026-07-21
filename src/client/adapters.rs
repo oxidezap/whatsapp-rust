@@ -107,7 +107,7 @@ impl Client {
         self.signal_cache
             .flush(&*backend)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))
+            .map_err(|error| error.context("Failed to flush signal cache"))
     }
 
     /// Signal-cache flush that is safe while the offline drain is active.
