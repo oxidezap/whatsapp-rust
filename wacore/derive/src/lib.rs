@@ -547,7 +547,8 @@ fn is_option_type(ty: &syn::Type) -> bool {
 //      { tag: String } catches unknown tags.
 //      Emits: wire_tag(), impl Serialize (SerializeMap), and a sibling
 //             <Name>Tag unit enum (unit-string WireEnum) for parser dispatch.
-//      No Deserialize — follow-up work; not needed by current consumers.
+//      Adding `content = "data"` selects Serde's adjacent representation,
+//      supports tuple payloads, and emits both Serialize and Deserialize.
 //
 //   3. int          (enum has #[wire(kind = "int")])
 //      Unit variants + optional #[wire_fallback] tuple with i32. Each variant
@@ -578,9 +579,11 @@ pub fn derive_wire_enum(input: TokenStream) -> TokenStream {
 
     match cfg.kind {
         WireKind::IntTagged => expand_wire_enum_int(&input.ident, &variants).into(),
-        WireKind::StringTagged(discriminator) => {
-            expand_wire_enum_tagged(&input.ident, &variants, &discriminator).into()
-        }
+        WireKind::StringTagged {
+            discriminator,
+            content,
+        } => expand_wire_enum_tagged(&input.ident, &variants, &discriminator, content.as_deref())
+            .into(),
         WireKind::UnitString => expand_wire_enum_unit(&input.ident, &variants).into(),
     }
 }
@@ -589,7 +592,10 @@ pub fn derive_wire_enum(input: TokenStream) -> TokenStream {
 
 enum WireKind {
     UnitString,
-    StringTagged(String),
+    StringTagged {
+        discriminator: String,
+        content: Option<String>,
+    },
     IntTagged,
 }
 
@@ -599,6 +605,7 @@ struct WireEnumCfg {
 
 fn parse_enum_level_wire(attrs: &[syn::Attribute]) -> syn::Result<WireEnumCfg> {
     let mut tag_field: Option<String> = None;
+    let mut content_field: Option<String> = None;
     let mut kind_is_int = false;
 
     for attr in attrs {
@@ -609,6 +616,9 @@ fn parse_enum_level_wire(attrs: &[syn::Attribute]) -> syn::Result<WireEnumCfg> {
             if meta.path.is_ident("tag") {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 tag_field = Some(lit.value());
+            } else if meta.path.is_ident("content") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                content_field = Some(lit.value());
             } else if meta.path.is_ident("kind") {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 match lit.value().as_str() {
@@ -628,15 +638,23 @@ fn parse_enum_level_wire(attrs: &[syn::Attribute]) -> syn::Result<WireEnumCfg> {
     }
 
     let kind = if kind_is_int {
-        if tag_field.is_some() {
+        if tag_field.is_some() || content_field.is_some() {
             return Err(syn::Error::new_spanned(
                 &attrs[0],
-                "#[wire(kind = \"int\")] is incompatible with #[wire(tag = \"...\")]",
+                "#[wire(kind = \"int\")] is incompatible with tagged string fields",
             ));
         }
         WireKind::IntTagged
-    } else if let Some(t) = tag_field {
-        WireKind::StringTagged(t)
+    } else if let Some(discriminator) = tag_field {
+        WireKind::StringTagged {
+            discriminator,
+            content: content_field,
+        }
+    } else if content_field.is_some() {
+        return Err(syn::Error::new_spanned(
+            &attrs[0],
+            "#[wire(content = \"...\")] requires #[wire(tag = \"...\")]",
+        ));
     } else {
         WireKind::UnitString
     };
@@ -1221,6 +1239,7 @@ fn expand_wire_enum_tagged(
     name: &syn::Ident,
     variants: &syn::punctuated::Punctuated<syn::Variant, syn::Token![,]>,
     discriminator: &str,
+    content: Option<&str>,
 ) -> proc_macro2::TokenStream {
     let mut infos = Vec::with_capacity(variants.len());
     for v in variants {
@@ -1296,6 +1315,33 @@ fn expand_wire_enum_tagged(
         }
     }
 
+    if content.is_some() {
+        if let Some(info) = fallback {
+            return syn::Error::new_spanned(
+                &info.ident,
+                "adjacently tagged WireEnum does not support #[wire_fallback]",
+            )
+            .to_compile_error();
+        }
+        for info in &infos {
+            let fields = match &info.fields {
+                syn::Fields::Named(fields) => &fields.named,
+                syn::Fields::Unnamed(fields) => &fields.unnamed,
+                syn::Fields::Unit => continue,
+            };
+            if let Some(field) = fields
+                .iter()
+                .find(|field| field_has_wire_skip(&field.attrs))
+            {
+                return syn::Error::new_spanned(
+                    field,
+                    "adjacently tagged WireEnum does not support #[wire(skip)]",
+                )
+                .to_compile_error();
+            }
+        }
+    }
+
     // --- wire_tag(&self) -> &str ---
 
     let wire_tag_arms: Vec<_> = infos
@@ -1317,71 +1363,275 @@ fn expand_wire_enum_tagged(
             }
         })
         .collect();
+    let wire_tag_return = if fallback.is_some() {
+        quote! { &str }
+    } else {
+        quote! { &'static str }
+    };
 
-    // --- Serialize arms ---
+    // --- Serde implementation ---
 
-    let serialize_arms: Vec<_> = infos
-        .iter()
-        .map(|info| {
-            let id = &info.ident;
-            if info.is_fallback {
-                // Only the discriminator is written (already done before match).
-                quote! { #name::#id { tag: _ } => {} }
-            } else {
+    let discriminator_lit = discriminator;
+    let serde_impl = if let Some(content_lit) = content {
+        let borrowed_ident = quote::format_ident!("__{}WireBorrowed", name);
+        let owned_ident = quote::format_ident!("__{}WireOwned", name);
+
+        let borrowed_variants: Vec<_> = infos
+            .iter()
+            .map(|info| {
+                let id = &info.ident;
+                let VariantWire::Str(primary) = info.wire.as_ref().unwrap() else {
+                    unreachable!()
+                };
+                let aliases = info
+                    .aliases
+                    .iter()
+                    .map(|alias| quote! { #[serde(alias = #alias)] });
+                let fields = match &info.fields {
+                    syn::Fields::Unit => quote! {},
+                    syn::Fields::Named(fields) => {
+                        let declarations = fields.named.iter().map(|field| {
+                            let field_id = field.ident.as_ref().unwrap();
+                            let ty = &field.ty;
+                            quote! { #field_id: &'__wire #ty }
+                        });
+                        quote! { { #(#declarations),* } }
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        let declarations = fields.unnamed.iter().map(|field| {
+                            let ty = &field.ty;
+                            quote! { &'__wire #ty }
+                        });
+                        quote! { ( #(#declarations),* ) }
+                    }
+                };
+                quote! {
+                    #[serde(rename = #primary)]
+                    #(#aliases)*
+                    #id #fields
+                }
+            })
+            .collect();
+
+        let owned_variants: Vec<_> = infos
+            .iter()
+            .map(|info| {
+                let id = &info.ident;
+                let VariantWire::Str(primary) = info.wire.as_ref().unwrap() else {
+                    unreachable!()
+                };
+                let aliases = info
+                    .aliases
+                    .iter()
+                    .map(|alias| quote! { #[serde(alias = #alias)] });
+                let fields = match &info.fields {
+                    syn::Fields::Unit => quote! {},
+                    syn::Fields::Named(fields) => {
+                        let declarations = fields.named.iter().map(|field| {
+                            let field_id = field.ident.as_ref().unwrap();
+                            let ty = &field.ty;
+                            quote! { #field_id: #ty }
+                        });
+                        quote! { { #(#declarations),* } }
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        let declarations = fields.unnamed.iter().map(|field| {
+                            let ty = &field.ty;
+                            quote! { #ty }
+                        });
+                        quote! { ( #(#declarations),* ) }
+                    }
+                };
+                quote! {
+                    #[serde(rename = #primary)]
+                    #(#aliases)*
+                    #id #fields
+                }
+            })
+            .collect();
+
+        let borrow_arms: Vec<_> = infos
+            .iter()
+            .map(|info| {
+                let id = &info.ident;
                 match &info.fields {
-                    syn::Fields::Unit => quote! { #name::#id => {} },
-                    syn::Fields::Named(named) => {
-                        let bindings: Vec<proc_macro2::TokenStream> = named
+                    syn::Fields::Unit => {
+                        quote! { #name::#id => #borrowed_ident::#id }
+                    }
+                    syn::Fields::Named(fields) => {
+                        let bindings = fields
                             .named
                             .iter()
-                            .map(|f| {
-                                let id = f.ident.as_ref().unwrap();
-                                if field_has_wire_skip(&f.attrs) {
-                                    quote! { #id: _ }
-                                } else {
-                                    quote! { #id }
-                                }
-                            })
-                            .collect();
-                        let entries: Vec<proc_macro2::TokenStream> = named
-                            .named
-                            .iter()
-                            .filter(|f| !field_has_wire_skip(&f.attrs))
-                            .map(|f| {
-                                let id = f.ident.as_ref().unwrap();
-                                let key = id.to_string();
-                                if is_option_type(&f.ty) {
-                                    quote! {
-                                        if let ::core::option::Option::Some(__v) = #id {
-                                            ::serde::ser::SerializeMap::serialize_entry(
-                                                &mut map, #key, __v
-                                            )?;
-                                        }
-                                    }
-                                } else {
-                                    quote! {
-                                        ::serde::ser::SerializeMap::serialize_entry(
-                                            &mut map, #key, #id
-                                        )?;
-                                    }
-                                }
-                            })
-                            .collect();
+                            .map(|field| field.ident.as_ref().unwrap());
+                        let values = bindings.clone();
                         quote! {
-                            #name::#id { #(#bindings),* } => {
-                                #(#entries)*
-                            }
+                            #name::#id { #(#bindings),* } =>
+                                #borrowed_ident::#id { #(#values),* }
                         }
                     }
-                    syn::Fields::Unnamed(_) => {
+                    syn::Fields::Unnamed(fields) => {
+                        let bindings: Vec<_> = (0..fields.unnamed.len())
+                            .map(|index| quote::format_ident!("__field_{index}"))
+                            .collect();
+                        let values = &bindings;
                         quote! {
-                            compile_error!("tagged WireEnum tuple variants are not supported — use named fields or unit");
+                            #name::#id(#(#bindings),*) =>
+                                #borrowed_ident::#id(#(#values),*)
                         }
                     }
                 }
+            })
+            .collect();
+
+        let own_arms: Vec<_> = infos
+            .iter()
+            .map(|info| {
+                let id = &info.ident;
+                match &info.fields {
+                    syn::Fields::Unit => quote! { #owned_ident::#id => #name::#id },
+                    syn::Fields::Named(fields) => {
+                        let bindings = fields
+                            .named
+                            .iter()
+                            .map(|field| field.ident.as_ref().unwrap());
+                        let values = bindings.clone();
+                        quote! {
+                            #owned_ident::#id { #(#bindings),* } =>
+                                #name::#id { #(#values),* }
+                        }
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        let bindings: Vec<_> = (0..fields.unnamed.len())
+                            .map(|index| quote::format_ident!("__field_{index}"))
+                            .collect();
+                        let values = &bindings;
+                        quote! {
+                            #owned_ident::#id(#(#bindings),*) =>
+                                #name::#id(#(#values),*)
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            #[doc(hidden)]
+            #[derive(::serde::Serialize)]
+            #[serde(tag = #discriminator_lit, content = #content_lit)]
+            enum #borrowed_ident<'__wire> {
+                #(#borrowed_variants),*
             }
-        })
-        .collect();
+
+            #[doc(hidden)]
+            #[derive(::serde::Deserialize)]
+            #[serde(tag = #discriminator_lit, content = #content_lit)]
+            enum #owned_ident {
+                #(#owned_variants),*
+            }
+
+            impl ::serde::Serialize for #name {
+                fn serialize<S: ::serde::Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> ::core::result::Result<S::Ok, S::Error> {
+                    let value = match self {
+                        #(#borrow_arms),*
+                    };
+                    ::serde::Serialize::serialize(&value, serializer)
+                }
+            }
+
+            impl<'de> ::serde::Deserialize<'de> for #name {
+                fn deserialize<D: ::serde::Deserializer<'de>>(
+                    deserializer: D,
+                ) -> ::core::result::Result<Self, D::Error> {
+                    let value = <#owned_ident as ::serde::Deserialize>::deserialize(deserializer)?;
+                    ::core::result::Result::Ok(match value {
+                        #(#own_arms),*
+                    })
+                }
+            }
+        }
+    } else {
+        let serialize_arms: Vec<_> = infos
+            .iter()
+            .map(|info| {
+                let id = &info.ident;
+                if info.is_fallback {
+                    quote! { #name::#id { tag: _ } => {} }
+                } else {
+                    match &info.fields {
+                        syn::Fields::Unit => quote! { #name::#id => {} },
+                        syn::Fields::Named(named) => {
+                            let bindings: Vec<proc_macro2::TokenStream> = named
+                                .named
+                                .iter()
+                                .map(|field| {
+                                    let id = field.ident.as_ref().unwrap();
+                                    if field_has_wire_skip(&field.attrs) {
+                                        quote! { #id: _ }
+                                    } else {
+                                        quote! { #id }
+                                    }
+                                })
+                                .collect();
+                            let entries: Vec<proc_macro2::TokenStream> = named
+                                .named
+                                .iter()
+                                .filter(|field| !field_has_wire_skip(&field.attrs))
+                                .map(|field| {
+                                    let id = field.ident.as_ref().unwrap();
+                                    let key = id.to_string();
+                                    if is_option_type(&field.ty) {
+                                        quote! {
+                                            if let ::core::option::Option::Some(__v) = #id {
+                                                ::serde::ser::SerializeMap::serialize_entry(
+                                                    &mut map, #key, __v
+                                                )?;
+                                            }
+                                        }
+                                    } else {
+                                        quote! {
+                                            ::serde::ser::SerializeMap::serialize_entry(
+                                                &mut map, #key, #id
+                                            )?;
+                                        }
+                                    }
+                                })
+                                .collect();
+                            quote! {
+                                #name::#id { #(#bindings),* } => {
+                                    #(#entries)*
+                                }
+                            }
+                        }
+                        syn::Fields::Unnamed(_) => quote! {
+                            compile_error!("tagged WireEnum tuple variants require #[wire(content = \"...\")]");
+                        },
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            impl ::serde::Serialize for #name {
+                fn serialize<S: ::serde::Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> ::core::result::Result<S::Ok, S::Error> {
+                    use ::serde::ser::SerializeMap;
+                    let mut map = serializer.serialize_map(None)?;
+                    ::serde::ser::SerializeMap::serialize_entry(
+                        &mut map, #discriminator_lit, self.wire_tag()
+                    )?;
+                    match self {
+                        #(#serialize_arms,)*
+                    }
+                    ::serde::ser::SerializeMap::end(map)
+                }
+            }
+        }
+    };
 
     // --- Sibling <Name>Tag unit enum (unit-string WireEnum) ---
 
@@ -1416,13 +1666,11 @@ fn expand_wire_enum_tagged(
 
     // --- Final expansion ---
 
-    let discriminator_lit = discriminator;
-
     quote! {
         impl #name {
             /// The wire tag this variant serializes as — the JSON discriminator
             /// and the exact tag the parser dispatches on.
-            pub fn wire_tag(&self) -> &str {
+            pub fn wire_tag(&self) -> #wire_tag_return {
                 match self {
                     #(#wire_tag_arms,)*
                 }
@@ -1435,22 +1683,7 @@ fn expand_wire_enum_tagged(
             }
         }
 
-        impl ::serde::Serialize for #name {
-            fn serialize<S: ::serde::Serializer>(
-                &self,
-                serializer: S,
-            ) -> ::core::result::Result<S::Ok, S::Error> {
-                use ::serde::ser::SerializeMap;
-                let mut map = serializer.serialize_map(None)?;
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map, #discriminator_lit, self.wire_tag()
-                )?;
-                match self {
-                    #(#serialize_arms,)*
-                }
-                ::serde::ser::SerializeMap::end(map)
-            }
-        }
+        #serde_impl
 
         /// Sibling unit enum listing every canonical wire tag for parser
         /// dispatch. Primary wire tags and any `#[wire_alias]` entries all

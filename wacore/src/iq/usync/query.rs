@@ -85,6 +85,7 @@ const LAST_PAGE: &str = "true";
 const DEVICES_VERSION: &str = "2";
 const BOT_PROFILE_VERSION: &str = "1";
 const E164_PREFIX: char = '+';
+const E164_MAX_DIGITS: usize = 15;
 
 /// Addressing mode used by the contact subprotocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, WireEnum)]
@@ -383,8 +384,13 @@ impl UsyncUser {
                 return Err(UsyncValidationError::InvalidPnJid { index });
             }
         }
-        if self.phone.as_ref().is_some_and(CompactString::is_empty) {
-            return Err(UsyncValidationError::EmptyPhone { index });
+        if let Some(phone) = &self.phone {
+            if phone.is_empty() {
+                return Err(UsyncValidationError::EmptyPhone { index });
+            }
+            if !is_canonical_usync_phone(phone) {
+                return Err(UsyncValidationError::InvalidPhone { index });
+            }
         }
         if self.username.as_ref().is_some_and(CompactString::is_empty) {
             return Err(UsyncValidationError::EmptyUsername { index });
@@ -447,6 +453,19 @@ fn normalize_usync_phone(mut phone: CompactString) -> CompactString {
     phone
 }
 
+fn is_canonical_usync_phone(phone: &str) -> bool {
+    let Some(digits) = phone.strip_prefix(E164_PREFIX) else {
+        return false;
+    };
+    let Some((&first, rest)) = digits.as_bytes().split_first() else {
+        return false;
+    };
+    digits.len() <= E164_MAX_DIGITS
+        && first.is_ascii_digit()
+        && first != b'0'
+        && rest.iter().all(u8::is_ascii_digit)
+}
+
 fn deserialize_optional_usync_phone<'de, D>(
     deserializer: D,
 ) -> Result<Option<CompactString>, D::Error>
@@ -500,22 +519,33 @@ fn validate_user_jid(jid: &Jid, index: usize) -> Result<(), UsyncValidationError
 }
 
 /// A known, typed USync subprotocol request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[wire(tag = "type", content = "data")]
 #[non_exhaustive]
 pub enum UsyncProtocol {
+    #[wire = "contact"]
     Contact {
         addressing_mode: UsyncAddressingMode,
     },
+    #[wire = "devices"]
     DevicesV2,
+    #[wire = "status"]
     Status,
+    #[wire = "text_status"]
     TextStatus,
+    #[wire = "disappearing_mode"]
     DisappearingMode,
+    #[wire = "business"]
     BusinessVerifiedName,
+    #[wire = "picture"]
     Picture,
+    #[wire = "lid"]
     Lid,
+    #[wire = "username"]
     Username,
+    #[wire = "bot"]
     BotProfileV1,
+    #[wire = "feature"]
     Features(Vec<UsyncFeature>),
 }
 
@@ -544,10 +574,10 @@ impl UsyncProtocol {
     }
 
     fn build_query_node(&self) -> Node {
-        let kind = self.kind();
+        let tag = self.wire_tag();
         match self {
             Self::Contact { addressing_mode } => {
-                let builder = NodeBuilder::new(kind.as_str());
+                let builder = NodeBuilder::new(tag);
                 if *addressing_mode == UsyncAddressingMode::Lid {
                     builder
                         .attr(ATTR_ADDRESSING_MODE, addressing_mode.as_str())
@@ -556,25 +586,25 @@ impl UsyncProtocol {
                     builder.build()
                 }
             }
-            Self::DevicesV2 => NodeBuilder::new(kind.as_str())
+            Self::DevicesV2 => NodeBuilder::new(tag)
                 .attr(ATTR_VERSION, DEVICES_VERSION)
                 .build(),
-            Self::BusinessVerifiedName => NodeBuilder::new(kind.as_str())
+            Self::BusinessVerifiedName => NodeBuilder::new(tag)
                 .children([NodeBuilder::new(TAG_VERIFIED_NAME).build()])
                 .build(),
-            Self::BotProfileV1 => NodeBuilder::new(kind.as_str())
+            Self::BotProfileV1 => NodeBuilder::new(tag)
                 .children([NodeBuilder::new(TAG_PROFILE)
                     .attr(ATTR_BOT_VERSION, BOT_PROFILE_VERSION)
                     .build()])
                 .build(),
-            Self::Features(features) => NodeBuilder::new(kind.as_str())
+            Self::Features(features) => NodeBuilder::new(tag)
                 .children(
                     features
                         .iter()
                         .map(|feature| NodeBuilder::new(feature.as_str()).build()),
                 )
                 .build(),
-            _ => NodeBuilder::new(kind.as_str()).build(),
+            _ => NodeBuilder::new(tag).build(),
         }
     }
 
@@ -666,6 +696,8 @@ pub enum UsyncValidationError {
     InvalidPnJid { index: usize },
     #[error("USync user at index {index} has an empty phone number")]
     EmptyPhone { index: usize },
+    #[error("USync user at index {index} has an invalid phone number")]
+    InvalidPhone { index: usize },
     #[error("USync user at index {index} has an empty username")]
     EmptyUsername { index: usize },
     #[error("USync user at index {index} has a username pin without a username")]
@@ -1079,20 +1111,31 @@ pub struct UsyncBotProfileResult {
 
 /// Sparse per-user result. Large, uncommon payloads are boxed so their layout
 /// does not inflate every status/contact/device item in large sync responses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[wire(tag = "type", content = "data")]
 #[non_exhaustive]
 pub enum UsyncProtocolResult {
+    #[wire = "contact"]
     Contact(UsyncOutcome<UsyncContactResult>),
+    #[wire = "devices"]
     Devices(UsyncOutcome<UsyncDevicesResult>),
+    #[wire = "status"]
     Status(UsyncOutcome<UsyncStatusResult>),
+    #[wire = "text_status"]
     TextStatus(UsyncOutcome<UsyncTextStatusResult>),
+    #[wire = "disappearing_mode"]
     DisappearingMode(UsyncOutcome<UsyncDisappearingModeResult>),
+    #[wire = "business"]
     Business(UsyncOutcome<Box<UsyncBusinessResult>>),
+    #[wire = "picture"]
     Picture(UsyncOutcome<u64>),
+    #[wire = "lid"]
     Lid(UsyncOutcome<Option<Jid>>),
+    #[wire = "username"]
     Username(UsyncOutcome<Option<CompactString>>),
+    #[wire = "bot"]
     Bot(UsyncOutcome<Box<UsyncBotProfileResult>>),
+    #[wire = "feature"]
     Features(UsyncOutcome<Vec<UsyncFeatureResult>>),
 }
 
@@ -1176,11 +1219,11 @@ fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, anyh
     let mut protocols = Vec::with_capacity(capacity);
     let mut has_contact = false;
     for node in user.children().into_iter().flatten() {
-        let Ok(kind) = UsyncProtocolKind::try_from(node.tag.as_ref()) else {
+        let Ok(tag) = UsyncProtocolResultTag::try_from(node.tag.as_ref()) else {
             continue;
         };
-        has_contact |= kind == UsyncProtocolKind::Contact;
-        protocols.push(parse_protocol_result(kind, node)?);
+        has_contact |= tag == UsyncProtocolResultTag::Contact;
+        protocols.push(parse_protocol_result(tag, node)?);
     }
 
     // Matches WA Web's parser: an id-less entry is retained only when the
@@ -1197,7 +1240,7 @@ fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, anyh
 }
 
 fn parse_protocol_result(
-    kind: UsyncProtocolKind,
+    tag: UsyncProtocolResultTag,
     node: &NodeRef<'_>,
 ) -> Result<UsyncProtocolResult, anyhow::Error> {
     macro_rules! outcome {
@@ -1209,32 +1252,40 @@ fn parse_protocol_result(
         };
     }
 
-    Ok(match kind {
-        UsyncProtocolKind::Contact => UsyncProtocolResult::Contact(outcome!(parse_contact(node))),
-        UsyncProtocolKind::Devices => UsyncProtocolResult::Devices(outcome!(parse_devices(node))),
-        UsyncProtocolKind::Status => UsyncProtocolResult::Status(outcome!(parse_status(node))),
-        UsyncProtocolKind::TextStatus => {
+    Ok(match tag {
+        UsyncProtocolResultTag::Contact => {
+            UsyncProtocolResult::Contact(outcome!(parse_contact(node)))
+        }
+        UsyncProtocolResultTag::Devices => {
+            UsyncProtocolResult::Devices(outcome!(parse_devices(node)))
+        }
+        UsyncProtocolResultTag::Status => UsyncProtocolResult::Status(outcome!(parse_status(node))),
+        UsyncProtocolResultTag::TextStatus => {
             UsyncProtocolResult::TextStatus(outcome!(parse_text_status(node)))
         }
-        UsyncProtocolKind::DisappearingMode => {
+        UsyncProtocolResultTag::DisappearingMode => {
             UsyncProtocolResult::DisappearingMode(outcome!(parse_disappearing_mode(node)))
         }
-        UsyncProtocolKind::Business => {
+        UsyncProtocolResultTag::Business => {
             UsyncProtocolResult::Business(outcome!(parse_business(node).map(Box::new)))
         }
-        UsyncProtocolKind::Picture => {
+        UsyncProtocolResultTag::Picture => {
             UsyncProtocolResult::Picture(outcome!(required_u64(node, ATTR_ID)))
         }
-        UsyncProtocolKind::Lid => UsyncProtocolResult::Lid(outcome!(optional_lid(node, ATTR_VAL))),
-        UsyncProtocolKind::Username => {
+        UsyncProtocolResultTag::Lid => {
+            UsyncProtocolResult::Lid(outcome!(optional_lid(node, ATTR_VAL)))
+        }
+        UsyncProtocolResultTag::Username => {
             UsyncProtocolResult::Username(outcome!(Ok::<_, anyhow::Error>(
                 node.content_as_string()
             )))
         }
-        UsyncProtocolKind::Bot => {
+        UsyncProtocolResultTag::Bot => {
             UsyncProtocolResult::Bot(outcome!(parse_bot_profile(node).map(Box::new)))
         }
-        UsyncProtocolKind::Feature => UsyncProtocolResult::Features(outcome!(parse_features(node))),
+        UsyncProtocolResultTag::Features => {
+            UsyncProtocolResult::Features(outcome!(parse_features(node)))
+        }
     })
 }
 
@@ -1742,6 +1793,9 @@ mod tests {
         .unwrap();
 
         let encoded = serde_json::to_vec(&query).unwrap();
+        let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(encoded_value["protocols"][1]["type"], "devices");
+        assert_eq!(encoded_value["protocols"][3]["type"], "feature");
         let decoded: UsyncQuery = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, query);
 
@@ -1771,6 +1825,24 @@ mod tests {
             duplicate.to_string().contains("duplicate USync protocol"),
             "unexpected deserialization error: {duplicate}"
         );
+    }
+
+    #[test]
+    fn query_validation_rejects_non_canonical_phone_inputs() {
+        const INVALID_PHONES: &[&str] = &["+", "abc", "+12 34", "+0123", "+1234567890123456"];
+
+        for phone in INVALID_PHONES {
+            let error = UsyncQuery::new(
+                UsyncMode::Query,
+                UsyncContext::Interactive,
+                vec![UsyncProtocol::Contact {
+                    addressing_mode: UsyncAddressingMode::Pn,
+                }],
+                vec![UsyncUser::from_phone(*phone)],
+            )
+            .unwrap_err();
+            assert_eq!(error, UsyncValidationError::InvalidPhone { index: 0 });
+        }
     }
 
     #[test]
