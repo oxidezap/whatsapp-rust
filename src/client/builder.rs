@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use super::Client;
+use super::{Client, ClientLifecycle, LifecycleRegistration};
 use crate::cache_config::CacheConfig;
 use crate::http::HttpClient;
 use crate::store::error::StoreError;
@@ -47,7 +47,7 @@ impl ClientBuild {
 }
 
 /// A validated client-construction failure.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientBuilderError {
     #[error("missing async runtime")]
@@ -60,6 +60,8 @@ pub enum ClientBuilderError {
     MissingHttpClient,
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
+    #[error("client lifecycle installation failed: {0}")]
+    LifecycleInstall(#[source] anyhow::Error),
 }
 
 /// Runtime-validated, low-level builder for [`Client`].
@@ -82,6 +84,7 @@ pub struct ClientBuilder {
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     background_saver_interval: Option<Duration>,
+    lifecycle: Option<Arc<dyn ClientLifecycle>>,
 }
 
 impl Default for ClientBuilder {
@@ -108,6 +111,7 @@ impl ClientBuilder {
             task_instrument: None,
             alloc_meter: None,
             background_saver_interval: None,
+            lifecycle: None,
         }
     }
 
@@ -256,6 +260,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Install the aggregate lifecycle used by extensions of this client.
+    pub fn with_lifecycle<L>(mut self, lifecycle: L) -> Self
+    where
+        L: ClientLifecycle + 'static,
+    {
+        self.lifecycle = Some(Arc::new(lifecycle));
+        self
+    }
+
+    /// Install an already-shared aggregate lifecycle.
+    pub fn with_lifecycle_arc(mut self, lifecycle: Arc<dyn ClientLifecycle>) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
     /// Validate dependencies, assemble an inert client, then start its services.
     pub async fn build(self) -> Result<ClientBuild, ClientBuilderError> {
         self.build_boxed().await
@@ -291,11 +310,12 @@ impl ClientBuilder {
                 probe_durability_backend(&persistence_manager.backend()).await?;
             }
 
-            Ok(self.finish(runtime, persistence_manager, transport_factory, http_client))
+            self.finish(runtime, persistence_manager, transport_factory, http_client)
+                .await
         })
     }
 
-    pub(crate) fn build_required(
+    pub(crate) async fn build_required(
         runtime: Arc<dyn Runtime>,
         persistence_manager: Arc<PersistenceManager>,
         transport_factory: Arc<dyn TransportFactory>,
@@ -303,21 +323,26 @@ impl ClientBuilder {
         override_version: Option<(u32, u32, u32)>,
         cache_config: CacheConfig,
     ) -> ClientBuild {
-        Self {
+        let result = Self {
             override_version,
             cache_config,
             ..Self::new()
         }
         .finish(runtime, persistence_manager, transport_factory, http_client)
+        .await;
+        match result {
+            Ok(build) => build,
+            Err(error) => unreachable!("default lifecycle-free build failed: {error}"),
+        }
     }
 
-    fn finish(
+    async fn finish(
         self,
         runtime: Arc<dyn Runtime>,
         persistence_manager: Arc<PersistenceManager>,
         transport_factory: Arc<dyn TransportFactory>,
         http_client: Arc<dyn HttpClient>,
-    ) -> ClientBuild {
+    ) -> Result<ClientBuild, ClientBuilderError> {
         let runtime: Arc<dyn Runtime> = match self.task_instrument {
             Some(instrument) => {
                 Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
@@ -325,6 +350,7 @@ impl ClientBuilder {
             None => runtime,
         };
 
+        let lifecycle = self.lifecycle.map(LifecycleRegistration::new).map(Arc::new);
         let assembly = Client::assemble(
             Arc::clone(&runtime),
             Arc::clone(&persistence_manager),
@@ -332,6 +358,7 @@ impl ClientBuilder {
             http_client,
             self.override_version,
             self.cache_config,
+            lifecycle,
         );
         let client = assembly.client();
 
@@ -353,6 +380,12 @@ impl ClientBuilder {
         if let Some(meter) = self.alloc_meter {
             let _ = client.alloc_meter.set(meter);
         }
+        if let Some(lifecycle) = &client.lifecycle {
+            lifecycle
+                .install(Arc::downgrade(&client))
+                .await
+                .map_err(ClientBuilderError::LifecycleInstall)?;
+        }
 
         let build = assembly.start();
         if let Some(interval) = self.background_saver_interval {
@@ -363,7 +396,7 @@ impl ClientBuilder {
             );
             let _ = build.client.saver_handle.set(saver_handle);
         }
-        build
+        Ok(build)
     }
 }
 
@@ -444,6 +477,27 @@ mod tests {
     use crate::test_utils::MockHttpClient;
     use crate::transport::mock::MockTransportFactory;
     use wacore::runtime::AbortHandle;
+
+    struct FailingLifecycle {
+        spawns: Arc<AtomicUsize>,
+        installed_client: std::sync::Mutex<Option<std::sync::Weak<Client>>>,
+    }
+
+    impl ClientLifecycle for FailingLifecycle {
+        fn install<'a>(
+            &'a self,
+            client: std::sync::Weak<Client>,
+        ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                assert_eq!(self.spawns.load(Ordering::SeqCst), 0);
+                *self
+                    .installed_client
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client);
+                Err(anyhow::anyhow!("injected install failure"))
+            })
+        }
+    }
 
     struct CountingRuntime {
         spawns: Arc<AtomicUsize>,
@@ -531,6 +585,7 @@ mod tests {
             Arc::new(MockHttpClient),
             None,
             CacheConfig::default(),
+            None,
         );
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
@@ -576,5 +631,44 @@ mod tests {
         assert!(client.saver_handle.get().is_some());
         assert_eq!(spawns.load(Ordering::SeqCst), 3);
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_install_failure_publishes_nothing_and_starts_no_tasks() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let lifecycle = Arc::new(FailingLifecycle {
+            spawns: Arc::clone(&spawns),
+            installed_client: std::sync::Mutex::new(None),
+        });
+
+        let result = ClientBuilder::new()
+            .with_runtime(CountingRuntime {
+                spawns: Arc::clone(&spawns),
+            })
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle_arc(lifecycle.clone())
+            .build()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ClientBuilderError::LifecycleInstall(_))
+        ));
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(
+            lifecycle
+                .installed_client
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_some_and(|client| client.upgrade().is_none())
+        );
     }
 }

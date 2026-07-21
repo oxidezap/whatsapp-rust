@@ -697,6 +697,9 @@ impl Client {
         // Increment connection generation to invalidate any stale post-login tasks
         // from previous connections (e.g., during 515 reconnect cycles).
         let current_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.begin_scope(current_generation);
+        }
 
         info!(
             "Successfully authenticated with WhatsApp servers! (gen={})",
@@ -1104,7 +1107,7 @@ impl Client {
                         // Presence is NOT sent here — WhatsApp Web sends presence from the
                         // setting_pushName mutation handler (WAWebPushNameSync), not from
                         // criticalSyncDone. Our setting_pushName handler already does this.
-                        client_clone.dispatch_connected();
+                        client_clone.dispatch_connected().await;
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
@@ -1166,7 +1169,7 @@ impl Client {
                 // for an outdated connection that was replaced mid-await.
                 check_generation!();
 
-                client_clone.dispatch_connected();
+                client_clone.dispatch_connected().await;
             }
         })).detach();
     }

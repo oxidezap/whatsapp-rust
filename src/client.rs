@@ -5,6 +5,7 @@ mod builder;
 mod context_impl;
 mod device_registry;
 pub(crate) mod device_topology;
+mod extension_lifecycle;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -16,6 +17,8 @@ mod sessions;
 mod voip;
 use builder::ClientAssembly;
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+use extension_lifecycle::LifecycleRegistration;
+pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
@@ -665,6 +668,8 @@ pub struct Client {
     /// error / connect_failure / disconnect. Per-connection subscribers
     /// (keepalive, request waiters, read loop, offline flush) observe this.
     pub(crate) connection_shutdown: std::sync::Mutex<wacore::runtime::ShutdownNotifier>,
+    /// Allocated only when an extension host installs lifecycle callbacks.
+    lifecycle: Option<Arc<LifecycleRegistration>>,
     /// Per-session wire I/O and activity counters. Written at the transport
     /// chokepoints (noise sender task, read loop); the keepalive dead-socket
     /// watchdog reads its activity timestamps. Snapshot via [`Client::stats`].

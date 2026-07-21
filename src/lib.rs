@@ -93,7 +93,10 @@ pub use client::{
     StatsSnapshot, StorageResourceReport, TransportResourceReport,
 };
 pub use client::{CallError, Voip};
-pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError};
+pub use client::{
+    Client, ClientBuild, ClientBuilder, ClientBuilderError, ClientLifecycle, ConnectionScope,
+    ConnectionScopeState,
+};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
