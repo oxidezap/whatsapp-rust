@@ -747,10 +747,11 @@ impl SessionRecord {
     /// before export so rebuilding the record cannot derive a possibly spent
     /// message key again.
     pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
-        if self.reserved_sender_chain_index > 0
+        let reserved_sender_chain_index = self.reserved_sender_chain_index;
+        if reserved_sender_chain_index > 0
             && let Some(state) = self.current_session.as_mut()
         {
-            state.fast_forward_sender_chain(self.reserved_sender_chain_index)?;
+            state.fast_forward_sender_chain(reserved_sender_chain_index)?;
         }
         let current_session = self
             .current_session
@@ -759,7 +760,14 @@ impl SessionRecord {
         let previous_sessions = Arc::try_unwrap(self.previous_sessions)
             .unwrap_or_else(|shared| shared.as_ref().clone())
             .into_iter()
-            .map(session_components_from_structure)
+            .map(|session| {
+                if reserved_sender_chain_index == 0 {
+                    return session_components_from_structure(session);
+                }
+                let mut state = SessionState::from_session_structure(session);
+                state.fast_forward_sender_chain(reserved_sender_chain_index)?;
+                session_components_from_structure(state.session)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(SessionRecordComponents {

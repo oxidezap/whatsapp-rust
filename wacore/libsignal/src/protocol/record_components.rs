@@ -992,18 +992,31 @@ mod tests {
     }
 
     #[test]
-    fn session_handoff_burns_the_reserved_sender_range() {
+    fn session_handoff_burns_the_reserved_sender_range_in_all_states() {
         let mut record = SessionRecord::from_components(session_record()).expect("valid record");
         record.reserve_sender_chain_counters(0);
         let ceiling = record.reserved_sender_chain_index();
         let components = record.into_components().expect("safe handoff");
         let index = components
             .current_session
-            .and_then(|session| session.sender_chain)
-            .and_then(|chain| chain.chain_key)
+            .as_ref()
+            .and_then(|session| session.sender_chain.as_ref())
+            .and_then(|chain| chain.chain_key.as_ref())
             .and_then(|chain| chain.index);
+        let archived_indexes: Vec<_> = components
+            .previous_sessions
+            .iter()
+            .map(|session| {
+                session
+                    .sender_chain
+                    .as_ref()
+                    .and_then(|chain| chain.chain_key.as_ref())
+                    .and_then(|chain| chain.index)
+            })
+            .collect();
 
         assert_eq!(index, Some(ceiling));
+        assert_eq!(archived_indexes, vec![Some(ceiling)]);
     }
 
     #[test]
