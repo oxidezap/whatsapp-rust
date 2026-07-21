@@ -44,12 +44,24 @@ impl Client {
         self.core.event_bus.subscribe_handler(handler)
     }
 
-    /// Enable or disable raw node forwarding.
-    /// When enabled, `Event::RawNode` is emitted for every decoded stanza before
-    /// the stanza router dispatches it. Only enable when external consumers need
-    /// raw protocol access (e.g. voice call stanzas).
-    pub fn set_raw_node_forwarding(&self, enabled: bool) {
-        self.raw_node_forwarding.store(enabled, Ordering::Relaxed);
+    /// Acquire raw decoded stanza forwarding for one consumer.
+    ///
+    /// `Event::RawNode` remains enabled until every acquired lease is dropped.
+    pub fn acquire_raw_node_forwarding(self: &Arc<Self>) -> RawNodeLease {
+        let incremented = self
+            .raw_node_forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(incremented, "raw-node forwarding lease counter overflow");
+        RawNodeLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn raw_node_forwarding_enabled(&self) -> bool {
+        self.raw_node_forwarding.load(Ordering::Relaxed) != 0
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.
@@ -525,6 +537,24 @@ impl Client {
         router.register(Arc::new(crate::handlers::presence::PresenceHandler));
 
         router
+    }
+}
+
+#[cfg(test)]
+mod raw_node_tests {
+    #[tokio::test]
+    async fn raw_node_forwarding_stays_enabled_until_the_last_lease_drops() {
+        let client = crate::test_utils::create_test_client().await;
+        assert!(!client.raw_node_forwarding_enabled());
+
+        let first = client.acquire_raw_node_forwarding();
+        let second = client.acquire_raw_node_forwarding();
+        assert!(client.raw_node_forwarding_enabled());
+
+        drop(first);
+        assert!(client.raw_node_forwarding_enabled());
+        drop(second);
+        assert!(!client.raw_node_forwarding_enabled());
     }
 }
 

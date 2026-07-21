@@ -192,13 +192,13 @@ impl Client {
                                             // observes these events or every raw node.
                                             "receipt" => {
                                                 !self.synchronous_ack
-                                                    && !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                    && !self.raw_node_forwarding_enabled()
                                                     && !self.core.event_bus.has_handler_for(
                                                         wacore::types::events::EventKind::Receipt,
                                                     )
                                             }
                                             "ack" => {
-                                                !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                !self.raw_node_forwarding_enabled()
                                                     && !self.core.event_bus.has_handler_for(
                                                         wacore::types::events::EventKind::ServerAck,
                                                     )
@@ -326,7 +326,7 @@ impl Client {
         // ACKs need shared ownership only for opt-in raw/node observers. The
         // usual response-waiter path borrows the node and can skip the Arc.
         if node.tag() == "ack"
-            && !self.raw_node_forwarding.load(Ordering::Relaxed)
+            && !self.raw_node_forwarding_enabled()
             && self.node_waiter_count.load(Ordering::Acquire) == 0
             && !self.offline_sync_metrics.active.load(Ordering::Acquire)
         {
@@ -457,7 +457,7 @@ impl Client {
 
         // Emit raw node before any early returns so all decoded stanzas
         // (including IQ responses and xmlstreamend) reach external observers
-        if self.raw_node_forwarding.load(Ordering::Relaxed) {
+        if self.raw_node_forwarding_enabled() {
             self.core
                 .event_bus
                 .dispatch(Event::RawNode(Arc::clone(&node)));

@@ -57,6 +57,25 @@ use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+/// Lease that keeps raw decoded stanza events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+#[must_use = "dropping the lease immediately releases raw-node forwarding"]
+pub struct RawNodeLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for RawNodeLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let previous = client.raw_node_forwarding.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "raw-node forwarding lease underflow");
+    }
+}
+
 /// Filter for matching incoming stanzas (nodes) by tag and attributes.
 ///
 /// Used with [`Client::wait_for_node`] to wait for specific stanzas.
@@ -1020,9 +1039,8 @@ pub struct Client {
     /// its allocation-churn snapshot. Unset unless that builder method was used.
     pub(crate) alloc_meter: std::sync::OnceLock<Arc<wacore::stats::AllocMeter>>,
 
-    /// When true, emit `Event::RawNode` for every decoded stanza before router dispatch.
-    /// Default false — only enable when external consumers need raw protocol access.
-    raw_node_forwarding: AtomicBool,
+    /// Number of consumers currently requesting `Event::RawNode` forwarding.
+    raw_node_forwarding: AtomicUsize,
 
     /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
     /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the

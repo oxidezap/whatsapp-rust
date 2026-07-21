@@ -95,7 +95,7 @@ pub use client::{
 pub use client::{CallError, Voip};
 pub use client::{
     Client, ClientBuild, ClientBuilder, ClientBuilderError, ClientLifecycle, ConnectionScope,
-    ConnectionScopeState,
+    ConnectionScopeState, RawNodeLease,
 };
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
@@ -181,7 +181,7 @@ pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
     pub use crate::client::{
         Client, ClientBuilder, ClientBuilderError, ClientError, ClientLifecycle, ConnectionScope,
-        ConnectionScopeState,
+        ConnectionScopeState, RawNodeLease,
     };
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]

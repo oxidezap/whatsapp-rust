@@ -906,7 +906,7 @@ pub enum Event {
 
     /// Raw decoded stanza, emitted before router dispatch.
     /// Library extension — no WA Web equivalent (WA Web has no raw stanza observer).
-    /// Gated by `Client::set_raw_node_forwarding(true)` to avoid overhead when unused.
+    /// Gated by `Client::acquire_raw_node_forwarding()` to avoid overhead when unused.
     #[serde(skip)]
     RawNode(Arc<OwnedNodeRef>),
 
