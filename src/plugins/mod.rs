@@ -204,6 +204,8 @@ pub enum PluginResourceError {
     NotActive,
     #[error("the plugin scope is shutting down")]
     ShuttingDown,
+    #[error("the plugin task capacity is exhausted")]
+    TaskCapacityExceeded,
 }
 
 #[derive(Debug, Error)]
@@ -229,7 +231,97 @@ struct PluginResources {
     closed: AtomicBool,
     activation: ShutdownNotifier,
     shutdown: ShutdownNotifier,
+    install_tasks: Arc<TaskTracker>,
+    connection_tasks: Mutex<ConnectionTaskRegistry>,
     subscriptions: Mutex<Vec<PluginCoreEventSubscription>>,
+}
+
+#[derive(Default)]
+struct ConnectionTaskRegistry {
+    closed: bool,
+    trackers: HashMap<u64, Arc<TaskTracker>>,
+}
+
+#[derive(Default)]
+struct TaskTrackerState {
+    active: usize,
+    closed: bool,
+}
+
+struct TaskTracker {
+    state: Mutex<TaskTrackerState>,
+    idle: ShutdownNotifier,
+}
+
+impl TaskTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(TaskTrackerState::default()),
+            idle: ShutdownNotifier::new(),
+        })
+    }
+
+    fn closed() -> Arc<Self> {
+        let tracker = Self::new();
+        tracker.close();
+        tracker
+    }
+
+    fn register(self: &Arc<Self>) -> Result<TaskLease, PluginResourceError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return Err(PluginResourceError::ShuttingDown);
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or(PluginResourceError::TaskCapacityExceeded)?;
+        Ok(TaskLease {
+            tracker: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        let idle = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+            state.active == 0
+        };
+        if idle {
+            self.idle.notify();
+        }
+    }
+
+    fn completion_signal(&self) -> ShutdownSignal {
+        self.idle.subscribe()
+    }
+}
+
+struct TaskLease {
+    tracker: Arc<TaskTracker>,
+}
+
+impl Drop for TaskLease {
+    fn drop(&mut self) {
+        let idle = {
+            let mut state = self
+                .tracker
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.active = state.active.saturating_sub(1);
+            state.closed && state.active == 0
+        };
+        if idle {
+            self.tracker.idle.notify();
+        }
+    }
 }
 
 struct PluginCoreEventSubscription {
@@ -244,6 +336,8 @@ impl PluginResources {
             closed: AtomicBool::new(false),
             activation: ShutdownNotifier::new(),
             shutdown: ShutdownNotifier::new(),
+            install_tasks: TaskTracker::new(),
+            connection_tasks: Mutex::new(ConnectionTaskRegistry::default()),
             subscriptions: Mutex::new(Vec::new()),
         })
     }
@@ -295,9 +389,77 @@ impl PluginResources {
         }
     }
 
+    fn connection_task_tracker(&self, generation: u64) -> Arc<TaskTracker> {
+        let mut registry = self
+            .connection_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.closed {
+            return TaskTracker::closed();
+        }
+        Arc::clone(
+            registry
+                .trackers
+                .entry(generation)
+                .or_insert_with(TaskTracker::new),
+        )
+    }
+
+    fn close_connection_tasks(&self, generation: u64) -> Arc<TaskTracker> {
+        let tracker = Arc::clone(
+            self.connection_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .trackers
+                .entry(generation)
+                .or_insert_with(TaskTracker::closed),
+        );
+        tracker.close();
+        tracker
+    }
+
+    fn forget_connection_tasks(&self, generation: u64, tracker: &Arc<TaskTracker>) {
+        let mut registry = self
+            .connection_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry
+            .trackers
+            .get(&generation)
+            .is_some_and(|current| Arc::ptr_eq(current, tracker))
+        {
+            registry.trackers.remove(&generation);
+        }
+    }
+
+    fn task_completion_signals(&self) -> Vec<ShutdownSignal> {
+        let mut signals = vec![self.install_tasks.completion_signal()];
+        signals.extend(
+            self.connection_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .trackers
+                .values()
+                .map(|tracker| tracker.completion_signal()),
+        );
+        signals
+    }
+
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        self.install_tasks.close();
+        let connection_trackers = {
+            let mut registry = self
+                .connection_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.closed = true;
+            registry.trackers.values().cloned().collect::<Vec<_>>()
+        };
+        for tracker in connection_trackers {
+            tracker.close();
         }
         self.shutdown.notify();
         let subscriptions = {
@@ -327,7 +489,8 @@ impl PluginTasks {
         if self.resources.closed.load(Ordering::Acquire) {
             return Err(PluginResourceError::ShuttingDown);
         }
-        spawn_after_activation(&self.runtime, Arc::clone(&self.resources), future);
+        let lease = self.resources.install_tasks.register()?;
+        spawn_after_activation(&self.runtime, Arc::clone(&self.resources), lease, future);
         Ok(())
     }
 
@@ -508,6 +671,7 @@ impl PluginConnectionScope {
 pub struct PluginConnectionTasks {
     runtime: Arc<dyn Runtime>,
     scope: ConnectionScope,
+    tracker: Arc<TaskTracker>,
 }
 
 impl PluginConnectionTasks {
@@ -518,7 +682,13 @@ impl PluginConnectionTasks {
         if self.scope.is_cancelled() {
             return Err(PluginResourceError::ShuttingDown);
         }
-        spawn_until_cancelled(&self.runtime, self.scope.cancellation_signal(), future);
+        let lease = self.tracker.register()?;
+        spawn_until_cancelled(
+            &self.runtime,
+            self.scope.cancellation_signal(),
+            lease,
+            future,
+        );
         Ok(())
     }
 
@@ -539,12 +709,17 @@ impl PluginConnectionTasks {
     }
 }
 
-fn spawn_until_cancelled<F>(runtime: &Arc<dyn Runtime>, cancellation: ShutdownSignal, future: F)
-where
+fn spawn_until_cancelled<F>(
+    runtime: &Arc<dyn Runtime>,
+    cancellation: ShutdownSignal,
+    lease: TaskLease,
+    future: F,
+) where
     F: Future<Output = ()> + Spawnable,
 {
     runtime
         .spawn(Box::pin(async move {
+            let _lease = lease;
             let cancelled = Box::pin(wait_for_shutdown(&cancellation));
             let work = Box::pin(future);
             let _ = futures::future::select(cancelled, work).await;
@@ -552,14 +727,19 @@ where
         .detach();
 }
 
-fn spawn_after_activation<F>(runtime: &Arc<dyn Runtime>, resources: Arc<PluginResources>, future: F)
-where
+fn spawn_after_activation<F>(
+    runtime: &Arc<dyn Runtime>,
+    resources: Arc<PluginResources>,
+    lease: TaskLease,
+    future: F,
+) where
     F: Future<Output = ()> + Spawnable,
 {
     let activation = resources.activation.subscribe();
     let cancellation = resources.shutdown.subscribe();
     runtime
         .spawn(Box::pin(async move {
+            let _lease = lease;
             let cancelled = Box::pin(wait_for_shutdown(&cancellation));
             let activated = Box::pin(wait_for_shutdown(&activation));
             if matches!(
@@ -990,8 +1170,18 @@ impl PluginHost {
 
     pub(crate) fn lifecycle_callback_timeout(&self) -> Duration {
         let callback_count = self.ordered.len() + usize::from(self.upstream.is_some());
+        let task_barrier_count = self
+            .ordered
+            .iter()
+            .filter(|plugin| {
+                plugin
+                    .manifest
+                    .capabilities
+                    .contains(PluginCapability::Tasks)
+            })
+            .count();
         self.callback_timeout
-            .saturating_mul(callback_count as u32)
+            .saturating_mul((callback_count + task_barrier_count) as u32)
             .saturating_add(Duration::from_secs(1))
     }
 
@@ -1052,17 +1242,30 @@ impl PluginHost {
         &self,
         scope: ConnectionScope,
         manifest: &PluginManifest,
+        task_tracker: Option<Arc<TaskTracker>>,
     ) -> PluginConnectionScope {
-        let tasks = manifest
-            .capabilities
-            .contains(PluginCapability::Tasks)
-            .then(|| self.runtime.get().cloned())
-            .flatten()
-            .map(|runtime| PluginConnectionTasks {
-                runtime,
-                scope: scope.clone(),
-            });
+        let tasks = if manifest.capabilities.contains(PluginCapability::Tasks) {
+            self.runtime
+                .get()
+                .cloned()
+                .zip(task_tracker)
+                .map(|(runtime, tracker)| PluginConnectionTasks {
+                    runtime,
+                    scope: scope.clone(),
+                    tracker,
+                })
+        } else {
+            None
+        };
         PluginConnectionScope { scope, tasks }
+    }
+
+    async fn wait_for_tasks(&self, completion_signals: Vec<ShutdownSignal>) -> anyhow::Result<()> {
+        let runtime = self
+            .runtime
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("plugin runtime is unavailable"))?;
+        wait_for_plugin_tasks(&**runtime, self.callback_timeout, completion_signals).await
     }
 
     async fn install_all(&self, client: Weak<Client>) -> anyhow::Result<()> {
@@ -1163,7 +1366,13 @@ impl ClientLifecycle for PluginHost {
                 failures.push(format!("upstream: {error:#}"));
             }
             for plugin in self.installed.get().into_iter().flatten() {
-                let plugin_scope = self.connection_scope(scope.clone(), &plugin.manifest);
+                let task_tracker = plugin
+                    .manifest
+                    .capabilities
+                    .contains(PluginCapability::Tasks)
+                    .then(|| plugin.resources.connection_task_tracker(scope.generation()));
+                let plugin_scope =
+                    self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
                 if let Err(error) = self
                     .run_callback(|| plugin.plugin.on_ready(plugin_scope))
                     .await
@@ -1179,7 +1388,26 @@ impl ClientLifecycle for PluginHost {
         Box::pin(async move {
             let mut failures = Vec::new();
             for plugin in self.installed.get().into_iter().flatten().rev() {
-                let plugin_scope = self.connection_scope(scope.clone(), &plugin.manifest);
+                let task_tracker = plugin
+                    .manifest
+                    .capabilities
+                    .contains(PluginCapability::Tasks)
+                    .then(|| plugin.resources.close_connection_tasks(scope.generation()));
+                if let Some(task_tracker) = &task_tracker {
+                    match self
+                        .wait_for_tasks(vec![task_tracker.completion_signal()])
+                        .await
+                    {
+                        Ok(()) => plugin
+                            .resources
+                            .forget_connection_tasks(scope.generation(), task_tracker),
+                        Err(error) => {
+                            failures.push(format!("{} tasks: {error:#}", plugin.manifest.id));
+                        }
+                    }
+                }
+                let plugin_scope =
+                    self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
                 if let Err(error) = self
                     .run_callback(|| plugin.plugin.on_closed(plugin_scope))
                     .await
@@ -1215,6 +1443,12 @@ impl ClientLifecycle for PluginHost {
             let mut failures = Vec::new();
             self.signal_shutdown();
             for plugin in self.installed.get().into_iter().flatten().rev() {
+                if let Err(error) = self
+                    .wait_for_tasks(plugin.resources.task_completion_signals())
+                    .await
+                {
+                    failures.push(format!("{} tasks: {error:#}", plugin.manifest.id));
+                }
                 if let Err(error) = self.run_callback(|| plugin.plugin.shutdown()).await {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
@@ -1241,18 +1475,43 @@ async fn shutdown_staged_plugins(
     mut installed: Vec<InstalledPlugin>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
 ) {
-    if let Some(plugin) = current
-        && let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+    if let Some(plugin) = current {
+        if let Err(error) = wait_for_plugin_tasks(
+            &*runtime,
+            PLUGIN_CALLBACK_TIMEOUT,
+            plugin.resources.task_completion_signals(),
+        )
+        .await
+        {
+            log::warn!(
+                "Plugin `{}` failed-install task cleanup failed: {error:#}",
+                plugin.manifest.id
+            );
+        }
+        if let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
             plugin.plugin.shutdown()
         })
         .await
-    {
-        log::warn!(
-            "Plugin `{}` failed-install rollback failed: {error:#}",
-            plugin.manifest.id
-        );
+        {
+            log::warn!(
+                "Plugin `{}` failed-install rollback failed: {error:#}",
+                plugin.manifest.id
+            );
+        }
     }
     while let Some(plugin) = installed.pop() {
+        if let Err(error) = wait_for_plugin_tasks(
+            &*runtime,
+            PLUGIN_CALLBACK_TIMEOUT,
+            plugin.resources.task_completion_signals(),
+        )
+        .await
+        {
+            log::warn!(
+                "Plugin `{}` rollback task cleanup failed: {error:#}",
+                plugin.manifest.id
+            );
+        }
         if let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
             plugin.plugin.shutdown()
         })
@@ -1268,6 +1527,26 @@ async fn shutdown_staged_plugins(
     {
         log::warn!("Upstream lifecycle rollback failed: {error:#}");
     }
+}
+
+async fn wait_for_plugin_tasks(
+    runtime: &dyn Runtime,
+    timeout: Duration,
+    completion_signals: Vec<ShutdownSignal>,
+) -> anyhow::Result<()> {
+    let wait_for_all = async move {
+        for signal in completion_signals {
+            wait_for_shutdown(&signal).await;
+        }
+    };
+    runtime_timeout(runtime, timeout, wait_for_all)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "plugin tasks did not stop within {:.3} seconds",
+                timeout.as_secs_f64()
+            )
+        })
 }
 
 async fn bounded_plugin_callback<'a>(
@@ -1766,7 +2045,12 @@ mod tests {
 
         fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
             let log = self.log.clone();
+            let task_dropped = self.task_dropped.clone();
             Box::pin(async move {
+                anyhow::ensure!(
+                    task_dropped.load(Ordering::Acquire),
+                    "rollback task still running during shutdown"
+                );
                 record(&log, "shutdown:rollback");
                 Ok(())
             })
@@ -2123,6 +2407,8 @@ mod tests {
         install_dropped: Arc<AtomicBool>,
         connection_started: Arc<AtomicBool>,
         connection_dropped: Arc<AtomicBool>,
+        closed_after_task: Arc<AtomicBool>,
+        shutdown_after_task: Arc<AtomicBool>,
     }
 
     impl ClientPlugin for ScopedTaskPlugin {
@@ -2166,6 +2452,24 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+            let task_dropped = self.connection_dropped.load(Ordering::Acquire);
+            let closed_after_task = self.closed_after_task.clone();
+            Box::pin(async move {
+                closed_after_task.store(task_dropped, Ordering::Release);
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let task_dropped = self.install_dropped.load(Ordering::Acquire);
+            let shutdown_after_task = self.shutdown_after_task.clone();
+            Box::pin(async move {
+                shutdown_after_task.store(task_dropped, Ordering::Release);
+                Ok(())
+            })
+        }
     }
 
     async fn wait_for_flag(flag: &AtomicBool) {
@@ -2184,6 +2488,8 @@ mod tests {
         let install_dropped = Arc::new(AtomicBool::new(false));
         let connection_started = Arc::new(AtomicBool::new(false));
         let connection_dropped = Arc::new(AtomicBool::new(false));
+        let closed_after_task = Arc::new(AtomicBool::new(false));
+        let shutdown_after_task = Arc::new(AtomicBool::new(false));
         let build = complete_builder()
             .await
             .with_plugin(ScopedTaskPlugin {
@@ -2191,6 +2497,8 @@ mod tests {
                 install_dropped: install_dropped.clone(),
                 connection_started: connection_started.clone(),
                 connection_dropped: connection_dropped.clone(),
+                closed_after_task: closed_after_task.clone(),
+                shutdown_after_task: shutdown_after_task.clone(),
             })
             .build()
             .await
@@ -2208,11 +2516,20 @@ mod tests {
             .expect("plugin ready callback");
         wait_for_flag(&connection_started).await;
         scope.cancel();
-        wait_for_flag(&connection_dropped).await;
+        client
+            .plugin_host
+            .as_ref()
+            .expect("plugin host")
+            .on_closed(scope)
+            .await
+            .expect("plugin closed callback");
+        assert!(connection_dropped.load(Ordering::Acquire));
+        assert!(closed_after_task.load(Ordering::Acquire));
         assert!(!install_dropped.load(Ordering::Acquire));
 
         client.disconnect().await;
-        wait_for_flag(&install_dropped).await;
+        assert!(install_dropped.load(Ordering::Acquire));
+        assert!(shutdown_after_task.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2222,6 +2539,7 @@ mod tests {
         let tasks = PluginConnectionTasks {
             runtime: Arc::new(TokioRuntime),
             scope: scope.clone(),
+            tracker: TaskTracker::new(),
         };
         let guard = DropFlag(task_dropped.clone());
         tasks
@@ -2269,6 +2587,7 @@ mod tests {
         let connection_tasks = PluginConnectionTasks {
             runtime: Arc::new(TokioRuntime),
             scope: scope.clone(),
+            tracker: TaskTracker::new(),
         };
         let connection_sleeper =
             tokio::spawn(async move { connection_tasks.sleep(Duration::from_secs(60)).await });
