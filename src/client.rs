@@ -690,6 +690,7 @@ pub struct Client {
     /// Allocated only when an extension host installs lifecycle callbacks.
     lifecycle: Option<Arc<LifecycleRegistration>>,
     /// Allocated only when at least one build-time plugin is registered.
+    #[cfg(feature = "plugins")]
     pub(crate) plugin_host: Option<Arc<crate::plugins::PluginHost>>,
     /// Per-session wire I/O and activity counters. Written at the transport
     /// chokepoints (noise sender task, read loop); the keepalive dead-socket

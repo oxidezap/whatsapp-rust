@@ -156,6 +156,7 @@ impl Client {
     ) -> ClientAssembly {
         let ClientExtensions {
             lifecycle,
+            #[cfg(feature = "plugins")]
             plugin_host,
         } = extensions;
         let mut unique_id_bytes = [0u8; 2];
@@ -185,6 +186,7 @@ impl Client {
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
             lifecycle,
+            #[cfg(feature = "plugins")]
             plugin_host,
             stats: Arc::new(wacore::stats::SessionStats::new()),
 

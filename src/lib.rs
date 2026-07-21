@@ -111,7 +111,9 @@ pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
 pub mod passkey;
+#[cfg(feature = "plugins")]
 pub mod plugins;
+#[cfg(feature = "plugins")]
 pub use plugins::{
     ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
     PluginConnectionTasks, PluginContext, PluginCoreEvents, PluginIq, PluginIqError,
@@ -190,6 +192,7 @@ pub mod prelude {
         Client, ClientBuilder, ClientBuilderError, ClientError, ClientLifecycle, ConnectionScope,
         ConnectionScopeState, RawNodeLease,
     };
+    #[cfg(feature = "plugins")]
     pub use crate::plugins::{
         ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext, PluginManifest,
     };
