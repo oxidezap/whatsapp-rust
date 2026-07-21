@@ -42,6 +42,7 @@ pub mod request;
 pub mod runtime;
 pub mod secret_enc_addon;
 pub mod send;
+mod serde_helpers;
 pub mod session;
 pub mod shortcake;
 pub mod stanza;

@@ -562,9 +562,8 @@ impl ProtocolStore for InMemoryBackend {
             return Ok(());
         }
         let mut state = self.state.lock().await;
-        let targets: std::collections::HashSet<&str> = device_jids.iter().copied().collect();
         for group_map in state.sender_key_devices.values_mut() {
-            group_map.retain(|jid, _| !targets.contains(jid.as_str()));
+            group_map.retain(|jid, _| !device_jids.contains(&jid.as_str()));
         }
         Ok(())
     }

@@ -1266,16 +1266,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: recipient.user.to_string(),
-                devices: vec![
-                    DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    },
-                    DeviceInfo {
-                        device_id: 1,
-                        key_index: None,
-                    },
-                ],
+                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,

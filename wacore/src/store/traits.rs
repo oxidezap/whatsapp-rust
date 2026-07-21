@@ -87,6 +87,42 @@ pub struct DeviceInfo {
     pub device_id: u32,
     /// The key index, if known
     pub key_index: Option<u32>,
+    /// Whether the device uses the hosted PN/LID address space.
+    #[serde(default)]
+    pub is_hosted: bool,
+}
+
+impl DeviceInfo {
+    /// Construct a regular device entry.
+    pub const fn new(device_id: u32, key_index: Option<u32>) -> Self {
+        Self {
+            device_id,
+            key_index,
+            is_hosted: false,
+        }
+    }
+
+    /// Apply the hosted bit reported by the device-list source.
+    pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
+        self.is_hosted = is_hosted;
+        self
+    }
+}
+
+#[cfg(test)]
+mod device_info_tests {
+    use super::DeviceInfo;
+
+    #[test]
+    fn hosted_flag_is_backward_compatible_with_persisted_json() {
+        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
+        assert!(!legacy.is_hosted);
+
+        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
+        let roundtrip: DeviceInfo =
+            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
+        assert!(roundtrip.is_hosted);
+    }
 }
 
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
