@@ -111,6 +111,13 @@ pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
 pub mod passkey;
+pub mod plugins;
+pub use plugins::{
+    ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
+    PluginConnectionTasks, PluginContext, PluginCoreEvents, PluginIq, PluginIqError,
+    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
+    PluginTasks,
+};
 pub mod request;
 pub(crate) mod signal_flush;
 pub use request::IqError;
@@ -182,6 +189,9 @@ pub mod prelude {
     pub use crate::client::{
         Client, ClientBuilder, ClientBuilderError, ClientError, ClientLifecycle, ConnectionScope,
         ConnectionScopeState, RawNodeLease,
+    };
+    pub use crate::plugins::{
+        ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext, PluginManifest,
     };
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]

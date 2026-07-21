@@ -7,6 +7,7 @@ use thiserror::Error;
 use super::{Client, ClientLifecycle, LifecycleRegistration};
 use crate::cache_config::CacheConfig;
 use crate::http::HttpClient;
+use crate::plugins::{ClientPlugin, PluginHost, PluginPlan, PluginPlanError, PluginRegistration};
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::sync_task::MajorSyncTask;
@@ -62,6 +63,10 @@ pub enum ClientBuilderError {
     UnsupportedDurabilityBackend(String),
     #[error("client lifecycle installation failed: {0}")]
     LifecycleInstall(#[source] anyhow::Error),
+    #[error("plugin host installation failed: {0}")]
+    PluginInstall(#[source] anyhow::Error),
+    #[error("invalid plugin plan: {0}")]
+    PluginPlan(#[from] PluginPlanError),
 }
 
 /// Runtime-validated, low-level builder for [`Client`].
@@ -85,6 +90,7 @@ pub struct ClientBuilder {
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     background_saver_interval: Option<Duration>,
     lifecycle: Option<Arc<dyn ClientLifecycle>>,
+    plugins: Vec<PluginRegistration>,
 }
 
 impl Default for ClientBuilder {
@@ -112,6 +118,7 @@ impl ClientBuilder {
             alloc_meter: None,
             background_saver_interval: None,
             lifecycle: None,
+            plugins: Vec::new(),
         }
     }
 
@@ -275,6 +282,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a native plugin for transactional installation before services start.
+    pub fn with_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(PluginRegistration::new(plugin));
+        self
+    }
+
+    /// Register an already-shared native plugin without changing its marker type.
+    pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+        self.plugins.push(PluginRegistration::new_arc(plugin));
+        self
+    }
+
+    pub(crate) fn with_plugin_registrations(
+        mut self,
+        registrations: Vec<PluginRegistration>,
+    ) -> Self {
+        self.plugins = registrations;
+        self
+    }
+
     /// Validate dependencies, assemble an inert client, then start its services.
     pub async fn build(self) -> Result<ClientBuild, ClientBuilderError> {
         self.build_boxed().await
@@ -343,6 +370,7 @@ impl ClientBuilder {
         transport_factory: Arc<dyn TransportFactory>,
         http_client: Arc<dyn HttpClient>,
     ) -> Result<ClientBuild, ClientBuilderError> {
+        let plugin_plan = PluginPlan::prepare(self.plugins)?;
         let runtime: Arc<dyn Runtime> = match self.task_instrument {
             Some(instrument) => {
                 Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
@@ -350,8 +378,13 @@ impl ClientBuilder {
             None => runtime,
         };
 
-        let lifecycle = self
-            .lifecycle
+        let mut lifecycle_handler = self.lifecycle;
+        let plugin_host = plugin_plan.map(|plan| {
+            let host = PluginHost::new(plan, lifecycle_handler.take());
+            lifecycle_handler = Some(host.clone());
+            host
+        });
+        let lifecycle = lifecycle_handler
             .map(|handler| Arc::new(LifecycleRegistration::new(handler, Arc::clone(&runtime))));
         let assembly = Client::assemble(
             Arc::clone(&runtime),
@@ -360,7 +393,10 @@ impl ClientBuilder {
             http_client,
             self.override_version,
             self.cache_config,
-            lifecycle,
+            ClientExtensions {
+                lifecycle,
+                plugin_host,
+            },
         );
         let client = assembly.client();
 
@@ -382,11 +418,14 @@ impl ClientBuilder {
         if let Some(meter) = self.alloc_meter {
             let _ = client.alloc_meter.set(meter);
         }
-        if let Some(lifecycle) = &client.lifecycle {
-            lifecycle
-                .install(Arc::downgrade(&client))
-                .await
-                .map_err(ClientBuilderError::LifecycleInstall)?;
+        if let Some(lifecycle) = &client.lifecycle
+            && let Err(error) = lifecycle.install(Arc::downgrade(&client)).await
+        {
+            return Err(if client.plugin_host.is_some() {
+                ClientBuilderError::PluginInstall(error)
+            } else {
+                ClientBuilderError::LifecycleInstall(error)
+            });
         }
 
         let build = assembly.start();
@@ -397,6 +436,9 @@ impl ClientBuilder {
                 build.client.shutdown_signal(),
             );
             let _ = build.client.saver_handle.set(saver_handle);
+        }
+        if let Some(plugin_host) = &client.plugin_host {
+            plugin_host.activate();
         }
         Ok(build)
     }
@@ -444,6 +486,12 @@ async fn probe_durability_backend(
 pub(super) struct ClientAssembly {
     client: Arc<Client>,
     sync_task_receiver: async_channel::Receiver<MajorSyncTask>,
+}
+
+#[derive(Default)]
+pub(super) struct ClientExtensions {
+    pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,
+    pub(super) plugin_host: Option<Arc<PluginHost>>,
 }
 
 impl ClientAssembly {
@@ -587,7 +635,7 @@ mod tests {
             Arc::new(MockHttpClient),
             None,
             CacheConfig::default(),
-            None,
+            ClientExtensions::default(),
         );
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 

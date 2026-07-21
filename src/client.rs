@@ -15,7 +15,7 @@ pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
 mod voip;
-use builder::ClientAssembly;
+use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
 use extension_lifecycle::LifecycleRegistration;
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
@@ -689,6 +689,8 @@ pub struct Client {
     pub(crate) connection_shutdown: std::sync::Mutex<wacore::runtime::ShutdownNotifier>,
     /// Allocated only when an extension host installs lifecycle callbacks.
     lifecycle: Option<Arc<LifecycleRegistration>>,
+    /// Allocated only when at least one build-time plugin is registered.
+    pub(crate) plugin_host: Option<Arc<crate::plugins::PluginHost>>,
     /// Per-session wire I/O and activity counters. Written at the transport
     /// chokepoints (noise sender task, read loop); the keepalive dead-socket
     /// watchdog reads its activity timestamps. Snapshot via [`Client::stats`].

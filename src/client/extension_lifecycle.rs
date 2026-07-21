@@ -47,7 +47,7 @@ pub struct ConnectionScope {
 }
 
 impl ConnectionScope {
-    fn new(generation: u64) -> Self {
+    pub(crate) fn new(generation: u64) -> Self {
         Self {
             inner: Arc::new(ConnectionScopeInner {
                 generation,
@@ -88,7 +88,7 @@ impl ConnectionScope {
             .is_ok()
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         let mut state = self.inner.state.load(Ordering::Acquire);
         while state < SCOPE_CANCELLED {
             match self.inner.state.compare_exchange_weak(

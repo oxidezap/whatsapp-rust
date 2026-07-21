@@ -152,8 +152,12 @@ impl Client {
         http_client: Arc<dyn crate::http::HttpClient>,
         override_version: Option<(u32, u32, u32)>,
         cache_config: CacheConfig,
-        lifecycle: Option<Arc<LifecycleRegistration>>,
+        extensions: ClientExtensions,
     ) -> ClientAssembly {
+        let ClientExtensions {
+            lifecycle,
+            plugin_host,
+        } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
@@ -181,6 +185,7 @@ impl Client {
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
             lifecycle,
+            plugin_host,
             stats: Arc::new(wacore::stats::SessionStats::new()),
 
             transport: Arc::new(Mutex::new(None)),

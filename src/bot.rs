@@ -1,6 +1,7 @@
 use crate::cache_config::CacheConfig;
 use crate::client::{Client, ClientBuilderError};
 use crate::pair_code::PairCodeOptions;
+use crate::plugins::{ClientPlugin, PluginRegistration};
 use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
@@ -671,6 +672,7 @@ pub struct BotBuilder<
     resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
+    plugins: Vec<PluginRegistration>,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -696,6 +698,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             resend_rate_limit: None,
             task_instrument: None,
             alloc_meter: None,
+            plugins: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -725,6 +728,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             resend_rate_limit: self.resend_rate_limit,
             task_instrument: self.task_instrument,
             alloc_meter: self.alloc_meter,
+            plugins: self.plugins,
             _marker: PhantomData,
         }
     }
@@ -841,6 +845,18 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     pub fn with_alloc_meter(mut self, meter: Arc<wacore::stats::AllocMeter>) -> Self {
         self.task_instrument = Some(meter.clone());
         self.alloc_meter = Some(meter);
+        self
+    }
+
+    /// Register a native plugin without changing the builder's typestate.
+    pub fn with_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(PluginRegistration::new(plugin));
+        self
+    }
+
+    /// Register an already-shared native plugin without changing its marker type.
+    pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+        self.plugins.push(PluginRegistration::new_arc(plugin));
         self
     }
 
@@ -1288,6 +1304,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_http_client_arc(http_client)
             .with_cache_config(self.cache_config)
             .with_custom_enc_handlers(self.custom_enc_handlers)
+            .with_plugin_registrations(self.plugins)
             .with_skip_history_sync(self.skip_history_sync)
             .with_background_saver_interval(std::time::Duration::from_secs(30));
 
@@ -1383,6 +1400,41 @@ mod tests {
             .await
             .expect("build")
             .client()
+    }
+
+    struct BotBuilderPlugin;
+
+    impl ClientPlugin for BotBuilderPlugin {
+        type Api = &'static str;
+
+        fn manifest(&self) -> crate::plugins::PluginManifest {
+            crate::plugins::PluginManifest::new("bot-builder-test", "0.1.0")
+        }
+
+        fn install(
+            &self,
+            _context: crate::plugins::PluginContext,
+        ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async { Ok(Arc::new("installed")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn typestate_builder_preserves_registered_plugins() {
+        let bot = Bot::builder()
+            .with_plugin(BotBuilderPlugin)
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("bot plugin build");
+        assert_eq!(
+            bot.client().plugin::<BotBuilderPlugin>().as_deref(),
+            Some(&"installed")
+        );
+        bot.client().disconnect().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {
