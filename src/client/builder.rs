@@ -845,7 +845,7 @@ mod tests {
     #[cfg(feature = "client-lifecycle")]
     async fn shutdown_during_install_rejects_leaked_run_and_the_build() {
         let (client_tx, client_rx) = async_channel::bounded(1);
-        let (release_tx, release_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
         let (run_finished_tx, run_finished_rx) = async_channel::bounded(1);
         let builder = complete_builder()
             .await
@@ -860,10 +860,12 @@ mod tests {
             .await
             .expect("client leaked during install");
         leaked_client.signal_shutdown_sync();
-        release_tx.send(()).await.expect("release installation");
 
         assert!(matches!(
-            build.await.expect("builder task"),
+            tokio::time::timeout(Duration::from_secs(2), build)
+                .await
+                .expect("lifecycle install ignored terminal shutdown")
+                .expect("builder task"),
             Err(ClientBuilderError::LifecycleInstall(_))
         ));
         tokio::time::timeout(Duration::from_secs(5), run_finished_rx.recv())

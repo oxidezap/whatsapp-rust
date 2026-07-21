@@ -929,6 +929,19 @@ impl Client {
         #[cfg(not(feature = "client-lifecycle"))]
         self.connection_generation.fetch_add(1, Ordering::SeqCst);
         #[cfg(feature = "client-lifecycle")]
+        let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
+            let lifecycle = Arc::clone(lifecycle);
+            scopeguard::guard((lifecycle, closed_generation), |(lifecycle, generation)| {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    lifecycle.close_scope(generation);
+                }))
+                .is_err()
+                {
+                    error!("Client lifecycle scope closure panicked");
+                }
+            })
+        });
+        #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_scope(closed_generation);
         }
@@ -1089,9 +1102,7 @@ impl Client {
             proc.clear_key_cache().await;
         }
         #[cfg(feature = "client-lifecycle")]
-        if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.close_scope(closed_generation);
-        }
+        drop(scope_close);
     }
 
     /// Waits for the noise socket to be established.

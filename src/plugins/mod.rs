@@ -1081,9 +1081,19 @@ impl PluginInstallRollback {
         let cleanup_runtime = runtime.clone();
         runtime
             .spawn(Box::pin(async move {
-                shutdown_staged_plugins(cleanup_runtime, current, installed, upstream, staged_apis)
-                    .await;
+                let result = AssertUnwindSafe(shutdown_staged_plugins(
+                    cleanup_runtime,
+                    current,
+                    installed,
+                    upstream,
+                    staged_apis,
+                ))
+                .catch_unwind()
+                .await;
                 completed.notify();
+                if result.is_err() {
+                    log::warn!("Plugin installation rollback panicked");
+                }
             }))
             .detach();
         Some(completion)
@@ -1126,6 +1136,8 @@ pub(crate) struct PluginHost {
     event_router: Option<PluginEventRouter>,
     callback_timeout: Duration,
     terminal: AtomicBool,
+    terminal_notifier: ShutdownNotifier,
+    installing_resources: Mutex<Vec<Weak<PluginResources>>>,
 }
 
 impl PluginHost {
@@ -1164,6 +1176,8 @@ impl PluginHost {
             event_router,
             callback_timeout,
             terminal: AtomicBool::new(false),
+            terminal_notifier: ShutdownNotifier::new(),
+            installing_resources: Mutex::new(Vec::new()),
         })
     }
 
@@ -1286,6 +1300,13 @@ impl PluginHost {
             .set(runtime.clone())
             .map_err(|_| anyhow::anyhow!("plugin host was installed more than once"))?;
 
+        let installing_resources = &self.installing_resources;
+        let _installing_resources = scopeguard::guard((), move |_| {
+            installing_resources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        });
         let mut rollback = PluginInstallRollback::new(runtime.clone(), self.ordered.len());
         self.abort_install_if_terminal(&mut rollback).await?;
         if let Some(upstream) = &self.upstream {
@@ -1313,9 +1334,29 @@ impl PluginHost {
             rollback.current = Some(InstalledPlugin {
                 plugin: planned.plugin.clone(),
                 manifest: planned.manifest.clone(),
-                resources,
+                resources: Arc::clone(&resources),
             });
-            let api = match plugin_install(|| planned.plugin.install(context)).await {
+            if !self.track_installing_resources(&resources) {
+                rollback.rollback().await;
+                anyhow::bail!("plugin host shut down during installation");
+            }
+            let terminal = self.terminal_notifier.subscribe();
+            let cancelled = Box::pin(wait_for_shutdown(&terminal));
+            let install = Box::pin(plugin_install(|| planned.plugin.install(context)));
+            let install_result = match futures::future::select(cancelled, install).await {
+                futures::future::Either::Left((_, install)) => {
+                    if std::panic::catch_unwind(AssertUnwindSafe(|| drop(install))).is_err() {
+                        log::warn!(
+                            "Plugin `{}` install future panicked while being cancelled",
+                            planned.manifest.id
+                        );
+                    }
+                    rollback.rollback().await;
+                    anyhow::bail!("plugin host shut down during installation");
+                }
+                futures::future::Either::Right((result, _)) => result,
+            };
+            let api = match install_result {
                 Ok(api) => api,
                 Err(error) => {
                     rollback.rollback().await;
@@ -1356,6 +1397,33 @@ impl PluginHost {
         }
         rollback.rollback().await;
         anyhow::bail!("plugin host shut down during installation")
+    }
+
+    fn track_installing_resources(&self, resources: &Arc<PluginResources>) -> bool {
+        let mut installing = self
+            .installing_resources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.terminal.load(Ordering::Acquire) {
+            drop(installing);
+            resources.close();
+            return false;
+        }
+        installing.push(Arc::downgrade(resources));
+        true
+    }
+
+    fn close_installing_resources(&self) {
+        let resources = self
+            .installing_resources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for resources in resources {
+            resources.close();
+        }
     }
 
     pub(crate) fn activate(&self) -> bool {
@@ -1466,6 +1534,8 @@ impl ClientLifecycle for PluginHost {
 
     fn signal_shutdown(&self) {
         self.terminal.store(true, Ordering::Release);
+        self.close_installing_resources();
+        self.terminal_notifier.notify();
         if let Some(router) = &self.event_router {
             router.close();
         }
@@ -1567,7 +1637,9 @@ async fn shutdown_staged_plugins(
     {
         log::warn!("Upstream lifecycle rollback failed: {error:#}");
     }
-    drop(staged_apis);
+    if std::panic::catch_unwind(AssertUnwindSafe(|| drop(staged_apis))).is_err() {
+        log::warn!("Plugin API panicked while being dropped during rollback");
+    }
 }
 
 async fn wait_for_plugin_tasks(
@@ -1699,6 +1771,57 @@ mod tests {
 
     struct ShutdownDuringPluginInstall;
 
+    struct CaptureInstallClient {
+        client: async_channel::Sender<Weak<Client>>,
+    }
+
+    impl ClientLifecycle for CaptureInstallClient {
+        fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+            let sender = self.client.clone();
+            Box::pin(async move {
+                sender.send(client).await?;
+                Ok(())
+            })
+        }
+    }
+
+    struct TerminalBlockingInstallPlugin {
+        started: async_channel::Sender<ShutdownSignal>,
+        install_dropped: Arc<AtomicBool>,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl ClientPlugin for TerminalBlockingInstallPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("terminal-blocking-install", "0.1.0")
+                .with_capability(PluginCapability::Tasks)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            let started = self.started.clone();
+            let install_dropped = self.install_dropped.clone();
+            Box::pin(async move {
+                let _drop = DropFlag(install_dropped);
+                let shutdown = context
+                    .tasks()
+                    .ok_or_else(|| anyhow::anyhow!("tasks capability missing"))?
+                    .shutdown_signal();
+                started.send(shutdown).await?;
+                futures::future::pending().await
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let shutdown_called = self.shutdown_called.clone();
+            Box::pin(async move {
+                shutdown_called.store(true, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+
     impl ClientLifecycle for ShutdownDuringPluginInstall {
         fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
             Box::pin(async move {
@@ -1754,6 +1877,43 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_inflight_plugin_install_and_closes_its_resources() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let install_dropped = Arc::new(AtomicBool::new(false));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let builder = complete_builder()
+            .await
+            .with_lifecycle(CaptureInstallClient { client: client_tx })
+            .with_plugin(TerminalBlockingInstallPlugin {
+                started: started_tx,
+                install_dropped: install_dropped.clone(),
+                shutdown_called: shutdown_called.clone(),
+            });
+
+        let build = tokio::spawn(async move { builder.build().await });
+        let client = client_rx
+            .recv()
+            .await
+            .expect("captured install client")
+            .upgrade()
+            .expect("client under construction");
+        let resource_shutdown = started_rx.recv().await.expect("plugin install started");
+
+        client.signal_shutdown_sync();
+        assert!(resource_shutdown.is_fired());
+        let result = tokio::time::timeout(Duration::from_secs(2), build)
+            .await
+            .expect("plugin install ignored terminal shutdown")
+            .expect("build task");
+
+        assert!(matches!(result, Err(ClientBuilderError::PluginInstall(_))));
+        assert!(install_dropped.load(Ordering::Acquire));
+        assert!(shutdown_called.load(Ordering::Acquire));
+        drop(client);
     }
 
     struct DependentPlugin {
@@ -2033,6 +2193,68 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    struct PanickingDropApi;
+
+    impl Drop for PanickingDropApi {
+        fn drop(&mut self) {
+            panic!("injected API drop panic");
+        }
+    }
+
+    struct PanickingDropPlugin {
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl ClientPlugin for PanickingDropPlugin {
+        type Api = PanickingDropApi;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("panicking-drop", "0.1.0")
+        }
+
+        fn install(
+            &self,
+            _context: PluginContext,
+        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async { Ok(Arc::new(PanickingDropApi)) })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let shutdown_called = self.shutdown_called.clone();
+            Box::pin(async move {
+                shutdown_called.store(true, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_staged_api_drop_cannot_strand_rollback_completion() {
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let plugin = Arc::new(PanickingDropPlugin {
+            shutdown_called: shutdown_called.clone(),
+        });
+        let manifest = plugin.manifest();
+        let erased_plugin: Arc<dyn ErasedClientPlugin> = Arc::new(PluginAdapter(plugin));
+        let resources = PluginResources::new();
+        let registry = Arc::new(ApiRegistry::default());
+        let api: ErasedApi = Arc::new(TypedApi(Arc::new(PanickingDropApi)));
+        registry.insert(TypeId::of::<PanickingDropPlugin>(), api);
+
+        let mut rollback = PluginInstallRollback::new(Arc::new(TokioRuntime), 1);
+        rollback.installed.push(InstalledPlugin {
+            plugin: erased_plugin,
+            manifest,
+            resources,
+        });
+        rollback.staged_apis = Some(registry);
+
+        tokio::time::timeout(Duration::from_secs(2), rollback.rollback())
+            .await
+            .expect("panicking API drop stranded rollback completion");
+        assert!(shutdown_called.load(Ordering::Acquire));
     }
 
     struct ContextRetainingApi {

@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::Client;
 use futures::FutureExt;
 use wacore::runtime::{
-    BoxFuture, Runtime, ShutdownNotifier, ShutdownSignal, timeout as rt_timeout,
+    BoxFuture, Runtime, ShutdownNotifier, ShutdownSignal, timeout as rt_timeout, wait_for_shutdown,
 };
 
 const SCOPE_OPEN: u8 = 0;
@@ -296,14 +296,32 @@ impl LifecycleRegistration {
     }
 
     pub(super) async fn install(&self, client: Weak<Client>) -> anyhow::Result<()> {
+        let rejected = self.construction_notifier.subscribe();
+        if self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_REJECTED {
+            return Err(anyhow::anyhow!(
+                "client shutdown began during lifecycle installation"
+            ));
+        }
         let install = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.handler.install(client)
         }))
         .map_err(|_| anyhow::anyhow!("lifecycle install panicked before returning a future"))?;
-        let result = std::panic::AssertUnwindSafe(install)
-            .catch_unwind()
-            .await
-            .map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?;
+        let cancelled = Box::pin(wait_for_shutdown(&rejected));
+        let install = Box::pin(std::panic::AssertUnwindSafe(install).catch_unwind());
+        let result = match futures::future::select(cancelled, install).await {
+            futures::future::Either::Left((_, install)) => {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(install))).is_err()
+                {
+                    log::warn!("Lifecycle install future panicked while being cancelled");
+                }
+                return Err(anyhow::anyhow!(
+                    "client shutdown began during lifecycle installation"
+                ));
+            }
+            futures::future::Either::Right((result, _)) => {
+                result.map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?
+            }
+        };
         if result.is_ok()
             && self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_REJECTED
         {
@@ -1852,16 +1870,27 @@ mod tests {
                 .await
                 .expect("persistence manager"),
         );
+        let lifecycle = Arc::new(RecordingLifecycle::default());
         let client = Client::builder()
             .with_runtime(TokioRuntime)
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
-            .with_lifecycle(RecordingLifecycle::default())
+            .with_lifecycle_arc(lifecycle.clone())
             .build()
             .await
             .expect("client build")
             .into_client();
+        const GENERATION: u64 = 41;
+        client
+            .connection_generation
+            .store(GENERATION, Ordering::SeqCst);
+        let registration = client.lifecycle.as_ref().expect("lifecycle registration");
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+        client.dispatch_connected().await;
+        let scope = registration
+            .scope_for(GENERATION)
+            .expect("connection scope");
         *client.transport.lock().await = Some(Arc::new(PanickingDisconnect));
 
         let cleanup_client = Arc::clone(&client);
@@ -1874,6 +1903,15 @@ mod tests {
             .expect_err("cleanup panic should reach its waiter");
 
         assert!(panic.is_panic());
+        assert_eq!(scope.state(), ConnectionScopeState::Closed);
+        assert!(registration.scope_for(GENERATION).is_none());
+        tokio::time::timeout(Duration::from_secs(2), registration.shutdown())
+            .await
+            .expect("shutdown waited for the panicked cleanup scope");
+        assert_eq!(
+            lifecycle.events(),
+            vec!["install", "ready:41", "closed:41", "shutdown"]
+        );
         client.signal_shutdown_sync();
     }
 
