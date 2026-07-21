@@ -1,6 +1,7 @@
 mod accessors;
 mod adapters;
 mod app_state;
+mod builder;
 mod context_impl;
 mod device_registry;
 pub(crate) mod device_topology;
@@ -13,6 +14,8 @@ pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
 mod voip;
+use builder::ClientAssembly;
+pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;

@@ -11,6 +11,11 @@ impl Client {
     /// long is the reconnect backoff counter reset to its base.
     pub(crate) const STABLE_CONNECTION_RESET_MS: i64 = 30_000;
 
+    /// Create a runtime-validated low-level client builder.
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::new()
+    }
+
     pub fn shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.shutdown_notifier.subscribe()
     }
@@ -87,7 +92,7 @@ impl Client {
         http_client: Arc<dyn crate::http::HttpClient>,
         override_version: Option<(u32, u32, u32)>,
     ) -> (Arc<Self>, async_channel::Receiver<MajorSyncTask>) {
-        Self::new_with_cache_config(
+        ClientBuilder::build_required(
             runtime,
             persistence_manager,
             transport_factory,
@@ -95,7 +100,7 @@ impl Client {
             override_version,
             CacheConfig::default(),
         )
-        .await
+        .into_parts()
     }
 
     /// Create a new `Client` with a custom [`CacheConfig`].
@@ -107,6 +112,25 @@ impl Client {
         override_version: Option<(u32, u32, u32)>,
         cache_config: CacheConfig,
     ) -> (Arc<Self>, async_channel::Receiver<MajorSyncTask>) {
+        ClientBuilder::build_required(
+            runtime,
+            persistence_manager,
+            transport_factory,
+            http_client,
+            override_version,
+            cache_config,
+        )
+        .into_parts()
+    }
+
+    pub(super) fn assemble(
+        runtime: Arc<dyn Runtime>,
+        persistence_manager: Arc<PersistenceManager>,
+        transport_factory: Arc<dyn crate::transport::TransportFactory>,
+        http_client: Arc<dyn crate::http::HttpClient>,
+        override_version: Option<(u32, u32, u32)>,
+        cache_config: CacheConfig,
+    ) -> ClientAssembly {
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
@@ -303,9 +327,12 @@ impl Client {
             .attach_topology(Arc::clone(&arc.device_topology));
         let _ = arc.self_weak.set(Arc::downgrade(&arc));
 
-        // Warm up the LID-PN cache from persistent storage
-        let warm_up_arc = arc.clone();
-        arc.runtime
+        ClientAssembly::new(arc, rx)
+    }
+
+    pub(super) fn start_services(self: &Arc<Self>) {
+        let warm_up_arc = self.clone();
+        self.runtime
             .spawn(Box::pin(async move {
                 if let Err(e) = warm_up_arc.warm_up_lid_pn_cache().await {
                     warn!("Failed to warm up LID-PN cache: {e}");
@@ -313,15 +340,12 @@ impl Client {
             }))
             .detach();
 
-        // Start background task to clean up stale device registry entries
-        let cleanup_arc = arc.clone();
-        arc.runtime
+        let cleanup_arc = self.clone();
+        self.runtime
             .spawn(Box::pin(async move {
                 cleanup_arc.device_registry_cleanup_loop().await;
             }))
             .detach();
-
-        (arc, rx)
     }
 
     // Deliberately NOT instrumented: this span would live for the entire client

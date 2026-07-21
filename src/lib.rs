@@ -84,7 +84,6 @@ pub mod types;
 
 pub mod client;
 pub(crate) mod flush_scope;
-pub use client::Client;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;
@@ -94,6 +93,7 @@ pub use client::{
     StatsSnapshot, StorageResourceReport, TransportResourceReport,
 };
 pub use client::{CallError, Voip};
+pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
