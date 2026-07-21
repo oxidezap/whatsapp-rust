@@ -1,5 +1,5 @@
 use crate::cache_config::CacheConfig;
-use crate::client::Client;
+use crate::client::{Client, ClientBuilderError};
 use crate::pair_code::PairCodeOptions;
 use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
@@ -87,49 +87,8 @@ pub enum BotBuilderError {
     /// Initializing the device row in the storage backend failed.
     #[error("failed to initialize the device store: {0}")]
     Store(#[from] StoreError),
-    /// An inbound durability hook was registered with a backend that does not
-    /// implement the pending-inbound buffer it requires.
-    #[error("the configured backend does not support the inbound durability hook: {0}")]
-    UnsupportedDurabilityBackend(String),
-}
-
-/// Verify the backend round-trips a pending-inbound buffer entry before we accept
-/// an inbound durability hook. A backend relying on the no-op/`Err` trait
-/// defaults fails here instead of silently looping every inbound message unacked.
-async fn probe_durability_backend(
-    backend: &std::sync::Arc<dyn Backend>,
-) -> std::result::Result<(), BotBuilderError> {
-    // A real JID (a backend may validate the format) and an id unique per probe
-    // invocation (pid + atomic counter) so concurrent builders on the same store
-    // never race on a shared probe row and false-fail.
-    use portable_atomic::{AtomicU64, Ordering};
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
-    const PROBE_JID: &str = "0@s.whatsapp.net";
-    const PROBE_PAYLOAD: &[u8] = b"probe";
-    let probe_id = format!(
-        "__wa_durability_probe_{}_{}__",
-        std::process::id(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let map_err = |e: StoreError| BotBuilderError::UnsupportedDurabilityBackend(e.to_string());
-    backend
-        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
-        .await
-        .map_err(map_err)?;
-    let got = backend
-        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    backend
-        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    if got.as_deref() != Some(PROBE_PAYLOAD) {
-        return Err(BotBuilderError::UnsupportedDurabilityBackend(
-            "pending-inbound buffer did not round-trip".to_string(),
-        ));
-    }
-    Ok(())
+    #[error(transparent)]
+    Client(#[from] ClientBuilderError),
 }
 
 /// `message` is `Arc` so cloning the context across spawned tasks only bumps a
@@ -1278,18 +1237,8 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             unreachable!("typestate guarantees all required fields are Provided")
         };
 
-        // Instrument the runtime before anything spawns through it, so every
-        // internal task (noise sender, saver, workers) reports to the hook.
-        // Default (None): the original runtime is used untouched. The Bot
-        // keeps its own copy for the `run()` path (see the field doc).
         let task_instrument = self.task_instrument;
         let alloc_meter = self.alloc_meter;
-        let runtime: Arc<dyn Runtime> = match task_instrument.clone() {
-            Some(instrument) => {
-                Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
-            }
-            None => runtime,
-        };
 
         // Note: For multi-account mode, create the backend with SqliteStore::new_for_device()
         // before passing it to with_backend_arc()
@@ -1331,57 +1280,37 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
 
         info!("Creating client...");
-        let (client, sync_task_receiver) = Client::new_with_cache_config(
-            runtime.clone(),
-            persistence_manager.clone(),
-            transport_factory,
-            http_client,
-            self.override_version,
-            self.cache_config,
-        )
-        .await;
+        let mut client_builder = Client::builder()
+            .with_runtime_arc(runtime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory_arc(transport_factory)
+            .with_http_client_arc(http_client)
+            .with_cache_config(self.cache_config)
+            .with_custom_enc_handlers(self.custom_enc_handlers)
+            .with_skip_history_sync(self.skip_history_sync)
+            .with_background_saver_interval(std::time::Duration::from_secs(30));
 
-        let saver_handle = persistence_manager.run_background_saver(
-            runtime,
-            std::time::Duration::from_secs(30),
-            client.shutdown_signal(),
-        );
-        // Tie the saver task to Arc<Client> so extracting client() and outliving
-        // Bot keeps periodic persistence alive. Client::drop on the last Arc
-        // drops the AbortHandle and aborts the task.
-        let _ = client.saver_handle.set(saver_handle);
-
-        // Typed alloc-meter handle for resource_report (its poll hooks are
-        // already wired via task_instrument above).
-        if let Some(meter) = alloc_meter {
-            let _ = client.alloc_meter.set(meter);
+        if let Some(version) = self.override_version {
+            client_builder = client_builder.with_version_override(version);
         }
-
-        // Register custom enc handlers. Immutable after build, so set the whole
-        // map once; the receive hot path then reads it lock-free.
-        let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
-
-        // Inbound durability hook (opt-in). Immutable after build; the receive
-        // path reads it lock-free. Probe the backend first: a backend that does
-        // not implement the pending-inbound buffer would otherwise leave every
-        // inbound message unacked and looping forever at runtime, so reject it
-        // here with a clear error instead.
         if let Some(hook) = self.inbound_durability_hook {
-            probe_durability_backend(&client.persistence_manager.backend()).await?;
-            let _ = client.inbound_durability_hook.set(hook);
+            client_builder = client_builder.with_inbound_durability_hook_arc(hook);
         }
-
-        if self.skip_history_sync {
-            client.set_skip_history_sync(true);
-        }
-
         if let Some(count) = self.wanted_pre_key_count {
-            client.set_wanted_pre_key_count(count);
+            client_builder = client_builder.with_wanted_pre_key_count(count);
         }
-
         if let Some((burst, refill_per_min)) = self.resend_rate_limit {
-            client.set_resend_rate_limit(burst, refill_per_min);
+            client_builder = client_builder.with_resend_rate_limit(burst, refill_per_min);
         }
+        client_builder = match alloc_meter {
+            Some(meter) => client_builder.with_alloc_meter(meter),
+            None => match task_instrument.clone() {
+                Some(instrument) => client_builder.with_task_instrument(instrument),
+                None => client_builder,
+            },
+        };
+
+        let (client, sync_task_receiver) = client_builder.build().await?.into_parts();
 
         Ok(Bot {
             client,

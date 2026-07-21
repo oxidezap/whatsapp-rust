@@ -1,13 +1,18 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 
 use super::Client;
 use crate::cache_config::CacheConfig;
 use crate::http::HttpClient;
+use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
+use crate::types::durability_hook::InboundDurabilityHook;
+use crate::types::enc_handler::EncHandler;
 use wacore::runtime::Runtime;
 
 /// Result of constructing a [`Client`].
@@ -42,7 +47,7 @@ impl ClientBuild {
 }
 
 /// A validated client-construction failure.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClientBuilderError {
     #[error("missing async runtime")]
@@ -53,6 +58,8 @@ pub enum ClientBuilderError {
     MissingTransportFactory,
     #[error("missing HTTP client")]
     MissingHttpClient,
+    #[error("the configured backend does not support the inbound durability hook: {0}")]
+    UnsupportedDurabilityBackend(String),
 }
 
 /// Runtime-validated, low-level builder for [`Client`].
@@ -67,6 +74,14 @@ pub struct ClientBuilder {
     http_client: Option<Arc<dyn HttpClient>>,
     override_version: Option<(u32, u32, u32)>,
     cache_config: CacheConfig,
+    custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
+    inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    skip_history_sync: bool,
+    wanted_pre_key_count: Option<usize>,
+    resend_rate_limit: Option<(u32, u32)>,
+    task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
+    alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
+    background_saver_interval: Option<Duration>,
 }
 
 impl Default for ClientBuilder {
@@ -85,6 +100,14 @@ impl ClientBuilder {
             http_client: None,
             override_version: None,
             cache_config: CacheConfig::default(),
+            custom_enc_handlers: HashMap::new(),
+            inbound_durability_hook: None,
+            skip_history_sync: false,
+            wanted_pre_key_count: None,
+            resend_rate_limit: None,
+            task_instrument: None,
+            alloc_meter: None,
+            background_saver_interval: None,
         }
     }
 
@@ -148,6 +171,91 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a handler for one encrypted payload type before the client starts.
+    pub fn with_enc_handler<H>(mut self, payload_type: impl Into<String>, handler: H) -> Self
+    where
+        H: EncHandler + 'static,
+    {
+        self.custom_enc_handlers
+            .insert(payload_type.into(), Arc::new(handler));
+        self
+    }
+
+    /// Register an already-shared encrypted payload handler.
+    pub fn with_enc_handler_arc(
+        mut self,
+        payload_type: impl Into<String>,
+        handler: Arc<dyn EncHandler>,
+    ) -> Self {
+        self.custom_enc_handlers
+            .insert(payload_type.into(), handler);
+        self
+    }
+
+    pub(crate) fn with_custom_enc_handlers(
+        mut self,
+        handlers: HashMap<String, Arc<dyn EncHandler>>,
+    ) -> Self {
+        self.custom_enc_handlers = handlers;
+        self
+    }
+
+    /// Install the durable-inbound hook after verifying backend support.
+    pub fn with_inbound_durability_hook<H>(mut self, hook: H) -> Self
+    where
+        H: InboundDurabilityHook + 'static,
+    {
+        self.inbound_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Install an already-shared durable-inbound hook.
+    pub fn with_inbound_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn InboundDurabilityHook>,
+    ) -> Self {
+        self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    pub fn with_skip_history_sync(mut self, skip: bool) -> Self {
+        self.skip_history_sync = skip;
+        self
+    }
+
+    pub fn with_wanted_pre_key_count(mut self, count: usize) -> Self {
+        self.wanted_pre_key_count = Some(count);
+        self
+    }
+
+    pub fn with_resend_rate_limit(mut self, burst: u32, refill_per_min: u32) -> Self {
+        self.resend_rate_limit = Some((burst, refill_per_min));
+        self
+    }
+
+    /// Instrument every task spawned through the configured runtime.
+    pub fn with_task_instrument(
+        mut self,
+        instrument: Arc<dyn wacore::stats::TaskInstrument>,
+    ) -> Self {
+        self.task_instrument = Some(instrument);
+        self.alloc_meter = None;
+        self
+    }
+
+    /// Install allocation attribution as the task instrument.
+    pub fn with_alloc_meter(mut self, meter: Arc<wacore::stats::AllocMeter>) -> Self {
+        self.task_instrument = Some(meter.clone());
+        self.alloc_meter = Some(meter);
+        self
+    }
+
+    /// Run periodic device persistence for the lifetime of the client.
+    pub fn with_background_saver_interval(mut self, interval: Duration) -> Self {
+        self.background_saver_interval = Some(interval);
+        self
+    }
+
     /// Validate dependencies, assemble an inert client, then start its services.
     pub async fn build(self) -> Result<ClientBuild, ClientBuilderError> {
         self.build_boxed().await
@@ -158,25 +266,32 @@ impl ClientBuilder {
         self,
     ) -> wacore::runtime::BoxFuture<'static, Result<ClientBuild, ClientBuilderError>> {
         Box::pin(async move {
-            let runtime = self.runtime.ok_or(ClientBuilderError::MissingRuntime)?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .cloned()
+                .ok_or(ClientBuilderError::MissingRuntime)?;
             let persistence_manager = self
                 .persistence_manager
+                .as_ref()
+                .cloned()
                 .ok_or(ClientBuilderError::MissingPersistenceManager)?;
             let transport_factory = self
                 .transport_factory
+                .as_ref()
+                .cloned()
                 .ok_or(ClientBuilderError::MissingTransportFactory)?;
             let http_client = self
                 .http_client
+                .as_ref()
+                .cloned()
                 .ok_or(ClientBuilderError::MissingHttpClient)?;
 
-            Ok(Self::build_required(
-                runtime,
-                persistence_manager,
-                transport_factory,
-                http_client,
-                self.override_version,
-                self.cache_config,
-            ))
+            if self.inbound_durability_hook.is_some() {
+                probe_durability_backend(&persistence_manager.backend()).await?;
+            }
+
+            Ok(self.finish(runtime, persistence_manager, transport_factory, http_client))
         })
     }
 
@@ -188,16 +303,105 @@ impl ClientBuilder {
         override_version: Option<(u32, u32, u32)>,
         cache_config: CacheConfig,
     ) -> ClientBuild {
-        Client::assemble(
-            runtime,
-            persistence_manager,
-            transport_factory,
-            http_client,
+        Self {
             override_version,
             cache_config,
-        )
-        .start()
+            ..Self::new()
+        }
+        .finish(runtime, persistence_manager, transport_factory, http_client)
     }
+
+    fn finish(
+        self,
+        runtime: Arc<dyn Runtime>,
+        persistence_manager: Arc<PersistenceManager>,
+        transport_factory: Arc<dyn TransportFactory>,
+        http_client: Arc<dyn HttpClient>,
+    ) -> ClientBuild {
+        let runtime: Arc<dyn Runtime> = match self.task_instrument {
+            Some(instrument) => {
+                Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
+            }
+            None => runtime,
+        };
+
+        let assembly = Client::assemble(
+            Arc::clone(&runtime),
+            Arc::clone(&persistence_manager),
+            transport_factory,
+            http_client,
+            self.override_version,
+            self.cache_config,
+        );
+        let client = assembly.client();
+
+        if !self.custom_enc_handlers.is_empty() {
+            let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
+        }
+        if let Some(hook) = self.inbound_durability_hook {
+            let _ = client.inbound_durability_hook.set(hook);
+        }
+        if self.skip_history_sync {
+            client.set_skip_history_sync(true);
+        }
+        if let Some(count) = self.wanted_pre_key_count {
+            client.set_wanted_pre_key_count(count);
+        }
+        if let Some((burst, refill_per_min)) = self.resend_rate_limit {
+            client.set_resend_rate_limit(burst, refill_per_min);
+        }
+        if let Some(meter) = self.alloc_meter {
+            let _ = client.alloc_meter.set(meter);
+        }
+
+        let build = assembly.start();
+        if let Some(interval) = self.background_saver_interval {
+            let saver_handle = persistence_manager.run_background_saver(
+                runtime,
+                interval,
+                build.client.shutdown_signal(),
+            );
+            let _ = build.client.saver_handle.set(saver_handle);
+        }
+        build
+    }
+}
+
+async fn probe_durability_backend(
+    backend: &Arc<dyn crate::store::traits::Backend>,
+) -> Result<(), ClientBuilderError> {
+    use portable_atomic::{AtomicU64, Ordering};
+
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    const PROBE_JID: &str = "0@s.whatsapp.net";
+    const PROBE_PAYLOAD: &[u8] = b"probe";
+    let probe_id = format!(
+        "__wa_durability_probe_{}_{}__",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let map_err =
+        |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
+
+    backend
+        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
+        .await
+        .map_err(map_err)?;
+    let stored = backend
+        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
+        .await
+        .map_err(map_err)?;
+    backend
+        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
+        .await
+        .map_err(map_err)?;
+
+    if stored.as_deref() != Some(PROBE_PAYLOAD) {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound buffer did not round-trip".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Owns the only path from a fully allocated client to started background
@@ -221,6 +425,10 @@ impl ClientAssembly {
     pub(super) fn start(self) -> ClientBuild {
         self.client.start_services();
         ClientBuild::new(self.client, self.sync_task_receiver)
+    }
+
+    fn client(&self) -> Arc<Client> {
+        Arc::clone(&self.client)
     }
 }
 
@@ -329,5 +537,44 @@ mod tests {
         let build = assembly.start();
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
         build.client().signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn low_level_builder_installs_options_and_owned_services() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let meter = Arc::new(wacore::stats::AllocMeter::new());
+
+        let build = ClientBuilder::new()
+            .with_runtime(CountingRuntime {
+                spawns: Arc::clone(&spawns),
+            })
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_skip_history_sync(true)
+            .with_wanted_pre_key_count(123)
+            .with_alloc_meter(Arc::clone(&meter))
+            .with_background_saver_interval(Duration::from_secs(3600))
+            .build()
+            .await
+            .expect("complete builder");
+        let client = build.client();
+
+        assert!(client.skip_history_sync_enabled());
+        assert_eq!(client.wanted_pre_key_count(), 123);
+        assert!(
+            client
+                .alloc_meter
+                .get()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &meter))
+        );
+        assert!(client.saver_handle.get().is_some());
+        assert_eq!(spawns.load(Ordering::SeqCst), 3);
+        client.signal_shutdown_sync();
     }
 }
