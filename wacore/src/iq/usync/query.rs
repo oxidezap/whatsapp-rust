@@ -12,6 +12,7 @@ use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
 use anyhow::{Context, anyhow};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, Node, NodeContent, NodeContentRef, NodeRef, Server};
@@ -171,14 +172,17 @@ pub enum UsyncFeature {
 }
 
 /// Per-user cache hints carried by the devices v2 subprotocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncDeviceSyncHint {
     /// Cached device-list hash, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device_hash: Option<CompactString>,
     /// Timestamp associated with the cached hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
     /// Expected timestamp used to detect stale key-index state.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_timestamp: Option<i64>,
 }
 
@@ -222,21 +226,54 @@ impl Default for UsyncDeviceSyncHint {
     }
 }
 
-/// A validated USync user input.
+/// A USync user input.
 ///
-/// Fields are private so callers cannot remove the identity established by a
-/// constructor. Protocol-specific additions are explicit builder methods.
-#[derive(Debug, Clone)]
+/// Constructors establish an identity and protocol-specific additions use
+/// explicit builder methods. Deserialization applies the same phone and JID
+/// normalization as those constructors; all invariants are validated when the
+/// user becomes part of [`UsyncQuery::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsyncUser {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_usync_jid"
+    )]
     id: Option<Jid>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_usync_jid"
+    )]
     pn_jid: Option<Jid>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_usync_phone"
+    )]
     phone: Option<CompactString>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_usync_jid"
+    )]
     known_lid: Option<Jid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     device_sync: Option<UsyncDeviceSyncHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     persona_id: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     username_pin: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     contact_type: Option<CompactString>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_helpers::serialize_optional_bytes",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_bytes"
+    )]
     tc_token: Option<Vec<u8>>,
 }
 
@@ -283,11 +320,7 @@ impl UsyncUser {
     }
 
     pub fn with_phone(mut self, phone: impl Into<CompactString>) -> Self {
-        let mut phone = phone.into();
-        if !phone.is_empty() && phone.bytes().all(|byte| byte.is_ascii_digit()) {
-            phone.insert(0, E164_PREFIX);
-        }
-        self.phone = Some(phone);
+        self.phone = Some(normalize_usync_phone(phone.into()));
         self
     }
 
@@ -407,6 +440,29 @@ impl UsyncUser {
     }
 }
 
+fn normalize_usync_phone(mut phone: CompactString) -> CompactString {
+    if !phone.is_empty() && phone.bytes().all(|byte| byte.is_ascii_digit()) {
+        phone.insert(0, E164_PREFIX);
+    }
+    phone
+}
+
+fn deserialize_optional_usync_phone<'de, D>(
+    deserializer: D,
+) -> Result<Option<CompactString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<CompactString>::deserialize(deserializer).map(|phone| phone.map(normalize_usync_phone))
+}
+
+fn deserialize_optional_usync_jid<'de, D>(deserializer: D) -> Result<Option<Jid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Jid>::deserialize(deserializer).map(|jid| jid.map(normalize_usync_user_jid))
+}
+
 /// Remove device addressing while retaining identity-bearing fields.
 ///
 /// PN/LID domain bytes can surface through `agent` during binary decoding but
@@ -444,7 +500,8 @@ fn validate_user_jid(jid: &Jid, index: usize) -> Result<(), UsyncValidationError
 }
 
 /// A known, typed USync subprotocol request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum UsyncProtocol {
     Contact {
@@ -634,12 +691,32 @@ pub enum UsyncValidationError {
 }
 
 /// A complete typed USync query, validated before it reaches the network.
-#[derive(Debug, Clone)]
+///
+/// Deserialization always delegates to [`Self::new`], so a serialized input
+/// cannot bypass protocol uniqueness or per-user validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UsyncQueryData")]
 pub struct UsyncQuery {
     mode: UsyncMode,
     context: UsyncContext,
     protocols: Vec<UsyncProtocol>,
     users: Vec<UsyncUser>,
+}
+
+#[derive(Deserialize)]
+struct UsyncQueryData {
+    mode: UsyncMode,
+    context: UsyncContext,
+    protocols: Vec<UsyncProtocol>,
+    users: Vec<UsyncUser>,
+}
+
+impl TryFrom<UsyncQueryData> for UsyncQuery {
+    type Error = UsyncValidationError;
+
+    fn try_from(value: UsyncQueryData) -> Result<Self, Self::Error> {
+        Self::new(value.mode, value.context, value.protocols, value.users)
+    }
 }
 
 impl UsyncQuery {
@@ -780,16 +857,21 @@ impl IqSpec for UsyncQuerySpec {
 }
 
 /// Result-level state for a single protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncProtocolState {
     pub protocol: UsyncProtocolKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_seconds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<UsyncSubprotocolError>,
 }
 
 /// Full neutral response from a typed USync query.
-#[derive(Debug, Clone)]
+///
+/// Its serialization walks this model by reference; no projection tree is
+/// constructed by the core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncResponse {
     pub protocol_states: Vec<UsyncProtocolState>,
@@ -806,10 +888,12 @@ impl UsyncResponse {
 
 /// Per-user response. `id` is optional because contact-only results without a
 /// JID are accepted by WhatsApp Web.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncUserResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Jid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pn_jid: Option<Jid>,
     pub protocols: Vec<UsyncProtocolResult>,
 }
@@ -823,7 +907,8 @@ impl UsyncUserResult {
 /// A protocol value or its per-user error. Errors are boxed because they are
 /// rare and contain owned strings; this keeps every successful result variant
 /// from inheriting their size.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum UsyncOutcome<T> {
     Value(T),
     Error(Box<UsyncSubprotocolError>),
@@ -845,61 +930,77 @@ impl<T> UsyncOutcome<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncContactResult {
     pub contact_type: CompactString,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<CompactString>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncDeviceResult {
     pub id: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub key_index: Option<u32>,
     pub is_hosted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncDeviceListResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<CompactString>,
     pub devices: Vec<UsyncDeviceResult>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncKeyIndexResult {
     pub timestamp: i64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_helpers::serialize_optional_bytes",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_bytes"
+    )]
     pub signed_key_index_bytes: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_timestamp: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncDevicesResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device_list: Option<UsyncDeviceListResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub key_index: Option<UsyncKeyIndexResult>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncBusinessResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_name: Option<VerifiedName>,
 }
 
 /// About/status payload. WhatsApp Web consumes only `status`, while the
 /// optional wire timestamp is retained for callers that need a lossless
 /// projection of responses carrying `t`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncStatusResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncDisappearingModeResult {
     pub duration_seconds: u32,
@@ -907,30 +1008,34 @@ pub struct UsyncDisappearingModeResult {
     pub ephemerality_disabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncTextStatusResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral_duration_seconds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_update_time: Option<CompactString>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncFeatureResult {
     pub feature: UsyncFeature,
     pub value: CompactString,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncBotPrompt {
     pub emoji: CompactString,
     pub text: CompactString,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncBotCommand {
     pub name: CompactString,
@@ -950,7 +1055,7 @@ pub enum UsyncBotProfessionalType {
     Other(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncBotProfileResult {
     pub name: CompactString,
@@ -962,15 +1067,20 @@ pub struct UsyncBotProfileResult {
     pub persona_id: CompactString,
     pub commands: Vec<UsyncBotCommand>,
     pub commands_description: CompactString,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_meta_created: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub creator_name: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub creator_profile_url: Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub posing_as_professional: Option<UsyncBotProfessionalType>,
 }
 
 /// Sparse per-user result. Large, uncommon payloads are boxed so their layout
 /// does not inflate every status/contact/device item in large sync responses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum UsyncProtocolResult {
     Contact(UsyncOutcome<UsyncContactResult>),
@@ -1493,6 +1603,11 @@ fn checked_u32(value: u64, attribute: &str) -> Result<u32, anyhow::Error> {
 mod tests {
     use super::*;
 
+    const TEST_PHONE: &str = "13135550100";
+    const TEST_E164_PHONE: &str = "+13135550100";
+    const TEST_PN_JID: &str = "13135550100@s.whatsapp.net";
+    const TEST_AGENT_BOT_JID: &str = "13135550100.2@bot";
+
     fn response(result: Vec<Node>, users: Vec<Node>) -> Node {
         NodeBuilder::new("iq")
             .attr("type", "result")
@@ -1518,7 +1633,7 @@ mod tests {
     #[test]
     fn typed_query_builds_canonical_envelope_and_protocol_inputs() {
         let user = UsyncUser::from_jid(Jid::lid("100000001").with_device(7))
-            .with_pn_jid(Jid::pn("15550000001").with_device(8))
+            .with_pn_jid(Jid::pn(TEST_PHONE).with_device(8))
             .with_known_lid(Jid::lid("100000001").with_device(9))
             .with_device_sync(
                 UsyncDeviceSyncHint::new()
@@ -1574,10 +1689,7 @@ mod tests {
             .and_then(|list| list.get_optional_child(TAG_USER))
             .unwrap();
         assert_eq!(user.attrs.get(ATTR_JID).unwrap().as_str(), "100000001@lid");
-        assert_eq!(
-            user.attrs.get(ATTR_PN_JID).unwrap().as_str(),
-            "15550000001@s.whatsapp.net"
-        );
+        assert_eq!(user.attrs.get(ATTR_PN_JID).unwrap().as_str(), TEST_PN_JID);
         let devices = user
             .get_optional_child(UsyncProtocolKind::Devices.as_str())
             .unwrap();
@@ -1595,12 +1707,69 @@ mod tests {
     #[test]
     fn digit_only_phone_inputs_are_normalized_to_e164() {
         assert_eq!(
-            UsyncUser::from_phone("15550000001").phone.as_deref(),
-            Some("+15550000001")
+            UsyncUser::from_phone(TEST_PHONE).phone.as_deref(),
+            Some(TEST_E164_PHONE)
         );
         assert_eq!(
-            UsyncUser::from_phone("+15550000001").phone.as_deref(),
-            Some("+15550000001")
+            UsyncUser::from_phone(TEST_E164_PHONE).phone.as_deref(),
+            Some(TEST_E164_PHONE)
+        );
+    }
+
+    #[test]
+    fn query_serde_round_trip_reuses_canonical_validation_and_normalization() {
+        let query = UsyncQuery::new(
+            UsyncMode::Delta,
+            UsyncContext::Background,
+            vec![
+                UsyncProtocol::Contact {
+                    addressing_mode: UsyncAddressingMode::Pn,
+                },
+                UsyncProtocol::DevicesV2,
+                UsyncProtocol::Status,
+                UsyncProtocol::Features(vec![UsyncFeature::EncryptV2, UsyncFeature::Voip]),
+            ],
+            vec![
+                UsyncUser::from_phone(TEST_PHONE)
+                    .with_device_sync(
+                        UsyncDeviceSyncHint::new()
+                            .with_device_hash("2:hash")
+                            .with_timestamp(100),
+                    )
+                    .with_tc_token(vec![1, 2, 3]),
+            ],
+        )
+        .unwrap();
+
+        let encoded = serde_json::to_vec(&query).unwrap();
+        let decoded: UsyncQuery = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, query);
+
+        let normalized: UsyncQuery = serde_json::from_value(serde_json::json!({
+            "mode": "query",
+            "context": "interactive",
+            "protocols": [{
+                "type": "contact",
+                "data": { "addressing_mode": "pn" }
+            }],
+            "users": [{ "phone": TEST_PHONE }]
+        }))
+        .unwrap();
+        assert_eq!(
+            normalized.users()[0].phone.as_deref(),
+            Some(TEST_E164_PHONE)
+        );
+
+        let duplicate = serde_json::from_value::<UsyncQuery>(serde_json::json!({
+            "mode": "query",
+            "context": "interactive",
+            "protocols": [{ "type": "status" }, { "type": "status" }],
+            "users": [{ "phone": TEST_PHONE }]
+        }))
+        .unwrap_err();
+        assert!(
+            duplicate.to_string().contains("duplicate USync protocol"),
+            "unexpected deserialization error: {duplicate}"
         );
     }
 
@@ -1610,7 +1779,7 @@ mod tests {
             UsyncMode::Query,
             UsyncContext::Interactive,
             vec![UsyncProtocol::Status, UsyncProtocol::Status],
-            vec![UsyncUser::from_jid(Jid::pn("15550000001"))],
+            vec![UsyncUser::from_jid(Jid::pn(TEST_PHONE))],
         )
         .unwrap_err();
         assert_eq!(
@@ -1622,7 +1791,7 @@ mod tests {
             UsyncMode::Query,
             UsyncContext::Interactive,
             vec![UsyncProtocol::Status],
-            vec![UsyncUser::from_phone("+15550000001")],
+            vec![UsyncUser::from_phone(TEST_E164_PHONE)],
         )
         .unwrap_err();
         assert_eq!(
@@ -1643,11 +1812,9 @@ mod tests {
             UsyncMode::Query,
             UsyncContext::Interactive,
             vec![UsyncProtocol::DevicesV2],
-            vec![
-                UsyncUser::from_jid(Jid::pn("15550000001")).with_device_sync(
-                    UsyncDeviceSyncHint::new().with_device_hash(CompactString::default()),
-                ),
-            ],
+            vec![UsyncUser::from_jid(Jid::pn(TEST_PHONE)).with_device_sync(
+                UsyncDeviceSyncHint::new().with_device_hash(CompactString::default()),
+            )],
         )
         .unwrap_err();
         assert_eq!(
@@ -1660,7 +1827,7 @@ mod tests {
             UsyncContext::Interactive,
             vec![UsyncProtocol::Status],
             vec![UsyncUser::from_jid(Jid {
-                user: "13135550001".into(),
+                user: TEST_PHONE.into(),
                 server: Server::Bot,
                 agent: 2,
                 device: 7,
@@ -1672,7 +1839,7 @@ mod tests {
             agent_qualified_bot,
             UsyncValidationError::InvalidUserJid {
                 index: 0,
-                jid: "13135550001.2@bot".to_owned(),
+                jid: TEST_AGENT_BOT_JID.to_owned(),
             }
         );
     }
@@ -1681,8 +1848,8 @@ mod tests {
     fn query_validation_never_silently_drops_user_inputs() {
         let cases = [
             (
-                UsyncUser::from_jid(Jid::pn("15550000001"))
-                    .with_phone("+15550000001")
+                UsyncUser::from_jid(Jid::pn(TEST_PHONE))
+                    .with_phone(TEST_E164_PHONE)
                     .with_contact_type("in"),
                 vec![UsyncProtocol::Contact {
                     addressing_mode: UsyncAddressingMode::Pn,
@@ -1690,23 +1857,23 @@ mod tests {
                 UsyncValidationError::ConflictingContactInputs { index: 0 },
             ),
             (
-                UsyncUser::from_jid(Jid::pn("15550000001"))
+                UsyncUser::from_jid(Jid::pn(TEST_PHONE))
                     .with_device_sync(UsyncDeviceSyncHint::new().with_timestamp(1)),
                 vec![UsyncProtocol::Status],
                 UsyncValidationError::DeviceSyncWithoutProtocol { index: 0 },
             ),
             (
-                UsyncUser::from_jid(Jid::pn("15550000001")).with_tc_token(vec![1]),
+                UsyncUser::from_jid(Jid::pn(TEST_PHONE)).with_tc_token(vec![1]),
                 vec![UsyncProtocol::DevicesV2],
                 UsyncValidationError::TcTokenWithoutProtocol { index: 0 },
             ),
             (
-                UsyncUser::from_jid(Jid::pn("15550000001")).with_persona_id("persona-1"),
+                UsyncUser::from_jid(Jid::pn(TEST_PHONE)).with_persona_id("persona-1"),
                 vec![UsyncProtocol::Status],
                 UsyncValidationError::PersonaIdWithoutProtocol { index: 0 },
             ),
             (
-                UsyncUser::from_jid(Jid::pn("15550000001")).with_known_lid(Jid::lid("100000001")),
+                UsyncUser::from_jid(Jid::pn(TEST_PHONE)).with_known_lid(Jid::lid("100000001")),
                 vec![UsyncProtocol::Status],
                 UsyncValidationError::KnownLidWithoutProtocol { index: 0 },
             ),
@@ -1793,7 +1960,7 @@ mod tests {
                 NodeBuilder::new(TAG_USER)
                     .children([NodeBuilder::new(UsyncProtocolKind::Contact.as_str())
                         .attr(ATTR_TYPE, "out")
-                        .string_content("+15550000001")
+                        .string_content(TEST_E164_PHONE)
                         .build()])
                     .build(),
             ],
@@ -1828,7 +1995,7 @@ mod tests {
             .attr(
                 ATTR_JID,
                 Jid {
-                    user: "13135550001".into(),
+                    user: TEST_PHONE.into(),
                     server: Server::Bot,
                     agent: 2,
                     device: 7,
@@ -1912,7 +2079,7 @@ mod tests {
             ])
             .build();
         let user = NodeBuilder::new(TAG_USER)
-            .attr(ATTR_JID, Jid::pn("15550000001"))
+            .attr(ATTR_JID, Jid::pn(TEST_PHONE))
             .children([devices])
             .build();
         let parsed = parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).unwrap();
@@ -1956,7 +2123,7 @@ mod tests {
                     .build()])
                 .build();
             let user = NodeBuilder::new(TAG_USER)
-                .attr(ATTR_JID, Jid::pn("15550000001"))
+                .attr(ATTR_JID, Jid::pn(TEST_PHONE))
                 .children([devices])
                 .build();
 
@@ -2071,7 +2238,7 @@ mod tests {
             ])
             .build();
         let user = NodeBuilder::new(TAG_USER)
-            .attr(ATTR_JID, Jid::pn("15550000001"))
+            .attr(ATTR_JID, Jid::pn(TEST_PHONE))
             .children([
                 NodeBuilder::new(UsyncProtocolKind::Picture.as_str())
                     .attr(ATTR_ID, "42")
@@ -2127,7 +2294,7 @@ mod tests {
     #[test]
     fn picture_without_id_is_rejected() {
         let user = NodeBuilder::new(TAG_USER)
-            .attr(ATTR_JID, Jid::pn("15550000001"))
+            .attr(ATTR_JID, Jid::pn(TEST_PHONE))
             .children([NodeBuilder::new(UsyncProtocolKind::Picture.as_str()).build()])
             .build();
 
@@ -2135,11 +2302,84 @@ mod tests {
     }
 
     #[test]
+    fn response_serde_round_trip_preserves_sparse_and_binary_results() {
+        let response = UsyncResponse {
+            protocol_states: vec![UsyncProtocolState {
+                protocol: UsyncProtocolKind::Status,
+                refresh_seconds: Some(60),
+                error: Some(UsyncSubprotocolError {
+                    code: Some(401),
+                    text: None,
+                    backoff: Some(5),
+                }),
+            }],
+            users: vec![UsyncUserResult {
+                id: Some(Jid::new("100000001", Server::HostedLid)),
+                pn_jid: Some(Jid::new(TEST_PHONE, Server::Hosted)),
+                protocols: vec![
+                    UsyncProtocolResult::Devices(UsyncOutcome::Value(UsyncDevicesResult {
+                        device_list: Some(UsyncDeviceListResult {
+                            hash: Some("2:hash".into()),
+                            devices: vec![UsyncDeviceResult {
+                                id: 7,
+                                key_index: Some(3),
+                                is_hosted: true,
+                            }],
+                        }),
+                        key_index: Some(UsyncKeyIndexResult {
+                            timestamp: 100,
+                            signed_key_index_bytes: Some(vec![1, 2, 3, 4]),
+                            expected_timestamp: None,
+                        }),
+                    })),
+                    UsyncProtocolResult::Status(UsyncOutcome::Value(UsyncStatusResult {
+                        status: Some(CompactString::default()),
+                        timestamp: None,
+                    })),
+                    UsyncProtocolResult::Business(UsyncOutcome::Value(Box::new(
+                        UsyncBusinessResult {
+                            verified_name: Some(VerifiedName {
+                                name: Some("Business".to_owned()),
+                                serial: None,
+                                issuer: None,
+                                certificate: Some(Vec::new()),
+                            }),
+                        },
+                    ))),
+                    UsyncProtocolResult::Bot(UsyncOutcome::Value(Box::new(
+                        UsyncBotProfileResult {
+                            name: "Assistant".into(),
+                            attributes: "helpful".into(),
+                            description: "Description".into(),
+                            category: "utility".into(),
+                            is_default: false,
+                            prompts: Vec::new(),
+                            persona_id: "persona-1".into(),
+                            commands: Vec::new(),
+                            commands_description: CompactString::default(),
+                            is_meta_created: None,
+                            creator_name: None,
+                            creator_profile_url: None,
+                            posing_as_professional: Some(UsyncBotProfessionalType::Other(
+                                "future".to_owned(),
+                            )),
+                        },
+                    ))),
+                ],
+            }],
+        };
+
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: UsyncResponse = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn parser_rejects_non_lid_values() {
         let invalid_lid = NodeBuilder::new(TAG_USER)
-            .attr(ATTR_JID, Jid::pn("15550000001"))
+            .attr(ATTR_JID, Jid::pn(TEST_PHONE))
             .children([NodeBuilder::new(UsyncProtocolKind::Lid.as_str())
-                .attr(ATTR_VAL, Jid::pn("15550000001"))
+                .attr(ATTR_VAL, Jid::pn(TEST_PHONE))
                 .build()])
             .build();
         assert!(

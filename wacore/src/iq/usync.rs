@@ -56,9 +56,10 @@ use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
 use anyhow::anyhow;
 use log::warn;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use wacore_binary::Jid;
 use wacore_binary::NodeRef;
-use wacore_binary::{Jid, Server};
 
 #[cfg(test)]
 use wacore_binary::builder::NodeBuilder;
@@ -114,11 +115,14 @@ pub struct IsOnWhatsAppUser {
     pub known_lid: Option<wacore_binary::CompactString>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsyncSubprotocolError {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff: Option<u32>,
 }
 
@@ -282,7 +286,7 @@ fn project_business(
 
 pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapping> {
     let user_jid = user.id.as_ref()?;
-    if user_jid.server != Server::Pn {
+    if !user_jid.server.is_pn_family() {
         return None;
     }
     let Some(UsyncProtocolResult::Lid(UsyncOutcome::Value(Some(lid)))) =
@@ -786,6 +790,7 @@ impl IqSpec for LidQuerySpec {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use wacore_binary::Server;
 
     /// Build a dummy key-index-list node for device IDs (used in test fixtures)
     fn build_test_key_index_list_node(device_ids: &[u16]) -> Node {
@@ -1571,6 +1576,26 @@ mod tests {
         assert_eq!(result.lid_mappings.len(), 1);
         assert_eq!(result.lid_mappings[0].phone_number, "9876543210");
         assert_eq!(result.lid_mappings[0].lid, "100000000000987");
+    }
+
+    #[test]
+    fn lid_mapping_projection_accepts_standard_and_hosted_namespaces() {
+        for (pn_server, lid_server) in [
+            (Server::Pn, Server::Lid),
+            (Server::Hosted, Server::HostedLid),
+        ] {
+            let user = UsyncUserResult {
+                id: Some(Jid::new("13135550100", pn_server)),
+                pn_jid: None,
+                protocols: vec![UsyncProtocolResult::Lid(UsyncOutcome::Value(Some(
+                    Jid::new("100000000000100", lid_server),
+                )))],
+            };
+
+            let mapping = project_lid_mapping(&user).expect("expected LID mapping");
+            assert_eq!(mapping.phone_number, "13135550100");
+            assert_eq!(mapping.lid, "100000000000100");
+        }
     }
 
     #[test]

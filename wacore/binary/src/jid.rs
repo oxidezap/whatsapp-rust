@@ -209,8 +209,38 @@ impl serde::Serialize for Server {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Server {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(deserializer)?;
-        Server::try_from(s).map_err(serde::de::Error::custom)
+        struct ServerVisitor;
+
+        impl serde::de::Visitor<'_> for ServerVisitor {
+            type Value = Server;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a known WhatsApp server identifier")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value.as_str()).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ServerVisitor)
     }
 }
 
@@ -1083,6 +1113,17 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn server_deserializes_borrowed_and_owned_strings() {
+        let borrowed: Server = serde_json::from_str("\"s.whatsapp.net\"").unwrap();
+        let owned: Server =
+            serde_json::from_value(serde_json::Value::String("lid".to_owned())).unwrap();
+
+        assert_eq!(borrowed, Server::Pn);
+        assert_eq!(owned, Server::Lid);
+    }
 
     /// `observe()` must never leak a raw phone number, must keep pseudonymous /
     /// non-personal JIDs intact for correlation, and must preserve device.

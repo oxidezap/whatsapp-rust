@@ -961,14 +961,52 @@ fn expand_wire_enum_unit(
         };
     }
 
-    let deserialize_impl = if fallback.is_some() {
+    let deserialize_impl = if let Some(fb) = fallback {
+        let fb_ident = &fb.ident;
         quote! {
             impl<'de> ::serde::Deserialize<'de> for #name {
                 fn deserialize<D: ::serde::Deserializer<'de>>(
                     deserializer: D,
                 ) -> ::core::result::Result<Self, D::Error> {
-                    let s = <::std::string::String as ::serde::Deserialize>::deserialize(deserializer)?;
-                    ::core::result::Result::Ok(<Self as ::core::convert::From<&str>>::from(s.as_str()))
+                    struct WireEnumVisitor;
+
+                    impl<'de> ::serde::de::Visitor<'de> for WireEnumVisitor {
+                        type Value = #name;
+
+                        fn expecting(
+                            &self,
+                            formatter: &mut ::core::fmt::Formatter<'_>,
+                        ) -> ::core::fmt::Result {
+                            formatter.write_str("a wire enum string")
+                        }
+
+                        fn visit_str<E>(
+                            self,
+                            value: &str,
+                        ) -> ::core::result::Result<Self::Value, E>
+                        where
+                            E: ::serde::de::Error,
+                        {
+                            ::core::result::Result::Ok(
+                                <#name as ::core::convert::From<&str>>::from(value),
+                            )
+                        }
+
+                        fn visit_string<E>(
+                            self,
+                            value: ::std::string::String,
+                        ) -> ::core::result::Result<Self::Value, E>
+                        where
+                            E: ::serde::de::Error,
+                        {
+                            ::core::result::Result::Ok(match value.as_str() {
+                                #(#from_arms,)*
+                                _ => #name::#fb_ident(value),
+                            })
+                        }
+                    }
+
+                    deserializer.deserialize_str(WireEnumVisitor)
                 }
             }
         }
@@ -978,9 +1016,31 @@ fn expand_wire_enum_unit(
                 fn deserialize<D: ::serde::Deserializer<'de>>(
                     deserializer: D,
                 ) -> ::core::result::Result<Self, D::Error> {
-                    let s = <::std::string::String as ::serde::Deserialize>::deserialize(deserializer)?;
-                    <Self as ::core::convert::TryFrom<&str>>::try_from(s.as_str())
-                        .map_err(|e| <D::Error as ::serde::de::Error>::custom(e.to_string()))
+                    struct WireEnumVisitor;
+
+                    impl<'de> ::serde::de::Visitor<'de> for WireEnumVisitor {
+                        type Value = #name;
+
+                        fn expecting(
+                            &self,
+                            formatter: &mut ::core::fmt::Formatter<'_>,
+                        ) -> ::core::fmt::Result {
+                            formatter.write_str("a known wire enum string")
+                        }
+
+                        fn visit_str<E>(
+                            self,
+                            value: &str,
+                        ) -> ::core::result::Result<Self::Value, E>
+                        where
+                            E: ::serde::de::Error,
+                        {
+                            <#name as ::core::convert::TryFrom<&str>>::try_from(value)
+                                .map_err(E::custom)
+                        }
+                    }
+
+                    deserializer.deserialize_str(WireEnumVisitor)
                 }
             }
         }

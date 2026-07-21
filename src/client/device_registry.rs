@@ -973,18 +973,19 @@ impl Client {
         record: &wacore::store::traits::DeviceListRecord,
     ) -> Vec<Jid> {
         let base = query_jid.to_non_ad();
-        record
-            .devices
-            .iter()
-            .map(|d| {
-                debug_assert!(
-                    d.device_id <= u16::MAX as u32,
-                    "device_id {} overflows u16",
-                    d.device_id
-                );
-                base.with_device_hosting(d.device_id as u16, d.is_hosted)
-            })
-            .collect()
+        let mut devices = Vec::with_capacity(record.devices.len());
+        for device in &record.devices {
+            match u16::try_from(device.device_id) {
+                Ok(device_id) => {
+                    devices.push(base.with_device_hosting(device_id, device.is_hosted));
+                }
+                Err(_) => warn!(
+                    "reconstruct_device_jids: device_id {} exceeds u16; skipping",
+                    device.device_id
+                ),
+            }
+        }
+        devices
     }
 
     /// Background loop placeholder for device registry cleanup.
@@ -2236,6 +2237,25 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert!(devices[0].is_lid(), "device JID should be LID-typed");
         assert_eq!(devices[0].user, lid, "device JID user should be the LID");
+    }
+
+    #[test]
+    fn reconstruct_device_jids_skips_unrepresentable_persisted_ids() {
+        let record = wacore::store::traits::DeviceListRecord {
+            user: "13135550100".into(),
+            devices: vec![
+                wacore::store::traits::DeviceInfo::new(7, None).with_hosting(true),
+                wacore::store::traits::DeviceInfo::new(u32::from(u16::MAX) + 1, None),
+            ],
+            timestamp: 0,
+            phash: None,
+            raw_id: None,
+        };
+
+        assert_eq!(
+            Client::reconstruct_device_jids(&Jid::pn("13135550100"), &record),
+            vec![Jid::new("13135550100", Server::Hosted).with_device(7)]
+        );
     }
 
     // A present-but-empty record must read as a miss (None), not Some([]). The
