@@ -78,8 +78,10 @@ pub struct BusinessHours {
 pub struct BusinessHoursConfig {
     pub day_of_week: DayOfWeek,
     pub mode: BusinessHourMode,
-    pub open_time: u32,
-    pub close_time: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_time: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_time: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -170,11 +172,9 @@ impl IqSpec for BusinessProfileSpec {
                             day_of_week: DayOfWeek::from(day.as_ref()),
                             mode: BusinessHourMode::from(mode_str.as_ref()),
                             open_time: optional_attr(c, "open_time")
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0),
+                                .and_then(|s| s.parse::<u32>().ok()),
                             close_time: optional_attr(c, "close_time")
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0),
+                                .and_then(|s| s.parse::<u32>().ok()),
                         })
                     })
                     .collect();
@@ -200,5 +200,49 @@ impl IqSpec for BusinessProfileSpec {
             address,
             business_hours,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_absent_business_hour_times() {
+        let jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        let spec = BusinessProfileSpec::new(&jid);
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("business_profile")
+                .children([NodeBuilder::new("profile")
+                    .attr("jid", &jid)
+                    .children([NodeBuilder::new("business_hours")
+                        .attr("timezone", "America/Araguaina")
+                        .children([
+                            NodeBuilder::new("business_hours_config")
+                                .attr("day_of_week", "mon")
+                                .attr("mode", "open_24h")
+                                .build(),
+                            NodeBuilder::new("business_hours_config")
+                                .attr("day_of_week", "tue")
+                                .attr("mode", "specific_hours")
+                                .attr("open_time", "480")
+                                .attr("close_time", "1080")
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let profile = spec
+            .parse_response(&response.as_node_ref())
+            .unwrap()
+            .unwrap();
+        let configs = profile.business_hours.business_config.unwrap();
+
+        assert_eq!(configs[0].open_time, None);
+        assert_eq!(configs[0].close_time, None);
+        assert_eq!(configs[1].open_time, Some(480));
+        assert_eq!(configs[1].close_time, Some(1080));
     }
 }

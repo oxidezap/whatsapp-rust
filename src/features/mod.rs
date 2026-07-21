@@ -43,12 +43,12 @@ pub use contacts::{
 pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
-    BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription,
+    BatchGroupResult, CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
     GroupEphemeralSettings, GroupError, GroupJoinError, GroupMetadata, GroupParticipant,
-    GroupParticipantOptions, GroupProfilePicture, GroupSubject, Groups, GrowthLockInfo,
-    InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
-    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse, ParticipantType,
-    PictureType,
+    GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture, GroupSubject, Groups,
+    GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType,
 };
 
 pub use labels::Labels;
@@ -59,7 +59,9 @@ pub use media_reupload::{
 
 pub use message_edit::{EncryptedEdit, SecretEncKind, SecretEncrypted};
 
-pub use mex::{Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse};
+pub use mex::{
+    Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse, ReachoutTimelock,
+};
 
 pub use newsletter::{
     Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
@@ -74,7 +76,7 @@ pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
 
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 
-pub use signal::{Signal, SignalError};
+pub use signal::{Signal, SignalError, SignalSessionInfo, SignalSessionMigration};
 pub use wacore::message_processing::EncType;
 
 pub use tctoken::{TcToken, TcTokenError};

@@ -94,18 +94,22 @@ enum RecordOutcome {
     /// Already durable in both directions; nothing to do.
     Skipped,
     /// Written to (or re-affirmed in) the cache; the caller should persist it.
-    /// `is_new` drives the PN→LID device/session migration.
-    Written { entry: LidPnEntry, is_new: bool },
+    /// `needs_migration` preserves the PN→LID device/session migration until
+    /// the mapping is durably persisted.
+    Written {
+        entry: LidPnEntry,
+        needs_migration: bool,
+    },
     /// An observational source conflicted with a known LID; the phone should be
     /// re-resolved via a live LID query rather than trusting this pair.
     NeedsUsync,
 }
 
-/// Outcome of recording a batch: entries to persist (with their `is_new`
+/// Outcome of recording a batch: entries to persist (with their migration
 /// flags) plus phones that need a live LID re-query.
 struct BatchRecordOutcome {
     entries: Vec<LidPnEntry>,
-    is_new_flags: Vec<bool>,
+    migration_flags: Vec<bool>,
     usync_phones: Vec<String>,
 }
 
@@ -173,10 +177,36 @@ impl Client {
                 self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
                 Ok(())
             }
-            RecordOutcome::Written { entry, is_new } => {
-                self.persist_and_migrate_lid_pn(entry, is_new).await
+            RecordOutcome::Written {
+                entry,
+                needs_migration,
+            } => {
+                self.persist_and_migrate_lid_pn(entry, needs_migration)
+                    .await
             }
         }
+    }
+
+    /// Durably add a batch of linked-identifier mappings and run the same
+    /// registry/session migrations as the single-entry path.
+    pub async fn add_lid_pn_mappings(
+        &self,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+    ) -> Result<usize> {
+        let BatchRecordOutcome {
+            entries,
+            migration_flags,
+            usync_phones,
+        } = self.record_lid_pn_batch_in_memory(mappings, source).await;
+        self.spawn_lid_usync_reconcile(usync_phones);
+
+        let count = entries.len();
+        if !entries.is_empty() {
+            self.persist_and_migrate_lid_pn_batch(entries, migration_flags)
+                .await?;
+        }
+        Ok(count)
     }
 
     /// Hot-path variant: cache is updated synchronously (so a subsequent
@@ -194,7 +224,7 @@ impl Client {
     /// Use [`add_lid_pn_mapping`] when the caller needs a durable guarantee.
     ///
     /// Concurrent calls for the same phone number may both observe
-    /// `is_new_mapping = true` and each spawn a persist task. The downstream
+    /// `needs_migration = true` and each spawn a persist task. The downstream
     /// work tolerates this:
     /// - `put_lid_mapping` is an upsert
     /// - `migrate_device_registry_on_lid_discovery` no-ops after the PN-keyed
@@ -209,7 +239,7 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        let (entry, is_new_mapping) = match self
+        let (entry, needs_migration) = match self
             .record_lid_pn_in_memory(lid, phone_number, source)
             .await
         {
@@ -218,7 +248,10 @@ impl Client {
                 self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
                 return;
             }
-            RecordOutcome::Written { entry, is_new } => (entry, is_new),
+            RecordOutcome::Written {
+                entry,
+                needs_migration,
+            } => (entry, needs_migration),
         };
         if is_offline {
             return;
@@ -227,7 +260,7 @@ impl Client {
         self.runtime
             .spawn(Box::pin(async move {
                 if let Err(err) = client
-                    .persist_and_migrate_lid_pn(entry, is_new_mapping)
+                    .persist_and_migrate_lid_pn(entry, needs_migration)
                     .await
                 {
                     log::warn!("Background LID-PN persist failed: {err}");
@@ -262,7 +295,7 @@ impl Client {
     ) {
         let BatchRecordOutcome {
             entries,
-            is_new_flags,
+            migration_flags,
             usync_phones,
         } = self.record_lid_pn_batch_in_memory(mappings, source).await;
 
@@ -280,7 +313,7 @@ impl Client {
         self.runtime
             .spawn(Box::pin(async move {
                 if let Err(err) = client
-                    .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
+                    .persist_and_migrate_lid_pn_batch(entries, migration_flags)
                     .await
                 {
                     log::warn!("Background LID-PN batch persist failed: {err}");
@@ -340,8 +373,8 @@ impl Client {
     /// migration-sync handler (which awaits persistence instead). Each pair
     /// runs through [`Self::record_lid_pn_in_memory`] under the source's write
     /// policy. Dedups by phone_number (last lid wins) — otherwise the same
-    /// phone appearing twice in one batch yields is_new=true for the first
-    /// (lid_A) and is_new=false for the second (lid_B), so signal migration
+    /// phone appearing twice in one batch requests migration for the first
+    /// (lid_A) but not the second (lid_B), so signal migration
     /// runs for lid_A while the persisted mapping ends up pointing at lid_B.
     /// (WA Web instead records the superseded entry with created_at=0; dropping
     /// it is equivalent for the resolved PN→LID mapping.)
@@ -358,7 +391,7 @@ impl Client {
         }
 
         let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
-        let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
+        let mut migration_flags: Vec<bool> = Vec::with_capacity(deduped.len());
         let mut usync_phones: Vec<String> = Vec::new();
         for (phone_number, lid) in deduped {
             match self
@@ -366,16 +399,19 @@ impl Client {
                 .await
             {
                 RecordOutcome::Skipped => {}
-                RecordOutcome::Written { entry, is_new } => {
+                RecordOutcome::Written {
+                    entry,
+                    needs_migration,
+                } => {
                     entries.push(entry);
-                    is_new_flags.push(is_new);
+                    migration_flags.push(needs_migration);
                 }
                 RecordOutcome::NeedsUsync => usync_phones.push(phone_number),
             }
         }
         BatchRecordOutcome {
             entries,
-            is_new_flags,
+            migration_flags,
             usync_phones,
         }
     }
@@ -401,11 +437,14 @@ impl Client {
         // Re-warm/re-affirm durability for a pair that is already the cached
         // mapping (exact, or reverse-only after a bounded-cache PN eviction).
         // Precedes the write/conflict branches so a self-consistent pair is
-        // neither re-migrated as a fresh directed write nor re-queried as a
-        // conflict; no migration runs, the PN↔LID association is unchanged.
+        // not re-queried as a conflict. A still-unpersisted pair retains its
+        // pending discovery migration across retries.
         let same_pair_forward_evicted =
             current_lid.is_none() && reverse_pn.as_deref() == Some(phone_number);
         if exact || same_pair_forward_evicted {
+            // The pair may only be cached because a prior batch write failed.
+            // Preserve its discovery migration until persistence succeeds.
+            let needs_migration = !self.lid_pn_cache.is_persisted(phone_number, lid).await;
             let existing = match self.lid_pn_cache.get_entry_by_phone(phone_number).await {
                 Some(entry) => Some(entry),
                 None => self.lid_pn_cache.get_entry_by_lid(lid).await,
@@ -415,7 +454,7 @@ impl Client {
                     self.lid_pn_cache.add(&entry).await;
                     RecordOutcome::Written {
                         entry,
-                        is_new: false,
+                        needs_migration,
                     }
                 }
                 None => RecordOutcome::Skipped,
@@ -436,7 +475,7 @@ impl Client {
             self.lid_pn_cache.add(&entry).await;
             return RecordOutcome::Written {
                 entry,
-                is_new: current_lid.is_none(),
+                needs_migration: current_lid.is_none(),
             };
         }
 
@@ -448,11 +487,20 @@ impl Client {
         RecordOutcome::Skipped
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn", level = "debug", skip_all, fields(is_new = is_new_mapping), err(Debug)))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.persist_migrate_lid_pn",
+            level = "debug",
+            skip_all,
+            fields(needs_migration),
+            err(Debug)
+        )
+    )]
     async fn persist_and_migrate_lid_pn(
         &self,
         entry: LidPnEntry,
-        is_new_mapping: bool,
+        needs_migration: bool,
     ) -> Result<()> {
         use anyhow::anyhow;
 
@@ -476,7 +524,7 @@ impl Client {
             .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
             .await;
 
-        if is_new_mapping {
+        if needs_migration {
             self.migrate_device_registry_on_lid_discovery(
                 &storage_entry.phone_number,
                 &storage_entry.lid,
@@ -496,10 +544,10 @@ impl Client {
     async fn persist_and_migrate_lid_pn_batch(
         &self,
         entries: Vec<LidPnEntry>,
-        is_new_flags: Vec<bool>,
+        migration_flags: Vec<bool>,
     ) -> Result<()> {
         let storage = self.persist_lid_pn_batch(entries).await?;
-        self.migrate_lid_pn_batch(storage, is_new_flags).await;
+        self.migrate_lid_pn_batch(storage, migration_flags).await;
         Ok(())
     }
 
@@ -543,9 +591,13 @@ impl Client {
     /// the persist so callers on the message pipeline can await durability but
     /// defer this part — each new mapping walks up to MIGRATION_DEVICE_RANGE
     /// per-address locks, which must not stall the global processing permit.
-    async fn migrate_lid_pn_batch(&self, storage: Vec<LidPnMappingEntry>, is_new_flags: Vec<bool>) {
-        for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
-            if *is_new {
+    async fn migrate_lid_pn_batch(
+        &self,
+        storage: Vec<LidPnMappingEntry>,
+        migration_flags: Vec<bool>,
+    ) {
+        for (entry, needs_migration) in storage.iter().zip(migration_flags.iter()) {
+            if *needs_migration {
                 self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;
                 self.migrate_signal_sessions_on_lid_discovery(&entry.phone_number, &entry.lid)
@@ -721,7 +773,7 @@ impl Client {
         // MIGRATION_DEVICE_RANGE locks per mapping would stall it.
         let BatchRecordOutcome {
             entries,
-            is_new_flags,
+            migration_flags,
             usync_phones,
         } = self
             .record_lid_pn_batch_in_memory(
@@ -741,7 +793,7 @@ impl Client {
                     let client = Arc::clone(self);
                     self.runtime
                         .spawn(Box::pin(async move {
-                            client.migrate_lid_pn_batch(storage, is_new_flags).await;
+                            client.migrate_lid_pn_batch(storage, migration_flags).await;
                         }))
                         .detach();
                 }
@@ -824,6 +876,31 @@ impl Client {
         pn: &str,
         lid: &str,
     ) -> bool {
+        use log::warn;
+
+        let outcome = self
+            .migrate_signal_sessions(&Jid::pn(pn), &Jid::lid(lid))
+            .await;
+        let migrated_sessions = outcome.migrated != 0;
+        if outcome.has_state_changes()
+            || self
+                .signal_cache
+                .has_pending_pairwise_writes_for_user(pn)
+                .await
+        {
+            let backend = self.persistence_manager.backend();
+            if let Err(error) = self.signal_cache.flush(backend.as_ref()).await {
+                warn!("Failed to flush signal cache after migration: {error:?}");
+            }
+        }
+        migrated_sessions
+    }
+
+    pub(crate) async fn migrate_signal_sessions(
+        &self,
+        from: &Jid,
+        to: &Jid,
+    ) -> crate::features::SignalSessionMigration {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
 
@@ -835,19 +912,17 @@ impl Client {
         // find nothing. On a lookup error, fall through to the full scan.
         if let Ok(false) = self
             .signal_cache
-            .has_state_for_user(pn, backend.as_ref())
+            .has_state_for_user(&from.user, backend.as_ref())
             .await
         {
-            return false;
+            return crate::features::SignalSessionMigration::default();
         }
 
-        let mut migrated = false;
+        let mut outcome = crate::features::SignalSessionMigration::default();
 
         for device_id in 0..MIGRATION_DEVICE_RANGE {
-            // `&str` → `CompactString` is inline for ≤24-byte user parts
-            // (all PN/LID identifiers fit), so no String intermediate.
-            let pn_jid = Jid::pn_device(pn, device_id);
-            let lid_jid = Jid::lid_device(lid, device_id);
+            let pn_jid = from.with_device(device_id);
+            let lid_jid = to.with_device(device_id);
 
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
@@ -869,18 +944,27 @@ impl Client {
 
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
             // (`ON CONFLICT DO UPDATE SET session=excluded.session`).
-            if let Ok(Some(session)) = self
+            match self
                 .signal_cache
                 .get_session(&pn_proto, backend.as_ref())
                 .await
             {
-                self.signal_cache.put_session(&lid_proto, session).await;
-                self.signal_cache.delete_session(&pn_proto).await;
-                migrated = true;
-                info!(
-                    "Migrated session {} -> {} (PN wins on conflict)",
-                    pn_proto, lid_proto
-                );
+                Ok(Some(session)) => {
+                    outcome.total += 1;
+                    self.signal_cache.put_session(&lid_proto, session).await;
+                    self.signal_cache.delete_session(&pn_proto).await;
+                    outcome.migrated += 1;
+                    info!(
+                        "Migrated session {} -> {} (PN wins on conflict)",
+                        pn_proto, lid_proto
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    outcome.total += 1;
+                    outcome.skipped += 1;
+                    warn!("Skipping session migration for {}: {error:?}", pn_proto);
+                }
             }
 
             // Identity uses LID-wins (the inverse of session). For the same
@@ -894,12 +978,12 @@ impl Client {
             // Match the LID lookup result explicitly so a transient read
             // failure isn't collapsed with `Ok(None)` and used as license
             // to overwrite a potentially-valid LID identity.
-            if let Ok(Some(identity_data)) = self
+            match self
                 .signal_cache
                 .get_identity(&pn_proto, backend.as_ref())
                 .await
             {
-                match self
+                Ok(Some(identity_data)) => match self
                     .signal_cache
                     .get_identity(&lid_proto, backend.as_ref())
                     .await
@@ -909,29 +993,32 @@ impl Client {
                             .put_identity(&lid_proto, &identity_data)
                             .await;
                         self.signal_cache.delete_identity(&pn_proto).await;
-                        migrated = true;
+                        outcome.migrated_identities += 1;
                         info!("Migrated identity {} -> {}", pn_proto, lid_proto);
                     }
                     Ok(Some(_)) => {
                         // LID-wins: existing LID identity preserved; drop the PN copy.
                         self.signal_cache.delete_identity(&pn_proto).await;
+                        outcome.discarded_identities += 1;
                     }
                     Err(e) => {
+                        outcome.skipped_identities += 1;
                         warn!(
                             "Skipping identity migration {} -> {}: \
                              failed to read LID identity: {e:?}",
                             pn_proto, lid_proto
                         );
                     }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    outcome.skipped_identities += 1;
+                    warn!("Skipping identity migration for {}: {error:?}", pn_proto);
                 }
             }
         }
 
-        // Flush migrated state to backend so it survives restarts
-        if let Err(e) = self.signal_cache.flush(backend.as_ref()).await {
-            warn!("Failed to flush signal cache after migration: {e:?}");
-        }
-        migrated
+        outcome
     }
 
     /// Look up the LID↔phone mapping for a JID. Cache-aside: falls back to
@@ -1004,8 +1091,10 @@ impl Client {
 mod tests {
     use super::*;
     use crate::lid_pn_cache::LearningSource;
-    use crate::test_utils::create_test_client;
+    use crate::test_utils::{create_test_client, create_test_client_with_backend};
     use std::sync::Arc;
+    use wacore::store::in_memory::InMemoryBackend;
+    use wacore::store::traits::SignalStore;
     use wacore_binary::Server;
 
     /// Fixture: test client with one cached peer LID-PN mapping.
@@ -1204,7 +1293,10 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            RecordOutcome::Written { is_new: false, .. }
+            RecordOutcome::Written {
+                needs_migration: false,
+                ..
+            }
         ));
         assert_eq!(
             client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
@@ -1238,10 +1330,10 @@ mod tests {
         );
     }
 
-    /// An exact re-learn of a not-yet-durable pair re-affirms durability
-    /// (WA Web dirty-set flush analog) without a migration.
+    /// An exact re-learn of a not-yet-durable pair retains the migration work
+    /// until its retry successfully persists the mapping.
     #[tokio::test]
-    async fn test_record_exact_match_heals_without_migration() {
+    async fn test_record_exact_match_preserves_pending_migration() {
         let client = create_test_client().await;
         let phone = "5511900000040";
         let lid = "200000000000040";
@@ -1255,13 +1347,48 @@ mod tests {
             .await;
 
         assert!(
-            matches!(outcome, RecordOutcome::Written { is_new: false, .. }),
-            "an exact re-learn re-affirms durability, no migration"
+            matches!(
+                outcome,
+                RecordOutcome::Written {
+                    needs_migration: true,
+                    ..
+                }
+            ),
+            "an exact re-learn must retain its pending migration"
         );
         assert_eq!(
             client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
             Some(lid)
         );
+    }
+
+    /// A failed batch persist leaves the pair cached but not durable. Retrying
+    /// the same batch must retain its discovery migration instead of treating
+    /// the cached pair as old.
+    #[tokio::test]
+    async fn test_record_batch_retry_preserves_pending_migration() {
+        let client = create_test_client().await;
+        let phone = "5511900000041";
+        let lid = "200000000000041";
+        let mapping = || vec![(lid.to_string(), phone.to_string())];
+
+        let first = client
+            .record_lid_pn_batch_in_memory(mapping(), LearningSource::Other)
+            .await;
+        assert_eq!(first.migration_flags, vec![true]);
+
+        // Do not persist `first`: this models the failed batch write.
+        let retry = client
+            .record_lid_pn_batch_in_memory(mapping(), LearningSource::Other)
+            .await;
+        assert_eq!(retry.migration_flags, vec![true]);
+
+        client.lid_pn_cache.mark_persisted(phone, lid).await;
+        let durable = client
+            .record_lid_pn_batch_in_memory(mapping(), LearningSource::Other)
+            .await;
+        assert!(durable.entries.is_empty());
+        assert!(durable.migration_flags.is_empty());
     }
 
     /// A stale source (`MigrationSyncOld`) writes, but with `created_at = 0`,
@@ -1312,7 +1439,10 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            RecordOutcome::Written { is_new: true, .. }
+            RecordOutcome::Written {
+                needs_migration: true,
+                ..
+            }
         ));
         assert_eq!(
             client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
@@ -1910,6 +2040,39 @@ mod tests {
         assert_eq!(client.lid_pn_cache.lid_count().await, 0);
     }
 
+    #[tokio::test]
+    async fn test_add_lid_pn_mappings_deduplicates_and_is_durable_on_return() {
+        let client: Arc<Client> = create_test_client().await;
+        let phone = "5511900012345";
+        let stale_lid = "200000000001234";
+        let current_lid = "200000000001235";
+
+        let written = client
+            .add_lid_pn_mappings(
+                vec![
+                    (stale_lid.to_owned(), phone.to_owned()),
+                    (current_lid.to_owned(), phone.to_owned()),
+                ],
+                LearningSource::Other,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(written, 1);
+        let persisted = client
+            .persistence_manager
+            .backend()
+            .get_lid_mapping(current_lid)
+            .await
+            .unwrap()
+            .expect("mapping must be durable when the call returns");
+        assert_eq!(persisted.phone_number, phone);
+        assert_eq!(
+            client.resolve_encryption_jid(&Jid::pn(phone)).await.user,
+            current_lid
+        );
+    }
+
     /// Online (`is_offline = false`) batch must persist the mapping to the
     /// backend AND run `migrate_device_registry_on_lid_discovery` for each
     /// newly learned PN. Polls until the detached task completes.
@@ -2367,6 +2530,90 @@ mod tests {
                 .migrate_signal_sessions_on_lid_discovery(pn, lid)
                 .await,
             "second call finds the PN side already drained"
+        );
+    }
+
+    /// Identity cleanup still needs a durable flush, but cannot make a failed
+    /// session decrypt succeed and must not request a retry.
+    #[tokio::test]
+    async fn identity_only_migration_flushes_without_requesting_decrypt_retry() {
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000002222";
+        let lid = "133333333333333";
+        let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        let backend = client.persistence_manager.backend();
+
+        client.signal_cache.put_identity(&pn_addr, &[7; 32]).await;
+        client.signal_cache.put_identity(&lid_addr, &[8; 32]).await;
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+        assert!(
+            !client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await,
+            "discarding only the stale PN identity cannot help a decrypt retry"
+        );
+        assert_eq!(backend.load_identity(pn_addr.as_str()).await.unwrap(), None);
+        assert_eq!(
+            backend.load_identity(lid_addr.as_str()).await.unwrap(),
+            Some([8; 32]),
+            "the destination identity must win and the cleanup must be durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn lid_discovery_retries_pending_migration_flush() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = create_test_client_with_backend(backend.clone()).await;
+        let pn = "5500000003333";
+        let lid = "144444444444444";
+        let pn_addr = Jid::pn_device(pn, 0).to_protocol_address();
+        let lid_addr = Jid::lid_device(lid, 0).to_protocol_address();
+        client
+            .signal_cache
+            .put_session(
+                &pn_addr,
+                SessionRecord::deserialize(&tagged_session_blob(9)).unwrap(),
+            )
+            .await;
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+        backend.set_fail_session_writes(true);
+        assert!(
+            client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await,
+            "the first pass moved a session in memory"
+        );
+        backend.set_fail_session_writes(false);
+        let attempts_before_retry = backend.session_batch_write_count();
+
+        assert!(
+            !client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await,
+            "a durability retry must not request another decrypt attempt"
+        );
+        assert!(backend.session_batch_write_count() > attempts_before_retry);
+        assert!(
+            backend
+                .get_session(pn_addr.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_session(lid_addr.as_str())
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

@@ -7,12 +7,14 @@ use crate::client::Client;
 use crate::features::groups::GroupError;
 use crate::features::groups::GroupMetadata;
 use crate::features::groups::GroupParticipant;
+use crate::features::groups::GroupParticipantOptions;
+use crate::features::groups::ParticipantChangeResponse;
 use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
 use log::warn;
 use thiserror::Error;
 use wacore::iq::groups::{
-    DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateIq, GroupCreateOptions,
+    CommunityParticipatingIq, DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateOptions,
     JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
@@ -93,6 +95,10 @@ pub struct CommunitySubgroup {
     pub id: Jid,
     pub subject: String,
     pub participant_count: Option<u32>,
+    /// Server-reported subgroup creation timestamp, when available.
+    pub creation: Option<u64>,
+    /// Server-reported subgroup creator, when available.
+    pub owner: Option<Jid>,
     pub is_default_sub_group: bool,
     pub is_general_chat: bool,
 }
@@ -158,11 +164,12 @@ impl<'a> Community<'a> {
             ..Default::default()
         };
 
-        let group = self
+        let mut metadata = self
             .client
-            .execute(GroupCreateIq::new(create_options))
-            .await?;
-        let mut metadata = GroupMetadata::from(group);
+            .groups()
+            .create_group(create_options)
+            .await?
+            .metadata;
 
         if let Some(desc_text) = description
             && let Ok(desc) = wacore::iq::groups::GroupDescription::new(&desc_text)
@@ -177,6 +184,27 @@ impl<'a> Community<'a> {
         Ok(CreateCommunityResult { metadata })
     }
 
+    /// Create a subgroup already linked to a parent group.
+    pub async fn create_subgroup(
+        &self,
+        name: impl Into<String>,
+        participants: &[Jid],
+        parent_jid: impl Into<Jid>,
+    ) -> Result<CreateCommunityResult, CommunityError> {
+        let options = GroupCreateOptions {
+            subject: name.into(),
+            participants: participants
+                .iter()
+                .cloned()
+                .map(GroupParticipantOptions::new)
+                .collect(),
+            linked_parent: Some(parent_jid.into()),
+            ..Default::default()
+        };
+        let metadata = self.client.groups().create_group(options).await?.metadata;
+        Ok(CreateCommunityResult { metadata })
+    }
+
     /// Deactivate (delete) a community. Subgroups are unlinked but not deleted.
     pub async fn deactivate(&self, community_jid: impl Into<Jid>) -> Result<(), CommunityError> {
         let community_jid = &community_jid.into();
@@ -184,6 +212,19 @@ impl<'a> Community<'a> {
             .execute(DeleteCommunityIq::new(community_jid))
             .await?;
         Ok(())
+    }
+
+    /// Remove participants from the parent and all linked groups.
+    pub async fn remove_participants(
+        &self,
+        community_jid: impl Into<Jid>,
+        participants: &[Jid],
+    ) -> Result<Vec<ParticipantChangeResponse>, CommunityError> {
+        Ok(self
+            .client
+            .groups()
+            .remove_participants_including_linked_groups(community_jid, participants)
+            .await?)
     }
 
     /// Link existing groups as subgroups of a community.
@@ -294,6 +335,27 @@ impl<'a> Community<'a> {
         Ok(subgroups)
     }
 
+    /// Fetch all parent groups the account currently participates in.
+    pub async fn get_participating(
+        &self,
+    ) -> Result<std::collections::HashMap<Jid, GroupMetadata>, CommunityError> {
+        let response = self.client.execute(CommunityParticipatingIq::new()).await?;
+        let mut result: std::collections::HashMap<Jid, GroupMetadata> = response
+            .groups
+            .into_iter()
+            .map(|community| {
+                let id = community.id.clone();
+                (id, GroupMetadata::from(community))
+            })
+            .collect();
+
+        for metadata in result.values_mut() {
+            self.client.groups().fill_participant_pns(metadata).await;
+        }
+
+        Ok(result)
+    }
+
     /// Fetch participant counts per subgroup via MEX (GraphQL).
     pub async fn get_subgroup_participant_counts(
         &self,
@@ -388,6 +450,32 @@ impl<'a> Community<'a> {
     }
 }
 
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse::<u64>().ok())
+}
+
+fn json_jid(value: &serde_json::Value) -> Option<Jid> {
+    if let Some(value) = value.as_str() {
+        return value.parse().ok();
+    }
+
+    let object = value.as_object()?;
+    ["id", "lid", "pn"]
+        .into_iter()
+        .filter_map(|field| object.get(field)?.as_str())
+        .find_map(|value| value.parse().ok())
+}
+
+fn json_bool(value: &serde_json::Value) -> Option<bool> {
+    value.as_bool().or_else(|| match value.as_str()? {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    })
+}
+
 fn parse_subgroup_node(node: &serde_json::Value, is_default: bool) -> Option<CommunitySubgroup> {
     let id_str = node.get("id")?.as_str()?;
     let jid: Jid = id_str.parse().ok()?;
@@ -407,20 +495,33 @@ fn parse_subgroup_node(node: &serde_json::Value, is_default: bool) -> Option<Com
     let participant_count = node
         .get("participants_count")
         .or_else(|| node.get("total_participants_count"))
-        .and_then(|c| c.as_u64())
-        .map(|c| c as u32);
+        .and_then(json_u64)
+        .and_then(|count| u32::try_from(count).ok());
+
+    let creation = node
+        .get("creation")
+        .or_else(|| node.get("creation_time"))
+        .and_then(json_u64)
+        .or_else(|| node.get("subject")?.get("creation_time").and_then(json_u64));
+    let owner = node
+        .get("creator")
+        .or_else(|| node.get("owner"))
+        .and_then(json_jid)
+        .or_else(|| node.get("subject")?.get("creator").and_then(json_jid));
 
     // Check if properties indicate general chat
     let is_general_from_props = node
         .get("properties")
         .and_then(|p| p.get("general_chat"))
-        .and_then(|v| v.as_bool())
+        .and_then(json_bool)
         .unwrap_or(false);
 
     Some(CommunitySubgroup {
         id: jid,
         subject,
         participant_count,
+        creation,
+        owner,
         is_default_sub_group: is_default,
         is_general_chat: is_general_from_props,
     })
@@ -429,5 +530,55 @@ fn parse_subgroup_node(node: &serde_json::Value, is_default: bool) -> Option<Com
 impl Client {
     pub fn community(&self) -> Community<'_> {
         Community::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subgroup_parser_preserves_typed_metadata() {
+        let node = serde_json::json!({
+            "id": "120363000000000002@g.us",
+            "subject": {
+                "value": "Fictitious subgroup",
+                "creation_time": "1700000012"
+            },
+            "creator": {
+                "id": "100000000000002@lid",
+                "pn": "15550000002@s.whatsapp.net"
+            },
+            "total_participants_count": 42,
+            "properties": { "general_chat": "1" }
+        });
+
+        let subgroup = parse_subgroup_node(&node, false).expect("valid subgroup");
+        assert_eq!(subgroup.subject, "Fictitious subgroup");
+        assert_eq!(subgroup.creation, Some(1_700_000_012));
+        assert_eq!(subgroup.participant_count, Some(42));
+        assert_eq!(subgroup.owner, Some("100000000000002@lid".parse().unwrap()));
+        assert!(subgroup.is_general_chat);
+        assert!(!subgroup.is_default_sub_group);
+    }
+
+    #[test]
+    fn subgroup_parser_accepts_legacy_scalar_metadata() {
+        let node = serde_json::json!({
+            "id": "120363000000000003@g.us",
+            "subject": "Legacy subgroup",
+            "creation": 1700000024,
+            "owner": "15550000003@s.whatsapp.net",
+            "properties": { "general_chat": false }
+        });
+
+        let subgroup = parse_subgroup_node(&node, true).expect("valid subgroup");
+        assert_eq!(subgroup.creation, Some(1_700_000_024));
+        assert_eq!(
+            subgroup.owner,
+            Some("15550000003@s.whatsapp.net".parse().unwrap())
+        );
+        assert!(!subgroup.is_general_chat);
+        assert!(subgroup.is_default_sub_group);
     }
 }

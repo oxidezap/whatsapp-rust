@@ -1389,7 +1389,14 @@ pub struct GroupUpdate {
     /// Identifier of the source notification stanza.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notification_id: Option<String>,
+    /// Display name supplied with the source notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
+    /// Raw offline-delivery marker supplied with the source notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
     /// Zero-based emitted-action index within the source notification.
+    #[builder(default)]
     pub action_index: u32,
     /// The admin/user who triggered the change (`participant` attribute)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1407,6 +1414,9 @@ pub struct GroupUpdate {
     pub timestamp: DateTime<Utc>,
     /// Whether the group uses LID addressing mode
     pub is_lid_addressing_mode: bool,
+    /// Whether participant identity information was incomplete in the source stanza.
+    #[builder(default)]
+    pub has_incomplete_participant_information: bool,
     /// The specific action
     pub action: crate::stanza::groups::GroupNotificationAction,
 }
@@ -1571,6 +1581,19 @@ mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
+
+    #[test]
+    fn group_update_builder_defaults_additive_scalar_fields() {
+        let update = GroupUpdate::builder()
+            .group_jid("120363000000000001@g.us".parse().unwrap())
+            .timestamp(DateTime::<Utc>::UNIX_EPOCH)
+            .is_lid_addressing_mode(false)
+            .action(crate::stanza::groups::GroupNotificationAction::Unlocked)
+            .build();
+
+        assert_eq!(update.action_index, 0);
+        assert!(!update.has_incomplete_participant_information);
+    }
 
     #[test]
     fn unavailable_fanout_flags_follow_wa_web_precedence() {

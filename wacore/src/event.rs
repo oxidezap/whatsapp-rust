@@ -6,10 +6,11 @@
 use anyhow::{Result, ensure};
 use waproto::whatsapp::message::EventResponseMessage;
 
-use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
+use crate::secret_enc_addon::{
+    AddonContext, MESSAGE_SECRET_SIZE, ModificationType, decrypt_addon, encrypt_addon,
+};
 
 const GCM_IV_SIZE: usize = 12;
-const MESSAGE_SECRET_SIZE: usize = 32;
 
 fn event_response_addon_ctx<'a>(
     stanza_id: &'a str,

@@ -398,7 +398,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         metadata
             .ephemeral
             .and_then(|settings| settings.expiration)
-            .unwrap_or(0),
+            .unwrap_or_default(),
         0,
         "Ephemeral should be disabled initially"
     );
@@ -492,8 +492,11 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .await?;
     let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
     assert_eq!(
-        metadata.ephemeral.and_then(|settings| settings.expiration),
-        Some(0),
+        metadata
+            .ephemeral
+            .and_then(|settings| settings.expiration)
+            .unwrap_or_default(),
+        0,
         "Ephemeral should be disabled after set_ephemeral(0)"
     );
     info!("Ephemeral disabled - verified");

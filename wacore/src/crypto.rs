@@ -16,12 +16,12 @@ pub enum CryptoError {
     InvalidHkdfLength,
 }
 
-/// Computes an MD5 digest.
+/// Legacy protocol fingerprint; this must not be used as a security hash.
 pub fn md5_digest(input: &[u8]) -> [u8; 16] {
     md5::compute(input).into()
 }
 
-/// Derives `expanded_length` bytes using HKDF-SHA256.
+/// Rejects output beyond HKDF's 255-block expansion limit before allocating.
 pub fn hkdf_sha256(
     input_key_material: &[u8],
     expanded_length: usize,
@@ -36,7 +36,7 @@ pub fn hkdf_sha256(
     Ok(output)
 }
 
-/// Derives HKDF-SHA256 output directly into a caller-provided buffer.
+/// Caller-owned output avoids an allocation in fixed-size derivation paths.
 pub fn hkdf_sha256_into(
     input_key_material: &[u8],
     salt: Option<&[u8]>,
@@ -48,12 +48,12 @@ pub fn hkdf_sha256_into(
         .map_err(|_| CryptoError::InvalidHkdfLength)
 }
 
-/// Generates a Curve25519 key pair with the configured secure random source.
+/// Uses the crate-wide secure random source so key generation follows one policy.
 pub fn generate_curve_key_pair() -> KeyPair {
     KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>())
 }
 
-/// Signs `message` with the supplied Curve25519 private key.
+/// Uses the same secure random policy as key generation for randomized signatures.
 pub fn calculate_curve_signature(
     private_key: &PrivateKey,
     message: &[u8],

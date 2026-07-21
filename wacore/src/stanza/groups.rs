@@ -15,6 +15,8 @@ use serde::Serialize;
 use wacore_binary::Jid;
 use wacore_binary::{Node, NodeRef};
 
+const MISSING_PARTICIPANT_IDENTIFICATION_TAG: &str = "missing_participant_identification";
+
 /// How a membership request was initiated.
 ///
 /// Maps to `WAWebRequestMethodType` in WhatsApp Web JS.
@@ -36,6 +38,10 @@ pub struct GroupNotification {
     pub group_jid: Jid,
     /// Notification stanza identifier (from `id`).
     pub notification_id: Option<String>,
+    /// Display name supplied with the notification.
+    pub notify: Option<String>,
+    /// Raw offline-delivery marker supplied with the notification.
+    pub offline: Option<String>,
     /// Admin/user who triggered the notification (from `participant` attribute)
     pub participant: Option<Jid>,
     /// Phone number JID of the participant (from `participant_pn` attribute, for LID groups)
@@ -49,6 +55,8 @@ pub struct GroupNotification {
     pub timestamp: u64,
     /// Whether the group uses LID addressing mode (from `addressing_mode="lid"`)
     pub is_lid_addressing_mode: bool,
+    /// Whether at least one participant identity was omitted by the server.
+    pub has_incomplete_participant_information: bool,
     /// One or more actions in this notification
     pub actions: Vec<GroupNotificationAction>,
 }
@@ -64,6 +72,17 @@ pub enum GroupParticipantType {
     Admin,
     #[wire = "superadmin"]
     SuperAdmin,
+}
+
+/// Delivery state for history shared with a newly joined participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum GroupHistorySentState {
+    #[wire = "HISTORY_NOT_SENT"]
+    HistoryNotSent,
+    #[wire = "HISTORY_SENT"]
+    HistorySent,
+    #[wire = "NOTICE_SENT"]
+    NoticeSent,
 }
 
 /// Participant info extracted from `<participant>` child elements.
@@ -105,6 +124,9 @@ pub struct GroupParticipantInfo {
     /// admin UI for tenure display.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub join_time: Option<u64>,
+    /// Delivery state for post-join group history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_history_sent_state: Option<GroupHistorySentState>,
 }
 
 /// All possible group notification action types.
@@ -348,6 +370,12 @@ impl GroupNotification {
         let mut attrs = node.attrs();
         let group_jid = attrs.optional_jid("from")?;
         let notification_id = attrs.optional_string("id").map(|value| value.into_owned());
+        let notify = attrs
+            .optional_string("notify")
+            .map(|value| value.into_owned());
+        let offline = attrs
+            .optional_string("offline")
+            .map(|value| value.into_owned());
         let participant = attrs.optional_jid("participant");
         let participant_pn = attrs.optional_jid("participant_pn");
         let participant_username = attrs
@@ -362,20 +390,34 @@ impl GroupNotification {
             .map(|v| v.as_str())
             .is_some_and(|s| s == "lid");
 
+        let mut has_incomplete_participant_information = false;
         let actions = node
             .children()
-            .map(|children| children.iter().filter_map(parse_action).collect())
+            .map(|children| {
+                let mut actions = Vec::with_capacity(children.len());
+                for child in children {
+                    if child.tag.as_ref() == MISSING_PARTICIPANT_IDENTIFICATION_TAG {
+                        has_incomplete_participant_information = true;
+                    } else if let Some(action) = parse_action(child) {
+                        actions.push(action);
+                    }
+                }
+                actions
+            })
             .unwrap_or_default();
 
         Some(Self {
             group_jid,
             notification_id,
+            notify,
+            offline,
             participant,
             participant_pn,
             participant_username,
             participant_country_code,
             timestamp,
             is_lid_addressing_mode,
+            has_incomplete_participant_information,
             actions,
         })
     }
@@ -396,7 +438,7 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
     use wacore_binary::NodeContentRef;
 
     // WA Web drops this child entirely; mirror that behavior.
-    if node.tag.as_ref() == "missing_participant_identification" {
+    if node.tag.as_ref() == MISSING_PARTICIPANT_IDENTIFICATION_TAG {
         return None;
     }
 
@@ -635,10 +677,13 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                     );
                     let lid = attrs.optional_jid("lid");
                     let username = attrs
-                        .optional_string("participant_username")
-                        .or_else(|| attrs.optional_string("username"))
+                        .optional_string("username")
+                        .or_else(|| attrs.optional_string("participant_username"))
                         .map(|s| s.into_owned());
                     let join_time = attrs.optional_u64("join_time");
+                    let group_history_sent_state = attrs
+                        .optional_string("group_history_sent_state")
+                        .and_then(|value| GroupHistorySentState::try_from(value.as_ref()).ok());
                     Some(GroupParticipantInfo {
                         jid,
                         phone_number,
@@ -647,6 +692,7 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                         lid,
                         username,
                         join_time,
+                        group_history_sent_state,
                     })
                 })
                 .collect()
@@ -676,6 +722,7 @@ fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                         lid: None,
                         username,
                         join_time: None,
+                        group_history_sent_state: None,
                     })
                 })
                 .collect()
@@ -760,18 +807,27 @@ mod tests {
             .attr("participant_pn", participant_pn.clone())
             .attr("participant_username", "group-admin")
             .attr("participant_country_code", "BR")
+            .attr("notify", "Group Admin")
+            .attr("offline", "1")
             .attr("t", "1704067200")
-            .children(vec![NodeBuilder::new("announcement").build()])
+            .children(vec![
+                NodeBuilder::new(MISSING_PARTICIPANT_IDENTIFICATION_TAG).build(),
+                NodeBuilder::new("announcement").build(),
+            ])
             .build();
 
         let notification = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
         assert_eq!(notification.notification_id.as_deref(), Some("GP-ROOT-1"));
+        assert_eq!(notification.notify.as_deref(), Some("Group Admin"));
+        assert_eq!(notification.offline.as_deref(), Some("1"));
         assert_eq!(notification.participant_pn, Some(participant_pn));
         assert_eq!(
             notification.participant_username.as_deref(),
             Some("group-admin")
         );
         assert_eq!(notification.participant_country_code.as_deref(), Some("BR"));
+        assert!(notification.has_incomplete_participant_information);
+        assert_eq!(notification.actions.len(), 1);
     }
 
     #[test]
@@ -871,9 +927,10 @@ mod tests {
                         .attr("jid", "55510000001@s.whatsapp.net")
                         .attr("type", "admin")
                         .attr("lid", "99900000000001@lid")
-                        .attr("participant_username", "alice")
-                        .attr("username", "fallback-alice")
+                        .attr("participant_username", "legacy-alice")
+                        .attr("username", "alice")
                         .attr("join_time", "1700000000")
+                        .attr("group_history_sent_state", "NOTICE_SENT")
                         .build(),
                 ])
                 .build(),
@@ -890,6 +947,10 @@ mod tests {
                 );
                 assert_eq!(p.username.as_deref(), Some("alice"));
                 assert_eq!(p.join_time, Some(1700000000));
+                assert_eq!(
+                    p.group_history_sent_state,
+                    Some(GroupHistorySentState::NoticeSent)
+                );
             }
             other => panic!("expected Add, got {:?}", other),
         }

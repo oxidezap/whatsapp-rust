@@ -3,11 +3,11 @@
 //! Thin wrapper over [`secret_enc_addon`] specialised for the
 //! `PollVoteMessage` proto and the `"Poll Vote"` use-case.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::secret_enc_addon::{
-    AddonContext, ModificationType, build_aad, decrypt_addon, encrypt_addon,
+    AddonContext, MESSAGE_SECRET_SIZE, ModificationType, build_aad, decrypt_addon, encrypt_addon,
 };
 
 const GCM_IV_SIZE: usize = 12;
@@ -272,6 +272,11 @@ pub fn decrypt_poll_vote_payload_with_secret(
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<Vec<u8>> {
+    ensure!(
+        message_secret.len() == MESSAGE_SECRET_SIZE,
+        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
+        message_secret.len()
+    );
     decrypt_addon(
         ciphertext.enc_payload,
         ciphertext.enc_iv,
@@ -406,6 +411,27 @@ mod tests {
             selected_options: hashes,
         };
         assert_eq!(plaintext, vote_message.encode_to_vec());
+    }
+
+    #[test]
+    fn payload_decrypt_rejects_invalid_message_secret_before_ciphertext() {
+        let error = decrypt_poll_vote_payload_with_secret(
+            PollVoteCiphertext {
+                enc_payload: &[],
+                enc_iv: &[],
+            },
+            &[0u8; MESSAGE_SECRET_SIZE - 1],
+            "id",
+            "creator@s.whatsapp.net",
+            "voter@s.whatsapp.net",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("message_secret must be 32 bytes")
+        );
     }
 
     #[test]

@@ -316,7 +316,7 @@ pub struct MessageInfo {
     pub server_id: MessageServerId,
     pub r#type: String,
     pub push_name: String,
-    #[serde(with = "chrono::serde::ts_seconds")]
+    #[serde(serialize_with = "chrono::serde::ts_seconds::serialize")]
     pub timestamp: DateTime<Utc>,
     pub category: MessageCategory,
     pub multicast: bool,

@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use std::num::NonZeroU32;
 use typed_builder::TypedBuilder;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Jid, Server};
+use wacore_binary::{CompactString, Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
 
 // Re-export AddressingMode from types::message for convenience
@@ -30,6 +30,19 @@ pub const BATCH_GROUP_INFO_LIMIT: usize = 10_000;
 
 /// Maximum number of pictures in a batch profile picture query.
 pub const BATCH_PROFILE_PICTURES_LIMIT: usize = 1_000;
+
+/// Maximum participant count accepted in a group-info response.
+pub const GROUP_INFO_PARTICIPANT_LIMIT: u32 = 19_999;
+
+/// Maximum disappearing-message expiration accepted in group metadata.
+pub const GROUP_EPHEMERAL_EXPIRATION_MAX: u32 = i32::MAX as u32;
+/// Maximum source trigger accepted by group settings.
+pub const GROUP_SETTING_TRIGGER_MAX: u32 = 20;
+/// Maximum schema evolution version accepted in group metadata.
+pub const GROUP_EVOLUTION_VERSION_MAX: u32 = 100;
+
+/// Max for `<ephemeral trigger>`, retained as the setting-specific public name.
+pub const EPHEMERAL_TRIGGER_MAX: u32 = GROUP_SETTING_TRIGGER_MAX;
 
 /// Member link mode for group invite links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -67,6 +80,19 @@ pub enum MemberShareHistoryMode {
     AdminShare,
     #[wire = "all_member_share"]
     AllMemberShare,
+}
+
+/// Review state for an appeal on a suspended group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum GroupAppealStatus {
+    #[wire = "approved"]
+    Approved,
+    #[wire = "in_review"]
+    InReview,
+    #[wire = "none"]
+    NoAppeal,
+    #[wire = "rejected"]
+    Rejected,
 }
 
 /// Growth lock info (system-managed, read-only).
@@ -494,6 +520,106 @@ pub struct GroupQueryRequest {
     pub request: GroupQueryRequestType,
 }
 
+fn optional_u64_attr(node: &NodeRef<'_>, name: &str) -> Result<Option<u64>> {
+    let Some(value) = node.attrs().optional_string(name) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error| anyhow!("invalid '{name}' attribute '{value}': {error}"))
+}
+
+fn optional_bounded_u32_attr(node: &NodeRef<'_>, name: &str, maximum: u32) -> Result<Option<u32>> {
+    let Some(value) = optional_u64_attr(node, name)? else {
+        return Ok(None);
+    };
+    let value = u32::try_from(value)
+        .map_err(|_| anyhow!("'{name}' attribute exceeds {maximum}: {value}"))?;
+    if value > maximum {
+        return Err(anyhow!("'{name}' attribute exceeds {maximum}: {value}"));
+    }
+    Ok(Some(value))
+}
+
+/// Less-common participant metadata, allocated only when at least one field is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GroupParticipantDetails {
+    /// Server-defined label associated with this participant.
+    pub participant_label: Option<CompactString>,
+    /// Modification timestamp for `participant_label`.
+    pub participant_label_mtime: Option<u64>,
+    /// Timestamp when the participant joined the group.
+    pub join_time: Option<u64>,
+    /// Whether initial group history was delivered to the participant.
+    pub group_history_sent: Option<bool>,
+    /// Server-rendered participant display name.
+    pub display_name: Option<CompactString>,
+    /// Whether the participant may be addressed directly.
+    pub is_addressable: bool,
+}
+
+impl Default for GroupParticipantDetails {
+    fn default() -> Self {
+        Self {
+            participant_label: None,
+            participant_label_mtime: None,
+            join_time: None,
+            group_history_sent: None,
+            display_name: None,
+            is_addressable: true,
+        }
+    }
+}
+
+impl GroupParticipantDetails {
+    fn from_node(node: &NodeRef<'_>) -> Result<Option<Box<Self>>> {
+        let mut attrs = node.attrs();
+        let participant_label = attrs
+            .optional_string("participant_label")
+            .map(|value| CompactString::from(value.as_ref()));
+        let group_history_sent = attrs.optional_bool_value("group_history_sent");
+        let display_name = attrs
+            .optional_string("display_name")
+            .map(|value| CompactString::from(value.as_ref()));
+        let is_addressable = attrs.optional_bool_value("addressable").unwrap_or(true);
+        attrs.finish()?;
+
+        let details = Self {
+            participant_label,
+            participant_label_mtime: optional_u64_attr(node, "participant_label_mtime")?,
+            join_time: optional_u64_attr(node, "join_time")?,
+            group_history_sent,
+            display_name,
+            is_addressable,
+        };
+        Ok((details != Self::default()).then(|| Box::new(details)))
+    }
+
+    fn apply_to_builder(self, mut builder: NodeBuilder) -> NodeBuilder {
+        if let Some(value) = self.participant_label {
+            builder = builder.attr("participant_label", value);
+        }
+        if let Some(value) = self.participant_label_mtime {
+            builder = builder.attr("participant_label_mtime", value);
+        }
+        if let Some(value) = self.join_time {
+            builder = builder.attr("join_time", value);
+        }
+        if let Some(value) = self.group_history_sent {
+            builder = builder.attr("group_history_sent", if value { "true" } else { "false" });
+        }
+        if let Some(value) = self.display_name {
+            builder = builder.attr("display_name", value);
+        }
+        if !self.is_addressable {
+            builder = builder.attr("addressable", "false");
+        }
+        builder
+    }
+}
+
 /// A participant in a group response.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -501,8 +627,9 @@ pub struct GroupParticipantResponse {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
     pub lid: Option<Jid>,
-    pub username: Option<String>,
+    pub username: Option<CompactString>,
     pub participant_type: ParticipantType,
+    pub details: Option<Box<GroupParticipantDetails>>,
 }
 
 impl ProtocolNode for GroupParticipantResponse {
@@ -519,10 +646,13 @@ impl ProtocolNode for GroupParticipantResponse {
             builder = builder.attr("lid", lid);
         }
         if let Some(username) = self.username {
-            builder = builder.attr("participant_username", username);
+            builder = builder.attr("username", username);
         }
         if self.participant_type != ParticipantType::Member {
             builder = builder.attr("type", self.participant_type.as_str());
+        }
+        if let Some(details) = self.details {
+            builder = details.apply_to_builder(builder);
         }
         builder.build()
     }
@@ -538,9 +668,9 @@ impl ProtocolNode for GroupParticipantResponse {
         let phone_number = attrs.optional_jid("phone_number");
         let lid = attrs.optional_jid("lid");
         let username = attrs
-            .optional_string("participant_username")
-            .or_else(|| attrs.optional_string("username"))
-            .map(|value| value.into_owned());
+            .optional_string("username")
+            .or_else(|| attrs.optional_string("participant_username"))
+            .map(|value| CompactString::from(value.as_ref()));
         let participant_type = attrs
             .optional_string("type")
             .and_then(|s| ParticipantType::try_from(s.as_ref()).ok())
@@ -552,6 +682,7 @@ impl ProtocolNode for GroupParticipantResponse {
             lid,
             username,
             participant_type,
+            details: GroupParticipantDetails::from_node(node)?,
         })
     }
 }
@@ -584,14 +715,13 @@ impl ProtocolNode for GroupEphemeralSettings {
             return Err(anyhow!("expected <ephemeral>, got <{}>", node.tag));
         }
 
-        let mut attrs = node.attrs();
         Ok(Self {
-            expiration: attrs
-                .optional_string("expiration")
-                .and_then(|value| value.parse().ok()),
-            trigger: attrs
-                .optional_string("trigger")
-                .and_then(|value| value.parse().ok()),
+            expiration: optional_bounded_u32_attr(
+                node,
+                "expiration",
+                GROUP_EPHEMERAL_EXPIRATION_MAX,
+            )?,
+            trigger: optional_bounded_u32_attr(node, "trigger", GROUP_SETTING_TRIGGER_MAX)?,
         })
     }
 }
@@ -616,6 +746,14 @@ pub struct GroupInfoResponse {
     pub creator_country_code: Option<String>,
     /// Group creation timestamp (from `creation` attribute).
     pub creation_time: Option<u64>,
+    /// Participant-list version identifier (from `p_v_id`).
+    pub participant_version_id: Option<String>,
+    /// Admin-list version identifier (from `a_v_id`).
+    pub admin_version_id: Option<String>,
+    /// Open thread identifier associated with the group.
+    pub open_thread_id: Option<String>,
+    /// Whether participant identity information was incomplete in this response.
+    pub has_missing_participant_identification: bool,
     /// Subject modification timestamp (from `s_t` attribute).
     pub subject_time: Option<u64>,
     /// Subject owner JID (from `s_o` attribute).
@@ -652,6 +790,8 @@ pub struct GroupInfoResponse {
     pub size: Option<u32>,
     /// Whether this group is a community parent group (has `<parent>` child).
     pub is_parent_group: bool,
+    /// Whether joins to this parent group require approval by default.
+    pub parent_membership_approval_required: bool,
     /// JID of the parent community (for subgroups, from `<linked_parent jid="..."/>`).
     pub parent_group_jid: Option<Jid>,
     /// Whether this is the default announcement subgroup of a community.
@@ -668,6 +808,14 @@ pub struct GroupInfoResponse {
     pub growth_locked: Option<GrowthLockInfo>,
     /// Whether the group is suspended.
     pub is_suspended: bool,
+    /// Whether a suspension appeal may be filed automatically.
+    pub suspension_can_auto_file: bool,
+    /// Current suspension-appeal state.
+    pub appeal_status: Option<GroupAppealStatus>,
+    /// Last suspension-appeal update timestamp.
+    pub appeal_update_time: Option<u64>,
+    /// Whether the group is marked as a support group.
+    pub is_support_group: bool,
     /// Whether admin reports are allowed.
     pub allow_admin_reports: bool,
     /// Whether the group is hidden.
@@ -676,8 +824,20 @@ pub struct GroupInfoResponse {
     pub is_incognito: bool,
     /// Whether group history is enabled.
     pub has_group_history: bool,
+    /// Whether automatic participant addition is disabled.
+    pub is_auto_add_disabled: bool,
+    /// Whether the group carries the CAPI capability marker.
+    pub has_capi: bool,
+    /// Group schema evolution version.
+    pub evolution_version: Option<u32>,
+    /// Whether the group safety-check feature is enabled.
+    pub has_group_safety_check: bool,
+    /// Whether participant labels are enabled.
+    pub participant_label_enabled: bool,
     /// Whether limit sharing is enabled.
     pub is_limit_sharing_enabled: bool,
+    /// Source trigger for limit-sharing enablement.
+    pub limit_sharing_trigger: Option<u32>,
 }
 
 impl ProtocolNode for GroupInfoResponse {
@@ -691,6 +851,10 @@ impl ProtocolNode for GroupInfoResponse {
             .into_iter()
             .map(|p| p.into_node())
             .collect();
+
+        if self.has_missing_participant_identification {
+            children.push(NodeBuilder::new("missing_participant_identification").build());
+        }
 
         if self.is_locked {
             children.push(NodeBuilder::new("locked").build());
@@ -757,7 +921,11 @@ impl ProtocolNode for GroupInfoResponse {
 
         // Community fields
         if self.is_parent_group {
-            children.push(NodeBuilder::new("parent").build());
+            let mut parent = NodeBuilder::new("parent");
+            if self.parent_membership_approval_required {
+                parent = parent.attr("default_membership_approval_mode", "request_required");
+            }
+            children.push(parent.build());
         }
         if let Some(ref parent_jid) = self.parent_group_jid {
             children.push(
@@ -793,8 +961,29 @@ impl ProtocolNode for GroupInfoResponse {
                     .build(),
             );
         }
+        if self.is_support_group {
+            children.push(NodeBuilder::new("support").build());
+        }
         if self.is_suspended {
-            children.push(NodeBuilder::new("suspended").build());
+            let mut suspended = NodeBuilder::new("suspended");
+            if self.suspension_can_auto_file {
+                suspended = suspended.attr("can_auto_file", "true");
+            }
+            children.push(suspended.build());
+        }
+        if let Some(status) = self.appeal_status {
+            children.push(
+                NodeBuilder::new("appeal_status")
+                    .attr("type", status.as_str())
+                    .build(),
+            );
+        }
+        if let Some(value) = self.appeal_update_time {
+            children.push(
+                NodeBuilder::new("appeal_update_time")
+                    .attr("value", value)
+                    .build(),
+            );
         }
         if self.allow_admin_reports {
             children.push(NodeBuilder::new("allow_admin_reports").build());
@@ -808,8 +997,31 @@ impl ProtocolNode for GroupInfoResponse {
         if self.has_group_history {
             children.push(NodeBuilder::new("group_history").build());
         }
+        if self.is_auto_add_disabled {
+            children.push(NodeBuilder::new("auto_add_disabled").build());
+        }
+        if self.has_capi {
+            children.push(NodeBuilder::new("capi").build());
+        }
+        if let Some(value) = self.evolution_version {
+            children.push(
+                NodeBuilder::new("evolution_version")
+                    .attr("value", value)
+                    .build(),
+            );
+        }
+        if self.has_group_safety_check {
+            children.push(NodeBuilder::new("group_safety_check").build());
+        }
+        if self.participant_label_enabled {
+            children.push(NodeBuilder::new("participant_label_enabled").build());
+        }
         if self.is_limit_sharing_enabled {
-            children.push(NodeBuilder::new("limit_sharing_enabled").build());
+            let mut limit_sharing = NodeBuilder::new("limit_sharing_enabled");
+            if let Some(trigger) = self.limit_sharing_trigger {
+                limit_sharing = limit_sharing.attr("trigger", trigger);
+            }
+            children.push(limit_sharing.build());
         }
 
         let mut builder = NodeBuilder::new("group")
@@ -835,6 +1047,15 @@ impl ProtocolNode for GroupInfoResponse {
         if let Some(creation_time) = self.creation_time {
             builder = builder.attr("creation", creation_time);
         }
+        if let Some(participant_version_id) = self.participant_version_id {
+            builder = builder.attr("p_v_id", participant_version_id);
+        }
+        if let Some(admin_version_id) = self.admin_version_id {
+            builder = builder.attr("a_v_id", admin_version_id);
+        }
+        if let Some(open_thread_id) = self.open_thread_id {
+            builder = builder.attr("open_thread_id", open_thread_id);
+        }
         if let Some(subject_time) = self.subject_time {
             builder = builder.attr("s_t", subject_time);
         }
@@ -856,8 +1077,11 @@ impl ProtocolNode for GroupInfoResponse {
 
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
         use wacore_binary::NodeContentRef;
-        if node.tag != "group" {
-            return Err(anyhow!("expected <group>, got <{}>", node.tag));
+        if node.tag != "group" && node.tag != "community" {
+            return Err(anyhow!(
+                "expected <group> or <community>, got <{}>",
+                node.tag
+            ));
         }
 
         let mut attrs = node.attrs();
@@ -897,17 +1121,33 @@ impl ProtocolNode for GroupInfoResponse {
             .optional_string("creator_country_code")
             .map(|value| value.into_owned());
         let creation_time = attrs.optional_u64("creation");
+        let participant_version_id = attrs
+            .optional_string("p_v_id")
+            .map(|value| value.into_owned());
+        let admin_version_id = attrs
+            .optional_string("a_v_id")
+            .map(|value| value.into_owned());
+        let open_thread_id = attrs
+            .optional_string("open_thread_id")
+            .map(|value| value.into_owned());
+        let has_missing_participant_identification = node
+            .get_optional_child_by_tag(&["missing_participant_identification"])
+            .is_some();
         let subject_time = attrs.optional_u64("s_t");
         let subject_owner = attrs.optional_jid("s_o");
         let subject_owner_pn = attrs.optional_jid("s_o_pn");
         let subject_owner_username = attrs
             .optional_string("s_o_username")
             .map(|value| value.into_owned());
-        let size = attrs
-            .optional_string("size")
-            .and_then(|s| s.parse::<u32>().ok());
+        let size = optional_bounded_u32_attr(node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
 
         let participants = collect_children::<GroupParticipantResponse>(node, "participant")?;
+        if participants.len() > GROUP_INFO_PARTICIPANT_LIMIT as usize {
+            return Err(anyhow!(
+                "group-info participant count exceeds {GROUP_INFO_PARTICIPANT_LIMIT}: {}",
+                participants.len()
+            ));
+        }
 
         let is_locked = node.get_optional_child_by_tag(&["locked"]).is_some();
         let is_announcement = node.get_optional_child_by_tag(&["announcement"]).is_some();
@@ -955,7 +1195,15 @@ impl ProtocolNode for GroupInfoResponse {
             .and_then(|n| n.attrs().optional_string("t"))
             .and_then(|s| s.parse::<u64>().ok());
 
-        let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
+        let parent_node = node.get_optional_child_by_tag(&["parent"]);
+        let is_parent_group = parent_node.is_some();
+        let parent_membership_approval_required = parent_node
+            .and_then(|parent| {
+                parent
+                    .attrs()
+                    .optional_string("default_membership_approval_mode")
+            })
+            .is_some_and(|value| value == "request_required");
         let parent_group_jid = node
             .get_optional_child_by_tag(&["linked_parent"])
             .and_then(|n| n.attrs().optional_jid("jid"));
@@ -994,16 +1242,64 @@ impl ProtocolNode for GroupInfoResponse {
             }
         });
 
-        let is_suspended = node.get_optional_child_by_tag(&["suspended"]).is_some();
+        let is_support_group = node.get_optional_child_by_tag(&["support"]).is_some();
+        let suspended_node = node.get_optional_child_by_tag(&["suspended"]);
+        let is_suspended = suspended_node.is_some();
+        let suspension_can_auto_file = match suspended_node {
+            None => false,
+            Some(suspended) => {
+                let mut attrs = suspended.attrs();
+                let can_auto_file = attrs.optional_bool("can_auto_file");
+                attrs.finish()?;
+                can_auto_file
+            }
+        };
+        let appeal_status =
+            node.get_optional_child_by_tag(&["appeal_status"])
+                .map(|appeal| {
+                    let value = appeal.attrs().optional_string("type").ok_or_else(|| {
+                        anyhow!("appeal_status missing required 'type' attribute")
+                    })?;
+                    GroupAppealStatus::try_from(value.as_ref())
+                        .map_err(|_| anyhow!("invalid appeal status '{value}'"))
+                })
+                .transpose()?;
+        let appeal_update_time = node
+            .get_optional_child_by_tag(&["appeal_update_time"])
+            .map(|appeal| {
+                optional_u64_attr(appeal, "value")?
+                    .ok_or_else(|| anyhow!("appeal_update_time missing required 'value' attribute"))
+            })
+            .transpose()?;
         let allow_admin_reports = node
             .get_optional_child_by_tag(&["allow_admin_reports"])
             .is_some();
         let is_hidden_group = node.get_optional_child_by_tag(&["hidden_group"]).is_some();
         let is_incognito = node.get_optional_child_by_tag(&["incognito"]).is_some();
         let has_group_history = node.get_optional_child_by_tag(&["group_history"]).is_some();
-        let is_limit_sharing_enabled = node
-            .get_optional_child_by_tag(&["limit_sharing_enabled"])
+        let is_auto_add_disabled = node
+            .get_optional_child_by_tag(&["auto_add_disabled"])
             .is_some();
+        let has_capi = node.get_optional_child_by_tag(&["capi"]).is_some();
+        let evolution_version = node
+            .get_optional_child_by_tag(&["evolution_version"])
+            .map(|evolution| {
+                optional_bounded_u32_attr(evolution, "value", GROUP_EVOLUTION_VERSION_MAX)?
+                    .ok_or_else(|| anyhow!("evolution_version missing required 'value' attribute"))
+            })
+            .transpose()?;
+        let has_group_safety_check = node
+            .get_optional_child_by_tag(&["group_safety_check"])
+            .is_some();
+        let participant_label_enabled = node
+            .get_optional_child_by_tag(&["participant_label_enabled"])
+            .is_some();
+        let limit_sharing_node = node.get_optional_child_by_tag(&["limit_sharing_enabled"]);
+        let is_limit_sharing_enabled = limit_sharing_node.is_some();
+        let limit_sharing_trigger = limit_sharing_node
+            .map(|limit| optional_bounded_u32_attr(limit, "trigger", GROUP_SETTING_TRIGGER_MAX))
+            .transpose()?
+            .flatten();
 
         Ok(Self {
             id,
@@ -1016,6 +1312,10 @@ impl ProtocolNode for GroupInfoResponse {
             creator_username,
             creator_country_code,
             creation_time,
+            participant_version_id,
+            admin_version_id,
+            open_thread_id,
+            has_missing_participant_identification,
             subject_time,
             subject_owner,
             subject_owner_pn,
@@ -1034,6 +1334,7 @@ impl ProtocolNode for GroupInfoResponse {
             member_link_mode,
             size,
             is_parent_group,
+            parent_membership_approval_required,
             parent_group_jid,
             is_default_sub_group,
             is_general_chat,
@@ -1042,11 +1343,21 @@ impl ProtocolNode for GroupInfoResponse {
             member_share_history_mode,
             growth_locked,
             is_suspended,
+            suspension_can_auto_file,
+            appeal_status,
+            appeal_update_time,
+            is_support_group,
             allow_admin_reports,
             is_hidden_group,
             is_incognito,
             has_group_history,
+            is_auto_add_disabled,
+            has_capi,
+            evolution_version,
+            has_group_safety_check,
+            participant_label_enabled,
             is_limit_sharing_enabled,
+            limit_sharing_trigger,
         })
     }
 }
@@ -1117,11 +1428,17 @@ impl ProtocolNode for GroupParticipatingResponse {
     }
 
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
-        if node.tag != "groups" {
-            return Err(anyhow!("expected <groups>, got <{}>", node.tag));
-        }
-
-        let groups = collect_children::<GroupInfoResponse>(node, "group")?;
+        let child_tag = match node.tag.as_ref() {
+            "groups" => "group",
+            "communities" => "community",
+            _ => {
+                return Err(anyhow!(
+                    "expected <groups> or <communities>, got <{}>",
+                    node.tag
+                ));
+            }
+        };
+        let groups = collect_children::<GroupInfoResponse>(node, child_tag)?;
 
         Ok(Self { groups })
     }
@@ -1180,7 +1497,10 @@ impl IqSpec for GroupQueryIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        match response.get_optional_child("group") {
+        match response
+            .get_optional_child("group")
+            .or_else(|| response.get_optional_child("community"))
+        {
             Some(group_node) => Ok(GroupInfoOutcome::Full(Box::new(
                 GroupInfoResponse::try_from_node_ref(group_node)?,
             ))),
@@ -1203,19 +1523,96 @@ impl IqSpec for GroupParticipatingIq {
     type Response = GroupParticipatingResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        InfoQuery::get(
-            GROUP_IQ_NAMESPACE,
-            Jid::new("", Server::Group),
-            Some(NodeContent::Nodes(vec![
-                GroupParticipatingRequest::new().into_node(),
-            ])),
-        )
+        build_participating_iq()
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let groups_node = required_child(response, "groups")?;
-        GroupParticipatingResponse::try_from_node_ref(groups_node)
+        if has_participating_shape(response, "groups", "group") {
+            parse_participating_response(response, "groups", "group")
+        } else {
+            parse_community_participating_response(response)
+        }
     }
+}
+
+/// IQ specification for getting all parent groups the user participates in.
+#[derive(Debug, Clone, Default)]
+pub struct CommunityParticipatingIq;
+
+impl CommunityParticipatingIq {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl IqSpec for CommunityParticipatingIq {
+    type Response = GroupParticipatingResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        build_participating_iq()
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        if has_participating_shape(response, "communities", "community") {
+            return parse_community_participating_response(response);
+        }
+
+        let mut result = parse_participating_response(response, "groups", "group")?;
+        result.groups.retain(|group| group.is_parent_group);
+        Ok(result)
+    }
+}
+
+fn parse_community_participating_response(
+    response: &NodeRef<'_>,
+) -> Result<GroupParticipatingResponse> {
+    let mut result = parse_participating_response(response, "communities", "community")?;
+    for community in &mut result.groups {
+        community.is_parent_group = true;
+    }
+    Ok(result)
+}
+
+fn build_participating_iq() -> InfoQuery<'static> {
+    InfoQuery::get(
+        GROUP_IQ_NAMESPACE,
+        Jid::new("", Server::Group),
+        Some(NodeContent::Nodes(vec![
+            GroupParticipatingRequest::new().into_node(),
+        ])),
+    )
+}
+
+fn has_participating_shape(
+    response: &NodeRef<'_>,
+    container_tag: &'static str,
+    child_tag: &'static str,
+) -> bool {
+    response.tag == container_tag
+        || response.get_optional_child(container_tag).is_some()
+        || response.get_optional_child(child_tag).is_some()
+}
+
+fn parse_participating_response(
+    response: &NodeRef<'_>,
+    container_tag: &'static str,
+    child_tag: &'static str,
+) -> Result<GroupParticipatingResponse> {
+    if response.tag == container_tag {
+        return GroupParticipatingResponse::try_from_node_ref(response);
+    }
+
+    if let Some(container) = response.get_optional_child(container_tag) {
+        return GroupParticipatingResponse::try_from_node_ref(container);
+    }
+
+    let groups = collect_children::<GroupInfoResponse>(response, child_tag)?;
+    if groups.is_empty() {
+        return Err(anyhow!(
+            "missing <{container_tag}> or direct <{child_tag}> participating result"
+        ));
+    }
+    Ok(GroupParticipatingResponse { groups })
 }
 
 /// IQ specification for creating a new group.
@@ -1246,7 +1643,10 @@ impl IqSpec for GroupCreateIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let group_node = required_child(response, "group")?;
+        let group_node = response
+            .get_optional_child("group")
+            .or_else(|| response.get_optional_child("community"))
+            .ok_or_else(|| anyhow!("missing group or community create result"))?;
         let mut info = GroupInfoResponse::try_from_node_ref(group_node)?;
 
         // Server may omit `<parent>` from a community-create reply; overlay
@@ -1257,6 +1657,7 @@ impl IqSpec for GroupCreateIq {
             info.parent_group_jid.is_some() || self.options.linked_parent.is_some();
         if self.options.is_parent && !is_linked_subgroup {
             info.is_parent_group = true;
+            info.parent_membership_approval_required |= self.options.closed;
             info.allow_non_admin_sub_group_creation |=
                 self.options.allow_non_admin_sub_group_creation;
         }
@@ -1541,13 +1942,18 @@ fn build_participant_action_iq(
     group_jid: &Jid,
     action: &'static str,
     participants: &[Jid],
+    include_linked_groups: bool,
 ) -> InfoQuery<'static> {
     let children: Vec<Node> = participants
         .iter()
         .map(|jid| NodeBuilder::new("participant").attr("jid", jid).build())
         .collect();
 
-    let action_node = NodeBuilder::new(action).children(children).build();
+    let mut action_node = NodeBuilder::new(action);
+    if include_linked_groups {
+        action_node = action_node.attr("linked_groups", "true");
+    }
+    let action_node = action_node.children(children).build();
 
     InfoQuery::set_ref(
         GROUP_IQ_NAMESPACE,
@@ -1583,7 +1989,7 @@ macro_rules! define_group_participant_iq {
             type Response = Vec<ParticipantChangeResponse>;
 
             fn build_iq(&self) -> InfoQuery<'static> {
-                build_participant_action_iq(&self.group_jid, $action, &self.participants)
+                build_participant_action_iq(&self.group_jid, $action, &self.participants, false)
             }
 
             fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
@@ -1616,7 +2022,7 @@ macro_rules! define_group_participant_iq {
             type Response = ();
 
             fn build_iq(&self) -> InfoQuery<'static> {
-                build_participant_action_iq(&self.group_jid, $action, &self.participants)
+                build_participant_action_iq(&self.group_jid, $action, &self.participants, false)
             }
 
             fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
@@ -1710,6 +2116,36 @@ define_group_participant_iq!(
     RemoveParticipantsIq, action = "remove", response = Vec<ParticipantChangeResponse>
 );
 
+/// IQ specification for removing participants from a parent group and all of
+/// its linked groups in the same server operation.
+#[derive(Debug, Clone)]
+pub struct RemoveParticipantsIncludingLinkedGroupsIq {
+    pub group_jid: Jid,
+    pub participants: Vec<Jid>,
+}
+
+impl RemoveParticipantsIncludingLinkedGroupsIq {
+    pub fn new(group_jid: &Jid, participants: &[Jid]) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            participants: participants.to_vec(),
+        }
+    }
+}
+
+impl IqSpec for RemoveParticipantsIncludingLinkedGroupsIq {
+    type Response = Vec<ParticipantChangeResponse>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        build_participant_action_iq(&self.group_jid, "remove", &self.participants, true)
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        let action_node = required_child(response, "remove")?;
+        collect_children::<ParticipantChangeResponse>(action_node, "participant")
+    }
+}
+
 define_group_participant_iq!(
     /// IQ specification for promoting participants to admin.
     ///
@@ -1719,7 +2155,7 @@ define_group_participant_iq!(
     ///   <promote><participant jid="{user_jid}"/></promote>
     /// </iq>
     /// ```
-    PromoteParticipantsIq, action = "promote", response = ()
+    PromoteParticipantsIq, action = "promote", response = Vec<ParticipantChangeResponse>
 );
 
 define_group_participant_iq!(
@@ -1731,7 +2167,7 @@ define_group_participant_iq!(
     ///   <demote><participant jid="{user_jid}"/></demote>
     /// </iq>
     /// ```
-    DemoteParticipantsIq, action = "demote", response = ()
+    DemoteParticipantsIq, action = "demote", response = Vec<ParticipantChangeResponse>
 );
 
 /// IQ specification for getting (or resetting) a group's invite link.
@@ -1880,9 +2316,6 @@ impl IqSpec for SetGroupAnnouncementIq {
         Ok(())
     }
 }
-
-/// Max for `<ephemeral trigger>`, per `WASmaxInGroupsGroupInfoMixin`.
-pub const EPHEMERAL_TRIGGER_MAX: u32 = 20;
 
 /// IQ specification for setting ephemeral (disappearing) messages on a group.
 ///
@@ -2473,7 +2906,10 @@ fn parse_group_id(id_str: &str) -> Result<Jid> {
 
 /// Shared response parser for group join IQs (both code-based and V4 invite).
 fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> {
-    if let Some(group_node) = response.get_optional_child("group") {
+    if let Some(group_node) = response
+        .get_optional_child("group")
+        .or_else(|| response.get_optional_child("community"))
+    {
         let jid_str = required_attr(group_node, "jid")?;
         let jid: Jid = jid_str
             .parse()
@@ -2488,7 +2924,7 @@ fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> 
         return Ok(JoinGroupResult::PendingApproval(jid));
     }
     Err(anyhow!(
-        "expected <group> or <membership_approval_request> in join response"
+        "expected <group>, <community>, or <membership_approval_request> in join response"
     ))
 }
 
@@ -2610,7 +3046,10 @@ impl IqSpec for GetGroupInviteInfoIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let group_node = required_child(response, "group")?;
+        let group_node = response
+            .get_optional_child("group")
+            .or_else(|| response.get_optional_child("community"))
+            .ok_or_else(|| anyhow!("missing group or community invite result"))?;
         GroupInfoResponse::try_from_node_ref(group_node)
     }
 }
@@ -3125,6 +3564,132 @@ mod tests {
     }
 
     #[test]
+    fn participating_iqs_select_their_own_container() {
+        let response = NodeBuilder::new("iq")
+            .children([
+                NodeBuilder::new("groups")
+                    .children([NodeBuilder::new("group")
+                        .attr("id", "120363000000000001@g.us")
+                        .attr("subject", "Regular group")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("communities")
+                    .children([NodeBuilder::new("community")
+                        .attr("id", "120363000000000002@g.us")
+                        .attr("subject", "Parent group")
+                        .build()])
+                    .build(),
+            ])
+            .build();
+
+        let groups = GroupParticipatingIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+        let communities = CommunityParticipatingIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+
+        assert_eq!(groups.groups.len(), 1);
+        assert_eq!(groups.groups[0].subject.as_str(), "Regular group");
+        assert_eq!(communities.groups.len(), 1);
+        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert!(communities.groups[0].is_parent_group);
+    }
+
+    #[test]
+    fn community_container_marks_entries_as_parent_groups() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("communities")
+                .children([NodeBuilder::new("community")
+                    .attr("id", "120363000000000003@g.us")
+                    .attr("subject", "Parent without redundant marker")
+                    .build()])
+                .build()])
+            .build();
+
+        let groups = GroupParticipatingIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+        let communities = CommunityParticipatingIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+
+        assert!(groups.groups[0].is_parent_group);
+        assert!(communities.groups[0].is_parent_group);
+    }
+
+    #[test]
+    fn participating_iqs_accept_direct_group_children() {
+        let response = NodeBuilder::new("iq")
+            .children([
+                NodeBuilder::new("group")
+                    .attr("id", "120363000000000001@g.us")
+                    .attr("subject", "Regular group")
+                    .build(),
+                NodeBuilder::new("group")
+                    .attr("id", "120363000000000002@g.us")
+                    .attr("subject", "Parent group")
+                    .children([NodeBuilder::new("parent").build()])
+                    .build(),
+            ])
+            .build();
+
+        let groups = GroupParticipatingIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+        let communities = CommunityParticipatingIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+
+        assert_eq!(groups.groups.len(), 2);
+        assert_eq!(communities.groups.len(), 1);
+        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+    }
+
+    #[test]
+    fn participating_iqs_preserve_errors_from_the_selected_shape() {
+        let malformed_groups = NodeBuilder::new("iq")
+            .children([
+                NodeBuilder::new("groups")
+                    .children([NodeBuilder::new("group")
+                        .attr("id", "120363000000000001@g.us")
+                        .attr("size", GROUP_INFO_PARTICIPANT_LIMIT + 1)
+                        .build()])
+                    .build(),
+                NodeBuilder::new("communities")
+                    .children([NodeBuilder::new("community")
+                        .attr("id", "120363000000000002@g.us")
+                        .build()])
+                    .build(),
+            ])
+            .build();
+        let error = GroupParticipatingIq::new()
+            .parse_response(&malformed_groups.as_node_ref())
+            .unwrap_err();
+        assert!(error.to_string().contains("'size' attribute exceeds"));
+
+        let malformed_direct_community = NodeBuilder::new("iq")
+            .children([
+                NodeBuilder::new("groups")
+                    .children([NodeBuilder::new("group")
+                        .attr("id", "120363000000000003@g.us")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("community")
+                    .attr("id", "120363000000000004@g.us")
+                    .children([NodeBuilder::new("evolution_version")
+                        .attr("value", GROUP_EVOLUTION_VERSION_MAX + 1)
+                        .build()])
+                    .build(),
+            ])
+            .build();
+        let error = CommunityParticipatingIq::new()
+            .parse_response(&malformed_direct_community.as_node_ref())
+            .unwrap_err();
+        assert!(error.to_string().contains("'value' attribute exceeds"));
+    }
+
+    #[test]
     fn test_group_subject_validation() {
         let subject = GroupSubject::new("Test Group").unwrap();
         assert_eq!(subject.as_str(), "Test Group");
@@ -3395,6 +3960,25 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_participants_including_linked_groups_iq() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let participant: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = RemoveParticipantsIncludingLinkedGroupsIq::new(&parent, &[participant]);
+        let iq = spec.build_iq();
+
+        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
+            assert_eq!(nodes[0].tag, "remove");
+            assert_eq!(
+                nodes[0].attrs().optional_string("linked_groups").as_deref(),
+                Some("true")
+            );
+            assert_eq!(nodes[0].get_children_by_tag("participant").count(), 1);
+        } else {
+            panic!("expected nodes content");
+        }
+    }
+
+    #[test]
     fn test_promote_demote_iq() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let p1: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
@@ -3407,13 +3991,39 @@ mod tests {
             panic!("expected nodes content");
         }
 
-        let demote = DemoteParticipantsIq::new(&group, &[p1]);
+        let promote_response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("promote")
+                .children([NodeBuilder::new("participant")
+                    .attr("jid", &p1)
+                    .attr("type", "admin")
+                    .build()])
+                .build()])
+            .build();
+        let promoted = promote
+            .parse_response(&promote_response.as_node_ref())
+            .unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].jid, p1);
+        assert_eq!(promoted[0].status.as_deref(), Some("admin"));
+
+        let demote = DemoteParticipantsIq::new(&group, std::slice::from_ref(&p1));
         let iq = demote.build_iq();
         if let Some(NodeContent::Nodes(nodes)) = &iq.content {
             assert_eq!(nodes[0].tag, "demote");
         } else {
             panic!("expected nodes content");
         }
+
+        let demote_response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("demote")
+                .children([NodeBuilder::new("participant").attr("jid", &p1).build()])
+                .build()])
+            .build();
+        let demoted = demote
+            .parse_response(&demote_response.as_node_ref())
+            .unwrap();
+        assert_eq!(demoted.len(), 1);
+        assert!(demoted[0].is_ok());
     }
 
     #[test]
@@ -3724,6 +4334,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn participating_groups_accepts_current_and_legacy_envelopes() {
+        let spec = GroupParticipatingIq::new();
+        for (container_tag, item_tag) in [("groups", "group"), ("communities", "community")] {
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new(container_tag)
+                    .children([NodeBuilder::new(item_tag)
+                        .attr("id", "120363000000000041@g.us")
+                        .attr("subject", "Fictitious parent")
+                        .children([NodeBuilder::new("parent").build()])
+                        .build()])
+                    .build()])
+                .build();
+
+            let groups = spec.parse_response(&response.as_node_ref()).unwrap().groups;
+            assert_eq!(groups.len(), 1);
+            assert!(groups[0].is_parent_group);
+        }
+    }
+
+    #[test]
     fn test_build_create_community_node() {
         let options = GroupCreateOptions {
             subject: "My Community".to_string(),
@@ -4014,10 +4644,38 @@ mod tests {
             .attr("creator_pn", "15550000010@s.whatsapp.net")
             .attr("creator_username", "fixture.creator")
             .attr("creator_country_code", "US")
+            .attr("p_v_id", "participants-v1")
+            .attr("a_v_id", "admins-v1")
+            .attr("open_thread_id", "thread-v1")
+            .attr("size", 2u32)
             .attr("s_o", "100000000000011@lid")
             .attr("s_o_pn", "15550000011@s.whatsapp.net")
             .attr("s_o_username", "fixture.subject")
             .children([
+                NodeBuilder::new("missing_participant_identification").build(),
+                NodeBuilder::new("parent")
+                    .attr("default_membership_approval_mode", "request_required")
+                    .build(),
+                NodeBuilder::new("support").build(),
+                NodeBuilder::new("suspended")
+                    .attr("can_auto_file", "true")
+                    .build(),
+                NodeBuilder::new("appeal_status")
+                    .attr("type", "in_review")
+                    .build(),
+                NodeBuilder::new("appeal_update_time")
+                    .attr("value", 1_700_000_099u64)
+                    .build(),
+                NodeBuilder::new("auto_add_disabled").build(),
+                NodeBuilder::new("capi").build(),
+                NodeBuilder::new("evolution_version")
+                    .attr("value", GROUP_EVOLUTION_VERSION_MAX)
+                    .build(),
+                NodeBuilder::new("group_safety_check").build(),
+                NodeBuilder::new("participant_label_enabled").build(),
+                NodeBuilder::new("limit_sharing_enabled")
+                    .attr("trigger", GROUP_SETTING_TRIGGER_MAX)
+                    .build(),
                 NodeBuilder::new("description")
                     .attr("id", "fixture-description")
                     .attr("participant", "100000000000012@lid")
@@ -4035,8 +4693,14 @@ mod tests {
                 NodeBuilder::new("participant")
                     .attr("jid", "100000000000013@lid")
                     .attr("phone_number", "15550000013@s.whatsapp.net")
-                    .attr("participant_username", "fixture.member")
+                    .attr("username", "fixture.member")
                     .attr("type", "superadmin")
+                    .attr("participant_label", "organizer")
+                    .attr("participant_label_mtime", 1_700_000_013u64)
+                    .attr("join_time", 1_700_000_014u64)
+                    .attr("group_history_sent", "0")
+                    .attr("display_name", "Fixture Member")
+                    .attr("addressable", "0")
                     .build(),
                 NodeBuilder::new("participant")
                     .attr("jid", "15550000014@s.whatsapp.net")
@@ -4058,6 +4722,32 @@ mod tests {
             Some("fixture.creator")
         );
         assert_eq!(response.creator_country_code.as_deref(), Some("US"));
+        assert_eq!(
+            response.participant_version_id.as_deref(),
+            Some("participants-v1")
+        );
+        assert_eq!(response.admin_version_id.as_deref(), Some("admins-v1"));
+        assert_eq!(response.open_thread_id.as_deref(), Some("thread-v1"));
+        assert!(response.has_missing_participant_identification);
+        assert!(response.parent_membership_approval_required);
+        assert!(response.is_support_group);
+        assert!(response.is_suspended);
+        assert!(response.suspension_can_auto_file);
+        assert_eq!(response.appeal_status, Some(GroupAppealStatus::InReview));
+        assert_eq!(response.appeal_update_time, Some(1_700_000_099));
+        assert!(response.is_auto_add_disabled);
+        assert!(response.has_capi);
+        assert_eq!(
+            response.evolution_version,
+            Some(GROUP_EVOLUTION_VERSION_MAX)
+        );
+        assert!(response.has_group_safety_check);
+        assert!(response.participant_label_enabled);
+        assert!(response.is_limit_sharing_enabled);
+        assert_eq!(
+            response.limit_sharing_trigger,
+            Some(GROUP_SETTING_TRIGGER_MAX)
+        );
         assert_eq!(
             response.subject_owner_pn,
             Some("15550000011@s.whatsapp.net".parse().unwrap())
@@ -4093,6 +4783,16 @@ mod tests {
             response.participants[0].username.as_deref(),
             Some("fixture.member")
         );
+        let details = response.participants[0]
+            .details
+            .as_deref()
+            .expect("participant details");
+        assert_eq!(details.participant_label.as_deref(), Some("organizer"));
+        assert_eq!(details.participant_label_mtime, Some(1_700_000_013));
+        assert_eq!(details.join_time, Some(1_700_000_014));
+        assert_eq!(details.group_history_sent, Some(false));
+        assert_eq!(details.display_name.as_deref(), Some("Fixture Member"));
+        assert!(!details.is_addressable);
         assert_eq!(
             response.participants[1].lid,
             Some("100000000000014@lid".parse().unwrap())
@@ -4112,6 +4812,65 @@ mod tests {
             round_trip.participants[0].participant_type,
             ParticipantType::SuperAdmin
         );
+        assert_eq!(
+            round_trip.participants[0].username.as_deref(),
+            Some("fixture.member")
+        );
+        assert_eq!(
+            round_trip.limit_sharing_trigger,
+            Some(GROUP_SETTING_TRIGGER_MAX)
+        );
+        assert!(round_trip.has_missing_participant_identification);
+    }
+
+    #[test]
+    fn group_info_treats_non_request_parent_mode_as_open() {
+        let node = NodeBuilder::new("community")
+            .attr("id", "120363000000000013@g.us")
+            .children([NodeBuilder::new("parent")
+                .attr("default_membership_approval_mode", "auto_approve")
+                .build()])
+            .build();
+
+        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        assert!(response.is_parent_group);
+        assert!(!response.parent_membership_approval_required);
+    }
+
+    #[test]
+    fn participant_details_accept_protocol_boolean_forms() {
+        for (wire, expected) in [("0", false), ("1", true)] {
+            let node = NodeBuilder::new("participant")
+                .attr("jid", "100000000000015@lid")
+                .attr("group_history_sent", wire)
+                .attr("addressable", wire)
+                .build();
+            let participant = GroupParticipantResponse::try_from_node(&node).unwrap();
+            let details = participant.details.expect("boolean details");
+            assert_eq!(details.group_history_sent, Some(expected));
+            assert_eq!(details.is_addressable, expected);
+        }
+
+        let invalid = NodeBuilder::new("participant")
+            .attr("jid", "100000000000015@lid")
+            .attr("addressable", "sometimes")
+            .build();
+        assert!(GroupParticipantResponse::try_from_node(&invalid).is_err());
+    }
+
+    #[test]
+    fn test_group_info_response_accepts_explicit_false_suspension_flag() {
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000015@g.us")
+            .attr("subject", "Suspended Group")
+            .children([NodeBuilder::new("suspended")
+                .attr("can_auto_file", "false")
+                .build()])
+            .build();
+
+        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        assert!(response.is_suspended);
+        assert!(!response.suspension_can_auto_file);
     }
 
     #[test]
@@ -4132,6 +4891,47 @@ mod tests {
         assert!(absent.ephemeral.is_none());
         assert_eq!(empty.ephemeral, Some(GroupEphemeralSettings::default()));
         assert!(empty.into_node().get_optional_child("ephemeral").is_some());
+    }
+
+    #[test]
+    fn test_group_info_response_rejects_out_of_range_metadata() {
+        let fixtures = [
+            NodeBuilder::new("group")
+                .attr("id", "120363000000000031@g.us")
+                .attr("size", GROUP_INFO_PARTICIPANT_LIMIT + 1)
+                .build(),
+            NodeBuilder::new("group")
+                .attr("id", "120363000000000032@g.us")
+                .children([NodeBuilder::new("ephemeral")
+                    .attr("expiration", u64::from(GROUP_EPHEMERAL_EXPIRATION_MAX) + 1)
+                    .build()])
+                .build(),
+            NodeBuilder::new("group")
+                .attr("id", "120363000000000033@g.us")
+                .children([NodeBuilder::new("ephemeral")
+                    .attr("trigger", GROUP_SETTING_TRIGGER_MAX + 1)
+                    .build()])
+                .build(),
+            NodeBuilder::new("group")
+                .attr("id", "120363000000000034@g.us")
+                .children([NodeBuilder::new("evolution_version")
+                    .attr("value", GROUP_EVOLUTION_VERSION_MAX + 1)
+                    .build()])
+                .build(),
+            NodeBuilder::new("group")
+                .attr("id", "120363000000000035@g.us")
+                .children([NodeBuilder::new("limit_sharing_enabled")
+                    .attr("trigger", GROUP_SETTING_TRIGGER_MAX + 1)
+                    .build()])
+                .build(),
+        ];
+
+        for fixture in fixtures {
+            assert!(
+                GroupInfoResponse::try_from_node(&fixture).is_err(),
+                "out-of-range group metadata must be rejected: {fixture:?}"
+            );
+        }
     }
 
     #[test]
@@ -4164,15 +4964,15 @@ mod tests {
         );
     }
 
-    /// `parse_response` should overlay `is_parent_group` and
-    /// `allow_non_admin_sub_group_creation` from the request when the server
-    /// omits `<parent>` from a community-create reply (WA Web's CreateJob
-    /// never reads parent markers from the response either).
+    /// `parse_response` should overlay parent settings from the request when
+    /// the server omits `<parent>` from a community-create reply (WA Web's
+    /// CreateJob never reads parent markers from the response either).
     #[test]
     fn test_group_create_iq_overlays_parent_flags() {
         let options = GroupCreateOptions {
             subject: "My Community".into(),
             is_parent: true,
+            closed: true,
             allow_non_admin_sub_group_creation: true,
             ..Default::default()
         };
@@ -4188,6 +4988,7 @@ mod tests {
         let response = spec.parse_response(&iq.as_node_ref()).unwrap();
 
         assert!(response.is_parent_group);
+        assert!(response.parent_membership_approval_required);
         assert!(response.allow_non_admin_sub_group_creation);
     }
 

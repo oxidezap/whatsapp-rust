@@ -27,7 +27,7 @@ use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 
 const GCM_IV_SIZE: usize = 12;
 const GCM_TAG_SIZE: usize = 16;
-const KEY_SIZE: usize = 32;
+pub(crate) const MESSAGE_SECRET_SIZE: usize = 32;
 
 /// Use-case literal that goes into the HKDF `info` buffer.
 ///
@@ -96,13 +96,12 @@ pub struct AddonContext<'a> {
 pub fn derive_use_case_secret(
     message_secret: &[u8],
     ctx: &AddonContext<'_>,
-) -> Result<[u8; KEY_SIZE]> {
-    if message_secret.len() != KEY_SIZE {
-        return Err(anyhow!(
-            "Invalid messageSecret size: expected {KEY_SIZE}, got {}",
-            message_secret.len()
-        ));
-    }
+) -> Result<[u8; MESSAGE_SECRET_SIZE]> {
+    anyhow::ensure!(
+        message_secret.len() == MESSAGE_SECRET_SIZE,
+        "Invalid messageSecret size: expected {MESSAGE_SECRET_SIZE}, got {}",
+        message_secret.len()
+    );
 
     let mut info = Vec::with_capacity(
         ctx.stanza_id.len()
@@ -115,7 +114,7 @@ pub fn derive_use_case_secret(
     info.extend_from_slice(ctx.modification_sender.as_bytes());
     info.extend_from_slice(ctx.modification_type.as_str().as_bytes());
 
-    let mut key = [0u8; KEY_SIZE];
+    let mut key = [0u8; MESSAGE_SECRET_SIZE];
     crate::crypto::hkdf_sha256_into(message_secret, None, &info, &mut key)
         .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
     Ok(key)

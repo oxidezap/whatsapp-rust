@@ -35,6 +35,7 @@ fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
         | IqError::Disconnected(_)
         | IqError::NotConnected
         | IqError::InternalChannelClosed
+        | IqError::DuplicateRequestId(_)
         | IqError::EncodeError(_) => KeepaliveResult::FatalFailure,
         // Exhaustive: forces a compile error when new IqError variants are added
         // so the developer must decide the classification.
@@ -317,6 +318,14 @@ mod tests {
     fn test_classify_internal_channel_closed_is_fatal() {
         assert_eq!(
             classify_keepalive_error(&IqError::InternalChannelClosed),
+            KeepaliveResult::FatalFailure,
+        );
+    }
+
+    #[test]
+    fn test_classify_duplicate_request_id_is_fatal() {
+        assert_eq!(
+            classify_keepalive_error(&IqError::DuplicateRequestId("duplicate".into())),
             KeepaliveResult::FatalFailure,
         );
     }
