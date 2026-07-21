@@ -290,12 +290,7 @@ fn is_on_whatsapp_query(spec: &IsOnWhatsAppSpec) -> UsyncQuery {
         .iter()
         .map(|user| {
             if user.jid.is_pn() {
-                let phone = if user.jid.user.starts_with('+') {
-                    user.jid.user.to_string()
-                } else {
-                    format!("+{}", user.jid.user)
-                };
-                let mut typed = UsyncUser::from_phone(phone);
+                let mut typed = UsyncUser::from_phone(user.jid.user.clone());
                 if let Some(lid) = &user.known_lid {
                     typed = typed.with_known_lid(Jid::lid(lid.as_str()));
                 }
@@ -841,6 +836,13 @@ mod tests {
             assert!(query.get_optional_child("contact").is_some());
             assert!(query.get_optional_child("lid").is_some());
             assert!(query.get_optional_child("business").is_some());
+
+            let contact = usync
+                .get_optional_child("list")
+                .and_then(|list| list.get_optional_child("user"))
+                .and_then(|user| user.get_optional_child("contact"))
+                .unwrap();
+            assert_eq!(contact.content_as_string().as_deref(), Some("+1234567890"));
         } else {
             panic!("Expected NodeContent::Nodes");
         }

@@ -10,6 +10,8 @@ use wacore_binary::{Jid, Server};
 
 use super::Client;
 
+const SIGNAL_NAMESPACE_COUNT: usize = 4;
+
 /// Per-group device-list snapshot for `resolve_group_devices_memoized`.
 /// Valid while the producing `GroupInfo` Arc is still the cached one AND the
 /// device-topology generation is unchanged.
@@ -79,7 +81,7 @@ impl UserLookupKeys {
     }
 
     /// Signal namespaces that may hold sessions for this identity.
-    fn signal_namespaces(&self) -> [(&str, Server); 4] {
+    fn signal_namespaces(&self) -> [(&str, Server); SIGNAL_NAMESPACE_COUNT] {
         match self {
             Self::LidWithPn { lid, pn } | Self::PnWithLid { lid, pn } => [
                 (pn, Server::Pn),
@@ -626,22 +628,22 @@ impl Client {
                 }
                 record.raw_id = Some(decoded.raw_id);
 
-                // Only add the new device if its key_index is accepted by the ADV list
-                if !record.devices.iter().any(|d| d.device_id == device_id)
-                    && wacore::adv::is_key_index_valid(device.key_index, &decoded)
-                {
-                    record.devices.push(
-                        wacore::store::traits::DeviceInfo::new(device_id, device.key_index)
-                            .with_hosting(is_hosted),
+                // Only trust notification metadata when its key index is accepted.
+                if wacore::adv::is_key_index_valid(device.key_index, &decoded) {
+                    self.append_or_refresh_device(
+                        &mut record,
+                        device_id,
+                        device.key_index,
+                        is_hosted,
                     );
                 }
             } else {
                 warn!("patch_device_add: failed to decode key-index-list for user {user}");
-                self.append_device_if_new(&mut record, device_id, device.key_index, is_hosted);
+                self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
             }
         } else {
             // No signed bytes — fall back to simple append
-            self.append_device_if_new(&mut record, device_id, device.key_index, is_hosted);
+            self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
         }
 
         // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
@@ -669,19 +671,24 @@ impl Client {
         }
     }
 
-    /// Append a device if it doesn't already exist in the record.
-    fn append_device_if_new(
+    /// Append a new device or refresh the addressing metadata of an existing one.
+    fn append_or_refresh_device(
         &self,
         record: &mut wacore::store::traits::DeviceListRecord,
         device_id: u32,
         key_index: Option<u32>,
         is_hosted: bool,
     ) {
-        if !record.devices.iter().any(|d| d.device_id == device_id) {
-            record.devices.push(
+        match record
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            Some(device) => device.is_hosted = is_hosted,
+            None => record.devices.push(
                 wacore::store::traits::DeviceInfo::new(device_id, key_index)
                     .with_hosting(is_hosted),
-            );
+            ),
         }
     }
 
@@ -817,13 +824,25 @@ impl Client {
         device_id: u16,
     ) -> Result<(), wacore::store::error::StoreError> {
         let lookup = self.resolve_lookup_keys(user).await;
-        let mut candidates: Vec<String> = Vec::with_capacity(4);
-        for (key, server) in lookup.signal_namespaces() {
-            let mut jid = Jid::new(key, server);
-            jid.device = device_id;
-            candidates.push(jid.to_string());
+        let namespaces = lookup.signal_namespaces();
+        let mut device_id_buffer = itoa::Buffer::new();
+        let device_id_text = device_id_buffer.format(device_id);
+        let separator_len = ':'.len_utf8() + '@'.len_utf8();
+        let capacity = namespaces
+            .iter()
+            .map(|(key, server)| {
+                key.len() + device_id_text.len() + server.as_str().len() + separator_len
+            })
+            .sum();
+        let mut candidates = String::with_capacity(capacity);
+        let mut ranges = [(0, 0); SIGNAL_NAMESPACE_COUNT];
+        for ((key, server), range) in namespaces.into_iter().zip(&mut ranges) {
+            let start = candidates.len();
+            wacore_binary::push_jid_to_string(key, server, 0, device_id, &mut candidates);
+            *range = (start, candidates.len());
         }
-        let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let refs: [&str; SIGNAL_NAMESPACE_COUNT] =
+            ranges.map(|(start, end)| &candidates[start..end]);
         self.persistence_manager
             .delete_sender_key_device_rows(&refs)
             .await?;
@@ -1726,8 +1745,9 @@ mod tests {
 
         setup_device_record(&client, "15551234567", &[0, 3]).await;
 
-        // Patch: add device 3 again — should not duplicate
-        let elem = make_device_element(3, None);
+        // Patch: add device 3 again — should refresh its namespace, not duplicate it.
+        let mut elem = make_device_element(3, None);
+        elem.jid.server = Server::Hosted;
         client.patch_device_add("15551234567", &elem, None).await;
 
         let updated = client
@@ -1740,6 +1760,12 @@ mod tests {
             1
         );
         assert!(updated.devices.iter().any(|d| d.device_id == 0));
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|d| d.device_id == 3 && d.is_hosted)
+        );
         assert_eq!(updated.devices.len(), 2);
     }
 
@@ -1989,6 +2015,41 @@ mod tests {
             phash: None,
             raw_id: Some(raw_id),
         }
+    }
+
+    #[tokio::test]
+    async fn signed_device_add_refreshes_existing_hosting_metadata() {
+        let client = create_test_client().await;
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                "15551234567".to_string(),
+                Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
+            )
+            .await;
+
+        let key_index_info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(make_signed_key_index_bytes(1, 0, vec![7])),
+        };
+        let mut elem = make_device_element(5, Some(7));
+        elem.jid.server = Server::Hosted;
+        client
+            .patch_device_add("15551234567", &elem, Some(&key_index_info))
+            .await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(updated.devices.len(), 2);
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == 5 && device.is_hosted)
+        );
     }
 
     // A raw_id mismatch drops stale companions and rebuilds from the notification;

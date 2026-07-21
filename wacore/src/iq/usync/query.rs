@@ -83,6 +83,7 @@ const FIRST_PAGE_INDEX: &str = "0";
 const LAST_PAGE: &str = "true";
 const DEVICES_VERSION: &str = "2";
 const BOT_PROFILE_VERSION: &str = "1";
+const E164_PREFIX: char = '+';
 
 /// Addressing mode used by the contact subprotocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, WireEnum)]
@@ -272,22 +273,26 @@ impl UsyncUser {
     }
 
     pub fn with_id(mut self, jid: Jid) -> Self {
-        self.id = Some(jid.into_non_ad());
+        self.id = Some(normalize_usync_user_jid(jid));
         self
     }
 
     pub fn with_pn_jid(mut self, jid: Jid) -> Self {
-        self.pn_jid = Some(jid.into_non_ad());
+        self.pn_jid = Some(normalize_usync_user_jid(jid));
         self
     }
 
     pub fn with_phone(mut self, phone: impl Into<CompactString>) -> Self {
-        self.phone = Some(phone.into());
+        let mut phone = phone.into();
+        if !phone.is_empty() && phone.bytes().all(|byte| byte.is_ascii_digit()) {
+            phone.insert(0, E164_PREFIX);
+        }
+        self.phone = Some(phone);
         self
     }
 
     pub fn with_known_lid(mut self, lid: Jid) -> Self {
-        self.known_lid = Some(lid.into_non_ad());
+        self.known_lid = Some(normalize_usync_user_jid(lid));
         self
     }
 
@@ -402,6 +407,20 @@ impl UsyncUser {
     }
 }
 
+/// Remove device addressing while retaining identity-bearing fields.
+///
+/// PN/LID domain bytes can surface through `agent` during binary decoding but
+/// are not part of those user identities. Other namespaces render the agent,
+/// so validation can reject unsupported agent-qualified query inputs instead
+/// of silently querying a different user.
+fn normalize_usync_user_jid(mut jid: Jid) -> Jid {
+    jid.device = 0;
+    if !jid.server.renders_agent() {
+        jid.agent = 0;
+    }
+    jid
+}
+
 fn validate_user_jid(jid: &Jid, index: usize) -> Result<(), UsyncValidationError> {
     let supported = !jid.user.is_empty()
         && matches!(
@@ -414,7 +433,7 @@ fn validate_user_jid(jid: &Jid, index: usize) -> Result<(), UsyncValidationError
                 | Server::Interop
                 | Server::Bot
         );
-    if supported {
+    if supported && jid.agent == 0 {
         Ok(())
     } else {
         Err(UsyncValidationError::InvalidUserJid {
@@ -1037,8 +1056,10 @@ fn parse_protocol_states(result: &NodeRef<'_>) -> Result<Vec<UsyncProtocolState>
 
 fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, anyhow::Error> {
     let mut attrs = user.attrs();
-    let id = attrs.optional_jid(ATTR_JID).map(|jid| jid.to_non_ad());
-    let pn_jid = attrs.optional_jid(ATTR_PN_JID).map(|jid| jid.to_non_ad());
+    let id = attrs.optional_jid(ATTR_JID).map(normalize_usync_user_jid);
+    let pn_jid = attrs
+        .optional_jid(ATTR_PN_JID)
+        .map(normalize_usync_user_jid);
     attrs.finish()?;
 
     let capacity = user.children().map_or(0, <[_]>::len);
@@ -1572,6 +1593,18 @@ mod tests {
     }
 
     #[test]
+    fn digit_only_phone_inputs_are_normalized_to_e164() {
+        assert_eq!(
+            UsyncUser::from_phone("15550000001").phone.as_deref(),
+            Some("+15550000001")
+        );
+        assert_eq!(
+            UsyncUser::from_phone("+15550000001").phone.as_deref(),
+            Some("+15550000001")
+        );
+    }
+
+    #[test]
     fn query_validation_rejects_ambiguous_or_invalid_inputs() {
         let duplicate = UsyncQuery::new(
             UsyncMode::Query,
@@ -1620,6 +1653,27 @@ mod tests {
         assert_eq!(
             empty_hash,
             UsyncValidationError::EmptyDeviceHash { index: 0 }
+        );
+
+        let agent_qualified_bot = UsyncQuery::new(
+            UsyncMode::Query,
+            UsyncContext::Interactive,
+            vec![UsyncProtocol::Status],
+            vec![UsyncUser::from_jid(Jid {
+                user: "13135550001".into(),
+                server: Server::Bot,
+                agent: 2,
+                device: 7,
+                integrator: 0,
+            })],
+        )
+        .unwrap_err();
+        assert_eq!(
+            agent_qualified_bot,
+            UsyncValidationError::InvalidUserJid {
+                index: 0,
+                jid: "13135550001.2@bot".to_owned(),
+            }
         );
     }
 
@@ -1766,6 +1820,28 @@ mod tests {
             parsed.users[0].protocols[0],
             UsyncProtocolResult::Contact(UsyncOutcome::Value(_))
         ));
+    }
+
+    #[test]
+    fn parser_preserves_identity_bearing_agents_while_stripping_devices() {
+        let user = NodeBuilder::new(TAG_USER)
+            .attr(
+                ATTR_JID,
+                Jid {
+                    user: "13135550001".into(),
+                    server: Server::Bot,
+                    agent: 2,
+                    device: 7,
+                    integrator: 0,
+                },
+            )
+            .children([NodeBuilder::new(UsyncProtocolKind::Status.as_str()).build()])
+            .build();
+
+        let parsed = parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).unwrap();
+        let id = parsed.users[0].id.as_ref().unwrap();
+        assert_eq!(id.agent, 2);
+        assert_eq!(id.device, 0);
     }
 
     #[test]
