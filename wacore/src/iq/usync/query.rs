@@ -12,7 +12,6 @@ use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
 use anyhow::{Context, anyhow};
-use log::warn;
 use thiserror::Error;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, Node, NodeContent, NodeContentRef, NodeRef, Server};
@@ -961,7 +960,7 @@ pub enum UsyncProtocolResult {
     TextStatus(UsyncOutcome<UsyncTextStatusResult>),
     DisappearingMode(UsyncOutcome<UsyncDisappearingModeResult>),
     Business(UsyncOutcome<Box<UsyncBusinessResult>>),
-    Picture(UsyncOutcome<Option<u64>>),
+    Picture(UsyncOutcome<u64>),
     Lid(UsyncOutcome<Option<Jid>>),
     Username(UsyncOutcome<Option<CompactString>>),
     Bot(UsyncOutcome<Box<UsyncBotProfileResult>>),
@@ -1093,7 +1092,7 @@ fn parse_protocol_result(
             UsyncProtocolResult::Business(outcome!(parse_business(node).map(Box::new)))
         }
         UsyncProtocolKind::Picture => {
-            UsyncProtocolResult::Picture(outcome!(optional_u64(node, ATTR_ID)))
+            UsyncProtocolResult::Picture(outcome!(required_u64(node, ATTR_ID)))
         }
         UsyncProtocolKind::Lid => UsyncProtocolResult::Lid(outcome!(optional_lid(node, ATTR_VAL))),
         UsyncProtocolKind::Username => {
@@ -1173,10 +1172,7 @@ fn parse_device_list(node: &NodeRef<'_>) -> Result<UsyncDeviceListResult, anyhow
     let capacity = node.children().map_or(0, <[_]>::len);
     let mut devices = Vec::with_capacity(capacity);
     for device in node.get_children_by_tag(TAG_DEVICE) {
-        match parse_device(device) {
-            Ok(device) => devices.push(device),
-            Err(error) => warn!(target: "usync", "skipping malformed USync device: {error}"),
-        }
+        devices.push(parse_device(device)?);
     }
     Ok(UsyncDeviceListResult { hash, devices })
 }
@@ -1433,9 +1429,11 @@ fn required_compact_string(node: &NodeRef<'_>, key: &str) -> Result<CompactStrin
     Ok(value)
 }
 
-fn optional_u64(node: &NodeRef<'_>, key: &str) -> Result<Option<u64>, anyhow::Error> {
+fn required_u64(node: &NodeRef<'_>, key: &str) -> Result<u64, anyhow::Error> {
     let mut attrs = node.attrs();
-    let value = attrs.optional_u64(key);
+    let value = attrs
+        .optional_u64(key)
+        .ok_or_else(|| anyhow!("<{}> is missing required '{key}' attribute", node.tag))?;
     attrs.finish()?;
     Ok(value)
 }
@@ -1861,40 +1859,33 @@ mod tests {
     }
 
     #[test]
-    fn devices_parser_skips_malformed_entries_without_dropping_siblings() {
-        let devices = NodeBuilder::new(UsyncProtocolKind::Devices.as_str())
-            .children([NodeBuilder::new(TAG_DEVICE_LIST)
-                .children([
-                    NodeBuilder::new(TAG_DEVICE).build(),
-                    NodeBuilder::new(TAG_DEVICE)
-                        .attr(ATTR_ID, (u64::from(u16::MAX) + 1).to_string())
-                        .build(),
-                    NodeBuilder::new(TAG_DEVICE)
-                        .attr(ATTR_ID, "7")
-                        .attr(ATTR_KEY_INDEX, "9")
-                        .build(),
-                ])
-                .build()])
-            .build();
-        let user = NodeBuilder::new(TAG_USER)
-            .attr(ATTR_JID, Jid::pn("15550000001"))
-            .children([devices])
-            .build();
+    fn devices_parser_rejects_malformed_lists_instead_of_returning_partial_data() {
+        let malformed_devices = [
+            NodeBuilder::new(TAG_DEVICE).build(),
+            NodeBuilder::new(TAG_DEVICE)
+                .attr(ATTR_ID, "invalid")
+                .build(),
+            NodeBuilder::new(TAG_DEVICE)
+                .attr(ATTR_ID, (u64::from(u16::MAX) + 1).to_string())
+                .build(),
+        ];
 
-        let parsed = parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).unwrap();
-        let Some(UsyncProtocolResult::Devices(UsyncOutcome::Value(devices))) =
-            parsed.users[0].protocol(UsyncProtocolKind::Devices)
-        else {
-            panic!("expected devices result");
-        };
-        assert_eq!(
-            devices.device_list.as_ref().unwrap().devices,
-            [UsyncDeviceResult {
-                id: 7,
-                key_index: Some(9),
-                is_hosted: false,
-            }]
-        );
+        for malformed in malformed_devices {
+            let devices = NodeBuilder::new(UsyncProtocolKind::Devices.as_str())
+                .children([NodeBuilder::new(TAG_DEVICE_LIST)
+                    .children([
+                        NodeBuilder::new(TAG_DEVICE).attr(ATTR_ID, "7").build(),
+                        malformed,
+                    ])
+                    .build()])
+                .build();
+            let user = NodeBuilder::new(TAG_USER)
+                .attr(ATTR_JID, Jid::pn("15550000001"))
+                .children([devices])
+                .build();
+
+            assert!(parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).is_err());
+        }
     }
 
     #[test]
@@ -2024,7 +2015,7 @@ mod tests {
         let user = &parsed.users[0];
         assert!(matches!(
             user.protocol(UsyncProtocolKind::Picture),
-            Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(Some(42))))
+            Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(42)))
         ));
         assert!(matches!(
             user.protocol(UsyncProtocolKind::Lid),
@@ -2058,17 +2049,13 @@ mod tests {
     }
 
     #[test]
-    fn picture_without_id_is_a_successful_absent_value() {
+    fn picture_without_id_is_rejected() {
         let user = NodeBuilder::new(TAG_USER)
             .attr(ATTR_JID, Jid::pn("15550000001"))
             .children([NodeBuilder::new(UsyncProtocolKind::Picture.as_str()).build()])
             .build();
 
-        let parsed = parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).unwrap();
-        assert!(matches!(
-            parsed.users[0].protocol(UsyncProtocolKind::Picture),
-            Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(None)))
-        ));
+        assert!(parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).is_err());
     }
 
     #[test]
