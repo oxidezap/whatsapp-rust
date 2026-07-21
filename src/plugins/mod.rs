@@ -6,20 +6,22 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use futures::FutureExt;
 use thiserror::Error;
 use wacore::iq::spec::IqSpec;
 use wacore::runtime::{
-    BoxFuture, Runtime, ShutdownNotifier, ShutdownSignal, Spawnable, wait_for_shutdown,
+    BoxFuture, Runtime, ShutdownNotifier, ShutdownSignal, Spawnable, timeout as runtime_timeout,
+    wait_for_shutdown,
 };
 use wacore::sync_marker::MaybeSendSync;
-use wacore::types::events::{EventHandler, EventInterest, Subscription};
+use wacore::types::events::{EventHandler, EventInterest, EventKind, Subscription};
 use wacore_binary::Jid;
 use waproto::whatsapp::Message;
 
 use crate::Client;
-use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState, RawNodeLease};
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
 
@@ -27,6 +29,7 @@ const CAP_CORE_EVENTS: u8 = 1 << 0;
 const CAP_TASKS: u8 = 1 << 1;
 const CAP_MESSAGING: u8 = 1 << 2;
 const CAP_IQ: u8 = 1 << 3;
+const PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A capability a plugin asks the host to expose during installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -207,7 +210,12 @@ struct PluginResources {
     closed: AtomicBool,
     activation: ShutdownNotifier,
     shutdown: ShutdownNotifier,
-    subscriptions: Mutex<Vec<Subscription>>,
+    subscriptions: Mutex<Vec<PluginCoreEventSubscription>>,
+}
+
+struct PluginCoreEventSubscription {
+    _subscription: Subscription,
+    _raw_node_lease: Option<RawNodeLease>,
 }
 
 impl PluginResources {
@@ -239,7 +247,11 @@ impl PluginResources {
         }
     }
 
-    fn retain_subscription(&self, subscription: Subscription) -> Result<(), PluginResourceError> {
+    fn retain_subscription(
+        &self,
+        subscription: Subscription,
+        raw_node_lease: Option<RawNodeLease>,
+    ) -> Result<(), PluginResourceError> {
         let mut subscriptions = self
             .subscriptions
             .lock()
@@ -248,7 +260,10 @@ impl PluginResources {
             drop(subscription);
             return Err(PluginResourceError::ShuttingDown);
         }
-        subscriptions.push(subscription);
+        subscriptions.push(PluginCoreEventSubscription {
+            _subscription: subscription,
+            _raw_node_lease: raw_node_lease,
+        });
         Ok(())
     }
 
@@ -307,8 +322,12 @@ impl PluginCoreEvents {
             .client
             .upgrade()
             .ok_or(PluginResourceError::ClientUnavailable)?;
+        let raw_node_lease = interest
+            .wants(EventKind::RawNode)
+            .then(|| client.acquire_raw_node_forwarding());
         let subscription = client.subscribe(interest, handler);
-        self.resources.retain_subscription(subscription)
+        self.resources
+            .retain_subscription(subscription, raw_node_lease)
     }
 }
 
@@ -760,6 +779,79 @@ struct InstalledPlugin {
     resources: Arc<PluginResources>,
 }
 
+struct PluginInstallRollback {
+    runtime: Arc<dyn Runtime>,
+    installed: Vec<InstalledPlugin>,
+    current: Option<InstalledPlugin>,
+    upstream: Option<Arc<dyn ClientLifecycle>>,
+    armed: bool,
+}
+
+impl PluginInstallRollback {
+    fn new(runtime: Arc<dyn Runtime>, capacity: usize) -> Self {
+        Self {
+            runtime,
+            installed: Vec::with_capacity(capacity),
+            current: None,
+            upstream: None,
+            armed: true,
+        }
+    }
+
+    fn close_resources(&self) {
+        if let Some(current) = &self.current {
+            current.resources.close();
+        }
+        for plugin in self.installed.iter().rev() {
+            plugin.resources.close();
+        }
+    }
+
+    async fn rollback(&mut self) {
+        self.close_resources();
+        let current = self.current.take();
+        let installed = std::mem::take(&mut self.installed);
+        let upstream = self.upstream.take();
+        self.armed = false;
+        shutdown_staged_plugins(self.runtime.clone(), current, installed, upstream).await;
+    }
+
+    fn take_installed(&mut self) -> Vec<InstalledPlugin> {
+        std::mem::take(&mut self.installed)
+    }
+
+    fn restore_installed(&mut self, installed: Vec<InstalledPlugin>) {
+        self.installed = installed;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.upstream = None;
+    }
+}
+
+impl Drop for PluginInstallRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.close_resources();
+        let current = self.current.take();
+        let installed = std::mem::take(&mut self.installed);
+        let upstream = self.upstream.take();
+        if current.is_none() && installed.is_empty() && upstream.is_none() {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let cleanup_runtime = runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                shutdown_staged_plugins(cleanup_runtime, current, installed, upstream).await;
+            }))
+            .detach();
+    }
+}
+
 pub(crate) struct PluginHost {
     ordered: Vec<PlannedPlugin>,
     manifests: Vec<PluginManifest>,
@@ -767,10 +859,19 @@ pub(crate) struct PluginHost {
     installed: OnceLock<Vec<InstalledPlugin>>,
     apis: OnceLock<HashMap<TypeId, ErasedApi>>,
     runtime: OnceLock<Arc<dyn Runtime>>,
+    callback_timeout: Duration,
 }
 
 impl PluginHost {
     pub(crate) fn new(plan: PluginPlan, upstream: Option<Arc<dyn ClientLifecycle>>) -> Arc<Self> {
+        Self::new_with_callback_timeout(plan, upstream, PLUGIN_CALLBACK_TIMEOUT)
+    }
+
+    fn new_with_callback_timeout(
+        plan: PluginPlan,
+        upstream: Option<Arc<dyn ClientLifecycle>>,
+        callback_timeout: Duration,
+    ) -> Arc<Self> {
         let manifests = plan
             .ordered
             .iter()
@@ -783,6 +884,7 @@ impl PluginHost {
             installed: OnceLock::new(),
             apis: OnceLock::new(),
             runtime: OnceLock::new(),
+            callback_timeout,
         })
     }
 
@@ -792,6 +894,13 @@ impl PluginHost {
 
     pub(crate) fn manifests(&self) -> &[PluginManifest] {
         &self.manifests
+    }
+
+    pub(crate) fn lifecycle_callback_timeout(&self) -> Duration {
+        let callback_count = self.ordered.len() + usize::from(self.upstream.is_some());
+        self.callback_timeout
+            .saturating_mul(callback_count as u32)
+            .saturating_add(Duration::from_secs(1))
     }
 
     fn context(
@@ -862,12 +971,16 @@ impl PluginHost {
             .set(runtime.clone())
             .map_err(|_| anyhow::anyhow!("plugin host was installed more than once"))?;
 
+        let mut rollback = PluginInstallRollback::new(runtime.clone(), self.ordered.len());
         if let Some(upstream) = &self.upstream {
-            plugin_callback(|| upstream.install(client.clone())).await?;
+            if let Err(error) = plugin_callback(|| upstream.install(client.clone())).await {
+                rollback.disarm();
+                return Err(error);
+            }
+            rollback.upstream = Some(upstream.clone());
         }
 
         let staging = Arc::new(ApiRegistry::default());
-        let mut installed: Vec<InstalledPlugin> = Vec::with_capacity(self.ordered.len());
         for planned in &self.ordered {
             let resources = PluginResources::new();
             let context = self.context(
@@ -878,21 +991,15 @@ impl PluginHost {
                 Arc::clone(&staging),
                 runtime.clone(),
             );
+            rollback.current = Some(InstalledPlugin {
+                plugin: planned.plugin.clone(),
+                manifest: planned.manifest.clone(),
+                resources,
+            });
             let api = match plugin_install(|| planned.plugin.install(context)).await {
                 Ok(api) => api,
                 Err(error) => {
-                    resources.close();
-                    for plugin in installed.iter().rev() {
-                        plugin.resources.close();
-                    }
-                    if let Err(shutdown_error) = plugin_callback(|| planned.plugin.shutdown()).await
-                    {
-                        log::warn!(
-                            "Plugin `{}` failed-install rollback failed: {shutdown_error:#}",
-                            planned.manifest.id
-                        );
-                    }
-                    self.rollback(&mut installed).await;
+                    rollback.rollback().await;
                     anyhow::bail!(
                         "plugin `{}` installation failed: {error:#}",
                         planned.manifest.id
@@ -900,19 +1007,22 @@ impl PluginHost {
                 }
             };
             staging.insert(planned.plugin.marker_type_id(), api);
-            installed.push(InstalledPlugin {
-                plugin: planned.plugin.clone(),
-                manifest: planned.manifest.clone(),
-                resources,
-            });
+            let Some(installed) = rollback.current.take() else {
+                rollback.rollback().await;
+                anyhow::bail!("plugin installation rollback state was lost");
+            };
+            rollback.installed.push(installed);
         }
 
         self.apis
             .set(staging.snapshot())
             .map_err(|_| anyhow::anyhow!("plugin APIs were published more than once"))?;
-        self.installed
-            .set(installed)
-            .map_err(|_| anyhow::anyhow!("plugins were installed more than once"))?;
+        let installed = rollback.take_installed();
+        if let Err(installed) = self.installed.set(installed) {
+            rollback.restore_installed(installed);
+            anyhow::bail!("plugins were installed more than once");
+        }
+        rollback.disarm();
         Ok(())
     }
 
@@ -922,20 +1032,15 @@ impl PluginHost {
         }
     }
 
-    async fn rollback(&self, installed: &mut Vec<InstalledPlugin>) {
-        for plugin in installed.iter().rev() {
-            plugin.resources.close();
-        }
-        while let Some(plugin) = installed.pop() {
-            if plugin_callback(|| plugin.plugin.shutdown()).await.is_err() {
-                log::warn!("Plugin `{}` rollback failed", plugin.manifest.id);
-            }
-        }
-        if let Some(upstream) = &self.upstream
-            && let Err(error) = plugin_callback(|| upstream.shutdown()).await
-        {
-            log::warn!("Upstream lifecycle rollback failed: {error:#}");
-        }
+    async fn run_callback<'a>(
+        &'a self,
+        make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
+    ) -> anyhow::Result<()> {
+        let runtime = self
+            .runtime
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("plugin runtime is unavailable"))?;
+        bounded_plugin_callback(&**runtime, self.callback_timeout, make_future).await
     }
 }
 
@@ -946,13 +1051,18 @@ impl ClientLifecycle for PluginHost {
 
     fn on_ready(&self, scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
-            if let Some(upstream) = &self.upstream {
-                plugin_callback(|| upstream.on_ready(scope.clone())).await?;
-            }
             let mut failures = Vec::new();
+            if let Some(upstream) = &self.upstream
+                && let Err(error) = self.run_callback(|| upstream.on_ready(scope.clone())).await
+            {
+                failures.push(format!("upstream: {error:#}"));
+            }
             for plugin in self.installed.get().into_iter().flatten() {
                 let plugin_scope = self.connection_scope(scope.clone(), &plugin.manifest);
-                if let Err(error) = plugin_callback(|| plugin.plugin.on_ready(plugin_scope)).await {
+                if let Err(error) = self
+                    .run_callback(|| plugin.plugin.on_ready(plugin_scope))
+                    .await
+                {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
@@ -965,13 +1075,15 @@ impl ClientLifecycle for PluginHost {
             let mut failures = Vec::new();
             for plugin in self.installed.get().into_iter().flatten().rev() {
                 let plugin_scope = self.connection_scope(scope.clone(), &plugin.manifest);
-                if let Err(error) = plugin_callback(|| plugin.plugin.on_closed(plugin_scope)).await
+                if let Err(error) = self
+                    .run_callback(|| plugin.plugin.on_closed(plugin_scope))
+                    .await
                 {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
             if let Some(upstream) = &self.upstream
-                && let Err(error) = plugin_callback(|| upstream.on_closed(scope)).await
+                && let Err(error) = self.run_callback(|| upstream.on_closed(scope)).await
             {
                 failures.push(format!("upstream: {error:#}"));
             }
@@ -979,19 +1091,28 @@ impl ClientLifecycle for PluginHost {
         })
     }
 
+    fn signal_shutdown(&self) {
+        for plugin in self.installed.get().into_iter().flatten().rev() {
+            plugin.resources.close();
+        }
+        if let Some(upstream) = &self.upstream
+            && std::panic::catch_unwind(AssertUnwindSafe(|| upstream.signal_shutdown())).is_err()
+        {
+            log::warn!("Upstream lifecycle synchronous shutdown signal panicked");
+        }
+    }
+
     fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
             let mut failures = Vec::new();
+            self.signal_shutdown();
             for plugin in self.installed.get().into_iter().flatten().rev() {
-                plugin.resources.close();
-            }
-            for plugin in self.installed.get().into_iter().flatten().rev() {
-                if let Err(error) = plugin_callback(|| plugin.plugin.shutdown()).await {
+                if let Err(error) = self.run_callback(|| plugin.plugin.shutdown()).await {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
             if let Some(upstream) = &self.upstream
-                && let Err(error) = plugin_callback(|| upstream.shutdown()).await
+                && let Err(error) = self.run_callback(|| upstream.shutdown()).await
             {
                 failures.push(format!("upstream: {error:#}"));
             }
@@ -1002,9 +1123,56 @@ impl ClientLifecycle for PluginHost {
 
 impl Drop for PluginHost {
     fn drop(&mut self) {
-        for plugin in self.installed.get().into_iter().flatten() {
-            plugin.resources.close();
+        self.signal_shutdown();
+    }
+}
+
+async fn shutdown_staged_plugins(
+    runtime: Arc<dyn Runtime>,
+    current: Option<InstalledPlugin>,
+    mut installed: Vec<InstalledPlugin>,
+    upstream: Option<Arc<dyn ClientLifecycle>>,
+) {
+    if let Some(plugin) = current
+        && let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+            plugin.plugin.shutdown()
+        })
+        .await
+    {
+        log::warn!(
+            "Plugin `{}` failed-install rollback failed: {error:#}",
+            plugin.manifest.id
+        );
+    }
+    while let Some(plugin) = installed.pop() {
+        if let Err(error) = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+            plugin.plugin.shutdown()
+        })
+        .await
+        {
+            log::warn!("Plugin `{}` rollback failed: {error:#}", plugin.manifest.id);
         }
+    }
+    if let Some(upstream) = upstream
+        && let Err(error) =
+            bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || upstream.shutdown())
+                .await
+    {
+        log::warn!("Upstream lifecycle rollback failed: {error:#}");
+    }
+}
+
+async fn bounded_plugin_callback<'a>(
+    runtime: &dyn Runtime,
+    timeout: Duration,
+    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    match runtime_timeout(runtime, timeout, plugin_callback(make_future)).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "callback timed out after {:.3} seconds",
+            timeout.as_secs_f64()
+        ),
     }
 }
 
@@ -1159,7 +1327,7 @@ mod tests {
             .build()
             .await
             .expect("valid plugin plan");
-        let client = build.client();
+        let client = build.into_client();
 
         assert_eq!(
             client
@@ -1233,7 +1401,7 @@ mod tests {
             .build()
             .await
             .expect("declared dependency plan");
-        let client = build.client();
+        let client = build.into_client();
         assert_eq!(client.plugin::<TransitiveProbe>().as_deref(), Some(&true));
         client.disconnect().await;
     }
@@ -1501,6 +1669,93 @@ mod tests {
         .expect("rollback aborted the install-scoped task");
     }
 
+    struct BlockingInstallPlugin {
+        log: Log,
+        started: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    impl ClientPlugin for BlockingInstallPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("blocking-install", "0.1.0").with_dependency("rollback")
+        }
+
+        fn install(
+            &self,
+            _context: PluginContext,
+        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            let log = self.log.clone();
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                record(&log, "install:blocking");
+                let _ = started.try_send(());
+                release.recv().await?;
+                Ok(Arc::new(()))
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let log = self.log.clone();
+            Box::pin(async move {
+                record(&log, "shutdown:blocking");
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_build_closes_resources_and_schedules_lifo_rollback() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
+        let builder = complete_builder()
+            .await
+            .with_plugin(BlockingInstallPlugin {
+                log: log.clone(),
+                started: started_tx,
+                release: release_rx,
+            })
+            .with_plugin(RollbackPlugin {
+                log: log.clone(),
+                task_dropped: task_dropped.clone(),
+            });
+
+        let build = tokio::spawn(async move { builder.build().await });
+        started_rx.recv().await.expect("blocking install started");
+        build.abort();
+        let _ = build.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let complete = log
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last()
+                    .is_some_and(|entry| entry == "shutdown:rollback");
+                if complete && task_dropped.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled build rollback completed");
+
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                "install:rollback",
+                "install:blocking",
+                "shutdown:blocking",
+                "shutdown:rollback"
+            ]
+        );
+    }
+
     struct PanickingPlugin {
         log: Log,
     }
@@ -1631,7 +1886,7 @@ mod tests {
             .build()
             .await
             .expect("scoped task plugin");
-        let client = build.client();
+        let client = build.into_client();
         wait_for_flag(&install_started).await;
 
         let scope = ConnectionScope::new(88);
@@ -1703,6 +1958,121 @@ mod tests {
         }
     }
 
+    struct FailingReadyLifecycle;
+
+    impl ClientLifecycle for FailingReadyLifecycle {
+        fn on_ready(&self, _scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { anyhow::bail!("injected upstream ready failure") })
+        }
+    }
+
+    struct ReadyPlugin<const MARKER: u8> {
+        id: &'static str,
+        dependency: Option<&'static str>,
+        log: Log,
+        stalls: bool,
+    }
+
+    impl<const MARKER: u8> ClientPlugin for ReadyPlugin<MARKER> {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            let manifest = PluginManifest::new(self.id, "0.1.0");
+            match self.dependency {
+                Some(dependency) => manifest.with_dependency(dependency),
+                None => manifest,
+            }
+        }
+
+        fn install(
+            &self,
+            _context: PluginContext,
+        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async { Ok(Arc::new(())) })
+        }
+
+        fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+            let id = self.id;
+            let log = self.log.clone();
+            let stalls = self.stalls;
+            Box::pin(async move {
+                record(&log, format!("ready:{id}"));
+                if stalls {
+                    futures::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_ready_failure_does_not_suppress_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = complete_builder()
+            .await
+            .with_lifecycle(FailingReadyLifecycle)
+            .with_plugin(ReadyPlugin::<1> {
+                id: "ready-probe",
+                dependency: None,
+                log: log.clone(),
+                stalls: false,
+            })
+            .build()
+            .await
+            .expect("ready probe client")
+            .into_client();
+
+        let result = client
+            .plugin_host
+            .as_ref()
+            .expect("plugin host")
+            .on_ready(ConnectionScope::new(91))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["ready:ready-probe"]
+        );
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_plugin_callback_does_not_suppress_following_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let plan = PluginPlan::prepare(vec![
+            PluginRegistration::new(ReadyPlugin::<2> {
+                id: "stalling-ready",
+                dependency: None,
+                log: log.clone(),
+                stalls: true,
+            }),
+            PluginRegistration::new(ReadyPlugin::<3> {
+                id: "following-ready",
+                dependency: Some("stalling-ready"),
+                log: log.clone(),
+                stalls: false,
+            }),
+        ])
+        .expect("valid callback plan")
+        .expect("non-empty callback plan");
+        let host = PluginHost::new_with_callback_timeout(plan, None, Duration::from_millis(10));
+        let client = complete_builder()
+            .await
+            .with_lifecycle_arc(host.clone())
+            .build()
+            .await
+            .expect("callback timeout client")
+            .into_client();
+
+        let result = host.on_ready(ConnectionScope::new(92)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["ready:stalling-ready", "ready:following-ready"]
+        );
+        client.disconnect().await;
+    }
+
     #[tokio::test]
     async fn composes_existing_lifecycle_outside_plugin_lifo_order() {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -1713,7 +2083,7 @@ mod tests {
             .build()
             .await
             .expect("composed lifecycle");
-        let client = build.client();
+        let client = build.into_client();
         assert_eq!(
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec!["install:upstream", "install:foundation"]
@@ -1753,7 +2123,7 @@ mod tests {
                     .core_events()
                     .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
                     .subscribe(
-                        EventInterest::of(&[wacore::types::events::EventKind::Connected]),
+                        EventInterest::of(&[EventKind::Connected, EventKind::RawNode]),
                         Arc::new(NoopEventHandler),
                     )?;
                 Ok(Arc::new(()))
@@ -1762,20 +2132,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_removes_plugin_event_subscriptions() {
+    async fn shutdown_removes_plugin_event_subscriptions_and_raw_lease() {
         let build = complete_builder()
             .await
             .with_plugin(EventSubscriptionPlugin)
             .build()
             .await
             .expect("event subscription plugin");
-        let client = build.client();
+        let client = build.into_client();
         assert!(
             client
                 .core
                 .event_bus
                 .has_handler_for(wacore::types::events::EventKind::Connected)
         );
+        assert!(client.raw_node_forwarding_enabled());
 
         client.disconnect().await;
         assert!(
@@ -1784,6 +2155,36 @@ mod tests {
                 .event_bus
                 .has_handler_for(wacore::types::events::EventKind::Connected)
         );
+        assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    #[tokio::test]
+    async fn synchronous_shutdown_closes_plugin_resources_with_live_client_refs() {
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let client = complete_builder()
+            .await
+            .with_plugin(RollbackPlugin {
+                log: Arc::new(Mutex::new(Vec::new())),
+                task_dropped: task_dropped.clone(),
+            })
+            .with_plugin(EventSubscriptionPlugin)
+            .build()
+            .await
+            .expect("plugin resource client")
+            .into_client();
+        let retained_client = client.clone();
+
+        client.signal_shutdown_sync();
+        wait_for_flag(&task_dropped).await;
+
+        assert!(!retained_client.raw_node_forwarding_enabled());
+        assert!(
+            !retained_client
+                .core
+                .event_bus
+                .has_handler_for(EventKind::Connected)
+        );
+        retained_client.disconnect().await;
     }
 
     struct CapabilityProbe;
@@ -1816,7 +2217,7 @@ mod tests {
             .build()
             .await
             .expect("capability plugin");
-        let client = build.client();
+        let client = build.into_client();
         assert_eq!(
             client.plugin::<CapabilityProbe>().as_deref(),
             Some(&[false, false, true, false])

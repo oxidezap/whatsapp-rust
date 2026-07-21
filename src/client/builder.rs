@@ -19,8 +19,8 @@ use wacore::runtime::Runtime;
 
 /// Result of constructing a [`Client`].
 ///
-/// The sync-task receiver has a single consumer and is therefore transferred
-/// together with the client rather than hidden behind a cloneable handle.
+/// Consume with [`ClientBuild::into_client`] for the standard worker or
+/// [`ClientBuild::into_parts`] when the host owns that worker itself.
 pub struct ClientBuild {
     client: Arc<Client>,
     sync_task_receiver: async_channel::Receiver<MajorSyncTask>,
@@ -37,12 +37,15 @@ impl ClientBuild {
         }
     }
 
-    /// Return the constructed client.
-    pub fn client(&self) -> Arc<Client> {
-        Arc::clone(&self.client)
+    /// Transfer the client and start its default major-sync worker.
+    pub fn into_client(self) -> Arc<Client> {
+        let (client, sync_task_receiver) = self.into_parts();
+        client.start_sync_task_worker(sync_task_receiver);
+        client
     }
 
-    /// Transfer ownership of the client and its sync-task receiver.
+    /// Transfer ownership of the client and its sole sync-task receiver.
+    /// The caller must drain the receiver for history sync to keep working.
     pub fn into_parts(self) -> (Arc<Client>, async_channel::Receiver<MajorSyncTask>) {
         (self.client, self.sync_task_receiver)
     }
@@ -60,6 +63,8 @@ pub enum ClientBuilderError {
     MissingTransportFactory,
     #[error("missing HTTP client")]
     MissingHttpClient,
+    #[error("background saver interval must be greater than zero")]
+    InvalidBackgroundSaverInterval,
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
     #[error("client lifecycle installation failed: {0}")]
@@ -341,6 +346,10 @@ impl ClientBuilder {
                 .cloned()
                 .ok_or(ClientBuilderError::MissingHttpClient)?;
 
+            if self.background_saver_interval == Some(Duration::ZERO) {
+                return Err(ClientBuilderError::InvalidBackgroundSaverInterval);
+            }
+
             if self.inbound_durability_hook.is_some() {
                 probe_durability_backend(&persistence_manager.backend()).await?;
             }
@@ -398,8 +407,17 @@ impl ClientBuilder {
             });
             (lifecycle_handler, plugin_host)
         };
-        let lifecycle = lifecycle_handler
-            .map(|handler| Arc::new(LifecycleRegistration::new(handler, Arc::clone(&runtime))));
+        let lifecycle = lifecycle_handler.map(|handler| {
+            #[cfg(feature = "plugins")]
+            if let Some(plugin_host) = &plugin_host {
+                return Arc::new(LifecycleRegistration::new_with_timeout(
+                    handler,
+                    Arc::clone(&runtime),
+                    plugin_host.lifecycle_callback_timeout(),
+                ));
+            }
+            Arc::new(LifecycleRegistration::new(handler, Arc::clone(&runtime)))
+        });
         let assembly = Client::assemble(
             Arc::clone(&runtime),
             Arc::clone(&persistence_manager),
@@ -593,6 +611,19 @@ mod tests {
         }
     }
 
+    async fn complete_builder() -> ClientBuilder {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        ClientBuilder::new()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+    }
+
     #[tokio::test]
     async fn validates_required_dependencies_before_assembly() {
         assert!(matches!(
@@ -658,7 +689,7 @@ mod tests {
 
         let build = assembly.start();
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
-        build.client().signal_shutdown_sync();
+        build.into_client().signal_shutdown_sync();
     }
 
     #[tokio::test]
@@ -685,7 +716,7 @@ mod tests {
             .build()
             .await
             .expect("complete builder");
-        let client = build.client();
+        let client = build.into_client();
 
         assert!(client.skip_history_sync_enabled());
         assert_eq!(client.wanted_pre_key_count(), 123);
@@ -696,8 +727,66 @@ mod tests {
                 .is_some_and(|installed| Arc::ptr_eq(installed, &meter))
         );
         assert!(client.saver_handle.get().is_some());
-        assert_eq!(spawns.load(Ordering::SeqCst), 3);
+        assert_eq!(spawns.load(Ordering::SeqCst), 4);
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn consuming_build_as_client_keeps_major_sync_worker_alive() {
+        let client = complete_builder()
+            .await
+            .build()
+            .await
+            .expect("complete builder")
+            .into_client();
+
+        assert!(!client.major_sync_task_sender.is_closed());
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_background_saver_interval() {
+        let result = complete_builder()
+            .await
+            .with_background_saver_interval(Duration::ZERO)
+            .build()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ClientBuilderError::InvalidBackgroundSaverInterval)
+        ));
+    }
+
+    struct PanickingInstallLifecycle {
+        when_polled: bool,
+    }
+
+    impl ClientLifecycle for PanickingInstallLifecycle {
+        fn install(
+            &self,
+            _client: std::sync::Weak<Client>,
+        ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<()>> {
+            if !self.when_polled {
+                panic!("injected synchronous install panic");
+            }
+            Box::pin(async { panic!("injected asynchronous install panic") })
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_install_panics_are_typed_build_errors() {
+        for when_polled in [false, true] {
+            let result = complete_builder()
+                .await
+                .with_lifecycle(PanickingInstallLifecycle { when_polled })
+                .build()
+                .await;
+            assert!(matches!(
+                result,
+                Err(ClientBuilderError::LifecycleInstall(_))
+            ));
+        }
     }
 
     #[tokio::test]

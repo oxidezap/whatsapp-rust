@@ -31,7 +31,7 @@ impl Client {
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.cancel_active_scope();
+            lifecycle.signal_shutdown_sync();
         }
         self.notify_connection_shutdown();
     }

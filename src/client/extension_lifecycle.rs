@@ -131,6 +131,8 @@ impl fmt::Debug for ConnectionScope {
 /// stalled extension cannot block reconnect. A future plugin host owns
 /// per-plugin ordering and isolation behind this client-level seam. `install`
 /// receives a weak client reference so retaining it cannot create a cycle.
+/// `signal_shutdown` is the non-blocking boundary for resources that must stop
+/// even when an FFI host cannot await `shutdown`.
 pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
     fn install<'a>(&'a self, _client: Weak<Client>) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
@@ -143,6 +145,10 @@ pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
     fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Stop synchronously owned resources before asynchronous shutdown begins.
+    /// Implementations must return promptly and make repeated calls harmless.
+    fn signal_shutdown(&self) {}
 
     fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
@@ -209,7 +215,7 @@ impl LifecycleRegistration {
         Self::new_with_timeout(handler, runtime, CALLBACK_TIMEOUT)
     }
 
-    fn new_with_timeout(
+    pub(super) fn new_with_timeout(
         handler: Arc<dyn ClientLifecycle>,
         runtime: Arc<dyn Runtime>,
         callback_timeout: Duration,
@@ -227,7 +233,14 @@ impl LifecycleRegistration {
     }
 
     pub(super) async fn install(&self, client: Weak<Client>) -> anyhow::Result<()> {
-        self.handler.install(client).await
+        let install = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handler.install(client)
+        }))
+        .map_err(|_| anyhow::anyhow!("lifecycle install panicked before returning a future"))?;
+        std::panic::AssertUnwindSafe(install)
+            .catch_unwind()
+            .await
+            .map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?
     }
 
     pub(super) fn begin_scope_if_current(
@@ -352,8 +365,7 @@ impl LifecycleRegistration {
     }
 
     pub(super) async fn shutdown(self: &Arc<Self>) {
-        self.terminal.store(true, Ordering::Release);
-        self.cancel_active_scope();
+        self.signal_shutdown_sync();
         {
             let mut queue = self.callback_queue();
             queue.shutdown_requested = true;
@@ -369,6 +381,19 @@ impl LifecycleRegistration {
             return;
         }
         wacore::runtime::wait_for_shutdown(&completed).await;
+    }
+
+    pub(super) fn signal_shutdown_sync(&self) {
+        let first_signal = !self.terminal.swap(true, Ordering::AcqRel);
+        self.cancel_active_scope();
+        if first_signal
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.handler.signal_shutdown();
+            }))
+            .is_err()
+        {
+            log::warn!("Client lifecycle synchronous shutdown signal panicked");
+        }
     }
 
     fn enqueue_callback(self: &Arc<Self>, callback: LifecycleCallback) {
@@ -806,7 +831,7 @@ mod tests {
             .build()
             .await
             .expect("client build");
-        let client = build.client();
+        let client = build.into_client();
         const GENERATION: u64 = 9;
         client
             .connection_generation
@@ -884,7 +909,7 @@ mod tests {
             .build()
             .await
             .expect("client build")
-            .client();
+            .into_client();
         const GENERATION: u64 = 13;
         client
             .connection_generation
@@ -959,7 +984,7 @@ mod tests {
             .build()
             .await
             .expect("client build")
-            .client();
+            .into_client();
         const GENERATION: u64 = 17;
         client
             .connection_generation
@@ -1152,7 +1177,7 @@ mod tests {
             .build()
             .await
             .expect("client build")
-            .client();
+            .into_client();
         const GENERATION: u64 = 37;
         client
             .connection_generation
@@ -1306,7 +1331,7 @@ mod tests {
             .build()
             .await
             .expect("client build")
-            .client();
+            .into_client();
         client
             .subscribe_handler(Arc::new(LogoutOrderHandler {
                 lifecycle: lifecycle.clone(),

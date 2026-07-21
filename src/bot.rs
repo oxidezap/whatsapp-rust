@@ -546,46 +546,7 @@ impl Bot {
         } = self;
 
         if let Some(receiver) = sync_task_receiver {
-            // This channel carries only HistorySync tasks: app-state sync runs via
-            // its own direct path (fetch_app_state_with_retry), nothing enqueues
-            // AppStateSync here. Chunks are independent (order-free upserts; the
-            // event carries chunk_order), so ingest concurrently, bounded low — each
-            // in-flight chunk decompresses a blob and the connect path is peak-
-            // memory-conscious (WA Web caps at histSyncChunk=3). Taking the permit in
-            // the recv loop backpressures history intake on a burst; since no
-            // app-state task flows here, that can't head-of-line block one.
-            const HISTORY_SYNC_CONCURRENCY: usize = 2;
-            let worker_client = Arc::downgrade(&client);
-            let history_permits = Arc::new(async_lock::Semaphore::new(HISTORY_SYNC_CONCURRENCY));
-            client
-                .runtime
-                .spawn(Box::pin(async move {
-                    while let Ok(task) = receiver.recv().await {
-                        let Some(worker_client) = worker_client.upgrade() else {
-                            break;
-                        };
-
-                        if matches!(task, crate::sync_task::MajorSyncTask::HistorySync { .. }) {
-                            let permit = history_permits.acquire_arc().await;
-                            let task_client = worker_client.clone();
-                            worker_client
-                                .runtime
-                                .spawn(Box::pin(async move {
-                                    let _permit = permit;
-                                    task_client.process_sync_task(task).await;
-                                }))
-                                .detach();
-                        } else {
-                            // Defensive: nothing enqueues AppStateSync today, but if
-                            // that changes it must run serially (ordered patches).
-                            worker_client.process_sync_task(task).await;
-                        }
-                    }
-                    info!(
-                        "Sync worker intake loop finished (detached history-sync tasks may still be running)."
-                    );
-                }))
-                .detach();
+            client.start_sync_task_worker(receiver);
         }
 
         if !event_handlers.is_empty() {

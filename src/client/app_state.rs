@@ -276,6 +276,42 @@ impl Client {
         pre_downloaded
     }
 
+    pub(crate) fn start_sync_task_worker(
+        self: &Arc<Self>,
+        receiver: async_channel::Receiver<crate::sync_task::MajorSyncTask>,
+    ) {
+        const HISTORY_SYNC_CONCURRENCY: usize = 2;
+
+        let worker_client = Arc::downgrade(self);
+        let history_permits = Arc::new(async_lock::Semaphore::new(HISTORY_SYNC_CONCURRENCY));
+        self.runtime
+            .spawn(Box::pin(async move {
+                while let Ok(task) = receiver.recv().await {
+                    let Some(worker_client) = worker_client.upgrade() else {
+                        break;
+                    };
+
+                    if matches!(task, crate::sync_task::MajorSyncTask::HistorySync { .. }) {
+                        let permit = history_permits.acquire_arc().await;
+                        let task_client = worker_client.clone();
+                        worker_client
+                            .runtime
+                            .spawn(Box::pin(async move {
+                                let _permit = permit;
+                                task_client.process_sync_task(task).await;
+                            }))
+                            .detach();
+                    } else {
+                        worker_client.process_sync_task(task).await;
+                    }
+                }
+                info!(
+                    "Sync worker intake loop finished (detached history-sync tasks may still be running)."
+                );
+            }))
+            .detach();
+    }
+
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
     #[cfg_attr(
         feature = "tracing",
