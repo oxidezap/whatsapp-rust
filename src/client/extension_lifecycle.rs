@@ -137,18 +137,24 @@ pub trait ClientLifecycle: wacore::sync_marker::MaybeSendSync {
 
 pub(super) struct LifecycleRegistration {
     handler: Arc<dyn ClientLifecycle>,
-    active_scope: std::sync::Mutex<Option<ConnectionScope>>,
+    scopes: std::sync::Mutex<ScopeRegistry>,
     callback_gate: async_lock::Mutex<()>,
     shutdown_gate: async_lock::Mutex<bool>,
     scope_changed: event_listener::Event,
     terminal: AtomicBool,
 }
 
+#[derive(Default)]
+struct ScopeRegistry {
+    active: Option<ConnectionScope>,
+    retired: Vec<ConnectionScope>,
+}
+
 impl LifecycleRegistration {
     pub(super) fn new(handler: Arc<dyn ClientLifecycle>) -> Self {
         Self {
             handler,
-            active_scope: std::sync::Mutex::new(None),
+            scopes: std::sync::Mutex::new(ScopeRegistry::default()),
             callback_gate: async_lock::Mutex::new(()),
             shutdown_gate: async_lock::Mutex::new(false),
             scope_changed: event_listener::Event::new(),
@@ -166,22 +172,21 @@ impl LifecycleRegistration {
         }
 
         let scope = ConnectionScope::new(generation);
-        let mut active = self
-            .active_scope
+        let mut scopes = self
+            .scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.terminal.load(Ordering::Acquire) {
             return;
         }
-        let replaced = active.replace(scope);
-        drop(active);
+        let replaced = scopes.active.replace(scope);
         if let Some(replaced) = replaced {
             log::warn!(
                 "Replacing unclosed connection scope for generation {}",
                 replaced.generation()
             );
             replaced.cancel();
-            replaced.close();
+            scopes.retired.push(replaced);
         }
     }
 
@@ -208,12 +213,14 @@ impl LifecycleRegistration {
     }
 
     pub(super) fn cancel_active_scope(&self) {
-        let scope = self
-            .active_scope
+        let scopes = self
+            .scopes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(scope) = scope {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(scope) = &scopes.active {
+            scope.cancel();
+        }
+        for scope in &scopes.retired {
             scope.cancel();
         }
     }
@@ -221,17 +228,22 @@ impl LifecycleRegistration {
     pub(super) async fn close_scope(&self, generation: u64) {
         let _callback_guard = self.callback_gate.lock().await;
         let scope = {
-            let mut active = self
-                .active_scope
+            let mut scopes = self
+                .scopes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if active
+            if scopes
+                .active
                 .as_ref()
                 .is_some_and(|scope| scope.generation() == generation)
             {
-                active.take()
+                scopes.active.take()
             } else {
-                None
+                scopes
+                    .retired
+                    .iter()
+                    .position(|scope| scope.generation() == generation)
+                    .map(|position| scopes.retired.remove(position))
             }
         };
         let Some(scope) = scope else {
@@ -258,7 +270,7 @@ impl LifecycleRegistration {
         loop {
             let scope_changed = self.scope_changed.listen();
             let callback_guard = self.callback_gate.lock().await;
-            if self.scope_for_active_generation().is_none() {
+            if !self.has_open_scopes() {
                 if let Err(error) = self.handler.shutdown().await {
                     log::warn!("Client lifecycle shutdown failed: {error:#}");
                 }
@@ -269,19 +281,29 @@ impl LifecycleRegistration {
         }
     }
 
-    fn scope_for_active_generation(&self) -> Option<ConnectionScope> {
-        self.active_scope
+    fn has_open_scopes(&self) -> bool {
+        let scopes = self
+            .scopes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        scopes.active.is_some() || !scopes.retired.is_empty()
     }
 
     fn scope_for(&self, generation: u64) -> Option<ConnectionScope> {
-        self.active_scope
+        let scopes = self
+            .scopes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        scopes
+            .active
             .as_ref()
             .filter(|scope| scope.generation() == generation)
+            .or_else(|| {
+                scopes
+                    .retired
+                    .iter()
+                    .find(|scope| scope.generation() == generation)
+            })
             .cloned()
     }
 }
@@ -602,6 +624,33 @@ mod tests {
             vec!["ready-started", "ready-finished", "closed"]
         );
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn replaced_scope_stays_closeable_by_its_generation() {
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let registration = LifecycleRegistration::new(lifecycle.clone());
+
+        registration.begin_scope(31);
+        assert!(registration.ready(31).await);
+        let first = registration.scope_for(31).expect("first scope");
+
+        registration.begin_scope(32);
+        assert_eq!(first.state(), ConnectionScopeState::Cancelled);
+        assert!(registration.scope_for(31).is_some());
+        assert!(registration.ready(32).await);
+
+        registration.close_scope(31).await;
+        assert_eq!(first.state(), ConnectionScopeState::Closed);
+        assert!(registration.scope_for(31).is_none());
+        assert!(registration.scope_for(32).is_some());
+
+        registration.close_scope(32).await;
+        registration.shutdown().await;
+        assert_eq!(
+            lifecycle.events(),
+            vec!["ready:31", "ready:32", "closed:31", "closed:32", "shutdown",]
+        );
     }
 
     #[tokio::test]
