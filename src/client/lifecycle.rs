@@ -782,6 +782,9 @@ impl Client {
     )]
     pub async fn reconnect(self: &Arc<Self>) {
         info!("Reconnecting: dropping transport for auto-reconnect.");
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_active_scope();
+        }
         wacore::telemetry::reconnect();
         self.intentional_reconnect.store(true, Ordering::Relaxed);
         self.auto_reconnect_errors
@@ -818,6 +821,9 @@ impl Client {
     )]
     pub async fn reconnect_immediately(self: &Arc<Self>) {
         info!("Reconnecting immediately (expected disconnect).");
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_active_scope();
+        }
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().

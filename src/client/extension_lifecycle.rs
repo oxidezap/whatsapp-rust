@@ -382,6 +382,15 @@ impl LifecycleRegistration {
         }
     }
 
+    pub(super) fn cancel_active_scope(&self) {
+        if ready_publication_active(self) {
+            self.cancel_active_scope_inner();
+        } else {
+            let _publication = self.ready_publication();
+            self.cancel_active_scope_inner();
+        }
+    }
+
     pub(super) fn close_scope(self: &Arc<Self>, generation: u64) {
         self.close_scope_with(generation, || {});
     }
@@ -616,6 +625,12 @@ impl LifecycleRegistration {
         }
     }
 
+    fn cancel_active_scope_inner(&self) {
+        if let Some(scope) = &self.scopes().active {
+            scope.cancel();
+        }
+    }
+
     fn mark_terminal_and_cancel_scopes(&self) -> bool {
         let first_signal = !self.terminal.swap(true, Ordering::AcqRel);
         let scopes = self.scopes();
@@ -771,6 +786,70 @@ mod tests {
     struct ReentrantDisconnectLifecycle {
         client: std::sync::Mutex<Option<Weak<Client>>>,
         events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    struct ReentrantReconnectLifecycle {
+        client: std::sync::Mutex<Option<Weak<Client>>>,
+        events: std::sync::Mutex<Vec<&'static str>>,
+        immediate: bool,
+    }
+
+    impl ClientLifecycle for ReentrantReconnectLifecycle {
+        fn install<'a>(&'a self, client: Weak<Client>) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                *self
+                    .client
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client);
+                Ok(())
+            })
+        }
+
+        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("ready-started");
+                let client = self
+                    .client
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .expect("installed client");
+                if self.immediate {
+                    client.reconnect_immediately().await;
+                } else {
+                    client.reconnect().await;
+                }
+                self.events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("ready-finished");
+                Ok(())
+            })
+        }
+
+        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("closed");
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("shutdown");
+                Ok(())
+            })
+        }
     }
 
     impl ClientLifecycle for ReentrantDisconnectLifecycle {
@@ -1376,6 +1455,57 @@ mod tests {
         );
         assert!(!client.is_logged_in());
         assert!(!client.is_ready.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn ready_callback_reconnect_requests_retire_the_scope_before_returning() {
+        for immediate in [false, true] {
+            let persistence_manager = Arc::new(
+                PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                    .await
+                    .expect("persistence manager"),
+            );
+            let lifecycle = Arc::new(ReentrantReconnectLifecycle {
+                client: std::sync::Mutex::new(None),
+                events: std::sync::Mutex::new(Vec::new()),
+                immediate,
+            });
+            let client = Client::builder()
+                .with_runtime(TokioRuntime)
+                .with_persistence_manager(persistence_manager)
+                .with_transport_factory(MockTransportFactory::new())
+                .with_http_client(MockHttpClient)
+                .with_lifecycle_arc(lifecycle.clone())
+                .build()
+                .await
+                .expect("client build")
+                .into_client();
+            const GENERATION: u64 = 18;
+            client
+                .connection_generation
+                .store(GENERATION, Ordering::SeqCst);
+            let registration = client.lifecycle.as_ref().expect("lifecycle registration");
+            assert!(registration.begin_scope_if_current(GENERATION, || true));
+
+            tokio::time::timeout(Duration::from_secs(2), client.dispatch_connected())
+                .await
+                .expect("reentrant reconnect completed");
+            let scope = registration
+                .scope_for(GENERATION)
+                .expect("cancelled connection scope");
+            assert_eq!(scope.state(), ConnectionScopeState::Cancelled);
+            assert!(!client.is_ready.load(Ordering::Relaxed));
+
+            registration.close_scope(GENERATION);
+            registration.shutdown().await;
+            assert_eq!(
+                *lifecycle
+                    .events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                vec!["ready-started", "ready-finished", "closed", "shutdown"]
+            );
+        }
     }
 
     #[tokio::test]
