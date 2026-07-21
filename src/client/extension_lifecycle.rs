@@ -1315,6 +1315,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_success_restores_logged_out_state() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle_arc(lifecycle)
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+        client
+            .lifecycle
+            .as_ref()
+            .expect("lifecycle registration")
+            .signal_shutdown_sync();
+
+        let success = wacore_binary::builder::NodeBuilder::new("success").build();
+        client.handle_success(&success.as_node_ref()).await;
+
+        assert!(!client.is_logged_in());
+        assert_eq!(client.connection_generation.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn replaced_scope_stays_closeable_by_its_generation() {
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let registration = Arc::new(LifecycleRegistration::new(

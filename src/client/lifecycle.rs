@@ -184,6 +184,7 @@ impl Client {
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
             is_logged_in: Arc::new(AtomicBool::new(false)),
+            login_transition: std::sync::Mutex::new(()),
             is_connecting: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             is_connected: Arc::new(AtomicBool::new(false)),
@@ -846,6 +847,10 @@ impl Client {
     }
 
     async fn cleanup_connection_state_inner(&self) {
+        let login_transition = self
+            .login_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Bump the generation FIRST: it is the "this connection is over"
         // signal every per-connection loop already polls. Chat-lane workers
         // stop draining their queues (their remaining stanzas were never
@@ -869,6 +874,7 @@ impl Client {
         // outgoing stanzas, which are transport-scoped.
         self.clear_sent_node_waiters();
         self.is_logged_in.store(false, Ordering::Relaxed);
+        drop(login_transition);
         self.is_ready.store(false, Ordering::Relaxed);
         // Publish the disconnected state BEFORE draining VoIP calls (it used to be cleared only after
         // the socket teardown below): a concurrent accept()/call() setup that finishes its async work

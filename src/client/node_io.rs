@@ -679,6 +679,10 @@ impl Client {
         tracing::instrument(name = "wa.conn.success", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_success(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
+        let login_transition = self
+            .login_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Skip processing if an expected disconnect is pending (e.g., 515 received).
         // This prevents race conditions where a spawned success handler runs after
         // cleanup_connection_state has already reset is_logged_in.
@@ -703,10 +707,12 @@ impl Client {
                     && !self.expected_disconnect.load(Ordering::Acquire)
             });
             if !opened {
+                self.is_logged_in.store(false, Ordering::SeqCst);
                 debug!("Ignoring <success> stanza retired during lifecycle publication");
                 return;
             }
         }
+        drop(login_transition);
 
         info!(
             "Successfully authenticated with WhatsApp servers! (gen={})",

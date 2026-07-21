@@ -448,8 +448,10 @@ impl CoreEventBusInner {
         let snapshot = Arc::new(HandlerSnapshot { handlers });
         // Retire the entry before clearing bits; an early read may only be a
         // harmless false positive.
-        *guard = Arc::clone(&snapshot);
+        let retired = std::mem::replace(&mut *guard, Arc::clone(&snapshot));
         self.store_aggregate(&snapshot);
+        drop(guard);
+        drop(retired);
         true
     }
 
@@ -2324,6 +2326,42 @@ mod tests {
         assert!(!bus.has_handler_for(EventKind::Connected));
         bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn handler_drop_can_unsubscribe_from_the_same_bus() {
+        use std::sync::Mutex;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct OwnsSubscription(Mutex<Option<Subscription>>);
+        impl EventHandler for OwnsSubscription {
+            fn handle_event(&self, _: Arc<Event>) {}
+        }
+        impl Drop for OwnsSubscription {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let owned = bus.subscribe_handler(ChannelEventHandler::new().0);
+        let owner = Arc::new(OwnsSubscription(Mutex::new(Some(owned))));
+        let outer = bus.subscribe_handler(owner.clone());
+        drop(owner);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(outer);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler drop re-entered event-bus removal");
+        assert!(!bus.has_handlers());
     }
 
     #[test]
