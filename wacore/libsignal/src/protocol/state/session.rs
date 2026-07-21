@@ -754,13 +754,14 @@ impl SessionRecord {
     ///
     /// Any durably reserved sender range is advanced to its exclusive ceiling
     /// before export so rebuilding the record cannot derive a possibly spent
-    /// message key again.
+    /// message key again. A chain too stale to advance is dropped fail-closed
+    /// without discarding the rest of the record.
     pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
         let reserved_sender_chain_index = self.reserved_sender_chain_index;
         if reserved_sender_chain_index > 0
             && let Some(state) = self.current_session.as_mut()
         {
-            state.fast_forward_sender_chain(reserved_sender_chain_index)?;
+            state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
         }
         let current_session = self
             .current_session

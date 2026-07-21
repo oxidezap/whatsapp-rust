@@ -1278,6 +1278,27 @@ mod tests {
     }
 
     #[test]
+    fn session_handoff_drops_unadvanceable_chains_without_losing_the_record() {
+        let mut record = SessionRecord::from_components(session_record()).expect("valid record");
+        record.reserve_sender_chain_counters(
+            crate::protocol::consts::MAX_RESERVATION_FAST_FORWARD + 1,
+        );
+
+        let components = record
+            .into_components()
+            .expect("unadvanceable chains must not consume the record on error");
+
+        assert!(
+            components
+                .current_session
+                .as_ref()
+                .is_some_and(|session| session.sender_chain.is_none())
+        );
+        assert_eq!(components.previous_sessions.len(), 1);
+        assert!(components.previous_sessions[0].sender_chain.is_none());
+    }
+
+    #[test]
     fn sender_key_components_use_the_canonical_record_codec() {
         let expected = sender_key_record();
         let bytes = SenderKeyRecord::from_components(expected.clone())

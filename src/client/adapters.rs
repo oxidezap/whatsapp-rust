@@ -1,6 +1,7 @@
 //! Signal/sender-key store adapters, per-session locks and noise socket access.
 
 use super::*;
+use anyhow::Context as _;
 
 impl Client {
     /// Build a [`SignalProtocolStoreAdapter`] from the current device state and signal cache.
@@ -107,7 +108,7 @@ impl Client {
         self.signal_cache
             .flush(&*backend)
             .await
-            .map_err(|error| error.context("Failed to flush signal cache"))
+            .context("Failed to flush signal cache")
     }
 
     /// Signal-cache flush that is safe while the offline drain is active.
@@ -223,7 +224,7 @@ mod tests {
     async fn signal_flush_context_preserves_the_backend_error_chain() {
         let backend = Arc::new(InMemoryBackend::new());
         let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
-        let peer = Jid::new("15550001111", Server::Pn).with_device(1);
+        let peer = Jid::new("12025550111", Server::Pn).with_device(1);
         crate::test_utils::seed_peer_session(&client, &peer).await;
         backend.set_fail_session_writes(true);
 
