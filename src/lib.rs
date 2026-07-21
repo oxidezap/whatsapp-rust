@@ -179,7 +179,10 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
-    pub use crate::client::{Client, ClientError};
+    pub use crate::client::{
+        Client, ClientBuilder, ClientBuilderError, ClientError, ClientLifecycle, ConnectionScope,
+        ConnectionScopeState,
+    };
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;

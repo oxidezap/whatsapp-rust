@@ -981,7 +981,7 @@ impl Client {
             proc.clear_key_cache().await;
         }
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.close_scope(closed_generation).await;
+            lifecycle.close_scope(closed_generation);
         }
     }
 

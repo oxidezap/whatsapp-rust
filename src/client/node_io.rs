@@ -698,7 +698,14 @@ impl Client {
         // from previous connections (e.g., during 515 reconnect cycles).
         let current_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.begin_scope(current_generation);
+            let opened = lifecycle.begin_scope_if_current(current_generation, || {
+                self.connection_generation.load(Ordering::SeqCst) == current_generation
+                    && !self.expected_disconnect.load(Ordering::Acquire)
+            });
+            if !opened {
+                debug!("Ignoring <success> stanza retired during lifecycle publication");
+                return;
+            }
         }
 
         info!(
