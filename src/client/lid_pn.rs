@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use log::debug;
 use wacore::iq::usync::LidQuerySpec;
-use wacore::store::traits::LidPnMappingEntry;
+use wacore::store::traits::{LidPnMappingEntry, SignalStore};
 use wacore_binary::Jid;
 
 use super::Client;
@@ -878,20 +878,35 @@ impl Client {
     ) -> bool {
         use log::warn;
 
-        let outcome = self
-            .migrate_signal_sessions(&Jid::pn(pn), &Jid::lid(lid))
+        let backend = self.persistence_manager.backend();
+        if let Ok(false) = self
+            .signal_cache
+            .has_state_for_user(pn, backend.as_ref())
+            .await
+        {
+            return false;
+        }
+
+        let standard = self
+            .migrate_signal_sessions_with_backend(&Jid::pn(pn), &Jid::lid(lid), backend.as_ref())
             .await;
-        let migrated_sessions = outcome.migrated != 0;
-        if outcome.has_state_changes()
+        let hosted = self
+            .migrate_signal_sessions_with_backend(
+                &Jid::new(pn, wacore_binary::Server::Hosted),
+                &Jid::new(lid, wacore_binary::Server::HostedLid),
+                backend.as_ref(),
+            )
+            .await;
+        let migrated_sessions = standard.migrated != 0 || hosted.migrated != 0;
+        if (standard.has_state_changes()
+            || hosted.has_state_changes()
             || self
                 .signal_cache
                 .has_pending_pairwise_writes_for_user(pn)
-                .await
+                .await)
+            && let Err(error) = self.signal_cache.flush(backend.as_ref()).await
         {
-            let backend = self.persistence_manager.backend();
-            if let Err(error) = self.signal_cache.flush(backend.as_ref()).await {
-                warn!("Failed to flush signal cache after migration: {error:?}");
-            }
+            warn!("Failed to flush signal cache after migration: {error:?}");
         }
         migrated_sessions
     }
@@ -901,9 +916,6 @@ impl Client {
         from: &Jid,
         to: &Jid,
     ) -> crate::features::SignalSessionMigration {
-        use log::{info, warn};
-        use wacore::types::jid::JidExt;
-
         let backend = self.persistence_manager.backend();
 
         // Nothing to migrate unless the PN side has Signal state. For a freshly
@@ -917,6 +929,23 @@ impl Client {
         {
             return crate::features::SignalSessionMigration::default();
         }
+
+        self.migrate_signal_sessions_with_backend(from, to, backend.as_ref())
+            .await
+    }
+
+    /// Migrate one matching address-family pair after the caller has established
+    /// that this user may have Signal state. Splitting the existence probe from
+    /// the scan lets LID discovery cover both regular and hosted namespaces with
+    /// one backend probe and one final flush.
+    async fn migrate_signal_sessions_with_backend(
+        &self,
+        from: &Jid,
+        to: &Jid,
+        backend: &dyn SignalStore,
+    ) -> crate::features::SignalSessionMigration {
+        use log::{info, warn};
+        use wacore::types::jid::JidExt;
 
         let mut outcome = crate::features::SignalSessionMigration::default();
 
@@ -944,11 +973,7 @@ impl Client {
 
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
             // (`ON CONFLICT DO UPDATE SET session=excluded.session`).
-            match self
-                .signal_cache
-                .get_session(&pn_proto, backend.as_ref())
-                .await
-            {
+            match self.signal_cache.get_session(&pn_proto, backend).await {
                 Ok(Some(session)) => {
                     outcome.total += 1;
                     self.signal_cache.put_session(&lid_proto, session).await;
@@ -978,38 +1003,32 @@ impl Client {
             // Match the LID lookup result explicitly so a transient read
             // failure isn't collapsed with `Ok(None)` and used as license
             // to overwrite a potentially-valid LID identity.
-            match self
-                .signal_cache
-                .get_identity(&pn_proto, backend.as_ref())
-                .await
-            {
-                Ok(Some(identity_data)) => match self
-                    .signal_cache
-                    .get_identity(&lid_proto, backend.as_ref())
-                    .await
-                {
-                    Ok(None) => {
-                        self.signal_cache
-                            .put_identity(&lid_proto, &identity_data)
-                            .await;
-                        self.signal_cache.delete_identity(&pn_proto).await;
-                        outcome.migrated_identities += 1;
-                        info!("Migrated identity {} -> {}", pn_proto, lid_proto);
-                    }
-                    Ok(Some(_)) => {
-                        // LID-wins: existing LID identity preserved; drop the PN copy.
-                        self.signal_cache.delete_identity(&pn_proto).await;
-                        outcome.discarded_identities += 1;
-                    }
-                    Err(e) => {
-                        outcome.skipped_identities += 1;
-                        warn!(
-                            "Skipping identity migration {} -> {}: \
+            match self.signal_cache.get_identity(&pn_proto, backend).await {
+                Ok(Some(identity_data)) => {
+                    match self.signal_cache.get_identity(&lid_proto, backend).await {
+                        Ok(None) => {
+                            self.signal_cache
+                                .put_identity(&lid_proto, &identity_data)
+                                .await;
+                            self.signal_cache.delete_identity(&pn_proto).await;
+                            outcome.migrated_identities += 1;
+                            info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                        }
+                        Ok(Some(_)) => {
+                            // LID-wins: existing LID identity preserved; drop the PN copy.
+                            self.signal_cache.delete_identity(&pn_proto).await;
+                            outcome.discarded_identities += 1;
+                        }
+                        Err(e) => {
+                            outcome.skipped_identities += 1;
+                            warn!(
+                                "Skipping identity migration {} -> {}: \
                              failed to read LID identity: {e:?}",
-                            pn_proto, lid_proto
-                        );
+                                pn_proto, lid_proto
+                            );
+                        }
                     }
-                },
+                }
                 Ok(None) => {}
                 Err(error) => {
                     outcome.skipped_identities += 1;
@@ -2093,10 +2112,7 @@ mod tests {
         backend
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 3,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(3, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2331,6 +2347,57 @@ mod tests {
              link to the peer's outbound chain.",
             surviving_regid, WORKING_REGID
         );
+    }
+
+    #[tokio::test]
+    async fn lid_discovery_migrates_standard_and_hosted_signal_namespaces() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "13135550100";
+        let lid = "100000000000100";
+        let backend = client.persistence_manager.backend();
+        let pairs = [
+            (Server::Pn, Server::Lid, 11),
+            (Server::Hosted, Server::HostedLid, 12),
+        ];
+
+        for (from_server, _, registration_id) in pairs {
+            let source = Jid::new(pn, from_server).to_protocol_address();
+            client
+                .signal_cache
+                .put_session(
+                    &source,
+                    SessionRecord::deserialize(&tagged_session_blob(registration_id)).unwrap(),
+                )
+                .await;
+        }
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+        assert!(
+            client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await
+        );
+        for (from_server, to_server, _) in pairs {
+            let source = Jid::new(pn, from_server).to_protocol_address();
+            let destination = Jid::new(lid, to_server).to_protocol_address();
+            assert!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .get_session(destination.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     /// A freshly-resolved peer (no prior PN Signal state) must short-circuit the

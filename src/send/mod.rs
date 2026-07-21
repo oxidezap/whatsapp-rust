@@ -3032,10 +3032,7 @@ mod tests {
         for user in &participant_users {
             let record = DeviceListRecord {
                 user: (*user).into(),
-                devices: vec![DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -4472,10 +4469,7 @@ mod tests {
             client
                 .update_device_list(wacore::store::traits::DeviceListRecord {
                     user,
-                    devices: vec![wacore::store::traits::DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    }],
+                    devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,

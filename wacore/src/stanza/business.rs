@@ -3,7 +3,7 @@
 //! Reference: WhatsApp Web `WAWebHandleBusinessNotification`
 
 use anyhow::{Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wacore_binary::Jid;
 use wacore_binary::NodeRef;
 
@@ -34,12 +34,17 @@ pub enum BusinessNotificationType {
 }
 
 /// Verified name certificate information.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedName {
     pub name: Option<String>,
     pub serial: Option<String>,
     pub issuer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_helpers::serialize_optional_bytes",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_bytes"
+    )]
     pub certificate: Option<Vec<u8>>,
 }
 

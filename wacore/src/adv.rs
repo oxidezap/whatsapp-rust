@@ -187,10 +187,7 @@ mod tests {
     use buffa::Message;
 
     fn dev(id: u32, key_index: Option<u32>) -> DeviceInfo {
-        DeviceInfo {
-            device_id: id,
-            key_index,
-        }
+        DeviceInfo::new(id, key_index)
     }
 
     #[test]

@@ -4033,16 +4033,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "1234567890".to_string(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 1,
-                    key_index: Some(42),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, Some(42))],
             timestamp: 1234567890,
             phash: Some("2:abcdef".to_string()),
             raw_id: None,
@@ -4069,10 +4060,7 @@ mod tests {
 
         let record1 = DeviceListRecord {
             user: "1234567890".to_string(),
-            devices: vec![DeviceInfo {
-                device_id: 0,
-                key_index: None,
-            }],
+            devices: vec![DeviceInfo::new(0, None)],
             timestamp: 1000,
             phash: Some("2:old".to_string()),
             raw_id: None,
@@ -4084,16 +4072,7 @@ mod tests {
 
         let record2 = DeviceListRecord {
             user: "1234567890".to_string(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 2,
-                    key_index: None,
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(2, None)],
             timestamp: 2000,
             phash: Some("2:new".to_string()),
             raw_id: None,

@@ -209,8 +209,38 @@ impl serde::Serialize for Server {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Server {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(deserializer)?;
-        Server::try_from(s).map_err(serde::de::Error::custom)
+        struct ServerVisitor;
+
+        impl serde::de::Visitor<'_> for ServerVisitor {
+            type Value = Server;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a known WhatsApp server identifier")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value.as_str()).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ServerVisitor)
     }
 }
 
@@ -558,6 +588,23 @@ impl Jid {
             device: device_id,
             integrator: self.integrator,
         }
+    }
+
+    /// Construct a device JID and select the hosted variant of PN/LID when
+    /// indicated by a device-list entry.
+    ///
+    /// Non-user namespaces are left unchanged because they have no hosted
+    /// counterpart on the wire.
+    pub fn with_device_hosting(&self, device_id: u16, is_hosted: bool) -> Self {
+        let mut jid = self.with_device(device_id);
+        jid.server = match (jid.server, is_hosted) {
+            (Server::Pn | Server::Hosted, true) => Server::Hosted,
+            (Server::Pn | Server::Hosted, false) => Server::Pn,
+            (Server::Lid | Server::HostedLid, true) => Server::HostedLid,
+            (Server::Lid | Server::HostedLid, false) => Server::Lid,
+            (server, _) => server,
+        };
+        jid
     }
 
     pub fn to_non_ad(&self) -> Self {
@@ -1066,6 +1113,17 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn server_deserializes_borrowed_and_owned_strings() {
+        let borrowed: Server = serde_json::from_str("\"s.whatsapp.net\"").unwrap();
+        let owned: Server =
+            serde_json::from_value(serde_json::Value::String("lid".to_owned())).unwrap();
+
+        assert_eq!(borrowed, Server::Pn);
+        assert_eq!(owned, Server::Lid);
+    }
 
     /// `observe()` must never leak a raw phone number, must keep pseudonymous /
     /// non-personal JIDs intact for correlation, and must preserve device.
@@ -1592,6 +1650,27 @@ mod tests {
         assert_eq!(jid.device, 33);
         assert!(jid.is_lid());
         assert!(jid.is_ad());
+    }
+
+    #[test]
+    fn with_device_hosting_preserves_addressing_family() {
+        let hosted_pn = Jid::pn("1234567890").with_device_hosting(7, true);
+        assert_eq!(hosted_pn.server, Server::Hosted);
+        assert_eq!(hosted_pn.device, 7);
+
+        let hosted_lid = Jid::lid("100000012345678").with_device_hosting(8, true);
+        assert_eq!(hosted_lid.server, Server::HostedLid);
+        assert_eq!(hosted_lid.device, 8);
+
+        let regular = Jid::pn("1234567890").with_device_hosting(9, false);
+        assert_eq!(regular.server, Server::Pn);
+
+        let regular_from_hosted =
+            Jid::new("1234567890", Server::Hosted).with_device_hosting(9, false);
+        assert_eq!(regular_from_hosted.server, Server::Pn);
+
+        let group = Jid::group("123-456").with_device_hosting(10, true);
+        assert_eq!(group.server, Server::Group);
     }
 
     #[test]
