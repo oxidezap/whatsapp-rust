@@ -612,18 +612,19 @@ impl Client {
                     && stored_raw_id != decoded.raw_id
                 {
                     info!(
-                        "raw_id mismatch for user {user}: stored={stored_raw_id}, received={}. Clearing record.",
+                        "raw_id mismatch for user {user}: stored={stored_raw_id}, received={}. Resetting companion devices.",
                         decoded.raw_id
                     );
                     self.clear_device_record(user, device.jid.server.as_str(), &record)
                         .await;
-                    record.devices.clear();
+                    record.devices.retain(|device| device.device_id == 0);
+                } else {
+                    // Filter stale devices by valid_indexes. A raw_id reset already
+                    // removed every companion while preserving primary metadata.
+                    record.devices =
+                        wacore::adv::filter_devices_by_key_index(&record.devices, &decoded);
                 }
                 record.raw_id = Some(decoded.raw_id);
-
-                // Filter stale devices by valid_indexes
-                record.devices =
-                    wacore::adv::filter_devices_by_key_index(&record.devices, &decoded);
 
                 // Only add the new device if its key_index is accepted by the ADV list
                 if !record.devices.iter().any(|d| d.device_id == device_id)
@@ -644,11 +645,9 @@ impl Client {
         }
 
         // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
-        // primary (device 0) to the rebuilt list unconditionally, so a raw_id
-        // mismatch (which clears the list) never drops it. `filter_devices_by_key_index`
-        // only keeps device 0 when it is already in the input, so after a clear the
-        // primary would otherwise be lost, leaving a record with no device 0 (or an
-        // empty list) that suppresses the usync re-fetch forever.
+        // primary (device 0) to the rebuilt list unconditionally. Preserve an
+        // existing primary and its metadata across a raw_id reset; restore a
+        // neutral entry only when the input record did not contain one.
         //
         // The primary's key_index is never read (`filter_devices_by_key_index` keeps
         // device 0 regardless and `is_key_index_valid` is not applied to it), so store
@@ -802,8 +801,8 @@ impl Client {
     }
 
     /// Delete `sender_key_devices` rows whose `device_jid` matches the given
-    /// (user, device_id) under either LID or PN addressing. Both alias keys
-    /// for the user are tried via `resolve_lookup_keys`. The in-memory cache
+    /// (user, device_id) under every standard and hosted Signal namespace.
+    /// Both aliases are resolved by `resolve_lookup_keys`. The in-memory cache
     /// is also evicted for groups that indexed the removed JID — necessary
     /// because a future re-add of the same device_id would otherwise hit
     /// a stale `has_key=true` entry and skip SKDM.
@@ -818,14 +817,11 @@ impl Client {
         device_id: u16,
     ) -> Result<(), wacore::store::error::StoreError> {
         let lookup = self.resolve_lookup_keys(user).await;
-        let servers = [wacore_binary::Server::Lid, wacore_binary::Server::Pn];
         let mut candidates: Vec<String> = Vec::with_capacity(4);
-        for server in servers {
-            for key in lookup.all_keys() {
-                let mut jid = Jid::new(key, server);
-                jid.device = device_id;
-                candidates.push(jid.to_string());
-            }
+        for (key, server) in lookup.signal_namespaces() {
+            let mut jid = Jid::new(key, server);
+            jid.device = device_id;
+            candidates.push(jid.to_string());
         }
         let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         self.persistence_manager
@@ -1824,6 +1820,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_sender_key_rows_covers_standard_and_hosted_user_namespaces() {
+        let client = create_test_client().await;
+        let lid = "100000000000001";
+        let pn = "15551234567";
+        setup_lid_pn(&client, lid, pn).await;
+
+        let removed_jids = [
+            Jid::new(pn, Server::Pn).with_device(5).to_string(),
+            Jid::new(lid, Server::Lid).with_device(5).to_string(),
+            Jid::new(pn, Server::Hosted).with_device(5).to_string(),
+            Jid::new(lid, Server::HostedLid).with_device(5).to_string(),
+        ];
+        let retained_jid = Jid::new(pn, Server::Hosted).with_device(6).to_string();
+        let mut entries: Vec<_> = removed_jids
+            .iter()
+            .map(|jid| (jid.as_str(), true))
+            .collect();
+        entries.push((retained_jid.as_str(), true));
+
+        let group = "120363000000000001@g.us";
+        client
+            .persistence_manager
+            .set_sender_key_status(group, &entries)
+            .await
+            .unwrap();
+
+        client
+            .delete_sender_key_rows_for_device(pn, 5)
+            .await
+            .unwrap();
+
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        for removed_jid in removed_jids {
+            assert!(
+                rows.iter().all(|(jid, _)| jid != &removed_jid),
+                "sender-key row was not deleted for {removed_jid}"
+            );
+        }
+        assert!(rows.iter().any(|(jid, _)| jid == &retained_jid));
+    }
+
+    #[tokio::test]
     async fn test_patch_device_update_key_index() {
         let client = create_test_client().await;
 
@@ -1949,19 +1991,23 @@ mod tests {
         }
     }
 
-    // raw_id mismatch clears the list and rebuilds from the notification; the
-    // primary (device 0) must survive. Regression guard for a record that would
-    // otherwise persist without device 0 (and then suppress usync forever).
+    // A raw_id mismatch drops stale companions and rebuilds from the notification;
+    // the primary (device 0) and its existing metadata must survive.
     #[tokio::test]
     async fn test_patch_device_add_raw_id_mismatch_preserves_primary() {
         let client = create_test_client().await;
 
+        let mut record = record_with_raw_id("15551234567", &[0, 5], 1);
+        record
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == 0)
+            .unwrap()
+            .is_hosted = true;
+
         client
             .device_registry_cache
-            .raw_insert_for_tests(
-                "15551234567".to_string(),
-                Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
-            )
+            .raw_insert_for_tests("15551234567".to_string(), Arc::new(record))
             .await;
 
         // New raw_id (2) != stored (1) → clear + rebuild. Notified device 19 has a
@@ -1991,8 +2037,10 @@ mod tests {
                     updated.devices
                 )
             });
-        // The re-seeded primary carries no key index (it is never read for device 0).
+        // The existing primary metadata is retained; it is not reconstructed from
+        // the incoming companion's namespace.
         assert_eq!(dev0.key_index, None);
+        assert!(dev0.is_hosted);
         assert!(updated.devices.iter().any(|d| d.device_id == 19));
         // Stale companion from the old identity is dropped by the clear.
         assert!(!updated.devices.iter().any(|d| d.device_id == 5));
