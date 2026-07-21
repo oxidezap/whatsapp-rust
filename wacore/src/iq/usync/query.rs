@@ -12,6 +12,7 @@ use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
 use anyhow::{Context, anyhow};
+use log::warn;
 use thiserror::Error;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, Node, NodeContent, NodeContentRef, NodeRef, Server};
@@ -272,12 +273,12 @@ impl UsyncUser {
     }
 
     pub fn with_id(mut self, jid: Jid) -> Self {
-        self.id = Some(jid);
+        self.id = Some(jid.into_non_ad());
         self
     }
 
     pub fn with_pn_jid(mut self, jid: Jid) -> Self {
-        self.pn_jid = Some(jid);
+        self.pn_jid = Some(jid.into_non_ad());
         self
     }
 
@@ -287,7 +288,7 @@ impl UsyncUser {
     }
 
     pub fn with_known_lid(mut self, lid: Jid) -> Self {
-        self.known_lid = Some(lid);
+        self.known_lid = Some(lid.into_non_ad());
         self
     }
 
@@ -918,13 +919,17 @@ pub struct UsyncBotCommand {
     pub description: CompactString,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
 #[non_exhaustive]
 pub enum UsyncBotProfessionalType {
+    #[wire = "unknown"]
     Unknown,
+    #[wire = "yes"]
     Yes,
+    #[wire = "no"]
     No,
-    Other(CompactString),
+    #[wire_fallback]
+    Other(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -956,7 +961,7 @@ pub enum UsyncProtocolResult {
     TextStatus(UsyncOutcome<UsyncTextStatusResult>),
     DisappearingMode(UsyncOutcome<UsyncDisappearingModeResult>),
     Business(UsyncOutcome<Box<UsyncBusinessResult>>),
-    Picture(UsyncOutcome<u64>),
+    Picture(UsyncOutcome<Option<u64>>),
     Lid(UsyncOutcome<Option<Jid>>),
     Username(UsyncOutcome<Option<CompactString>>),
     Bot(UsyncOutcome<Box<UsyncBotProfileResult>>),
@@ -1088,7 +1093,7 @@ fn parse_protocol_result(
             UsyncProtocolResult::Business(outcome!(parse_business(node).map(Box::new)))
         }
         UsyncProtocolKind::Picture => {
-            UsyncProtocolResult::Picture(outcome!(required_u64(node, ATTR_ID)))
+            UsyncProtocolResult::Picture(outcome!(optional_u64(node, ATTR_ID)))
         }
         UsyncProtocolKind::Lid => UsyncProtocolResult::Lid(outcome!(optional_lid(node, ATTR_VAL))),
         UsyncProtocolKind::Username => {
@@ -1168,24 +1173,31 @@ fn parse_device_list(node: &NodeRef<'_>) -> Result<UsyncDeviceListResult, anyhow
     let capacity = node.children().map_or(0, <[_]>::len);
     let mut devices = Vec::with_capacity(capacity);
     for device in node.get_children_by_tag(TAG_DEVICE) {
-        let mut attrs = device.attrs();
-        let raw_id = attrs
-            .optional_u64(ATTR_ID)
-            .ok_or_else(|| anyhow!("USync device is missing '{ATTR_ID}'"))?;
-        let id = checked_u16(raw_id, ATTR_ID)?;
-        let key_index = attrs
-            .optional_u64(ATTR_KEY_INDEX)
-            .map(|value| checked_u32(value, ATTR_KEY_INDEX))
-            .transpose()?;
-        let is_hosted = attrs.optional_bool_value(ATTR_IS_HOSTED).unwrap_or(false);
-        attrs.finish()?;
-        devices.push(UsyncDeviceResult {
-            id,
-            key_index,
-            is_hosted,
-        });
+        match parse_device(device) {
+            Ok(device) => devices.push(device),
+            Err(error) => warn!(target: "usync", "skipping malformed USync device: {error}"),
+        }
     }
     Ok(UsyncDeviceListResult { hash, devices })
+}
+
+fn parse_device(node: &NodeRef<'_>) -> Result<UsyncDeviceResult, anyhow::Error> {
+    let mut attrs = node.attrs();
+    let raw_id = attrs
+        .optional_u64(ATTR_ID)
+        .ok_or_else(|| anyhow!("USync device is missing '{ATTR_ID}'"))?;
+    let id = checked_u16(raw_id, ATTR_ID)?;
+    let key_index = attrs
+        .optional_u64(ATTR_KEY_INDEX)
+        .map(|value| checked_u32(value, ATTR_KEY_INDEX))
+        .transpose()?;
+    let is_hosted = attrs.optional_bool_value(ATTR_IS_HOSTED).unwrap_or(false);
+    attrs.finish()?;
+    Ok(UsyncDeviceResult {
+        id,
+        key_index,
+        is_hosted,
+    })
 }
 
 fn parse_key_index(node: &NodeRef<'_>) -> Result<UsyncKeyIndexResult, anyhow::Error> {
@@ -1331,14 +1343,8 @@ fn parse_bot_profile(node: &NodeRef<'_>) -> Result<UsyncBotProfileResult, anyhow
     };
     let posing_as_professional = profile
         .get_optional_child(TAG_POSING_AS_PROFESSIONAL)
-        .map(|posing| required_compact_string(posing, ATTR_TYPE))
-        .transpose()?
-        .map(|value| match value.as_str() {
-            "unknown" => UsyncBotProfessionalType::Unknown,
-            "yes" => UsyncBotProfessionalType::Yes,
-            "no" => UsyncBotProfessionalType::No,
-            _ => UsyncBotProfessionalType::Other(value),
-        });
+        .map(parse_bot_professional_type)
+        .transpose()?;
 
     Ok(UsyncBotProfileResult {
         name,
@@ -1427,11 +1433,18 @@ fn required_compact_string(node: &NodeRef<'_>, key: &str) -> Result<CompactStrin
     Ok(value)
 }
 
-fn required_u64(node: &NodeRef<'_>, key: &str) -> Result<u64, anyhow::Error> {
+fn optional_u64(node: &NodeRef<'_>, key: &str) -> Result<Option<u64>, anyhow::Error> {
     let mut attrs = node.attrs();
-    let value = attrs
-        .optional_u64(key)
-        .ok_or_else(|| anyhow!("<{}> is missing required '{key}' attribute", node.tag))?;
+    let value = attrs.optional_u64(key);
+    attrs.finish()?;
+    Ok(value)
+}
+
+fn parse_bot_professional_type(
+    node: &NodeRef<'_>,
+) -> Result<UsyncBotProfessionalType, anyhow::Error> {
+    let mut attrs = node.attrs();
+    let value = UsyncBotProfessionalType::from(attrs.required_string(ATTR_TYPE)?.as_ref());
     attrs.finish()?;
     Ok(value)
 }
@@ -1485,9 +1498,9 @@ mod tests {
 
     #[test]
     fn typed_query_builds_canonical_envelope_and_protocol_inputs() {
-        let user = UsyncUser::from_jid(Jid::lid("100000001"))
-            .with_pn_jid(Jid::pn("15550000001"))
-            .with_known_lid(Jid::lid("100000001"))
+        let user = UsyncUser::from_jid(Jid::lid("100000001").with_device(7))
+            .with_pn_jid(Jid::pn("15550000001").with_device(8))
+            .with_known_lid(Jid::lid("100000001").with_device(9))
             .with_device_sync(
                 UsyncDeviceSyncHint::new()
                     .with_device_hash("2:hash")
@@ -1541,6 +1554,11 @@ mod tests {
             .get_optional_child(TAG_LIST)
             .and_then(|list| list.get_optional_child(TAG_USER))
             .unwrap();
+        assert_eq!(user.attrs.get(ATTR_JID).unwrap().as_str(), "100000001@lid");
+        assert_eq!(
+            user.attrs.get(ATTR_PN_JID).unwrap().as_str(),
+            "15550000001@s.whatsapp.net"
+        );
         let devices = user
             .get_optional_child(UsyncProtocolKind::Devices.as_str())
             .unwrap();
@@ -1548,6 +1566,10 @@ mod tests {
             devices.attrs.get(ATTR_EXPECTED_TIMESTAMP).unwrap().as_str(),
             "101"
         );
+        let lid = user
+            .get_optional_child(UsyncProtocolKind::Lid.as_str())
+            .unwrap();
+        assert_eq!(lid.attrs.get(ATTR_JID).unwrap().as_str(), "100000001@lid");
         assert!(user.get_optional_child("tctoken").is_some());
     }
 
@@ -1839,6 +1861,43 @@ mod tests {
     }
 
     #[test]
+    fn devices_parser_skips_malformed_entries_without_dropping_siblings() {
+        let devices = NodeBuilder::new(UsyncProtocolKind::Devices.as_str())
+            .children([NodeBuilder::new(TAG_DEVICE_LIST)
+                .children([
+                    NodeBuilder::new(TAG_DEVICE).build(),
+                    NodeBuilder::new(TAG_DEVICE)
+                        .attr(ATTR_ID, (u64::from(u16::MAX) + 1).to_string())
+                        .build(),
+                    NodeBuilder::new(TAG_DEVICE)
+                        .attr(ATTR_ID, "7")
+                        .attr(ATTR_KEY_INDEX, "9")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let user = NodeBuilder::new(TAG_USER)
+            .attr(ATTR_JID, Jid::pn("15550000001"))
+            .children([devices])
+            .build();
+
+        let parsed = parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).unwrap();
+        let Some(UsyncProtocolResult::Devices(UsyncOutcome::Value(devices))) =
+            parsed.users[0].protocol(UsyncProtocolKind::Devices)
+        else {
+            panic!("expected devices result");
+        };
+        assert_eq!(
+            devices.device_list.as_ref().unwrap().devices,
+            [UsyncDeviceResult {
+                id: 7,
+                key_index: Some(9),
+                is_hosted: false,
+            }]
+        );
+    }
+
+    #[test]
     fn parser_handles_disappearing_text_status_features_and_user_error() {
         let user = NodeBuilder::new(TAG_USER)
             .attr(ATTR_JID, Jid::lid("100000001"))
@@ -1965,7 +2024,7 @@ mod tests {
         let user = &parsed.users[0];
         assert!(matches!(
             user.protocol(UsyncProtocolKind::Picture),
-            Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(42)))
+            Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(Some(42))))
         ));
         assert!(matches!(
             user.protocol(UsyncProtocolKind::Lid),
@@ -1992,10 +2051,28 @@ mod tests {
             bot.posing_as_professional,
             Some(UsyncBotProfessionalType::Yes)
         );
+        assert_eq!(
+            UsyncBotProfessionalType::from("future"),
+            UsyncBotProfessionalType::Other("future".to_owned())
+        );
     }
 
     #[test]
-    fn parser_rejects_non_lid_values_and_numeric_overflow() {
+    fn picture_without_id_is_a_successful_absent_value() {
+        let user = NodeBuilder::new(TAG_USER)
+            .attr(ATTR_JID, Jid::pn("15550000001"))
+            .children([NodeBuilder::new(UsyncProtocolKind::Picture.as_str()).build()])
+            .build();
+
+        let parsed = parse_usync_response(&response(Vec::new(), vec![user]).as_node_ref()).unwrap();
+        assert!(matches!(
+            parsed.users[0].protocol(UsyncProtocolKind::Picture),
+            Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(None)))
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_non_lid_values() {
         let invalid_lid = NodeBuilder::new(TAG_USER)
             .attr(ATTR_JID, Jid::pn("15550000001"))
             .children([NodeBuilder::new(UsyncProtocolKind::Lid.as_str())
@@ -2004,21 +2081,6 @@ mod tests {
             .build();
         assert!(
             parse_usync_response(&response(Vec::new(), vec![invalid_lid]).as_node_ref()).is_err()
-        );
-
-        let overflowing_device = NodeBuilder::new(TAG_USER)
-            .attr(ATTR_JID, Jid::pn("15550000001"))
-            .children([NodeBuilder::new(UsyncProtocolKind::Devices.as_str())
-                .children([NodeBuilder::new(TAG_DEVICE_LIST)
-                    .children([NodeBuilder::new(TAG_DEVICE)
-                        .attr(ATTR_ID, (u64::from(u16::MAX) + 1).to_string())
-                        .build()])
-                    .build()])
-                .build()])
-            .build();
-        assert!(
-            parse_usync_response(&response(Vec::new(), vec![overflowing_device]).as_node_ref())
-                .is_err()
         );
     }
 

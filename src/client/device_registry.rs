@@ -6,7 +6,7 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use wacore_binary::Jid;
+use wacore_binary::{Jid, Server};
 
 use super::Client;
 
@@ -75,6 +75,24 @@ impl UserLookupKeys {
         match self {
             Self::LidWithPn { lid, .. } | Self::PnWithLid { lid, .. } => lid,
             Self::Unknown { user } => user,
+        }
+    }
+
+    /// Signal namespaces that may hold sessions for this identity.
+    fn signal_namespaces(&self) -> [(&str, Server); 4] {
+        match self {
+            Self::LidWithPn { lid, pn } | Self::PnWithLid { lid, pn } => [
+                (pn, Server::Pn),
+                (lid, Server::Lid),
+                (pn, Server::Hosted),
+                (lid, Server::HostedLid),
+            ],
+            Self::Unknown { user } => [
+                (user, Server::Pn),
+                (user, Server::Lid),
+                (user, Server::Hosted),
+                (user, Server::HostedLid),
+            ],
         }
     }
 }
@@ -634,7 +652,9 @@ impl Client {
         //
         // The primary's key_index is never read (`filter_devices_by_key_index` keeps
         // device 0 regardless and `is_key_index_valid` is not applied to it), so store
-        // `None` to match how device 0 is recorded everywhere else.
+        // `None` to match how device 0 is recorded everywhere else. Hosting belongs
+        // to each device-list entry, so the companion notification cannot classify
+        // the primary.
         if !record.devices.iter().any(|d| d.device_id == 0) {
             record
                 .devices
@@ -666,20 +686,16 @@ impl Client {
         }
     }
 
-    /// Delete Signal sessions for specific device IDs under both LID and PN
-    /// addresses, then flush. Shared by `clear_device_record` and
-    /// `patch_device_remove`.
+    /// Delete Signal sessions for specific device IDs in every user namespace,
+    /// then flush. Shared by `clear_device_record` and `patch_device_remove`.
     async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
         let lookup = self.resolve_lookup_keys(user).await;
-        let servers = [wacore_binary::Server::Lid, wacore_binary::Server::Pn];
-        for server in servers {
-            for key in lookup.all_keys() {
-                for &device_id in device_ids {
-                    let mut jid = Jid::new(key, server);
-                    jid.device = device_id;
-                    let addr = wacore::types::jid::JidExt::to_protocol_address(&jid);
-                    self.signal_cache.delete_session(&addr).await;
-                }
+        for (key, server) in lookup.signal_namespaces() {
+            for &device_id in device_ids {
+                let mut jid = Jid::new(key, server);
+                jid.device = device_id;
+                let addr = wacore::types::jid::JidExt::to_protocol_address(&jid);
+                self.signal_cache.delete_session(&addr).await;
             }
         }
         self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
@@ -1766,6 +1782,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_sessions_covers_standard_and_hosted_user_namespaces() {
+        use wacore::libsignal::protocol::SessionRecord;
+
+        let client = create_test_client().await;
+        let lid = "100000000000001";
+        let pn = "15551234567";
+        setup_lid_pn(&client, lid, pn).await;
+
+        let addresses: Vec<_> = [
+            Jid::new(pn, Server::Pn).with_device(5),
+            Jid::new(lid, Server::Lid).with_device(5),
+            Jid::new(pn, Server::Hosted).with_device(5),
+            Jid::new(lid, Server::HostedLid).with_device(5),
+        ]
+        .iter()
+        .map(wacore::types::jid::JidExt::to_protocol_address)
+        .collect();
+
+        for address in &addresses {
+            client
+                .signal_cache
+                .put_session(address, SessionRecord::new_fresh())
+                .await;
+        }
+
+        client.delete_sessions_for_devices(pn, &[5]).await;
+
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        for address in addresses {
+            assert!(
+                !client
+                    .signal_cache
+                    .has_session(&address, &*snapshot.backend)
+                    .await
+                    .unwrap(),
+                "session was not deleted for {}",
+                address.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_patch_device_update_key_index() {
         let client = create_test_client().await;
 
@@ -1817,6 +1875,34 @@ mod tests {
         assert_eq!(updated.devices.len(), 2);
         let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
         assert_eq!(dev3.key_index, Some(2));
+    }
+
+    #[tokio::test]
+    async fn hosted_companion_does_not_reclassify_primary_device() {
+        let client = create_test_client().await;
+        setup_device_record(&client, "15551234567", &[0]).await;
+
+        let mut elem = make_device_element(3, Some(2));
+        elem.jid.server = Server::Hosted;
+        client.patch_device_add("15551234567", &elem, None).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == 3 && device.is_hosted)
+        );
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == 0 && !device.is_hosted)
+        );
     }
 
     /// Encode an `ADVSignedKeyIndexList` whose decoded `raw_id`/`valid_indexes`

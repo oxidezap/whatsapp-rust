@@ -447,7 +447,7 @@ impl IqSpec for UserInfoSpec {
             };
             let (picture_id, picture_error) = match user.protocol(UsyncProtocolKind::Picture) {
                 Some(UsyncProtocolResult::Picture(UsyncOutcome::Value(id))) => {
-                    (Some(id.to_string()), None)
+                    (id.as_ref().map(ToString::to_string), None)
                 }
                 Some(UsyncProtocolResult::Picture(UsyncOutcome::Error(error))) => {
                     (None, Some((**error).clone()))
