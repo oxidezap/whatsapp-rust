@@ -70,10 +70,13 @@ impl ConnectionScope {
         }
     }
 
+    /// Fires when this scope stops owning connection work, whether it is
+    /// cancelled during retirement or reaches final closure after cleanup.
     pub fn cancellation_signal(&self) -> ShutdownSignal {
         self.inner.cancellation.subscribe()
     }
 
+    /// Returns `true` after either cancellation or final closure.
     pub fn is_cancelled(&self) -> bool {
         self.inner.state.load(Ordering::Acquire) >= SCOPE_CANCELLED
     }

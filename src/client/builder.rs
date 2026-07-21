@@ -352,8 +352,7 @@ impl ClientBuilder {
 
         let lifecycle = self
             .lifecycle
-            .map(|handler| LifecycleRegistration::new(handler, Arc::clone(&runtime)))
-            .map(Arc::new);
+            .map(|handler| Arc::new(LifecycleRegistration::new(handler, Arc::clone(&runtime))));
         let assembly = Client::assemble(
             Arc::clone(&runtime),
             Arc::clone(&persistence_manager),
