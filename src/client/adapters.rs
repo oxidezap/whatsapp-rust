@@ -1,6 +1,7 @@
 //! Signal/sender-key store adapters, per-session locks and noise socket access.
 
 use super::*;
+use anyhow::Context as _;
 
 impl Client {
     /// Build a [`SignalProtocolStoreAdapter`] from the current device state and signal cache.
@@ -107,7 +108,7 @@ impl Client {
         self.signal_cache
             .flush(&*backend)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))
+            .context("Failed to flush signal cache")
     }
 
     /// Signal-cache flush that is safe while the offline drain is active.
@@ -210,5 +211,38 @@ fn log_signal_flush_error(context: &str, id: Option<&str>, e: &anyhow::Error) {
         log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
     } else {
         log::error!("Failed to flush signal cache ({context}): {e:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore::store::in_memory::InMemoryBackend;
+    use wacore_binary::{Jid, Server};
+
+    #[tokio::test]
+    async fn signal_flush_context_preserves_the_backend_error_chain() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        let peer = Jid::new("12025550111", Server::Pn).with_device(1);
+        crate::test_utils::seed_peer_session(&client, &peer).await;
+        backend.set_fail_session_writes(true);
+
+        let error = client
+            .flush_signal_cache()
+            .await
+            .expect_err("injected backend failure must propagate");
+        let chain: Vec<String> = error.chain().map(ToString::to_string).collect();
+
+        assert_eq!(
+            chain.first().map(String::as_str),
+            Some("Failed to flush signal cache")
+        );
+        assert!(
+            chain
+                .iter()
+                .any(|cause| cause.contains("put_sessions_batch failing (test hook)")),
+            "typed backend cause missing from {chain:?}"
+        );
     }
 }

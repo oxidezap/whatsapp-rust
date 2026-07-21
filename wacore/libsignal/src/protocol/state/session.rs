@@ -13,6 +13,9 @@ use subtle::ConstantTimeEq;
 use crate::core::curve::KeyType;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
+use crate::protocol::record_components::{
+    SessionRecordComponents, session_components_from_structure, session_structure_from_components,
+};
 use crate::protocol::state::{PreKeyId, SignedPreKeyId};
 use crate::protocol::stores::SessionStructure;
 use crate::protocol::stores::session_structure::{self};
@@ -244,8 +247,10 @@ impl SessionState {
         if self.session.sender_chain.is_unset() {
             return Ok(false);
         }
-        // We removed timestamp from PendingPreKey, so we can't check for expiration here.
-        // Assuming it's valid if it exists.
+
+        self.sender_ratchet_key()?;
+        self.sender_ratchet_private_key()?;
+        self.get_sender_chain_key()?;
         Ok(true)
     }
 
@@ -464,6 +469,13 @@ impl SessionState {
         }
         self.set_sender_chain_key(&chain_key)?;
         Ok(())
+    }
+
+    fn fast_forward_sender_chain_or_drop(&mut self, target: u32) {
+        if let Err(error) = self.fast_forward_sender_chain(target) {
+            log::error!("dropping unusable sender chain: {error}");
+            self.session.sender_chain = MessageField::none();
+        }
     }
 
     pub fn get_message_keys(
@@ -712,6 +724,68 @@ impl SessionRecord {
         }
     }
 
+    /// Builds a record from validated protocol components.
+    ///
+    /// Components do not carry process-local durability metadata. The imported
+    /// chain therefore starts a fresh reservation lifecycle, while archived
+    /// sessions are bounded to the same limit used by record deserialization.
+    pub fn from_components(value: SessionRecordComponents) -> Result<Self, SignalProtocolError> {
+        let current_session = value
+            .current_session
+            .map(session_structure_from_components)
+            .transpose()?
+            .map(SessionState::from_session_structure);
+        let previous_sessions = value
+            .previous_sessions
+            .into_iter()
+            .take(consts::ARCHIVED_STATES_MAX_LENGTH)
+            .map(session_structure_from_components)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            current_session,
+            previous_sessions: Arc::new(previous_sessions),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
+        })
+    }
+
+    /// Consumes the record and projects its protocol components.
+    ///
+    /// Any durably reserved sender range is advanced to its exclusive ceiling
+    /// before export so rebuilding the record cannot derive a possibly spent
+    /// message key again. A chain too stale to advance is dropped fail-closed
+    /// without discarding the rest of the record.
+    pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
+        let reserved_sender_chain_index = self.reserved_sender_chain_index;
+        if reserved_sender_chain_index > 0
+            && let Some(state) = self.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
+        }
+        let current_session = self
+            .current_session
+            .map(|state| session_components_from_structure(state.session))
+            .transpose()?;
+        let previous_sessions = Arc::try_unwrap(self.previous_sessions)
+            .unwrap_or_else(|shared| shared.as_ref().clone())
+            .into_iter()
+            .map(|session| {
+                if reserved_sender_chain_index == 0 {
+                    return session_components_from_structure(session);
+                }
+                let mut state = SessionState::from_session_structure(session);
+                state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
+                session_components_from_structure(state.session)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(SessionRecordComponents {
+            current_session,
+            previous_sessions,
+        })
+    }
+
     pub fn reserved_sender_chain_index(&self) -> u32 {
         self.reserved_sender_chain_index
     }
@@ -943,23 +1017,23 @@ impl SessionRecord {
     pub fn promote_state(&mut self, new_state: SessionState) {
         self.archive_current_state_inner();
         let mut state = new_state;
-        if self.reserved_sender_chain_index > 0
-            && let Err(e) = state.fast_forward_sender_chain(self.reserved_sender_chain_index)
-        {
-            // Only reachable with a corrupt reservation (gap beyond the
-            // ceiling); refuse to expose the chain rather than risk reuse.
-            log::error!("dropping promoted sender chain: {e}");
-            state.session.sender_chain = None.into();
+        if self.reserved_sender_chain_index > 0 {
+            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
         }
         self.current_session = Some(state);
     }
 
     /// Make a freshly ratcheted state current. Its sender chain key material
     /// was just generated from a fresh random ephemeral, so no counter on it
-    /// can ever have been spent: the inherited lease is meaningless for it and
-    /// is reset instead of burned. The first send re-reserves durably before
-    /// hitting the wire.
+    /// can ever have been spent. Burn the inherited lease into the state being
+    /// archived before resetting it for the fresh chain; otherwise the archive
+    /// could later reissue a counter covered by the discarded lease.
     pub fn promote_fresh_state(&mut self, new_state: SessionState) {
+        if self.reserved_sender_chain_index > 0
+            && let Some(state) = self.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+        }
         self.archive_current_state_inner();
         self.current_session = Some(new_state);
         self.reserved_sender_chain_index = 0;
@@ -1232,6 +1306,76 @@ mod tests {
         state
     }
 
+    fn assert_malformed_sender_chain(
+        state: &SessionState,
+        expected_error: &str,
+        mutate: impl FnOnce(&mut session_structure::Chain),
+    ) {
+        let mut structure = SessionStructure::from(state);
+        mutate(
+            structure
+                .sender_chain
+                .as_option_mut()
+                .expect("test sender chain"),
+        );
+        let state = SessionState::from(structure);
+        assert_eq!(
+            state
+                .has_usable_sender_chain()
+                .expect_err("malformed sender chain must fail")
+                .to_string(),
+            expected_error
+        );
+    }
+
+    #[test]
+    fn complete_sender_chain_is_usable() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        assert!(state.has_usable_sender_chain().unwrap());
+    }
+
+    #[test]
+    fn present_sender_chain_must_be_structurally_usable() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        assert_malformed_sender_chain(&state, "missing sender ratchet key", |chain| {
+            chain.sender_ratchet_key = None;
+        });
+        assert_malformed_sender_chain(&state, "invalid sender chain ratchet key", |chain| {
+            chain.sender_ratchet_key = Some(Vec::new());
+        });
+        assert_malformed_sender_chain(&state, "missing sender ratchet private key", |chain| {
+            chain.sender_ratchet_key_private = None;
+        });
+        assert_malformed_sender_chain(
+            &state,
+            "invalid sender chain private ratchet key",
+            |chain| {
+                chain.sender_ratchet_key_private = Some(vec![0; 31]);
+            },
+        );
+        assert_malformed_sender_chain(&state, "missing sender chain key", |chain| {
+            chain.chain_key = MessageField::none();
+        });
+        assert_malformed_sender_chain(&state, "missing sender chain key index", |chain| {
+            chain
+                .chain_key
+                .as_option_mut()
+                .expect("test chain key")
+                .index = None;
+        });
+        assert_malformed_sender_chain(&state, "missing sender chain key bytes", |chain| {
+            chain.chain_key.as_option_mut().expect("test chain key").key = None;
+        });
+        assert_malformed_sender_chain(&state, "invalid sender chain key", |chain| {
+            chain.chain_key.as_option_mut().expect("test chain key").key =
+                Some(bytes::Bytes::from_static(&[0; 31]));
+        });
+    }
+
     #[test]
     fn set_sender_chain_key_requires_existing_sender_chain() {
         let mut csprng = rng();
@@ -1278,18 +1422,54 @@ mod tests {
         );
     }
 
-    /// A freshly ratcheted chain has never spent a counter, so promoting it
-    /// resets the lease instead of burning it (the first send re-reserves).
     #[test]
-    fn promote_fresh_state_resets_the_lease() {
+    fn component_handoff_drops_a_stale_archived_sender_chain() {
         let mut csprng = rng();
-        let base_key = KeyPair::generate(&mut csprng).public_key;
-        let state = create_test_session_state(3, &base_key);
+        let archived_base_key = KeyPair::generate(&mut csprng).public_key;
+        let archived = create_test_session_state(3, &archived_base_key);
+        let current_base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut current = create_test_session_state(3, &current_base_key);
+        let spent_counter = consts::MAX_RESERVATION_FAST_FORWARD + 1;
+        current
+            .set_sender_chain_key(&ChainKey::new([9; 32], spent_counter))
+            .expect("current sender chain");
 
-        let mut record = SessionRecord::new_fresh();
-        record.reserve_sender_chain_counters(500);
+        let mut record = SessionRecord::new(archived);
+        record.promote_fresh_state(current);
+        record.reserve_sender_chain_counters(spent_counter);
+        let reserved = record.reserved_sender_chain_index();
 
-        record.promote_fresh_state(state);
+        let components = record
+            .into_components()
+            .expect("stale archive must not block handoff");
+        assert_eq!(
+            components
+                .current_session
+                .as_ref()
+                .and_then(|session| session.sender_chain.as_ref())
+                .and_then(|chain| chain.chain_key.as_ref())
+                .and_then(|chain_key| chain_key.index),
+            Some(reserved)
+        );
+        assert_eq!(components.previous_sessions.len(), 1);
+        assert!(components.previous_sessions[0].sender_chain.is_none());
+    }
+
+    /// A freshly ratcheted chain starts at zero, while the state being archived
+    /// must retain the safety provided by the lease that is about to be reset.
+    #[test]
+    fn promote_fresh_state_retires_the_archived_lease_before_reset() {
+        let mut csprng = rng();
+        let archived_base_key = KeyPair::generate(&mut csprng).public_key;
+        let archived = create_test_session_state(3, &archived_base_key);
+        let fresh_base_key = KeyPair::generate(&mut csprng).public_key;
+        let fresh = create_test_session_state(3, &fresh_base_key);
+
+        let mut record = SessionRecord::new(archived);
+        record.reserve_sender_chain_counters(0);
+        let retired_ceiling = record.reserved_sender_chain_index();
+
+        record.promote_fresh_state(fresh);
         assert_eq!(record.reserved_sender_chain_index(), 0);
         let chain = record
             .session_state()
@@ -1297,6 +1477,14 @@ mod tests {
             .get_sender_chain_key()
             .unwrap();
         assert_eq!(chain.index(), 0, "a fresh chain must not be burned");
+
+        let components = record.into_components().expect("safe handoff");
+        let archived_index = components.previous_sessions[0]
+            .sender_chain
+            .as_ref()
+            .and_then(|chain| chain.chain_key.as_ref())
+            .and_then(|chain_key| chain_key.index);
+        assert_eq!(archived_index, Some(retired_ceiling));
     }
 
     /// A corrupt reservation absurdly far ahead of the chain must be refused

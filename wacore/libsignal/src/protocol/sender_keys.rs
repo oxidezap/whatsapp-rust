@@ -11,6 +11,10 @@ use hmac::{HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::protocol::crypto::hmac_sha256;
+use crate::protocol::record_components::{
+    SenderKeyRecordComponents, sender_state_components_from_structure,
+    sender_state_structure_from_components,
+};
 use crate::protocol::stores::{
     SenderKeyRecordStructure, SenderKeyStateStructure, sender_key_state_structure,
 };
@@ -438,6 +442,27 @@ impl SenderKeyState {
         state
     }
 
+    fn into_protobuf(mut self) -> SenderKeyStateStructure {
+        debug_assert!(
+            self.state.sender_message_keys.is_empty()
+                && self.state.sender_chain_key.as_option().is_none(),
+            "backlog and chain key must have a single in-memory owner"
+        );
+        let message_keys = std::sync::Arc::try_unwrap(self.message_keys)
+            .unwrap_or_else(|shared| shared.as_ref().clone());
+        self.state.sender_message_keys = message_keys
+            .iter()
+            .map(StoredMessageKey::as_protobuf)
+            .collect();
+        self.state.sender_chain_key = self
+            .sender_chain
+            .as_ref()
+            .map_or_else(MessageField::none, |chain| {
+                MessageField::some(chain.as_protobuf())
+            });
+        self.state
+    }
+
     pub fn add_sender_message_key(&mut self, sender_message_key: &SenderMessageKey) {
         let keys = std::sync::Arc::make_mut(&mut self.message_keys);
         keys.push(StoredMessageKey {
@@ -508,6 +533,48 @@ impl SenderKeyRecord {
         }
     }
 
+    /// Builds a record from validated protocol components.
+    ///
+    /// Components do not carry process-local durability metadata, so the
+    /// imported current chain starts a fresh reservation lifecycle. Historical
+    /// states are bounded to the same limit enforced by record mutation and
+    /// deserialization.
+    pub fn from_components(value: SenderKeyRecordComponents) -> Result<Self, SignalProtocolError> {
+        let states = value
+            .states
+            .into_iter()
+            .take(consts::MAX_SENDER_KEY_STATES)
+            .map(sender_state_structure_from_components)
+            .map(|state| state.map(SenderKeyState::from_protobuf))
+            .collect::<Result<VecDeque<_>, _>>()?;
+
+        Ok(Self {
+            states,
+            wire_gated: false,
+            reserved_iteration: 0,
+        })
+    }
+
+    /// Consumes the record and projects its protocol components.
+    ///
+    /// Any durably reserved sender range is advanced to its exclusive ceiling
+    /// before export so rebuilding the record cannot derive a possibly spent
+    /// message key again.
+    pub fn into_components(mut self) -> Result<SenderKeyRecordComponents, SignalProtocolError> {
+        if self.reserved_iteration > 0
+            && let Some(state) = self.states.front_mut()
+        {
+            state.fast_forward_sender_chain(self.reserved_iteration)?;
+        }
+        let states = self
+            .states
+            .into_iter()
+            .map(SenderKeyState::into_protobuf)
+            .map(sender_state_components_from_structure)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SenderKeyRecordComponents { states })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.states.is_empty()
     }
@@ -548,8 +615,16 @@ impl SenderKeyRecord {
         let skr = waproto::codec::sender_key_record_decode(buf)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
-        let mut states = VecDeque::with_capacity(skr.sender_key_states.len());
-        for state in skr.sender_key_states {
+        let mut states = VecDeque::with_capacity(
+            skr.sender_key_states
+                .len()
+                .min(consts::MAX_SENDER_KEY_STATES),
+        );
+        for state in skr
+            .sender_key_states
+            .into_iter()
+            .take(consts::MAX_SENDER_KEY_STATES)
+        {
             // Validate seeds eagerly so callers get a clear error on corrupt data.
             if let Some(sender_chain) = state.sender_chain_key.as_option() {
                 let _ = seed_to_array(sender_chain.seed.as_ref())?;
@@ -1374,6 +1449,23 @@ mod tests {
         // Should not have more than MAX_SENDER_KEY_STATES
         let chain_ids: Vec<u32> = record.chain_ids_for_logging().collect();
         assert!(chain_ids.len() <= consts::MAX_SENDER_KEY_STATES);
+    }
+
+    #[test]
+    fn test_sender_key_record_deserialize_bounds_state_history() {
+        let mut state = record_with_state(12345, 0x42).as_protobuf();
+        let state = state.sender_key_states.pop().expect("test state");
+        let encoded = SenderKeyRecordStructure {
+            sender_key_states: vec![state; consts::MAX_SENDER_KEY_STATES + 1],
+        }
+        .encode_to_vec();
+
+        let record = SenderKeyRecord::deserialize(&encoded).expect("valid record");
+
+        assert_eq!(
+            record.chain_ids_for_logging().len(),
+            consts::MAX_SENDER_KEY_STATES
+        );
     }
 
     /// Test SenderKeyRecord chain ID lookup

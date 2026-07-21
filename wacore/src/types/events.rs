@@ -252,6 +252,7 @@ pub enum EventKind {
     HistorySync,
     OfflineSyncPreview,
     OfflineSyncCompleted,
+    DirtyState,
     DeviceListUpdate,
     IdentityChange,
     BusinessStatusUpdate,
@@ -883,6 +884,8 @@ pub enum Event {
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
     OfflineSyncCompleted(OfflineSyncCompleted),
+    /// The server marked one of its cached protocol domains dirty.
+    DirtyState(DirtyState),
 
     /// Device list changed for a user (device added/removed/updated)
     DeviceListUpdate(DeviceListUpdate),
@@ -1018,6 +1021,7 @@ impl Event {
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
+            Event::DirtyState(_) => EventKind::DirtyState,
             Event::DeviceListUpdate(_) => EventKind::DeviceListUpdate,
             Event::IdentityChange(_) => EventKind::IdentityChange,
             Event::BusinessStatusUpdate(_) => EventKind::BusinessStatusUpdate,
@@ -1358,6 +1362,19 @@ pub struct OfflineSyncPreview {
 #[non_exhaustive]
 pub struct OfflineSyncCompleted {
     pub count: i32,
+}
+
+/// A valid `<ib><dirty>` marker received from the server.
+///
+/// The client still performs its built-in clean/resync work; this event lets
+/// consumers refresh domain-specific derived state without observing every raw
+/// stanza.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DirtyState {
+    pub dirty_type: crate::iq::dirty::DirtyType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
@@ -1765,6 +1782,23 @@ mod tests {
 
         assert_eq!(update.action_index, 0);
         assert!(!update.has_incomplete_participant_information);
+    }
+
+    #[test]
+    fn dirty_state_preserves_wire_type_and_optional_timestamp() {
+        let dirty = DirtyState::builder()
+            .dirty_type(crate::iq::dirty::DirtyType::Groups)
+            .maybe_timestamp(Some(1_725_000_000))
+            .build();
+
+        assert_eq!(
+            serde_json::to_value(&dirty).unwrap(),
+            serde_json::json!({
+                "dirty_type": "groups",
+                "timestamp": 1_725_000_000_u64,
+            })
+        );
+        assert_eq!(Event::DirtyState(dirty).kind(), EventKind::DirtyState);
     }
 
     #[test]
