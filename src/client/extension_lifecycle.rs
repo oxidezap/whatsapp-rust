@@ -7,9 +7,7 @@ use std::time::Duration;
 
 use super::Client;
 use futures::FutureExt;
-use wacore::runtime::{
-    BoxFuture, Runtime, ShutdownNotifier, ShutdownSignal, timeout as rt_timeout, wait_for_shutdown,
-};
+use wacore::runtime::{BoxFuture, Runtime, ShutdownNotifier, ShutdownSignal, wait_for_shutdown};
 
 const SCOPE_OPEN: u8 = 0;
 const SCOPE_READY: u8 = 1;
@@ -302,26 +300,35 @@ impl LifecycleRegistration {
                 "client shutdown began during lifecycle installation"
             ));
         }
-        let install = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut install = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.handler.install(client)
         }))
         .map_err(|_| anyhow::anyhow!("lifecycle install panicked before returning a future"))?;
         let cancelled = Box::pin(wait_for_shutdown(&rejected));
-        let install = Box::pin(std::panic::AssertUnwindSafe(install).catch_unwind());
-        let result = match futures::future::select(cancelled, install).await {
-            futures::future::Either::Left((_, install)) => {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(install))).is_err()
-                {
-                    log::warn!("Lifecycle install future panicked while being cancelled");
+        let result = {
+            let install_poll = std::future::poll_fn(|context| install.as_mut().poll(context));
+            let install_poll = Box::pin(std::panic::AssertUnwindSafe(install_poll).catch_unwind());
+            match futures::future::select(cancelled, install_poll).await {
+                futures::future::Either::Left((_, install_poll)) => {
+                    drop(install_poll);
+                    None
                 }
-                return Err(anyhow::anyhow!(
-                    "client shutdown began during lifecycle installation"
-                ));
-            }
-            futures::future::Either::Right((result, _)) => {
-                result.map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?
+                futures::future::Either::Right((result, _)) => Some(result),
             }
         };
+        let drop_panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(install))).is_err();
+        if drop_panicked {
+            return Err(anyhow::anyhow!(
+                "lifecycle install future panicked while being dropped"
+            ));
+        }
+        let Some(result) = result else {
+            return Err(anyhow::anyhow!(
+                "client shutdown began during lifecycle installation"
+            ));
+        };
+        let result = result.map_err(|_| anyhow::anyhow!("lifecycle install future panicked"))?;
         if result.is_ok()
             && self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_REJECTED
         {
@@ -646,22 +653,37 @@ impl LifecycleRegistration {
             log::warn!("Client lifecycle {name} panicked");
             return;
         };
-        let callback = std::future::poll_fn(|context| {
+        let result = {
+            let callback_poll = std::future::poll_fn(|context| {
+                let _callback_context = CallbackContextGuard::enter(self);
+                callback.as_mut().poll(context)
+            });
+            let callback_poll =
+                Box::pin(std::panic::AssertUnwindSafe(callback_poll).catch_unwind());
+            match futures::future::select(callback_poll, self.runtime.sleep(self.callback_timeout))
+                .await
+            {
+                futures::future::Either::Left((result, _)) => Some(result),
+                futures::future::Either::Right(((), callback_poll)) => {
+                    drop(callback_poll);
+                    None
+                }
+            }
+        };
+        let drop_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _callback_context = CallbackContextGuard::enter(self);
-            callback.as_mut().poll(context)
-        });
-        let result = std::panic::AssertUnwindSafe(rt_timeout(
-            &*self.runtime,
-            self.callback_timeout,
-            callback,
-        ))
-        .catch_unwind()
-        .await;
+            drop(callback);
+        }))
+        .is_err();
+        if drop_panicked {
+            log::warn!("Client lifecycle {name} panicked while being dropped");
+            return;
+        }
         match result {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => log::warn!("Client lifecycle {name} failed: {error:#}"),
-            Ok(Err(_)) => log::warn!("Client lifecycle {name} timed out"),
-            Err(_) => log::warn!("Client lifecycle {name} panicked"),
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(error))) => log::warn!("Client lifecycle {name} failed: {error:#}"),
+            Some(Err(_)) => log::warn!("Client lifecycle {name} panicked"),
+            None => log::warn!("Client lifecycle {name} timed out"),
         }
     }
 
@@ -1062,6 +1084,31 @@ mod tests {
         shutdown_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct DropPanickingFutureLifecycle {
+        closed_calls: AtomicUsize,
+        shutdown_calls: AtomicUsize,
+    }
+
+    struct DropPanickingPendingFuture;
+
+    impl Future for DropPanickingPendingFuture {
+        type Output = anyhow::Result<()>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropPanickingPendingFuture {
+        fn drop(&mut self) {
+            panic!("injected lifecycle callback drop panic");
+        }
+    }
+
     impl ClientLifecycle for SynchronousPanicLifecycle {
         fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
             self.ready_calls.fetch_add(1, Ordering::SeqCst);
@@ -1076,6 +1123,26 @@ mod tests {
         fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
             panic!("synchronous shutdown panic");
+        }
+    }
+
+    impl ClientLifecycle for DropPanickingFutureLifecycle {
+        fn on_ready<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(DropPanickingPendingFuture)
+        }
+
+        fn on_closed<'a>(&'a self, _scope: ConnectionScope) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.closed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
     }
 
@@ -1759,6 +1826,31 @@ mod tests {
             .expect("callback driver recovered from synchronous panics");
 
         assert_eq!(lifecycle.ready_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.closed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.shutdown_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn callback_drop_panics_do_not_strand_the_driver() {
+        let lifecycle = Arc::new(DropPanickingFutureLifecycle::default());
+        let registration = Arc::new(LifecycleRegistration::new_with_timeout(
+            lifecycle.clone(),
+            Arc::new(TokioRuntime),
+            Duration::from_millis(10),
+        ));
+        const GENERATION: u64 = 24;
+        assert!(registration.begin_scope_if_current(GENERATION, || true));
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registration.ready(GENERATION))
+                .await
+                .expect("ready callback cancellation completed")
+        );
+        registration.close_scope(GENERATION);
+        tokio::time::timeout(Duration::from_secs(1), registration.shutdown())
+            .await
+            .expect("callback driver recovered from a drop panic");
+
         assert_eq!(lifecycle.closed_calls.load(Ordering::SeqCst), 1);
         assert_eq!(lifecycle.shutdown_calls.load(Ordering::SeqCst), 1);
     }

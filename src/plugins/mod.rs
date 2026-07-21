@@ -389,31 +389,54 @@ impl PluginResources {
         }
     }
 
-    fn connection_task_tracker(&self, generation: u64) -> Arc<TaskTracker> {
+    fn connection_task_tracker(&self, generation: u64) -> (Arc<TaskTracker>, bool) {
         let mut registry = self
             .connection_tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if registry.closed {
-            return TaskTracker::closed();
+            return (TaskTracker::closed(), false);
         }
-        Arc::clone(
-            registry
-                .trackers
-                .entry(generation)
-                .or_insert_with(TaskTracker::new),
-        )
+        match registry.trackers.entry(generation) {
+            std::collections::hash_map::Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let tracker = TaskTracker::new();
+                entry.insert(Arc::clone(&tracker));
+                (tracker, true)
+            }
+        }
+    }
+
+    fn retire_connection_tasks_on_cancel(
+        self: &Arc<Self>,
+        runtime: &Arc<dyn Runtime>,
+        generation: u64,
+        tracker: Arc<TaskTracker>,
+        cancellation: ShutdownSignal,
+    ) {
+        // Lifecycle queue pressure may discard on_closed, so retirement follows cancellation.
+        let resources = Arc::downgrade(self);
+        runtime
+            .spawn(Box::pin(async move {
+                wait_for_shutdown(&cancellation).await;
+                tracker.close();
+                wait_for_shutdown(&tracker.completion_signal()).await;
+                if let Some(resources) = resources.upgrade() {
+                    resources.forget_connection_tasks(generation, &tracker);
+                }
+            }))
+            .detach();
     }
 
     fn close_connection_tasks(&self, generation: u64) -> Arc<TaskTracker> {
-        let tracker = Arc::clone(
-            self.connection_tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .trackers
-                .entry(generation)
-                .or_insert_with(TaskTracker::closed),
-        );
+        let tracker = self
+            .connection_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trackers
+            .get(&generation)
+            .cloned()
+            .unwrap_or_else(TaskTracker::closed);
         tracker.close();
         tracker
     }
@@ -1492,7 +1515,19 @@ impl ClientLifecycle for PluginHost {
                     .manifest
                     .capabilities
                     .contains(PluginCapability::Tasks)
-                    .then(|| plugin.resources.connection_task_tracker(scope.generation()));
+                    .then(|| {
+                        let (tracker, created) =
+                            plugin.resources.connection_task_tracker(scope.generation());
+                        if created && let Some(runtime) = self.runtime.get() {
+                            plugin.resources.retire_connection_tasks_on_cancel(
+                                runtime,
+                                scope.generation(),
+                                Arc::clone(&tracker),
+                                scope.cancellation_signal(),
+                            );
+                        }
+                        tracker
+                    });
                 let plugin_scope =
                     self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
                 if let Err(error) = self
@@ -1681,35 +1716,60 @@ async fn bounded_plugin_callback<'a>(
     timeout: Duration,
     make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    match runtime_timeout(runtime, timeout, plugin_callback(make_future)).await {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!(
-            "callback timed out after {:.3} seconds",
-            timeout.as_secs_f64()
-        ),
+    let callback = Box::pin(plugin_callback(make_future));
+    match futures::future::select(callback, runtime.sleep(timeout)).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), callback)) => {
+            let cancellation_panicked =
+                std::panic::catch_unwind(AssertUnwindSafe(|| drop(callback))).is_err();
+            if cancellation_panicked {
+                anyhow::bail!(
+                    "callback timed out after {:.3} seconds and panicked while being cancelled",
+                    timeout.as_secs_f64()
+                );
+            }
+            anyhow::bail!(
+                "callback timed out after {:.3} seconds",
+                timeout.as_secs_f64()
+            )
+        }
     }
 }
 
 async fn plugin_callback<'a>(
     make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
+    let mut future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
         .map_err(|_| anyhow::anyhow!("callback panicked before returning a future"))?;
-    AssertUnwindSafe(future)
-        .catch_unwind()
-        .await
-        .map_err(|_| anyhow::anyhow!("callback future panicked"))?
+    let result = AssertUnwindSafe(std::future::poll_fn(|context| {
+        future.as_mut().poll(context)
+    }))
+    .catch_unwind()
+    .await
+    .map_err(|_| anyhow::anyhow!("callback future panicked"));
+    let drop_result = std::panic::catch_unwind(AssertUnwindSafe(|| drop(future)));
+    if drop_result.is_err() {
+        anyhow::bail!("callback future panicked while being dropped");
+    }
+    result?
 }
 
 async fn plugin_install<'a>(
     make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<ErasedApi>>,
 ) -> anyhow::Result<ErasedApi> {
-    let future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
+    let mut future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
         .map_err(|_| anyhow::anyhow!("install panicked before returning a future"))?;
-    AssertUnwindSafe(future)
-        .catch_unwind()
-        .await
-        .map_err(|_| anyhow::anyhow!("install future panicked"))?
+    let result = AssertUnwindSafe(std::future::poll_fn(|context| {
+        future.as_mut().poll(context)
+    }))
+    .catch_unwind()
+    .await
+    .map_err(|_| anyhow::anyhow!("install future panicked"));
+    let drop_result = std::panic::catch_unwind(AssertUnwindSafe(|| drop(future)));
+    if drop_result.is_err() {
+        anyhow::bail!("install future panicked while being dropped");
+    }
+    result?
 }
 
 fn finish_callbacks(stage: &str, failures: Vec<String>) -> anyhow::Result<()> {
@@ -2841,24 +2901,33 @@ mod tests {
             .expect("scoped task plugin");
         let client = build.into_client();
         wait_for_flag(&install_started).await;
+        let host = client.plugin_host.as_ref().expect("plugin host").clone();
+        let resources = Arc::clone(&host.installed.get().expect("installed plugins")[0].resources);
 
         let scope = ConnectionScope::new(88);
-        client
-            .plugin_host
-            .as_ref()
-            .expect("plugin host")
-            .on_ready(scope.clone())
+        host.on_ready(scope.clone())
             .await
             .expect("plugin ready callback");
         wait_for_flag(&connection_started).await;
         scope.cancel();
-        client
-            .plugin_host
-            .as_ref()
-            .expect("plugin host")
-            .on_closed(scope)
-            .await
-            .expect("plugin closed callback");
+        wait_for_flag(&connection_dropped).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let retained = resources
+                    .connection_tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .trackers
+                    .contains_key(&scope.generation());
+                if !retained {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled generation tracker retired without on_closed");
+        host.on_closed(scope).await.expect("plugin closed callback");
         assert!(connection_dropped.load(Ordering::Acquire));
         assert!(closed_after_task.load(Ordering::Acquire));
         assert!(!install_dropped.load(Ordering::Acquire));
@@ -3007,6 +3076,49 @@ mod tests {
         }
     }
 
+    struct DropPanickingReadyPlugin {
+        log: Log,
+    }
+
+    struct DropPanickingPendingFuture;
+
+    impl Future for DropPanickingPendingFuture {
+        type Output = anyhow::Result<()>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropPanickingPendingFuture {
+        fn drop(&mut self) {
+            panic!("injected callback cancellation panic");
+        }
+    }
+
+    impl ClientPlugin for DropPanickingReadyPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("drop-panicking-ready", "0.1.0")
+        }
+
+        fn install(
+            &self,
+            _context: PluginContext,
+        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async { Ok(Arc::new(())) })
+        }
+
+        fn on_ready(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+            record(&self.log, "ready:drop-panicking-ready");
+            Box::pin(DropPanickingPendingFuture)
+        }
+    }
+
     #[tokio::test]
     async fn upstream_ready_failure_does_not_suppress_plugins() {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -3071,6 +3183,38 @@ mod tests {
         assert_eq!(
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec!["ready:stalling-ready", "ready:following-ready"]
+        );
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn panicking_timeout_cancellation_does_not_suppress_following_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let plan = PluginPlan::prepare(vec![
+            PluginRegistration::new(DropPanickingReadyPlugin { log: log.clone() }),
+            PluginRegistration::new(ReadyPlugin::<4> {
+                id: "following-drop-panic",
+                dependency: Some("drop-panicking-ready"),
+                log: log.clone(),
+                stalls: false,
+            }),
+        ])
+        .expect("valid callback plan")
+        .expect("non-empty callback plan");
+        let host = PluginHost::new_with_callback_timeout(plan, None, Duration::from_millis(10));
+        let client = complete_builder()
+            .await
+            .with_lifecycle_arc(host.clone())
+            .build()
+            .await
+            .expect("callback cancellation client")
+            .into_client();
+
+        let result = host.on_ready(ConnectionScope::new(93)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["ready:drop-panicking-ready", "ready:following-drop-panic"]
         );
         client.disconnect().await;
     }
