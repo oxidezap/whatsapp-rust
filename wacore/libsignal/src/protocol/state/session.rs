@@ -1024,10 +1024,15 @@ impl SessionRecord {
 
     /// Make a freshly ratcheted state current. Its sender chain key material
     /// was just generated from a fresh random ephemeral, so no counter on it
-    /// can ever have been spent: the inherited lease is meaningless for it and
-    /// is reset instead of burned. The first send re-reserves durably before
-    /// hitting the wire.
+    /// can ever have been spent. Burn the inherited lease into the state being
+    /// archived before resetting it for the fresh chain; otherwise the archive
+    /// could later reissue a counter covered by the discarded lease.
     pub fn promote_fresh_state(&mut self, new_state: SessionState) {
+        if self.reserved_sender_chain_index > 0
+            && let Some(state) = self.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+        }
         self.archive_current_state_inner();
         self.current_session = Some(new_state);
         self.reserved_sender_chain_index = 0;
@@ -1449,18 +1454,21 @@ mod tests {
         assert!(components.previous_sessions[0].sender_chain.is_none());
     }
 
-    /// A freshly ratcheted chain has never spent a counter, so promoting it
-    /// resets the lease instead of burning it (the first send re-reserves).
+    /// A freshly ratcheted chain starts at zero, while the state being archived
+    /// must retain the safety provided by the lease that is about to be reset.
     #[test]
-    fn promote_fresh_state_resets_the_lease() {
+    fn promote_fresh_state_retires_the_archived_lease_before_reset() {
         let mut csprng = rng();
-        let base_key = KeyPair::generate(&mut csprng).public_key;
-        let state = create_test_session_state(3, &base_key);
+        let archived_base_key = KeyPair::generate(&mut csprng).public_key;
+        let archived = create_test_session_state(3, &archived_base_key);
+        let fresh_base_key = KeyPair::generate(&mut csprng).public_key;
+        let fresh = create_test_session_state(3, &fresh_base_key);
 
-        let mut record = SessionRecord::new_fresh();
-        record.reserve_sender_chain_counters(500);
+        let mut record = SessionRecord::new(archived);
+        record.reserve_sender_chain_counters(0);
+        let retired_ceiling = record.reserved_sender_chain_index();
 
-        record.promote_fresh_state(state);
+        record.promote_fresh_state(fresh);
         assert_eq!(record.reserved_sender_chain_index(), 0);
         let chain = record
             .session_state()
@@ -1468,6 +1476,14 @@ mod tests {
             .get_sender_chain_key()
             .unwrap();
         assert_eq!(chain.index(), 0, "a fresh chain must not be burned");
+
+        let components = record.into_components().expect("safe handoff");
+        let archived_index = components.previous_sessions[0]
+            .sender_chain
+            .as_ref()
+            .and_then(|chain| chain.chain_key.as_ref())
+            .and_then(|chain_key| chain_key.index);
+        assert_eq!(archived_index, Some(retired_ceiling));
     }
 
     /// A corrupt reservation absurdly far ahead of the chain must be refused
