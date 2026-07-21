@@ -272,10 +272,14 @@ impl PluginResources {
             return;
         }
         self.shutdown.notify();
-        self.subscriptions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        let subscriptions = {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *subscriptions)
+        };
+        drop(subscriptions);
     }
 }
 
@@ -2281,6 +2285,50 @@ mod tests {
         }
     }
 
+    struct ReentrantSubscriptionHandler {
+        events: PluginCoreEvents,
+    }
+
+    impl EventHandler for ReentrantSubscriptionHandler {
+        fn handle_event(&self, _event: Arc<wacore::types::events::Event>) {}
+    }
+
+    impl Drop for ReentrantSubscriptionHandler {
+        fn drop(&mut self) {
+            let _ = self.events.subscribe(
+                EventInterest::of(&[EventKind::Connected]),
+                Arc::new(NoopEventHandler),
+            );
+        }
+    }
+
+    struct ReentrantSubscriptionPlugin;
+
+    impl ClientPlugin for ReentrantSubscriptionPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("reentrant-subscription", "0.1.0")
+                .with_capability(PluginCapability::CoreEvents)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                let events = context
+                    .core_events()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?;
+                events.subscribe(
+                    EventInterest::of(&[EventKind::Connected]),
+                    Arc::new(ReentrantSubscriptionHandler {
+                        events: events.clone(),
+                    }),
+                )?;
+                Ok(Arc::new(()))
+            })
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_removes_plugin_event_subscriptions_and_raw_lease() {
         let build = complete_builder()
@@ -2306,6 +2354,29 @@ mod tests {
                 .has_handler_for(wacore::types::events::EventKind::Connected)
         );
         assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    #[tokio::test]
+    async fn resource_close_drops_reentrant_handlers_outside_the_subscription_lock() {
+        let client = complete_builder()
+            .await
+            .with_plugin(ReentrantSubscriptionPlugin)
+            .build()
+            .await
+            .expect("reentrant subscription plugin")
+            .into_client();
+        let shutdown_client = client.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            shutdown_client.signal_shutdown_sync();
+            let _ = completed_tx.send(());
+        });
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reentrant handler teardown must not deadlock");
+        shutdown.join().expect("shutdown thread");
+        client.disconnect().await;
     }
 
     #[tokio::test]
