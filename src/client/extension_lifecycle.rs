@@ -1368,7 +1368,7 @@ mod tests {
             .store(GENERATION, Ordering::SeqCst);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(GENERATION, || true));
-        client.dispatch_connected().await;
+        client.dispatch_connected(GENERATION).await;
 
         let scope = lifecycle
             .scopes
@@ -1532,7 +1532,7 @@ mod tests {
 
         let ready_client = Arc::clone(&client);
         let ready_task = tokio::spawn(async move {
-            ready_client.dispatch_connected().await;
+            ready_client.dispatch_connected(GENERATION).await;
         });
         ready_started_rx
             .recv()
@@ -1607,7 +1607,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client.dispatch_connected(),
+            client.dispatch_connected(GENERATION),
         )
         .await
         .expect("reentrant disconnect completed");
@@ -1654,9 +1654,12 @@ mod tests {
             let registration = client.lifecycle.as_ref().expect("lifecycle registration");
             assert!(registration.begin_scope_if_current(GENERATION, || true));
 
-            tokio::time::timeout(Duration::from_secs(2), client.dispatch_connected())
-                .await
-                .expect("reentrant reconnect completed");
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.dispatch_connected(GENERATION),
+            )
+            .await
+            .expect("reentrant reconnect completed");
             let scope = registration
                 .scope_for(GENERATION)
                 .expect("cancelled connection scope");
@@ -1951,7 +1954,7 @@ mod tests {
             .store(GENERATION, Ordering::SeqCst);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(GENERATION, || true));
-        client.dispatch_connected().await;
+        client.dispatch_connected(GENERATION).await;
         let scope = registration
             .scope_for(GENERATION)
             .expect("connection scope");
@@ -2014,7 +2017,7 @@ mod tests {
             .store(GENERATION, Ordering::SeqCst);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(GENERATION, || true));
-        client.dispatch_connected().await;
+        client.dispatch_connected(GENERATION).await;
         let scope = registration
             .scope_for(GENERATION)
             .expect("connection scope");
@@ -2061,6 +2064,52 @@ mod tests {
             .await
             .expect("shutdown did not wait for a rejected scope");
         assert_eq!(lifecycle.shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_connected_dispatch_cannot_claim_a_new_scope() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_lifecycle_arc(lifecycle.clone())
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+        const STALE_GENERATION: u64 = 60;
+        const CURRENT_GENERATION: u64 = 62;
+        client
+            .connection_generation
+            .store(CURRENT_GENERATION, Ordering::SeqCst);
+        let registration = client.lifecycle.as_ref().expect("lifecycle registration");
+        assert!(registration.begin_scope_if_current(CURRENT_GENERATION, || true));
+
+        client.dispatch_connected(STALE_GENERATION).await;
+
+        let scope = registration
+            .scope_for(CURRENT_GENERATION)
+            .expect("current scope");
+        assert_eq!(scope.state(), ConnectionScopeState::Open);
+        assert!(!client.is_ready.load(Ordering::Relaxed));
+        assert_eq!(lifecycle.events(), vec!["install"]);
+
+        client.dispatch_connected(CURRENT_GENERATION).await;
+        assert_eq!(scope.state(), ConnectionScopeState::Ready);
+        assert!(client.is_ready.load(Ordering::Relaxed));
+        assert_eq!(lifecycle.events(), vec!["install", "ready:62"]);
+
+        registration.cancel_scope(CURRENT_GENERATION);
+        registration.close_scope(CURRENT_GENERATION);
+        registration.shutdown().await;
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]

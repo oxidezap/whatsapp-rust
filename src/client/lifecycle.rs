@@ -81,27 +81,49 @@ impl Client {
         self.is_connected() && self.is_logged_in() && self.is_ready.load(Ordering::Relaxed)
     }
 
-    /// Dispatch the Connected event and notify waiters.
-    pub(crate) async fn dispatch_connected(&self) {
+    /// Dispatch the Connected event and notify waiters for the originating connection.
+    pub(crate) async fn dispatch_connected(&self, expected_generation: u64) {
         #[cfg(feature = "client-lifecycle")]
         {
-            let generation = self.connection_generation.load(Ordering::SeqCst);
             if let Some(lifecycle) = &self.lifecycle {
-                if !lifecycle.ready(generation).await {
-                    debug!("Skipping Connected dispatch for retired generation {generation}");
+                if !lifecycle.ready(expected_generation).await {
+                    debug!(
+                        "Skipping Connected dispatch for retired generation {expected_generation}"
+                    );
                     return;
                 }
-                if self.connection_generation.load(Ordering::SeqCst) != generation {
-                    debug!("Skipping Connected dispatch after generation changed");
+
+                // Cleanup takes the same lock before retiring the generation, so the final
+                // validation and publication form one transition with its generation bump.
+                let _login_transition = self
+                    .login_transition
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if self.connection_generation.load(Ordering::SeqCst) != expected_generation
+                    || self.expected_disconnect.load(Ordering::Acquire)
+                {
+                    debug!(
+                        "Skipping Connected dispatch after generation {expected_generation} retired"
+                    );
                     return;
                 }
-                if !lifecycle.publish_ready(generation, || self.publish_connected()) {
+                if !lifecycle.publish_ready(expected_generation, || self.publish_connected()) {
                     debug!("Skipping Connected dispatch after lifecycle cancellation");
                 }
                 return;
             }
         }
 
+        let _login_transition = self
+            .login_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.connection_generation.load(Ordering::SeqCst) != expected_generation
+            || self.expected_disconnect.load(Ordering::Acquire)
+        {
+            debug!("Skipping Connected dispatch after its connection retired");
+            return;
+        }
         self.publish_connected();
     }
 

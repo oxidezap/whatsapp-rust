@@ -1121,7 +1121,7 @@ impl Client {
                         // Presence is NOT sent here — WhatsApp Web sends presence from the
                         // setting_pushName mutation handler (WAWebPushNameSync), not from
                         // criticalSyncDone. Our setting_pushName handler already does this.
-                        client_clone.dispatch_connected().await;
+                        client_clone.dispatch_connected(task_generation).await;
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
@@ -1183,7 +1183,7 @@ impl Client {
                 // for an outdated connection that was replaced mid-await.
                 check_generation!();
 
-                client_clone.dispatch_connected().await;
+                client_clone.dispatch_connected(task_generation).await;
             }
         })).detach();
     }
