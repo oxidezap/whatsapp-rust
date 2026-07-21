@@ -258,6 +258,8 @@ pub struct PluginStats {
     pub callback_failures: u64,
     pub callback_timeouts: u64,
     pub task_drain_timeouts: u64,
+    /// Spawned workers that panicked while running or being cancelled.
+    pub task_panics: u64,
     /// Core-event handler calls that returned without panicking.
     pub core_events_delivered: u64,
     /// Panics isolated before they could unwind through the client's event dispatcher.
@@ -619,6 +621,7 @@ struct PluginDiagnostics {
     callback_failures: AtomicU64,
     callback_timeouts: AtomicU64,
     task_drain_timeouts: AtomicU64,
+    task_panics: AtomicU64,
     core_events_delivered: AtomicU64,
     core_event_panics: AtomicU64,
     shutdown_complete: AtomicBool,
@@ -632,6 +635,7 @@ impl PluginDiagnostics {
             callback_failures: AtomicU64::new(0),
             callback_timeouts: AtomicU64::new(0),
             task_drain_timeouts: AtomicU64::new(0),
+            task_panics: AtomicU64::new(0),
             core_events_delivered: AtomicU64::new(0),
             core_event_panics: AtomicU64::new(0),
             shutdown_complete: AtomicBool::new(false),
@@ -690,6 +694,7 @@ impl PluginDiagnostics {
         let callback_failures = self.callback_failures.load(Ordering::Relaxed);
         let callback_timeouts = self.callback_timeouts.load(Ordering::Relaxed);
         let task_drain_timeouts = self.task_drain_timeouts.load(Ordering::Relaxed);
+        let task_panics = self.task_panics.load(Ordering::Relaxed);
         let core_events_delivered = self.core_events_delivered.load(Ordering::Relaxed);
         let core_event_panics = self.core_event_panics.load(Ordering::Relaxed);
         let state = if self.shutdown_complete.load(Ordering::Acquire) {
@@ -707,6 +712,7 @@ impl PluginDiagnostics {
         let health = if callback_failures > 0
             || callback_timeouts > 0
             || task_drain_timeouts > 0
+            || task_panics > 0
             || core_event_panics > 0
             || resources.teardown_panics > 0
             || event_degraded
@@ -723,6 +729,7 @@ impl PluginDiagnostics {
             callback_failures,
             callback_timeouts,
             task_drain_timeouts,
+            task_panics,
             core_events_delivered,
             core_event_panics,
             resource_teardown_panics: resources.teardown_panics,
@@ -743,6 +750,8 @@ impl PluginDiagnostics {
 pub struct PluginTasks {
     runtime: Arc<dyn Runtime>,
     resources: Arc<PluginResources>,
+    diagnostics: Arc<PluginDiagnostics>,
+    plugin_id: Arc<str>,
 }
 
 impl PluginTasks {
@@ -754,7 +763,14 @@ impl PluginTasks {
             return Err(PluginResourceError::ShuttingDown);
         }
         let lease = self.resources.install_tasks.register()?;
-        spawn_after_activation(&self.runtime, Arc::clone(&self.resources), lease, future);
+        spawn_after_activation(
+            &self.runtime,
+            Arc::clone(&self.resources),
+            Arc::clone(&self.diagnostics),
+            Arc::clone(&self.plugin_id),
+            lease,
+            future,
+        );
         Ok(())
     }
 
@@ -985,6 +1001,8 @@ pub struct PluginConnectionTasks {
     runtime: Arc<dyn Runtime>,
     scope: ConnectionScope,
     tracker: Arc<TaskTracker>,
+    diagnostics: Arc<PluginDiagnostics>,
+    plugin_id: Arc<str>,
 }
 
 impl PluginConnectionTasks {
@@ -999,6 +1017,8 @@ impl PluginConnectionTasks {
         spawn_until_cancelled(
             &self.runtime,
             self.scope.cancellation_signal(),
+            Arc::clone(&self.diagnostics),
+            Arc::clone(&self.plugin_id),
             lease,
             future,
         );
@@ -1022,19 +1042,100 @@ impl PluginConnectionTasks {
     }
 }
 
+struct GuardedPluginTask<F: Future<Output = ()>> {
+    future: Option<std::pin::Pin<Box<F>>>,
+    diagnostics: Arc<PluginDiagnostics>,
+    plugin_id: Arc<str>,
+    failure_recorded: bool,
+}
+
+impl<F> GuardedPluginTask<F>
+where
+    F: Future<Output = ()>,
+{
+    fn new(future: F, diagnostics: Arc<PluginDiagnostics>, plugin_id: Arc<str>) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+            diagnostics,
+            plugin_id,
+            failure_recorded: false,
+        }
+    }
+
+    fn record_panic(&mut self, stage: &str) {
+        if !self.failure_recorded {
+            self.failure_recorded = true;
+            self.diagnostics.task_panics.fetch_add(1, Ordering::Relaxed);
+        }
+        log::warn!("Plugin `{}` task panicked {stage}", self.plugin_id);
+    }
+
+    fn drop_future(&mut self) -> bool {
+        let future = self.future.take();
+        std::panic::catch_unwind(AssertUnwindSafe(|| drop(future))).is_err()
+    }
+}
+
+impl<F> Unpin for GuardedPluginTask<F> where F: Future<Output = ()> {}
+
+impl<F> Future for GuardedPluginTask<F>
+where
+    F: Future<Output = ()>,
+{
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let Some(future) = this.future.as_mut() else {
+            return std::task::Poll::Ready(());
+        };
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context)));
+        match result {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(())) => {
+                if this.drop_future() {
+                    this.record_panic("after completion");
+                }
+                std::task::Poll::Ready(())
+            }
+            Err(_) => {
+                this.record_panic("while running");
+                if this.drop_future() {
+                    this.record_panic("while cleaning up after failure");
+                }
+                std::task::Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl<F: Future<Output = ()>> Drop for GuardedPluginTask<F> {
+    fn drop(&mut self) {
+        if self.drop_future() {
+            self.record_panic("while being cancelled");
+        }
+    }
+}
+
 fn spawn_until_cancelled<F>(
     runtime: &Arc<dyn Runtime>,
     cancellation: ShutdownSignal,
+    diagnostics: Arc<PluginDiagnostics>,
+    plugin_id: Arc<str>,
     lease: TaskLease,
     future: F,
 ) where
     F: Future<Output = ()> + Spawnable,
 {
+    let work = GuardedPluginTask::new(future, diagnostics, plugin_id);
     runtime
         .spawn(Box::pin(async move {
             let _lease = lease;
             let cancelled = Box::pin(wait_for_shutdown(&cancellation));
-            let work = Box::pin(future);
+            let work = Box::pin(work);
             let _ = futures::future::select(cancelled, work).await;
         }))
         .detach();
@@ -1043,6 +1144,8 @@ fn spawn_until_cancelled<F>(
 fn spawn_after_activation<F>(
     runtime: &Arc<dyn Runtime>,
     resources: Arc<PluginResources>,
+    diagnostics: Arc<PluginDiagnostics>,
+    plugin_id: Arc<str>,
     lease: TaskLease,
     future: F,
 ) where
@@ -1050,6 +1153,7 @@ fn spawn_after_activation<F>(
 {
     let activation = resources.activation.subscribe();
     let cancellation = resources.shutdown.subscribe();
+    let work = GuardedPluginTask::new(future, diagnostics, plugin_id);
     runtime
         .spawn(Box::pin(async move {
             let _lease = lease;
@@ -1065,7 +1169,7 @@ fn spawn_after_activation<F>(
                 return;
             }
             let cancelled = Box::pin(wait_for_shutdown(&cancellation));
-            let work = Box::pin(future);
+            let work = Box::pin(work);
             let _ = futures::future::select(cancelled, work).await;
         }))
         .detach();
@@ -1578,6 +1682,7 @@ impl PluginHost {
         } = parts;
         let manifest = &planned.manifest;
         let capabilities = manifest.capabilities;
+        let plugin_id: Arc<str> = Arc::from(manifest.id.as_str());
         PluginContext {
             plugin_id: manifest.id.clone(),
             dependencies: apis.dependency_view(&planned.dependency_markers),
@@ -1586,7 +1691,7 @@ impl PluginHost {
                 .then(|| PluginCoreEvents {
                     client: client.clone(),
                     resources: Arc::clone(&resources),
-                    plugin_id: Arc::from(manifest.id.as_str()),
+                    plugin_id: Arc::clone(&plugin_id),
                     diagnostics: Arc::clone(&diagnostics),
                 }),
             tasks: capabilities
@@ -1594,6 +1699,8 @@ impl PluginHost {
                 .then(|| PluginTasks {
                     runtime: Arc::clone(&runtime),
                     resources: Arc::clone(&resources),
+                    diagnostics: Arc::clone(&diagnostics),
+                    plugin_id,
                 }),
             messaging: capabilities.contains(PluginCapability::Messaging).then(|| {
                 PluginMessaging {
@@ -1625,10 +1732,14 @@ impl PluginHost {
     fn connection_scope(
         &self,
         scope: ConnectionScope,
-        manifest: &PluginManifest,
+        plugin: &InstalledPlugin,
         task_tracker: Option<Arc<TaskTracker>>,
     ) -> PluginConnectionScope {
-        let tasks = if manifest.capabilities.contains(PluginCapability::Tasks) {
+        let tasks = if plugin
+            .manifest
+            .capabilities
+            .contains(PluginCapability::Tasks)
+        {
             self.runtime
                 .get()
                 .cloned()
@@ -1637,6 +1748,8 @@ impl PluginHost {
                     runtime,
                     scope: scope.clone(),
                     tracker,
+                    diagnostics: Arc::clone(&plugin.diagnostics),
+                    plugin_id: Arc::from(plugin.manifest.id.as_str()),
                 })
         } else {
             None
@@ -1867,8 +1980,7 @@ impl ClientLifecycle for PluginHost {
                         }
                         tracker
                     });
-                let plugin_scope =
-                    self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
+                let plugin_scope = self.connection_scope(scope.clone(), plugin, task_tracker);
                 let result = self
                     .run_callback(|| plugin.plugin.on_ready(plugin_scope))
                     .await;
@@ -1904,8 +2016,7 @@ impl ClientLifecycle for PluginHost {
                         }
                     }
                 }
-                let plugin_scope =
-                    self.connection_scope(scope.clone(), &plugin.manifest, task_tracker);
+                let plugin_scope = self.connection_scope(scope.clone(), plugin, task_tracker);
                 let result = self
                     .run_callback(|| plugin.plugin.on_closed(plugin_scope))
                     .await;
@@ -2641,6 +2752,25 @@ mod tests {
         }
     }
 
+    struct PendingDropPanic;
+
+    impl Future for PendingDropPanic {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropPanic {
+        fn drop(&mut self) {
+            panic!("injected task cancellation panic");
+        }
+    }
+
     struct PanickingDropApi;
 
     impl Drop for PanickingDropApi {
@@ -3336,6 +3466,8 @@ mod tests {
             runtime: Arc::new(TokioRuntime),
             scope: scope.clone(),
             tracker: TaskTracker::new(),
+            diagnostics: PluginDiagnostics::new(),
+            plugin_id: Arc::from("connection-task-test"),
         };
         let guard = DropFlag(task_dropped.clone());
         tasks
@@ -3360,12 +3492,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawned_task_panics_are_isolated_and_degrade_health() {
+        let diagnostics = PluginDiagnostics::new();
+        let plugin_id: Arc<str> = Arc::from("panicking-task-test");
+        let resources = PluginResources::new();
+        diagnostics.attach_resources(&resources);
+        resources.activate();
+        let install_tasks = PluginTasks {
+            runtime: Arc::new(TokioRuntime),
+            resources: resources.clone(),
+            diagnostics: diagnostics.clone(),
+            plugin_id: plugin_id.clone(),
+        };
+        install_tasks
+            .spawn(async { panic!("injected install task panic") })
+            .expect("spawn install task");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while diagnostics.task_panics.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("install task panic was not recorded");
+        assert_eq!(resources.install_tasks.active(), 0);
+
+        let connection_scope = ConnectionScope::new(101);
+        let connection_tracker = TaskTracker::new();
+        let connection_tasks = PluginConnectionTasks {
+            runtime: Arc::new(TokioRuntime),
+            scope: connection_scope,
+            tracker: connection_tracker.clone(),
+            diagnostics: diagnostics.clone(),
+            plugin_id: plugin_id.clone(),
+        };
+        connection_tasks
+            .spawn(async { panic!("injected connection task panic") })
+            .expect("spawn connection task");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while diagnostics.task_panics.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection task panic was not recorded");
+        assert_eq!(connection_tracker.active(), 0);
+
+        let cancellation_scope = ConnectionScope::new(102);
+        let cancellation_tracker = TaskTracker::new();
+        let cancellation_tasks = PluginConnectionTasks {
+            runtime: Arc::new(TokioRuntime),
+            scope: cancellation_scope.clone(),
+            tracker: cancellation_tracker.clone(),
+            diagnostics: diagnostics.clone(),
+            plugin_id,
+        };
+        cancellation_tasks
+            .spawn(PendingDropPanic)
+            .expect("spawn cancellation task");
+        cancellation_scope.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while diagnostics.task_panics.load(Ordering::Relaxed) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task cancellation panic was not recorded");
+        assert_eq!(cancellation_tracker.active(), 0);
+
+        let stats = diagnostics.snapshot("panicking-task-test", false, None);
+        assert_eq!(stats.task_panics, 3);
+        assert_eq!(stats.health, PluginHealth::Degraded);
+        resources.close();
+    }
+
+    #[tokio::test]
     async fn task_sleeps_return_when_their_owner_is_cancelled() {
         let resources = PluginResources::new();
         resources.activate();
         let install_tasks = PluginTasks {
             runtime: Arc::new(TokioRuntime),
             resources: resources.clone(),
+            diagnostics: PluginDiagnostics::new(),
+            plugin_id: Arc::from("install-sleep-test"),
         };
         let install_sleeper =
             tokio::spawn(async move { install_tasks.sleep(Duration::from_secs(60)).await });
@@ -3384,6 +3595,8 @@ mod tests {
             runtime: Arc::new(TokioRuntime),
             scope: scope.clone(),
             tracker: TaskTracker::new(),
+            diagnostics: PluginDiagnostics::new(),
+            plugin_id: Arc::from("connection-sleep-test"),
         };
         let connection_sleeper =
             tokio::spawn(async move { connection_tasks.sleep(Duration::from_secs(60)).await });
