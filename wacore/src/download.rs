@@ -5,7 +5,6 @@ use crate::libsignal::crypto::{
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
-use hkdf::Hkdf;
 use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
@@ -487,10 +486,14 @@ impl DownloadUtils {
         media_key: &[u8],
         app_info: MediaType,
     ) -> Result<([u8; 16], [u8; 32], [u8; 32])> {
-        let hk = Hkdf::<Sha256>::new(None, media_key);
         let mut expanded = [0u8; 112];
-        hk.expand(app_info.app_info().as_bytes(), &mut expanded)
-            .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
+        crate::crypto::hkdf_sha256_into(
+            media_key,
+            None,
+            app_info.app_info().as_bytes(),
+            &mut expanded,
+        )
+        .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
         let iv: [u8; 16] = expanded[0..16]
             .try_into()
             .map_err(|_| anyhow!("HKDF output has unexpected length for IV"))?;

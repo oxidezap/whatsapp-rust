@@ -83,12 +83,30 @@ pub enum CallError {
 impl Voip<'_> {
     /// Reject an incoming call. Fire-and-forget — no server response is expected.
     pub async fn reject(&self, incoming: &IncomingCall) -> Result<(), CallError> {
-        let call_id = incoming.action.call_id();
+        self.reject_call(
+            incoming.action.call_id(),
+            &incoming.from,
+            incoming.action.call_creator(),
+        )
+        .await
+    }
+
+    /// Reject a call when its signaling identifiers are already available.
+    /// `peer` is the outer `<call to>` target, while `call_creator` is the
+    /// action's `call-creator` attribute; preserve them separately because
+    /// they may differ for companion-device signaling.
+    /// Fire-and-forget — no server response is expected.
+    pub async fn reject_call(
+        &self,
+        call_id: &str,
+        peer: &Jid,
+        call_creator: &Jid,
+    ) -> Result<(), CallError> {
         if call_id.is_empty() {
             return Err(CallError::EmptyCallId);
         }
         let id = self.client.generate_request_id();
-        let stanza = build_reject(call_id, &incoming.from, incoming.action.call_creator(), &id);
+        let stanza = build_reject(call_id, peer, call_creator, &id);
         // Consume the ringing flag BEFORE the async send: a caller <terminate> processed while we await
         // the send would otherwise hit take_ringing first and surface a phantom missed call for a call
         // we already declined (WA Web deletes it from _ringingCalls on reject). No-op if never ringing.
@@ -226,6 +244,10 @@ mod tests {
         Jid::new("111111111111111", Server::Lid)
     }
 
+    fn call_creator() -> Jid {
+        Jid::new("222222222222222", Server::Lid)
+    }
+
     fn incoming_reject() -> IncomingCall {
         IncomingCall::new_for_test(
             caller(),
@@ -254,6 +276,41 @@ mod tests {
             .await
             .expect("reject should send");
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reject_call_sends_stanza_without_event_context() {
+        let (client, count) = make_client_with_count().await;
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let peer = caller();
+        let creator = call_creator();
+        client
+            .voip()
+            .reject_call("CALL-ID-0001", &peer, &creator)
+            .await
+            .expect("reject should send");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let sent = waiter.await.expect("reject stanza should be observable");
+        let call = sent.as_node_ref();
+        assert_eq!(
+            call.attrs().optional_string("to").as_deref(),
+            Some(peer.to_string().as_str())
+        );
+        let reject = &call.children().expect("call action")[0];
+        assert_eq!(reject.tag, "reject");
+        assert_eq!(
+            reject.attrs().optional_string("call-id").as_deref(),
+            Some("CALL-ID-0001")
+        );
+        assert_eq!(
+            reject.attrs().optional_string("call-creator").as_deref(),
+            Some(creator.to_string().as_str())
+        );
+        assert_eq!(
+            reject.attrs().optional_string("count").as_deref(),
+            Some("0")
+        );
     }
 
     #[tokio::test]

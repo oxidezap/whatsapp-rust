@@ -673,7 +673,8 @@ impl From<&SessionState> for SessionStructure {
 /// prevent that — already-released readers skip unknown fields by definition —
 /// so it is a release-note constraint, not a code one. Never lower this
 /// number into a range an older reader might interpret.
-const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 = 100;
+const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
+    crate::protocol::local_field::COUNTER_RESERVATION_FIELD;
 
 #[derive(Clone)]
 pub struct SessionRecord {

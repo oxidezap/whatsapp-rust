@@ -1,15 +1,16 @@
 //! SSRC derivation and participant-LID helpers for E2E HKDF `info`.
 
-use hkdf::Hkdf;
-use sha2::Sha256;
-
 /// Participant / stream SSRC: HKDF-SHA256(salt=slot_word LE32, ikm=call_id, info=lid, 4),
 /// read back as a little-endian u32.
 pub fn derive_wasm_participant_ssrc(call_id: &str, lid: &str, slot_word: u32) -> u32 {
-    let hk = Hkdf::<Sha256>::new(Some(&slot_word.to_le_bytes()), call_id.as_bytes());
     let mut okm = [0u8; 4];
-    hk.expand(lid.as_bytes(), &mut okm)
-        .expect("4 bytes within HKDF limit");
+    crate::crypto::hkdf_sha256_into(
+        call_id.as_bytes(),
+        Some(&slot_word.to_le_bytes()),
+        lid.as_bytes(),
+        &mut okm,
+    )
+    .expect("4 bytes within HKDF limit");
     u32::from_le_bytes(okm)
 }
 

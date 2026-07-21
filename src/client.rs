@@ -25,6 +25,7 @@ use futures::FutureExt;
 #[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use wacore::xml::{DisplayableNode, DisplayableNodeRef};
 use wacore_binary::JidExt;
@@ -529,9 +530,95 @@ pub(crate) struct OfflineSyncMetrics {
     pub start_time: std::sync::Mutex<Option<wacore::time::Instant>>,
 }
 
+type ResponseWaiterSender = futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>;
+
+struct ResponseWaiterEntry {
+    generation: NonZeroU64,
+    sender: ResponseWaiterSender,
+}
+
 /// Map of pending IQ/ack response waiters, keyed by request id.
-pub(crate) type ResponseWaiterMap =
-    HashMap<String, futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>>;
+///
+/// Every registration carries a unique generation so guarded IQ cleanup cannot
+/// remove a newer waiter that reused the same explicit ID.
+#[derive(Default)]
+pub(crate) struct ResponseWaiterMap {
+    entries: HashMap<String, ResponseWaiterEntry>,
+    last_generation: u64,
+}
+
+impl ResponseWaiterMap {
+    fn next_generation(&mut self) -> NonZeroU64 {
+        loop {
+            self.last_generation = self.last_generation.wrapping_add(1);
+            if let Some(generation) = NonZeroU64::new(self.last_generation) {
+                return generation;
+            }
+        }
+    }
+
+    pub(crate) fn try_insert_guarded(
+        &mut self,
+        request_id: String,
+        sender: ResponseWaiterSender,
+    ) -> Option<NonZeroU64> {
+        use std::collections::hash_map::Entry;
+
+        let generation = self.next_generation();
+        match self.entries.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(ResponseWaiterEntry { generation, sender });
+                Some(generation)
+            }
+            Entry::Occupied(_) => None,
+        }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        request_id: String,
+        sender: ResponseWaiterSender,
+    ) -> Option<ResponseWaiterSender> {
+        let generation = self.next_generation();
+        self.entries
+            .insert(request_id, ResponseWaiterEntry { generation, sender })
+            .map(|entry| entry.sender)
+    }
+
+    pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiterSender> {
+        self.entries.remove(request_id).map(|entry| entry.sender)
+    }
+
+    pub(crate) fn remove_guarded(&mut self, request_id: &str, cleanup_generation: NonZeroU64) {
+        if self
+            .entries
+            .get(request_id)
+            .is_some_and(|entry| entry.generation == cleanup_generation)
+        {
+            self.entries.remove(request_id);
+        }
+    }
+
+    /// Drop every pending sender and release the map allocation without
+    /// resetting the generation sequence. Guards owned by the drained requests
+    /// may outlive a disconnect and must never match a later registration.
+    pub(crate) fn clear(&mut self) {
+        self.entries = HashMap::new();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, request_id: &str) -> bool {
+        self.entries.contains_key(request_id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,

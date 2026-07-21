@@ -3,11 +3,11 @@
 //! Thin wrapper over [`secret_enc_addon`] specialised for the
 //! `PollVoteMessage` proto and the `"Poll Vote"` use-case.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::secret_enc_addon::{
-    AddonContext, ModificationType, build_aad, decrypt_addon, encrypt_addon,
+    AddonContext, MESSAGE_SECRET_SIZE, ModificationType, build_aad, decrypt_addon, encrypt_addon,
 };
 
 const GCM_IV_SIZE: usize = 12;
@@ -251,13 +251,38 @@ pub fn decrypt_poll_vote_with_secret(
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    let plaintext = decrypt_addon(
+    let plaintext = decrypt_poll_vote_payload_with_secret(
+        ciphertext,
+        message_secret,
+        stanza_id,
+        poll_creator_jid,
+        voter_jid,
+    )?;
+    decode_selected_options(&plaintext)
+}
+
+/// Decrypt a poll vote and return its encoded `PollVoteMessage` payload.
+///
+/// This is useful when the caller owns protobuf decoding or needs to preserve
+/// fields unknown to this version of the core.
+pub fn decrypt_poll_vote_payload_with_secret(
+    ciphertext: PollVoteCiphertext<'_>,
+    message_secret: &[u8],
+    stanza_id: &str,
+    poll_creator_jid: &str,
+    voter_jid: &str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        message_secret.len() == MESSAGE_SECRET_SIZE,
+        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
+        message_secret.len()
+    );
+    decrypt_addon(
         ciphertext.enc_payload,
         ciphertext.enc_iv,
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
-    )?;
-    decode_selected_options(&plaintext)
+    )
 }
 
 fn visit_poll_vote_with_secret<F>(
@@ -272,11 +297,15 @@ fn visit_poll_vote_with_secret<F>(
 where
     F: FnMut(&[u8]),
 {
-    let plaintext = decrypt_addon(
-        enc_payload,
-        iv,
+    let plaintext = decrypt_poll_vote_payload_with_secret(
+        PollVoteCiphertext {
+            enc_payload,
+            enc_iv: iv,
+        },
         message_secret,
-        &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
+        stanza_id,
+        poll_creator_jid,
+        voter_jid,
     )?;
     // Validate the entire plaintext BEFORE emitting anything: `visit` has
     // observable side effects in the caller and the caller has a fallback path
@@ -340,6 +369,8 @@ mod tests {
 
     #[test]
     fn vote_encrypt_decrypt_roundtrip() {
+        use buffa::Message;
+
         let secret = [0xCDu8; 32];
         let stanza_id = "3EB0ABCD1234";
         let creator = "creator@s.whatsapp.net";
@@ -364,6 +395,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, hashes);
+
+        let plaintext = decrypt_poll_vote_payload_with_secret(
+            PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
+            &secret,
+            stanza_id,
+            creator,
+            voter,
+        )
+        .unwrap();
+        let vote_message = waproto::whatsapp::message::PollVoteMessage {
+            selected_options: hashes,
+        };
+        assert_eq!(plaintext, vote_message.encode_to_vec());
+    }
+
+    #[test]
+    fn payload_decrypt_rejects_invalid_message_secret_before_ciphertext() {
+        let error = decrypt_poll_vote_payload_with_secret(
+            PollVoteCiphertext {
+                enc_payload: &[],
+                enc_iv: &[],
+            },
+            &[0u8; MESSAGE_SECRET_SIZE - 1],
+            "id",
+            "creator@s.whatsapp.net",
+            "voter@s.whatsapp.net",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("message_secret must be 32 bytes")
+        );
     }
 
     #[test]

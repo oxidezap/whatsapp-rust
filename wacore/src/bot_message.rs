@@ -16,8 +16,6 @@
 //! editing a prior reply.
 
 use anyhow::{Result, anyhow};
-use hkdf::Hkdf;
-use sha2::Sha256;
 
 use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 
@@ -50,9 +48,8 @@ fn derive_base_bot_key(message_secret: &[u8]) -> Result<[u8; KEY_SIZE]> {
             message_secret.len()
         ));
     }
-    let hk = Hkdf::<Sha256>::new(None, message_secret);
     let mut out = [0u8; KEY_SIZE];
-    hk.expand(BOT_MESSAGE_INFO, &mut out)
+    crate::crypto::hkdf_sha256_into(message_secret, None, BOT_MESSAGE_INFO, &mut out)
         .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
     Ok(out)
 }
@@ -68,9 +65,8 @@ fn derive_per_message_key(
     info.extend_from_slice(ctx.msg_id.as_bytes());
     info.extend_from_slice(ctx.target_sender_user_jid.as_bytes());
     info.extend_from_slice(ctx.bot_user_jid.as_bytes());
-    let hk = Hkdf::<Sha256>::new(None, base_key);
     let mut out = [0u8; KEY_SIZE];
-    hk.expand(&info, &mut out)
+    crate::crypto::hkdf_sha256_into(base_key, None, &info, &mut out)
         .expect("HKDF expand with 32-byte output never fails");
     out
 }

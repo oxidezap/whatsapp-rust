@@ -7,10 +7,12 @@ use crate::request::IqError;
 use serde::Serialize;
 use thiserror::Error;
 use wacore::iq::mex::MexQuerySpec;
+use wacore::iq::mex_operations::fetch_reachout_timelock;
 use wacore_binary::jid::JidError;
 
 // Re-export types from wacore
 pub use wacore::iq::mex::{MexDoc, MexErrorExtensions, MexGraphQLError, MexResponse};
+pub use wacore::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
 
 /// Error types for MEX operations.
 #[derive(Debug, Error)]
@@ -113,6 +115,12 @@ impl<'a> Mex<'a> {
         self.execute_request(request).await
     }
 
+    /// Fetch the account's current reachout-timelock state.
+    pub async fn fetch_reachout_timelock(&self) -> Result<ReachoutTimelock, MexError> {
+        let response = self.query(mex_request!(fetch_reachout_timelock {})).await?;
+        decode_reachout_timelock(response.data)
+    }
+
     #[inline]
     async fn execute_request<V: Serialize>(
         &self,
@@ -140,6 +148,18 @@ impl<'a> Mex<'a> {
 
         Ok(response)
     }
+}
+
+fn decode_reachout_timelock(data: Option<serde_json::Value>) -> Result<ReachoutTimelock, MexError> {
+    let data = data.ok_or_else(|| {
+        MexError::PayloadParsing("reachout timelock response missing data".into())
+    })?;
+    let response: fetch_reachout_timelock::Response = serde_json::from_value(data)?;
+    response
+        .xwa2_fetch_account_reachout_timelock
+        .ok_or_else(|| {
+            MexError::PayloadParsing("reachout timelock response missing account state".into())
+        })
 }
 
 impl Client {
@@ -274,6 +294,32 @@ mod tests {
         assert_eq!(users.len(), 1);
         assert_eq!(users[0]["country_code"], "BR");
         assert_eq!(users[0]["jid"], "551199887766@s.whatsapp.net");
+    }
+
+    #[test]
+    fn test_reachout_timelock_response() {
+        let result = decode_reachout_timelock(Some(json!({
+            "xwa2_fetch_account_reachout_timelock": {
+                "is_active": true,
+                "time_enforcement_ends": "1770000000",
+                "enforcement_type": "DEFAULT"
+            }
+        })))
+        .expect("reachout payload");
+
+        assert_eq!(result.is_active, Some(true));
+        assert_eq!(result.time_enforcement_ends.as_deref(), Some("1770000000"));
+        assert_eq!(result.enforcement_type.as_deref(), Some("DEFAULT"));
+        assert!(matches!(
+            decode_reachout_timelock(None),
+            Err(MexError::PayloadParsing(_))
+        ));
+        assert!(matches!(
+            decode_reachout_timelock(Some(json!({
+                "xwa2_fetch_account_reachout_timelock": null
+            }))),
+            Err(MexError::PayloadParsing(_))
+        ));
     }
 
     #[test]

@@ -27,7 +27,6 @@ use crate::libsignal::crypto::{CryptoProviderError, aes_256_gcm_encrypt};
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use aes::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::RngExt;
 use sha2::Sha256;
@@ -473,10 +472,8 @@ impl PairCodeUtils {
         combined_secret.extend_from_slice(&identity_shared);
         combined_secret.extend_from_slice(&random_bytes);
 
-        let hk_adv = Hkdf::<Sha256>::new(None, &combined_secret);
         let mut new_adv_secret = [0u8; 32];
-        hk_adv
-            .expand(b"adv_secret", &mut new_adv_secret)
+        crate::crypto::hkdf_sha256_into(&combined_secret, None, b"adv_secret", &mut new_adv_secret)
             .map_err(|_| PairCodeError::AdvSecretKeyDerivation)?;
 
         // Prepare bundle: companion_identity_pub (32) + primary_identity_pub (32) + random_bytes (32) = 96 bytes
@@ -491,11 +488,14 @@ impl PairCodeUtils {
 
         // Derive bundle encryption key using HKDF
         // HKDF(IKM=ephemeral_shared, salt=random_salt, info="link_code_pairing_key_bundle_encryption_key")
-        let hk_bundle = Hkdf::<Sha256>::new(Some(&key_bundle_salt), &ephemeral_shared);
         let mut enc_key = [0u8; 32];
-        hk_bundle
-            .expand(b"link_code_pairing_key_bundle_encryption_key", &mut enc_key)
-            .map_err(|_| PairCodeError::BundleKeyDerivation)?;
+        crate::crypto::hkdf_sha256_into(
+            &ephemeral_shared,
+            Some(&key_bundle_salt),
+            b"link_code_pairing_key_bundle_encryption_key",
+            &mut enc_key,
+        )
+        .map_err(|_| PairCodeError::BundleKeyDerivation)?;
 
         // Generate random IV for AES-GCM (12 bytes)
         let mut iv = [0u8; 12];

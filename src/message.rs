@@ -5,17 +5,12 @@ use log::{debug, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use wacore::libsignal::crypto::DecryptionError;
-use wacore::libsignal::protocol::SenderKeyDistributionMessage;
 use wacore::libsignal::protocol::SenderKeyStore;
 use wacore::libsignal::protocol::group_decrypt;
-use wacore::libsignal::protocol::process_sender_key_distribution_message;
 use wacore::libsignal::protocol::{
     CiphertextMessage, DecryptionResult, IdentityChange, OwnedCiphertextMessage,
     PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt,
     message_decrypt_owned,
-};
-use wacore::libsignal::protocol::{
-    PublicKey as SignalPublicKey, SENDERKEY_MESSAGE_CURRENT_VERSION,
 };
 use wacore::message_processing::EncType;
 use wacore::protocol::nack::NackReason;

@@ -26,6 +26,7 @@ use crate::iq::spec::IqSpec;
 use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use anyhow::anyhow;
+use std::time::Duration;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{NodeContent, NodeRef};
@@ -59,6 +60,8 @@ pub struct ProfilePictureSpec {
     /// Current known picture ID. When set, the server can skip re-sending
     /// if the picture hasn't changed (cache optimization).
     pub existing_id: Option<String>,
+    /// Optional request timeout override.
+    pub timeout: Option<Duration>,
 }
 
 impl ProfilePictureSpec {
@@ -68,6 +71,7 @@ impl ProfilePictureSpec {
             picture_type: ProfilePictureType::Preview,
             tc_token: None,
             existing_id: None,
+            timeout: None,
         }
     }
 
@@ -77,6 +81,7 @@ impl ProfilePictureSpec {
             picture_type: ProfilePictureType::Full,
             tc_token: None,
             existing_id: None,
+            timeout: None,
         }
     }
 
@@ -86,6 +91,7 @@ impl ProfilePictureSpec {
             picture_type,
             tc_token: None,
             existing_id: None,
+            timeout: None,
         }
     }
 
@@ -99,6 +105,12 @@ impl ProfilePictureSpec {
     /// The server may return an empty result if the picture hasn't changed.
     pub fn with_existing_id(mut self, id: String) -> Self {
         self.existing_id = Some(id);
+        self
+    }
+
+    /// Override the default request timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }
@@ -120,12 +132,16 @@ impl IqSpec for ProfilePictureSpec {
             picture_builder = picture_builder.children([build_tc_token_node(token)]);
         }
 
-        InfoQuery::get(
+        let query = InfoQuery::get(
             "w:profile:picture",
             Jid::new("", Server::Pn),
             Some(NodeContent::Nodes(vec![picture_builder.build()])),
         )
-        .with_target_ref(&self.jid)
+        .with_target_ref(&self.jid);
+        match self.timeout {
+            Some(timeout) => query.with_timeout(timeout),
+            None => query,
+        }
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
@@ -380,6 +396,16 @@ mod tests {
         if let Some(NodeContent::Nodes(nodes)) = &iq.content {
             assert!(nodes[0].attrs.get("type").is_some_and(|s| s == "image"));
         }
+    }
+
+    #[test]
+    fn test_profile_picture_spec_timeout_override() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let timeout = Duration::from_millis(1_250);
+        let iq = ProfilePictureSpec::preview(&jid)
+            .with_timeout(timeout)
+            .build_iq();
+        assert_eq!(iq.timeout, Some(timeout));
     }
 
     #[test]

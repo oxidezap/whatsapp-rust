@@ -667,8 +667,8 @@ fn test_cloud_api_device_without_prekey() {
 /// # Why filter hosted devices from groups?
 ///
 /// WhatsApp Web explicitly excludes hosted devices from group message fanout.
-/// From the JS code (`getFanOutList`):
-/// ```javascript
+/// From the reference client (`getFanOutList`):
+/// ```text
 /// var isHosted = e.id === 99 || e.isHosted === true;
 /// var includeInFanout = !isHosted || isOneToOneChat;
 /// ```

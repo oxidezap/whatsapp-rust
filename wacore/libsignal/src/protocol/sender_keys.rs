@@ -489,7 +489,7 @@ pub struct SenderKeyRecord {
 /// The vendored `SenderKeyRecordStructure` proto is untouched; the generated
 /// decoder skips this unknown top-level field and `deserialize` scans it out.
 /// Matches the field-number scheme `SessionRecord` uses for its DM counterpart.
-const RESERVED_ITERATION_FIELD: u32 = 100;
+const RESERVED_ITERATION_FIELD: u32 = super::local_field::COUNTER_RESERVATION_FIELD;
 
 impl SenderKeyRecord {
     /// Replaces the states wholesale, so the wire gate — which belongs to the

@@ -14,6 +14,7 @@ pub mod bot_message;
 pub mod client;
 pub mod client_profile;
 pub mod companion_reg;
+pub mod crypto;
 pub mod download;
 pub mod iq;
 pub mod protocol;

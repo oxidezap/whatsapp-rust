@@ -495,7 +495,7 @@ impl Device {
             version.secondary.unwrap_or(0),
             version.tertiary.unwrap_or(0)
         );
-        let build_hash: [u8; 16] = md5::compute(version_str.as_bytes()).into();
+        let build_hash = crate::crypto::md5_digest(version_str.as_bytes());
 
         let reg_data = wa::client_payload::DevicePairingRegistrationData {
             e_regid: Some(self.registration_id.to_be_bytes().to_vec()),

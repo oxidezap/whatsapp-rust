@@ -118,8 +118,13 @@ impl<'a> AttrParserRef<'a> {
             })
     }
 
+    /// Parse an optional protocol boolean while preserving absence.
+    pub fn optional_bool_value(&mut self, key: &str) -> Option<bool> {
+        self.get_bool(key, false)
+    }
+
     pub fn optional_bool(&mut self, key: &str) -> bool {
-        self.get_bool(key, false).unwrap_or(false)
+        self.optional_bool_value(key).unwrap_or(false)
     }
 
     pub fn bool(&mut self, key: &str) -> bool {
@@ -266,8 +271,13 @@ impl<'a> AttrParser<'a> {
             })
     }
 
+    /// Parse an optional protocol boolean while preserving absence.
+    pub fn optional_bool_value(&mut self, key: &str) -> Option<bool> {
+        self.get_bool(key, false)
+    }
+
     pub fn optional_bool(&mut self, key: &str) -> bool {
-        self.get_bool(key, false).unwrap_or(false)
+        self.optional_bool_value(key).unwrap_or(false)
     }
 
     pub fn bool(&mut self, key: &str) -> bool {

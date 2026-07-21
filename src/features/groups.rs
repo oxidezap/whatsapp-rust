@@ -15,10 +15,10 @@ use wacore::iq::groups::{
     GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq, GroupCreateIq,
     GroupInfoOutcome, GroupInfoResponse, GroupParticipantResponse, GroupParticipatingIq,
     GroupQueryIq, LeaveGroupIq, MembershipRequestActionIq, PromoteParticipantsIq,
-    RemoveParticipantsIq, RevokeRequestCodeIq, SetAllowAdminReportsIq, SetGroupAnnouncementIq,
-    SetGroupDescriptionIq, SetGroupEphemeralIq, SetGroupHistoryIq, SetGroupLockedIq,
-    SetGroupMembershipApprovalIq, SetGroupSubjectIq, SetMemberAddModeIq,
-    SetNoFrequentlyForwardedIq, normalize_participants,
+    RemoveParticipantsIncludingLinkedGroupsIq, RemoveParticipantsIq, RevokeRequestCodeIq,
+    SetAllowAdminReportsIq, SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq,
+    SetGroupHistoryIq, SetGroupLockedIq, SetGroupMembershipApprovalIq, SetGroupSubjectIq,
+    SetMemberAddModeIq, SetNoFrequentlyForwardedIq, normalize_participants,
 };
 use wacore::iq::mex_operations::update_group_property;
 use wacore::types::message::AddressingMode;
@@ -26,10 +26,11 @@ use wacore_binary::{Jid, JidExt as _};
 
 use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
 pub use wacore::iq::groups::{
-    GroupCreateOptions, GroupDescription, GroupJoinError, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult,
-    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
-    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
+    GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
+    GroupJoinError, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
+    GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType,
 };
 
 /// Error returned by group operations (metadata queries, participant and
@@ -95,32 +96,42 @@ pub enum BatchGroupResult {
 pub struct GroupMetadata {
     pub id: Jid,
     pub subject: String,
+    pub notify: Option<String>,
     pub participants: Vec<GroupParticipant>,
     pub addressing_mode: AddressingMode,
     /// Group creator JID.
     pub creator: Option<Jid>,
+    pub creator_pn: Option<Jid>,
+    pub creator_username: Option<String>,
+    pub creator_country_code: Option<String>,
     /// Group creation timestamp (Unix seconds).
     pub creation_time: Option<u64>,
+    pub participant_version_id: Option<String>,
+    pub admin_version_id: Option<String>,
+    pub open_thread_id: Option<String>,
+    pub has_missing_participant_identification: bool,
     /// Subject modification timestamp (Unix seconds).
     pub subject_time: Option<u64>,
     /// Subject owner JID.
     pub subject_owner: Option<Jid>,
+    pub subject_owner_pn: Option<Jid>,
+    pub subject_owner_username: Option<String>,
     /// Group description body text.
     pub description: Option<String>,
     /// Description ID (for conflict detection when updating).
     pub description_id: Option<String>,
     /// JID of the participant who set the description.
     pub description_owner: Option<Jid>,
+    pub description_owner_pn: Option<Jid>,
+    pub description_owner_username: Option<String>,
     /// Timestamp when the description was set.
     pub description_time: Option<u64>,
     /// Whether the group is locked (only admins can edit group info).
     pub is_locked: bool,
     /// Whether announcement mode is enabled (only admins can send messages).
     pub is_announcement: bool,
-    /// Ephemeral message expiration in seconds (0 = disabled).
-    pub ephemeral_expiration: u32,
-    /// Disappearing mode trigger (from `trigger` attribute on `<ephemeral>`).
-    pub ephemeral_trigger: Option<u32>,
+    /// Disappearing-message settings when the server includes an `<ephemeral>` node.
+    pub ephemeral: Option<GroupEphemeralSettings>,
     /// Whether membership approval is required to join.
     pub membership_approval: bool,
     /// Who can add members to the group.
@@ -131,6 +142,7 @@ pub struct GroupMetadata {
     pub size: Option<u32>,
     /// Whether this group is a community parent group.
     pub is_parent_group: bool,
+    pub parent_membership_approval_required: bool,
     /// JID of the parent community (for subgroups).
     pub parent_group_jid: Option<Jid>,
     /// Whether this is the default announcement subgroup of a community.
@@ -147,6 +159,10 @@ pub struct GroupMetadata {
     pub growth_locked: Option<GrowthLockInfo>,
     /// Whether the group is suspended.
     pub is_suspended: bool,
+    pub suspension_can_auto_file: bool,
+    pub appeal_status: Option<GroupAppealStatus>,
+    pub appeal_update_time: Option<u64>,
+    pub is_support_group: bool,
     /// Whether admin reports are allowed.
     pub allow_admin_reports: bool,
     /// Whether the group is hidden.
@@ -155,15 +171,24 @@ pub struct GroupMetadata {
     pub is_incognito: bool,
     /// Whether group history is enabled.
     pub has_group_history: bool,
+    pub is_auto_add_disabled: bool,
+    pub has_capi: bool,
+    pub evolution_version: Option<u32>,
+    pub has_group_safety_check: bool,
+    pub participant_label_enabled: bool,
     /// Whether limit sharing is enabled.
     pub is_limit_sharing_enabled: bool,
+    pub limit_sharing_trigger: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupParticipant {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
+    pub lid: Option<Jid>,
+    pub username: Option<wacore_binary::CompactString>,
     pub participant_type: ParticipantType,
+    pub details: Option<Box<GroupParticipantDetails>>,
 }
 
 impl GroupParticipant {
@@ -181,7 +206,10 @@ impl From<GroupParticipantResponse> for GroupParticipant {
         Self {
             jid: p.jid,
             phone_number: p.phone_number,
+            lid: p.lid,
+            username: p.username,
             participant_type: p.participant_type,
+            details: p.details,
         }
     }
 }
@@ -191,25 +219,37 @@ impl From<GroupInfoResponse> for GroupMetadata {
         Self {
             id: group.id,
             subject: group.subject.into_string(),
+            notify: group.notify,
             participants: group.participants.into_iter().map(Into::into).collect(),
             addressing_mode: group.addressing_mode,
             creator: group.creator,
+            creator_pn: group.creator_pn,
+            creator_username: group.creator_username,
+            creator_country_code: group.creator_country_code,
             creation_time: group.creation_time,
+            participant_version_id: group.participant_version_id,
+            admin_version_id: group.admin_version_id,
+            open_thread_id: group.open_thread_id,
+            has_missing_participant_identification: group.has_missing_participant_identification,
             subject_time: group.subject_time,
             subject_owner: group.subject_owner,
+            subject_owner_pn: group.subject_owner_pn,
+            subject_owner_username: group.subject_owner_username,
             description: group.description,
             description_id: group.description_id,
             description_owner: group.description_owner,
+            description_owner_pn: group.description_owner_pn,
+            description_owner_username: group.description_owner_username,
             description_time: group.description_time,
             is_locked: group.is_locked,
             is_announcement: group.is_announcement,
-            ephemeral_expiration: group.ephemeral_expiration,
-            ephemeral_trigger: group.ephemeral_trigger,
+            ephemeral: group.ephemeral,
             membership_approval: group.membership_approval,
             member_add_mode: group.member_add_mode,
             member_link_mode: group.member_link_mode,
             size: group.size,
             is_parent_group: group.is_parent_group,
+            parent_membership_approval_required: group.parent_membership_approval_required,
             parent_group_jid: group.parent_group_jid,
             is_default_sub_group: group.is_default_sub_group,
             is_general_chat: group.is_general_chat,
@@ -218,11 +258,21 @@ impl From<GroupInfoResponse> for GroupMetadata {
             member_share_history_mode: group.member_share_history_mode,
             growth_locked: group.growth_locked,
             is_suspended: group.is_suspended,
+            suspension_can_auto_file: group.suspension_can_auto_file,
+            appeal_status: group.appeal_status,
+            appeal_update_time: group.appeal_update_time,
+            is_support_group: group.is_support_group,
             allow_admin_reports: group.allow_admin_reports,
             is_hidden_group: group.is_hidden_group,
             is_incognito: group.is_incognito,
             has_group_history: group.has_group_history,
+            is_auto_add_disabled: group.is_auto_add_disabled,
+            has_capi: group.has_capi,
+            evolution_version: group.evolution_version,
+            has_group_safety_check: group.has_group_safety_check,
+            participant_label_enabled: group.participant_label_enabled,
             is_limit_sharing_enabled: group.is_limit_sharing_enabled,
+            limit_sharing_trigger: group.limit_sharing_trigger,
         }
     }
 }
@@ -235,6 +285,12 @@ pub struct CreateGroupResult {
 
 pub struct Groups<'a> {
     client: &'a Client,
+}
+
+#[derive(Clone, Copy)]
+enum ParticipantRemovalScope {
+    Group,
+    LinkedGroups,
 }
 
 impl<'a> Groups<'a> {
@@ -354,7 +410,7 @@ impl<'a> Groups<'a> {
     /// LID-addressed groups, so consumers keying data by PN would treat current
     /// members as absent. No-op outside LID-addressed groups or when the PN is
     /// already present; unknown mappings leave the participant untouched.
-    async fn fill_participant_pns(&self, meta: &mut GroupMetadata) {
+    pub(super) async fn fill_participant_pns(&self, meta: &mut GroupMetadata) {
         if meta.addressing_mode != AddressingMode::Lid {
             return;
         }
@@ -569,6 +625,17 @@ impl<'a> Groups<'a> {
             .client
             .execute(RemoveParticipantsIq::new(jid, participants))
             .await?;
+        self.apply_participant_removals(jid, &result, ParticipantRemovalScope::Group)
+            .await;
+        Ok(result)
+    }
+
+    async fn apply_participant_removals(
+        &self,
+        jid: &Jid,
+        result: &[ParticipantChangeResponse],
+        scope: ParticipantRemovalScope,
+    ) {
         let accepted: Vec<&str> = result
             .iter()
             .filter(|r| r.is_ok())
@@ -576,19 +643,51 @@ impl<'a> Groups<'a> {
             .collect();
         if !accepted.is_empty() {
             let group_cache = self.client.get_group_cache().await;
-            if let Some(info) = group_cache.get(jid).await {
-                let mut info = Arc::unwrap_or_clone(info);
-                info.remove_participants(&accepted);
-                self.client.persist_group_metadata(jid, &info).await;
-                group_cache.insert(jid.clone(), Arc::new(info)).await;
-            } else {
-                // Cache expired: can't patch in place, so drop the now-stale blob.
-                self.client.invalidate_persisted_group_metadata(jid).await;
+            match scope {
+                ParticipantRemovalScope::Group => {
+                    if let Some(info) = group_cache.get(jid).await {
+                        let mut info = Arc::unwrap_or_clone(info);
+                        info.remove_participants(&accepted);
+                        self.client.persist_group_metadata(jid, &info).await;
+                        group_cache.insert(jid.clone(), Arc::new(info)).await;
+                    } else {
+                        // Cache expired: can't patch in place, so drop the now-stale blob.
+                        self.client.invalidate_persisted_group_metadata(jid).await;
+                    }
+                }
+                ParticipantRemovalScope::LinkedGroups => {
+                    // The response carries no subgroup IDs, and the lean send
+                    // cache intentionally stores no hierarchy. Invalidate the
+                    // known parent here; the per-subgroup remove notifications
+                    // carry the affected JIDs, patch their own cache entries,
+                    // and rotate their sender-key chains without evicting
+                    // unrelated groups.
+                    group_cache.invalidate(jid).await;
+                    self.client.invalidate_persisted_group_metadata(jid).await;
+                }
             }
             self.client
                 .rotate_sender_key_on_participant_remove(jid, &accepted)
                 .await;
         }
+    }
+
+    /// Remove participants from a parent group and all of its linked groups.
+    pub async fn remove_participants_including_linked_groups(
+        &self,
+        jid: impl Into<Jid>,
+        participants: &[Jid],
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
+        let jid = &jid.into();
+        let result = self
+            .client
+            .execute(RemoveParticipantsIncludingLinkedGroupsIq::new(
+                jid,
+                participants,
+            ))
+            .await?;
+        self.apply_participant_removals(jid, &result, ParticipantRemovalScope::LinkedGroups)
+            .await;
         Ok(result)
     }
 
@@ -596,7 +695,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<(), GroupError> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -608,7 +707,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<(), GroupError> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -1020,6 +1119,17 @@ impl<'a> Groups<'a> {
         group_jid: impl Into<Jid>,
         label: impl Into<String>,
     ) -> Result<(), GroupError> {
+        self.update_member_label_with_id(group_jid, label)
+            .await
+            .map(|_| ())
+    }
+
+    /// Set or clear the member label and return the sent message ID.
+    pub async fn update_member_label_with_id(
+        &self,
+        group_jid: impl Into<Jid>,
+        label: impl Into<String>,
+    ) -> Result<String, GroupError> {
         let group_jid = &group_jid.into();
         if !group_jid.is_group() {
             return Err(GroupError::InvalidRequest(format!(
@@ -1032,11 +1142,12 @@ impl<'a> Groups<'a> {
         // as an extra node — otherwise the member_label appdata/tag_reason attrs
         // never reach the wire.
         let (_edit, meta) = crate::send::infer_stanza_metadata(&msg);
+        let message_id = self.client.generate_message_id();
         self.client
             .send_message_impl(
                 group_jid.clone(),
                 &msg,
-                None,
+                Some(message_id.clone()),
                 false,
                 false,
                 None,
@@ -1044,7 +1155,7 @@ impl<'a> Groups<'a> {
                 None,
             )
             .await?;
-        Ok(())
+        Ok(message_id)
     }
 
     async fn resolve_participant_tokens(&self, jids: &[Jid]) -> Vec<GroupParticipantOptions> {
@@ -1254,7 +1365,10 @@ mod tests {
             participants: vec![GroupParticipant {
                 jid: participant_jid,
                 phone_number: None,
+                lid: None,
+                username: None,
                 participant_type: ParticipantType::Admin,
+                details: None,
             }],
             ..Default::default()
         };
@@ -1285,7 +1399,10 @@ mod tests {
             participants: vec![GroupParticipant {
                 jid: Jid::new("26263000000099", Server::Lid),
                 phone_number: None,
+                lid: None,
+                username: None,
                 participant_type: ParticipantType::Member,
+                details: None,
             }],
             addressing_mode: AddressingMode::Lid,
             ..Default::default()
@@ -1309,7 +1426,10 @@ mod tests {
             participants: vec![GroupParticipant {
                 jid: Jid::new("5521900000098", Server::Pn),
                 phone_number: None,
+                lid: None,
+                username: None,
                 participant_type: ParticipantType::Member,
+                details: None,
             }],
             addressing_mode: AddressingMode::Pn,
             ..Default::default()
@@ -1414,6 +1534,40 @@ mod tests {
         // not a deep copy of the participant list and LID/PN maps.
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.participants.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn linked_removal_preserves_unrelated_group_cache_entries() {
+        use wacore::protocol::ProtocolNode;
+        use wacore_binary::builder::NodeBuilder;
+
+        let client = crate::test_utils::create_test_client().await;
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let unrelated: Jid = "120363000000000002@g.us".parse().unwrap();
+        let removed: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
+        let cache = client.get_group_cache().await;
+        for jid in [&parent, &unrelated] {
+            cache
+                .insert(
+                    jid.clone(),
+                    Arc::new(GroupInfo::new(vec![removed.clone()], AddressingMode::Pn)),
+                )
+                .await;
+        }
+        let response = ParticipantChangeResponse::try_from_node(
+            &NodeBuilder::new("participant")
+                .attr("jid", &removed)
+                .build(),
+        )
+        .expect("participant response should parse");
+
+        client
+            .groups()
+            .apply_participant_removals(&parent, &[response], ParticipantRemovalScope::LinkedGroups)
+            .await;
+
+        assert!(cache.get(&parent).await.is_none());
+        assert!(cache.get(&unrelated).await.is_some());
     }
 
     #[tokio::test]
