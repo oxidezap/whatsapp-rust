@@ -247,8 +247,10 @@ impl SessionState {
         if self.session.sender_chain.is_unset() {
             return Ok(false);
         }
-        // We removed timestamp from PendingPreKey, so we can't check for expiration here.
-        // Assuming it's valid if it exists.
+
+        self.sender_ratchet_key()?;
+        self.sender_ratchet_private_key()?;
+        self.get_sender_chain_key()?;
         Ok(true)
     }
 
@@ -1294,6 +1296,76 @@ mod tests {
         state.set_sender_chain(&sender_keypair, &chain_key);
 
         state
+    }
+
+    fn assert_malformed_sender_chain(
+        state: &SessionState,
+        expected_error: &str,
+        mutate: impl FnOnce(&mut session_structure::Chain),
+    ) {
+        let mut structure = SessionStructure::from(state);
+        mutate(
+            structure
+                .sender_chain
+                .as_option_mut()
+                .expect("test sender chain"),
+        );
+        let state = SessionState::from(structure);
+        assert_eq!(
+            state
+                .has_usable_sender_chain()
+                .expect_err("malformed sender chain must fail")
+                .to_string(),
+            expected_error
+        );
+    }
+
+    #[test]
+    fn complete_sender_chain_is_usable() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        assert!(state.has_usable_sender_chain().unwrap());
+    }
+
+    #[test]
+    fn present_sender_chain_must_be_structurally_usable() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        assert_malformed_sender_chain(&state, "missing sender ratchet key", |chain| {
+            chain.sender_ratchet_key = None;
+        });
+        assert_malformed_sender_chain(&state, "invalid sender chain ratchet key", |chain| {
+            chain.sender_ratchet_key = Some(Vec::new());
+        });
+        assert_malformed_sender_chain(&state, "missing sender ratchet private key", |chain| {
+            chain.sender_ratchet_key_private = None;
+        });
+        assert_malformed_sender_chain(
+            &state,
+            "invalid sender chain private ratchet key",
+            |chain| {
+                chain.sender_ratchet_key_private = Some(vec![0; 31]);
+            },
+        );
+        assert_malformed_sender_chain(&state, "missing sender chain key", |chain| {
+            chain.chain_key = MessageField::none();
+        });
+        assert_malformed_sender_chain(&state, "missing sender chain key index", |chain| {
+            chain
+                .chain_key
+                .as_option_mut()
+                .expect("test chain key")
+                .index = None;
+        });
+        assert_malformed_sender_chain(&state, "missing sender chain key bytes", |chain| {
+            chain.chain_key.as_option_mut().expect("test chain key").key = None;
+        });
+        assert_malformed_sender_chain(&state, "invalid sender chain key", |chain| {
+            chain.chain_key.as_option_mut().expect("test chain key").key =
+                Some(bytes::Bytes::from_static(&[0; 31]));
+        });
     }
 
     #[test]
