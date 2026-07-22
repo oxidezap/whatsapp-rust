@@ -191,13 +191,17 @@ install once
   readied first and closed/shut down last.
 
 `PluginTasks` survives reconnects and receives cancellation only on rollback or
-terminal shutdown. `PluginConnectionTasks` is tied to one generation:
-cancellation is signalled synchronously, while actual future destruction is
-cooperative at executor poll boundaries. Plugin tasks must not block an executor
-thread or detach untracked work. A non-cooperative task may outlive the bounded
-drain, in which case teardown proceeds and diagnostics remain degraded.
+terminal shutdown. `PluginConnectionTasks` is tied to one generation. Their
+default `spawn` drops the future when cancellation wins. `spawn_cooperative`
+instead keeps polling accepted work after signalling shutdown; that future must
+observe `shutdown_signal()` or `cancellation_signal()` and finish itself. The
+host waits only through the configured task-drain deadline, then proceeds and
+marks the plugin degraded if work remains. Plugin tasks must not block an
+executor thread or detach untracked work.
 
-Callbacks are serialized, bounded by timeouts, and isolated from panics,
+`PluginHostConfig` independently configures per-callback and per-task-drain
+deadlines; both default to five seconds and reject zero. Callbacks are
+serialized, bounded by those timeouts, and isolated from panics,
 including panics while constructing, polling, cancelling, or destroying their
 futures. One faulty plugin must not suppress later callbacks. Stale `Ready`
 work is bounded under reconnect pressure; every accepted `Closed` callback is

@@ -41,7 +41,8 @@ const CAP_TASKS: u8 = 1 << 1;
 const CAP_MESSAGING: u8 = 1 << 2;
 const CAP_IQ: u8 = 1 << 3;
 const CAP_PLUGIN_EVENTS: u8 = 1 << 4;
-const PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A capability a plugin asks the host to expose during installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,6 +90,48 @@ impl PluginCapabilities {
 
     pub const fn contains(self, capability: PluginCapability) -> bool {
         self.0 & capability.bit() != 0
+    }
+}
+
+/// Deadlines applied by the native plugin host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginHostConfig {
+    callback_timeout: Duration,
+    task_drain_timeout: Duration,
+}
+
+impl PluginHostConfig {
+    pub const fn new() -> Self {
+        Self {
+            callback_timeout: DEFAULT_PLUGIN_CALLBACK_TIMEOUT,
+            task_drain_timeout: DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT,
+        }
+    }
+
+    /// Bound each `on_ready`, `on_closed`, and `shutdown` callback.
+    pub const fn with_callback_timeout(mut self, timeout: Duration) -> Self {
+        self.callback_timeout = timeout;
+        self
+    }
+
+    /// Bound each install- or connection-scoped task drain.
+    pub const fn with_task_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.task_drain_timeout = timeout;
+        self
+    }
+
+    pub const fn callback_timeout(self) -> Duration {
+        self.callback_timeout
+    }
+
+    pub const fn task_drain_timeout(self) -> Duration {
+        self.task_drain_timeout
+    }
+}
+
+impl Default for PluginHostConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -932,6 +975,26 @@ impl PluginTasks {
     where
         F: Future<Output = ()> + Spawnable,
     {
+        self.spawn_with_mode(future, PluginTaskShutdown::Abort)
+    }
+
+    /// Track work that must observe [`shutdown_signal`](Self::shutdown_signal)
+    /// and finish itself after shutdown is signalled.
+    pub fn spawn_cooperative<F>(&self, future: F) -> Result<(), PluginResourceError>
+    where
+        F: Future<Output = ()> + Spawnable,
+    {
+        self.spawn_with_mode(future, PluginTaskShutdown::Cooperative)
+    }
+
+    fn spawn_with_mode<F>(
+        &self,
+        future: F,
+        shutdown: PluginTaskShutdown,
+    ) -> Result<(), PluginResourceError>
+    where
+        F: Future<Output = ()> + Spawnable,
+    {
         if self.resources.closed.load(Ordering::Acquire) {
             return Err(PluginResourceError::ShuttingDown);
         }
@@ -943,6 +1006,7 @@ impl PluginTasks {
             Arc::clone(&self.plugin_id),
             lease,
             future,
+            shutdown,
         );
         Ok(())
     }
@@ -1195,6 +1259,26 @@ impl PluginConnectionTasks {
     where
         F: Future<Output = ()> + Spawnable,
     {
+        self.spawn_with_mode(future, PluginTaskShutdown::Abort)
+    }
+
+    /// Track work that must observe [`cancellation_signal`](Self::cancellation_signal)
+    /// and finish itself after this generation is cancelled.
+    pub fn spawn_cooperative<F>(&self, future: F) -> Result<(), PluginResourceError>
+    where
+        F: Future<Output = ()> + Spawnable,
+    {
+        self.spawn_with_mode(future, PluginTaskShutdown::Cooperative)
+    }
+
+    fn spawn_with_mode<F>(
+        &self,
+        future: F,
+        shutdown: PluginTaskShutdown,
+    ) -> Result<(), PluginResourceError>
+    where
+        F: Future<Output = ()> + Spawnable,
+    {
         if self.scope.is_cancelled() {
             return Err(PluginResourceError::ShuttingDown);
         }
@@ -1206,8 +1290,13 @@ impl PluginConnectionTasks {
             Arc::clone(&self.plugin_id),
             lease,
             future,
+            shutdown,
         );
         Ok(())
+    }
+
+    pub fn cancellation_signal(&self) -> ShutdownSignal {
+        self.scope.cancellation_signal()
     }
 
     /// Sleep through the configured runtime, returning promptly when this generation retires.
@@ -1305,6 +1394,12 @@ impl<F: Future<Output = ()>> Drop for GuardedPluginTask<F> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PluginTaskShutdown {
+    Abort,
+    Cooperative,
+}
+
 fn spawn_until_cancelled<F>(
     runtime: &Arc<dyn Runtime>,
     cancellation: ShutdownSignal,
@@ -1312,6 +1407,7 @@ fn spawn_until_cancelled<F>(
     plugin_id: Arc<str>,
     lease: TaskLease,
     future: F,
+    shutdown: PluginTaskShutdown,
 ) where
     F: Future<Output = ()> + Spawnable,
 {
@@ -1319,9 +1415,14 @@ fn spawn_until_cancelled<F>(
     runtime
         .spawn(Box::pin(async move {
             let _lease = lease;
-            let cancelled = Box::pin(wait_for_shutdown(&cancellation));
             let work = Box::pin(work);
-            let _ = futures::future::select(cancelled, work).await;
+            match shutdown {
+                PluginTaskShutdown::Abort => {
+                    let cancelled = Box::pin(wait_for_shutdown(&cancellation));
+                    let _ = futures::future::select(cancelled, work).await;
+                }
+                PluginTaskShutdown::Cooperative => work.await,
+            }
         }))
         .detach();
 }
@@ -1333,6 +1434,7 @@ fn spawn_after_activation<F>(
     plugin_id: Arc<str>,
     lease: TaskLease,
     future: F,
+    shutdown: PluginTaskShutdown,
 ) where
     F: Future<Output = ()> + Spawnable,
 {
@@ -1353,9 +1455,14 @@ fn spawn_after_activation<F>(
             if resources.closed.load(Ordering::Acquire) {
                 return;
             }
-            let cancelled = Box::pin(wait_for_shutdown(&cancellation));
             let work = Box::pin(work);
-            let _ = futures::future::select(cancelled, work).await;
+            match shutdown {
+                PluginTaskShutdown::Abort => {
+                    let cancelled = Box::pin(wait_for_shutdown(&cancellation));
+                    let _ = futures::future::select(cancelled, work).await;
+                }
+                PluginTaskShutdown::Cooperative => work.await,
+            }
         }))
         .detach();
 }
@@ -1678,6 +1785,7 @@ struct InstalledPlugin {
 
 struct PluginInstallRollback {
     runtime: Arc<dyn Runtime>,
+    config: PluginHostConfig,
     installed: Vec<InstalledPlugin>,
     current: Option<InstalledPlugin>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
@@ -1686,9 +1794,10 @@ struct PluginInstallRollback {
 }
 
 impl PluginInstallRollback {
-    fn new(runtime: Arc<dyn Runtime>, capacity: usize) -> Self {
+    fn new(runtime: Arc<dyn Runtime>, capacity: usize, config: PluginHostConfig) -> Self {
         Self {
             runtime,
+            config,
             installed: Vec::with_capacity(capacity),
             current: None,
             upstream: None,
@@ -1729,10 +1838,12 @@ impl PluginInstallRollback {
         let completion = completed.subscribe();
         let runtime = self.runtime.clone();
         let cleanup_runtime = runtime.clone();
+        let config = self.config;
         runtime
             .spawn(Box::pin(async move {
                 let result = AssertUnwindSafe(shutdown_staged_plugins(
                     cleanup_runtime,
+                    config,
                     current,
                     installed,
                     upstream,
@@ -1798,7 +1909,7 @@ pub(crate) struct PluginHost {
     apis: OnceLock<HashMap<TypeId, ErasedApi>>,
     runtime: OnceLock<Arc<dyn Runtime>>,
     event_router: Option<PluginEventRouter>,
-    callback_timeout: Duration,
+    config: PluginHostConfig,
     terminal: AtomicBool,
     terminal_notifier: ShutdownNotifier,
     installing_resources: Mutex<Vec<Weak<PluginResources>>>,
@@ -1807,14 +1918,31 @@ pub(crate) struct PluginHost {
 }
 
 impl PluginHost {
-    pub(crate) fn new(plan: PluginPlan, upstream: Option<Arc<dyn ClientLifecycle>>) -> Arc<Self> {
-        Self::new_with_callback_timeout(plan, upstream, PLUGIN_CALLBACK_TIMEOUT)
+    pub(crate) fn new(
+        plan: PluginPlan,
+        upstream: Option<Arc<dyn ClientLifecycle>>,
+        config: PluginHostConfig,
+    ) -> Arc<Self> {
+        Self::new_with_config(plan, upstream, config)
     }
 
+    #[cfg(test)]
     fn new_with_callback_timeout(
         plan: PluginPlan,
         upstream: Option<Arc<dyn ClientLifecycle>>,
         callback_timeout: Duration,
+    ) -> Arc<Self> {
+        Self::new_with_config(
+            plan,
+            upstream,
+            PluginHostConfig::new().with_callback_timeout(callback_timeout),
+        )
+    }
+
+    fn new_with_config(
+        plan: PluginPlan,
+        upstream: Option<Arc<dyn ClientLifecycle>>,
+        config: PluginHostConfig,
     ) -> Arc<Self> {
         let manifests = plan
             .ordered
@@ -1844,7 +1972,7 @@ impl PluginHost {
             apis: OnceLock::new(),
             runtime: OnceLock::new(),
             event_router,
-            callback_timeout,
+            config,
             terminal: AtomicBool::new(false),
             terminal_notifier: ShutdownNotifier::new(),
             installing_resources: Mutex::new(Vec::new()),
@@ -1920,8 +2048,14 @@ impl PluginHost {
                     .contains(PluginCapability::Tasks)
             })
             .count();
-        self.callback_timeout
-            .saturating_mul((callback_count + task_barrier_count) as u32)
+        self.config
+            .callback_timeout()
+            .saturating_mul(callback_count as u32)
+            .saturating_add(
+                self.config
+                    .task_drain_timeout()
+                    .saturating_mul(task_barrier_count as u32),
+            )
             .saturating_add(Duration::from_secs(1))
     }
 
@@ -2023,7 +2157,12 @@ impl PluginHost {
             .runtime
             .get()
             .ok_or(PluginTaskDrainError::RuntimeUnavailable)?;
-        wait_for_plugin_tasks(&**runtime, self.callback_timeout, completion_signals).await
+        wait_for_plugin_tasks(
+            &**runtime,
+            self.config.task_drain_timeout(),
+            completion_signals,
+        )
+        .await
     }
 
     async fn install_all(&self, client: Weak<Client>) -> anyhow::Result<()> {
@@ -2044,7 +2183,8 @@ impl PluginHost {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
         });
-        let mut rollback = PluginInstallRollback::new(runtime.clone(), self.ordered.len());
+        let mut rollback =
+            PluginInstallRollback::new(runtime.clone(), self.ordered.len(), self.config);
         self.abort_install_if_terminal(&mut rollback).await?;
         if let Some(upstream) = &self.upstream {
             if let Err(error) = plugin_callback(|| upstream.install(client.clone())).await {
@@ -2228,7 +2368,7 @@ impl PluginHost {
         let runtime = self.runtime.get().ok_or_else(|| {
             PluginCallbackError::Callback(anyhow::anyhow!("plugin runtime is unavailable"))
         })?;
-        bounded_plugin_callback(&**runtime, self.callback_timeout, make_future).await
+        bounded_plugin_callback(&**runtime, self.config.callback_timeout(), make_future).await
     }
 
     fn record_upstream_callback(&self, result: &Result<(), PluginCallbackError>) {
@@ -2417,6 +2557,7 @@ enum PluginTaskDrainError {
 
 async fn shutdown_staged_plugins(
     runtime: Arc<dyn Runtime>,
+    config: PluginHostConfig,
     current: Option<InstalledPlugin>,
     mut installed: Vec<InstalledPlugin>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
@@ -2425,7 +2566,7 @@ async fn shutdown_staged_plugins(
     if let Some(plugin) = current {
         let task_result = wait_for_plugin_tasks(
             &*runtime,
-            PLUGIN_CALLBACK_TIMEOUT,
+            config.task_drain_timeout(),
             plugin.resources.task_completion_signals(),
         )
         .await;
@@ -2436,7 +2577,7 @@ async fn shutdown_staged_plugins(
                 plugin.manifest.id
             );
         }
-        let callback_result = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+        let callback_result = bounded_plugin_callback(&*runtime, config.callback_timeout(), || {
             plugin.plugin.shutdown()
         })
         .await;
@@ -2452,7 +2593,7 @@ async fn shutdown_staged_plugins(
     while let Some(plugin) = installed.pop() {
         let task_result = wait_for_plugin_tasks(
             &*runtime,
-            PLUGIN_CALLBACK_TIMEOUT,
+            config.task_drain_timeout(),
             plugin.resources.task_completion_signals(),
         )
         .await;
@@ -2463,7 +2604,7 @@ async fn shutdown_staged_plugins(
                 plugin.manifest.id
             );
         }
-        let callback_result = bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || {
+        let callback_result = bounded_plugin_callback(&*runtime, config.callback_timeout(), || {
             plugin.plugin.shutdown()
         })
         .await;
@@ -2475,7 +2616,7 @@ async fn shutdown_staged_plugins(
     }
     if let Some(upstream) = upstream
         && let Err(error) =
-            bounded_plugin_callback(&*runtime, PLUGIN_CALLBACK_TIMEOUT, || upstream.shutdown())
+            bounded_plugin_callback(&*runtime, config.callback_timeout(), || upstream.shutdown())
                 .await
     {
         log::warn!("Upstream lifecycle rollback failed: {error:#}");
@@ -2638,6 +2779,31 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_plugin_host_deadlines() {
+        let callback = complete_builder()
+            .await
+            .with_plugin_host_config(PluginHostConfig::new().with_callback_timeout(Duration::ZERO))
+            .build()
+            .await;
+        assert!(matches!(
+            callback,
+            Err(ClientBuilderError::InvalidPluginCallbackTimeout)
+        ));
+
+        let task_drain = complete_builder()
+            .await
+            .with_plugin_host_config(
+                PluginHostConfig::new().with_task_drain_timeout(Duration::ZERO),
+            )
+            .build()
+            .await;
+        assert!(matches!(
+            task_drain,
+            Err(ClientBuilderError::InvalidPluginTaskDrainTimeout)
+        ));
     }
 
     struct FoundationPlugin {
@@ -3358,7 +3524,8 @@ mod tests {
         let api: ErasedApi = Arc::new(TypedApi(Arc::new(PanickingDropApi)));
         registry.insert(TypeId::of::<PanickingDropPlugin>(), api);
 
-        let mut rollback = PluginInstallRollback::new(Arc::new(TokioRuntime), 1);
+        let mut rollback =
+            PluginInstallRollback::new(Arc::new(TokioRuntime), 1, PluginHostConfig::default());
         rollback.installed.push(InstalledPlugin {
             plugin: erased_plugin,
             manifest,
@@ -3849,6 +4016,123 @@ mod tests {
         shutdown_after_task: Arc<AtomicBool>,
     }
 
+    struct CooperativeTaskPlugin {
+        install_started: Arc<AtomicBool>,
+        install_finished: Arc<AtomicBool>,
+        connection_started: Arc<AtomicBool>,
+        connection_finished: Arc<AtomicBool>,
+        closed_after_task: Arc<AtomicBool>,
+        shutdown_after_task: Arc<AtomicBool>,
+    }
+
+    impl ClientPlugin for CooperativeTaskPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("cooperative-tasks", "0.1.0")
+                .with_capability(PluginCapability::Tasks)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            let tasks = context
+                .tasks()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("tasks capability missing"));
+            let started = Arc::clone(&self.install_started);
+            let finished = Arc::clone(&self.install_finished);
+            Box::pin(async move {
+                let tasks = tasks?;
+                let shutdown = tasks.shutdown_signal();
+                tasks.spawn_cooperative(async move {
+                    started.store(true, Ordering::Release);
+                    wait_for_shutdown(&shutdown).await;
+                    tokio::task::yield_now().await;
+                    finished.store(true, Ordering::Release);
+                })?;
+                Ok(Arc::new(()))
+            })
+        }
+
+        fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+            let tasks = scope
+                .tasks()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("connection tasks capability missing"));
+            let started = Arc::clone(&self.connection_started);
+            let finished = Arc::clone(&self.connection_finished);
+            Box::pin(async move {
+                let tasks = tasks?;
+                let cancelled = tasks.cancellation_signal();
+                tasks.spawn_cooperative(async move {
+                    started.store(true, Ordering::Release);
+                    wait_for_shutdown(&cancelled).await;
+                    tokio::task::yield_now().await;
+                    finished.store(true, Ordering::Release);
+                })?;
+                Ok(())
+            })
+        }
+
+        fn on_closed(&self, _scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+            let finished = self.connection_finished.load(Ordering::Acquire);
+            let observed = Arc::clone(&self.closed_after_task);
+            Box::pin(async move {
+                observed.store(finished, Ordering::Release);
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let finished = self.install_finished.load(Ordering::Acquire);
+            let observed = Arc::clone(&self.shutdown_after_task);
+            Box::pin(async move {
+                observed.store(finished, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+
+    struct TimedDrainPlugin {
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        release_tx: async_channel::Sender<()>,
+        release_rx: async_channel::Receiver<()>,
+    }
+
+    impl ClientPlugin for TimedDrainPlugin {
+        type Api = ();
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("timed-drain", "0.1.0").with_capability(PluginCapability::Tasks)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            let tasks = context
+                .tasks()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("tasks capability missing"));
+            let started = Arc::clone(&self.started);
+            let finished = Arc::clone(&self.finished);
+            let release = self.release_rx.clone();
+            Box::pin(async move {
+                tasks?.spawn_cooperative(async move {
+                    started.store(true, Ordering::Release);
+                    let _ = release.recv().await;
+                    finished.store(true, Ordering::Release);
+                })?;
+                Ok(Arc::new(()))
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let release = self.release_tx.clone();
+            Box::pin(async move {
+                let _ = release.try_send(());
+                Ok(())
+            })
+        }
+    }
+
     impl ClientPlugin for ScopedTaskPlugin {
         type Api = ();
 
@@ -3996,6 +4280,88 @@ mod tests {
         assert_eq!(stats.plugins[0].state, PluginState::Stopped);
         assert_eq!(stats.plugins[0].install_tasks, 0);
         assert_eq!(stats.plugins[0].callbacks_completed, 3);
+    }
+
+    #[tokio::test]
+    async fn cooperative_tasks_drain_before_lifecycle_callbacks() {
+        let install_started = Arc::new(AtomicBool::new(false));
+        let install_finished = Arc::new(AtomicBool::new(false));
+        let connection_started = Arc::new(AtomicBool::new(false));
+        let connection_finished = Arc::new(AtomicBool::new(false));
+        let closed_after_task = Arc::new(AtomicBool::new(false));
+        let shutdown_after_task = Arc::new(AtomicBool::new(false));
+        let config = PluginHostConfig::new()
+            .with_callback_timeout(Duration::from_secs(1))
+            .with_task_drain_timeout(Duration::from_secs(1));
+        let client = complete_builder()
+            .await
+            .with_plugin_host_config(config)
+            .with_plugin(CooperativeTaskPlugin {
+                install_started: Arc::clone(&install_started),
+                install_finished: Arc::clone(&install_finished),
+                connection_started: Arc::clone(&connection_started),
+                connection_finished: Arc::clone(&connection_finished),
+                closed_after_task: Arc::clone(&closed_after_task),
+                shutdown_after_task: Arc::clone(&shutdown_after_task),
+            })
+            .build()
+            .await
+            .expect("cooperative task plugin")
+            .into_client();
+        let host = client.plugin_host.as_ref().expect("plugin host").clone();
+        assert_eq!(host.config, config);
+        wait_for_flag(&install_started).await;
+
+        let scope = ConnectionScope::new(212);
+        host.on_ready(scope.clone())
+            .await
+            .expect("cooperative ready callback");
+        wait_for_flag(&connection_started).await;
+        scope.cancel();
+        host.on_closed(scope)
+            .await
+            .expect("cooperative closed callback");
+        assert!(connection_finished.load(Ordering::Acquire));
+        assert!(closed_after_task.load(Ordering::Acquire));
+
+        client.disconnect().await;
+        assert!(install_finished.load(Ordering::Acquire));
+        assert!(shutdown_after_task.load(Ordering::Acquire));
+        let stats = client.plugin_stats().expect("cooperative plugin stats");
+        assert_eq!(stats.plugins[0].task_drain_timeouts, 0);
+        assert_eq!(stats.plugins[0].health, PluginHealth::Healthy);
+    }
+
+    #[tokio::test]
+    async fn configured_task_drain_timeout_degrades_and_continues_shutdown() {
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let client = complete_builder()
+            .await
+            .with_plugin_host_config(
+                PluginHostConfig::new()
+                    .with_callback_timeout(Duration::from_secs(1))
+                    .with_task_drain_timeout(Duration::from_millis(10)),
+            )
+            .with_plugin(TimedDrainPlugin {
+                started: Arc::clone(&started),
+                finished: Arc::clone(&finished),
+                release_tx,
+                release_rx,
+            })
+            .build()
+            .await
+            .expect("timed drain plugin")
+            .into_client();
+        wait_for_flag(&started).await;
+
+        client.disconnect().await;
+        wait_for_flag(&finished).await;
+        let stats = client.plugin_stats().expect("timed drain stats");
+        assert_eq!(stats.plugins[0].task_drain_timeouts, 1);
+        assert_eq!(stats.plugins[0].health, PluginHealth::Degraded);
+        assert_eq!(stats.plugins[0].state, PluginState::Stopped);
     }
 
     #[tokio::test]

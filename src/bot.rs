@@ -2,7 +2,7 @@ use crate::cache_config::CacheConfig;
 use crate::client::{Client, ClientBuilderError};
 use crate::pair_code::PairCodeOptions;
 #[cfg(feature = "plugins")]
-use crate::plugins::{ClientPlugin, PluginRegistration, UntypedClientPlugin};
+use crate::plugins::{ClientPlugin, PluginHostConfig, PluginRegistration, UntypedClientPlugin};
 use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
@@ -636,6 +636,8 @@ pub struct BotBuilder<
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     #[cfg(feature = "plugins")]
     plugins: Vec<PluginRegistration>,
+    #[cfg(feature = "plugins")]
+    plugin_host_config: PluginHostConfig,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -663,6 +665,8 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             alloc_meter: None,
             #[cfg(feature = "plugins")]
             plugins: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_host_config: PluginHostConfig::default(),
             _marker: PhantomData,
         }
     }
@@ -694,6 +698,8 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             alloc_meter: self.alloc_meter,
             #[cfg(feature = "plugins")]
             plugins: self.plugins,
+            #[cfg(feature = "plugins")]
+            plugin_host_config: self.plugin_host_config,
             _marker: PhantomData,
         }
     }
@@ -843,6 +849,14 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     pub fn with_untyped_plugin_arc<P: UntypedClientPlugin>(mut self, plugin: Arc<P>) -> Self {
         self.plugins
             .push(PluginRegistration::new_untyped_arc(plugin));
+        self
+    }
+
+    /// Configure plugin lifecycle and tracked-task deadlines.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_plugin_host_config(mut self, config: PluginHostConfig) -> Self {
+        self.plugin_host_config = config;
         self
     }
 
@@ -1293,7 +1307,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_skip_history_sync(self.skip_history_sync)
             .with_background_saver_interval(std::time::Duration::from_secs(30));
         #[cfg(feature = "plugins")]
-        let client_builder = client_builder.with_plugin_registrations(self.plugins);
+        let client_builder = client_builder
+            .with_plugin_registrations(self.plugins)
+            .with_plugin_host_config(self.plugin_host_config);
         let mut client_builder = client_builder;
 
         if let Some(version) = self.override_version {

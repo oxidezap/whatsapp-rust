@@ -125,9 +125,9 @@ pub use plugins::{
     PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
     PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
     PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
-    PluginFuture, PluginHealth, PluginHostStats, PluginIq, PluginIqError, PluginManifest,
-    PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError, PluginState,
-    PluginStats, PluginTasks, UntypedClientPlugin,
+    PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginIq, PluginIqError,
+    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
+    PluginState, PluginStats, PluginTasks, UntypedClientPlugin,
 };
 pub mod request;
 pub(crate) mod signal_flush;
@@ -208,8 +208,8 @@ pub mod prelude {
         ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext,
         PluginCoreEventSubscription, PluginEventEndpointConfig, PluginEventOverflow,
         PluginEventPayloadEncoding, PluginEventRouter, PluginEventSelector,
-        PluginEventSubscription, PluginEventTopic, PluginEvents, PluginFuture, PluginManifest,
-        UntypedClientPlugin,
+        PluginEventSubscription, PluginEventTopic, PluginEvents, PluginFuture, PluginHostConfig,
+        PluginManifest, UntypedClientPlugin,
     };
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]

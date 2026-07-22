@@ -11,7 +11,8 @@ use crate::cache_config::CacheConfig;
 use crate::http::HttpClient;
 #[cfg(feature = "plugins")]
 use crate::plugins::{
-    ClientPlugin, PluginHost, PluginPlan, PluginPlanError, PluginRegistration, UntypedClientPlugin,
+    ClientPlugin, PluginHost, PluginHostConfig, PluginPlan, PluginPlanError, PluginRegistration,
+    UntypedClientPlugin,
 };
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
@@ -69,6 +70,14 @@ pub enum ClientBuilderError {
     MissingHttpClient,
     #[error("background saver interval must be greater than zero")]
     InvalidBackgroundSaverInterval,
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    #[error("plugin callback timeout must be greater than zero")]
+    InvalidPluginCallbackTimeout,
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    #[error("plugin task-drain timeout must be greater than zero")]
+    InvalidPluginTaskDrainTimeout,
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
     #[cfg(feature = "client-lifecycle")]
@@ -109,6 +118,8 @@ pub struct ClientBuilder {
     lifecycle: Option<Arc<dyn ClientLifecycle>>,
     #[cfg(feature = "plugins")]
     plugins: Vec<PluginRegistration>,
+    #[cfg(feature = "plugins")]
+    plugin_host_config: PluginHostConfig,
 }
 
 impl Default for ClientBuilder {
@@ -139,6 +150,8 @@ impl ClientBuilder {
             lifecycle: None,
             #[cfg(feature = "plugins")]
             plugins: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_host_config: PluginHostConfig::default(),
         }
     }
 
@@ -339,6 +352,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Configure plugin lifecycle and tracked-task deadlines.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_plugin_host_config(mut self, config: PluginHostConfig) -> Self {
+        self.plugin_host_config = config;
+        self
+    }
+
     #[cfg(feature = "plugins")]
     pub(crate) fn with_plugin_registrations(
         mut self,
@@ -381,6 +402,15 @@ impl ClientBuilder {
 
             if self.background_saver_interval == Some(Duration::ZERO) {
                 return Err(ClientBuilderError::InvalidBackgroundSaverInterval);
+            }
+
+            #[cfg(feature = "plugins")]
+            if self.plugin_host_config.callback_timeout() == Duration::ZERO {
+                return Err(ClientBuilderError::InvalidPluginCallbackTimeout);
+            }
+            #[cfg(feature = "plugins")]
+            if self.plugin_host_config.task_drain_timeout() == Duration::ZERO {
+                return Err(ClientBuilderError::InvalidPluginTaskDrainTimeout);
             }
 
             if self.inbound_durability_hook.is_some() {
@@ -435,7 +465,7 @@ impl ClientBuilder {
         let (lifecycle_handler, plugin_host) = {
             let mut lifecycle_handler = lifecycle_handler;
             let plugin_host = plugin_plan.map(|plan| {
-                let host = PluginHost::new(plan, lifecycle_handler.take());
+                let host = PluginHost::new(plan, lifecycle_handler.take(), self.plugin_host_config);
                 lifecycle_handler = Some(host.clone());
                 host
             });
