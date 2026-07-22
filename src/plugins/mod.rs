@@ -370,7 +370,7 @@ struct PluginResources {
     shutdown: ShutdownNotifier,
     install_tasks: Arc<TaskTracker>,
     connection_tasks: Mutex<ConnectionTaskRegistry>,
-    subscriptions: Mutex<Vec<Arc<PluginCoreEventSubscriptionInner>>>,
+    subscriptions: Mutex<Vec<Weak<PluginCoreEventSubscriptionInner>>>,
     teardown_panics: AtomicU64,
 }
 
@@ -519,10 +519,9 @@ impl PluginCoreEventSubscriptionInner {
             return Ok(false);
         };
         if !subscription.update_interest(interest) {
-            let registration = (state.subscription.take(), state.raw_node_lease.take());
             drop(state);
             drop(acquired_raw_node_lease);
-            drop(registration);
+            self.close();
             return Ok(false);
         }
 
@@ -539,6 +538,7 @@ impl PluginCoreEventSubscriptionInner {
     }
 
     fn close(&self) -> bool {
+        let resources = self.resources.upgrade();
         let registration = {
             let mut state = self
                 .state
@@ -548,13 +548,16 @@ impl PluginCoreEventSubscriptionInner {
         };
         let active = registration.0.is_some();
         if std::panic::catch_unwind(AssertUnwindSafe(|| drop(registration))).is_err() {
-            if let Some(resources) = self.resources.upgrade() {
+            if let Some(resources) = &resources {
                 resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
             }
             log::warn!(
                 "Plugin `{}` core-event subscription panicked while closing",
                 self.plugin_id
             );
+        }
+        if let Some(resources) = resources {
+            resources.forget_subscription(self);
         }
         active
     }
@@ -669,8 +672,12 @@ impl PluginResources {
             if self.closed.load(Ordering::Acquire) {
                 true
             } else {
-                subscriptions.retain(|subscription| subscription.is_active());
-                subscriptions.push(Arc::clone(&registration));
+                subscriptions.retain(|subscription| {
+                    subscription
+                        .upgrade()
+                        .is_some_and(|subscription| subscription.is_active())
+                });
+                subscriptions.push(Arc::downgrade(&registration));
                 false
             }
         };
@@ -682,6 +689,16 @@ impl PluginResources {
                 inner: registration,
             })
         }
+    }
+
+    fn forget_subscription(&self, subscription: &PluginCoreEventSubscriptionInner) {
+        let subscription_ptr = std::ptr::from_ref(subscription);
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|candidate| {
+                candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), subscription_ptr)
+            });
     }
 
     fn connection_task_tracker(&self, generation: u64) -> (Arc<TaskTracker>, bool) {
@@ -788,7 +805,9 @@ impl PluginResources {
             std::mem::take(&mut *subscriptions)
         };
         for subscription in subscriptions {
-            subscription.close();
+            if let Some(subscription) = subscription.upgrade() {
+                subscription.close();
+            }
         }
     }
 }
@@ -826,6 +845,7 @@ impl PluginResources {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
+                .filter_map(Weak::upgrade)
                 .filter(|subscription| subscription.is_active())
                 .count(),
             teardown_panics: self.teardown_panics.load(Ordering::Relaxed),
@@ -5171,6 +5191,66 @@ mod tests {
                 .core_event_subscriptions,
             0
         );
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_plugin_subscriptions_leave_no_retained_registry_entries() {
+        let client = complete_builder()
+            .await
+            .build()
+            .await
+            .expect("client")
+            .into_client();
+        let resources = PluginResources::new();
+        resources.activate();
+        let diagnostics = PluginDiagnostics::new();
+        diagnostics.attach_resources(&resources);
+        let events = PluginCoreEvents {
+            client: Arc::downgrade(&client),
+            resources: Arc::clone(&resources),
+            plugin_id: Arc::from("subscription-churn"),
+            diagnostics,
+        };
+
+        let subscriptions = (0..128)
+            .map(|_| {
+                events
+                    .subscribe(
+                        EventInterest::of(&[EventKind::Connected]),
+                        Arc::new(NoopEventHandler),
+                    )
+                    .expect("subscription")
+            })
+            .collect::<Vec<_>>();
+        let registrations = subscriptions
+            .iter()
+            .map(|subscription| Arc::downgrade(&subscription.inner))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resources
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            subscriptions.len()
+        );
+
+        drop(subscriptions);
+
+        assert!(
+            resources
+                .subscriptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+        assert!(
+            registrations
+                .into_iter()
+                .all(|registration| registration.upgrade().is_none())
+        );
+        assert_eq!(resources.stats().core_event_subscriptions, 0);
         client.disconnect().await;
     }
 
