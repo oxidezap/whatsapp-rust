@@ -5626,12 +5626,65 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
         nack.get_attr("participant")
             .is_some_and(|value| value.as_str() == "15551234567:7@s.whatsapp.net")
     );
+    assert!(
+        nack.get_attr("type")
+            .is_some_and(|value| value.as_str() == "retry")
+    );
     let meta = nack
         .get_optional_child("meta")
         .expect("InvalidProtobuf should carry its failure detail");
     assert!(
         meta.get_attr("failure_reason")
             .is_some_and(|value| value.as_str() == "42")
+    );
+}
+
+#[tokio::test]
+async fn explicit_and_automatic_receipt_acks_use_distinct_participant_policies() {
+    let (client, transport) = capturing_client("receipt_ack_participant_policy").await;
+    const FROM: &str = "12025550111:7@s.whatsapp.net";
+
+    let explicit = NodeBuilder::new("receipt")
+        .attr("id", "EXPLICIT-RECEIPT-ACK")
+        .attr("from", FROM)
+        .attr("participant", FROM)
+        .attr("type", "read")
+        .build();
+    client
+        .acknowledge_stanza(&explicit.as_node_ref())
+        .await
+        .expect("generic receipt ack should send");
+
+    let automatic = NodeBuilder::new("receipt")
+        .attr("id", "AUTOMATIC-RECEIPT-ACK")
+        .attr("from", FROM)
+        .attr("participant", FROM)
+        .attr("type", "read")
+        .build();
+    client
+        .send_ack_for(&automatic.as_node_ref())
+        .await
+        .expect("specialized receipt ack should send");
+
+    let frames = transport.sent();
+    assert_eq!(frames.len(), 2);
+
+    let explicit_bytes = decode_frame(0, &frames[0]).expect("explicit ack frame should decrypt");
+    let explicit_ack = wacore_binary::marshal::unmarshal_ref(&explicit_bytes[1..])
+        .expect("explicit ack frame should decode");
+    assert!(
+        explicit_ack
+            .get_attr("participant")
+            .is_some_and(|value| value.as_str() == FROM),
+        "generic explicit ack must preserve participant"
+    );
+
+    let automatic_bytes = decode_frame(1, &frames[1]).expect("automatic ack frame should decrypt");
+    let automatic_ack = wacore_binary::marshal::unmarshal_ref(&automatic_bytes[1..])
+        .expect("automatic ack frame should decode");
+    assert!(
+        automatic_ack.get_attr("participant").is_none(),
+        "specialized receipt ack must omit a participant equal to its destination"
     );
 }
 

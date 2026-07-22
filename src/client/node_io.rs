@@ -593,9 +593,10 @@ impl Client {
     fn encode_ack_from_snapshot(
         &self,
         node: &wacore_binary::NodeRef<'_>,
+        participant_policy: AckParticipantPolicy,
     ) -> Result<Vec<u8>, crate::features::StanzaResponseError> {
         let device = self.persistence_manager.get_device_snapshot();
-        let encoded = encode_ack_bytes(node, device.pn.as_ref());
+        let encoded = encode_ack_bytes(node, device.pn.as_ref(), participant_policy);
         drop(device);
         encoded
     }
@@ -615,7 +616,9 @@ impl Client {
         if !self.is_connected() {
             return Err(ClientError::NotConnected);
         }
-        let buf = match self.encode_ack_from_snapshot(node) {
+        let buf = match self
+            .encode_ack_from_snapshot(node, AckParticipantPolicy::OmitReceiptDestinationDuplicate)
+        {
             Ok(buf) => buf,
             Err(e) => {
                 log::warn!("Failed to encode ack: {e}");
@@ -638,7 +641,7 @@ impl Client {
         &self,
         stanza: &wacore_binary::NodeRef<'_>,
     ) -> Result<(), crate::features::StanzaResponseError> {
-        let bytes = self.encode_ack_from_snapshot(stanza)?;
+        let bytes = self.encode_ack_from_snapshot(stanza, AckParticipantPolicy::Preserve)?;
         self.send_raw_bytes(bytes).await?;
         Ok(())
     }
@@ -648,7 +651,8 @@ impl Client {
     /// in a single flushed task.
     pub(crate) async fn send_transport_ack(&self, info: &crate::types::message::MessageInfo) {
         let source = message_ack_source_node(info);
-        let encoded = self.encode_ack_from_snapshot(&source.as_node_ref());
+        let encoded =
+            self.encode_ack_from_snapshot(&source.as_node_ref(), AckParticipantPolicy::Preserve);
         match encoded {
             Ok(buf) => {
                 if let Err(e) = self.send_raw_bytes(buf).await
@@ -681,7 +685,7 @@ impl Client {
         self: &Arc<Self>,
         node: &wacore_binary::NodeRef<'_>,
     ) {
-        let buf = match self.encode_ack_from_snapshot(node) {
+        let buf = match self.encode_ack_from_snapshot(node, AckParticipantPolicy::Preserve) {
             Ok(buf) => buf,
             Err(e) => {
                 log::warn!("Failed to encode node transport ack: {e}");

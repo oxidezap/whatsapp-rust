@@ -1060,10 +1060,32 @@ fn value_refs_display_equal(
     }
 }
 
+#[derive(Clone, Copy)]
+enum AckParticipantPolicy {
+    Preserve,
+    OmitReceiptDestinationDuplicate,
+}
+
+#[inline]
+fn ack_participant<'node, 'data>(
+    node: &'node wacore_binary::NodeRef<'data>,
+    from: &wacore_binary::node::ValueRef<'data>,
+    policy: AckParticipantPolicy,
+) -> Option<&'node wacore_binary::node::ValueRef<'data>> {
+    node.get_attr("participant")
+        .filter(|participant| match policy {
+            AckParticipantPolicy::Preserve => true,
+            AckParticipantPolicy::OmitReceiptDestinationDuplicate => {
+                node.tag != "receipt" || !value_refs_display_equal(participant, from)
+            }
+        })
+}
+
 /// Build an `<ack/>` for the given stanza, matching WA Web / whatsmeow behavior:
 ///
 /// - `class` = original stanza tag
-/// - `id`, `to` (flipped from `from`), `participant` copied from original
+/// - `id`, `to` (flipped from `from`) copied from original
+/// - `participant` follows the generic or receipt-specialized policy
 /// - `from` = own device PN, only for message acks
 /// - `type` echoed when present, except `notification type="encrypt"` with
 ///   an `<identity/>` child
@@ -1078,6 +1100,7 @@ fn value_refs_display_equal(
 fn encode_ack_bytes(
     node: &wacore_binary::NodeRef<'_>,
     own_device_pn: Option<&Jid>,
+    participant_policy: AckParticipantPolicy,
 ) -> Result<Vec<u8>, crate::features::StanzaResponseError> {
     use wacore_binary::encoder::{ByteWriter, EncodeNode, Encoder};
 
@@ -1090,15 +1113,7 @@ fn encode_ack_bytes(
                 "from",
             ))?;
     let tag = node.tag.as_ref();
-    // WAWebReceiptAck: `participant: r && r !== e ? DEVICE_JID(r) : DROP_ATTR`.
-    // This is specific to the specialized receipt ACK. Generic ACKs and NACKs
-    // preserve participant even when it duplicates the destination.
-    let participant_val = node.get_attr("participant").filter(|participant| {
-        if tag != "receipt" {
-            return true;
-        }
-        !value_refs_display_equal(participant, from_val)
-    });
+    let participant_val = ack_participant(node, from_val, participant_policy);
     // Server expects `recipient` echoed back so it can route the ack to the
     // origin companion/device (hosted-companion, peer, LID-routed stanzas).
     // Dropping it makes the server close the stream with `<stream:error><ack/>`.
@@ -1220,19 +1235,19 @@ fn message_ack_source_node(info: &crate::types::message::MessageInfo) -> Node {
     builder.build()
 }
 
-/// Build an ack Node (used in tests for structure verification).
+/// Build an automatic ack Node (used in tests for structure verification).
 #[cfg(test)]
 fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>) -> Option<Node> {
     let id = node.get_attr("id")?.to_node_value();
     let from_ref = node.get_attr("from")?;
     let from = from_ref.to_node_value();
     let tag = node.tag.as_ref();
-    // Only the specialized receipt ACK drops a participant that duplicates
-    // `to` (the flipped `from`).
-    let participant = node
-        .get_attr("participant")
-        .filter(|participant| tag != "receipt" || !value_refs_display_equal(participant, from_ref))
-        .map(|v| v.to_node_value());
+    let participant = ack_participant(
+        node,
+        from_ref,
+        AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+    )
+    .map(|value| value.to_node_value());
     let recipient = node.get_attr("recipient").map(|v| v.to_node_value());
     let typ = if !is_encrypt_identity_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())

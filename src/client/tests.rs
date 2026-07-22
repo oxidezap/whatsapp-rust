@@ -2332,8 +2332,12 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
         .attr("type", "text")
         .attr("recipient", "146991363395800@lid")
         .build();
-    let buf = encode_ack_bytes(&with_recipient.as_node_ref(), Some(&own_device_pn))
-        .expect("encode_ack_bytes should produce bytes");
+    let buf = encode_ack_bytes(
+        &with_recipient.as_node_ref(),
+        Some(&own_device_pn),
+        AckParticipantPolicy::Preserve,
+    )
+    .expect("encode_ack_bytes should produce bytes");
     // The Encoder prepends a leading format byte (see `marshal`); the
     // decoder wants raw protocol bytes — same handling as `node_to_owned_ref`.
     let decoded =
@@ -2364,8 +2368,12 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
         .attr("type", "text")
         .attr("participant", "181531758878822@lid")
         .build();
-    let buf = encode_ack_bytes(&without_recipient.as_node_ref(), Some(&own_device_pn))
-        .expect("encode_ack_bytes should produce bytes");
+    let buf = encode_ack_bytes(
+        &without_recipient.as_node_ref(),
+        Some(&own_device_pn),
+        AckParticipantPolicy::Preserve,
+    )
+    .expect("encode_ack_bytes should produce bytes");
     let decoded =
         wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
     assert!(
@@ -2380,7 +2388,11 @@ fn test_encode_ack_bytes_requires_public_response_inputs() {
         .attr("from", "15551234567@s.whatsapp.net")
         .build();
     assert!(matches!(
-        encode_ack_bytes(&without_id.as_node_ref(), None),
+        encode_ack_bytes(
+            &without_id.as_node_ref(),
+            None,
+            AckParticipantPolicy::Preserve,
+        ),
         Err(crate::features::StanzaResponseError::MissingAttribute("id"))
     ));
 
@@ -2388,7 +2400,11 @@ fn test_encode_ack_bytes_requires_public_response_inputs() {
         .attr("id", "MISSING-FROM")
         .build();
     assert!(matches!(
-        encode_ack_bytes(&without_from.as_node_ref(), None),
+        encode_ack_bytes(
+            &without_from.as_node_ref(),
+            None,
+            AckParticipantPolicy::Preserve,
+        ),
         Err(crate::features::StanzaResponseError::MissingAttribute(
             "from"
         ))
@@ -2399,7 +2415,7 @@ fn test_encode_ack_bytes_requires_public_response_inputs() {
         .attr("from", "15551234567@s.whatsapp.net")
         .build();
     assert!(matches!(
-        encode_ack_bytes(&message.as_node_ref(), None),
+        encode_ack_bytes(&message.as_node_ref(), None, AckParticipantPolicy::Preserve,),
         Err(crate::features::StanzaResponseError::MissingLocalIdentity)
     ));
 }
@@ -2413,8 +2429,12 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         .attr("participant", "15551234567@s.whatsapp.net")
         .attr("type", "retry")
         .build();
-    let bytes = encode_ack_bytes(&receipt.as_node_ref(), None)
-        .expect("complete receipt should produce an ack");
+    let bytes = encode_ack_bytes(
+        &receipt.as_node_ref(),
+        None,
+        AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+    )
+    .expect("complete receipt should produce an ack");
     let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
         .expect("encoded receipt ack should decode");
 
@@ -2432,13 +2452,36 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
     );
     assert!(ack.get_attr("from").is_none());
 
+    let group_receipt = NodeBuilder::new("receipt")
+        .attr("id", "GROUP-RECEIPT-ACK")
+        .attr("from", "120363098765432100@g.us")
+        .attr("participant", "12025550111:7@s.whatsapp.net")
+        .build();
+    let bytes = encode_ack_bytes(
+        &group_receipt.as_node_ref(),
+        None,
+        AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+    )
+    .expect("group receipt should produce an ack");
+    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+        .expect("encoded group receipt ack should decode");
+    assert!(
+        ack.get_attr("participant")
+            .is_some_and(|value| value.as_str() == "12025550111:7@s.whatsapp.net"),
+        "receipt ack must preserve a participant distinct from its destination"
+    );
+
     let generic = NodeBuilder::new("message")
         .attr("id", "MESSAGE-ACK")
         .attr("from", "15551234567@s.whatsapp.net")
         .attr("participant", &from)
         .build();
-    let bytes = encode_ack_bytes(&generic.as_node_ref(), Some(&from))
-        .expect("complete message should produce an ack");
+    let bytes = encode_ack_bytes(
+        &generic.as_node_ref(),
+        Some(&from),
+        AckParticipantPolicy::Preserve,
+    )
+    .expect("complete message should produce an ack");
     let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
         .expect("encoded message ack should decode");
     assert!(
@@ -2468,8 +2511,12 @@ fn test_encode_ack_bytes_compares_jid_participants_by_display() {
         .attr("from", &from)
         .attr("participant", &participant)
         .build();
-    let bytes = encode_ack_bytes(&receipt.as_node_ref(), None)
-        .expect("complete receipt should produce an ack");
+    let bytes = encode_ack_bytes(
+        &receipt.as_node_ref(),
+        None,
+        AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+    )
+    .expect("complete receipt should produce an ack");
     let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
         .expect("encoded receipt ack should decode");
 
@@ -2487,8 +2534,12 @@ fn test_encode_ack_bytes_drops_encrypt_identity_notification_type() {
         .attr("type", "encrypt")
         .children([NodeBuilder::new("identity").build()])
         .build();
-    let bytes = encode_ack_bytes(&notification.as_node_ref(), None)
-        .expect("complete notification should produce an ack");
+    let bytes = encode_ack_bytes(
+        &notification.as_node_ref(),
+        None,
+        AckParticipantPolicy::Preserve,
+    )
+    .expect("complete notification should produce an ack");
     let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
         .expect("encoded notification ack should decode");
 
@@ -2507,8 +2558,8 @@ fn test_encode_ack_bytes_preserves_call_class_and_type() {
         .attr("from", "15551234567@s.whatsapp.net")
         .attr("type", "offer_notice")
         .build();
-    let bytes =
-        encode_ack_bytes(&call.as_node_ref(), None).expect("complete call should produce an ack");
+    let bytes = encode_ack_bytes(&call.as_node_ref(), None, AckParticipantPolicy::Preserve)
+        .expect("complete call should produce an ack");
     let ack =
         wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("encoded call ack should decode");
 
