@@ -93,15 +93,31 @@ impl Client {
             jid.device = 0;
         }
         wacore::types::jid::sort_dedup_by_user(&mut jids);
-        self.fetch_user_devices(jids).await
+        self.fetch_user_devices_with_freshness(jids, crate::cache::Freshness::Refresh)
+            .await
     }
 
     async fn fetch_user_devices(&self, jids: Vec<Jid>) -> Result<Vec<Jid>, anyhow::Error> {
+        self.fetch_user_devices_with_freshness(jids, crate::cache::Freshness::CachePreferred)
+            .await
+    }
+
+    async fn fetch_user_devices_with_freshness(
+        &self,
+        jids: Vec<Jid>,
+        freshness: crate::cache::Freshness,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
         let sid = self.generate_request_id();
-        let response = self.execute(DeviceListSpec::new(jids, sid)).await?;
+        let spec = match freshness {
+            crate::cache::Freshness::CachePreferred => DeviceListSpec::new(jids, sid),
+            crate::cache::Freshness::Refresh => {
+                DeviceListSpec::new(jids, sid).require_complete_response()
+            }
+        };
+        let response = self.execute(spec).await?;
         Ok(self.process_device_list_response(&response).await)
     }
 

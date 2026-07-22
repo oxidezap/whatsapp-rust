@@ -563,13 +563,7 @@ pub struct DeviceListSpec {
     /// returns only CHANGED users (WA Web `syncDeviceList`). Users the server omits
     /// from the response are UNCHANGED and their cached devices must be preserved.
     pub hashes: std::collections::HashMap<Jid, (String, i64)>,
-    response_shape: DeviceListResponseShape,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceListResponseShape {
-    Complete,
-    Incremental,
+    require_complete_response: bool,
 }
 
 impl DeviceListSpec {
@@ -578,7 +572,7 @@ impl DeviceListSpec {
             jids,
             sid: sid.into(),
             hashes: std::collections::HashMap::new(),
-            response_shape: DeviceListResponseShape::Complete,
+            require_complete_response: false,
         }
     }
 
@@ -593,8 +587,16 @@ impl DeviceListSpec {
             jids,
             sid: sid.into(),
             hashes,
-            response_shape: DeviceListResponseShape::Incremental,
+            require_complete_response: false,
         }
+    }
+
+    /// Reject a response that omits any requested user or returns no devices
+    /// for one. Use for authoritative refreshes; ordinary fanout remains
+    /// best-effort when an individual user cannot be resolved.
+    pub fn require_complete_response(mut self) -> Self {
+        self.require_complete_response = true;
+        self
     }
 }
 
@@ -717,7 +719,7 @@ impl IqSpec for DeviceListSpec {
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
         let parsed = project_device_list_response(parse_usync_response(response)?)?;
-        if self.response_shape == DeviceListResponseShape::Complete {
+        if self.require_complete_response {
             for expected in &self.jids {
                 let Some(returned) = parsed.device_lists.iter().find(|returned| {
                     returned.user.user == expected.user && returned.user.server == expected.server
@@ -1406,7 +1408,9 @@ mod tests {
         // keeps the omitted user's cached devices (device_hash merge-safety).
         let a: Jid = "1111111111@s.whatsapp.net".parse().unwrap();
         let b: Jid = "2222222222@s.whatsapp.net".parse().unwrap();
-        let complete = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-complete");
+        let best_effort = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-best-effort");
+        let complete = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-complete")
+            .require_complete_response();
         let incremental =
             DeviceListSpec::with_hashes(vec![a, b], "sid-omit", std::collections::HashMap::new());
 
@@ -1431,9 +1435,11 @@ mod tests {
             complete.parse_response(&response.as_node_ref()).is_err(),
             "a complete query must not accept a partial snapshot"
         );
-        let result = incremental.parse_response(&response.as_node_ref()).unwrap();
-        assert_eq!(result.device_lists.len(), 1, "omitted user must not appear");
-        assert_eq!(result.device_lists[0].user.user, "1111111111");
+        for spec in [best_effort, incremental] {
+            let result = spec.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(result.device_lists.len(), 1, "omitted user must not appear");
+            assert_eq!(result.device_lists[0].user.user, "1111111111");
+        }
     }
 
     #[test]
@@ -1487,7 +1493,10 @@ mod tests {
     fn device_list_devices_error_skips_only_that_user() {
         let jid1: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let jid2: Jid = "9876543210@s.whatsapp.net".parse().unwrap();
-        let complete = DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-complete");
+        let best_effort =
+            DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-best-effort");
+        let complete = DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-complete")
+            .require_complete_response();
         let incremental = DeviceListSpec::with_hashes(
             vec![jid1, jid2],
             "test-sid",
@@ -1531,9 +1540,11 @@ mod tests {
             complete.parse_response(&response.as_node_ref()).is_err(),
             "a per-user error makes a complete snapshot unusable"
         );
-        let result = incremental.parse_response(&response.as_node_ref()).unwrap();
-        assert_eq!(result.device_lists.len(), 1);
-        assert_eq!(result.device_lists[0].user.user, "9876543210");
+        for spec in [best_effort, incremental] {
+            let result = spec.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(result.device_lists.len(), 1);
+            assert_eq!(result.device_lists[0].user.user, "9876543210");
+        }
     }
 
     #[test]
