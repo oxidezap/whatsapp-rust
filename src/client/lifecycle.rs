@@ -1187,9 +1187,8 @@ impl Client {
         self.is_connected.load(Ordering::Acquire)
     }
 
-    /// Force the connected flag (tests only): the facade's connect path now gates on `is_connected`,
-    /// so a unit test driving `spawn_call`/`place_call` must mark the client connected first.
-    #[cfg(all(test, feature = "voip-runtime"))]
+    /// Force the connected flag for tests that exercise connected-only operations.
+    #[cfg(test)]
     pub(crate) fn set_connected_for_test(&self, connected: bool) {
         self.is_connected.store(connected, Ordering::Release);
     }

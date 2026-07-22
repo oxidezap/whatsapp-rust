@@ -322,6 +322,55 @@ where
         guard.insert_new(key, value, now, self.max_capacity, self.evict_guard);
     }
 
+    /// Atomically derive and optionally store a value from the current entry.
+    ///
+    /// The closure runs synchronously under the cache's existing write lock.
+    /// Returning `None` leaves an existing value unchanged and keeps a missing
+    /// key absent. The key is cloned only when the operation inserts a new
+    /// entry.
+    pub async fn upsert_with_by_ref<Q, R>(
+        &self,
+        key: &Q,
+        update: impl FnOnce(Option<&V>) -> (Option<V>, R),
+    ) -> R
+    where
+        K: Borrow<Q>,
+        Q: ToOwned<Owned = K> + Hash + Eq + ?Sized,
+    {
+        let now = self.entry_time();
+        let mut guard = self.inner.write().await;
+
+        if guard
+            .map
+            .get(key)
+            .is_some_and(|entry| self.is_expired(entry, now))
+            && let Some(owned_key) = Self::find_key(&guard, key)
+        {
+            guard.remove_key(&owned_key);
+        }
+
+        let (next, result) = update(guard.map.get(key).map(|entry| &entry.value));
+        let Some(next) = next else {
+            return result;
+        };
+
+        if let Some(entry) = guard.map.get_mut(key) {
+            entry.value = next;
+            entry.inserted_at = now;
+            entry.last_accessed_at = now;
+        } else if self.max_capacity != Some(0) {
+            guard.insert_new(
+                key.to_owned(),
+                next,
+                now,
+                self.max_capacity,
+                self.evict_guard,
+            );
+        }
+
+        result
+    }
+
     /// Insert and return a clone of the value in one write lock.
     async fn insert_and_return(&self, key: K, value: V) -> V {
         let now = self.entry_time();
@@ -632,6 +681,38 @@ mod tests {
         cache.insert("key1".to_string(), "v2".to_string()).await;
         assert_eq!(cache.get("key1").await, Some("v2".to_string()));
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_with_by_ref_serializes_read_modify_write() {
+        let cache = Arc::new(build_cache::<String, u32>());
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let cache = Arc::clone(&cache);
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .upsert_with_by_ref("counter", |current| {
+                        let next = current.copied().unwrap_or_default() + 1;
+                        (Some(next), next)
+                    })
+                    .await
+            }));
+        }
+
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        results.sort_unstable();
+
+        assert_eq!(results, (1..=32).collect::<Vec<_>>());
+        assert_eq!(cache.get("counter").await, Some(32));
+
+        let unchanged = cache
+            .upsert_with_by_ref("counter", |current| (None, current.copied()))
+            .await;
+        assert_eq!(unchanged, Some(32));
+        assert_eq!(cache.get("counter").await, Some(32));
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 
 use crate::client::Client;
 use anyhow;
+use anyhow::Context as _;
 use log;
 
 use std::sync::atomic::Ordering;
@@ -420,7 +421,7 @@ impl Client {
         self.persistence_manager
             .flush()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
+            .context("failed to flush prekey watermarks")?;
         Ok((id, key_pair.public_key))
     }
 
@@ -460,7 +461,7 @@ impl Client {
         self.persistence_manager
             .flush()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermark after mark: {e:?}"))?;
+            .context("failed to flush prekey watermark after mark")?;
         Ok(())
     }
 
@@ -594,7 +595,7 @@ impl Client {
         self.persistence_manager
             .flush()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
+            .context("failed to flush prekey watermarks")?;
 
         // Only the leftover (already-stored) window keys are read back and decoded;
         // the fresh ones are already in `fresh_pre_keys`. On the common connect path
@@ -693,7 +694,7 @@ impl Client {
         self.persistence_manager
             .flush()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to flush abandon watermark: {e:?}"))?;
+            .context("failed to flush abandon watermark")?;
 
         self.execute(spec).await?;
 

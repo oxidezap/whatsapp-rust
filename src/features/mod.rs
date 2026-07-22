@@ -17,6 +17,7 @@ mod profile;
 mod reaction;
 mod rotate_key;
 mod signal;
+mod stanza;
 pub(crate) mod status;
 mod tctoken;
 
@@ -77,6 +78,11 @@ pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 
 pub use signal::{Signal, SignalError, SignalSessionInfo, SignalSessionMigration};
+pub(crate) use stanza::required_stanza_attr;
+pub use stanza::{
+    NackReason, RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome,
+    StanzaRejection, StanzaResponseError,
+};
 pub use wacore::message_processing::EncType;
 
 pub use tctoken::{TcToken, TcTokenError};

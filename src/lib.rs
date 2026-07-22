@@ -171,15 +171,16 @@ pub use features::{
     InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex,
-    MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterError,
+    MexError, MexErrorExtensions, MexRequest, MexResponse, NackReason, Newsletter, NewsletterError,
     NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
     NewsletterRole, NewsletterState, NewsletterVerification, ParticipantChangeResponse,
     ParticipantType, PictureType, PollError, Presence, PresenceError, PresenceStatus, Profile,
-    ProfileError, ProfilePicture, ReachoutTimelock, SecretEncKind, SecretEncrypted,
+    ProfileError, ProfilePicture, ReachoutTimelock, RetryReason, RetryRequestError,
+    RetryRequestOptions, RetryRequestOutcome, SecretEncKind, SecretEncrypted,
     SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
-    Status, StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
-    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key,
-    message_range,
+    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
+    SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo,
+    UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;

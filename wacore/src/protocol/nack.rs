@@ -1,7 +1,6 @@
-//! Codes sent as the `error` attr on `<ack class="message">` nacks
-//! (`Handle/MsgSendAck.js` + `Create/NackFromStanza.js`). Server stops
-//! retransmitting on receipt; use vs `<receipt type="retry">` for
-//! recoverable errors.
+//! Codes sent as the `error` attribute on protocol rejection acknowledgements.
+//! The server stops retransmitting on receipt; use `<receipt type="retry">`
+//! instead for recoverable errors.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 #[wire(kind = "int")]
@@ -65,5 +64,11 @@ mod tests {
         assert_eq!(NackReason::UnsupportedAdminRevoke.code(), 550);
         assert_eq!(NackReason::UnsupportedLIDGroup.code(), 551);
         assert_eq!(NackReason::DBOperationFailed.code(), 552);
+    }
+
+    #[test]
+    fn nack_reason_preserves_unknown_numeric_codes() {
+        assert_eq!(NackReason::from(599), NackReason::Unknown(599));
+        assert_eq!(NackReason::Unknown(599).code(), 599);
     }
 }

@@ -96,8 +96,7 @@ pub struct CategorizedEncNodes<'a> {
     pub has_ordering_violation: bool,
 }
 
-/// Maximum retry attempts per message (matches WhatsApp Web's MAX_RETRY = 5).
-const MAX_DECRYPT_RETRIES: u8 = 5;
+use crate::protocol::retry::MAX_RETRY_COUNT as MAX_DECRYPT_RETRIES;
 
 /// Categorize the `<enc>` child nodes of a message stanza into session (1:1)
 /// and group (sender-key) buckets.

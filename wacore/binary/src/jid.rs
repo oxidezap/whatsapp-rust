@@ -709,6 +709,21 @@ impl Jid {
         write_jid_fallible(writer, &self.user, self.server, self.agent, self.device)
     }
 
+    /// Compare the display representation with `other` without allocating.
+    #[inline]
+    pub fn display_eq(&self, other: &str) -> bool {
+        jid_display_eq(&self.user, self.server, self.agent, self.device, other)
+    }
+
+    /// Compare two JIDs by the representation emitted by [`fmt::Display`].
+    #[inline]
+    pub fn display_eq_jid(&self, other: &Self) -> bool {
+        jid_displays_equal(
+            (&self.user, self.server, self.agent, self.device),
+            (&other.user, other.server, other.agent, other.device),
+        )
+    }
+
     /// Compare device identity (user, server, device) without allocation.
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
@@ -758,6 +773,39 @@ impl<'a> JidRef<'a> {
             device: self.device,
             integrator: self.integrator,
         }
+    }
+
+    /// Compare the display representation with `other` without allocating.
+    #[inline]
+    pub fn display_eq(&self, other: &str) -> bool {
+        jid_display_eq(&self.user, self.server, self.agent, self.device, other)
+    }
+
+    /// Compare two borrowed JIDs by the representation emitted by [`fmt::Display`].
+    #[inline]
+    pub fn display_eq_jid(&self, other: &Self) -> bool {
+        jid_displays_equal(
+            (&self.user, self.server, self.agent, self.device),
+            (&other.user, other.server, other.agent, other.device),
+        )
+    }
+}
+
+impl PartialEq<JidRef<'_>> for Jid {
+    #[inline]
+    fn eq(&self, other: &JidRef<'_>) -> bool {
+        self.user.as_str() == other.user.as_ref()
+            && self.server == other.server
+            && self.agent == other.agent
+            && self.device == other.device
+            && self.integrator == other.integrator
+    }
+}
+
+impl PartialEq<Jid> for JidRef<'_> {
+    #[inline]
+    fn eq(&self, other: &Jid) -> bool {
+        other == self
     }
 }
 
@@ -963,6 +1011,52 @@ fn write_jid_fallible<W: fmt::Write + ?Sized>(
     write_jid!(fallible w, user, server, agent, device)
 }
 
+struct StrEqWriter<'a> {
+    target: &'a [u8],
+    position: usize,
+    matches: bool,
+}
+
+impl fmt::Write for StrEqWriter<'_> {
+    #[inline]
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.matches {
+            let bytes = value.as_bytes();
+            let end = self.position + bytes.len();
+            if end > self.target.len() || self.target[self.position..end] != *bytes {
+                self.matches = false;
+            }
+            self.position = end;
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn jid_display_eq(user: &str, server: Server, agent: u8, device: u16, other: &str) -> bool {
+    let mut writer = StrEqWriter {
+        target: other.as_bytes(),
+        position: 0,
+        matches: true,
+    };
+    let written = write_jid_fallible(&mut writer, user, server, agent, device).is_ok();
+    written && writer.matches && writer.position == other.len()
+}
+
+#[inline]
+fn jid_displays_equal(left: (&str, Server, u8, u16), right: (&str, Server, u8, u16)) -> bool {
+    let (left_user, left_server, left_agent, left_device) = left;
+    let (right_user, right_server, right_agent, right_device) = right;
+    if left_user.is_empty() || right_user.is_empty() {
+        return left_user.is_empty() && right_user.is_empty() && left_server == right_server;
+    }
+
+    left_user == right_user
+        && left_server == right_server
+        && left_device == right_device
+        && (!left_server.renders_agent() || left_agent == right_agent)
+}
+
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut w = JidStackWriter::new();
@@ -1113,6 +1207,117 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn display_eq_matches_owned_and_borrowed_jids_without_normalizing() {
+        let canonical = "123456789.4:17@interop";
+        let owned = Jid::from_str(canonical).unwrap();
+        let borrowed = parse_jid_ref(canonical).unwrap();
+
+        for value in [canonical, "123456789.4:16@interop", "123456789@interop", ""] {
+            assert_eq!(owned.display_eq(value), value == canonical);
+            assert_eq!(borrowed.display_eq(value), value == canonical);
+        }
+
+        let long_user = "a".repeat(128);
+        let long_value = format!("{long_user}@lid");
+        let long_jid = Jid::lid(long_user);
+        assert!(long_jid.display_eq(&long_value));
+        assert!(!long_jid.display_eq(&format!("{long_value}x")));
+    }
+
+    #[test]
+    fn display_eq_jid_uses_only_rendered_components() {
+        let pn = Jid {
+            user: "12025550111".into(),
+            server: Server::Pn,
+            agent: 1,
+            device: 7,
+            integrator: 3,
+        };
+        let pn_same_display = Jid {
+            agent: 2,
+            integrator: 9,
+            ..pn.clone()
+        };
+        assert_eq!(pn.to_string(), pn_same_display.to_string());
+        assert!(pn.display_eq_jid(&pn_same_display));
+
+        let pn_other_device = Jid {
+            device: 8,
+            ..pn.clone()
+        };
+        assert!(!pn.display_eq_jid(&pn_other_device));
+
+        let bot = Jid {
+            user: "13136555001".into(),
+            server: Server::Bot,
+            agent: 1,
+            device: 0,
+            integrator: 0,
+        };
+        let other_bot_agent = Jid {
+            agent: 2,
+            ..bot.clone()
+        };
+        assert!(!bot.display_eq_jid(&other_bot_agent));
+
+        let server_only = Jid {
+            user: "".into(),
+            server: Server::Pn,
+            agent: 1,
+            device: 7,
+            integrator: 3,
+        };
+        let same_server_only = Jid {
+            agent: 2,
+            device: 9,
+            integrator: 4,
+            ..server_only.clone()
+        };
+        assert_eq!(server_only.to_string(), same_server_only.to_string());
+        assert!(server_only.display_eq_jid(&same_server_only));
+
+        let borrowed = JidRef {
+            user: NodeStr::Borrowed("12025550111"),
+            server: Server::Pn,
+            agent: 1,
+            device: 7,
+            integrator: 0,
+        };
+        let borrowed_same_display = JidRef {
+            agent: 2,
+            ..borrowed.clone()
+        };
+        assert!(borrowed.display_eq_jid(&borrowed_same_display));
+    }
+
+    #[test]
+    fn owned_and_borrowed_jids_compare_without_conversion() {
+        let owned = Jid {
+            user: "12025550111".into(),
+            server: Server::Pn,
+            agent: 0,
+            device: 7,
+            integrator: 0,
+        };
+        let borrowed = JidRef {
+            user: NodeStr::Borrowed("12025550111"),
+            server: Server::Pn,
+            agent: 0,
+            device: 7,
+            integrator: 0,
+        };
+
+        assert_eq!(owned, borrowed);
+        assert_eq!(borrowed, owned);
+
+        let other_device = JidRef {
+            device: 8,
+            ..borrowed.clone()
+        };
+        assert_ne!(owned, other_device);
+    }
 
     #[cfg(feature = "serde")]
     #[test]
