@@ -251,6 +251,7 @@ pub enum EventKind {
     HistorySync,
     OfflineSyncPreview,
     OfflineSyncCompleted,
+    DirtyState,
     DeviceListUpdate,
     IdentityChange,
     BusinessStatusUpdate,
@@ -623,7 +624,11 @@ pub struct DisappearingModeChanged {
 /// `maybe_*` setter), never an empty-string / zero sentinel. Even the
 /// unit-marker events are empty sealed structs built as
 /// `Connected::builder().build()`, so a new payload must follow the pattern.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Debug` output is intentionally variant-name-only (`{:?}` prints e.g.
+/// `Messages`): a derived impl would drag the entire generated proto `Debug`
+/// graph into the binary. `Serialize` the event when full contents are needed.
+#[derive(Clone, Serialize)]
 #[non_exhaustive]
 pub enum Event {
     Connected(Connected),
@@ -637,8 +642,7 @@ pub enum Event {
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
-    /// One or more decrypted inbound messages, in arrival order (Baileys'
-    /// `messages.upsert` shape). Live traffic arrives as single-message
+    /// One or more decrypted inbound messages, in arrival order. Live traffic arrives as single-message
     /// batches; an offline drain delivers one batch per durable commit, so a
     /// consumer never sees a message that a registered durability hook has
     /// not committed. The `Arc` slice is shared with the hook call — same
@@ -708,6 +712,8 @@ pub enum Event {
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
     OfflineSyncCompleted(OfflineSyncCompleted),
+    /// The server marked one of its cached protocol domains dirty.
+    DirtyState(DirtyState),
 
     /// Device list changed for a user (device added/removed/updated)
     DeviceListUpdate(DeviceListUpdate),
@@ -843,6 +849,7 @@ impl Event {
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
+            Event::DirtyState(_) => EventKind::DirtyState,
             Event::DeviceListUpdate(_) => EventKind::DeviceListUpdate,
             Event::IdentityChange(_) => EventKind::IdentityChange,
             Event::BusinessStatusUpdate(_) => EventKind::BusinessStatusUpdate,
@@ -880,6 +887,15 @@ impl Event {
     }
 }
 
+// Variant name only, on purpose: Messages/HistorySync transitively contain
+// `wa::Message`, so a derived impl would keep the entire generated proto Debug
+// graph (hundreds of KiB) in the binary. Serialize the event for full contents.
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.kind(), f)
+    }
+}
+
 /// One decrypted inbound message. The same items (and order) back both
 /// consumer surfaces: the durability hook's batch and [`Event::Messages`].
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -889,8 +905,7 @@ pub struct InboundMessage {
     pub info: Arc<MessageInfo>,
 }
 
-/// How a [`MessageBatch`] was delivered. Mirrors Baileys' `messages.upsert`
-/// `type` field (`notify` / `append`). This describes the delivery shape,
+/// How a [`MessageBatch`] was delivered. This describes the delivery shape,
 /// not a message's provenance: whether a stanza came from the offline queue
 /// is `info.is_offline` on each [`InboundMessage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1177,6 +1192,19 @@ pub struct OfflineSyncCompleted {
     pub count: i32,
 }
 
+/// A valid `<ib><dirty>` marker received from the server.
+///
+/// The client still performs its built-in clean/resync work; this event lets
+/// consumers refresh domain-specific derived state without observing every raw
+/// stanza.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DirtyState {
+    pub dirty_type: crate::iq::dirty::DirtyType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum DecryptFailMode {
     #[wire = "show"]
@@ -1375,16 +1403,37 @@ pub struct ContactSyncRequested {
 pub struct GroupUpdate {
     /// The group this update applies to
     pub group_jid: Jid,
+    /// Identifier of the source notification stanza.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
+    /// Display name supplied with the source notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
+    /// Raw offline-delivery marker supplied with the source notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
+    /// Zero-based emitted-action index within the source notification.
+    #[builder(default)]
+    pub action_index: u32,
     /// The admin/user who triggered the change (`participant` attribute)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant: Option<Jid>,
     /// Phone number JID of the participant (for LID-addressed groups)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_pn: Option<Jid>,
+    /// Username of the participant, when supplied by the group notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_username: Option<String>,
+    /// Country code supplied for the participant by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_country_code: Option<String>,
     /// When the change occurred
     pub timestamp: DateTime<Utc>,
     /// Whether the group uses LID addressing mode
     pub is_lid_addressing_mode: bool,
+    /// Whether participant identity information was incomplete in the source stanza.
+    #[builder(default)]
+    pub has_incomplete_participant_information: bool,
     /// The specific action
     pub action: crate::stanza::groups::GroupNotificationAction,
 }
@@ -1544,10 +1593,41 @@ pub struct LabelAssociationUpdate {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
+
+    #[test]
+    fn group_update_builder_defaults_additive_scalar_fields() {
+        let update = GroupUpdate::builder()
+            .group_jid("120363000000000001@g.us".parse().unwrap())
+            .timestamp(DateTime::<Utc>::UNIX_EPOCH)
+            .is_lid_addressing_mode(false)
+            .action(crate::stanza::groups::GroupNotificationAction::Unlocked)
+            .build();
+
+        assert_eq!(update.action_index, 0);
+        assert!(!update.has_incomplete_participant_information);
+    }
+
+    #[test]
+    fn dirty_state_preserves_wire_type_and_optional_timestamp() {
+        let dirty = DirtyState::builder()
+            .dirty_type(crate::iq::dirty::DirtyType::Groups)
+            .maybe_timestamp(Some(1_725_000_000))
+            .build();
+
+        assert_eq!(
+            serde_json::to_value(&dirty).unwrap(),
+            serde_json::json!({
+                "dirty_type": "groups",
+                "timestamp": 1_725_000_000_u64,
+            })
+        );
+        assert_eq!(Event::DirtyState(dirty).kind(), EventKind::DirtyState);
+    }
 
     #[test]
     fn unavailable_fanout_flags_follow_wa_web_precedence() {

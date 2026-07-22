@@ -164,6 +164,11 @@ impl Client {
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.lock().await.len();
         let chatstate_handlers = self.chatstate_handlers.read().await.len();
+        let history_sync_activity = self.history_sync_activity.snapshot();
+        let history_sync_tasks = CollectionStats::new(
+            history_sync_activity.tasks as u64,
+            history_sync_activity.payload_bytes as u64,
+        );
 
         MemoryReport {
             group_cache,
@@ -177,6 +182,9 @@ impl Client {
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
             pdo_requested: self.pdo_requested.entry_count(),
+            history_sync_tasks,
+            history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
+            history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
             group_distribution_locks: group_distribution_locks.entries,

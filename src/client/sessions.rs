@@ -1,9 +1,13 @@
 //! E2E Session management for Client.
 
 use anyhow::Result;
+use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use wacore::libsignal::protocol::{
+    IdentityChange, PreKeyBundle, SignalProtocolError, UsePQRatchet, process_prekey_bundle,
+};
 use wacore::libsignal::store::SessionStore;
 use wacore::types::jid::JidExt;
 use wacore_binary::Jid;
@@ -12,6 +16,38 @@ use super::Client;
 use crate::types::events::{Event, OfflineSyncCompleted};
 
 impl Client {
+    /// Install a supplied pre-key bundle into the shared Signal cache.
+    ///
+    /// The caller owns batching and the final durability flush. Keeping those
+    /// outside lets multi-device establishment reuse one adapter and one flush.
+    pub(crate) async fn install_prekey_bundle_cached(
+        &self,
+        jid: &Jid,
+        bundle: &PreKeyBundle,
+        adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
+        rng: &mut StdRng,
+    ) -> Result<IdentityChange, SignalProtocolError> {
+        let signal_address = jid.to_protocol_address();
+        let session_mutex = self.session_lock_for(signal_address.as_str()).await;
+        let session_guard = session_mutex.lock().await;
+
+        let identity_change = process_prekey_bundle(
+            &signal_address,
+            &mut adapter.session_store,
+            &mut adapter.identity_store,
+            bundle,
+            rng,
+            UsePQRatchet::No,
+        )
+        .await?;
+
+        drop(session_guard);
+        if identity_change == IdentityChange::ReplacedExisting {
+            self.react_to_local_identity_change(jid);
+        }
+        Ok(identity_change)
+    }
+
     /// WA Web: `WAWebOfflineResumeConst.OFFLINE_STANZA_TIMEOUT_MS = 60000`
     pub(crate) const DEFAULT_OFFLINE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -213,25 +249,11 @@ impl Client {
         }
     }
 
-    pub(crate) fn begin_history_sync_task(&self) {
-        self.history_sync_tasks_in_flight
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn finish_history_sync_task(&self) {
-        // The `previous <= 1` clamp is also the underflow guard: a detached task
-        // that finishes after cleanup_connection_state() reset the counter to 0
-        // hits fetch_sub-from-0, which momentarily wraps the stored value to
-        // usize::MAX — but previous == 0 takes this branch and stores 0, so the
-        // wrap never sticks (and it never leaves the idle waiter blocked).
-        let previous = self
-            .history_sync_tasks_in_flight
-            .fetch_sub(1, Ordering::Relaxed);
-        if previous <= 1 {
-            self.history_sync_tasks_in_flight
-                .store(0, Ordering::Relaxed);
-            self.history_sync_idle_notifier.notify(usize::MAX);
-        }
+    pub(crate) fn begin_history_sync_task(
+        &self,
+        payload_bytes: usize,
+    ) -> crate::sync_task::HistorySyncTaskTracker {
+        self.history_sync_activity.begin(payload_bytes)
     }
 
     pub async fn wait_for_startup_sync(&self, timeout: std::time::Duration) -> Result<()> {
@@ -251,8 +273,8 @@ impl Client {
         }
 
         loop {
-            let history_fut = self.history_sync_idle_notifier.listen();
-            if self.history_sync_tasks_in_flight.load(Ordering::Relaxed) == 0 {
+            let history_fut = self.history_sync_activity.listen();
+            if self.history_sync_activity.tasks() == 0 {
                 return Ok(());
             }
 
@@ -352,9 +374,6 @@ impl Client {
     /// Returns the number of sessions successfully established.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_establish", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn fetch_and_establish_sessions(&self, jids: &[Jid]) -> Result<usize, anyhow::Error> {
-        use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
-        use wacore::types::jid::JidExt;
-
         if jids.is_empty() {
             return Ok(0);
         }
@@ -364,6 +383,7 @@ impl Client {
             .await?;
 
         let mut adapter = self.signal_adapter().await;
+        let mut rng = rand::make_rng::<StdRng>();
 
         let mut success_count = 0;
         let mut missing_count = 0;
@@ -371,30 +391,13 @@ impl Client {
 
         for jid in jids {
             if let Some(bundle) = prekey_bundles.get(&jid.normalize_for_prekey_bundle()) {
-                let signal_addr = jid.to_protocol_address();
-
-                // Acquire per-sender session lock to prevent race with concurrent message decryption.
-                let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
-                let _session_guard = session_mutex.lock().await;
-
-                match process_prekey_bundle(
-                    &signal_addr,
-                    &mut adapter.session_store,
-                    &mut adapter.identity_store,
-                    bundle,
-                    &mut rand::make_rng::<rand::rngs::StdRng>(),
-                    UsePQRatchet::No,
-                )
-                .await
+                match self
+                    .install_prekey_bundle_cached(jid, bundle, &mut adapter, &mut rng)
+                    .await
                 {
-                    Ok(identity_change) => {
+                    Ok(_) => {
                         success_count += 1;
                         log::debug!("Successfully established session with {}", jid.observe());
-                        if identity_change
-                            == wacore::libsignal::protocol::IdentityChange::ReplacedExisting
-                        {
-                            self.react_to_local_identity_change(jid);
-                        }
                     }
                     Err(e) => {
                         failed_count += 1;

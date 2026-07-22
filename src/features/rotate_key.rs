@@ -7,12 +7,10 @@
 
 use crate::client::Client;
 use crate::request::IqError;
-use buffa::Message;
 use wacore::iq::prekeys::RotateSignedPreKeySpec;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wacore::libsignal::store::record_helpers::new_signed_pre_key_record;
 use wacore::store::commands::DeviceCommand;
-use waproto::whatsapp::SignedPreKeyRecordStructure;
 
 /// Rotation cadence. This is the one value NOT grounded in the WA Web bundle
 /// (there it is a persisted background job with a server-tuned schedule), so
@@ -73,7 +71,7 @@ impl Client {
         }
 
         if should_rotate_signed_pre_key(last, now) {
-            self.rotate_signed_pre_key().await?;
+            self.rotate_signed_pre_key_inner().await?;
         }
         Ok(())
     }
@@ -89,10 +87,14 @@ impl Client {
     /// ambiguous transport error (the server may have accepted `new_id`) leaves
     /// the staged key decryptable via the load fallback; a definitive rejection
     /// just leaves the current key in place to retry — never advancing the
-    /// cadence or pruning the key the server still hands out. A single-flight
-    /// lock ([`maybe_rotate_signed_pre_key`]) keeps overlapping tasks from
-    /// racing this sequence.
-    pub(crate) async fn rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
+    /// cadence or pruning the key the server still hands out. Calls are
+    /// serialized with the automatic rotation path.
+    pub async fn rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
+        let _guard = self.signed_pre_key_rotation_lock.lock().await;
+        self.rotate_signed_pre_key_inner().await
+    }
+
+    async fn rotate_signed_pre_key_inner(&self) -> Result<(), anyhow::Error> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let now = wacore::time::now_millis();
         let backend = self.persistence_manager.backend();
@@ -110,7 +112,7 @@ impl Client {
             .map_err(|e| anyhow::anyhow!("failed to load staged signed pre-key: {e}"))?
         {
             Some(bytes) => {
-                let s = SignedPreKeyRecordStructure::decode_from_slice(&bytes)
+                let s = waproto::codec::signed_pre_key_record_decode(&bytes)
                     .map_err(|e| anyhow::anyhow!("staged signed pre-key decode: {e}"))?;
                 let public = PublicKey::from_djb_public_key_bytes(
                     s.public_key
@@ -143,7 +145,10 @@ impl Client {
                 let record =
                     new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
                 backend
-                    .store_signed_prekey(new_id, &record.encode_to_vec())
+                    .store_signed_prekey(
+                        new_id,
+                        &waproto::codec::signed_pre_key_record_to_vec(&record),
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to stage new signed pre-key: {e}"))?;
                 (kp, signature)
@@ -161,57 +166,61 @@ impl Client {
             wacore::time::now_utc(),
         );
         backend
-            .store_signed_prekey(old_id, &old_record.encode_to_vec())
+            .store_signed_prekey(
+                old_id,
+                &waproto::codec::signed_pre_key_record_to_vec(&old_record),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("failed to retain old signed pre-key: {e}"))?;
 
         // WA Web reads 406 = bad key, 409 = server validation fail, >=500 =
-        // transient; none warrant hard-failing login or advancing local state.
-        // On any failure the staged candidate stays put for the next retry.
-        match self
+        // transient; none advance local state or fail the automatic login path.
+        // Deterministic rejections discard the candidate; retryable and
+        // ambiguous failures retain it verbatim for the next attempt.
+        let upload_result = self
             .execute(RotateSignedPreKeySpec::new(
                 new_id,
                 new_kp.public_key,
                 signature.to_vec(),
             ))
-            .await
-        {
+            .await;
+        match upload_result {
             Ok(()) => {}
-            Err(IqError::ServerError { code, text, .. }) => {
-                // WA Web treats 406 (bad key) and 409 (validation fail) as
-                // deterministic rejections of THIS key; reusing the staged
-                // candidate on retry would then wedge rotation forever (old_id
-                // never advances, so new_id is recomputed the same). Drop it to
-                // force a fresh mint — and REQUIRE the cleanup: if the remove
-                // fails, propagate so we never silently leave the rejected key
-                // staged. Every other code (rate limits, transient 5xx, …) is
-                // retryable, so keep the staged key for a plain retry.
-                if code == 406 || code == 409 {
-                    backend.remove_signed_prekey(new_id).await.map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to drop rejected staged signed pre-key {new_id}: {e}"
-                        )
-                    })?;
-                    log::warn!(
-                        "signed pre-key rotation rejected (code={code}, text='{text}'); \
-                         discarded the rejected key, will remint on a later connect"
-                    );
+            Err(error) => {
+                if let IqError::ServerError { code, text, .. } = &error {
+                    // WA Web treats 406 (bad key) and 409 (validation fail) as
+                    // deterministic rejections of THIS key; reusing the staged
+                    // candidate on retry would then wedge rotation forever (old_id
+                    // never advances, so new_id is recomputed the same). Drop it to
+                    // force a fresh mint — and REQUIRE the cleanup: if the remove
+                    // fails, propagate so we never silently leave the rejected key
+                    // staged. Every other code (rate limits, transient 5xx, …) is
+                    // retryable, so keep the staged key for a plain retry.
+                    if *code == 406 || *code == 409 {
+                        backend.remove_signed_prekey(new_id).await.map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to drop rejected staged signed pre-key {new_id}: {e}"
+                            )
+                        })?;
+                        log::warn!(
+                            "signed pre-key rotation rejected (code={code}, text='{text}'); \
+                             discarded the rejected key, will remint on a later connect"
+                        );
+                    } else {
+                        log::warn!(
+                            "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
+                             keeping the staged key, will retry on a later connect"
+                        );
+                    }
                 } else {
+                    // Ambiguous transport failure: the server may have accepted the
+                    // key, so keep the staged candidate and reuse it on retry.
                     log::warn!(
-                        "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
+                        "signed pre-key rotation upload failed: {error:?}; \
                          keeping the staged key, will retry on a later connect"
                     );
                 }
-                return Ok(());
-            }
-            Err(e) => {
-                // Ambiguous transport failure: the server may have accepted the
-                // key, so keep the staged candidate and reuse it on retry.
-                log::warn!(
-                    "signed pre-key rotation upload failed: {e:?}; \
-                     keeping the staged key, will retry on a later connect"
-                );
-                return Ok(());
+                return Err(error.into());
             }
         }
 
@@ -294,5 +303,78 @@ mod tests {
         );
         // At and beyond the 24-bit border, wrap back to 1.
         assert_eq!(next_signed_pre_key_id(MAX_SIGNED_PRE_KEY_ID), 1);
+    }
+
+    #[tokio::test]
+    async fn public_rotation_uses_the_single_flight_lock() {
+        let client = crate::test_utils::create_test_client().await;
+        let guard = client.signed_pre_key_rotation_lock.lock().await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client.rotate_signed_pre_key(),
+            )
+            .await
+            .is_err(),
+            "manual rotation must serialize with an active rotation"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn due_automatic_rotation_does_not_relock_its_single_flight_guard() {
+        let client = crate::test_utils::create_test_client().await;
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let staged_id = next_signed_pre_key_id(snapshot.signed_pre_key_id);
+        let due_baseline =
+            wacore::time::now_millis().saturating_sub(SIGNED_PRE_KEY_ROTATION_INTERVAL_MS);
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetSignedPreKeyRotationBaseline(due_baseline))
+            .await;
+        client
+            .persistence_manager
+            .flush()
+            .await
+            .expect("persist due rotation baseline");
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.maybe_rotate_signed_pre_key(),
+        )
+        .await
+        .expect("automatic rotation must not recursively acquire its held lock")
+        .expect_err("the disconnected test client must fail at upload");
+        assert!(
+            error
+                .downcast_ref::<IqError>()
+                .is_some_and(|error| matches!(error, IqError::NotConnected))
+        );
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .load_signed_prekey(staged_id)
+                .await
+                .expect("load staged signed pre-key")
+                .is_some(),
+            "the due path must reach the inner rotation flow before upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_rotation_reports_upload_failure() {
+        let client = crate::test_utils::create_test_client().await;
+
+        let error = client
+            .rotate_signed_pre_key()
+            .await
+            .expect_err("manual rotation must report a failed upload");
+        assert!(
+            error
+                .downcast_ref::<IqError>()
+                .is_some_and(|error| matches!(error, IqError::NotConnected))
+        );
     }
 }

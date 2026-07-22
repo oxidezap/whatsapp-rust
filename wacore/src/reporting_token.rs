@@ -17,7 +17,7 @@
 //! without seeing the full message content. Only specific fields are extracted
 //! based on a predefined whitelist matching WhatsApp Web behavior.
 
-use std::sync::LazyLock;
+use std::{fmt, sync::LazyLock};
 
 use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
@@ -257,6 +257,69 @@ pub const REPORTING_TOKEN_SIZE: usize = 16;
 /// This string is appended to the HKDF info as per WhatsApp Web implementation.
 const USE_CASE_REPORT_TOKEN: &str = "Report Token";
 
+/// Keeps the normal reporting-token info (`stanza || sender || remote || use-case`)
+/// on the stack. This is a performance threshold, not a protocol limit: longer
+/// inputs transparently use a heap buffer with room for subsequent formatter
+/// writes.
+const REPORTING_TOKEN_INFO_INLINE_CAPACITY: usize = 128;
+
+enum ReportingTokenInfo {
+    Inline {
+        bytes: [u8; REPORTING_TOKEN_INFO_INLINE_CAPACITY],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl ReportingTokenInfo {
+    fn with_capacity(capacity: usize) -> Self {
+        if capacity <= REPORTING_TOKEN_INFO_INLINE_CAPACITY {
+            Self::Inline {
+                bytes: [0; REPORTING_TOKEN_INFO_INLINE_CAPACITY],
+                len: 0,
+            }
+        } else {
+            Self::Heap(Vec::with_capacity(capacity))
+        }
+    }
+
+    fn extend_from_slice(&mut self, value: &[u8]) {
+        match self {
+            Self::Inline { bytes, len } => {
+                let end = *len + value.len();
+                if end <= bytes.len() {
+                    bytes[*len..end].copy_from_slice(value);
+                    *len = end;
+                    return;
+                }
+
+                // JIDs are emitted in multiple `fmt::Write` calls. Keep one
+                // inline buffer's worth of spare capacity so promotion does not
+                // immediately reallocate on the remaining JID/use-case writes.
+                let mut heap = Vec::with_capacity(end + REPORTING_TOKEN_INFO_INLINE_CAPACITY);
+                heap.extend_from_slice(&bytes[..*len]);
+                heap.extend_from_slice(value);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(bytes) => bytes.extend_from_slice(value),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl fmt::Write for ReportingTokenInfo {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+}
+
 /// HKDF-Extract with no salt is `HMAC-SHA256(zero_block, ikm)`, so the zero-key
 /// ipad/opad schedule is constant across every send. Cache it once and clone per
 /// derivation instead of re-running `Hkdf::new(None, ..)`'s two compressions each
@@ -277,14 +340,79 @@ pub fn generate_message_secret() -> [u8; MESSAGE_SECRET_SIZE] {
 ///
 /// The info is constructed as: stanza_id || sender_jid || remote_jid || "Report Token"
 /// This matches WhatsApp Web's Binary.build(stanzaId, senderJid, remoteJid, REPORT_TOKEN)
-fn build_hkdf_info(stanza_id: &str, sender_jid: &str, remote_jid: &str) -> Vec<u8> {
-    let cap = stanza_id.len() + sender_jid.len() + remote_jid.len() + USE_CASE_REPORT_TOKEN.len();
-    let mut info = Vec::with_capacity(cap);
+fn build_hkdf_info_with(
+    stanza_id: &str,
+    sender_len: usize,
+    remote_len: usize,
+    write_jids: impl FnOnce(&mut ReportingTokenInfo) -> fmt::Result,
+) -> Result<ReportingTokenInfo> {
+    let capacity = stanza_id
+        .len()
+        .checked_add(sender_len)
+        .and_then(|len| len.checked_add(remote_len))
+        .and_then(|len| len.checked_add(USE_CASE_REPORT_TOKEN.len()))
+        .ok_or_else(|| anyhow!("Reporting token HKDF info length overflow"))?;
+
+    let mut info = ReportingTokenInfo::with_capacity(capacity);
     info.extend_from_slice(stanza_id.as_bytes());
-    info.extend_from_slice(sender_jid.as_bytes());
-    info.extend_from_slice(remote_jid.as_bytes());
+    write_jids(&mut info).map_err(|_| anyhow!("Failed to format reporting token JIDs"))?;
     info.extend_from_slice(USE_CASE_REPORT_TOKEN.as_bytes());
-    info
+    Ok(info)
+}
+
+fn build_hkdf_info(
+    stanza_id: &str,
+    sender_jid: &str,
+    remote_jid: &str,
+) -> Result<ReportingTokenInfo> {
+    build_hkdf_info_with(stanza_id, sender_jid.len(), remote_jid.len(), |info| {
+        info.extend_from_slice(sender_jid.as_bytes());
+        info.extend_from_slice(remote_jid.as_bytes());
+        Ok(())
+    })
+}
+
+fn build_hkdf_info_for_jids(
+    stanza_id: &str,
+    sender_jid: &Jid,
+    remote_jid: &Jid,
+) -> Result<ReportingTokenInfo> {
+    // Start inline and let the infallible writer promote only unusually long
+    // protocol inputs. Avoiding a separate sizing pass formats each JID once.
+    build_hkdf_info_with(stanza_id, 0, 0, |info| {
+        sender_jid.write_display_to(info)?;
+        remote_jid.write_display_to(info)
+    })
+}
+
+fn validate_message_secret(message_secret: &[u8]) -> Result<()> {
+    if message_secret.len() == MESSAGE_SECRET_SIZE {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Invalid message secret size: expected {}, got {}",
+        MESSAGE_SECRET_SIZE,
+        message_secret.len()
+    ))
+}
+
+fn derive_reporting_token_key_from_info(
+    message_secret: &[u8],
+    info: &[u8],
+) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE]> {
+    // No-salt extract via the cached zero-keyed HMAC; output is byte-identical to
+    // `Hkdf::new(None, message_secret)` but skips the constant ipad/opad schedule.
+    let mut extract = REPORTING_TOKEN_EXTRACT_HMAC.clone();
+    extract.update(message_secret);
+    let prk = extract.finalize().into_bytes();
+    let mut key = [0u8; REPORTING_TOKEN_KEY_SIZE];
+    Hkdf::<Sha256>::from_prk(&prk)
+        .expect("PRK is hash-sized")
+        .expand(info, &mut key)
+        .map_err(|e| anyhow!("HKDF expand failed: {}", e))?;
+
+    Ok(key)
 }
 
 /// Derive the reporting token key from the message secret using HKDF.
@@ -303,28 +431,20 @@ pub fn derive_reporting_token_key(
     sender_jid: &str,
     remote_jid: &str,
 ) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE]> {
-    if message_secret.len() != MESSAGE_SECRET_SIZE {
-        return Err(anyhow!(
-            "Invalid message secret size: expected {}, got {}",
-            MESSAGE_SECRET_SIZE,
-            message_secret.len()
-        ));
-    }
+    validate_message_secret(message_secret)?;
+    let info = build_hkdf_info(stanza_id, sender_jid, remote_jid)?;
+    derive_reporting_token_key_from_info(message_secret, info.as_bytes())
+}
 
-    let info = build_hkdf_info(stanza_id, sender_jid, remote_jid);
-
-    // No-salt extract via the cached zero-keyed HMAC; output is byte-identical to
-    // `Hkdf::new(None, message_secret)` but skips the constant ipad/opad schedule.
-    let mut extract = REPORTING_TOKEN_EXTRACT_HMAC.clone();
-    extract.update(message_secret);
-    let prk = extract.finalize().into_bytes();
-    let mut key = [0u8; REPORTING_TOKEN_KEY_SIZE];
-    Hkdf::<Sha256>::from_prk(&prk)
-        .expect("PRK is hash-sized")
-        .expand(&info, &mut key)
-        .map_err(|e| anyhow!("HKDF expand failed: {}", e))?;
-
-    Ok(key)
+fn derive_reporting_token_key_for_jids(
+    message_secret: &[u8],
+    stanza_id: &str,
+    sender_jid: &Jid,
+    remote_jid: &Jid,
+) -> Result<[u8; REPORTING_TOKEN_KEY_SIZE]> {
+    validate_message_secret(message_secret)?;
+    let info = build_hkdf_info_for_jids(stanza_id, sender_jid, remote_jid)?;
+    derive_reporting_token_key_from_info(message_secret, info.as_bytes())
 }
 
 /// Decode a varint from a byte slice.
@@ -591,6 +711,10 @@ pub fn generate_reporting_token(
 /// again. The DM send path encodes the message once for the wire plaintext and threads
 /// those same bytes here, so a token-bearing DM no longer encodes its message a second
 /// time per send just to extract the token's whitelisted fields.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.reporting_token", level = "debug", skip_all)
+)]
 pub fn generate_reporting_token_from_encoded(
     message: &wa::Message,
     encoded_message: &[u8],
@@ -615,11 +739,8 @@ pub fn generate_reporting_token_from_encoded(
         generate_message_secret()
     };
 
-    let sender_jid_str = sender_jid.to_string();
-    let remote_jid_str = remote_jid.to_string();
-
     let key =
-        derive_reporting_token_key(&message_secret, stanza_id, &sender_jid_str, &remote_jid_str)
+        derive_reporting_token_key_for_jids(&message_secret, stanza_id, sender_jid, remote_jid)
             .ok()?;
 
     let token = calculate_reporting_token(&key, &content).ok()?;
@@ -632,6 +753,10 @@ pub fn generate_reporting_token_from_encoded(
 }
 
 /// Build the `<reporting>` node for a message stanza.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.reporting_node", level = "debug", skip_all)
+)]
 pub fn build_reporting_node(result: &ReportingTokenResult) -> Node {
     let token_node = NodeBuilder::new("reporting_token")
         .attrs([("v", result.version.to_string())])
@@ -742,20 +867,75 @@ mod tests {
     }
 
     #[test]
+    fn jid_key_derivation_matches_string_api_for_inline_and_heap_info() {
+        let secret = [0x42; MESSAGE_SECRET_SIZE];
+        let stanza_id = "3EB0E0E5F2D4F618589C0B";
+        let cases = [
+            (
+                Jid::pn_device("5511999887766".to_owned(), 7),
+                Jid::pn_device("5511888776655".to_owned(), 3),
+            ),
+            (
+                Jid::pn("sender".repeat(REPORTING_TOKEN_INFO_INLINE_CAPACITY)),
+                Jid::pn("remote".repeat(REPORTING_TOKEN_INFO_INLINE_CAPACITY)),
+            ),
+        ];
+
+        for (case_index, (sender, remote)) in cases.iter().enumerate() {
+            let sender_string = sender.to_string();
+            let remote_string = remote.to_string();
+            let expected =
+                derive_reporting_token_key(&secret, stanza_id, &sender_string, &remote_string)
+                    .expect("string inputs should derive a key");
+            let actual = derive_reporting_token_key_for_jids(&secret, stanza_id, sender, remote)
+                .expect("JID inputs should derive a key");
+
+            assert_eq!(
+                actual, expected,
+                "JID derivation mismatch in case {case_index}"
+            );
+
+            let info = build_hkdf_info_for_jids(stanza_id, sender, remote)
+                .expect("JIDs should build HKDF info");
+            assert_eq!(
+                matches!(info, ReportingTokenInfo::Heap(_)),
+                case_index == 1,
+                "only the oversized case should use the heap fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn heap_promotion_reserves_space_for_follow_up_writes() {
+        let mut info = ReportingTokenInfo::with_capacity(REPORTING_TOKEN_INFO_INLINE_CAPACITY);
+        info.extend_from_slice(&[0; REPORTING_TOKEN_INFO_INLINE_CAPACITY]);
+        info.extend_from_slice(&[1]);
+
+        let ReportingTokenInfo::Heap(bytes) = info else {
+            panic!("overflowing inline reporting info should promote to heap");
+        };
+        assert!(
+            bytes.capacity() >= bytes.len() + REPORTING_TOKEN_INFO_INLINE_CAPACITY,
+            "heap promotion should absorb subsequent formatter writes"
+        );
+    }
+
+    #[test]
     fn derive_key_matches_plain_hkdf_extract() {
         // The cached zero-keyed HMAC extract must produce a key byte-identical to
         // `Hkdf::new(None, secret)` across a spread of secrets.
         let stanza_id = "3EB0E0E5F2D4F618589C0B";
         let sender_jid = "5511999887766@s.whatsapp.net";
         let remote_jid = "5511888776655@s.whatsapp.net";
-        let info = build_hkdf_info(stanza_id, sender_jid, remote_jid);
+        let info = build_hkdf_info(stanza_id, sender_jid, remote_jid)
+            .expect("test inputs should build HKDF info");
 
         for seed in 0u8..32 {
             let secret = [seed.wrapping_mul(37).wrapping_add(11); MESSAGE_SECRET_SIZE];
 
             let mut expected = [0u8; REPORTING_TOKEN_KEY_SIZE];
             Hkdf::<Sha256>::new(None, &secret)
-                .expand(&info, &mut expected)
+                .expand(info.as_bytes(), &mut expected)
                 .expect("valid output length");
 
             let got = derive_reporting_token_key(&secret, stanza_id, sender_jid, remote_jid)
@@ -1477,12 +1657,13 @@ mod tests {
     #[test]
     fn test_hkdf_info_construction() {
         // Verify the HKDF info is constructed correctly
-        let info = build_hkdf_info("STANZA", "sender@s.whatsapp.net", "remote@s.whatsapp.net");
+        let info = build_hkdf_info("STANZA", "sender@s.whatsapp.net", "remote@s.whatsapp.net")
+            .expect("test inputs should build HKDF info");
 
         let expected = b"STANZAsender@s.whatsapp.netremote@s.whatsapp.netReport Token";
         assert_eq!(
-            info,
-            expected.to_vec(),
+            info.as_bytes(),
+            expected,
             "HKDF info construction changed! This will break token verification."
         );
     }

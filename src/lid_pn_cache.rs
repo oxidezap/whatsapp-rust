@@ -57,7 +57,7 @@ pub struct LidPnCache {
     /// remap (or a stale detached write that marks late) only matches its own
     /// LID, never a newer un-persisted one. `Arc<str>` value: the hot-path check
     /// clones a refcount and compares in place, no payload copy. In-memory only;
-    /// cold after restart just replays the idempotent upsert.
+    /// mappings loaded from persistent storage are marked during warm-up.
     persisted: TypedCache<Arc<str>, Arc<str>>,
 }
 
@@ -265,6 +265,17 @@ impl LidPnCache {
 
         for entry in entries {
             self.add(&entry).await;
+            // `warm_up` only accepts durable rows. Mark the pair that won the
+            // PN-side timestamp resolution so a live re-learn neither writes
+            // it again nor repeats discovery migrations.
+            if self
+                .pn_to_entry
+                .get(&*entry.phone_number)
+                .await
+                .is_some_and(|current| current.lid == entry.lid)
+            {
+                self.mark_persisted(&entry.phone_number, &entry.lid).await;
+            }
             count += 1;
         }
 
@@ -438,6 +449,9 @@ mod tests {
         assert_eq!(cache.get_current_lid("pn1").await.as_deref(), Some("lid1"));
         assert_eq!(cache.get_current_lid("pn2").await.as_deref(), Some("lid2"));
         assert_eq!(cache.get_current_lid("pn3").await.as_deref(), Some("lid3"));
+        assert!(cache.can_skip_relearn("pn1", "lid1").await);
+        assert!(cache.can_skip_relearn("pn2", "lid2").await);
+        assert!(cache.can_skip_relearn("pn3", "lid3").await);
     }
 
     #[tokio::test]

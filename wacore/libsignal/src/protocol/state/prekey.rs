@@ -5,8 +5,6 @@
 
 use std::fmt;
 
-use buffa::Message;
-
 use crate::protocol::{
     KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::PreKeyRecordStructure,
 };
@@ -43,7 +41,7 @@ impl PreKeyRecord {
 
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         Ok(Self {
-            pre_key: PreKeyRecordStructure::decode_from_slice(data)
+            pre_key: waproto::codec::pre_key_record_decode(data)
                 .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
         })
     }
@@ -88,6 +86,6 @@ impl PreKeyRecord {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        Ok(self.pre_key.encode_to_vec())
+        Ok(waproto::codec::pre_key_record_to_vec(&self.pre_key))
     }
 }

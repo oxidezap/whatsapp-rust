@@ -7,6 +7,11 @@ use wacore::types::events::{GroupUpdate, MexNotification};
 use wacore_binary::NodeContentRef;
 use wacore_binary::{NodeRef, OwnedNodeRef};
 
+#[inline]
+fn clone_or_take_last<T: Clone>(value: &mut Option<T>, is_last: bool) -> Option<T> {
+    if is_last { value.take() } else { value.clone() }
+}
+
 /// Sync is fire-and-forget (spawned), so this is not async -- it parses
 /// collection nodes synchronously and spawns the async sync task.
 pub(crate) fn handle_server_sync_notification(
@@ -116,7 +121,7 @@ pub(crate) fn handle_server_sync_notification(
     tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
 )]
 pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
-    let notification = match GroupNotification::try_from_node_ref(node.get()) {
+    let mut notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,
         None => {
             warn!(target: "Client/Group", "w:gp2 notification missing 'from' attribute");
@@ -129,13 +134,33 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         .and_then(wacore::time::from_secs)
         .unwrap_or_else(wacore::time::now_utc);
 
-    for action in notification.actions {
+    let actions = std::mem::take(&mut notification.actions);
+    let group_cache = actions
+        .iter()
+        .any(|action| {
+            matches!(
+                action,
+                GroupNotificationAction::Add { .. }
+                    | GroupNotificationAction::Remove { .. }
+                    | GroupNotificationAction::Modify { .. }
+            )
+        })
+        .then(|| client.get_group_cache());
+    let group_cache = match group_cache {
+        Some(cache) => Some(cache.await),
+        None => None,
+    };
+    let action_count = actions.len();
+
+    for (action_index, action) in actions.into_iter().enumerate() {
         // Granularly patch group cache instead of invalidating — matches WA Web's
         // addParticipantInfo / removeParticipantInfo pattern and avoids a
         // group metadata IQ round-trip.
         match &action {
             GroupNotificationAction::Add { participants, .. } => {
-                let group_cache = client.get_group_cache().await;
+                let group_cache = group_cache
+                    .as_ref()
+                    .expect("participant actions initialize the group cache");
                 if let Some(info) = group_cache.get(&notification.group_jid).await {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.add_participants(
@@ -168,7 +193,9 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
             }
             GroupNotificationAction::Remove { participants, .. } => {
                 let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
-                let group_cache = client.get_group_cache().await;
+                let group_cache = group_cache
+                    .as_ref()
+                    .expect("participant actions initialize the group cache");
                 if let Some(info) = group_cache.get(&notification.group_jid).await {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
@@ -220,9 +247,9 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                 // before storage, so a stale Arc<GroupInfo> here would let the
                 // next send rebuild the sender key against the old participant
                 // list (missing the migrated JID, still targeting the old one).
-                client
-                    .get_group_cache()
-                    .await
+                group_cache
+                    .as_ref()
+                    .expect("participant actions initialize the group cache")
                     .invalidate(&notification.group_jid)
                     .await;
                 client
@@ -238,13 +265,41 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
             notification.group_jid.observe(), action.tag_name()
         );
 
+        let is_last_action = action_index + 1 == action_count;
         client.core.event_bus.dispatch(Event::GroupUpdate(
             GroupUpdate::builder()
                 .group_jid(notification.group_jid.clone())
-                .maybe_participant(notification.participant.clone())
-                .maybe_participant_pn(notification.participant_pn.clone())
+                .maybe_notification_id(clone_or_take_last(
+                    &mut notification.notification_id,
+                    is_last_action,
+                ))
+                .maybe_notify(clone_or_take_last(&mut notification.notify, is_last_action))
+                .maybe_offline(clone_or_take_last(
+                    &mut notification.offline,
+                    is_last_action,
+                ))
+                .action_index(u32::try_from(action_index).unwrap_or(u32::MAX))
+                .maybe_participant(clone_or_take_last(
+                    &mut notification.participant,
+                    is_last_action,
+                ))
+                .maybe_participant_pn(clone_or_take_last(
+                    &mut notification.participant_pn,
+                    is_last_action,
+                ))
+                .maybe_participant_username(clone_or_take_last(
+                    &mut notification.participant_username,
+                    is_last_action,
+                ))
+                .maybe_participant_country_code(clone_or_take_last(
+                    &mut notification.participant_country_code,
+                    is_last_action,
+                ))
                 .timestamp(timestamp)
                 .is_lid_addressing_mode(notification.is_lid_addressing_mode)
+                .has_incomplete_participant_information(
+                    notification.has_incomplete_participant_information,
+                )
                 .action(action)
                 .build(),
         ));

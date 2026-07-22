@@ -232,6 +232,7 @@ pub fn companion_platform_display(ct: CompanionWebClientType, os: &str) -> Strin
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

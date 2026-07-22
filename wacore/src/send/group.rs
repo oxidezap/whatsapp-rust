@@ -154,7 +154,7 @@ pub async fn prepare_group_stanza(
     });
 
     // Generate reporting token if the message type supports it.
-    // For groups, both sender_jid and remote_jid are the group JID (to_jid) per Baileys implementation.
+    // For groups, both sender_jid and remote_jid are the destination group JID.
     // Reuse the message's own secret when the caller set one (e.g. polls) instead of minting a fresh
     // one that would overwrite it, matching WA Web (the reporting token derives from messageSecret).
     let existing_secret = crate::reporting_token::extract_message_secret(message);

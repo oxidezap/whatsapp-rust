@@ -1,6 +1,5 @@
 use crate::client_profile::ClientProfile;
 use crate::libsignal::protocol::{IdentityKeyPair, KeyPair};
-use buffa::Message;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use std::sync::{Arc, LazyLock};
@@ -9,15 +8,15 @@ use waproto::whatsapp as wa;
 
 /// Protobuf-bytes serde for `ADVSignedDeviceIdentity` (the generated types lack `Deserialize`).
 pub mod account_serde {
-    use buffa::Message;
+
     use waproto::whatsapp as wa;
 
     pub fn to_bytes(account: &wa::ADVSignedDeviceIdentity) -> Vec<u8> {
-        account.encode_to_vec()
+        waproto::codec::adv_signed_device_identity_to_vec(account)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<wa::ADVSignedDeviceIdentity, buffa::DecodeError> {
-        wa::ADVSignedDeviceIdentity::decode_from_slice(bytes)
+        waproto::codec::adv_signed_device_identity_decode(bytes)
     }
 
     pub fn serialize<S: serde::Serializer>(
@@ -487,7 +486,7 @@ impl Device {
         };
         let mut payload = build_base_client_payload(app_version, &self.client_profile);
 
-        let device_props_bytes = self.device_props.encode_to_vec();
+        let device_props_bytes = waproto::codec::device_props_to_vec(&self.device_props);
 
         let version = &payload.user_agent.app_version;
         let version_str = format!(
@@ -496,7 +495,7 @@ impl Device {
             version.secondary.unwrap_or(0),
             version.tertiary.unwrap_or(0)
         );
-        let build_hash: [u8; 16] = md5::compute(version_str.as_bytes()).into();
+        let build_hash = crate::crypto::md5_digest(version_str.as_bytes());
 
         let reg_data = wa::client_payload::DevicePairingRegistrationData {
             e_regid: Some(self.registration_id.to_be_bytes().to_vec()),
@@ -523,8 +522,10 @@ impl Device {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message;
 
     #[test]
     fn test_registration_id_range() {

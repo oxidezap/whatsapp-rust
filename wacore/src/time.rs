@@ -275,6 +275,12 @@ fn default_monotonic_provider() -> Box<dyn MonotonicProvider> {
 pub struct Instant(u64);
 
 impl Instant {
+    /// The origin of the configured monotonic clock.
+    ///
+    /// Useful as a storage sentinel when a component has time-based behavior
+    /// disabled and therefore must not read the platform clock.
+    pub const ZERO: Self = Self(0);
+
     /// Capture the current monotonic instant.
     #[inline]
     pub fn now() -> Self {

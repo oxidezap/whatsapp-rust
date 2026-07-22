@@ -157,6 +157,26 @@ struct SendBranchOutput {
     dm_phash: Option<String>,
 }
 
+/// Keep each branch future out of the shared send frame. In tracing builds the
+/// dedicated span lets allocation profilers distinguish this deliberate box
+/// from work performed while polling the selected branch.
+#[inline]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        name = "wa.send.branch_box",
+        level = "debug",
+        skip_all,
+        fields(future_bytes = std::mem::size_of::<F>())
+    )
+)]
+fn box_send_branch<F>(future: F) -> std::pin::Pin<Box<F>>
+where
+    F: std::future::Future,
+{
+    Box::pin(future)
+}
+
 /// True when every SKDM target belongs to our own account (PN or LID user).
 /// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
 /// `markHasSenderKey`), so an own-only `needs` set is the permanent
@@ -1457,9 +1477,9 @@ impl Client {
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             dm_phash,
         } = if peer && !to.is_group() {
-            Box::pin(self.send_peer_branch(to, message, request_id)).await?
+            box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
-            Box::pin(self.send_group_branch(
+            box_send_branch(self.send_group_branch(
                 to,
                 message,
                 request_id,
@@ -1469,7 +1489,7 @@ impl Client {
             ))
             .await?
         } else {
-            Box::pin(self.send_dm_branch(
+            box_send_branch(self.send_dm_branch(
                 to,
                 message,
                 request_id,
@@ -1517,7 +1537,6 @@ impl Client {
             }
             return Err(e.into());
         }
-
         if let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),
@@ -2174,10 +2193,10 @@ impl Client {
             now,
         );
         let entry = wacore::store::traits::MsgSecretEntry {
-            chat: chat.to_non_ad_string(),
-            sender: sender.to_non_ad_string(),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
+            chat: chat.to_non_ad_string().into(),
+            sender: sender.to_non_ad_string().into(),
+            msg_id: msg_id.into(),
+            secret: *secret,
             expires_at,
             message_ts: now,
         };
@@ -2259,6 +2278,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
@@ -3012,10 +3032,7 @@ mod tests {
         for user in &participant_users {
             let record = DeviceListRecord {
                 user: (*user).into(),
-                devices: vec![DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -3936,8 +3953,7 @@ mod tests {
         }
 
         /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
-        /// order matters — this is the shape the upstream Baileys
-        /// reproducer emits.
+        /// order matters because it is part of the wire shape.
         #[test]
         fn dm_emits_bot_before_biz() {
             let nodes = build_extra_stanza_nodes(
@@ -4453,10 +4469,7 @@ mod tests {
             client
                 .update_device_list(wacore::store::traits::DeviceListRecord {
                     user,
-                    devices: vec![wacore::store::traits::DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    }],
+                    devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,

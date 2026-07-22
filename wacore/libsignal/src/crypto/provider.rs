@@ -15,7 +15,17 @@ use sha2::Sha256;
 
 use crate::crypto::aes_gcm::{Aes256GcmDecryption, Aes256GcmEncryption, Aes256GcmKey};
 
+const AES_BLOCK_SIZE: usize = 16;
 const GCM_TAG: usize = 16;
+
+fn rust_hmac_sha256_parts(key: &[u8], inputs: &[&[u8]]) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    for input in inputs {
+        mac.update(input);
+    }
+    mac.finalize().into_bytes().into()
+}
 
 /// Growable byte buffer usable with in-place AES-GCM operations.
 ///
@@ -156,6 +166,24 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoProviderError>;
 
+    /// AES-256-CBC decrypt with PKCS7 unpadding in the caller-owned buffer.
+    ///
+    /// The fallback preserves compatibility with external providers by routing
+    /// through their existing out-of-place implementation. Providers with a
+    /// mutable-buffer primitive should override this to avoid holding the full
+    /// ciphertext and plaintext allocations at the same time.
+    fn aes_256_cbc_decrypt_in_place(
+        &self,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), CryptoProviderError> {
+        let mut out = Vec::with_capacity(buffer.len());
+        self.aes_256_cbc_decrypt(key, iv, buffer, &mut out)?;
+        *buffer = out;
+        Ok(())
+    }
+
     /// AES-256-GCM seal. Appends `ciphertext || tag(16)` to `out`.
     /// Ciphertext length equals plaintext length.
     fn aes_256_gcm_encrypt(
@@ -181,6 +209,16 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
 
     /// HMAC-SHA256 one-shot. Zero-alloc output.
     fn hmac_sha256(&self, key: &[u8], input: &[u8]) -> [u8; 32];
+
+    /// HMAC-SHA256 over two adjacent logical inputs without concatenating them.
+    /// The fallback preserves custom-provider routing; providers with an
+    /// incremental primitive should override it to avoid the temporary buffer.
+    fn hmac_sha256_two_part(&self, key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32] {
+        let mut input = Vec::with_capacity(first.len().saturating_add(second.len()));
+        input.extend_from_slice(first);
+        input.extend_from_slice(second);
+        self.hmac_sha256(key, &input)
+    }
 
     /// In-place AES-256-GCM seal. On entry `buffer` holds the plaintext; on
     /// return it holds `ciphertext || tag` (length grown by 16).
@@ -266,7 +304,7 @@ impl SignalCryptoProvider for RustCryptoProvider {
         plaintext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoProviderError> {
-        let padding = 16 - (plaintext.len() % 16);
+        let padding = AES_BLOCK_SIZE - (plaintext.len() % AES_BLOCK_SIZE);
         let encrypted_size = plaintext.len() + padding;
         let start = out.len();
 
@@ -289,7 +327,7 @@ impl SignalCryptoProvider for RustCryptoProvider {
         ciphertext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoProviderError> {
-        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(AES_BLOCK_SIZE) {
             return Err(CryptoProviderError::BadInput);
         }
 
@@ -297,12 +335,25 @@ impl SignalCryptoProvider for RustCryptoProvider {
         out.reserve(ciphertext.len());
         out.extend_from_slice(ciphertext);
 
+        self.aes_256_cbc_decrypt_in_place(key, iv, out)
+    }
+
+    fn aes_256_cbc_decrypt_in_place(
+        &self,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), CryptoProviderError> {
+        if buffer.is_empty() || !buffer.len().is_multiple_of(AES_BLOCK_SIZE) {
+            return Err(CryptoProviderError::BadInput);
+        }
+
         let decryptor = cbc::Decryptor::<Aes256>::new(key.into(), iv.into());
         let decrypted_len = decryptor
-            .decrypt_padded::<Pkcs7>(out)
+            .decrypt_padded::<Pkcs7>(buffer)
             .map_err(|_| CryptoProviderError::BadInput)?
             .len();
-        out.truncate(decrypted_len);
+        buffer.truncate(decrypted_len);
         Ok(())
     }
 
@@ -352,10 +403,11 @@ impl SignalCryptoProvider for RustCryptoProvider {
     }
 
     fn hmac_sha256(&self, key: &[u8], input: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
-            .expect("HMAC-SHA256 accepts any key length");
-        mac.update(input);
-        mac.finalize().into_bytes().into()
+        rust_hmac_sha256_parts(key, &[input])
+    }
+
+    fn hmac_sha256_two_part(&self, key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32] {
+        rust_hmac_sha256_parts(key, &[first, second])
     }
 
     fn aes_256_gcm_encrypt_in_place(
@@ -507,6 +559,19 @@ mod tests {
         mac.update(data);
         let expected: [u8; 32] = mac.finalize().into_bytes().into();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn rust_provider_two_part_hmac_matches_contiguous_input() {
+        let provider = RustCryptoProvider;
+        let key = b"mac key";
+        let first = b"message ";
+        let second = b"body";
+
+        assert_eq!(
+            provider.hmac_sha256_two_part(key, first, second),
+            provider.hmac_sha256(key, b"message body")
+        );
     }
 
     /// NIST SP 800-38D Test Case 14: all-zero key/nonce, 128-bit plaintext.

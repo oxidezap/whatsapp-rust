@@ -12,7 +12,12 @@ use crate::store::error::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use wacore_appstate::processor::AppStateMutationMAC;
+
+/// Inline protocol-sized message secret. The array makes invalid lengths
+/// unrepresentable without a heap allocation or pointer indirection per row.
+pub type MessageSecret = [u8; crate::reporting_token::MESSAGE_SECRET_SIZE];
 
 /// App state synchronization key for WhatsApp's app state protocol.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,10 +58,15 @@ pub struct TcTokenEntry {
 /// Message-secret write entry keyed by chat, sender, and message ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsgSecretEntry {
-    pub chat: String,
-    pub sender: String,
-    pub msg_id: String,
-    pub secret: Vec<u8>,
+    /// Canonical non-AD chat JID. Shared across entries from the same history
+    /// conversation instead of allocating one identical string per message.
+    pub chat: Arc<str>,
+    /// Canonical non-AD sender JID. Often aliases `chat` for direct messages.
+    pub sender: Arc<str>,
+    /// Message identifier. `Arc<str>` keeps entry clones used by buffered
+    /// persistence cheap without changing the serialized representation.
+    pub msg_id: Arc<str>,
+    pub secret: MessageSecret,
     /// Absolute unix-seconds retention deadline. `0` means never expire.
     /// Computed by the caller from the parent message's event time plus a
     /// per-add-on-kind horizon (see `MsgSecretRetention`). The store prunes
@@ -77,6 +87,42 @@ pub struct DeviceInfo {
     pub device_id: u32,
     /// The key index, if known
     pub key_index: Option<u32>,
+    /// Whether the device uses the hosted PN/LID address space.
+    #[serde(default)]
+    pub is_hosted: bool,
+}
+
+impl DeviceInfo {
+    /// Construct a regular device entry.
+    pub const fn new(device_id: u32, key_index: Option<u32>) -> Self {
+        Self {
+            device_id,
+            key_index,
+            is_hosted: false,
+        }
+    }
+
+    /// Apply the hosted bit reported by the device-list source.
+    pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
+        self.is_hosted = is_hosted;
+        self
+    }
+}
+
+#[cfg(test)]
+mod device_info_tests {
+    use super::DeviceInfo;
+
+    #[test]
+    fn hosted_flag_is_backward_compatible_with_persisted_json() {
+        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
+        assert!(!legacy.is_hosted);
+
+        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
+        let roundtrip: DeviceInfo =
+            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
+        assert!(roundtrip.is_hosted);
+    }
 }
 
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
@@ -687,7 +733,7 @@ pub trait DeviceStore: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MsgSecretStore: Send + Sync {
-    /// Persist `secret` (typically 32 bytes) under the composite key with NO
+    /// Persist the protocol-sized `secret` under the composite key with NO
     /// expiry (`expires_at = 0`). Convenience wrapper over [`put_msg_secrets`].
     /// `chat`, `sender`, and `msg_id` are JID strings / message ID strings;
     /// callers should pass non-AD (no-device) form for the JIDs so lookups
@@ -702,13 +748,13 @@ pub trait MsgSecretStore: Send + Sync {
         chat: &str,
         sender: &str,
         msg_id: &str,
-        secret: &[u8],
+        secret: &[u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
     ) -> Result<()> {
         self.put_msg_secrets(vec![MsgSecretEntry {
-            chat: chat.to_string(),
-            sender: sender.to_string(),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
+            chat: Arc::from(chat),
+            sender: Arc::from(sender),
+            msg_id: Arc::from(msg_id),
+            secret: *secret,
             expires_at: 0,
             message_ts: 0,
         }])

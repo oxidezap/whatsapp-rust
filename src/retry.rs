@@ -1,14 +1,13 @@
 use crate::client::Client;
 use crate::message::RetryReason;
 use crate::types::events::Receipt;
-use buffa::Message;
 use log::{debug, info, warn};
 use wacore::types::message::MessageCategory;
 
 use scopeguard;
 use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
-use wacore::libsignal::protocol::{PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle};
+use wacore::libsignal::protocol::{PreKeyBundle, PublicKey};
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::JidExt as _;
@@ -1050,32 +1049,12 @@ impl Client {
             identity_key.into(),
         )?;
 
-        // Acquire per-sender session lock to prevent race with concurrent message decryption.
-        // This matches the session_locks pattern used in process_session_enc_batch.
-        let session_mutex = self.session_lock_for(signal_address.as_str()).await;
-        let _session_guard = session_mutex.lock().await;
-
         let mut adapter = self.signal_adapter().await;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        self.install_prekey_bundle_cached(requester_jid, &bundle, &mut adapter, &mut rng)
+            .await?;
 
-        let identity_change = process_prekey_bundle(
-            &signal_address,
-            &mut adapter.session_store,
-            &mut adapter.identity_store,
-            &bundle,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-            UsePQRatchet::No,
-        )
-        .await?;
-
-        // Flush after session establishment; release the session lock first
-        // (the batch-safe flush acquires the processing permit, whose holder
-        // may need this same lock).
-        drop(_session_guard);
         self.flush_signal_cache_batch_safe().await?;
-
-        if identity_change == wacore::libsignal::protocol::IdentityChange::ReplacedExisting {
-            self.react_to_local_identity_change(requester_jid);
-        }
 
         info!(
             "Processed key bundle from retry receipt for {}",
@@ -1149,11 +1128,11 @@ impl Client {
             // Validate the account BEFORE reserving/marking the prekey: a missing
             // account bails here, and marking after would abandon a one-time
             // prekey from the upload window without any receipt going out.
-            let device_identity_bytes = device_snapshot
-                .account
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing device account info for retry receipt"))?
-                .encode_to_vec();
+            let device_identity_bytes = waproto::codec::adv_signed_device_identity_to_vec(
+                device_snapshot.account.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing device account info for retry receipt")
+                })?,
+            );
 
             // markKeyAsUploaded: the retry prekey goes directly to the peer, so
             // it must not also be re-offered to the server pool (a third party

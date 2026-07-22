@@ -79,6 +79,10 @@ impl MessageUtils {
     /// the shared bytes are spliced + padded here instead of re-encoding the message.
     /// `content` must be the message's encoding with no reporting context spliced on (the
     /// caller only takes this path when the message has no top-level message_context_info).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.dm_plaintext", level = "debug", skip_all)
+    )]
     pub fn pad_with_context_from_encoded(
         content: &[u8],
         extra_context: Option<&wa::MessageContextInfo>,
@@ -175,7 +179,11 @@ impl MessageUtils {
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
         let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
         let mut own_devices = Vec::with_capacity(own_cap);
-        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_wire_tag(
+            TAG_DEVICE_SENT_MESSAGE,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut own_devices,
+        );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
         push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
         push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
@@ -199,6 +207,10 @@ impl MessageUtils {
     /// into `content`. The DM send path reuses the single message encode it also feeds to
     /// the reporting token, so the message is no longer encoded twice per send. `content`
     /// must be the message's encoding with no reporting context spliced on.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.dm_plaintexts", level = "debug", skip_all)
+    )]
     pub fn dm_plaintexts_from_encoded(
         content: &[u8],
         extra_context: Option<&wa::MessageContextInfo>,
@@ -223,7 +235,11 @@ impl MessageUtils {
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
         let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
         let mut own_devices = Vec::with_capacity(own_cap);
-        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_wire_tag(
+            TAG_DEVICE_SENT_MESSAGE,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut own_devices,
+        );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
         push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
         push_len_delimited(TAG_DSM_MESSAGE, content, &mut own_devices);
@@ -270,7 +286,11 @@ impl MessageUtils {
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
         let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
         let mut own_devices = Vec::with_capacity(own_cap);
-        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_wire_tag(
+            TAG_DEVICE_SENT_MESSAGE,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut own_devices,
+        );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
         push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
         push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
@@ -288,6 +308,10 @@ impl MessageUtils {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.participant_hash", level = "debug", skip_all)
+    )]
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
     ) -> Result<String> {
@@ -376,6 +400,232 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 
+/// History-sync metadata detached from a decoded plaintext while the large
+/// inline blob keeps sharing the decrypt buffer. The generated owned protobuf
+/// type remains the single source for protocol fields; only its byte payload is
+/// represented separately so async processing does not need a megabyte copy.
+#[derive(Debug)]
+pub struct DetachedHistorySyncNotification {
+    pub notification: wa::message::HistorySyncNotification,
+    pub inline_payload: Option<buffa::bytes::Bytes>,
+}
+
+impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotification {
+    fn from(mut notification: wa::message::HistorySyncNotification) -> Self {
+        let inline_payload = notification
+            .initial_hist_bootstrap_inline_payload
+            .take()
+            .map(buffa::bytes::Bytes::from);
+        Self {
+            notification,
+            inline_payload,
+        }
+    }
+}
+
+/// Decode an owned plaintext while detaching an inline history-sync payload as
+/// a zero-copy `Bytes` slice.
+///
+/// Only the generated schema tags needed to reach the inline byte field are
+/// inspected. The field is removed from a lazily rewritten wire buffer before
+/// the regular generated decoder runs, so the large payload is never copied
+/// into the owned protobuf tree. Every other field is still decoded by Buffa's
+/// generated implementation, keeping protobuf merge and unknown-field
+/// semantics in one place.
+pub fn decode_plaintext_detached_history_sync(
+    padded_plaintext: Vec<u8>,
+    padding_version: u8,
+) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
+    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
+    let source = buffa::bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
+
+    // Mirror `unwrap_device_sent`: once a DSM carries an inner message, only
+    // that message is dispatched. Inspecting just this generated-tag path
+    // avoids decoding/materializing the complete MessageView graph.
+    let history_path = if contains_nested_message_field(&source, DEVICE_SENT_INNER_MESSAGE_PATH)? {
+        DEVICE_SENT_HISTORY_PAYLOAD_PATH
+    } else {
+        DIRECT_HISTORY_PAYLOAD_PATH
+    };
+
+    #[cfg(feature = "tracing")]
+    let decode_span = tracing::trace_span!(
+        "wa.message.detach_history_sync_payload",
+        plaintext_bytes = source.len() as u64
+    );
+    #[cfg(feature = "tracing")]
+    let decode_guard = decode_span.enter();
+    let redaction = redact_nested_bytes_field(&source, 0, history_path)?;
+    #[cfg(feature = "tracing")]
+    drop(decode_guard);
+
+    #[cfg(feature = "tracing")]
+    let materialize_span = tracing::trace_span!(
+        "wa.message.decode_plaintext",
+        plaintext_bytes = source.len() as u64,
+        payload_detached = redaction.detached_value.is_some()
+    );
+    #[cfg(feature = "tracing")]
+    let _materialize_guard = materialize_span.enter();
+    let encoded = redaction.rewritten.as_deref().unwrap_or(&source);
+    let mut message = waproto::codec::message_decode(encoded)
+        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))?;
+
+    let mut history_sync =
+        take_history_sync_notification(&mut message).map(DetachedHistorySyncNotification::from);
+    if let Some(payload_range) = redaction.detached_value {
+        let detached = history_sync
+            .as_mut()
+            .ok_or_else(|| anyhow!("inline history-sync payload had no decoded notification"))?;
+        detached.inline_payload = Some(source.slice(payload_range));
+    }
+
+    Ok((message, history_sync))
+}
+
+fn take_history_sync_notification(
+    message: &mut wa::Message,
+) -> Option<wa::message::HistorySyncNotification> {
+    // Mirror `unwrap_device_sent`: when a valid DSM wrapper exists, only its
+    // inner message is dispatched. Otherwise the top-level message is used.
+    let message = match message.device_sent_message.as_option_mut() {
+        Some(device_sent) if device_sent.message.is_set() => device_sent.message.as_option_mut()?,
+        _ => message,
+    };
+    message
+        .protocol_message
+        .as_option_mut()?
+        .history_sync_notification
+        .take()
+}
+
+#[derive(Default)]
+struct WireRedaction {
+    /// Present only when at least one target field was removed. Rewriting is
+    /// lazy so plaintexts without inline history never clone their wire bytes.
+    rewritten: Option<Vec<u8>>,
+    /// Byte range in the original plaintext. For a repeated singular bytes
+    /// field, protobuf merge semantics select the final occurrence.
+    detached_value: Option<std::ops::Range<usize>>,
+}
+
+/// Whether a nested message field path is set on the wire.
+///
+/// This deliberately recognizes only length-delimited fields, the schema wire
+/// type for every segment in the supplied generated-tag paths. A mismatched
+/// known field is left for the regular decoder to reject with its canonical
+/// error after routing has been selected.
+fn contains_nested_message_field(message: &[u8], path: &[u32]) -> Result<bool, buffa::DecodeError> {
+    let Some((&field_number, remaining_path)) = path.split_first() else {
+        return Ok(false);
+    };
+
+    let mut remaining = message;
+    while !remaining.is_empty() {
+        let mut after_tag = remaining;
+        let tag = buffa::encoding::Tag::decode(&mut after_tag)?;
+        if tag.field_number() == field_number
+            && tag.wire_type() == buffa::encoding::WireType::LengthDelimited
+        {
+            let value_range = length_delimited_value_range(message.len(), after_tag)?;
+            if remaining_path.is_empty()
+                || contains_nested_message_field(&message[value_range.clone()], remaining_path)?
+            {
+                return Ok(true);
+            }
+            remaining = &message[value_range.end..];
+        } else {
+            buffa::encoding::skip_field_depth(tag, &mut after_tag, buffa::RECURSION_LIMIT)?;
+            remaining = after_tag;
+        }
+    }
+    Ok(false)
+}
+
+/// Remove every occurrence of the bytes field at `path`, rebuilding only the
+/// containing length-delimited fields whose sizes changed. Unrelated wire
+/// fields are copied byte-for-byte, while their eventual interpretation stays
+/// with the generated decoder.
+fn redact_nested_bytes_field(
+    message: &[u8],
+    absolute_offset: usize,
+    path: &[u32],
+) -> Result<WireRedaction, buffa::DecodeError> {
+    let Some((&field_number, remaining_path)) = path.split_first() else {
+        return Ok(WireRedaction::default());
+    };
+
+    let mut result = WireRedaction::default();
+    let mut copied_until = 0;
+    let mut remaining = message;
+
+    while !remaining.is_empty() {
+        let field_start = message.len() - remaining.len();
+        let mut after_tag = remaining;
+        let tag = buffa::encoding::Tag::decode(&mut after_tag)?;
+
+        if tag.field_number() == field_number
+            && tag.wire_type() == buffa::encoding::WireType::LengthDelimited
+        {
+            let tag_end = message.len() - after_tag.len();
+            let value_range = length_delimited_value_range(message.len(), after_tag)?;
+
+            if remaining_path.is_empty() {
+                let rewritten = result.rewritten.get_or_insert_with(Vec::new);
+                rewritten.extend_from_slice(&message[copied_until..field_start]);
+                copied_until = value_range.end;
+                result.detached_value =
+                    Some(absolute_offset + value_range.start..absolute_offset + value_range.end);
+            } else {
+                let child = redact_nested_bytes_field(
+                    &message[value_range.clone()],
+                    absolute_offset + value_range.start,
+                    remaining_path,
+                )?;
+                if let Some(child_range) = child.detached_value {
+                    result.detached_value = Some(child_range);
+                }
+                if let Some(child_bytes) = child.rewritten {
+                    let rewritten = result.rewritten.get_or_insert_with(Vec::new);
+                    rewritten.extend_from_slice(&message[copied_until..field_start]);
+                    // Preserve the original tag bytes. Only the containing
+                    // length changes, so that varint is intentionally rebuilt.
+                    rewritten.extend_from_slice(&message[field_start..tag_end]);
+                    push_varint(child_bytes.len() as u64, rewritten);
+                    rewritten.extend_from_slice(&child_bytes);
+                    copied_until = value_range.end;
+                }
+            }
+
+            remaining = &message[value_range.end..];
+        } else {
+            buffa::encoding::skip_field_depth(tag, &mut after_tag, buffa::RECURSION_LIMIT)?;
+            remaining = after_tag;
+        }
+    }
+
+    if let Some(rewritten) = result.rewritten.as_mut() {
+        rewritten.extend_from_slice(&message[copied_until..]);
+    }
+    Ok(result)
+}
+
+fn length_delimited_value_range(
+    message_len: usize,
+    mut after_tag: &[u8],
+) -> Result<std::ops::Range<usize>, buffa::DecodeError> {
+    let value_len = buffa::encoding::decode_varint(&mut after_tag)?;
+    let value_len = usize::try_from(value_len).map_err(|_| buffa::DecodeError::MessageTooLarge)?;
+    let value_start = message_len - after_tag.len();
+    let value_end = value_start
+        .checked_add(value_len)
+        .ok_or(buffa::DecodeError::MessageTooLarge)?;
+    if value_end > message_len {
+        return Err(buffa::DecodeError::UnexpectedEof);
+    }
+    Ok(value_start..value_end)
+}
+
 /// Use when borrowed fields are enough and a full owned message is avoidable.
 pub fn decode_plaintext_view(
     padded_plaintext: &[u8],
@@ -460,11 +710,26 @@ pub struct DmPlaintexts {
 // Protobuf field numbers spliced by `encode_dm_plaintexts`, sourced from the
 // generated schema tags so a .proto renumber breaks here at compile time
 // instead of silently changing the wire payload.
-const TAG_DEVICE_SENT_MESSAGE: u64 = waproto::tags::message::DEVICE_SENT_MESSAGE as u64;
-const TAG_MESSAGE_CONTEXT_INFO: u64 = waproto::tags::message::MESSAGE_CONTEXT_INFO as u64;
-const TAG_DSM_DESTINATION_JID: u64 =
-    waproto::tags::message::device_sent_message::DESTINATION_JID as u64;
-const TAG_DSM_MESSAGE: u64 = waproto::tags::message::device_sent_message::MESSAGE as u64;
+const TAG_DEVICE_SENT_MESSAGE: u32 = waproto::tags::message::DEVICE_SENT_MESSAGE;
+const TAG_MESSAGE_CONTEXT_INFO: u32 = waproto::tags::message::MESSAGE_CONTEXT_INFO;
+const TAG_DSM_DESTINATION_JID: u32 = waproto::tags::message::device_sent_message::DESTINATION_JID;
+const TAG_DSM_MESSAGE: u32 = waproto::tags::message::device_sent_message::MESSAGE;
+
+const DEVICE_SENT_INNER_MESSAGE_PATH: &[u32] = &[TAG_DEVICE_SENT_MESSAGE, TAG_DSM_MESSAGE];
+const DIRECT_HISTORY_PAYLOAD_PATH: &[u32] = &[
+    waproto::tags::message::PROTOCOL_MESSAGE,
+    waproto::tags::message::protocol_message::HISTORY_SYNC_NOTIFICATION,
+    waproto::tags::message::history_sync_notification::INITIAL_HIST_BOOTSTRAP_INLINE_PAYLOAD,
+];
+const DEVICE_SENT_HISTORY_PAYLOAD_PATH: &[u32] = &[
+    TAG_DEVICE_SENT_MESSAGE,
+    TAG_DSM_MESSAGE,
+    waproto::tags::message::PROTOCOL_MESSAGE,
+    waproto::tags::message::protocol_message::HISTORY_SYNC_NOTIFICATION,
+    waproto::tags::message::history_sync_notification::INITIAL_HIST_BOOTSTRAP_INLINE_PAYLOAD,
+];
+
+const PROTOBUF_WIRE_TYPE_BITS: u32 = 3;
 
 /// Append a base-128 varint (protobuf wire format).
 #[inline]
@@ -476,12 +741,22 @@ fn push_varint(mut v: u64, out: &mut Vec<u8>) {
     out.push(v as u8);
 }
 
+#[inline]
+fn wire_tag_value(field: u32, wire_type: buffa::encoding::WireType) -> u64 {
+    (u64::from(field) << PROTOBUF_WIRE_TYPE_BITS) | wire_type as u64
+}
+
+#[inline]
+fn push_wire_tag(field: u32, wire_type: buffa::encoding::WireType, out: &mut Vec<u8>) {
+    push_varint(wire_tag_value(field, wire_type), out);
+}
+
 /// Append a length-delimited protobuf field (wire type 2): a string field, or a
 /// nested message field carrying already-encoded `bytes`. The latter is the splice
 /// point that lets the shared content be reused without re-encoding it.
 #[inline]
-fn push_len_delimited(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
-    push_varint((field << 3) | 2, out); // wire type 2 = length-delimited
+fn push_len_delimited(field: u32, bytes: &[u8], out: &mut Vec<u8>) {
+    push_wire_tag(field, buffa::encoding::WireType::LengthDelimited, out);
     push_varint(bytes.len() as u64, out);
     out.extend_from_slice(bytes);
 }
@@ -501,15 +776,19 @@ fn varint_len(mut v: u64) -> usize {
 /// bytes (key + length varint + payload). Mirrors what `push_len_delimited`
 /// writes, so a nested field's length can be pre-computed without a temp buffer.
 #[inline]
-fn len_delimited_len(field: u64, payload_len: usize) -> usize {
-    varint_len((field << 3) | 2) + varint_len(payload_len as u64) + payload_len
+fn len_delimited_len(field: u32, payload_len: usize) -> usize {
+    varint_len(wire_tag_value(
+        field,
+        buffa::encoding::WireType::LengthDelimited,
+    )) + varint_len(payload_len as u64)
+        + payload_len
 }
 
 /// Append a message_context_info as a nested length-delimited field, encoding it
 /// straight into `out` (no intermediate `Vec`). Used for the small
 /// `message_context_info` field on both plaintexts.
 #[inline]
-fn push_message_field(field: u64, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
+fn push_message_field(field: u32, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
     let mut cache = buffa::SizeCache::new();
     let size = waproto::codec::message_context_info_compute_size(msg, &mut cache);
     push_message_field_sized(field, msg, size, &mut cache, out);
@@ -521,13 +800,13 @@ fn push_message_field(field: u64, msg: &wa::MessageContextInfo, out: &mut Vec<u8
 /// 0; `write_to` consumes them, so this avoids measuring the sub-tree twice.
 #[inline]
 fn push_message_field_sized(
-    field: u64,
+    field: u32,
     msg: &wa::MessageContextInfo,
     size: usize,
     cache: &mut buffa::SizeCache,
     out: &mut Vec<u8>,
 ) {
-    push_varint((field << 3) | 2, out);
+    push_wire_tag(field, buffa::encoding::WireType::LengthDelimited, out);
     push_varint(size as u64, out);
     waproto::codec::message_context_info_write_to(msg, cache, out);
 }
@@ -853,6 +1132,7 @@ pub fn parse_message_info(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod plaintext_view_tests {
     use super::*;
 
@@ -864,6 +1144,27 @@ mod plaintext_view_tests {
         wa::message::SenderKeyDistributionMessage {
             group_id: Some("120000000000000000@g.us".to_string()),
             axolotl_sender_key_distribution_message: Some(bytes.to_vec()),
+        }
+    }
+
+    fn history_notification(payload: Vec<u8>) -> wa::message::HistorySyncNotification {
+        wa::message::HistorySyncNotification {
+            file_length: Some(payload.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
+            initial_hist_bootstrap_inline_payload: Some(payload),
+            progress: Some(73),
+            ..Default::default()
+        }
+    }
+
+    fn message_with_history(payload: Vec<u8>, text: &str) -> wa::Message {
+        wa::Message {
+            conversation: Some(text.to_owned()),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                history_sync_notification: buffa::MessageField::some(history_notification(payload)),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -894,6 +1195,65 @@ mod plaintext_view_tests {
 
         assert_eq!(view.conversation(), Some("hello"));
         assert!(view.bytes().len() < padded_len);
+    }
+
+    #[test]
+    fn detached_history_payload_shares_plaintext_and_preserves_message() {
+        let inline_payload = vec![0xA5; 1024];
+        let padded = padded(&message_with_history(inline_payload.clone(), "preserved"));
+        let plaintext_start = padded.as_ptr() as usize;
+        let plaintext_end = plaintext_start + padded.len();
+
+        let (decoded, detached) = decode_plaintext_detached_history_sync(padded, 2)
+            .expect("owned view decode should succeed");
+        let detached = detached.expect("history notification should be detached");
+        let payload = detached
+            .inline_payload
+            .expect("inline history payload should be detached");
+
+        assert_eq!(decoded.conversation.as_deref(), Some("preserved"));
+        assert!(
+            decoded
+                .protocol_message
+                .as_option()
+                .is_some_and(|protocol| !protocol.history_sync_notification.is_set()),
+            "only the detached history field should be cleared"
+        );
+        assert_eq!(detached.notification.file_length, Some(1024));
+        assert_eq!(detached.notification.progress, Some(73));
+        assert_eq!(payload.as_ref(), inline_payload);
+        assert!(
+            (plaintext_start..plaintext_end).contains(&(payload.as_ptr() as usize)),
+            "the detached payload must remain a slice of the original decrypt buffer"
+        );
+    }
+
+    #[test]
+    fn detached_history_follows_device_sent_unwrap_semantics() {
+        let inner_payload = vec![0x11; 64];
+        let inner = message_with_history(inner_payload.clone(), "inner");
+        let mut wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
+        wrapped.protocol_message = buffa::MessageField::some(wa::message::ProtocolMessage {
+            history_sync_notification: buffa::MessageField::some(history_notification(vec![
+                0x22;
+                32
+            ])),
+            ..Default::default()
+        });
+
+        let (decoded, detached) = decode_plaintext_detached_history_sync(padded(&wrapped), 2)
+            .expect("device-sent message should decode");
+        let decoded = unwrap_device_sent(decoded);
+        let detached = detached.expect("inner history notification should be detached");
+
+        assert_eq!(decoded.conversation.as_deref(), Some("inner"));
+        assert!(
+            decoded
+                .protocol_message
+                .as_option()
+                .is_some_and(|protocol| !protocol.history_sync_notification.is_set())
+        );
+        assert_eq!(detached.inline_payload.as_deref(), Some(&inner_payload[..]));
     }
 
     #[test]
@@ -1355,6 +1715,7 @@ mod parse_message_info_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod device_sent_tests {
     use super::*;
 
@@ -1568,22 +1929,16 @@ mod device_sent_tests {
         );
     }
 
-    /// Pin the spliced field numbers to the prost-generated schema: encode a probe
+    /// Pin the spliced field numbers to the generated schema: encode a probe
     /// with only the relevant field set and read the first protobuf key. If the
-    /// .proto ever renumbers one of these fields, prost regenerates and this fails
+    /// .proto ever renumbers one of these fields, Buffa regenerates and this fails
     /// with a precise message, so the hand-written framing cannot silently drift.
     #[test]
-    fn splice_tags_match_prost_schema() {
-        fn first_field_number(bytes: &[u8]) -> u64 {
-            let (mut key, mut shift) = (0u64, 0u32);
-            for &b in bytes {
-                key |= u64::from(b & 0x7f) << shift;
-                if b & 0x80 == 0 {
-                    break;
-                }
-                shift += 7;
-            }
-            key >> 3
+    fn splice_tags_match_generated_schema() {
+        fn first_field_number(mut bytes: &[u8]) -> u32 {
+            buffa::encoding::Tag::decode(&mut bytes)
+                .expect("probe should start with a valid protobuf tag")
+                .field_number()
         }
 
         let outer_dsm = wa::Message {

@@ -4,7 +4,11 @@
 //! All data lives in RAM behind a single [`async_lock::Mutex`] and is lost
 //! when the struct is dropped.
 
+use hashbrown::hash_map::Entry;
+use hashbrown::{Equivalent, HashMap as HbHashMap};
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::Hash;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -37,7 +41,31 @@ struct PreKeyEntry {
 type BaseKeyKey = (String, String);
 
 /// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
-type MsgSecretRow = (Vec<u8>, i64, i64);
+type MsgSecretRow = (MessageSecret, i64, i64);
+
+#[derive(Eq, Hash, PartialEq)]
+struct MsgSecretKey {
+    chat: Arc<str>,
+    sender: Arc<str>,
+    msg_id: Arc<str>,
+}
+
+#[derive(Hash)]
+struct MsgSecretKeyRef<'a> {
+    chat: &'a str,
+    sender: &'a str,
+    msg_id: &'a str,
+}
+
+impl Equivalent<MsgSecretKey> for MsgSecretKeyRef<'_> {
+    fn equivalent(&self, key: &MsgSecretKey) -> bool {
+        self.chat == key.chat.as_ref()
+            && self.sender == key.sender.as_ref()
+            && self.msg_id == key.msg_id.as_ref()
+    }
+}
+
+type MsgSecretMap = HbHashMap<MsgSecretKey, MsgSecretRow, RandomState>;
 
 /// Inner state protected by the mutex.
 #[derive(Default)]
@@ -73,7 +101,7 @@ struct InMemoryState {
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
     /// event time is unknown. The keepalive cleanup prunes expired rows.
-    msg_secrets: HashMap<(String, String, String), MsgSecretRow>,
+    msg_secrets: MsgSecretMap,
 
     // --- Device ---
     device: Option<Device>,
@@ -534,9 +562,8 @@ impl ProtocolStore for InMemoryBackend {
             return Ok(());
         }
         let mut state = self.state.lock().await;
-        let targets: std::collections::HashSet<&str> = device_jids.iter().copied().collect();
         for group_map in state.sender_key_devices.values_mut() {
-            group_map.retain(|jid, _| !targets.contains(jid.as_str()));
+            group_map.retain(|jid, _| !device_jids.contains(&jid.as_str()));
         }
         Ok(())
     }
@@ -871,18 +898,29 @@ impl MsgSecretStore for InMemoryBackend {
         use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
         let mut state = self.state.lock().await;
+        // Initial history batches are overwhelmingly new rows, so reserve
+        // once. Once populated, a batch may be mostly overwrites; reserving its
+        // full length then would grow the table without adding any rows.
+        if state.msg_secrets.is_empty() {
+            state.msg_secrets.reserve(stored);
+        }
         for entry in entries {
-            let key = (entry.chat, entry.sender, entry.msg_id);
-            let (expires_at, message_ts) = match state.msg_secrets.get(&key) {
-                Some((_, existing_exp, existing_ts)) => (
-                    merge_msg_secret_expiry(*existing_exp, entry.expires_at),
-                    merge_msg_secret_message_ts(*existing_ts, entry.message_ts),
-                ),
-                None => (entry.expires_at, entry.message_ts),
+            let key = MsgSecretKey {
+                chat: entry.chat,
+                sender: entry.sender,
+                msg_id: entry.msg_id,
             };
-            state
-                .msg_secrets
-                .insert(key, (entry.secret, expires_at, message_ts));
+            match state.msg_secrets.entry(key) {
+                Entry::Occupied(mut occupied) => {
+                    let (secret, expires_at, message_ts) = occupied.get_mut();
+                    *secret = entry.secret;
+                    *expires_at = merge_msg_secret_expiry(*expires_at, entry.expires_at);
+                    *message_ts = merge_msg_secret_message_ts(*message_ts, entry.message_ts);
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
+                }
+            }
         }
         Ok(stored)
     }
@@ -910,8 +948,12 @@ impl MsgSecretStore for InMemoryBackend {
             .lock()
             .await
             .msg_secrets
-            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _, message_ts)| (secret.clone(), *message_ts)))
+            .get(&MsgSecretKeyRef {
+                chat,
+                sender,
+                msg_id,
+            })
+            .map(|(secret, _, message_ts)| (secret.to_vec(), *message_ts)))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -1200,7 +1242,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
-                    secret: vec![1u8; 32],
+                    secret: [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1208,7 +1250,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M2".into(),
-                    secret: vec![2u8; 32],
+                    secret: [2u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1216,7 +1258,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
-                    secret: vec![9u8; 32],
+                    secret: [9u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1255,7 +1297,11 @@ mod tests {
             let mut state = backend.state.lock().await;
             let entry = state
                 .msg_secrets
-                .get_mut(&("c".into(), "s".into(), "OLD".into()))
+                .get_mut(&MsgSecretKeyRef {
+                    chat: "c",
+                    sender: "s",
+                    msg_id: "OLD",
+                })
                 .unwrap();
             entry.1 = crate::time::now_secs() - 86_400 * 30;
         }

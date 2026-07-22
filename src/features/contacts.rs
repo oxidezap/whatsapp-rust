@@ -7,6 +7,7 @@ use crate::client::Client;
 use crate::request::IqError;
 use log::debug;
 use std::collections::HashMap;
+use std::time::Duration;
 use thiserror::Error;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
 use wacore::iq::usync::{IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec};
@@ -197,6 +198,17 @@ impl<'a> Contacts<'a> {
         jid: &Jid,
         preview: bool,
     ) -> Result<Option<ProfilePicture>, ContactError> {
+        self.get_profile_picture_with_timeout(jid, preview, None)
+            .await
+    }
+
+    /// Fetch a profile picture with an optional request timeout override.
+    pub async fn get_profile_picture_with_timeout(
+        &self,
+        jid: &Jid,
+        preview: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Option<ProfilePicture>, ContactError> {
         debug!(
             "get_profile_picture: fetching {} picture for {}",
             if preview { "preview" } else { "full" },
@@ -209,6 +221,9 @@ impl<'a> Contacts<'a> {
             ProfilePictureType::Full
         };
         let mut spec = ProfilePictureSpec::new(jid, picture_type);
+        if let Some(timeout) = timeout {
+            spec = spec.with_timeout(timeout);
+        }
 
         // Skip own JID: server never responds when tctoken is sent for self
         let is_own_jid = {

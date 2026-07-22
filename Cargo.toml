@@ -59,9 +59,9 @@ zerocopy = { version = "0.8.52", default-features = false, features = ["derive"]
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-buffa = { version = "0.8.1", default-features = false, features = ["json"] }
-buffa-build = { version = "0.8.1", default-features = false }
-buffa-descriptor = { version = "0.8.1", default-features = false }
+buffa = { version = "0.9.0", default-features = false, features = ["json"] }
+buffa-build = { version = "0.9.0", default-features = false }
+buffa-descriptor = { version = "0.9.0", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 bon = { version = "3.9.3", default-features = false, features = ["std"] }
@@ -77,6 +77,7 @@ event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
+hashbrown = { version = "0.15.5", default-features = false, features = ["equivalent"] }
 heck = "0.5"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
@@ -172,6 +173,7 @@ bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
+hashbrown = { workspace = true }
 hex = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
@@ -301,6 +303,11 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.serde_json]
 opt-level = "s"
+# The bundled SQLite amalgamation (sqlite3.c) — cargo exports OPT_LEVEL to the
+# build script and the cc crate maps it to -Oz. The C core was the one crate
+# the per-package sweep above missed; same I/O-bound tradeoff as diesel.
+[profile.release.package.libsqlite3-sys]
+opt-level = "z"
 
 # Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
 # fast (release uses fat LTO) and debug symbols stay for local profiling.

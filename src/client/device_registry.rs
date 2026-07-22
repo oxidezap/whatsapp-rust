@@ -6,9 +6,11 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use wacore_binary::Jid;
+use wacore_binary::{Jid, Server};
 
 use super::Client;
+
+const SIGNAL_NAMESPACE_COUNT: usize = 4;
 
 /// Per-group device-list snapshot for `resolve_group_devices_memoized`.
 /// Valid while the producing `GroupInfo` Arc is still the cached one AND the
@@ -75,6 +77,24 @@ impl UserLookupKeys {
         match self {
             Self::LidWithPn { lid, .. } | Self::PnWithLid { lid, .. } => lid,
             Self::Unknown { user } => user,
+        }
+    }
+
+    /// Signal namespaces that may hold sessions for this identity.
+    fn signal_namespaces(&self) -> [(&str, Server); SIGNAL_NAMESPACE_COUNT] {
+        match self {
+            Self::LidWithPn { lid, pn } | Self::PnWithLid { lid, pn } => [
+                (pn, Server::Pn),
+                (lid, Server::Lid),
+                (pn, Server::Hosted),
+                (lid, Server::HostedLid),
+            ],
+            Self::Unknown { user } => [
+                (user, Server::Pn),
+                (user, Server::Lid),
+                (user, Server::Hosted),
+                (user, Server::HostedLid),
+            ],
         }
     }
 }
@@ -576,6 +596,7 @@ impl Client {
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) {
         let device_id = device.device_id();
+        let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
 
         let Some(mut record) = self.load_device_record(user).await else {
             return;
@@ -593,52 +614,52 @@ impl Client {
                     && stored_raw_id != decoded.raw_id
                 {
                     info!(
-                        "raw_id mismatch for user {user}: stored={stored_raw_id}, received={}. Clearing record.",
+                        "raw_id mismatch for user {user}: stored={stored_raw_id}, received={}. Resetting companion devices.",
                         decoded.raw_id
                     );
                     self.clear_device_record(user, device.jid.server.as_str(), &record)
                         .await;
-                    record.devices.clear();
+                    record.devices.retain(|device| device.device_id == 0);
+                } else {
+                    // Filter stale devices by valid_indexes. A raw_id reset already
+                    // removed every companion while preserving primary metadata.
+                    record.devices =
+                        wacore::adv::filter_devices_by_key_index(&record.devices, &decoded);
                 }
                 record.raw_id = Some(decoded.raw_id);
 
-                // Filter stale devices by valid_indexes
-                record.devices =
-                    wacore::adv::filter_devices_by_key_index(&record.devices, &decoded);
-
-                // Only add the new device if its key_index is accepted by the ADV list
-                if !record.devices.iter().any(|d| d.device_id == device_id)
-                    && wacore::adv::is_key_index_valid(device.key_index, &decoded)
-                {
-                    record.devices.push(wacore::store::traits::DeviceInfo {
+                // Only trust notification metadata when its key index is accepted.
+                if wacore::adv::is_key_index_valid(device.key_index, &decoded) {
+                    self.append_or_refresh_device(
+                        &mut record,
                         device_id,
-                        key_index: device.key_index,
-                    });
+                        device.key_index,
+                        is_hosted,
+                    );
                 }
             } else {
                 warn!("patch_device_add: failed to decode key-index-list for user {user}");
-                self.append_device_if_new(&mut record, device_id, device.key_index);
+                self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
             }
         } else {
             // No signed bytes — fall back to simple append
-            self.append_device_if_new(&mut record, device_id, device.key_index);
+            self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
         }
 
         // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
-        // primary (device 0) to the rebuilt list unconditionally, so a raw_id
-        // mismatch (which clears the list) never drops it. `filter_devices_by_key_index`
-        // only keeps device 0 when it is already in the input, so after a clear the
-        // primary would otherwise be lost, leaving a record with no device 0 (or an
-        // empty list) that suppresses the usync re-fetch forever.
+        // primary (device 0) to the rebuilt list unconditionally. Preserve an
+        // existing primary and its metadata across a raw_id reset; restore a
+        // neutral entry only when the input record did not contain one.
         //
         // The primary's key_index is never read (`filter_devices_by_key_index` keeps
         // device 0 regardless and `is_key_index_valid` is not applied to it), so store
-        // `None` to match how device 0 is recorded everywhere else.
+        // `None` to match how device 0 is recorded everywhere else. Hosting belongs
+        // to each device-list entry, so the companion notification cannot classify
+        // the primary.
         if !record.devices.iter().any(|d| d.device_id == 0) {
-            record.devices.push(wacore::store::traits::DeviceInfo {
-                device_id: 0,
-                key_index: None,
-            });
+            record
+                .devices
+                .push(wacore::store::traits::DeviceInfo::new(0, None));
         }
 
         // New devices are picked up automatically by `resolve_skdm_targets`:
@@ -650,35 +671,37 @@ impl Client {
         }
     }
 
-    /// Append a device if it doesn't already exist in the record.
-    fn append_device_if_new(
+    /// Append a new device or refresh the addressing metadata of an existing one.
+    fn append_or_refresh_device(
         &self,
         record: &mut wacore::store::traits::DeviceListRecord,
         device_id: u32,
         key_index: Option<u32>,
+        is_hosted: bool,
     ) {
-        if !record.devices.iter().any(|d| d.device_id == device_id) {
-            record.devices.push(wacore::store::traits::DeviceInfo {
-                device_id,
-                key_index,
-            });
+        match record
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            Some(device) => device.is_hosted = is_hosted,
+            None => record.devices.push(
+                wacore::store::traits::DeviceInfo::new(device_id, key_index)
+                    .with_hosting(is_hosted),
+            ),
         }
     }
 
-    /// Delete Signal sessions for specific device IDs under both LID and PN
-    /// addresses, then flush. Shared by `clear_device_record` and
-    /// `patch_device_remove`.
+    /// Delete Signal sessions for specific device IDs in every user namespace,
+    /// then flush. Shared by `clear_device_record` and `patch_device_remove`.
     async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
         let lookup = self.resolve_lookup_keys(user).await;
-        let servers = [wacore_binary::Server::Lid, wacore_binary::Server::Pn];
-        for server in servers {
-            for key in lookup.all_keys() {
-                for &device_id in device_ids {
-                    let mut jid = Jid::new(key, server);
-                    jid.device = device_id;
-                    let addr = wacore::types::jid::JidExt::to_protocol_address(&jid);
-                    self.signal_cache.delete_session(&addr).await;
-                }
+        for (key, server) in lookup.signal_namespaces() {
+            for &device_id in device_ids {
+                let mut jid = Jid::new(key, server);
+                jid.device = device_id;
+                let addr = wacore::types::jid::JidExt::to_protocol_address(&jid);
+                self.signal_cache.delete_session(&addr).await;
             }
         }
         self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
@@ -785,8 +808,8 @@ impl Client {
     }
 
     /// Delete `sender_key_devices` rows whose `device_jid` matches the given
-    /// (user, device_id) under either LID or PN addressing. Both alias keys
-    /// for the user are tried via `resolve_lookup_keys`. The in-memory cache
+    /// (user, device_id) under every standard and hosted Signal namespace.
+    /// Both aliases are resolved by `resolve_lookup_keys`. The in-memory cache
     /// is also evicted for groups that indexed the removed JID — necessary
     /// because a future re-add of the same device_id would otherwise hit
     /// a stale `has_key=true` entry and skip SKDM.
@@ -801,16 +824,25 @@ impl Client {
         device_id: u16,
     ) -> Result<(), wacore::store::error::StoreError> {
         let lookup = self.resolve_lookup_keys(user).await;
-        let servers = [wacore_binary::Server::Lid, wacore_binary::Server::Pn];
-        let mut candidates: Vec<String> = Vec::with_capacity(4);
-        for server in servers {
-            for key in lookup.all_keys() {
-                let mut jid = Jid::new(key, server);
-                jid.device = device_id;
-                candidates.push(jid.to_string());
-            }
+        let namespaces = lookup.signal_namespaces();
+        let mut device_id_buffer = itoa::Buffer::new();
+        let device_id_text = device_id_buffer.format(device_id);
+        let separator_len = ':'.len_utf8() + '@'.len_utf8();
+        let capacity = namespaces
+            .iter()
+            .map(|(key, server)| {
+                key.len() + device_id_text.len() + server.as_str().len() + separator_len
+            })
+            .sum();
+        let mut candidates = String::with_capacity(capacity);
+        let mut ranges = [(0, 0); SIGNAL_NAMESPACE_COUNT];
+        for ((key, server), range) in namespaces.into_iter().zip(&mut ranges) {
+            let start = candidates.len();
+            wacore_binary::push_jid_to_string(key, server, 0, device_id, &mut candidates);
+            *range = (start, candidates.len());
         }
-        let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let refs: [&str; SIGNAL_NAMESPACE_COUNT] =
+            ranges.map(|(start, end)| &candidates[start..end]);
         self.persistence_manager
             .delete_sender_key_device_rows(&refs)
             .await?;
@@ -934,31 +966,26 @@ impl Client {
     }
 
     /// Reconstruct `Vec<Jid>` from a `DeviceListRecord`, using the query JID's
-    /// user part and server type. This ensures that a PN-typed query always
-    /// returns PN-typed device JIDs even if the record is stored under a LID key
-    /// (and vice versa), which matters after PN-to-LID migration.
+    /// user part and addressing family while honoring each device's hosted bit.
+    /// This keeps PN/LID selection independent from the registry's storage key.
     fn reconstruct_device_jids(
         query_jid: &Jid,
         record: &wacore::store::traits::DeviceListRecord,
     ) -> Vec<Jid> {
-        let user = &query_jid.user;
-        record
-            .devices
-            .iter()
-            .map(|d| {
-                debug_assert!(
-                    d.device_id <= u16::MAX as u32,
-                    "device_id {} overflows u16",
-                    d.device_id
-                );
-                let device = d.device_id as u16;
-                if query_jid.is_lid() {
-                    Jid::lid_device(user.clone(), device)
-                } else {
-                    Jid::pn_device(user.clone(), device)
+        let base = query_jid.to_non_ad();
+        let mut devices = Vec::with_capacity(record.devices.len());
+        for device in &record.devices {
+            match u16::try_from(device.device_id) {
+                Ok(device_id) => {
+                    devices.push(base.with_device_hosting(device_id, device.is_hosted));
                 }
-            })
-            .collect()
+                Err(_) => warn!(
+                    "reconstruct_device_jids: device_id {} exceeds u16; skipping",
+                    device.device_id
+                ),
+            }
+        }
+        devices
     }
 
     /// Background task placeholder: waits for the shutdown signal, then exits.
@@ -1035,6 +1062,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::lid_pn_cache::LearningSource;
@@ -1056,10 +1084,7 @@ mod tests {
             user: user.into(),
             devices: device_ids
                 .iter()
-                .map(|&id| wacore::store::traits::DeviceInfo {
-                    device_id: id,
-                    key_index: None,
-                })
+                .map(|&id| wacore::store::traits::DeviceInfo::new(id, None))
                 .collect(),
             timestamp: wacore::time::now_secs(),
             phash: None,
@@ -1360,10 +1385,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: pn.into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1385,14 +1407,8 @@ mod tests {
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: lid.into(),
                 devices: vec![
-                    wacore::store::traits::DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    },
-                    wacore::store::traits::DeviceInfo {
-                        device_id: 11,
-                        key_index: None,
-                    },
+                    wacore::store::traits::DeviceInfo::new(0, None),
+                    wacore::store::traits::DeviceInfo::new(11, None),
                 ],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
@@ -1424,10 +1440,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990003".into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1443,10 +1456,7 @@ mod tests {
         client
             .update_device_lists(vec![wacore::store::traits::DeviceListRecord {
                 user: "5511999990004".into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1484,10 +1494,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990005".into(),
-                devices: vec![wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1745,8 +1752,9 @@ mod tests {
 
         setup_device_record(&client, "15551234567", &[0, 3]).await;
 
-        // Patch: add device 3 again — should not duplicate
-        let elem = make_device_element(3, None);
+        // Patch: add device 3 again — should refresh its namespace, not duplicate it.
+        let mut elem = make_device_element(3, None);
+        elem.jid.server = Server::Hosted;
         client.patch_device_add("15551234567", &elem, None).await;
 
         let updated = client
@@ -1759,6 +1767,12 @@ mod tests {
             1
         );
         assert!(updated.devices.iter().any(|d| d.device_id == 0));
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|d| d.device_id == 3 && d.is_hosted)
+        );
         assert_eq!(updated.devices.len(), 2);
     }
 
@@ -1797,6 +1811,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_sessions_covers_standard_and_hosted_user_namespaces() {
+        use wacore::libsignal::protocol::SessionRecord;
+
+        let client = create_test_client().await;
+        let lid = "100000000000001";
+        let pn = "15551234567";
+        setup_lid_pn(&client, lid, pn).await;
+
+        let addresses: Vec<_> = [
+            Jid::new(pn, Server::Pn).with_device(5),
+            Jid::new(lid, Server::Lid).with_device(5),
+            Jid::new(pn, Server::Hosted).with_device(5),
+            Jid::new(lid, Server::HostedLid).with_device(5),
+        ]
+        .iter()
+        .map(wacore::types::jid::JidExt::to_protocol_address)
+        .collect();
+
+        for address in &addresses {
+            client
+                .signal_cache
+                .put_session(address, SessionRecord::new_fresh())
+                .await;
+        }
+
+        client.delete_sessions_for_devices(pn, &[5]).await;
+
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        for address in addresses {
+            assert!(
+                !client
+                    .signal_cache
+                    .has_session(&address, &*snapshot.backend)
+                    .await
+                    .unwrap(),
+                "session was not deleted for {}",
+                address.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_sender_key_rows_covers_standard_and_hosted_user_namespaces() {
+        let client = create_test_client().await;
+        let lid = "100000000000001";
+        let pn = "15551234567";
+        setup_lid_pn(&client, lid, pn).await;
+
+        let removed_jids = [
+            Jid::new(pn, Server::Pn).with_device(5).to_string(),
+            Jid::new(lid, Server::Lid).with_device(5).to_string(),
+            Jid::new(pn, Server::Hosted).with_device(5).to_string(),
+            Jid::new(lid, Server::HostedLid).with_device(5).to_string(),
+        ];
+        let retained_jid = Jid::new(pn, Server::Hosted).with_device(6).to_string();
+        let mut entries: Vec<_> = removed_jids
+            .iter()
+            .map(|jid| (jid.as_str(), true))
+            .collect();
+        entries.push((retained_jid.as_str(), true));
+
+        let group = "120363000000000001@g.us";
+        client
+            .persistence_manager
+            .set_sender_key_status(group, &entries)
+            .await
+            .unwrap();
+
+        client
+            .delete_sender_key_rows_for_device(pn, 5)
+            .await
+            .unwrap();
+
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        for removed_jid in removed_jids {
+            assert!(
+                rows.iter().all(|(jid, _)| jid != &removed_jid),
+                "sender-key row was not deleted for {removed_jid}"
+            );
+        }
+        assert!(rows.iter().any(|(jid, _)| jid == &retained_jid));
+    }
+
+    #[tokio::test]
     async fn test_patch_device_update_key_index() {
         let client = create_test_client().await;
 
@@ -1804,14 +1906,8 @@ mod tests {
         let record = wacore::store::traits::DeviceListRecord {
             user: "15551234567".to_string(),
             devices: vec![
-                wacore::store::traits::DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                wacore::store::traits::DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(1),
-                },
+                wacore::store::traits::DeviceInfo::new(0, None),
+                wacore::store::traits::DeviceInfo::new(3, Some(1)),
             ],
             timestamp: 1000,
             phash: None,
@@ -1856,6 +1952,34 @@ mod tests {
         assert_eq!(dev3.key_index, Some(2));
     }
 
+    #[tokio::test]
+    async fn hosted_companion_does_not_reclassify_primary_device() {
+        let client = create_test_client().await;
+        setup_device_record(&client, "15551234567", &[0]).await;
+
+        let mut elem = make_device_element(3, Some(2));
+        elem.jid.server = Server::Hosted;
+        client.patch_device_add("15551234567", &elem, None).await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == 3 && device.is_hosted)
+        );
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == 0 && !device.is_hosted)
+        );
+    }
+
     /// Encode an `ADVSignedKeyIndexList` whose decoded `raw_id`/`valid_indexes`
     /// drive `patch_device_add` (the signature is not verified locally; the
     /// notification arrives over the authenticated Noise channel).
@@ -1890,9 +2014,8 @@ mod tests {
             user: user.into(),
             devices: device_ids
                 .iter()
-                .map(|&id| wacore::store::traits::DeviceInfo {
-                    device_id: id,
-                    key_index: if id == 0 { None } else { Some(7) },
+                .map(|&id| {
+                    wacore::store::traits::DeviceInfo::new(id, if id == 0 { None } else { Some(7) })
                 })
                 .collect(),
             timestamp: 1000,
@@ -1901,19 +2024,58 @@ mod tests {
         }
     }
 
-    // raw_id mismatch clears the list and rebuilds from the notification; the
-    // primary (device 0) must survive. Regression guard for a record that would
-    // otherwise persist without device 0 (and then suppress usync forever).
     #[tokio::test]
-    async fn test_patch_device_add_raw_id_mismatch_preserves_primary() {
+    async fn signed_device_add_refreshes_existing_hosting_metadata() {
         let client = create_test_client().await;
-
         client
             .device_registry_cache
             .raw_insert_for_tests(
                 "15551234567".to_string(),
                 Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
             )
+            .await;
+
+        let key_index_info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(make_signed_key_index_bytes(1, 0, vec![7])),
+        };
+        let mut elem = make_device_element(5, Some(7));
+        elem.jid.server = Server::Hosted;
+        client
+            .patch_device_add("15551234567", &elem, Some(&key_index_info))
+            .await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(updated.devices.len(), 2);
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == 5 && device.is_hosted)
+        );
+    }
+
+    // A raw_id mismatch drops stale companions and rebuilds from the notification;
+    // the primary (device 0) and its existing metadata must survive.
+    #[tokio::test]
+    async fn test_patch_device_add_raw_id_mismatch_preserves_primary() {
+        let client = create_test_client().await;
+
+        let mut record = record_with_raw_id("15551234567", &[0, 5], 1);
+        record
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == 0)
+            .unwrap()
+            .is_hosted = true;
+
+        client
+            .device_registry_cache
+            .raw_insert_for_tests("15551234567".to_string(), Arc::new(record))
             .await;
 
         // New raw_id (2) != stored (1) → clear + rebuild. Notified device 19 has a
@@ -1943,8 +2105,10 @@ mod tests {
                     updated.devices
                 )
             });
-        // The re-seeded primary carries no key index (it is never read for device 0).
+        // The existing primary metadata is retained; it is not reconstructed from
+        // the incoming companion's namespace.
         assert_eq!(dev0.key_index, None);
+        assert!(dev0.is_hosted);
         assert!(updated.devices.iter().any(|d| d.device_id == 19));
         // Stale companion from the old identity is dropped by the clear.
         assert!(!updated.devices.iter().any(|d| d.device_id == 5));
@@ -2003,16 +2167,7 @@ mod tests {
         // Store device list under PN in backend
         let record = DeviceListRecord {
             user: pn.to_string(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 39,
-                    key_index: Some(25),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2090,6 +2245,25 @@ mod tests {
         assert_eq!(devices[0].user, lid, "device JID user should be the LID");
     }
 
+    #[test]
+    fn reconstruct_device_jids_skips_unrepresentable_persisted_ids() {
+        let record = wacore::store::traits::DeviceListRecord {
+            user: "13135550100".into(),
+            devices: vec![
+                wacore::store::traits::DeviceInfo::new(7, None).with_hosting(true),
+                wacore::store::traits::DeviceInfo::new(u32::from(u16::MAX) + 1, None),
+            ],
+            timestamp: 0,
+            phash: None,
+            raw_id: None,
+        };
+
+        assert_eq!(
+            Client::reconstruct_device_jids(&Jid::pn("13135550100"), &record),
+            vec![Jid::new("13135550100", Server::Hosted).with_device(7)]
+        );
+    }
+
     // A present-but-empty record must read as a miss (None), not Some([]). The
     // 1:1 send path reads get_devices_from_registry directly and only warms from
     // the network on None, so an empty Some would shadow that warmup and the
@@ -2120,10 +2294,7 @@ mod tests {
         // Seed backend DB directly (bypassing the in-process cache)
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![DeviceInfo {
-                device_id: 0,
-                key_index: None,
-            }],
+            devices: vec![DeviceInfo::new(0, None)],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2176,16 +2347,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(5),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2260,16 +2422,7 @@ mod tests {
         // Pre-populate device registry with device 0 AND device 3
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(5),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2363,10 +2516,7 @@ mod tests {
         backend
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 5,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(5, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2381,10 +2531,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 7,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(7, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2416,10 +2563,7 @@ mod tests {
         backend
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(0, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2460,10 +2604,7 @@ mod tests {
             backend
                 .update_device_list(DeviceListRecord {
                     user: user.to_string(),
-                    devices: vec![DeviceInfo {
-                        device_id: 1,
-                        key_index: None,
-                    }],
+                    devices: vec![DeviceInfo::new(1, None)],
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -2518,10 +2659,7 @@ mod tests {
 
         let legacy = DeviceListRecord {
             user: pn.to_string(),
-            devices: vec![DeviceInfo {
-                device_id: 9,
-                key_index: None,
-            }],
+            devices: vec![DeviceInfo::new(9, None)],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2539,10 +2677,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: pn.to_string(),
-                devices: vec![DeviceInfo {
-                    device_id: 10,
-                    key_index: None,
-                }],
+                devices: vec![DeviceInfo::new(10, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,

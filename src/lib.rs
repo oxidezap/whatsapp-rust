@@ -6,6 +6,34 @@
 // `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
 #![recursion_limit = "512"]
 
+// Process-wide allocation counter shared by empirical unit-test guards. Tests
+// use minimum deltas across repeated windows so allocations from sibling test
+// threads cannot create false passes.
+#[cfg(test)]
+#[allow(clippy::disallowed_types)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    struct CountingAlloc;
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
+}
+
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
@@ -117,19 +145,21 @@ pub use features::{
     ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
     CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
     CreateGroupResult, EncryptedEdit, EventCreationParams, EventResponseType, Events,
-    GroupCreateOptions, GroupDescription, GroupError, GroupJoinError, GroupMetadata,
-    GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType,
-    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels,
-    LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
-    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
-    MembershipRequest, Mex, MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter,
-    NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
-    NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
-    ParticipantChangeResponse, ParticipantType, PictureType, PollError, Presence, PresenceError,
-    PresenceStatus, Profile, ProfileError, ProfilePicture, SecretEncKind, SecretEncrypted,
-    SetProfilePictureResponse, Signal, SignalError, Status, StatusPrivacySetting,
-    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
-    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupError,
+    GroupJoinError, GroupMetadata, GroupParticipant, GroupParticipantDetails,
+    GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo,
+    InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
+    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex,
+    MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterError,
+    NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
+    NewsletterRole, NewsletterState, NewsletterVerification, ParticipantChangeResponse,
+    ParticipantType, PictureType, PollError, Presence, PresenceError, PresenceStatus, Profile,
+    ProfileError, ProfilePicture, ReachoutTimelock, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
+    Status, StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
+    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key,
+    message_range,
 };
 
 pub mod bot;

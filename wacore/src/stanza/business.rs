@@ -3,8 +3,7 @@
 //! Reference: WhatsApp Web `WAWebHandleBusinessNotification`
 
 use anyhow::{Result, anyhow};
-use buffa::Message as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wacore_binary::Jid;
 use wacore_binary::NodeRef;
 
@@ -35,12 +34,17 @@ pub enum BusinessNotificationType {
 }
 
 /// Verified name certificate information.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedName {
     pub name: Option<String>,
     pub serial: Option<String>,
     pub issuer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_helpers::serialize_optional_bytes",
+        deserialize_with = "crate::serde_helpers::deserialize_optional_bytes"
+    )]
     pub certificate: Option<Vec<u8>>,
 }
 
@@ -77,13 +81,10 @@ impl VerifiedName {
         // lives only inside the certificate protobuf (content bytes). Decode it
         // to fill the missing fields, matching WAWebCommonParsersVerifiedName.
         if let Some(cert_bytes) = certificate.as_deref()
-            && let Ok(cert) =
-                waproto::whatsapp::VerifiedNameCertificate::decode_from_slice(cert_bytes)
+            && let Ok(cert) = waproto::codec::verified_name_certificate_decode(cert_bytes)
             && let Some(details_bytes) = cert.details.as_deref()
             && let Ok(details) =
-                waproto::whatsapp::verified_name_certificate::Details::decode_from_slice(
-                    details_bytes,
-                )
+                waproto::codec::verified_name_certificate_details_decode(details_bytes)
         {
             name = name.or(details.verified_name);
             serial = serial.or_else(|| details.serial.map(|s| s.to_string()));
@@ -385,8 +386,10 @@ impl BusinessNotification {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message as _;
     use wacore_binary::builder::NodeBuilder;
 
     #[test]

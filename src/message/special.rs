@@ -1,7 +1,6 @@
 //! Special message types: newsletter, app-state key share, sender-key distribution.
 
 use super::*;
-use buffa::Message as _;
 
 const APP_STATE_KEY_SHARE_SEND_ATTEMPTS: u8 = 3;
 const APP_STATE_KEY_SHARE_SEND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -90,7 +89,9 @@ impl Client {
             Some(KeyComponents {
                 key_id,
                 data,
-                fingerprint_bytes: fingerprint.encode_to_vec(),
+                fingerprint_bytes: waproto::codec::app_state_sync_key_fingerprint_to_vec(
+                    fingerprint,
+                ),
                 timestamp: key_data.timestamp.unwrap_or_default(),
             })
         }
@@ -182,9 +183,7 @@ impl Client {
                 continue;
             };
             let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
-                match wa::message::AppStateSyncKeyFingerprint::decode_from_slice(
-                    &stored.fingerprint,
-                ) {
+                match waproto::codec::app_state_sync_key_fingerprint_decode(&stored.fingerprint) {
                     Ok(fingerprint) => {
                         buffa::MessageField::some(wa::message::AppStateSyncKeyData {
                             key_data: Some(stored.key_data),
@@ -381,98 +380,10 @@ impl Client {
         sender_jid: &Jid,
         axolotl_bytes: &[u8],
     ) {
-        let skdm = match SenderKeyDistributionMessage::try_from(axolotl_bytes) {
-            Ok(msg) => msg,
-            Err(e1) => match wa::SenderKeyDistributionMessage::decode_from_slice(axolotl_bytes) {
-                Ok(go_msg) => {
-                    let (Some(signing_key), Some(id), Some(iteration), Some(chain_key)) = (
-                        go_msg.signing_key.as_ref(),
-                        go_msg.id,
-                        go_msg.iteration,
-                        go_msg.chain_key.as_ref(),
-                    ) else {
-                        log::warn!(
-                            "Go SKDM from {} missing required fields (signing_key={}, id={}, iteration={}, chain_key={})",
-                            sender_jid.observe(),
-                            go_msg.signing_key.is_some(),
-                            go_msg.id.is_some(),
-                            go_msg.iteration.is_some(),
-                            go_msg.chain_key.is_some()
-                        );
-                        return;
-                    };
-                    let chain_key_arr: [u8; 32] = match chain_key.as_slice().try_into() {
-                        Ok(arr) => arr,
-                        Err(_) => {
-                            log::error!(
-                                "Invalid chain_key length {} from Go SKDM from {}",
-                                chain_key.len(),
-                                sender_jid.observe()
-                            );
-                            return;
-                        }
-                    };
-                    match SignalPublicKey::from_djb_public_key_bytes(signing_key) {
-                        Ok(pub_key) => {
-                            match SenderKeyDistributionMessage::new(
-                                SENDERKEY_MESSAGE_CURRENT_VERSION,
-                                id,
-                                iteration,
-                                chain_key_arr,
-                                pub_key,
-                            ) {
-                                Ok(skdm) => skdm,
-                                Err(e) => {
-                                    log::error!(
-                                        "Failed to construct SKDM from Go format from {}: {:?} (original parse error: {:?})",
-                                        sender_jid.observe(),
-                                        e,
-                                        e1
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to parse public key from Go SKDM for {}: {:?} (original parse error: {:?})",
-                                sender_jid.observe(),
-                                e,
-                                e1
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(e2) => {
-                    log::error!(
-                        "Failed to parse SenderKeyDistributionMessage (standard and Go fallback) from {}: primary: {:?}, fallback: {:?}",
-                        sender_jid.observe(),
-                        e1,
-                        e2
-                    );
-                    return;
-                }
-            },
-        };
-
-        // Normalize to bare sender for consistent sender key addressing.
-        let sender_bare = sender_jid.to_non_ad();
-        let sender_address = sender_bare.to_protocol_address();
-
-        let sender_key_name = make_sender_key_name(group_jid, &sender_address);
-
-        // Route through the signal cache adapter so the sender key is immediately visible
-        // in the cache for subsequent group_decrypt calls within the same message batch.
-        // Only the sender-key store is needed here, so build it standalone instead of
-        // the full five-store adapter.
-        let mut sender_key_store = self.sender_key_adapter().await;
-        let chain_lock = sender_key_store.sender_key_lock(&sender_key_name).await;
-        let _chain_guard = chain_lock.lock().await;
-
-        if let Err(e) =
-            process_sender_key_distribution_message(&sender_key_name, &skdm, &mut sender_key_store)
-                .await
+        if let Err(e) = self
+            .signal()
+            .process_sender_key_distribution_cached(group_jid, sender_jid, axolotl_bytes)
+            .await
         {
             log::error!(
                 "Failed to process SenderKeyDistributionMessage from {}: {:?}",

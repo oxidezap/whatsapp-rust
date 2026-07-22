@@ -158,6 +158,24 @@ pub fn parse_jid_fast(s: &str) -> Option<ParsedJidParts<'_>> {
     })
 }
 
+/// Parse the allocation-free JID shapes into the same borrowed type used by
+/// the binary decoder.
+///
+/// Returns `None` when the string needs [`Jid`]'s compatibility fallback or
+/// names an unknown server. Callers that must accept those edge cases can fall
+/// back to `s.parse::<Jid>()`; normal user/group/LID/bot JIDs stay borrowed.
+#[inline]
+pub fn parse_jid_ref(s: &str) -> Option<JidRef<'_>> {
+    let parts = parse_jid_fast(s)?;
+    Some(JidRef {
+        user: NodeStr::Borrowed(parts.user),
+        server: Server::try_from(parts.server).ok()?,
+        agent: parts.agent,
+        device: parts.device,
+        integrator: parts.integrator,
+    })
+}
+
 /// Known WhatsApp server identifiers.
 ///
 /// Maps to the wire protocol's AD_JID domain type (u8) and the `@server` suffix
@@ -191,8 +209,38 @@ impl serde::Serialize for Server {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Server {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(deserializer)?;
-        Server::try_from(s).map_err(serde::de::Error::custom)
+        struct ServerVisitor;
+
+        impl serde::de::Visitor<'_> for ServerVisitor {
+            type Value = Server;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a known WhatsApp server identifier")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Server::try_from(value.as_str()).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ServerVisitor)
     }
 }
 
@@ -542,6 +590,23 @@ impl Jid {
         }
     }
 
+    /// Construct a device JID and select the hosted variant of PN/LID when
+    /// indicated by a device-list entry.
+    ///
+    /// Non-user namespaces are left unchanged because they have no hosted
+    /// counterpart on the wire.
+    pub fn with_device_hosting(&self, device_id: u16, is_hosted: bool) -> Self {
+        let mut jid = self.with_device(device_id);
+        jid.server = match (jid.server, is_hosted) {
+            (Server::Pn | Server::Hosted, true) => Server::Hosted,
+            (Server::Pn | Server::Hosted, false) => Server::Pn,
+            (Server::Lid | Server::HostedLid, true) => Server::HostedLid,
+            (Server::Lid | Server::HostedLid, false) => Server::Lid,
+            (server, _) => server,
+        };
+        jid
+    }
+
     pub fn to_non_ad(&self) -> Self {
         Self {
             user: self.user.clone(),
@@ -637,6 +702,13 @@ impl Jid {
         push_jid_to_string(&self.user, self.server, self.agent, self.device, buf);
     }
 
+    /// Write the Display representation to any [`fmt::Write`] sink without an
+    /// intermediate `String`.
+    #[inline]
+    pub fn write_display_to<W: fmt::Write + ?Sized>(&self, writer: &mut W) -> fmt::Result {
+        write_jid_fallible(writer, &self.user, self.server, self.agent, self.device)
+    }
+
     /// Compare device identity (user, server, device) without allocation.
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
@@ -707,14 +779,8 @@ impl FromStr for Jid {
     type Err = JidError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Try fast path first for well-formed JIDs
-        if let Some(parts) = parse_jid_fast(s) {
-            return Ok(Jid {
-                user: CompactString::from(parts.user),
-                server: Server::try_from(parts.server)?,
-                agent: parts.agent,
-                device: parts.device,
-                integrator: parts.integrator,
-            });
+        if let Some(jid) = parse_jid_ref(s) {
+            return Ok(jid.to_owned());
         }
 
         // Fallback to original parsing for edge cases and validation
@@ -887,7 +953,7 @@ impl fmt::Write for JidStackWriter {
 }
 
 #[inline]
-fn write_jid_fallible<W: fmt::Write>(
+fn write_jid_fallible<W: fmt::Write + ?Sized>(
     w: &mut W,
     user: &str,
     server: Server,
@@ -900,10 +966,10 @@ fn write_jid_fallible<W: fmt::Write>(
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut w = JidStackWriter::new();
-        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+        if self.write_display_to(&mut w).is_ok() {
             return f.write_str(w.as_str());
         }
-        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
+        self.write_display_to(f)
     }
 }
 
@@ -1048,6 +1114,17 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn server_deserializes_borrowed_and_owned_strings() {
+        let borrowed: Server = serde_json::from_str("\"s.whatsapp.net\"").unwrap();
+        let owned: Server =
+            serde_json::from_value(serde_json::Value::String("lid".to_owned())).unwrap();
+
+        assert_eq!(borrowed, Server::Pn);
+        assert_eq!(owned, Server::Lid);
+    }
+
     /// `observe()` must never leak a raw phone number, must keep pseudonymous /
     /// non-personal JIDs intact for correlation, and must preserve device.
     #[test]
@@ -1147,6 +1224,27 @@ mod tests {
             "Formatted string did not match expected output for {}",
             input
         );
+    }
+
+    #[test]
+    fn borrowed_parser_matches_owned_fast_path_and_bot_classification() {
+        for raw in [
+            "5511999998888:7@s.whatsapp.net",
+            "120363012345678901@g.us",
+            "123456789012345@lid",
+            "assistant@bot",
+            "13135551234@s.whatsapp.net",
+        ] {
+            let borrowed = parse_jid_ref(raw).expect("common JID should stay borrowed");
+            let owned = raw.parse::<Jid>().unwrap();
+
+            assert!(matches!(borrowed.user, NodeStr::Borrowed(_)));
+            assert_eq!(borrowed.to_owned(), owned);
+            assert_eq!(borrowed.is_bot(), owned.is_bot());
+        }
+
+        assert!(parse_jid_ref("g.us").is_none(), "server-only uses fallback");
+        assert!(parse_jid_ref("user@unknown").is_none());
     }
 
     #[test]
@@ -1555,6 +1653,27 @@ mod tests {
     }
 
     #[test]
+    fn with_device_hosting_preserves_addressing_family() {
+        let hosted_pn = Jid::pn("1234567890").with_device_hosting(7, true);
+        assert_eq!(hosted_pn.server, Server::Hosted);
+        assert_eq!(hosted_pn.device, 7);
+
+        let hosted_lid = Jid::lid("100000012345678").with_device_hosting(8, true);
+        assert_eq!(hosted_lid.server, Server::HostedLid);
+        assert_eq!(hosted_lid.device, 8);
+
+        let regular = Jid::pn("1234567890").with_device_hosting(9, false);
+        assert_eq!(regular.server, Server::Pn);
+
+        let regular_from_hosted =
+            Jid::new("1234567890", Server::Hosted).with_device_hosting(9, false);
+        assert_eq!(regular_from_hosted.server, Server::Pn);
+
+        let group = Jid::group("123-456").with_device_hosting(10, true);
+        assert_eq!(group.server, Server::Group);
+    }
+
+    #[test]
     fn test_status_broadcast_jid() {
         let jid = Jid::status_broadcast();
         assert_eq!(jid.user, STATUS_BROADCAST_USER);
@@ -1668,7 +1787,8 @@ mod tests {
 
     /// Verify that all JID formatting paths produce identical output:
     /// `Jid::Display`, `JidRef::Display`, `push_jid_to_string`, `push_jid_to_compact`,
-    /// and `Jid::push_to`. Exercises the agent-elision rules across server variants.
+    /// `Jid::push_to`, and the generic writer. Exercises the agent-elision rules
+    /// across server variants.
     #[test]
     fn test_jid_format_parity() {
         struct Case {
@@ -1820,6 +1940,10 @@ mod tests {
             let mut push_buf = String::new();
             jid.push_to(&mut push_buf);
 
+            // Generic fmt::Write path.
+            let mut write_buf = String::new();
+            jid.write_display_to(&mut write_buf).unwrap();
+
             assert_eq!(display, ref_display, "case {i}: Display vs JidRef::Display");
             assert_eq!(
                 display, string_buf,
@@ -1831,6 +1955,7 @@ mod tests {
                 "case {i}: Display vs push_jid_to_compact"
             );
             assert_eq!(display, push_buf, "case {i}: Display vs Jid::push_to");
+            assert_eq!(display, write_buf, "case {i}: Display vs generic writer");
         }
     }
 }

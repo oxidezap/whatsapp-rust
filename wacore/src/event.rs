@@ -4,13 +4,13 @@
 //! `EventResponseMessage` proto and the `"Event Response"` use-case.
 
 use anyhow::{Result, ensure};
-use buffa::Message;
 use waproto::whatsapp::message::EventResponseMessage;
 
-use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
+use crate::secret_enc_addon::{
+    AddonContext, MESSAGE_SECRET_SIZE, ModificationType, decrypt_addon, encrypt_addon,
+};
 
 const GCM_IV_SIZE: usize = 12;
-const MESSAGE_SECRET_SIZE: usize = 32;
 
 fn event_response_addon_ctx<'a>(
     stanza_id: &'a str,
@@ -39,7 +39,7 @@ pub fn encrypt_event_response_with_secret(
         "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
         message_secret.len()
     );
-    let plaintext = response.encode_to_vec();
+    let plaintext = waproto::codec::event_response_message_to_vec(response);
     encrypt_addon(
         &plaintext,
         message_secret,
@@ -59,19 +59,41 @@ pub fn decrypt_event_response_with_secret(
     event_creator_jid: &str,
     responder_jid: &str,
 ) -> Result<EventResponseMessage> {
+    let plaintext = decrypt_event_response_payload_with_secret(
+        enc_payload,
+        iv,
+        message_secret,
+        stanza_id,
+        event_creator_jid,
+        responder_jid,
+    )?;
+    Ok(waproto::codec::event_response_message_decode(&plaintext)?)
+}
+
+/// Decrypt an event response and return its encoded protobuf payload.
+///
+/// This keeps authentication and key derivation centralized while allowing a
+/// caller to use its own protobuf decoder.
+pub fn decrypt_event_response_payload_with_secret(
+    enc_payload: &[u8],
+    iv: &[u8],
+    message_secret: &[u8],
+    stanza_id: &str,
+    event_creator_jid: &str,
+    responder_jid: &str,
+) -> Result<Vec<u8>> {
     // The IV length is validated downstream by decrypt_addon (try_into [u8; 12]).
     ensure!(
         message_secret.len() == MESSAGE_SECRET_SIZE,
         "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
         message_secret.len()
     );
-    let plaintext = decrypt_addon(
+    decrypt_addon(
         enc_payload,
         iv,
         message_secret,
         &event_response_addon_ctx(stanza_id, event_creator_jid, responder_jid),
-    )?;
-    Ok(EventResponseMessage::decode_from_slice(&plaintext[..])?)
+    )
 }
 
 #[cfg(test)]
@@ -106,6 +128,20 @@ mod tests {
         .unwrap();
         assert_eq!(out.response, Some(EventResponseType::Going));
         assert_eq!(out.extra_guest_count, Some(2));
+
+        let plaintext = decrypt_event_response_payload_with_secret(
+            &enc,
+            &iv,
+            &secret,
+            "EVTID",
+            "5511777777777@s.whatsapp.net",
+            "5511888888888@s.whatsapp.net",
+        )
+        .unwrap();
+        assert_eq!(
+            plaintext,
+            waproto::codec::event_response_message_to_vec(&resp)
+        );
     }
 
     #[test]

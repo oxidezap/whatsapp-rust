@@ -50,6 +50,19 @@ pub fn aes_256_cbc_decrypt_into(
         .map_err(|_| DecryptionError::BadCiphertext("failed to decrypt"))
 }
 
+/// Decrypt and unpad a caller-owned ciphertext buffer in place.
+pub fn aes_256_cbc_decrypt_in_place(
+    buffer: &mut Vec<u8>,
+    key: &[u8],
+    iv: &[u8],
+) -> Result<(), DecryptionError> {
+    let key: &[u8; 32] = key.try_into().map_err(|_| DecryptionError::BadKeyOrIv)?;
+    let iv: &[u8; 16] = iv.try_into().map_err(|_| DecryptionError::BadKeyOrIv)?;
+    provider()
+        .aes_256_cbc_decrypt_in_place(key, iv, buffer)
+        .map_err(|_| DecryptionError::BadCiphertext("failed to decrypt"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +105,22 @@ mod tests {
         let mut decrypted = Vec::new();
         aes_256_cbc_decrypt_into(&ciphertext, &key, &iv, &mut decrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes_cbc_in_place_roundtrip_reuses_allocation() {
+        let key = [0x42u8; 32];
+        let iv = [0x11u8; 16];
+        let plaintext = b"caller-owned ciphertext allocation";
+
+        let mut buffer = Vec::new();
+        aes_256_cbc_encrypt_into(plaintext, &key, &iv, &mut buffer).unwrap();
+        let allocation = buffer.as_ptr();
+
+        aes_256_cbc_decrypt_in_place(&mut buffer, &key, &iv).unwrap();
+
+        assert_eq!(buffer, plaintext);
+        assert_eq!(buffer.as_ptr(), allocation);
     }
 
     /// NIST AES-256-CBC known-answer vector (from NIST SP 800-38A, Section F.2.5/F.2.6)

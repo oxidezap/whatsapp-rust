@@ -72,9 +72,32 @@ impl Client {
     /// processing and the commit batcher: both must serialize on the same
     /// instance for the drain-flush safety argument to hold.
     pub(crate) async fn acquire_message_processing_permit(&self) -> async_lock::SemaphoreGuardArc {
+        // A holder stalling while the drain semaphore is at 1 permit freezes
+        // every lane and sender with no other signal — surface long waits
+        // instead of hanging silently. The slow path keeps ONE acquire future
+        // alive across warn ticks so the waiter never loses its queue position.
+        const PERMIT_WAIT_WARN: std::time::Duration = std::time::Duration::from_secs(10);
         loop {
             let (generation, semaphore) = self.read_message_semaphore();
-            let permit = semaphore.acquire_arc().await;
+            let permit = match semaphore.try_acquire_arc() {
+                Some(permit) => permit,
+                None => {
+                    let acquire = semaphore.acquire_arc();
+                    futures::pin_mut!(acquire);
+                    let sleep = self.runtime.sleep(PERMIT_WAIT_WARN);
+                    futures::pin_mut!(sleep);
+                    match futures::future::select(&mut acquire, sleep).await {
+                        futures::future::Either::Left((permit, _)) => permit,
+                        futures::future::Either::Right(((), _)) => {
+                            warn!(
+                                "Message-processing permit not acquired after {PERMIT_WAIT_WARN:?} (drain_active={}); a stanza worker or drain flush may be stalled",
+                                self.inbound_commit_batch.is_active()
+                            );
+                            acquire.await
+                        }
+                    }
+                }
+            };
             if generation == self.message_semaphore_generation.load(Ordering::SeqCst) {
                 return permit;
             }
@@ -467,40 +490,48 @@ impl Client {
             return;
         }
 
+        // Most messages do not need a transport <ack> from this generic gate.
+        // Move those nodes into their chat lane instead of retaining a second
+        // Arc in this dispatcher while decryption starts. Besides removing an
+        // atomic refcount pair, this lets a large uniquely-owned pkmsg donate
+        // its receive buffer to authenticated in-place decryption. Newsletter
+        // and status messages keep the extra owner until their deferred ack is
+        // encoded, preserving the existing acknowledgement semantics.
+        let should_ack = self.should_ack(nr);
+        let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
+
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
-        let handled = match nr.tag.as_ref() {
+        match nr.tag.as_ref() {
             "ack" => {
                 self.handle_ack_response_arc(&node);
-                true
             }
             "receipt" => {
-                self.handle_receipt_inline(Arc::clone(&node));
-                true
+                self.handle_receipt_inline(node);
             }
             "message" => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
-                    Arc::clone(&node),
+                    node,
                     &mut cancelled,
                 )
-                .await
+                .await;
             }
             _ => {
-                self.stanza_router
+                let handled = self
+                    .stanza_router
                     .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
-                    .await
+                    .await;
+                if !handled {
+                    warn!(
+                        "Received unknown top-level node: {}",
+                        DisplayableNodeRef(node.get())
+                    );
+                }
             }
-        };
-        if !handled {
-            warn!(
-                "Received unknown top-level node: {}",
-                DisplayableNodeRef(nr)
-            );
         }
 
-        // Send the deferred ACK if applicable and not cancelled by handler
-        if self.should_ack(nr) && !cancelled {
+        if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }
     }

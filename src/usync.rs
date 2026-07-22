@@ -3,12 +3,35 @@
 //! Device list IQ specification is defined in `wacore::iq::usync`.
 
 use crate::client::Client;
+use crate::request::IqError;
 use log::{debug, warn};
 use std::collections::HashSet;
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::Jid;
 
+pub use wacore::iq::usync::{
+    UsyncAddressingMode, UsyncBotCommand, UsyncBotProfessionalType, UsyncBotProfileResult,
+    UsyncBotPrompt, UsyncBusinessResult, UsyncContactResult, UsyncContext, UsyncDeviceListResult,
+    UsyncDeviceResult, UsyncDeviceSyncHint, UsyncDevicesResult, UsyncDisappearingModeResult,
+    UsyncFeature, UsyncFeatureResult, UsyncKeyIndexResult, UsyncMode, UsyncOutcome, UsyncProtocol,
+    UsyncProtocolKind, UsyncProtocolResult, UsyncProtocolState, UsyncQuery, UsyncResponse,
+    UsyncStatusResult, UsyncSubprotocolError, UsyncTextStatusResult, UsyncUser, UsyncUserResult,
+    UsyncValidationError,
+};
+
 impl Client {
+    /// Executes a typed USync query.
+    ///
+    /// The client generates the protocol `sid` independently from the IQ ID,
+    /// matching WhatsApp Web. This neutral operation only returns decoded wire
+    /// data; cache and persistence effects remain in specialized client APIs.
+    pub async fn query_usync(&self, query: UsyncQuery) -> Result<UsyncResponse, IqError> {
+        let sid = self.generate_request_id();
+        let spec = wacore::iq::usync::UsyncQuerySpec::new(query, sid)
+            .map_err(|error| IqError::EncodeError(error.into()))?;
+        self.execute(spec).await
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.usync.get_user_devices", level = "debug", skip_all, fields(users = jids.len()), err(Debug)))]
     pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
         let mut jids_to_fetch: HashSet<Jid> = HashSet::with_capacity(jids.len());
@@ -179,15 +202,16 @@ impl Client {
             let mut devices: Vec<wacore::store::traits::DeviceInfo> = user_list
                 .devices
                 .iter()
-                .map(|d| wacore::store::traits::DeviceInfo {
-                    device_id: d.device as u32,
+                .map(|d| {
                     // Server-returned key_index takes priority over cached
-                    key_index: d.key_index.or_else(|| {
+                    let key_index = d.key_index.or_else(|| {
                         existing_key_indices
                             .get(&(d.device as u32))
                             .copied()
                             .flatten()
-                    }),
+                    });
+                    wacore::store::traits::DeviceInfo::new(d.device as u32, key_index)
+                        .with_hosting(d.is_hosted)
                 })
                 .collect();
 
@@ -199,9 +223,7 @@ impl Client {
             // Convert filtered DeviceInfo list back to JIDs for return
             let user_jid = &user_list.user;
             for d in &devices {
-                let mut jid = user_jid.clone();
-                jid.device = d.device_id as u16;
-                fetched_devices.push(jid);
+                fetched_devices.push(user_jid.with_device_hosting(d.device_id as u16, d.is_hosted));
             }
 
             // An empty device list is never valid — WA Web always keeps the primary
@@ -337,16 +359,7 @@ mod tests {
         // Insert a device record into the registry (simulates prior usync/notification)
         let record = DeviceListRecord {
             user: "1234567890".into(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 3,
-                    key_index: Some(10),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(10))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -369,16 +382,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "100000012345678".into(),
-            devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 39,
-                    key_index: Some(25),
-                },
-            ],
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -401,10 +405,7 @@ mod tests {
         // Insert into backend DB via update_device_list
         let record = DeviceListRecord {
             user: "9876543210".into(),
-            devices: vec![DeviceInfo {
-                device_id: 5,
-                key_index: None,
-            }],
+            devices: vec![DeviceInfo::new(5, None)],
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -481,16 +482,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "2222222222".into(),
-                devices: vec![
-                    DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    },
-                    DeviceInfo {
-                        device_id: 7,
-                        key_index: None,
-                    },
-                ],
+                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: Some("2:oldB".to_string()),
                 raw_id: None,
@@ -502,10 +494,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: "1111111111@s.whatsapp.net".parse().unwrap(),
-                devices: vec![UsyncDevice {
-                    device: 0,
-                    key_index: None,
-                }],
+                devices: vec![UsyncDevice::new(0, None)],
                 phash: Some("2:a".to_string()),
                 key_index_bytes: None,
             }],
@@ -531,6 +520,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_response_preserves_hosted_device_addressing() {
+        use wacore::iq::usync::DeviceListResponse;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("1111111111");
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![
+                    UsyncDevice::new(0, None),
+                    UsyncDevice::new(7, Some(3)).with_hosting(true),
+                ],
+                phash: Some("2:hosted".to_string()),
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+
+        let fetched = client.process_device_list_response(&response).await;
+        assert!(
+            fetched
+                .iter()
+                .any(|jid| jid.device == 7 && jid.server == wacore_binary::Server::Hosted)
+        );
+
+        let cached = client
+            .get_devices_from_registry(&user)
+            .await
+            .expect("processed devices should be cached");
+        assert!(
+            cached
+                .iter()
+                .any(|jid| jid.device == 7 && jid.server == wacore_binary::Server::Hosted)
+        );
+    }
+
     /// A usync that returns an empty device list for a user is transient or
     /// corrupt (WA Web always keeps device 0). `process_device_list_response`
     /// must not persist it: a good cached record stays intact instead of being
@@ -545,16 +572,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "3333333333".into(),
-                devices: vec![
-                    DeviceInfo {
-                        device_id: 0,
-                        key_index: None,
-                    },
-                    DeviceInfo {
-                        device_id: 4,
-                        key_index: None,
-                    },
-                ],
+                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(4, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: Some("3:old".to_string()),
                 raw_id: None,

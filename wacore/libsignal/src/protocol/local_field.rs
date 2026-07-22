@@ -6,6 +6,7 @@ use buffa::encoding::{Tag, WireType, decode_varint, encode_varint, skip_field};
 const STORE_INCARNATION_FIELD: u32 = 101;
 const STORE_INCARNATION_LEN: usize = 16;
 pub(crate) const STORE_INCARNATION_ENCODED_LEN: usize = 19;
+pub(crate) const COUNTER_RESERVATION_FIELD: u32 = 100;
 
 pub(crate) struct LocalRecordFields {
     pub(crate) reservation: u32,

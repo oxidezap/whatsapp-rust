@@ -3,6 +3,7 @@ pub use wacore::appstate::Mutation;
 pub use wacore::appstate_sync::{AppStateProcessor, AppStateSyncDriver, AppStateSyncError};
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use async_lock::Mutex;
@@ -329,7 +330,7 @@ mod tests {
         value_blob.extend_from_slice(&value_mac);
 
         wa::SyncdMutation {
-            operation: Some(op),
+            operation: Some(op.into()),
             record: buffa::MessageField::some(wa::SyncdRecord {
                 index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),

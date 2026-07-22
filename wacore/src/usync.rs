@@ -1,6 +1,8 @@
-use anyhow::{Result, anyhow};
+use crate::iq::usync::{
+    device_list_query, parse_usync_response, project_device_list_response, project_lid_mapping,
+};
+use anyhow::Result;
 use wacore_binary::Jid;
-use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeRef};
 
 /// A LID mapping learned from usync response
@@ -16,6 +18,25 @@ pub struct UsyncLidMapping {
 pub struct UsyncDevice {
     pub device: u16,
     pub key_index: Option<u32>,
+    /// Whether this device belongs to the hosted address space.
+    pub is_hosted: bool,
+}
+
+impl UsyncDevice {
+    /// Construct a regular device entry.
+    pub const fn new(device: u16, key_index: Option<u32>) -> Self {
+        Self {
+            device,
+            key_index,
+            is_hosted: false,
+        }
+    }
+
+    /// Apply the hosted bit reported by the device list.
+    pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
+        self.is_hosted = is_hosted;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,113 +48,14 @@ pub struct UserDeviceList {
 }
 
 pub fn build_get_user_devices_query(jids: &[Jid], sid: &str) -> Node {
-    let user_nodes = jids
-        .iter()
-        .map(|jid| {
-            NodeBuilder::new("user")
-                .attr("jid", jid.to_non_ad())
-                .build()
-        })
-        .collect::<Vec<_>>();
-
-    let query_node = NodeBuilder::new("query")
-        .children([NodeBuilder::new("devices").attr("version", "2").build()])
-        .build();
-
-    let list_node = NodeBuilder::new("list").children(user_nodes).build();
-
-    NodeBuilder::new("usync")
-        .attrs([
-            ("context", "message"),
-            ("index", "0"),
-            ("last", "true"),
-            ("mode", "query"),
-            ("sid", sid),
-        ])
-        .children([query_node, list_node])
-        .build()
+    device_list_query(jids, None).build_node(sid)
 }
 
 /// Parse usync response returning devices grouped by user with phash.
 /// This is the full-featured version that includes the participant hash.
 pub fn parse_get_user_devices_response_with_phash(resp_node: &Node) -> Result<Vec<UserDeviceList>> {
-    let list_node = resp_node
-        .get_optional_child_by_tag(&["usync", "list"])
-        .ok_or_else(|| anyhow!("<usync> or <list> not found in usync response"))?;
-
-    let mut result = Vec::new();
-
-    for user_node in list_node.get_children_by_tag("user") {
-        let user_jid = user_node.attrs().jid("jid");
-        let device_list_node = user_node
-            .get_optional_child_by_tag(&["devices", "device-list"])
-            .ok_or_else(|| anyhow!("<device-list> not found for user {}", user_jid.observe()))?;
-
-        // Extract phash from device-list node attributes
-        let phash = device_list_node
-            .attrs()
-            .optional_string("hash")
-            .map(|s| s.to_string());
-
-        // Parse key-index-list from <devices> node (sibling of <device-list>)
-        // WA Web: WAWebUsyncDevice.deviceParser() extracts both deviceList and keyIndex
-        let devices_parent = user_node.get_optional_child("devices");
-        let key_index_bytes = devices_parent
-            .and_then(|dp| dp.get_optional_child("key-index-list"))
-            .and_then(|ki| match &ki.content {
-                Some(wacore_binary::NodeContent::Bytes(b)) if !b.is_empty() => Some(b.clone()),
-                _ => None,
-            });
-
-        let capacity = device_list_node.children().map_or(0, |c| c.len());
-        let mut devices = Vec::with_capacity(capacity);
-        for device_node in device_list_node.get_children_by_tag("device") {
-            let device_id_str = match device_node.attrs().optional_string("id") {
-                Some(id) => id,
-                None => {
-                    log::warn!(target: "usync", "device node missing 'id' attribute, skipping");
-                    continue;
-                }
-            };
-            let device_id: u16 = match device_id_str.parse() {
-                Ok(id) => id,
-                Err(_) => {
-                    log::warn!(target: "usync", "invalid device id '{device_id_str}' for user {}, skipping", user_jid.observe());
-                    continue;
-                }
-            };
-
-            let key_index = device_node
-                .attrs()
-                .optional_string("key-index")
-                .and_then(|s| s.parse::<u32>().ok());
-            devices.push(UsyncDevice {
-                device: device_id,
-                key_index,
-            });
-        }
-
-        // WA Web: WAWebHandleAdvForUsyncApi.handleADVSyncResult() rejects usync results
-        // that have companion devices but no signedKeyIndexBytes.
-        let has_companion = devices.iter().any(|d| d.device != 0);
-        if has_companion && key_index_bytes.is_none() {
-            log::warn!(
-                target: "usync",
-                "User {} has companion devices but no signedKeyIndexBytes, skipping",
-                user_jid.observe()
-            );
-            continue;
-        }
-
-        result.push(UserDeviceList {
-            user: user_jid.to_non_ad(),
-            devices,
-            phash,
-            key_index_bytes,
-        });
-    }
-
-    Ok(result)
+    let response = parse_usync_response(&resp_node.as_node_ref())?;
+    Ok(project_device_list_response(response)?.device_lists)
 }
 
 /// Parse usync response returning a flat list of device JIDs.
@@ -143,59 +65,29 @@ pub fn parse_get_user_devices_response(resp_node: &Node) -> Result<Vec<Jid>> {
         .into_iter()
         .flat_map(|u| {
             let user_jid = u.user;
-            u.devices.into_iter().map(move |d| {
-                let mut jid = user_jid.clone();
-                jid.device = d.device;
-                jid
-            })
+            u.devices
+                .into_iter()
+                .map(move |d| user_jid.with_device_hosting(d.device, d.is_hosted))
         })
         .collect())
 }
 
 /// Parse LID mappings from a usync `NodeRef` response (zero-copy path).
 pub fn parse_lid_mappings_from_response(resp_node: &NodeRef<'_>) -> Vec<UsyncLidMapping> {
-    let mut mappings = Vec::new();
-
-    let list_node = match resp_node.get_optional_child_by_tag(&["usync", "list"]) {
-        Some(node) => node,
-        None => return mappings,
-    };
-
-    for user_node in list_node.get_children_by_tag("user") {
-        let user_jid_str = match user_node.attrs().optional_string("jid") {
-            Some(jid) => jid,
-            None => continue,
-        };
-        let user_jid: Jid = match user_jid_str.parse() {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-
-        if user_jid.server != wacore_binary::Server::Pn {
-            continue;
-        }
-
-        if let Some(lid_node) = user_node.get_optional_child("lid") {
-            let lid_val = match lid_node.attrs().optional_string("val") {
-                Some(v) => v,
-                None => continue,
-            };
-            if !lid_val.is_empty()
-                && let Ok(lid_jid) = lid_val.parse::<Jid>()
-                && lid_jid.server == wacore_binary::Server::Lid
-            {
-                mappings.push(UsyncLidMapping {
-                    phone_number: user_jid.user.clone(),
-                    lid: lid_jid.user.clone(),
-                });
-            }
-        }
-    }
-
-    mappings
+    parse_usync_response(resp_node).map_or_else(
+        |_| Vec::new(),
+        |response| {
+            response
+                .users
+                .iter()
+                .filter_map(project_lid_mapping)
+                .collect()
+        },
+    )
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
@@ -428,6 +320,7 @@ mod tests {
             NodeBuilder::new("device")
                 .attr("id", "4")
                 .attr("key-index", "93")
+                .attr("is_hosted", "true")
                 .build(),
             NodeBuilder::new("device")
                 .attr("id", "24")
@@ -475,9 +368,13 @@ mod tests {
         // Device 4: key-index="93"
         assert_eq!(result[0].devices[1].device, 4);
         assert_eq!(result[0].devices[1].key_index, Some(93));
+        assert!(result[0].devices[1].is_hosted);
 
         // Device 24: key-index="113"
         assert_eq!(result[0].devices[2].device, 24);
         assert_eq!(result[0].devices[2].key_index, Some(113));
+
+        let flat = parse_get_user_devices_response(&response).unwrap();
+        assert_eq!(flat[1].server, wacore_binary::Server::Hosted);
     }
 }

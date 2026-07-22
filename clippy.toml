@@ -1,8 +1,23 @@
 disallowed-methods = [
     { path = "chrono::Utc::now", reason = "use wacore::time::now_utc() to respect the pluggable TimeProvider (WASM + deterministic tests)" },
-    { path = "chrono::Local::now", reason = "use wacore::time::now_utc() (Local depends on SystemTime which panics on WASM)" },
+    { path = "chrono::Local::now", reason = "use wacore::time::now_utc() to respect the pluggable TimeProvider and avoid direct system-clock access", allow-invalid = true },
     { path = "std::time::SystemTime::now", reason = "use wacore::time::now_millis() / now_utc()" },
     { path = "std::time::Instant::now", reason = "use wacore::time::Instant::now()" },
+    # buffa's Message codec methods are generic over the buffer type, so every
+    # calling crate stamps its own copy of the full encode/decode tree (LTO
+    # cannot merge them). Route waproto types through the pinned wrappers in
+    # waproto::codec — add one there if missing. Crate-local protos (their sole
+    # instantiation site) and tests carry a scoped allow instead.
+    { path = "buffa::message::Message::encode_to_vec", reason = "use waproto::codec::*_to_vec (pinned single instantiation; direct calls duplicate the encode tree per crate)" },
+    { path = "buffa::message::Message::encode", reason = "use waproto::codec::*_encode_into (pinned single instantiation; direct calls duplicate the encode tree per crate)" },
+    { path = "buffa::message::Message::write_to", reason = "use waproto::codec::*_write_to (pinned single instantiation; direct calls duplicate the encode tree per crate)" },
+    { path = "buffa::message::Message::decode_from_slice", reason = "use waproto::codec::*_decode (pinned single instantiation; direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::merge_from_slice", reason = "use waproto::codec::*_merge (pinned single instantiation; direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::merge_to_limit", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::decode", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::decode_length_delimited", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the decode tree per crate)" },
+    { path = "buffa::message::Message::encode_length_delimited", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the encode tree per crate)" },
+    { path = "buffa::message::Message::encode_to_bytes", reason = "use a waproto::codec pinned wrapper (direct calls duplicate the encode tree per crate)" },
 ]
 
 # 64-bit atomic *types*: 32-bit targets (Xtensa/ESP32) have no native AtomicU64/

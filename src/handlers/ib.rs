@@ -1,6 +1,6 @@
 use super::traits::StanzaHandler;
 use crate::client::Client;
-use crate::types::events::{Event, OfflineSyncPreview};
+use crate::types::events::{DirtyState, Event, OfflineSyncPreview};
 use async_trait::async_trait;
 use futures::FutureExt;
 use log::{debug, info, warn};
@@ -67,6 +67,13 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                     DirtyType::Groups | DirtyType::NewsletterMetadata
                 );
                 let needs_resync = bit.dirty_type == DirtyType::SyncdAppState;
+
+                client.core.event_bus.dispatch(Event::DirtyState(
+                    DirtyState::builder()
+                        .dirty_type(bit.dirty_type.clone())
+                        .maybe_timestamp(bit.timestamp)
+                        .build(),
+                ));
 
                 debug!(
                     "Received dirty state notification for type: '{dirty_type_str}'. Sending clean IQ."
@@ -214,5 +221,38 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 warn!("Unhandled ib child: <{}>", child.tag);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{TestEventCollector, create_test_client};
+    use wacore_binary::builder::NodeBuilder;
+
+    #[tokio::test]
+    async fn valid_dirty_marker_dispatches_typed_event() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+        let node = NodeBuilder::new("ib")
+            .children([NodeBuilder::new("dirty")
+                .attr("type", "account_sync")
+                .attr("timestamp", "1725000000")
+                .build()])
+            .build();
+
+        handle_ib_impl(client, &node.as_node_ref()).await;
+
+        assert!(collector.events().iter().any(|event| {
+            matches!(
+                &**event,
+                Event::DirtyState(DirtyState {
+                    dirty_type: DirtyType::AccountSync,
+                    timestamp: Some(1_725_000_000),
+                    ..
+                })
+            )
+        }));
     }
 }

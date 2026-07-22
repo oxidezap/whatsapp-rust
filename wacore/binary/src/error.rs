@@ -20,6 +20,10 @@ pub enum BinaryError {
     /// Node nesting exceeded the recursion cap — a hostile frame trying to
     /// overflow the native stack, rejected before recursing.
     MaxDepthExceeded,
+    /// The exact-marshal encode pass diverged from its size plan (byte count
+    /// or hint-tape consumption) — an internal encoder bug, distinct from a
+    /// malformed input node, surfaced instead of shipping corrupt bytes.
+    PlanMismatch,
 }
 
 impl fmt::Display for BinaryError {
@@ -28,6 +32,9 @@ impl fmt::Display for BinaryError {
             BinaryError::Io(e) => write!(f, "I/O error: {e}"),
             BinaryError::InvalidToken(t) => write!(f, "Invalid token read from stream: {t}"),
             BinaryError::InvalidNode => write!(f, "Invalid node format"),
+            BinaryError::PlanMismatch => {
+                write!(f, "Exact-marshal encode diverged from its size plan")
+            }
             BinaryError::NonStringKey => write!(f, "Attribute key was not a string"),
             BinaryError::AttrParse(s) => write!(f, "Attribute parsing failed: {s}"),
             BinaryError::MissingAttr(s) => write!(f, "Missing required attribute: {s}"),
@@ -86,6 +93,7 @@ impl Clone for BinaryError {
             BinaryError::LeftoverData(n) => BinaryError::LeftoverData(*n),
             BinaryError::AttrList(list) => BinaryError::AttrList(list.clone()),
             BinaryError::MaxDepthExceeded => BinaryError::MaxDepthExceeded,
+            BinaryError::PlanMismatch => BinaryError::PlanMismatch,
         }
     }
 }

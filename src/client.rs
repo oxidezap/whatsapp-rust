@@ -25,6 +25,7 @@ use futures::FutureExt;
 #[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use wacore::xml::{DisplayableNode, DisplayableNodeRef};
 use wacore_binary::JidExt;
@@ -239,6 +240,14 @@ pub struct MemoryReport {
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
+    /// Queued/running history-sync tasks and their logical compressed-payload
+    /// byte sum. A shared `Bytes` slice may retain a larger backing allocation,
+    /// whose capacity is not exposed by the type.
+    pub history_sync_tasks: CollectionStats,
+    /// Lifetime high-water mark of queued/running history-sync tasks.
+    pub history_sync_tasks_peak: u64,
+    /// Lifetime high-water mark of logical compressed-payload bytes.
+    pub history_sync_payload_bytes_peak: u64,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     pub chat_lanes: u64,
@@ -267,7 +276,7 @@ impl MemoryReport {
     /// Every byte-carrying collection with its display name — the single list
     /// [`Self::total_estimated_bytes`] and `Display` derive from, so a new
     /// collection cannot be summed but not shown (or vice versa).
-    fn collections(&self) -> [(&'static str, &CollectionStats); 10] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 11] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -279,6 +288,7 @@ impl MemoryReport {
             ("signal_sessions:", &self.signal_sessions),
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
+            ("history_sync_tasks:", &self.history_sync_tasks),
         ]
     }
 
@@ -298,8 +308,10 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
-        // caches; the rest are the Signal store caches.
+        // caches; the next SIGNAL_CACHES are Signal store caches. The final
+        // entry is transient history-sync retention.
         const TTL_BOUNDED: usize = 7;
+        const SIGNAL_CACHES: usize = 3;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
@@ -345,9 +357,25 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         writeln!(f, "--- Signal store caches ---")?;
-        for (name, c) in &collections[TTL_BOUNDED..] {
+        for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
         }
+        writeln!(f, "--- In-flight history sync ---")?;
+        line(
+            f,
+            collections[TTL_BOUNDED + SIGNAL_CACHES].0,
+            &self.history_sync_tasks,
+        )?;
+        writeln!(
+            f,
+            "  peak tasks:             {}",
+            self.history_sync_tasks_peak
+        )?;
+        writeln!(
+            f,
+            "  peak payload storage:   {} B",
+            self.history_sync_payload_bytes_peak
+        )?;
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
@@ -502,9 +530,95 @@ pub(crate) struct OfflineSyncMetrics {
     pub start_time: std::sync::Mutex<Option<wacore::time::Instant>>,
 }
 
+type ResponseWaiterSender = futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>;
+
+struct ResponseWaiterEntry {
+    generation: NonZeroU64,
+    sender: ResponseWaiterSender,
+}
+
 /// Map of pending IQ/ack response waiters, keyed by request id.
-pub(crate) type ResponseWaiterMap =
-    HashMap<String, futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>>;
+///
+/// Every registration carries a unique generation so guarded IQ cleanup cannot
+/// remove a newer waiter that reused the same explicit ID.
+#[derive(Default)]
+pub(crate) struct ResponseWaiterMap {
+    entries: HashMap<String, ResponseWaiterEntry>,
+    last_generation: u64,
+}
+
+impl ResponseWaiterMap {
+    fn next_generation(&mut self) -> NonZeroU64 {
+        loop {
+            self.last_generation = self.last_generation.wrapping_add(1);
+            if let Some(generation) = NonZeroU64::new(self.last_generation) {
+                return generation;
+            }
+        }
+    }
+
+    pub(crate) fn try_insert_guarded(
+        &mut self,
+        request_id: String,
+        sender: ResponseWaiterSender,
+    ) -> Option<NonZeroU64> {
+        use std::collections::hash_map::Entry;
+
+        let generation = self.next_generation();
+        match self.entries.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(ResponseWaiterEntry { generation, sender });
+                Some(generation)
+            }
+            Entry::Occupied(_) => None,
+        }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        request_id: String,
+        sender: ResponseWaiterSender,
+    ) -> Option<ResponseWaiterSender> {
+        let generation = self.next_generation();
+        self.entries
+            .insert(request_id, ResponseWaiterEntry { generation, sender })
+            .map(|entry| entry.sender)
+    }
+
+    pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiterSender> {
+        self.entries.remove(request_id).map(|entry| entry.sender)
+    }
+
+    pub(crate) fn remove_guarded(&mut self, request_id: &str, cleanup_generation: NonZeroU64) {
+        if self
+            .entries
+            .get(request_id)
+            .is_some_and(|entry| entry.generation == cleanup_generation)
+        {
+            self.entries.remove(request_id);
+        }
+    }
+
+    /// Drop every pending sender and release the map allocation without
+    /// resetting the generation sequence. Guards owned by the drained requests
+    /// may outlive a disconnect and must never match a later registration.
+    pub(crate) fn clear(&mut self) {
+        self.entries = HashMap::new();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, request_id: &str) -> bool {
+        self.entries.contains_key(request_id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
@@ -706,10 +820,9 @@ pub struct Client {
     /// Empty (zero capacity) outside the offline window.
     pub(crate) offline_receipt_buffer:
         std::sync::Mutex<Vec<Arc<crate::types::message::MessageInfo>>>,
-    /// Number of history sync tasks currently queued or running.
-    pub(crate) history_sync_tasks_in_flight: Arc<AtomicUsize>,
-    /// Notifier triggered when history sync work becomes idle.
-    pub(crate) history_sync_idle_notifier: Arc<event_listener::Event>,
+    /// Task count, retained payload storage, peaks, and idle notification for
+    /// history sync work.
+    pub(crate) history_sync_activity: Arc<crate::sync_task::HistorySyncActivity>,
     /// Flushed by `disconnect()`/`reconnect()` before tearing down the transport
     /// so in-flight delivery receipts aren't dropped with `NotConnected`
     /// (issue #571).

@@ -63,6 +63,10 @@ pub struct InflateReader<'a> {
 impl<'a> InflateReader<'a> {
     /// Output decompress window per pump; also the compaction threshold.
     const CHUNK: usize = 64 * 1024;
+    /// Keep one output window between sequential streams. The pump compacts a
+    /// consumed prefix before inflating, so a second window is only needed when
+    /// one individual record genuinely exceeds `CHUNK`.
+    const RETAINED_CAPACITY: usize = Self::CHUNK;
     /// Cap on retained free-list entries, so concurrently-alive readers on one
     /// thread don't grow the pool unbounded.
     const POOL_MAX: usize = 4;
@@ -145,10 +149,15 @@ impl<'a> InflateReader<'a> {
     }
 
     fn pump(&mut self) -> io::Result<()> {
-        // Drop the consumed prefix before growing, so the buffer holds roughly
-        // just the record currently being accumulated.
-        if self.cursor >= Self::CHUNK || self.cursor == self.buf.len() {
-            self.buf.drain(..self.cursor);
+        // Reclaim the consumed prefix before inflating. Reserving a full output
+        // window on top of a small read-ahead suffix made ordinary framed
+        // streams jump from 64 to 128 KiB even though no record needed it.
+        // Compacting here keeps those streams in one window; a record larger
+        // than the window still grows normally below.
+        if self.cursor != 0 {
+            let remaining = self.buf.len() - self.cursor;
+            self.buf.copy_within(self.cursor.., 0);
+            self.buf.truncate(remaining);
             self.cursor = 0;
         }
 
@@ -161,7 +170,9 @@ impl<'a> InflateReader<'a> {
         // Inflate straight into the window's spare capacity: a stack chunk +
         // extend_from_slice would copy every decompressed byte a second time
         // (~10% of a history-sync extraction).
-        self.buf.reserve(Self::CHUNK);
+        if self.buf.len() == self.buf.capacity() {
+            self.buf.reserve(Self::CHUNK);
+        }
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
         let status = inflate_into_spare(
@@ -218,9 +229,12 @@ impl Drop for InflateReader<'_> {
             let mut buf = std::mem::take(&mut self.buf);
             // A large top-level record (e.g. a big conversation, up to `max`) can
             // grow `buf` to many MB; don't retain that allocation in the pool for
-            // the thread's lifetime. Shrink back toward the normal working size.
+            // the thread's lifetime. Keep the one-window steady-state used by
+            // framed streams, but shrink genuinely oversized records.
             buf.clear();
-            buf.shrink_to(Self::CHUNK);
+            if buf.capacity() > Self::RETAINED_CAPACITY {
+                buf.shrink_to(Self::RETAINED_CAPACITY);
+            }
             INFLATE_POOL.with(|p| {
                 let mut pool = p.borrow_mut();
                 if pool.len() < Self::POOL_MAX {
@@ -404,6 +418,28 @@ mod tests {
     }
 
     #[test]
+    fn inflate_reader_keeps_one_window_for_smaller_records() {
+        INFLATE_POOL.with(|p| p.borrow_mut().clear());
+        const RECORD: usize = 30 * 1024;
+        let original = varied(RECORD * 8);
+        let compressed = zlib(&original);
+        let mut r = InflateReader::new(&compressed, 64 * 1024 * 1024);
+
+        for expected in original.chunks(RECORD) {
+            assert!(r.ensure(expected.len()).unwrap());
+            assert_eq!(&r.available()[..expected.len()], expected);
+            r.consume(expected.len());
+            assert!(
+                r.buf.capacity() <= InflateReader::CHUNK,
+                "sub-window records grew the inflate buffer to {} bytes",
+                r.buf.capacity()
+            );
+        }
+        assert!(!r.ensure(1).unwrap());
+        assert!(r.is_done());
+    }
+
+    #[test]
     fn inflate_reader_enforces_max() {
         let original = vec![0u8; 1024 * 1024];
         let compressed = zlib(&original);
@@ -479,7 +515,8 @@ mod tests {
     #[test]
     fn drop_shrinks_oversized_buffer_before_pooling() {
         // Buffering a large record grows `buf` to many MB; on return to the pool it
-        // must be shrunk back toward CHUNK, not parked at full size for the thread.
+        // must be shrunk back toward the bounded steady-state capacity, not parked
+        // at full size for the thread.
         INFLATE_POOL.with(|p| p.borrow_mut().clear());
         let big = varied(2 * 1024 * 1024);
         let compressed = zlib(&big);
@@ -490,7 +527,7 @@ mod tests {
         }
         let pooled = INFLATE_POOL.with(|p| p.borrow().last().map(|(_, b)| b.capacity()));
         assert!(
-            matches!(pooled, Some(cap) if cap <= InflateReader::CHUNK * 2),
+            matches!(pooled, Some(cap) if cap <= InflateReader::RETAINED_CAPACITY),
             "pooled buffer not shrunk: {pooled:?}"
         );
     }

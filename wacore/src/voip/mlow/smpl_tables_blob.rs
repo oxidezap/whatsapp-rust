@@ -40,6 +40,9 @@ fn inflate(compressed: &[u8]) -> Vec<u8> {
 }
 
 /// Load a protobuf table from its embedded zlib blob.
+// Crate-local mlow.tables protos: sole instantiation site, nothing to pin in
+// waproto::codec.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn load_blob_buffa<T: buffa::Message>(compressed: &[u8]) -> T {
     let bytes = inflate(compressed);
     T::decode_from_slice(bytes.as_slice()).expect("mlow table blob must protobuf-decode")
@@ -56,6 +59,7 @@ pub(crate) fn make_blob_raw(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod generator {
     use super::*;
     use std::fs;

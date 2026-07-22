@@ -78,6 +78,12 @@ fn high_watermark(max_entries: usize) -> usize {
     max_entries.saturating_add((max_entries / EVICTION_SLACK_DIVISOR).max(EVICTION_SLACK_FLOOR))
 }
 
+fn protocol_address_matches_user(address: &str, user: &str) -> bool {
+    address
+        .strip_prefix(user)
+        .is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':'))
+}
+
 /// In-memory write-back cache for Signal protocol state.
 /// Keys use `Arc<str>` for O(1) clone. Sessions cached as objects (serialized on flush).
 /// Capacity-bounded: every path that grows a store (writes and read-populate
@@ -90,6 +96,9 @@ pub struct SignalStoreCache {
     pending_session_restores: SyncMutex<Vec<PendingSessionRestore>>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
+    /// Fast-path guard for the normally-empty pending distribution map. Warm
+    /// group encrypts avoid a second sender-key mutex acquisition.
+    has_pending_sender_key_distributions: AtomicBool,
     /// Consumed one-time prekeys buffered for durable deletion, keyed by the
     /// address of the session whose pkmsg promotion consumed each one. The flush
     /// deletes a prekey only after that session is persisted, so a crash can never
@@ -303,6 +312,11 @@ struct SenderKeyStoreState {
     /// re-derives forward),
     /// so unrelated group receives never force a sync flush onto a DM send.
     wire_gate_pending: HashSet<Arc<str>>,
+    /// Distributions created for a new outbound chain but not yet returned by
+    /// a successful encryption call. A failed durability gate leaves the
+    /// distribution here so a retry cannot emit ciphertext for an
+    /// undistributed key.
+    pending_distributions: HashMap<Arc<str>, Arc<[u8]>>,
 }
 
 impl SenderKeyStoreState {
@@ -312,6 +326,7 @@ impl SenderKeyStoreState {
             cache: HashMap::new(),
             dirty: HashSet::new(),
             wire_gate_pending: HashSet::new(),
+            pending_distributions: HashMap::new(),
         }
     }
 
@@ -336,12 +351,14 @@ impl SenderKeyStoreState {
         let addr = self.key_for(address);
         self.cache.insert(addr.clone(), None);
         self.dirty.insert(addr.clone());
+        self.pending_distributions.remove(address);
     }
 
     fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();
         self.wire_gate_pending.clear();
+        self.pending_distributions.clear();
     }
 
     fn discard(&mut self, incarnation: StoreIncarnation) {
@@ -447,6 +464,7 @@ impl SignalStoreCache {
             pending_session_restores: SyncMutex::new(Vec::new()),
             identities: Mutex::new(ByteStoreState::new()),
             sender_keys: Mutex::new(SenderKeyStoreState::new(incarnation)),
+            has_pending_sender_key_distributions: AtomicBool::new(false),
             removed_prekeys: Mutex::new(HashMap::new()),
             sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
@@ -626,23 +644,50 @@ impl SignalStoreCache {
     /// (even a stale/checked-out marker), so it never reports "none" when state
     /// might exist.
     pub async fn has_state_for_user(&self, user: &str, backend: &dyn SignalStore) -> Result<bool> {
-        fn matches(addr: &str, user: &str) -> bool {
-            addr.strip_prefix(user)
-                .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
-        }
         {
             let state = self.lock_sessions().await;
-            if state.cache.keys().any(|k| matches(k, user)) {
+            if state
+                .cache
+                .keys()
+                .any(|address| protocol_address_matches_user(address, user))
+            {
                 return Ok(true);
             }
         }
         {
             let state = self.identities.lock().await;
-            if state.cache.keys().any(|k| matches(k, user)) {
+            if state
+                .cache
+                .keys()
+                .any(|address| protocol_address_matches_user(address, user))
+            {
                 return Ok(true);
             }
         }
         Ok(backend.has_signal_state_for_user(user).await?)
+    }
+
+    /// Whether this user's pairwise session or identity writes still need a
+    /// durability retry. Migration uses this after a failed flush, when the
+    /// cache already reflects the move and a second pass makes no new changes.
+    pub async fn has_pending_pairwise_writes_for_user(&self, user: &str) -> bool {
+        {
+            let state = self.lock_sessions().await;
+            if state
+                .dirty
+                .iter()
+                .chain(&state.deleted)
+                .any(|address| protocol_address_matches_user(address, user))
+            {
+                return true;
+            }
+        }
+        let state = self.identities.lock().await;
+        state
+            .dirty
+            .iter()
+            .chain(&state.deleted)
+            .any(|address| protocol_address_matches_user(address, user))
     }
 
     // === Sessions (object cache — serialize only during flush) ===
@@ -947,6 +992,59 @@ impl SignalStoreCache {
         state.evict_if_needed(self.max_entries);
     }
 
+    /// Retain a newly created sender-key distribution until the encryption
+    /// operation that owns it passes its durability gate.
+    pub async fn cache_pending_sender_key_distribution(
+        &self,
+        name: &SenderKeyName,
+        distribution: Arc<[u8]>,
+    ) {
+        let mut state = self.sender_keys.lock().await;
+        let key = state.key_for(name.cache_key());
+        state.pending_distributions.insert(key, distribution);
+        self.has_pending_sender_key_distributions
+            .store(true, Ordering::Release);
+    }
+
+    /// Return a retained distribution whose prior encryption attempt did not
+    /// complete its durability gate.
+    pub async fn pending_sender_key_distribution(&self, name: &SenderKeyName) -> Option<Arc<[u8]>> {
+        if !self
+            .has_pending_sender_key_distributions
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.sender_keys
+            .lock()
+            .await
+            .pending_distributions
+            .get(name.cache_key())
+            .cloned()
+    }
+
+    /// Clear a retained distribution after a successful encryption, but only
+    /// if it is still the distribution observed by that call. This prevents a
+    /// concurrent chain replacement from losing its newer distribution.
+    pub async fn clear_pending_sender_key_distribution(
+        &self,
+        name: &SenderKeyName,
+        expected: &[u8],
+    ) {
+        let mut state = self.sender_keys.lock().await;
+        if state
+            .pending_distributions
+            .get(name.cache_key())
+            .is_some_and(|distribution| distribution.as_ref() == expected)
+        {
+            state.pending_distributions.remove(name.cache_key());
+            if state.pending_distributions.is_empty() {
+                self.has_pending_sender_key_distributions
+                    .store(false, Ordering::Release);
+            }
+        }
+    }
+
     /// Shared lock for the `name` chain. Same name returns the same lock so a
     /// concurrent encrypt can't read a chain iteration another is advancing.
     pub async fn sender_key_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
@@ -984,6 +1082,49 @@ impl SignalStoreCache {
         let _guard = lock.lock().await;
         let mut state = self.sender_keys.lock().await;
         state.delete(cache_key);
+        if state.pending_distributions.is_empty() {
+            self.has_pending_sender_key_distributions
+                .store(false, Ordering::Release);
+        }
+    }
+
+    /// Delete one sender-key chain from the cache and backend while holding its
+    /// chain lock. Only this record is persisted, avoiding a global cache flush
+    /// while preventing an in-flight mutation from resurrecting the old chain.
+    pub async fn delete_sender_key_durable(
+        &self,
+        name: &SenderKeyName,
+        backend: &dyn SignalStore,
+    ) -> Result<()> {
+        let lock = self.sender_key_lock(name).await;
+        let _guard = lock.lock().await;
+        let cache_key = name.cache_key();
+        {
+            let mut state = self.sender_keys.lock().await;
+            state.delete(cache_key);
+            if state.pending_distributions.is_empty() {
+                self.has_pending_sender_key_distributions
+                    .store(false, Ordering::Release);
+            }
+        }
+
+        // The per-chain guard above keeps this record stable; unrelated chains
+        // must not queue behind backend latency on the global cache mutex.
+        backend.delete_sender_key(cache_key).await?;
+
+        let mut state = self.sender_keys.lock().await;
+        if matches!(state.cache.get(cache_key), Some(None)) {
+            state.dirty.remove(cache_key);
+            state.wire_gate_pending.remove(cache_key);
+        } else if state.cache.contains_key(cache_key) {
+            // Defensive against a direct cache writer that did not honor the
+            // chain lock: the backend delete may have raced its write, so keep
+            // the replacement dirty for the next flush.
+            let key = state.key_for(cache_key);
+            state.dirty.insert(key);
+        }
+        state.evict_if_needed(self.max_entries);
+        Ok(())
     }
 
     // === Consumed pre-keys ===
@@ -1247,7 +1388,7 @@ impl SignalStoreCache {
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
 
-        let (sk_count, sk_keys_len, sk_recs): (u64, usize, Vec<_>) = {
+        let (sk_count, sk_keys_len, sk_pending_bytes, sk_recs): (u64, usize, usize, Vec<_>) = {
             let sk = self.sender_keys.lock().await;
             let mut keys_len = 0usize;
             let recs = sk
@@ -1258,10 +1399,29 @@ impl SignalStoreCache {
                     v.clone()
                 })
                 .collect();
-            (sk.cache.len() as u64, keys_len, recs)
+            let pending_bytes = sk
+                .pending_distributions
+                .values()
+                .map(|distribution| distribution.len())
+                .sum();
+            let (pending_only_count, pending_only_key_bytes) = sk
+                .pending_distributions
+                .keys()
+                .filter(|key| !sk.cache.contains_key(key.as_ref()))
+                .fold((0usize, 0usize), |(count, bytes), key| {
+                    (count + 1, bytes + key.len())
+                });
+            keys_len += pending_only_key_bytes;
+            (
+                (sk.cache.len() + pending_only_count) as u64,
+                keys_len,
+                pending_bytes,
+                recs,
+            )
         };
-        let sk_bytes: usize =
-            sk_keys_len + sk_recs.iter().map(|r| r.estimated_size()).sum::<usize>();
+        let sk_bytes: usize = sk_keys_len
+            + sk_pending_bytes
+            + sk_recs.iter().map(|r| r.estimated_size()).sum::<usize>();
         let sender_keys = CollectionStats::new(sk_count, sk_bytes as u64);
 
         (sessions, identities, sender_keys)
@@ -1286,6 +1446,8 @@ impl SignalStoreCache {
         }
         self.identities.lock().await.clear();
         self.sender_keys.lock().await.discard(incarnation);
+        self.has_pending_sender_key_distributions
+            .store(false, Ordering::Release);
         // Drop buffered prekey removals together with the volatile sessions they
         // belong to: the promoted session is gone, so the still-durable prekey
         // must stay so a redelivered pkmsg can rebuild the session.
@@ -1314,8 +1476,13 @@ impl SignalStoreCache {
         drop(identities);
 
         let mut sender_keys = self.sender_keys.lock().await;
-        if sender_keys.dirty.is_empty() && sender_keys.wire_gate_pending.is_empty() {
+        if sender_keys.dirty.is_empty()
+            && sender_keys.wire_gate_pending.is_empty()
+            && sender_keys.pending_distributions.is_empty()
+        {
             sender_keys.clear();
+            self.has_pending_sender_key_distributions
+                .store(false, Ordering::Release);
         }
     }
 }
@@ -3490,6 +3657,55 @@ mod pre_wire_gate_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_sender_key_delete_does_not_block_unrelated_chains() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(DeleteBarrierBackend::new(DeleteTarget::SenderKey));
+        backend.fail_delete.store(false, Ordering::Release);
+        let target = SenderKeyName::from_parts("g1@g.us", "u@s.whatsapp.net:0");
+        let unrelated = SenderKeyName::from_parts("g2@g.us", "u@s.whatsapp.net:0");
+        cache
+            .put_sender_key(&target, SenderKeyRecord::new_empty())
+            .await;
+        let target_lock = cache.sender_key_lock(&target).await;
+
+        let deletion = tokio::spawn({
+            let cache = cache.clone();
+            let backend = backend.clone();
+            async move {
+                cache
+                    .delete_sender_key_durable(&target, backend.as_ref())
+                    .await
+            }
+        });
+        backend.entered.wait().await;
+
+        assert!(
+            target_lock.try_lock().is_none(),
+            "the target chain must remain serialized during backend deletion"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cache.put_sender_key(&unrelated, SenderKeyRecord::new_empty()),
+        )
+        .await
+        .expect("backend latency for one chain must not hold the global cache lock");
+
+        backend.release.wait().await;
+        deletion
+            .await
+            .expect("delete task")
+            .expect("durable delete");
+        assert!(
+            cache
+                .get_sender_key(&unrelated, backend.as_ref())
+                .await
+                .unwrap()
+                .is_some(),
+            "unrelated state must remain available"
         );
     }
 

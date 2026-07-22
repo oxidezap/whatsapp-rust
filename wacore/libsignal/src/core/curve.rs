@@ -67,6 +67,11 @@ pub struct PublicKey {
 }
 
 impl PublicKey {
+    /// Length of a raw Curve25519 public key, without its type prefix.
+    pub const RAW_KEY_LEN: usize = curve25519::PUBLIC_KEY_LENGTH;
+    /// Length of the canonical serialized form, including its type prefix.
+    pub const SERIALIZED_KEY_LEN: usize = Self::RAW_KEY_LEN + 1;
+
     fn new(key: PublicKeyData) -> Self {
         Self { key }
     }
@@ -107,8 +112,8 @@ impl PublicKey {
     }
 
     /// Serialize the public key to a fixed-size array (1 type byte + 32 key bytes).
-    pub fn serialize(&self) -> [u8; 33] {
-        let mut result = [0u8; 33];
+    pub fn serialize(&self) -> [u8; Self::SERIALIZED_KEY_LEN] {
+        let mut result = [0u8; Self::SERIALIZED_KEY_LEN];
         result[0] = self.key_type().value();
         match &self.key {
             PublicKeyData::DjbPublicKey(v) => result[1..].copy_from_slice(v),

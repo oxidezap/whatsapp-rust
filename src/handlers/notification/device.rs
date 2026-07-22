@@ -615,9 +615,9 @@ pub(crate) async fn handle_account_sync_devices(
         user: from_jid.user.to_string(),
         devices: devices
             .iter()
-            .map(|d| DeviceInfo {
-                device_id: d.jid.device as u32,
-                key_index: d.key_index,
+            .map(|d| {
+                DeviceInfo::new(d.jid.device as u32, d.key_index)
+                    .with_hosting(wacore_binary::JidExt::is_hosted(&d.jid))
             })
             .collect(),
         timestamp,

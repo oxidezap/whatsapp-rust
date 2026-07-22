@@ -140,7 +140,7 @@ impl Client {
             transport_factory,
             noise_socket: Arc::new(Mutex::new(None)),
 
-            response_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            response_waiters: Arc::new(std::sync::Mutex::new(ResponseWaiterMap::default())),
             node_waiters: std::sync::Mutex::new(Vec::new()),
             node_waiter_count: AtomicUsize::new(0),
             sent_node_waiters: std::sync::Mutex::new(Vec::new()),
@@ -228,8 +228,7 @@ impl Client {
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
-            history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
-            history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
+            history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(async_lock::Mutex::new(HashSet::new())),
@@ -898,9 +897,7 @@ impl Client {
             Ok(mut guard) => *guard = None,
             Err(poison) => *poison.into_inner() = None,
         }
-        self.history_sync_tasks_in_flight
-            .store(0, Ordering::Relaxed);
-        self.history_sync_idle_notifier.notify(usize::MAX);
+        self.history_sync_activity.reset();
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
         // Scoped so the sync guard is dropped before the awaits below (a
@@ -908,9 +905,10 @@ impl Client {
         let waiter_count = {
             let mut waiters_map = self.response_waiters_guard();
             let count = waiters_map.len();
-            // Replace with new map to release backing storage; old senders drop
-            // here, causing receivers to get RecvError → InternalChannelClosed.
-            *waiters_map = HashMap::new();
+            // Release the backing storage while preserving the generation
+            // sequence; an old request guard may drop after reconnect and must
+            // not match a new waiter that reused the same explicit ID.
+            waiters_map.clear();
             count
         };
         if waiter_count > 0 {

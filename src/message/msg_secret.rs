@@ -93,10 +93,10 @@ impl Client {
             wacore::time::now_secs(),
         );
         Some(wacore::store::traits::MsgSecretEntry {
-            chat: chat.to_non_ad_string(),
-            sender: sender.to_non_ad_string(),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
+            chat: chat.to_non_ad_string().into(),
+            sender: sender.to_non_ad_string().into(),
+            msg_id: msg_id.into(),
+            secret: *secret,
             expires_at,
             message_ts: message_ts.and_then(|t| i64::try_from(t).ok()).unwrap_or(0),
         })
@@ -464,12 +464,10 @@ impl Client {
         info: &Arc<MessageInfo>,
         payload: EncPayload,
     ) {
-        use buffa::Message as _;
-        use wa::MessageSecretMessage;
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
-        let ms_msg = match MessageSecretMessage::decode_from_slice(&payload.ciphertext) {
+        let ms_msg = match waproto::codec::message_secret_message_decode(&payload.ciphertext) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(

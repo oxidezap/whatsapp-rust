@@ -8,7 +8,9 @@ use std::cell::RefCell;
 use rand::{CryptoRng, Rng};
 
 use crate::crypto::DecryptionError as DecryptionErrorCrypto;
-use crate::crypto::{aes_256_cbc_decrypt_into, aes_256_cbc_encrypt_into};
+use crate::crypto::{
+    aes_256_cbc_decrypt_in_place, aes_256_cbc_decrypt_into, aes_256_cbc_encrypt_into,
+};
 
 // Thread-local buffers for AES operations to reduce allocations and memory fragmentation
 thread_local! {
@@ -72,7 +74,7 @@ const fn forward_jump_limit(is_self: bool) -> usize {
     }
 }
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
-use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
+use crate::protocol::ratchet::{ChainKey, RootKey, UsePQRatchet};
 use crate::protocol::state::{DecryptSnapshot, PreKeyId, SessionState};
 use crate::protocol::{
     CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
@@ -95,6 +97,162 @@ pub struct DecryptionResult {
     /// the caller buffers this id and deletes it alongside the session flush.
     /// `None` for a SignalMessage decrypt or a pkmsg that reused an existing session.
     pub consumed_prekey_id: Option<PreKeyId>,
+}
+
+/// A parsed Signal envelope whose wire storage may be consumed by decryption.
+///
+/// Borrowed APIs remain available for callers that need to retain ciphertext.
+/// This owner lets receive pipelines reuse a uniquely-owned ciphertext
+/// allocation for plaintext after authentication, avoiding a full-size peak
+/// copy for large inline messages. Errors before authenticated decryption leave
+/// the envelope available for identity/session migration retries.
+#[derive(Debug)]
+pub struct OwnedCiphertextMessage {
+    inner: Option<CiphertextMessage>,
+}
+
+impl OwnedCiphertextMessage {
+    pub fn new(message: CiphertextMessage) -> Self {
+        Self {
+            inner: Some(message),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    fn message_type(&self) -> Option<CiphertextMessageType> {
+        self.inner.as_ref().map(CiphertextMessage::message_type)
+    }
+
+    fn pre_key_message(&self) -> Option<&PreKeySignalMessage> {
+        match self.inner.as_ref()? {
+            CiphertextMessage::PreKeySignalMessage(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    fn signal_message(&self) -> Option<&SignalMessage> {
+        match self.inner.as_ref()? {
+            CiphertextMessage::SignalMessage(message) => Some(message),
+            CiphertextMessage::PreKeySignalMessage(message) => Some(message.message()),
+            _ => None,
+        }
+    }
+
+    fn take_signal_message(&mut self) -> Option<SignalMessage> {
+        match self.inner.take()? {
+            CiphertextMessage::SignalMessage(message) => Some(message),
+            CiphertextMessage::PreKeySignalMessage(message) => Some(message.into_message()),
+            other => {
+                self.inner = Some(other);
+                None
+            }
+        }
+    }
+}
+
+impl From<CiphertextMessage> for OwnedCiphertextMessage {
+    fn from(message: CiphertextMessage) -> Self {
+        Self::new(message)
+    }
+}
+
+// Keeping both ownership modes in one concrete type avoids duplicating the
+// decrypt state machine while deferring owned-envelope consumption until MAC
+// authentication succeeds.
+enum SignalDecryptInput<'a> {
+    Borrowed(&'a SignalMessage),
+    Owned(&'a mut OwnedCiphertextMessage),
+}
+
+impl SignalDecryptInput<'_> {
+    #[inline(always)]
+    fn signal_message(&self) -> &SignalMessage {
+        match self {
+            Self::Borrowed(message) => message,
+            Self::Owned(message) => message
+                .signal_message()
+                .expect("owned Signal decrypt input has a Signal envelope"),
+        }
+    }
+
+    #[inline(always)]
+    fn is_available(&self) -> bool {
+        match self {
+            Self::Borrowed(_) => true,
+            Self::Owned(message) => message.is_available(),
+        }
+    }
+
+    fn decrypt(
+        &mut self,
+        key: &[u8],
+        iv: &[u8],
+    ) -> std::result::Result<Vec<u8>, DecryptionErrorCrypto> {
+        match self {
+            Self::Borrowed(message) => decrypt_borrowed_signal(message, key, iv),
+            Self::Owned(message) => {
+                let message = message
+                    .take_signal_message()
+                    .expect("authenticated owned input remains available");
+                match message.try_into_ciphertext_vec() {
+                    Ok(mut ciphertext) => {
+                        aes_256_cbc_decrypt_in_place(&mut ciphertext, key, iv)?;
+                        Ok(ciphertext)
+                    }
+                    Err(shared) => decrypt_borrowed_signal(&shared, key, iv),
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn decrypt_borrowed_signal(
+    message: &SignalMessage,
+    key: &[u8],
+    iv: &[u8],
+) -> std::result::Result<Vec<u8>, DecryptionErrorCrypto> {
+    DECRYPTION_BUFFER.with(|buffer| {
+        let mut buf_wrapper = buffer.borrow_mut();
+        let buf = buf_wrapper.get_buffer();
+        let ciphertext = message
+            .body()
+            .map_err(|_| DecryptionErrorCrypto::BadCiphertext("invalid Signal ciphertext body"))?;
+        aes_256_cbc_decrypt_into(ciphertext, key, iv, buf)?;
+        let result = std::mem::take(buf);
+        // Keep ordinary messages allocation-free without pinning an occasional
+        // oversized plaintext in thread-local storage.
+        buf.reserve(EncryptionBuffer::INITIAL_CAPACITY);
+        Ok(result)
+    })
+}
+
+enum PreKeyDecryptInput<'a> {
+    Borrowed(&'a PreKeySignalMessage),
+    Owned(&'a mut OwnedCiphertextMessage),
+}
+
+impl<'a> PreKeyDecryptInput<'a> {
+    #[inline]
+    fn pre_key_message(&self) -> &PreKeySignalMessage {
+        match self {
+            Self::Borrowed(message) => message,
+            Self::Owned(message) => message
+                .pre_key_message()
+                .expect("owned PreKey decrypt input has a PreKey envelope"),
+        }
+    }
+
+    #[inline]
+    fn into_signal_input(self) -> SignalDecryptInput<'a> {
+        match self {
+            Self::Borrowed(message) => SignalDecryptInput::Borrowed(message.message()),
+            Self::Owned(message) => SignalDecryptInput::Owned(message),
+        }
+    }
 }
 
 pub async fn message_encrypt(
@@ -283,9 +441,79 @@ pub async fn message_decrypt<R: Rng + CryptoRng>(
     }
 }
 
+/// Decrypt a caller-owned Signal envelope, reusing its wire allocation when it
+/// is uniquely owned. See [`OwnedCiphertextMessage`] for retry semantics.
+#[allow(clippy::too_many_arguments)]
+pub async fn message_decrypt_owned<R: Rng + CryptoRng>(
+    ciphertext: &mut OwnedCiphertextMessage,
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    pre_key_store: &mut dyn PreKeyStore,
+    signed_pre_key_store: &dyn SignedPreKeyStore,
+    csprng: &mut R,
+    use_pq_ratchet: UsePQRatchet,
+) -> Result<DecryptionResult> {
+    match ciphertext.message_type() {
+        Some(CiphertextMessageType::Whisper) => {
+            message_decrypt_signal_input(
+                SignalDecryptInput::Owned(ciphertext),
+                remote_address,
+                session_store,
+                identity_store,
+                csprng,
+            )
+            .await
+        }
+        Some(CiphertextMessageType::PreKey) => {
+            message_decrypt_prekey_input(
+                PreKeyDecryptInput::Owned(ciphertext),
+                remote_address,
+                session_store,
+                identity_store,
+                pre_key_store,
+                signed_pre_key_store,
+                csprng,
+                use_pq_ratchet,
+            )
+            .await
+        }
+        Some(kind) => Err(SignalProtocolError::InvalidArgument(format!(
+            "message_decrypt_owned cannot decrypt {kind:?} messages"
+        ))),
+        None => Err(SignalProtocolError::InvalidArgument(
+            "owned ciphertext was already consumed".to_owned(),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     ciphertext: &PreKeySignalMessage,
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    pre_key_store: &mut dyn PreKeyStore,
+    signed_pre_key_store: &dyn SignedPreKeyStore,
+    csprng: &mut R,
+    use_pq_ratchet: UsePQRatchet,
+) -> Result<DecryptionResult> {
+    message_decrypt_prekey_input(
+        PreKeyDecryptInput::Borrowed(ciphertext),
+        remote_address,
+        session_store,
+        identity_store,
+        pre_key_store,
+        signed_pre_key_store,
+        csprng,
+        use_pq_ratchet,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn message_decrypt_prekey_input<R: Rng + CryptoRng>(
+    ciphertext: PreKeyDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
@@ -329,7 +557,7 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
 
 #[allow(clippy::too_many_arguments)]
 async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
-    ciphertext: &PreKeySignalMessage,
+    ciphertext: PreKeyDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_record: &mut SessionRecord,
     identity_store: &mut dyn IdentityKeyStore,
@@ -339,7 +567,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
     use_pq_ratchet: UsePQRatchet,
 ) -> Result<(Vec<u8>, Option<PreKeyId>, IdentityChange)> {
     let process_prekey_result = session::process_prekey(
-        ciphertext,
+        ciphertext.pre_key_message(),
         remote_address,
         session_record,
         identity_store,
@@ -359,27 +587,26 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
                     remote_address,
                     &errs,
                     session_record,
-                    ciphertext.message()
+                    ciphertext.pre_key_message().message()
                 )?
             );
             let [e] = errs;
             return Err(e);
         }
     };
+    let their_identity_key = *identity_to_save.their_identity_key;
+    let mut ciphertext = ciphertext.into_signal_input();
 
     let decrypt = decrypt_message_with_record(
         remote_address,
         session_record,
-        ciphertext.message(),
+        &mut ciphertext,
         CiphertextMessageType::PreKey,
         csprng,
     )?;
 
     let saved = identity_store
-        .save_identity(
-            identity_to_save.remote_address,
-            identity_to_save.their_identity_key,
-        )
+        .save_identity(remote_address, &their_identity_key)
         .await?;
     let plaintext = decrypt.commit();
 
@@ -403,12 +630,29 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
 ) -> Result<DecryptionResult> {
+    message_decrypt_signal_input(
+        SignalDecryptInput::Borrowed(ciphertext),
+        remote_address,
+        session_store,
+        identity_store,
+        csprng,
+    )
+    .await
+}
+
+async fn message_decrypt_signal_input<R: Rng + CryptoRng>(
+    mut ciphertext: SignalDecryptInput<'_>,
+    remote_address: &ProtocolAddress,
+    session_store: &mut dyn SessionStore,
+    identity_store: &mut dyn IdentityKeyStore,
+    csprng: &mut R,
+) -> Result<DecryptionResult> {
     let mut session = SessionCheckout::load(session_store, remote_address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
     let result = message_decrypt_signal_inner(
-        ciphertext,
+        &mut ciphertext,
         remote_address,
         session.record_mut(),
         identity_store,
@@ -427,7 +671,7 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
 }
 
 async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
-    ciphertext: &SignalMessage,
+    ciphertext: &mut SignalDecryptInput<'_>,
     remote_address: &ProtocolAddress,
     session_record: &mut SessionRecord,
     identity_store: &mut dyn IdentityKeyStore,
@@ -730,7 +974,7 @@ impl Drop for RecordDecryptTransaction<'_> {
 fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
     record: &'a mut SessionRecord,
-    ciphertext: &SignalMessage,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     csprng: &mut R,
 ) -> Result<RecordDecrypt<'a>> {
@@ -738,22 +982,23 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         original_message_type,
         CiphertextMessageType::Whisper | CiphertextMessageType::PreKey
     ));
-    let log_decryption_failure = |state: &SessionState, error: &SignalProtocolError| {
-        // A warning rather than an error because we try multiple sessions.
-        log::warn!(
-            "Failed to decrypt {:?} message with ratchet key: {} and counter: {}. \
+    let log_decryption_failure =
+        |message: &SignalMessage, state: &SessionState, error: &SignalProtocolError| {
+            // A warning rather than an error because we try multiple sessions.
+            log::warn!(
+                "Failed to decrypt {:?} message with ratchet key: {} and counter: {}. \
              Session loaded for {}. Local session has base key: {} and counter: {}. {}",
-            original_message_type,
-            hex::encode(ciphertext.sender_ratchet_key().public_key_bytes()),
-            ciphertext.counter(),
-            remote_address,
-            state
-                .sender_ratchet_key_for_logging()
-                .unwrap_or_else(|e| format!("<error: {e}>")),
-            state.previous_counter(),
-            error
-        );
-    };
+                original_message_type,
+                hex::encode(message.sender_ratchet_key().public_key_bytes()),
+                message.counter(),
+                remote_address,
+                state
+                    .sender_ratchet_key_for_logging()
+                    .unwrap_or_else(|e| format!("<error: {e}>")),
+                state.previous_counter(),
+                error
+            );
+        };
 
     let mut errs = vec![];
 
@@ -803,8 +1048,15 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 record.set_session_state(current_state);
                 return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
             }
+            Err(e) if !ciphertext.is_available() => {
+                // Authentication succeeded, but the provider rejected the
+                // caller-owned body after it had been consumed for in-place
+                // decryption. No other session can validly authenticate it.
+                record.set_session_state(current_state);
+                return Err(e);
+            }
             Err(e) => {
-                log_decryption_failure(&current_state, &e);
+                log_decryption_failure(ciphertext.signal_message(), &current_state, &e);
                 errs.push(e);
                 match original_message_type {
                     CiphertextMessageType::PreKey => {
@@ -820,7 +1072,7 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                                 remote_address,
                                 &errs,
                                 record,
-                                ciphertext
+                                ciphertext.signal_message()
                             )?
                         );
                         // Preserve BadMac so it maps to WA Web error code 7 in retry receipts.
@@ -895,8 +1147,12 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 record.restore_previous_session(idx, previous);
                 return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
             }
+            Err(e) if !ciphertext.is_available() => {
+                record.restore_previous_session(idx, previous);
+                return Err(e);
+            }
             Err(e) => {
-                log_decryption_failure(&previous, &e);
+                log_decryption_failure(ciphertext.signal_message(), &previous, &e);
                 errs.push(e);
                 // Restore the session at the same index and move to next
                 record.restore_previous_session(idx, previous);
@@ -926,7 +1182,7 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     }
     log::error!(
         "{}",
-        create_decryption_failure_log(remote_address, &errs, record, ciphertext)?
+        create_decryption_failure_log(remote_address, &errs, record, ciphertext.signal_message())?
     );
 
     // If any session state produced a BadMac error, propagate it rather than the
@@ -1000,7 +1256,7 @@ impl StateDecryptEffect {
 fn decrypt_message_with_state<R: Rng + CryptoRng>(
     current_or_previous: CurrentOrPrevious,
     state: &mut SessionState,
-    ciphertext: &SignalMessage,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     csprng: &mut R,
@@ -1013,18 +1269,19 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         )
     })?;
 
-    let ciphertext_version = ciphertext.message_version() as u32;
+    let message = ciphertext.signal_message();
+    let ciphertext_version = message.message_version() as u32;
     if ciphertext_version != state.session_version()? {
         return Err(SignalProtocolError::UnrecognizedMessageVersion(
             ciphertext_version,
         ));
     }
 
-    let their_ephemeral = ciphertext.sender_ratchet_key();
-    let counter = ciphertext.counter();
+    let their_ephemeral = *message.sender_ratchet_key();
+    let counter = message.counter();
 
     // Deferring the common in-order advance keeps cancellation rollback free.
-    if let Some(chain_key) = state.get_receiver_chain_key(their_ephemeral)?
+    if let Some(chain_key) = state.get_receiver_chain_key(&their_ephemeral)?
         && chain_key.index() == counter
     {
         let (message_key_gen, next_chain) = chain_key.step_with_message_keys()?;
@@ -1039,7 +1296,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         return Ok(StateDecryptResult {
             plaintext,
             effect: StateDecryptEffect::DeferredChainKey {
-                ratchet_key: *their_ephemeral,
+                ratchet_key: their_ephemeral,
                 chain_key: next_chain,
             },
         });
@@ -1054,7 +1311,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         original_message_type,
         remote_address,
         csprng,
-        their_ephemeral,
+        &their_ephemeral,
         counter,
     );
     match result {
@@ -1073,14 +1330,15 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
 fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     current_or_previous: CurrentOrPrevious,
     state: &mut SessionState,
-    ciphertext: &SignalMessage,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     csprng: &mut R,
     their_ephemeral: &PublicKey,
     counter: u32,
 ) -> Result<Vec<u8>> {
-    let chain_key = get_or_create_chain_key(state, their_ephemeral, remote_address, csprng)?;
+    let (chain_key, deferred_ratchet) =
+        get_or_create_chain_key(state, their_ephemeral, remote_address)?;
 
     let message_key_gen = get_or_create_message_key(
         state,
@@ -1091,20 +1349,29 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
         counter,
     )?;
 
-    decrypt_with_message_keys(
+    let plaintext = decrypt_with_message_keys(
         current_or_previous,
         state,
         ciphertext,
         original_message_type,
         remote_address,
         message_key_gen,
-    )
+    )?;
+
+    // Generating a new sender ratchet requires fresh entropy and a second DH.
+    // Neither can affect inbound MAC verification, so perform them only after
+    // the candidate session has authenticated the message.
+    if let Some(deferred_ratchet) = deferred_ratchet {
+        deferred_ratchet.apply(state, their_ephemeral, csprng)?;
+    }
+
+    Ok(plaintext)
 }
 
 fn decrypt_with_message_keys(
     current_or_previous: CurrentOrPrevious,
     state: &SessionState,
-    ciphertext: &SignalMessage,
+    ciphertext: &mut SignalDecryptInput<'_>,
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     message_key_gen: MessageKeyGenerator,
@@ -1120,7 +1387,7 @@ fn decrypt_with_message_keys(
 
     let local_identity_key = state.local_identity_key()?;
 
-    let mac_valid = ciphertext.verify_mac(
+    let mac_valid = ciphertext.signal_message().verify_mac(
         &their_identity_key,
         &local_identity_key,
         message_keys.mac_key(),
@@ -1146,46 +1413,56 @@ fn decrypt_with_message_keys(
         return Err(SignalProtocolError::BadMac(original_message_type));
     }
 
-    DECRYPTION_BUFFER.with(|buffer| {
-        let mut buf_wrapper = buffer.borrow_mut();
-        let buf = buf_wrapper.get_buffer();
-        match aes_256_cbc_decrypt_into(
-            ciphertext.body()?,
-            message_keys.cipher_key(),
-            message_keys.iv(),
-            buf,
-        ) {
-            Ok(()) => {
-                let result = std::mem::take(buf);
-                // Restore buffer capacity for next use (take() leaves empty Vec with 0 capacity)
-                buf.reserve(EncryptionBuffer::INITIAL_CAPACITY);
-                Ok(result)
-            }
-            Err(DecryptionErrorCrypto::BadKeyOrIv) => {
-                log::warn!("{current_or_previous} session state corrupt for {remote_address}",);
-                Err(SignalProtocolError::InvalidSessionStructure(
-                    "invalid receiver chain message keys",
-                ))
-            }
-            Err(DecryptionErrorCrypto::BadCiphertext(msg)) => {
-                log::warn!("failed to decrypt 1:1 message: {msg}");
-                Err(SignalProtocolError::InvalidMessage(
-                    original_message_type,
-                    "failed to decrypt",
-                ))
-            }
+    match ciphertext.decrypt(message_keys.cipher_key(), message_keys.iv()) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(DecryptionErrorCrypto::BadKeyOrIv) => {
+            log::warn!("{current_or_previous} session state corrupt for {remote_address}",);
+            Err(SignalProtocolError::InvalidSessionStructure(
+                "invalid receiver chain message keys",
+            ))
         }
-    })
+        Err(DecryptionErrorCrypto::BadCiphertext(msg)) => {
+            log::warn!("failed to decrypt 1:1 message: {msg}");
+            Err(SignalProtocolError::InvalidMessage(
+                original_message_type,
+                "failed to decrypt",
+            ))
+        }
+    }
 }
 
-fn get_or_create_chain_key<R: Rng + CryptoRng>(
+#[must_use = "the deferred sender ratchet must be applied after authenticated decryption succeeds"]
+struct DeferredSenderRatchet {
+    receiver_root_key: RootKey,
+    previous_counter: u32,
+}
+
+impl DeferredSenderRatchet {
+    fn apply<R: Rng + CryptoRng>(
+        self,
+        state: &mut SessionState,
+        their_ephemeral: &PublicKey,
+        csprng: &mut R,
+    ) -> Result<()> {
+        let our_new_ephemeral = KeyPair::generate(csprng);
+        let sender_chain = self
+            .receiver_root_key
+            .create_chain(their_ephemeral, &our_new_ephemeral.private_key)?;
+
+        state.set_root_key(&sender_chain.0);
+        state.set_previous_counter(self.previous_counter);
+        state.set_sender_chain(&our_new_ephemeral, &sender_chain.1);
+        Ok(())
+    }
+}
+
+fn get_or_create_chain_key(
     state: &mut SessionState,
     their_ephemeral: &PublicKey,
     remote_address: &ProtocolAddress,
-    csprng: &mut R,
-) -> Result<ChainKey> {
+) -> Result<(ChainKey, Option<DeferredSenderRatchet>)> {
     if let Some(chain) = state.get_receiver_chain_key(their_ephemeral)? {
-        return Ok(chain);
+        return Ok((chain, None));
     }
 
     log::debug!("{remote_address} creating new chains.");
@@ -1193,24 +1470,15 @@ fn get_or_create_chain_key<R: Rng + CryptoRng>(
     let root_key = state.root_key()?;
     let our_ephemeral = state.sender_ratchet_private_key()?;
     let receiver_chain = root_key.create_chain(their_ephemeral, &our_ephemeral)?;
-    let our_new_ephemeral = KeyPair::generate(csprng);
-    let sender_chain = receiver_chain
-        .0
-        .create_chain(their_ephemeral, &our_new_ephemeral.private_key)?;
-
-    state.set_root_key(&sender_chain.0);
-    state.add_receiver_chain(their_ephemeral, &receiver_chain.1);
 
     let current_index = state.get_sender_chain_key()?.index();
-    let previous_index = if current_index > 0 {
-        current_index - 1
-    } else {
-        0
+    let deferred_ratchet = DeferredSenderRatchet {
+        receiver_root_key: receiver_chain.0,
+        previous_counter: current_index.saturating_sub(1),
     };
-    state.set_previous_counter(previous_index);
-    state.set_sender_chain(&our_new_ephemeral, &sender_chain.1);
+    state.add_receiver_chain(their_ephemeral, &receiver_chain.1);
 
-    Ok(receiver_chain.1)
+    Ok((receiver_chain.1, Some(deferred_ratchet)))
 }
 
 fn get_or_create_message_key(
@@ -1677,6 +1945,93 @@ mod tests {
     }
 
     #[test]
+    fn owned_prekey_decrypt_consumes_the_envelope_on_success() {
+        const PLAINTEXT_BYTES: usize = 64 * 1024;
+
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let plaintext = vec![0x7a; PLAINTEXT_BYTES];
+        let ciphertext = futures::executor::block_on(message_encrypt(
+            &plaintext,
+            &tp.bob_addr,
+            &mut tp.alice_sessions,
+            &mut tp.alice_identity,
+        ))
+        .expect("encrypt owned prekey test message");
+        assert!(matches!(
+            &ciphertext,
+            CiphertextMessage::PreKeySignalMessage(_)
+        ));
+        let mut ciphertext = OwnedCiphertextMessage::from(ciphertext);
+
+        let decrypted = futures::executor::block_on(message_decrypt_owned(
+            &mut ciphertext,
+            &tp.alice_addr,
+            &mut tp.bob_sessions,
+            &mut tp.bob_identity,
+            &mut tp.bob_prekeys,
+            &tp.bob_signed,
+            &mut rng,
+            UsePQRatchet::No,
+        ))
+        .expect("decrypt caller-owned prekey message");
+
+        assert_eq!(decrypted.plaintext, plaintext);
+        assert!(!ciphertext.is_available());
+    }
+
+    #[test]
+    fn owned_prekey_bad_mac_preserves_the_envelope_for_retry() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let ciphertext = futures::executor::block_on(message_encrypt(
+            b"authenticated retry",
+            &tp.bob_addr,
+            &mut tp.alice_sessions,
+            &mut tp.alice_identity,
+        ))
+        .expect("encrypt owned retry test message");
+        let CiphertextMessage::PreKeySignalMessage(pre_key) = ciphertext else {
+            panic!("pending session must emit a PreKey envelope");
+        };
+        let mut nested_wire = pre_key.message().serialized().to_vec();
+        let mac_byte = nested_wire
+            .len()
+            .checked_sub(4)
+            .expect("test Signal envelope contains a MAC");
+        nested_wire[mac_byte] ^= 0xff;
+        let nested = SignalMessage::try_from(nested_wire.as_slice())
+            .expect("corrupted MAC keeps the nested envelope parseable");
+        let corrupted = PreKeySignalMessage::new(
+            pre_key.message_version(),
+            pre_key.registration_id(),
+            pre_key.pre_key_id(),
+            pre_key.signed_pre_key_id(),
+            *pre_key.base_key(),
+            *pre_key.identity_key(),
+            nested,
+        )
+        .expect("rebuild test PreKey envelope");
+        let mut corrupted =
+            OwnedCiphertextMessage::from(CiphertextMessage::PreKeySignalMessage(corrupted));
+
+        let error = futures::executor::block_on(message_decrypt_owned(
+            &mut corrupted,
+            &tp.alice_addr,
+            &mut tp.bob_sessions,
+            &mut tp.bob_identity,
+            &mut tp.bob_prekeys,
+            &tp.bob_signed,
+            &mut rng,
+            UsePQRatchet::No,
+        ))
+        .expect_err("a corrupted nested MAC must fail authentication");
+
+        assert!(matches!(error, SignalProtocolError::BadMac(_)));
+        assert!(corrupted.is_available());
+    }
+
+    #[test]
     fn cancelled_signal_decrypt_restores_the_ratchet_for_retry() {
         let mut tp = setup_established_session();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -2105,13 +2460,22 @@ mod tests {
             let corrupted = SignalMessage::try_from(corrupted_bytes.as_slice())
                 .expect("protobuf is intact, only MAC region is modified");
 
+            // This message carries a fresh inbound ratchet key. Authentication
+            // failure must not generate the deferred outbound ratchet or consume
+            // caller entropy.
+            const DECRYPT_RNG_SEED: u64 = 0xD3FE_22ED;
+            let mut decrypt_rng =
+                <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(DECRYPT_RNG_SEED);
+            let mut untouched_rng =
+                <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(DECRYPT_RNG_SEED);
+
             // Bob tries to decrypt the corrupted message
             let err = message_decrypt_signal(
                 &corrupted,
                 &tp.alice_addr,
                 &mut tp.bob_sessions,
                 &mut tp.bob_identity,
-                &mut rng,
+                &mut decrypt_rng,
             )
             .await
             .expect_err("decryption should fail due to corrupted MAC");
@@ -2121,6 +2485,8 @@ mod tests {
                 matches!(err, SignalProtocolError::BadMac(_)),
                 "expected BadMac, got: {err}"
             );
+            use rand::RngExt as _;
+            assert_eq!(decrypt_rng.random::<u64>(), untouched_rng.random::<u64>());
         });
     }
 

@@ -233,6 +233,18 @@ where
         PortableCacheBuilder::new()
     }
 
+    /// Read the monotonic clock only for caches that can expire entries.
+    /// Non-expiring caches use a stable sentinel because their timestamps are
+    /// never observed, avoiding unnecessary clock reads on every operation.
+    #[inline]
+    fn entry_time(&self) -> Instant {
+        if self.ttl.is_some() || self.tti.is_some() {
+            Instant::now()
+        } else {
+            Instant::ZERO
+        }
+    }
+
     fn is_expired(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
         if let Some(ttl) = self.ttl
             && now.saturating_duration_since(entry.inserted_at) >= ttl
@@ -260,7 +272,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let now = Instant::now();
+        let now = self.entry_time();
 
         // Fast path (no TTI): read lock only, no write needed.
         if self.tti.is_none() {
@@ -293,7 +305,7 @@ where
     }
 
     pub async fn insert(&self, key: K, value: V) {
-        let now = Instant::now();
+        let now = self.entry_time();
         let mut guard = self.inner.write().await;
 
         if let Some(entry) = guard.map.get_mut(&key) {
@@ -312,7 +324,7 @@ where
 
     /// Insert and return a clone of the value in one write lock.
     async fn insert_and_return(&self, key: K, value: V) -> V {
-        let now = Instant::now();
+        let now = self.entry_time();
         let mut guard = self.inner.write().await;
 
         if let Some(entry) = guard.map.get_mut(&key) {
@@ -337,7 +349,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let now = Instant::now();
+        let now = self.entry_time();
         let mut guard = self.inner.write().await;
         let owned_key = Self::find_key(&guard, key)?;
         let entry = guard.remove_key(&owned_key)?;
@@ -544,7 +556,7 @@ where
 
     /// Evict expired entries and clean up unused init locks.
     pub async fn run_pending_tasks(&self) {
-        let now = Instant::now();
+        let now = self.entry_time();
         let mut guard = self.inner.write().await;
 
         guard.map.retain(|_, entry| !self.is_expired(entry, now));
@@ -596,6 +608,20 @@ mod tests {
 
         cache.insert("key1".to_string(), "value1".to_string()).await;
         assert_eq!(cache.get("key1").await, Some("value1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn capacity_only_cache_uses_clock_free_timestamps() {
+        let cache = build_cache::<String, String>();
+        assert_eq!(cache.entry_time(), Instant::ZERO);
+
+        cache.insert("key".into(), "value".into()).await;
+        assert_eq!(cache.get("key").await.as_deref(), Some("value"));
+
+        let guard = cache.inner.read().await;
+        let entry = guard.map.get("key").expect("inserted cache entry");
+        assert_eq!(entry.inserted_at, Instant::ZERO);
+        assert_eq!(entry.last_accessed_at, Instant::ZERO);
     }
 
     #[tokio::test]

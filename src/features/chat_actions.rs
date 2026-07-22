@@ -38,8 +38,8 @@ const MUTE_INDEFINITE: i64 = -1;
 
 pub type SyncActionMessageRange = wa::sync_action_value::SyncActionMessageRange;
 
-/// Enables multi-device conflict resolution. `None` is safe (matches whatsmeow/Baileys).
-/// Only WA Web (with a full message DB) populates this.
+/// Enables multi-device conflict resolution. `None` is safe for clients without
+/// a complete message database; callers with one can populate the range.
 pub fn message_range(
     last_message_timestamp: i64,
     last_system_message_timestamp: Option<i64>,
@@ -826,6 +826,7 @@ impl Client {
     /// like [`ChatActions`] and [`Labels`](crate::Labels) wrap it.
     ///
     /// ```no_run
+    /// # #![recursion_limit = "512"]
     /// # async fn ex(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
     /// use whatsapp_rust::schemas;
     /// use whatsapp_rust::waproto::whatsapp as wa;

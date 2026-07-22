@@ -13,7 +13,7 @@ use wacore::iq::prekeys::{
     DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
 };
 use wacore::libsignal::protocol::{KeyPair, PreKeyBundle, PublicKey};
-use wacore::libsignal::store::record_helpers::new_pre_key_record;
+use wacore::libsignal::store::record_helpers::encode_pre_key_record_to;
 use wacore::store::commands::DeviceCommand;
 use wacore_binary::Jid;
 
@@ -284,10 +284,21 @@ impl Client {
         r
     }
 
-    /// Ensure the server has enough pre-keys, uploading if below threshold.
-    /// When `force` is true, skips the count guard (used by digest key repair).
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.upload_pre_keys", level = "debug", skip_all, fields(force = force), err(Debug)))]
-    pub(crate) async fn upload_pre_keys(&self, force: bool) -> Result<(), anyhow::Error> {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.upload_pre_keys",
+            level = "debug",
+            skip_all,
+            fields(force = force, wanted = ?wanted),
+            err(Debug)
+        )
+    )]
+    async fn upload_pre_keys_with_count(
+        &self,
+        force: bool,
+        wanted: Option<usize>,
+    ) -> Result<(), anyhow::Error> {
         // Decision is should_upload_pre_keys(force, count), but a forced upload short-circuits
         // and skips the server-count IQ entirely: WA Web's handlePreKeyLow uploads
         // unconditionally, so a stale or transiently-failing count must never block or delay
@@ -306,7 +317,10 @@ impl Client {
             log::debug!("Server has {server_count} pre-keys, uploading.");
         }
 
-        self.upload_pre_keys_inner().await
+        match wanted {
+            Some(wanted) => self.upload_pre_keys_inner_with_count(wanted).await,
+            None => self.upload_pre_keys_inner().await,
+        }
     }
 
     /// Get-or-generate ONE one-time prekey, mirroring WA Web's
@@ -362,9 +376,7 @@ impl Client {
                         })
                         .await;
                 }
-                use buffa::Message;
-                let structure =
-                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record)?;
+                let structure = waproto::codec::pre_key_record_decode(&record)?;
                 let record = wacore::libsignal::store::record_helpers::prekey_structure_to_record(
                     structure,
                 )?;
@@ -389,11 +401,9 @@ impl Client {
             if raw > MAX_PREKEY_ID { 1 } else { raw }
         };
         let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let record = new_pre_key_record(id, &key_pair);
-        use buffa::Message;
-        backend
-            .store_prekey(id, &record.encode_to_vec(), false)
-            .await?;
+        let mut encoded_record = Vec::new();
+        encode_pre_key_record_to(id, &key_pair, &mut encoded_record);
+        backend.store_prekey(id, &encoded_record, false).await?;
         self.persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
                 next_pre_key_id: id.saturating_add(1),
@@ -467,7 +477,12 @@ impl Client {
         )
     )]
     async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
-        self.upload_pre_keys_pass(true).await
+        let wanted = self.wanted_pre_key_count.load(Ordering::Relaxed);
+        self.upload_pre_keys_inner_with_count(wanted).await
+    }
+
+    async fn upload_pre_keys_inner_with_count(&self, wanted: usize) -> Result<(), anyhow::Error> {
+        self.upload_pre_keys_pass(true, wanted).await
     }
 
     /// One upload pass. `allow_collapse_retry` permits a single inline rerun
@@ -475,14 +490,17 @@ impl Client {
     /// login path logs and moves on) still ends the pass with fresh keys; the
     /// rerun cannot hit the empty branch again because the collapsed plan
     /// generates a full batch.
-    async fn upload_pre_keys_pass(&self, allow_collapse_retry: bool) -> Result<(), anyhow::Error> {
+    async fn upload_pre_keys_pass(
+        &self,
+        allow_collapse_retry: bool,
+        configured: usize,
+    ) -> Result<(), anyhow::Error> {
         // INVARIANT: every caller holds `prekey_upload_lock` (login, prekey-low
         // notification, refresh, digest repair), serializing the watermark math
         // with the retry-receipt single-key path.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let backend = device_snapshot.backend.clone();
 
-        let configured = self.wanted_pre_key_count.load(Ordering::Relaxed);
         let wanted = clamp_wanted_pre_key_count(configured);
         if wanted != configured {
             log::warn!("wanted_pre_key_count {configured} out of range, clamped to {wanted}");
@@ -518,8 +536,6 @@ impl Client {
             // the async executor responsive. Records are encoded into one contiguous
             // buffer with zero-copy Bytes slices instead of an alloc per record.
             let (encoded_batch, generated) = wacore::runtime::blocking(&*self.runtime, move || {
-                use buffa::Message;
-
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -538,7 +554,7 @@ impl Client {
                     let pre_key_id = gen_start + i as u32;
                     let key_pair = KeyPair::generate(&mut rng);
                     let start = buf.len();
-                    new_pre_key_record(pre_key_id, &key_pair).encode(&mut buf);
+                    encode_pre_key_record_to(pre_key_id, &key_pair, &mut buf);
                     offsets.push((pre_key_id, start..buf.len()));
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 }
@@ -608,7 +624,7 @@ impl Client {
                     plan.window_start,
                     plan.new_next
                 );
-                return Box::pin(self.upload_pre_keys_pass(false)).await;
+                return Box::pin(self.upload_pre_keys_pass(false, configured)).await;
             }
             anyhow::bail!("no prekey available to upload");
         }
@@ -620,17 +636,15 @@ impl Client {
             // `PreKeyRecordStructure::decode` the consume path runs, so a record
             // accepted here is one this device can later decrypt with. Fresh keys skip
             // decode entirely; their public keys never left memory.
-            use buffa::Message;
             for (id, record) in &leftover_rows {
-                let public_key =
-                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record[..])
-                        .map_err(anyhow::Error::from)
-                        .and_then(|s| {
-                            let raw = s
-                                .public_key
-                                .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                            PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
-                        });
+                let public_key = waproto::codec::pre_key_record_decode(&record[..])
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| {
+                        let raw = s
+                            .public_key
+                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
+                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                    });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
                     Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),
@@ -714,17 +728,35 @@ impl Client {
     /// Verified against WA Web JS: `{ algo: { type: "fibonacci", first: 1e3, second: 2e3 }, max: 61e4 }`
     ///
     /// When `force` is true, bypasses the count guard (used by digest repair path).
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.upload_pre_keys_retry", level = "debug", skip_all, fields(force = force), err(Debug)))]
     pub(crate) async fn upload_pre_keys_with_retry(
         &self,
         force: bool,
+    ) -> Result<(), anyhow::Error> {
+        self.upload_pre_keys_with_retry_count(force, None).await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.upload_pre_keys_retry",
+            level = "debug",
+            skip_all,
+            fields(force = force, wanted = ?wanted),
+            err(Debug)
+        )
+    )]
+    async fn upload_pre_keys_with_retry_count(
+        &self,
+        force: bool,
+        wanted: Option<usize>,
     ) -> Result<(), anyhow::Error> {
         let mut delay_a: u64 = 1;
         let mut delay_b: u64 = 2;
         const MAX_DELAY_SECS: u64 = 610;
 
         loop {
-            match self.upload_pre_keys(force).await {
+            let result = self.upload_pre_keys_with_count(force, wanted).await;
+            match result {
                 Ok(()) => {
                     log::info!("Pre-key upload succeeded");
                     // Operation-level outcome: one emit per logical upload, not per attempt.
@@ -758,7 +790,7 @@ impl Client {
     /// Force-refresh the server's one-time pre-key pool with a fresh batch.
     ///
     /// Intended for callers that just restored a device from an external source
-    /// (e.g., migrating a Baileys session into an `InMemoryBackend`). The server
+    /// into an `InMemoryBackend`. The server
     /// may still hold pre-key IDs whose private key material the caller cannot
     /// reconstruct; any `pkmsg` referencing those IDs will fail forever with
     /// `InvalidPreKeyId`. Uploading a fresh batch gives the server new IDs the
@@ -781,6 +813,40 @@ impl Client {
         self.upload_pre_keys_with_retry(true).await
     }
 
+    /// Force-refresh the server pool using a caller-selected batch size without
+    /// changing the client's configured background replenishment size. The
+    /// count is clamped to the same protocol-safe bounds as regular uploads.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.refresh_pre_keys_with_count",
+            level = "debug",
+            skip_all,
+            fields(count = count),
+            err(Debug)
+        )
+    )]
+    pub async fn refresh_pre_keys_with_count(&self, count: usize) -> Result<(), anyhow::Error> {
+        let _guard = self.prekey_upload_lock.lock().await;
+        self.upload_pre_keys_with_retry_count(true, Some(count))
+            .await
+    }
+
+    /// Ensure the server pool is above the low-water mark.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.ensure_pre_keys",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
+    pub async fn ensure_pre_keys(&self) -> Result<(), anyhow::Error> {
+        let _guard = self.prekey_upload_lock.lock().await;
+        self.upload_pre_keys_with_retry(false).await
+    }
+
     /// Validate server key bundle digest, re-uploading only when the server has no record.
     ///
     /// Matches WA Web's `WAWebDigestKeyJob.digestKey()`:
@@ -800,7 +866,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
+    pub async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
         // Hold the lock across the whole pass so the 404 re-upload can't race with
         // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys` on
         // `next_pre_key_id` allocation.
@@ -1066,6 +1132,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod window_tests {
     use wacore::libsignal::protocol::PublicKey;
 
@@ -1078,6 +1145,25 @@ mod window_tests {
         client: &crate::client::Client,
     ) -> std::sync::Arc<dyn crate::store::traits::Backend> {
         client.persistence_manager.backend()
+    }
+
+    #[tokio::test]
+    async fn explicit_upload_count_does_not_change_background_configuration() {
+        let client = crate::test_utils::create_test_client_with_name("prekey_explicit_count").await;
+        client.set_wanted_pre_key_count(5);
+
+        let _ = client.upload_pre_keys_inner_with_count(7).await;
+
+        assert_eq!(client.wanted_pre_key_count(), 5);
+        assert_eq!(snapshot(&client), (8, 8));
+        assert_eq!(
+            backend(&client)
+                .load_prekeys_batch(&[1, 2, 3, 4, 5, 6, 7])
+                .await
+                .unwrap()
+                .len(),
+            7
+        );
     }
 
     /// A failed upload IQ must leave the watermarks past the generated window

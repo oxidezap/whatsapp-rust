@@ -2,6 +2,8 @@
 //! implement the async traits using only this crate's re-exports (no direct
 //! buffa/bytes/anyhow/async-trait/chrono dependency of its own).
 #![cfg(test)]
+// Tests/benches exercise the raw buffa API.
+#![allow(clippy::disallowed_methods)]
 
 use crate as whatsapp_rust;
 use whatsapp_rust::waproto::whatsapp as wa;

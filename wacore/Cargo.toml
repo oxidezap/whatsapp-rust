@@ -63,6 +63,7 @@ event-listener = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 getrandom = { workspace = true, optional = true }
+hashbrown = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
@@ -104,6 +105,10 @@ harness = false
 
 [[bench]]
 name = "send_receive_benchmark"
+harness = false
+
+[[bench]]
+name = "token_lookup_benchmark"
 harness = false
 
 [[bench]]

@@ -1,11 +1,10 @@
 use crate::libsignal::crypto::{
-    CryptographicMac, DecryptionError as AesCbcDecryptionError, Error as CryptoError,
-    aes_256_cbc_decrypt_into,
+    DecryptionError as AesCbcDecryptionError, Error as CryptoError, aes_256_cbc_decrypt_in_place,
+    aes_256_cbc_decrypt_into, hmac_sha256_two_part,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
-use hkdf::Hkdf;
 use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
@@ -13,6 +12,10 @@ use thiserror::Error;
 use waproto::whatsapp as wa;
 use waproto::whatsapp::ExternalBlobReference;
 use waproto::whatsapp::message::HistorySyncNotification;
+
+const MEDIA_MAC_SIZE: usize = 10;
+const AES_BLOCK_SIZE: usize = 16;
+const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -366,22 +369,18 @@ impl DownloadUtils {
         use aes::Aes256;
         use aes::cipher::KeyInit;
 
-        const MAC_SIZE: usize = 10;
-        const BLOCK: usize = 16;
-        const CHUNK: usize = 8 * 1024;
-
         fn decrypt_cbc_block(
             cblock: &[u8],
             cipher: &Aes256,
-            prev_block: &[u8; BLOCK],
-        ) -> Result<([u8; BLOCK], [u8; BLOCK])> {
+            prev_block: &[u8; AES_BLOCK_SIZE],
+        ) -> Result<([u8; AES_BLOCK_SIZE], [u8; AES_BLOCK_SIZE])> {
             use aes::cipher::{Block, BlockCipherDecrypt};
-            let cblock_arr: [u8; BLOCK] = cblock
+            let cblock_arr: [u8; AES_BLOCK_SIZE] = cblock
                 .try_into()
                 .map_err(|_| anyhow!("Invalid block size"))?;
             let mut block: Block<Aes256> = cblock_arr.into();
             cipher.decrypt_block(&mut block);
-            let mut decrypted: [u8; BLOCK] = block.into();
+            let mut decrypted: [u8; AES_BLOCK_SIZE] = block.into();
             for (b, &p) in decrypted.iter_mut().zip(prev_block.iter()) {
                 *b ^= p;
             }
@@ -398,10 +397,11 @@ impl DownloadUtils {
             Aes256::new_from_slice(&cipher_key).map_err(|_| anyhow!("Bad AES key length"))?;
 
         let mut bytes_written: u64 = 0;
-        let mut tail: Vec<u8> = Vec::with_capacity(CHUNK + BLOCK + MAC_SIZE);
+        let mut tail: Vec<u8> =
+            Vec::with_capacity(STREAM_CHUNK_SIZE + AES_BLOCK_SIZE + MEDIA_MAC_SIZE);
         let mut prev_block = iv;
 
-        let mut read_buf = [0u8; CHUNK];
+        let mut read_buf = [0u8; STREAM_CHUNK_SIZE];
 
         loop {
             let n = reader.read(&mut read_buf)?;
@@ -410,16 +410,16 @@ impl DownloadUtils {
             }
             tail.extend_from_slice(&read_buf[..n]);
 
-            if tail.len() > MAC_SIZE + BLOCK {
-                let mut processable_len = tail.len() - (MAC_SIZE + BLOCK);
-                processable_len -= processable_len % BLOCK;
-                if processable_len >= BLOCK {
+            if tail.len() > MEDIA_MAC_SIZE + AES_BLOCK_SIZE {
+                let mut processable_len = tail.len() - (MEDIA_MAC_SIZE + AES_BLOCK_SIZE);
+                processable_len -= processable_len % AES_BLOCK_SIZE;
+                if processable_len >= AES_BLOCK_SIZE {
                     hmac.update(&tail[..processable_len]);
-                    for cblock in tail[..processable_len].chunks_exact(BLOCK) {
+                    for cblock in tail[..processable_len].chunks_exact(AES_BLOCK_SIZE) {
                         let (decrypted, cblock_arr) =
                             decrypt_cbc_block(cblock, &cipher, &prev_block)?;
                         writer.write_all(&decrypted)?;
-                        bytes_written += BLOCK as u64;
+                        bytes_written += AES_BLOCK_SIZE as u64;
                         prev_block = cblock_arr;
                     }
                     // Drain processed bytes, reusing the Vec's existing allocation
@@ -428,20 +428,22 @@ impl DownloadUtils {
             }
         }
 
-        if tail.len() < MAC_SIZE + BLOCK || !(tail.len() - MAC_SIZE).is_multiple_of(BLOCK) {
+        if tail.len() < MEDIA_MAC_SIZE + AES_BLOCK_SIZE
+            || !(tail.len() - MEDIA_MAC_SIZE).is_multiple_of(AES_BLOCK_SIZE)
+        {
             return Err(anyhow!("Invalid final media size"));
         }
-        let mac_index = tail.len() - MAC_SIZE;
+        let mac_index = tail.len() - MEDIA_MAC_SIZE;
         let (final_ciphertext, mac_bytes) = tail.split_at(mac_index);
         hmac.update(final_ciphertext);
         let expected_mac_full = hmac.finalize().into_bytes();
-        let expected_mac = &expected_mac_full[..MAC_SIZE];
+        let expected_mac = &expected_mac_full[..MEDIA_MAC_SIZE];
         if subtle::ConstantTimeEq::ct_eq(mac_bytes, expected_mac).unwrap_u8() == 0 {
             return Err(anyhow!("MAC mismatch"));
         }
 
         let mut final_plain = Vec::with_capacity(final_ciphertext.len());
-        for cblock in final_ciphertext.chunks_exact(BLOCK) {
+        for cblock in final_ciphertext.chunks_exact(AES_BLOCK_SIZE) {
             let (decrypted, cblock_arr) = decrypt_cbc_block(cblock, &cipher, &prev_block)?;
             final_plain.extend_from_slice(&decrypted);
             prev_block = cblock_arr;
@@ -450,7 +452,7 @@ impl DownloadUtils {
             Some(&v) => v as usize,
             None => return Err(anyhow!("Empty plaintext after decrypt")),
         };
-        if pad_len == 0 || pad_len > BLOCK || pad_len > final_plain.len() {
+        if pad_len == 0 || pad_len > AES_BLOCK_SIZE || pad_len > final_plain.len() {
             return Err(anyhow!("Invalid PKCS7 padding"));
         }
         if !final_plain[final_plain.len() - pad_len..]
@@ -484,10 +486,14 @@ impl DownloadUtils {
         media_key: &[u8],
         app_info: MediaType,
     ) -> Result<([u8; 16], [u8; 32], [u8; 32])> {
-        let hk = Hkdf::<Sha256>::new(None, media_key);
         let mut expanded = [0u8; 112];
-        hk.expand(app_info.app_info().as_bytes(), &mut expanded)
-            .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
+        crate::crypto::hkdf_sha256_into(
+            media_key,
+            None,
+            app_info.app_info().as_bytes(),
+            &mut expanded,
+        )
+        .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
         let iv: [u8; 16] = expanded[0..16]
             .try_into()
             .map_err(|_| anyhow!("HKDF output has unexpected length for IV"))?;
@@ -512,33 +518,52 @@ impl DownloadUtils {
         media_key: &[u8],
         media_type: MediaType,
     ) -> std::result::Result<Vec<u8>, MediaDecryptionError> {
-        const MAC_SIZE: usize = 10;
-        if encrypted_payload.len() <= MAC_SIZE {
+        let mut output = encrypted_payload.to_vec();
+        Self::verify_and_decrypt_in_place(&mut output, media_key, media_type)?;
+        Ok(output)
+    }
+
+    /// Authenticate and decrypt an encrypted media payload in its existing
+    /// allocation. This is the zero-copy counterpart to [`Self::verify_and_decrypt`]
+    /// for buffered HTTP clients: the trailing MAC and PKCS#7 padding are removed
+    /// by truncating the input vector after CBC decryption.
+    ///
+    /// Authentication is completed before any byte is mutated, so an invalid
+    /// MAC leaves `encrypted_payload` unchanged. Errors after successful
+    /// authentication, such as malformed padding, may leave the buffer
+    /// truncated or partially decrypted.
+    pub fn verify_and_decrypt_in_place(
+        encrypted_payload: &mut Vec<u8>,
+        media_key: &[u8],
+        media_type: MediaType,
+    ) -> std::result::Result<(), MediaDecryptionError> {
+        if encrypted_payload.len() <= MEDIA_MAC_SIZE {
             return Err(MediaDecryptionError::PayloadTooShort);
         }
 
-        let (ciphertext, received_mac) =
-            encrypted_payload.split_at(encrypted_payload.len() - MAC_SIZE);
-
+        let ciphertext_len = encrypted_payload.len() - MEDIA_MAC_SIZE;
+        let received_mac: [u8; MEDIA_MAC_SIZE] = encrypted_payload[ciphertext_len..]
+            .try_into()
+            .map_err(|_| MediaDecryptionError::PayloadTooShort)?;
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, media_type)?;
 
-        let computed_mac_full = {
-            let mut mac =
-                CryptographicMac::new("HmacSha256", &mac_key).map_err(MediaDecryptionError::Mac)?;
-            mac.update(&iv);
-            mac.update(ciphertext);
-            mac.finalize()
-        };
-        if subtle::ConstantTimeEq::ct_eq(&computed_mac_full[..MAC_SIZE], received_mac).unwrap_u8()
+        let computed_mac_full =
+            hmac_sha256_two_part(&mac_key, &iv, &encrypted_payload[..ciphertext_len]);
+        if subtle::ConstantTimeEq::ct_eq(&computed_mac_full[..MEDIA_MAC_SIZE], &received_mac)
+            .unwrap_u8()
             == 0
         {
             return Err(MediaDecryptionError::InvalidMac);
         }
+        if ciphertext_len == 0 || !ciphertext_len.is_multiple_of(AES_BLOCK_SIZE) {
+            return Err(MediaDecryptionError::Decryption(
+                AesCbcDecryptionError::BadCiphertext("invalid ciphertext length"),
+            ));
+        }
 
-        let mut output = Vec::new();
-        aes_256_cbc_decrypt_into(ciphertext, &cipher_key, &iv, &mut output)
-            .map_err(MediaDecryptionError::Decryption)?;
-        Ok(output)
+        encrypted_payload.truncate(ciphertext_len);
+        aes_256_cbc_decrypt_in_place(encrypted_payload, &cipher_key, &iv)
+            .map_err(MediaDecryptionError::Decryption)
     }
 }
 
@@ -591,6 +616,76 @@ mod tests {
             ],
             auth: "test-auth-token".into(),
         }
+    }
+
+    fn encrypted_media_fixture(
+        plaintext: &[u8],
+        media_key: &[u8],
+        media_type: MediaType,
+    ) -> Vec<u8> {
+        use crate::libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
+
+        let (iv, cipher_key, mac_key) =
+            DownloadUtils::get_media_keys(media_key, media_type).unwrap();
+        let mut payload = Vec::new();
+        aes_256_cbc_encrypt_into(plaintext, &cipher_key, &iv, &mut payload).unwrap();
+        let mut mac = CryptographicMac::new("HmacSha256", &mac_key).unwrap();
+        mac.update(&iv);
+        mac.update(&payload);
+        payload.extend_from_slice(&mac.finalize()[..MEDIA_MAC_SIZE]);
+        payload
+    }
+
+    #[test]
+    fn in_place_media_decrypt_matches_streaming_without_reallocating() {
+        let media_key = [0x42; 32];
+        for plaintext_len in [0_usize, 1, 15, 16, 17, 8 * 1024 + 7, 128 * 1024 + 3] {
+            let plaintext: Vec<u8> = (0..plaintext_len)
+                .map(|index| index.wrapping_mul(31) as u8)
+                .collect();
+            let encrypted = encrypted_media_fixture(&plaintext, &media_key, MediaType::History);
+            let streaming = DownloadUtils::decrypt_stream(
+                std::io::Cursor::new(&encrypted),
+                &media_key,
+                MediaType::History,
+            )
+            .unwrap();
+
+            let mut in_place = encrypted;
+            let allocation = in_place.as_ptr();
+            let capacity = in_place.capacity();
+            DownloadUtils::verify_and_decrypt_in_place(
+                &mut in_place,
+                &media_key,
+                MediaType::History,
+            )
+            .unwrap();
+
+            assert_eq!(in_place, plaintext, "plaintext length {plaintext_len}");
+            assert_eq!(in_place, streaming, "plaintext length {plaintext_len}");
+            assert_eq!(in_place.as_ptr(), allocation, "allocation must be reused");
+            assert_eq!(in_place.capacity(), capacity, "capacity must be reused");
+        }
+    }
+
+    #[test]
+    fn in_place_media_decrypt_authenticates_before_mutating() {
+        let media_key = [0x24; 32];
+        let mut encrypted =
+            encrypted_media_fixture(b"authenticated payload", &media_key, MediaType::History);
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 1;
+        let original = encrypted.clone();
+
+        assert!(matches!(
+            DownloadUtils::verify_and_decrypt_in_place(
+                &mut encrypted,
+                &media_key,
+                MediaType::History,
+            ),
+            Err(MediaDecryptionError::InvalidMac)
+        ));
+        assert_eq!(encrypted, original);
     }
 
     #[test]

@@ -2,6 +2,62 @@
 
 use super::*;
 
+/// Parsed session envelope with explicit retry/ownership semantics.
+///
+/// Pre-key payloads are the large history-sync path and can safely donate
+/// their uniquely-owned wire allocation after authentication. Ordinary Signal
+/// messages retain their ciphertext because identity and PN/LID recovery may
+/// need to retry them after a successful cryptographic decrypt.
+enum ParsedSessionMessage {
+    Retained(CiphertextMessage),
+    Consumable(OwnedCiphertextMessage),
+}
+
+impl ParsedSessionMessage {
+    fn is_available(&self) -> bool {
+        match self {
+            Self::Retained(_) => true,
+            Self::Consumable(message) => message.is_available(),
+        }
+    }
+}
+
+async fn decrypt_session_message(
+    message: &mut ParsedSessionMessage,
+    signal_address: &wacore::libsignal::protocol::ProtocolAddress,
+    adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
+    rng: &mut rand::rngs::StdRng,
+) -> std::result::Result<DecryptionResult, SignalProtocolError> {
+    match message {
+        ParsedSessionMessage::Retained(message) => {
+            message_decrypt(
+                message,
+                signal_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+        ParsedSessionMessage::Consumable(message) => {
+            message_decrypt_owned(
+                message,
+                signal_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+    }
+}
+
 impl Client {
     /// Test convenience: scope to the current generation. Production inbound
     /// traffic always goes through the chat-lane worker, which passes its own
@@ -405,21 +461,23 @@ impl Client {
         let is_group_sender = sender_encryption_jid.is_group()
             || sender_encryption_jid.is_broadcast_list()
             || sender_encryption_jid.is_status_broadcast();
+        let session_payload_count = session_payloads.len();
+        let session_payloads_empty = session_payloads.is_empty();
 
-        let session_outcome = if !is_group_sender && !session_payloads.is_empty() {
+        let session_outcome = if !is_group_sender && !session_payloads_empty {
             self.clone()
                 .process_session_enc_batch(
-                    &session_payloads,
+                    session_payloads,
                     &info,
                     &sender_encryption_jid,
                     decrypt_fail_mode,
                 )
                 .await
         } else {
-            if is_group_sender && !session_payloads.is_empty() {
+            if is_group_sender && !session_payloads_empty {
                 log::debug!(
                     "Skipping {} session messages from group sender {}",
-                    session_payloads.len(),
+                    session_payload_count,
                     sender_encryption_jid.observe()
                 );
             }
@@ -445,7 +503,7 @@ impl Client {
         // to resend the entire message including SKDM.
         if !group_payloads.is_empty() {
             let should_process_skmsg =
-                should_process_skmsg_after_session(session_payloads.is_empty(), session_outcome);
+                should_process_skmsg_after_session(session_payloads_empty, session_outcome);
 
             if should_process_skmsg {
                 match self
@@ -511,7 +569,7 @@ impl Client {
             }
         } else if !session_decrypted_successfully
             && !session_had_duplicates
-            && !session_payloads.is_empty()
+            && !session_payloads_empty
         {
             // Edge case: message with only msg/pkmsg that failed to decrypt, no skmsg
             log::log!(
@@ -575,12 +633,11 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
-        payloads: &[EncPayload],
+        payloads: Vec<EncPayload>,
         info: &Arc<MessageInfo>,
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> SessionBatchOutcome {
-        use wacore::libsignal::protocol::CiphertextMessage;
         if payloads.is_empty() {
             return SessionBatchOutcome::default();
         }
@@ -613,65 +670,18 @@ impl Client {
         let mut local_identity_reacted = false;
 
         for payload in payloads {
-            let ciphertext = &payload.ciphertext[..];
-            let enc_type = payload.enc_type;
+            let EncPayload {
+                ciphertext,
+                enc_type,
+                padding_version,
+            } = payload;
             let enc_type_str = enc_type.as_wire_str();
-            let padding_version = payload.padding_version;
-
-            // WA Web `MsgSendReceipt.js` nacks PARSE_ERROR; without it the
-            // server retransmits the malformed stanza forever. Mirrors the
-            // `handle_decrypt_failure` shape (dispatch event + spawn wire I/O
-            // so the session lock isn't held across the send).
-            let parsed_message = if enc_type == EncType::PreKeyMessage {
-                match PreKeySignalMessage::try_from(ciphertext) {
-                    Ok(m) => CiphertextMessage::PreKeySignalMessage(m),
-                    Err(e) => {
-                        log::error!(
-                            "[msg:{}] Failed to parse PreKeySignalMessage from {}: {e:?}. Sending nack.",
-                            info.id,
-                            info.source.sender.observe()
-                        );
-                        // |= so a later dedup'd return (false) can't clobber
-                        // a true set by a prior iteration in this batch.
-                        outcome.had_failure = true;
-                        outcome.undecryptable |= self
-                            .dispatch_undecryptable_event(
-                                Arc::clone(info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
-                                decrypt_fail_mode,
-                            )
-                            .await;
-                        self.spawn_nack(info, NackReason::ParsingError, None);
-                        continue;
-                    }
-                }
-            } else {
-                match SignalMessage::try_from(ciphertext) {
-                    Ok(m) => CiphertextMessage::SignalMessage(m),
-                    Err(e) => {
-                        log::error!(
-                            "[msg:{}] Failed to parse SignalMessage from {}: {e:?}. Sending nack.",
-                            info.id,
-                            info.source.sender.observe()
-                        );
-                        outcome.had_failure = true;
-                        outcome.undecryptable |= self
-                            .dispatch_undecryptable_event(
-                                Arc::clone(info),
-                                false,
-                                crate::types::events::UnavailableType::Unknown,
-                                decrypt_fail_mode,
-                            )
-                            .await;
-                        self.spawn_nack(info, NackReason::ParsingError, None);
-                        continue;
-                    }
-                }
-            };
+            #[cfg(feature = "tracing")]
+            let ciphertext_len = ciphertext.len();
 
             if enc_type == EncType::PreKeyMessage {
-                // FLAGGED FOR DEBUGGING: "Bad Mac" Reproducibility
+                // Capture before parsing moves the wire buffer into the owned
+                // decrypt path; this feature exists to reproduce BadMac reports.
                 #[cfg(feature = "debug-snapshots")]
                 {
                     use base64::prelude::*;
@@ -680,7 +690,7 @@ impl Client {
                         "sender_jid": sender_encryption_jid.to_string(),
                         "timestamp": info.timestamp,
                         "enc_type": enc_type_str,
-                        "payload_base64": BASE64_STANDARD.encode(ciphertext),
+                        "payload_base64": BASE64_STANDARD.encode(ciphertext.as_ref()),
                     });
 
                     let content_bytes = serde_json::to_vec_pretty(&payload).unwrap_or_default();
@@ -693,26 +703,74 @@ impl Client {
                         log::warn!("Failed to create snapshot for pkmsg: {}", e);
                     }
                 }
-                #[cfg(not(feature = "debug-snapshots"))]
-                {
-                    // No-op if disabled
-                }
             }
+
+            // WA Web `MsgSendReceipt.js` nacks PARSE_ERROR; without it the
+            // server retransmits the malformed stanza forever. Mirrors the
+            // `handle_decrypt_failure` shape (dispatch event + spawn wire I/O
+            // so the session lock isn't held across the send).
+            let parsed_message = {
+                #[cfg(feature = "tracing")]
+                let _parse_span = tracing::trace_span!(
+                    "wa.recv.session_parse",
+                    ciphertext_bytes = ciphertext_len as u64,
+                    enc_type = enc_type_str
+                )
+                .entered();
+                if enc_type == EncType::PreKeyMessage {
+                    PreKeySignalMessage::try_from(ciphertext)
+                        .map(CiphertextMessage::PreKeySignalMessage)
+                        .map(OwnedCiphertextMessage::from)
+                        .map(ParsedSessionMessage::Consumable)
+                } else {
+                    SignalMessage::try_from(ciphertext)
+                        .map(CiphertextMessage::SignalMessage)
+                        .map(ParsedSessionMessage::Retained)
+                }
+            };
+            let mut parsed_message = match parsed_message {
+                Ok(message) => message,
+                Err(e) => {
+                    log::error!(
+                        "[msg:{}] Failed to parse {enc_type_str} Signal envelope from {}: {e:?}. Sending nack.",
+                        info.id,
+                        info.source.sender.observe()
+                    );
+                    // |= so a later dedup'd return (false) can't clobber a true
+                    // set by a prior iteration in this batch.
+                    outcome.had_failure = true;
+                    outcome.undecryptable |= self
+                        .dispatch_undecryptable_event(
+                            Arc::clone(info),
+                            false,
+                            crate::types::events::UnavailableType::Unknown,
+                            decrypt_fail_mode,
+                        )
+                        .await;
+                    self.spawn_nack(info, NackReason::ParsingError, None);
+                    continue;
+                }
+            };
 
             // Shadow with wire string for all downstream usage (logging, handlers)
             let enc_type = enc_type_str;
 
-            let decrypt_res = message_decrypt(
-                &parsed_message,
+            let decrypt_res = decrypt_session_message(
+                &mut parsed_message,
                 &signal_address,
-                &mut adapter.session_store,
-                &mut adapter.identity_store,
-                &mut adapter.pre_key_store,
-                &adapter.signed_pre_key_store,
+                &mut adapter,
                 &mut rng,
-                UsePQRatchet::No,
-            )
-            .await;
+            );
+            #[cfg(feature = "tracing")]
+            let decrypt_res = tracing::Instrument::instrument(
+                decrypt_res,
+                tracing::trace_span!(
+                    "wa.recv.session_crypto",
+                    ciphertext_bytes = ciphertext_len as u64,
+                    enc_type = enc_type_str
+                ),
+            );
+            let decrypt_res = decrypt_res.await;
 
             match decrypt_res {
                 Ok(decrypted) => {
@@ -811,15 +869,11 @@ impl Client {
                             address
                         );
 
-                        let retry_decrypt_res = message_decrypt(
-                            &parsed_message,
+                        let retry_decrypt_res = decrypt_session_message(
+                            &mut parsed_message,
                             &signal_address,
-                            &mut adapter.session_store,
-                            &mut adapter.identity_store,
-                            &mut adapter.pre_key_store,
-                            &adapter.signed_pre_key_store,
+                            &mut adapter,
                             &mut rng,
-                            UsePQRatchet::No,
                         )
                         .await;
 
@@ -878,7 +932,7 @@ impl Client {
                                         .try_pn_to_lid_migration_decrypt(
                                             sender_encryption_jid,
                                             &signal_address,
-                                            &parsed_message,
+                                            &mut parsed_message,
                                             &mut adapter,
                                             &mut rng,
                                             enc_type,
@@ -961,7 +1015,7 @@ impl Client {
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
-                                &parsed_message,
+                                &mut parsed_message,
                                 &mut adapter,
                                 &mut rng,
                                 enc_type,
@@ -1005,7 +1059,7 @@ impl Client {
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
-                                &parsed_message,
+                                &mut parsed_message,
                                 &mut adapter,
                                 &mut rng,
                                 enc_type,
@@ -1058,7 +1112,7 @@ impl Client {
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
-                                &parsed_message,
+                                &mut parsed_message,
                                 &mut adapter,
                                 &mut rng,
                                 enc_type,
@@ -1161,7 +1215,7 @@ impl Client {
         } in deferred
         {
             match self
-                .handle_decrypted_plaintext(enc_type, &plaintext, padding_version, info)
+                .handle_decrypted_plaintext(enc_type, plaintext, padding_version, info)
                 .await
             {
                 Ok(plaintext_outcome) => {
@@ -1249,7 +1303,7 @@ impl Client {
                     if let Err(e) = self
                         .handle_decrypted_plaintext(
                             "skmsg",
-                            &padded_plaintext,
+                            padded_plaintext,
                             padding_version,
                             info,
                         )
@@ -1407,11 +1461,15 @@ impl Client {
     pub(crate) async fn handle_decrypted_plaintext(
         self: &Arc<Self>,
         enc_type: &str,
-        padded_plaintext: &[u8],
+        padded_plaintext: Vec<u8>,
         padding_version: u8,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
-        let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
+        let (original_msg, history_sync_taken) =
+            wacore::messages::decode_plaintext_detached_history_sync(
+                padded_plaintext,
+                padding_version,
+            )?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
@@ -1522,12 +1580,6 @@ impl Client {
             self.handle_pdo_response(pdo_response, info).await;
         }
 
-        // Note: msg might be modified by take() below
-        let history_sync_taken = msg
-            .protocol_message
-            .as_option_mut()
-            .and_then(|pm| pm.history_sync_notification.take());
-
         // history_sync_notification is self-only (our phone drives history sync).
         // A spoofed one from a peer would force a download of attacker-controlled
         // history, so honour it only from self. WA Web
@@ -1601,7 +1653,7 @@ impl Client {
         self: &Arc<Self>,
         sender_jid: &Jid,
         signal_address: &wacore::libsignal::protocol::ProtocolAddress,
-        parsed_message: &wacore::libsignal::protocol::CiphertextMessage,
+        parsed_message: &mut ParsedSessionMessage,
         adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
         rng: &mut rand::rngs::StdRng,
         enc_type: &'static str,
@@ -1611,9 +1663,7 @@ impl Client {
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
         deferred: &mut Vec<DeferredPlaintext>,
     ) -> MigrationDecryptResult {
-        use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
-
-        if !sender_jid.is_lid() {
+        if !parsed_message.is_available() || !sender_jid.is_lid() {
             return MigrationDecryptResult::NotDecrypted;
         }
 
@@ -1645,18 +1695,7 @@ impl Client {
             return MigrationDecryptResult::NotDecrypted;
         }
 
-        match message_decrypt(
-            parsed_message,
-            signal_address,
-            &mut adapter.session_store,
-            &mut adapter.identity_store,
-            &mut adapter.pre_key_store,
-            &adapter.signed_pre_key_store,
-            rng,
-            UsePQRatchet::No,
-        )
-        .await
-        {
+        match decrypt_session_message(parsed_message, signal_address, adapter, rng).await {
             // PN→LID migration re-addresses an existing peer; the LID address gets
             // the identity for the first time (NewOrUnchanged), so no local
             // identity-change reaction is warranted here.
