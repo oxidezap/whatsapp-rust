@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use e2e_tests::{TestClient, text_msg};
 use log::info;
 use whatsapp_rust::waproto::whatsapp as wa;

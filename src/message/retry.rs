@@ -3,6 +3,55 @@
 use super::*;
 
 impl Client {
+    /// Request retransmission of an inbound message stanza.
+    ///
+    /// The stanza is parsed once into the canonical message metadata model.
+    /// This operation sends only the retry receipt; transport acknowledgement
+    /// remains the caller's responsibility.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.request_retry", level = "debug", skip_all, err(Debug))
+    )]
+    pub async fn request_message_retry(
+        self: &Arc<Self>,
+        stanza: &NodeRef<'_>,
+        options: crate::features::RetryRequestOptions,
+    ) -> Result<crate::features::RetryRequestOutcome, crate::features::RetryRequestError> {
+        if stanza.tag.as_ref() != "message" {
+            return Err(crate::features::RetryRequestError::UnsupportedStanzaClass);
+        }
+        if stanza.get_attr("id").is_none() {
+            return Err(crate::features::RetryRequestError::MissingAttribute("id"));
+        }
+        if stanza.get_attr("from").is_none() {
+            return Err(crate::features::RetryRequestError::MissingAttribute("from"));
+        }
+        if !self.is_connected() {
+            return Err(crate::client::ClientError::NotConnected.into());
+        }
+
+        let device = self.persistence_manager.get_device_snapshot();
+        let own_pn = device
+            .pn
+            .as_ref()
+            .ok_or(crate::features::RetryRequestError::MissingLocalIdentity)?;
+        let info = wacore::messages::parse_message_info(stanza, own_pn, device.lid.as_ref())
+            .map_err(crate::features::RetryRequestError::InvalidStanza)?;
+        let max_sender_retry_count = message_enc_nodes_for_device(stanza, Some(own_pn))
+            .map(sender_retry_count)
+            .max()
+            .unwrap_or(0);
+        let info = Arc::new(info);
+        drop(device);
+
+        self.request_retry_for_info(
+            &info,
+            options,
+            (max_sender_retry_count > 0).then_some(max_sender_retry_count),
+        )
+        .await
+    }
+
     /// Dispatch an `UndecryptableMessage` event at most once per `(chat, id)`
     /// via the single-flight `get_with` semantic on `undecryptable_dispatched`.
     /// The atomic arm avoids the get-then-insert race where two concurrent
@@ -125,26 +174,33 @@ impl Client {
     /// Increments the retry count for a message and returns the new count.
     /// Returns `None` if max retries have been reached.
     ///
-    /// Note: get-then-insert has a theoretical TOCTOU window since
-    /// `spawn_retry_receipt` detaches. In practice, retries for the same
-    /// message are rare and a double-send is benign (recipients deduplicate
-    /// by message ID).
     pub(crate) async fn increment_retry_count(
         &self,
         cache_key: &str,
         reason: RetryReason,
     ) -> Option<u8> {
-        let cache_key = cache_key.to_owned();
-        let current = self.message_retry_counts.get(&cache_key).await;
-        let new_count = match current {
-            Some((count, _)) if count >= MAX_DECRYPT_RETRIES => return None,
-            Some((count, _)) => count + 1,
-            None => 1,
-        };
         self.message_retry_counts
-            .insert(cache_key, (new_count, Some(reason)))
+            .upsert_with_by_ref(cache_key, |current| {
+                let count = match current {
+                    Some((count, _)) if *count >= MAX_DECRYPT_RETRIES => return (None, None),
+                    Some((count, _)) => *count + 1,
+                    None => 1,
+                };
+                (Some((count, Some(reason))), Some(count))
+            })
+            .await
+    }
+
+    /// Raise the local retry count to a sender-echoed count without allowing a
+    /// concurrent local increment to be overwritten.
+    pub(crate) async fn preseed_retry_count(&self, cache_key: &str, sender_count: u8) {
+        self.message_retry_counts
+            .upsert_with_by_ref(cache_key, |current| match current {
+                Some((count, _)) if *count >= sender_count => (None, ()),
+                Some((_, reason)) => (Some((sender_count, *reason)), ()),
+                None => (Some((sender_count, None)), ()),
+            })
             .await;
-        Some(new_count)
     }
 
     /// Generate consistent cache key for retry logic.
@@ -208,26 +264,25 @@ impl Client {
     }
 
     /// Increment the retry count and send the retry receipt (or, at the cap, a
-    /// last-resort PDO). Awaitable so it can be ordered before the transport ack.
-    ///
-    /// Returns whether the caller should send the ack: `false` when we intended
-    /// to retry but the send failed (so the stanza stays queued for another try),
-    /// `true` when the resend went out or we deliberately gave up at the cap.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
-    async fn run_retry_receipt(
+    /// last-resort PDO). This is the shared operation used by explicit requests
+    /// and the automatic decrypt-failure pipeline.
+    async fn request_retry_for_info(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
-        reason: RetryReason,
-    ) -> bool {
+        options: crate::features::RetryRequestOptions,
+        sender_retry_count: Option<u8>,
+    ) -> Result<crate::features::RetryRequestOutcome, crate::features::RetryRequestError> {
+        let reason = options.reason();
         let cache_key = self
             .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
             .await;
 
+        if let Some(sender_retry_count) = sender_retry_count {
+            self.preseed_retry_count(&cache_key, sender_retry_count)
+                .await;
+        }
+
         let Some(retry_count) = self.increment_retry_count(&cache_key, reason).await else {
-            // Every further redelivery of a capped message lands here, so
-            // keep it at debug; the high-retry warn already fired on the way
-            // to the cap, and the PDO is a once-per-message no-op after the
-            // first request.
             log::debug!(
                 "Max retries ({}) reached for message {} from {} [{:?}]. Requesting PDO fallback.",
                 MAX_DECRYPT_RETRIES,
@@ -235,9 +290,8 @@ impl Client {
                 info.source.sender.observe(),
                 reason
             );
-            // Capped: give up and clear the backlog regardless of PDO outcome.
             self.run_pdo_request(info).await;
-            return true;
+            return Ok(crate::features::RetryRequestOutcome::LimitReached);
         };
 
         if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
@@ -250,14 +304,25 @@ impl Client {
                 reason
             );
         }
-        let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
-            Ok(()) => {
+
+        let send_result = self
+            .send_retry_receipt(info, retry_count, reason, options.force_include_keys())
+            .await;
+
+        // PDO is an independent first-attempt recovery path. Preserve it even
+        // when building or sending the retry receipt fails; the caller still
+        // receives that failure and the automatic pipeline still withholds its
+        // transport acknowledgement.
+        if retry_count == 1 {
+            self.run_pdo_request(info).await;
+        }
+
+        let send_outcome = send_result?;
+
+        let outcome = match send_outcome {
+            crate::retry::RetryReceiptSendOutcome::Sent { included_keys } => {
                 wacore::telemetry::retry_receipt(reason.as_str());
                 if retry_count >= MAX_DECRYPT_RETRIES {
-                    // Parity with WA Web's MessageHighRetryCount WAM event (id
-                    // 3132): committed after the retry receipt is sent, not
-                    // before — WAWebHandleMsgSendReceipt awaits sendRetryReceipt
-                    // and only then calls maybePostMessageHighRetryCountMetric.
                     wacore::telemetry::high_retry(reason.as_str());
                 }
                 debug!(
@@ -268,25 +333,47 @@ impl Client {
                     info.source.sender.observe(),
                     reason
                 );
-                true
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to send retry receipt #{} for message {} [{:?}]: {:?}",
+                crate::features::RetryRequestOutcome::Sent {
                     retry_count,
-                    info.id,
-                    reason,
-                    e
-                );
-                false
+                    included_keys,
+                }
+            }
+            crate::retry::RetryReceiptSendOutcome::Suppressed => {
+                crate::features::RetryRequestOutcome::Suppressed { retry_count }
             }
         };
 
-        // First retry only, to avoid duplicate PDO requests. Awaited so it runs
-        // before the caller's ack; the retry receipt already landed first.
-        if retry_count == 1 {
-            self.run_pdo_request(info).await;
+        Ok(outcome)
+    }
+
+    /// Awaitable automatic wrapper so retry can be ordered before transport ack.
+    ///
+    /// Returns whether the caller should send the ack: `false` when we intended
+    /// to retry but the send failed (so the stanza stays queued for another try),
+    /// `true` when the resend went out or we deliberately gave up at the cap.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
+    async fn run_retry_receipt(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        reason: RetryReason,
+    ) -> bool {
+        match self
+            .request_retry_for_info(
+                info,
+                crate::features::RetryRequestOptions::new().with_reason(reason),
+                None,
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                log::error!(
+                    "Failed to send retry receipt for message {} [{:?}]: {error:?}",
+                    info.id,
+                    reason
+                );
+                false
+            }
         }
-        retry_sent
     }
 }

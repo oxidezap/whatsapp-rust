@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use e2e_tests::TestClient;
 use log::info;
 use wacore::store::traits::AppSyncStore;

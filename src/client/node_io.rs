@@ -589,6 +589,18 @@ impl Client {
         }
     }
 
+    #[inline]
+    fn encode_ack_from_snapshot(
+        &self,
+        node: &wacore_binary::NodeRef<'_>,
+        participant_policy: AckParticipantPolicy,
+    ) -> Result<Vec<u8>, crate::features::StanzaResponseError> {
+        let device = self.persistence_manager.get_device_snapshot();
+        let encoded = encode_ack_bytes(node, device.pn.as_ref(), participant_policy);
+        drop(device);
+        encoded
+    }
+
     /// Build and send an <ack/> node corresponding to the given stanza.
     #[cfg_attr(
         feature = "tracing",
@@ -604,10 +616,10 @@ impl Client {
         if !self.is_connected() {
             return Err(ClientError::NotConnected);
         }
-        let own_pn = self.get_pn();
-        let buf = match encode_ack_bytes(node, own_pn.as_ref()) {
-            Ok(Some(buf)) => buf,
-            Ok(None) => return Ok(()),
+        let buf = match self
+            .encode_ack_from_snapshot(node, AckParticipantPolicy::OmitReceiptDestinationDuplicate)
+        {
+            Ok(buf) => buf,
             Err(e) => {
                 log::warn!("Failed to encode ack: {e}");
                 return Ok(());
@@ -616,21 +628,39 @@ impl Client {
         self.send_raw_bytes(buf).await
     }
 
+    /// Confirm a received stanza using its original borrowed node.
+    ///
+    /// Unlike the tolerant automatic receive path, malformed input is returned
+    /// to the caller and no successful outcome is reported unless the response
+    /// reaches the transport.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.ack_explicit", level = "debug", skip_all, err(Debug))
+    )]
+    pub async fn acknowledge_stanza(
+        &self,
+        stanza: &wacore_binary::NodeRef<'_>,
+    ) -> Result<(), crate::features::StanzaResponseError> {
+        let bytes = self.encode_ack_from_snapshot(stanza, AckParticipantPolicy::Preserve)?;
+        self.send_raw_bytes(bytes).await?;
+        Ok(())
+    }
+
     /// Send a transport ack so the server stops replaying a stanza from the
     /// offline queue. Awaitable so callers can order it after a retry receipt
     /// in a single flushed task.
     pub(crate) async fn send_transport_ack(&self, info: &crate::types::message::MessageInfo) {
         let source = message_ack_source_node(info);
-        let own_pn = self.get_pn();
-        match encode_ack_bytes(&source.as_node_ref(), own_pn.as_ref()) {
-            Ok(Some(buf)) => {
+        let encoded =
+            self.encode_ack_from_snapshot(&source.as_node_ref(), AckParticipantPolicy::Preserve);
+        match encoded {
+            Ok(buf) => {
                 if let Err(e) = self.send_raw_bytes(buf).await
                     && !e.is_transport_unavailable()
                 {
                     log::warn!("Failed to send transport ack for undecryptable message: {e:?}");
                 }
             }
-            Ok(None) => {}
             Err(e) => log::warn!("Failed to encode transport ack: {e}"),
         }
     }
@@ -655,10 +685,8 @@ impl Client {
         self: &Arc<Self>,
         node: &wacore_binary::NodeRef<'_>,
     ) {
-        let own_pn = self.get_pn();
-        let buf = match encode_ack_bytes(node, own_pn.as_ref()) {
-            Ok(Some(b)) => b,
-            Ok(None) => return,
+        let buf = match self.encode_ack_from_snapshot(node, AckParticipantPolicy::Preserve) {
+            Ok(buf) => buf,
             Err(e) => {
                 log::warn!("Failed to encode node transport ack: {e}");
                 return;

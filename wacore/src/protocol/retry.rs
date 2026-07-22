@@ -125,16 +125,26 @@ pub fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> 
     parse_registration_id(registration_node.content_bytes()?)
 }
 
-/// Returns whether keys should be included in a retry receipt for the given
-/// retry count and reason.
+/// Whether a normal stateful retry receipt carries the local key bundle.
 ///
-/// WhatsApp Web only includes keys when `retryCount >= 2`. As an optimization,
-/// keys are included on retry #1 for `NoSession` errors to reduce round-trips
-/// for skmsg-only message failures.
-pub fn should_include_keys(retry_count: u8, reason: RetryReason) -> bool {
-    let include_keys_early =
-        reason == RetryReason::NoSession || reason == RetryReason::UnknownCompanionNoPrekey;
-    retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early
+/// The diagnostic reason does not affect key distribution. Use
+/// [`should_include_keys_with_policy`] when the caller has an explicit force
+/// request or stateless destination.
+pub fn should_include_keys(retry_count: u8, _reason: RetryReason) -> bool {
+    should_include_keys_with_policy(retry_count, false, false)
+}
+
+/// Whether a retry receipt carries the local key bundle under the full policy.
+///
+/// The observed sender has only two early-inclusion inputs: an explicit force
+/// request and stateless addressing. The retry reason remains an independent
+/// diagnostic attribute and does not affect key distribution.
+pub fn should_include_keys_with_policy(
+    retry_count: u8,
+    force_include_keys: bool,
+    is_stateless: bool,
+) -> bool {
+    force_include_keys || is_stateless || retry_count >= MIN_RETRY_COUNT_FOR_KEYS
 }
 
 /// Whether a retry from a device that is not in our device registry must be
@@ -333,41 +343,29 @@ mod tests {
     }
 
     #[test]
-    fn should_include_keys_no_session_retry_1() {
-        assert!(
-            should_include_keys(1, RetryReason::NoSession),
-            "NoSession at retry#1 should include keys (optimization)"
-        );
+    fn should_not_include_keys_on_first_normal_retry() {
+        assert!(!should_include_keys(1, RetryReason::NoSession));
+        assert!(!should_include_keys(1, RetryReason::InvalidMessage));
     }
 
     #[test]
-    fn should_include_keys_unknown_companion_retry_1() {
-        assert!(
-            should_include_keys(1, RetryReason::UnknownCompanionNoPrekey),
-            "UnknownCompanionNoPrekey at retry#1 should include keys"
-        );
+    fn should_include_keys_when_forced() {
+        assert!(should_include_keys_with_policy(1, true, false));
     }
 
     #[test]
-    fn should_include_keys_invalid_message_retry_1() {
-        assert!(
-            !should_include_keys(1, RetryReason::InvalidMessage),
-            "InvalidMessage at retry#1 should NOT include keys"
-        );
+    fn should_include_keys_for_stateless_recipient() {
+        assert!(should_include_keys_with_policy(1, false, true));
     }
 
     #[test]
-    fn should_include_keys_retry_2_any_reason() {
-        assert!(should_include_keys(2, RetryReason::InvalidMessage));
+    fn should_include_keys_at_retry_threshold() {
         assert!(should_include_keys(2, RetryReason::UnknownError));
-        assert!(should_include_keys(2, RetryReason::BadMac));
-        assert!(should_include_keys(2, RetryReason::NoSession));
     }
 
     #[test]
-    fn should_include_keys_retry_3_any_reason() {
-        assert!(should_include_keys(3, RetryReason::InvalidMessage));
-        assert!(should_include_keys(3, RetryReason::UnknownError));
+    fn should_include_keys_after_retry_threshold() {
+        assert!(should_include_keys(3, RetryReason::BadMac));
     }
 
     #[test]
