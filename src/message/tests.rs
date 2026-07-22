@@ -5688,10 +5688,12 @@ async fn explicit_stanza_responses_reject_incomplete_input_without_sending() {
     assert_eq!(transport.failed_sends(), 1);
 }
 
+const EXPLICIT_RETRY_SENDER: &str = "12025550111:7@s.whatsapp.net";
+
 fn retry_request_stanza(id: &'static str) -> wacore_binary::Node {
     NodeBuilder::new("message")
         .attr("id", id)
-        .attr("from", "15551234567:7@s.whatsapp.net")
+        .attr("from", EXPLICIT_RETRY_SENDER)
         .attr("t", "1")
         .attr("type", "text")
         .build()
@@ -6088,7 +6090,7 @@ async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
     ));
 
     let stanza = retry_request_stanza("RETRY-LIMIT");
-    let sender: Jid = "15551234567:7@s.whatsapp.net".parse().expect("sender");
+    let sender: Jid = EXPLICIT_RETRY_SENDER.parse().expect("sender");
     let chat = sender.to_non_ad();
     let cache_key = client
         .make_retry_cache_key(&chat, "RETRY-LIMIT", &sender)
@@ -6139,7 +6141,7 @@ async fn explicit_retry_while_disconnected_preserves_budget_and_prekeys() {
         ))
     ));
 
-    let sender: Jid = "15551234567:7@s.whatsapp.net".parse().expect("sender");
+    let sender: Jid = EXPLICIT_RETRY_SENDER.parse().expect("sender");
     let cache_key = client
         .make_retry_cache_key(&sender.to_non_ad(), "EXPLICIT-RETRY-DISCONNECTED", &sender)
         .await;
