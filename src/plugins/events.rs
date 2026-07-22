@@ -195,6 +195,10 @@ pub enum PluginEventPublishError {
 }
 
 /// Result of one non-blocking fan-out attempt.
+///
+/// `dropped` counts queue entries discarded while processing this call. Under `DropOldest`, the
+/// discarded entry may belong to an earlier publication from another namespace; cumulative
+/// publisher statistics attribute that loss to the discarded envelope's owner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PluginEventPublishReport {
@@ -219,6 +223,7 @@ pub struct PluginEventEndpointStats {
 ///
 /// `published` counts successful calls, including calls with no subscriber. Fanout fields count
 /// endpoint outcomes; `delivered` advances only when a receiver removes an envelope from its queue.
+/// `dropped` follows the discarded envelope, including cross-namespace `DropOldest` eviction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PluginEventPublisherStats {
@@ -301,7 +306,6 @@ impl PublisherCounters {
                 self.published.fetch_add(1, Ordering::Relaxed);
                 self.matched.fetch_add(report.matched, Ordering::Relaxed);
                 self.enqueued.fetch_add(report.enqueued, Ordering::Relaxed);
-                self.dropped.fetch_add(report.dropped, Ordering::Relaxed);
                 self.closed.fetch_add(report.closed, Ordering::Relaxed);
             }
             Err(_) => {
@@ -383,8 +387,9 @@ impl EventEndpoint {
                     self.enqueued.fetch_add(1, Ordering::Relaxed);
                     EnqueueOutcome::Enqueued
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(TrySendError::Full(dropped)) => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
+                    dropped.publisher.dropped.fetch_add(1, Ordering::Relaxed);
                     EnqueueOutcome::Dropped
                 }
                 Err(TrySendError::Closed(_)) => EnqueueOutcome::Closed,
@@ -392,8 +397,9 @@ impl EventEndpoint {
             PluginEventOverflow::DropOldest => match self.sender.force_send(event) {
                 Ok(evicted) => {
                     self.enqueued.fetch_add(1, Ordering::Relaxed);
-                    if evicted.is_some() {
+                    if let Some(evicted) = evicted {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
+                        evicted.publisher.dropped.fetch_add(1, Ordering::Relaxed);
                         EnqueueOutcome::EnqueuedAfterDrop
                     } else {
                         EnqueueOutcome::Enqueued
@@ -1085,6 +1091,36 @@ mod tests {
         assert_eq!(subscription.stats().dropped, 2);
         assert_eq!(router.stats().dropped, 2);
         assert_eq!(router.stats().delivered, 2);
+    }
+
+    #[test]
+    fn drop_oldest_charges_the_evicted_publisher_across_namespaces() {
+        let router = PluginEventRouter::new(["alpha".to_string(), "beta".to_string()]);
+        let tick = topic("tick");
+        let subscription = router
+            .subscribe(
+                [selector("alpha", &tick), selector("beta", &tick)],
+                PluginEventEndpointConfig::new(1, PluginEventOverflow::DropOldest),
+            )
+            .expect("subscription");
+
+        assert_eq!(publish(&router, "alpha", &tick, 1).dropped, 0);
+        assert_eq!(publish(&router, "beta", &tick, 2).dropped, 1);
+
+        let event = subscription.try_recv().expect("newest event");
+        assert_eq!(&*event.plugin_id, "beta");
+        assert_eq!(subscription.stats().dropped, 1);
+        assert_eq!(
+            router
+                .publisher_stats("alpha")
+                .expect("alpha stats")
+                .dropped,
+            1
+        );
+        let beta = router.publisher_stats("beta").expect("beta stats");
+        assert_eq!(beta.dropped, 0);
+        assert_eq!(beta.delivered, 1);
+        assert_eq!(router.stats().dropped, 1);
     }
 
     #[test]
