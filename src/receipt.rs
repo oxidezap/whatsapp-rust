@@ -1406,7 +1406,7 @@ mod tests {
             let stanza = NodeBuilder::new(tag)
                 .attr("id", "STANZA-ID")
                 .attr("from", "120363021033254949@g.us")
-                .attr("participant", "15551234567:4@s.whatsapp.net")
+                .attr("participant", "12025550111:4@s.whatsapp.net")
                 .attr("type", "test-type")
                 .build();
             let nack = build_nack_node(
@@ -1437,7 +1437,7 @@ mod tests {
                     .get("participant")
                     .map(|value| value.as_str())
                     .as_deref(),
-                Some("15551234567:4@s.whatsapp.net")
+                Some("12025550111:4@s.whatsapp.net")
             );
             assert_eq!(
                 nack.attrs
@@ -1460,7 +1460,7 @@ mod tests {
     fn unrecognized_stanza_rejection_preserves_custom_class() {
         let stanza = NodeBuilder::new("future-stanza")
             .attr("id", "FUTURE-ID")
-            .attr("from", "15551234567@s.whatsapp.net")
+            .attr("from", "12025550111@s.whatsapp.net")
             .build();
         let nack = build_nack_node(
             &stanza.as_node_ref(),
@@ -1492,8 +1492,8 @@ mod tests {
     fn nack_does_not_apply_the_receipt_ack_participant_rule() {
         let stanza = NodeBuilder::new("receipt")
             .attr("id", "NACK-DUPLICATE-PARTICIPANT")
-            .attr("from", "15551234567@s.whatsapp.net")
-            .attr("participant", "15551234567@s.whatsapp.net")
+            .attr("from", "12025550111@s.whatsapp.net")
+            .attr("participant", "12025550111@s.whatsapp.net")
             .build();
         let nack = build_nack_node(
             &stanza.as_node_ref(),
@@ -1506,7 +1506,7 @@ mod tests {
         assert!(
             nack.attrs
                 .get("participant")
-                .is_some_and(|value| value == "15551234567@s.whatsapp.net"),
+                .is_some_and(|value| value == "12025550111@s.whatsapp.net"),
             "nack must preserve participant even when a receipt ack would omit it"
         );
     }
@@ -1514,7 +1514,7 @@ mod tests {
     #[test]
     fn nack_from_original_stanza_requires_id_and_from() {
         let without_id = NodeBuilder::new("message")
-            .attr("from", "15551234567@s.whatsapp.net")
+            .attr("from", "12025550111@s.whatsapp.net")
             .build();
         assert!(matches!(
             build_nack_node(
@@ -1546,7 +1546,7 @@ mod tests {
     fn nack_preserves_unknown_numeric_reason() {
         let stanza = NodeBuilder::new("message")
             .attr("id", "UNKNOWN-REASON")
-            .attr("from", "15551234567@s.whatsapp.net")
+            .attr("from", "12025550111@s.whatsapp.net")
             .build();
         let nack = build_nack_node(
             &stanza.as_node_ref(),

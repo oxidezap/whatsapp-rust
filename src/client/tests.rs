@@ -2385,7 +2385,7 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
 #[test]
 fn test_encode_ack_bytes_requires_public_response_inputs() {
     let without_id = NodeBuilder::new("receipt")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .build();
     assert!(matches!(
         encode_ack_bytes(
@@ -2412,7 +2412,7 @@ fn test_encode_ack_bytes_requires_public_response_inputs() {
 
     let message = NodeBuilder::new("message")
         .attr("id", "MISSING-IDENTITY")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .build();
     assert!(matches!(
         encode_ack_bytes(&message.as_node_ref(), None, AckParticipantPolicy::Preserve,),
@@ -2422,11 +2422,11 @@ fn test_encode_ack_bytes_requires_public_response_inputs() {
 
 #[test]
 fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
-    let from: Jid = "15551234567@s.whatsapp.net".parse().unwrap();
+    let from: Jid = "12025550111@s.whatsapp.net".parse().unwrap();
     let receipt = NodeBuilder::new("receipt")
         .attr("id", "RECEIPT-ACK")
         .attr("from", &from)
-        .attr("participant", "15551234567@s.whatsapp.net")
+        .attr("participant", "12025550111@s.whatsapp.net")
         .attr("type", "retry")
         .build();
     let bytes = encode_ack_bytes(
@@ -2473,7 +2473,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
 
     let generic = NodeBuilder::new("message")
         .attr("id", "MESSAGE-ACK")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .attr("participant", &from)
         .build();
     let bytes = encode_ack_bytes(
@@ -2486,7 +2486,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         .expect("encoded message ack should decode");
     assert!(
         ack.get_attr("participant")
-            .is_some_and(|value| value.as_str() == "15551234567@s.whatsapp.net"),
+            .is_some_and(|value| value.as_str() == "12025550111@s.whatsapp.net"),
         "generic ack must not inherit the receipt-only participant rule"
     );
 }
@@ -2530,7 +2530,7 @@ fn test_encode_ack_bytes_compares_jid_participants_by_display() {
 fn test_encode_ack_bytes_drops_encrypt_identity_notification_type() {
     let notification = NodeBuilder::new("notification")
         .attr("id", "IDENTITY-NOTIFICATION")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .attr("type", "encrypt")
         .children([NodeBuilder::new("identity").build()])
         .build();
@@ -2555,7 +2555,7 @@ fn test_encode_ack_bytes_drops_encrypt_identity_notification_type() {
 fn test_encode_ack_bytes_preserves_call_class_and_type() {
     let call = NodeBuilder::new("call")
         .attr("id", "CALL-ACK")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .attr("type", "offer_notice")
         .build();
     let bytes = encode_ack_bytes(&call.as_node_ref(), None, AckParticipantPolicy::Preserve)

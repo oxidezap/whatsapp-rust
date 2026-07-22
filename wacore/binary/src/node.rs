@@ -1033,14 +1033,14 @@ mod value_ref_tests {
         assert!(string != "other");
 
         let jid = ValueRef::Jid(JidRef {
-            user: NodeStr::Borrowed("15551234567"),
+            user: NodeStr::Borrowed("12025550111"),
             server: Server::Pn,
             agent: 0,
             device: 7,
             integrator: 0,
         });
-        assert!(jid == "15551234567:7@s.whatsapp.net");
-        assert!(jid != "15551234567@s.whatsapp.net");
+        assert!(jid == "12025550111:7@s.whatsapp.net");
+        assert!(jid != "12025550111@s.whatsapp.net");
     }
 }
 

@@ -5546,8 +5546,8 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
 
     let message = NodeBuilder::new("message")
         .attr("id", "EXPLICIT-ACK")
-        .attr("from", "15551234567:7@s.whatsapp.net")
-        .attr("participant", "15557654321:4@s.whatsapp.net")
+        .attr("from", "12025550111:7@s.whatsapp.net")
+        .attr("participant", "13125550112:4@s.whatsapp.net")
         .attr("recipient", "5511000000001@s.whatsapp.net")
         .attr("type", "text")
         .build();
@@ -5559,7 +5559,7 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
     let receipt = NodeBuilder::new("receipt")
         .attr("id", "EXPLICIT-NACK")
         .attr("from", "120363021033254949@g.us")
-        .attr("participant", "15551234567:7@s.whatsapp.net")
+        .attr("participant", "12025550111:7@s.whatsapp.net")
         .attr("type", "retry")
         .build();
     client
@@ -5587,7 +5587,7 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
     );
     assert!(
         ack.get_attr("to")
-            .is_some_and(|value| value.as_str() == "15551234567:7@s.whatsapp.net")
+            .is_some_and(|value| value.as_str() == "12025550111:7@s.whatsapp.net")
     );
     assert!(
         ack.get_attr("from")
@@ -5595,7 +5595,7 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
     );
     assert!(
         ack.get_attr("participant")
-            .is_some_and(|value| value.as_str() == "15557654321:4@s.whatsapp.net")
+            .is_some_and(|value| value.as_str() == "13125550112:4@s.whatsapp.net")
     );
     assert!(
         ack.get_attr("recipient")
@@ -5624,7 +5624,7 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
     );
     assert!(
         nack.get_attr("participant")
-            .is_some_and(|value| value.as_str() == "15551234567:7@s.whatsapp.net")
+            .is_some_and(|value| value.as_str() == "12025550111:7@s.whatsapp.net")
     );
     assert!(
         nack.get_attr("type")
@@ -5695,7 +5695,7 @@ async fn explicit_stanza_responses_reject_incomplete_input_without_sending() {
     let (client, transport) = capturing_client("explicit_stanza_invalid").await;
 
     let ack_without_id = NodeBuilder::new("receipt")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .build();
     assert!(matches!(
         client
@@ -5722,7 +5722,7 @@ async fn explicit_stanza_responses_reject_incomplete_input_without_sending() {
     transport.fail_next_sends(1);
     let valid_receipt = NodeBuilder::new("receipt")
         .attr("id", "TRANSPORT-FAILURE")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .build();
     let error = client
         .acknowledge_stanza(&valid_receipt.as_node_ref())
@@ -5923,7 +5923,7 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     let group = NodeBuilder::new("message")
         .attr("id", "RETRY-GROUP")
         .attr("from", "120363021033254949@g.us")
-        .attr("participant", "15551234567:7@s.whatsapp.net")
+        .attr("participant", "12025550111:7@s.whatsapp.net")
         .attr("t", "1")
         .build();
     assert_eq!(
@@ -5944,7 +5944,7 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     assert_eq!(group_receipt.to, "120363021033254949@g.us");
     assert_eq!(
         group_receipt.participant.as_deref(),
-        Some("15551234567:7@s.whatsapp.net")
+        Some("12025550111:7@s.whatsapp.net")
     );
     assert_eq!(group_receipt.recipient, None);
     assert_eq!(group_receipt.category, None);
@@ -5952,7 +5952,7 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     let status = NodeBuilder::new("message")
         .attr("id", "RETRY-STATUS")
         .attr("from", "status@broadcast")
-        .attr("participant", "15551234567:7@s.whatsapp.net")
+        .attr("participant", "12025550111:7@s.whatsapp.net")
         .attr("t", "1")
         .build();
     client
@@ -5967,13 +5967,13 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     assert_eq!(status_receipt.to, "status@broadcast");
     assert_eq!(
         status_receipt.participant.as_deref(),
-        Some("15551234567:7@s.whatsapp.net")
+        Some("12025550111:7@s.whatsapp.net")
     );
 
     let peer = NodeBuilder::new("message")
         .attr("id", "RETRY-PEER")
         .attr("from", "5511000000001:9@s.whatsapp.net")
-        .attr("recipient", "15551234567@s.whatsapp.net")
+        .attr("recipient", "12025550111@s.whatsapp.net")
         .attr("category", "peer")
         .attr("t", "1")
         .build();
@@ -5993,7 +5993,7 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     let self_fanout = NodeBuilder::new("message")
         .attr("id", "RETRY-SELF")
         .attr("from", "5511000000001:9@s.whatsapp.net")
-        .attr("recipient", "15551234567@s.whatsapp.net")
+        .attr("recipient", "12025550111@s.whatsapp.net")
         .attr("t", "1")
         .build();
     client
@@ -6008,13 +6008,13 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     assert_eq!(self_receipt.to, "5511000000001:9@s.whatsapp.net");
     assert_eq!(
         self_receipt.recipient.as_deref(),
-        Some("15551234567@s.whatsapp.net")
+        Some("12025550111@s.whatsapp.net")
     );
     assert_eq!(self_receipt.category, None);
 
     let hosted = NodeBuilder::new("message")
         .attr("id", "RETRY-HOSTED")
-        .attr("from", "15551234567:7@hosted")
+        .attr("from", "12025550111:7@hosted")
         .attr("t", "1")
         .build();
     assert_eq!(
@@ -6032,7 +6032,7 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     );
     let hosted_receipt =
         find_receipt_details(&transport.sent(), "RETRY-HOSTED").expect("hosted retry receipt");
-    assert_eq!(hosted_receipt.to, "15551234567:7@hosted");
+    assert_eq!(hosted_receipt.to, "12025550111:7@hosted");
     assert!(hosted_receipt.has_keys);
 
     let bot_dm = NodeBuilder::new("message")
@@ -6089,7 +6089,7 @@ async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
 
     let receipt = NodeBuilder::new("receipt")
         .attr("id", "WRONG-CLASS")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .build();
     assert!(matches!(
         client
@@ -6102,7 +6102,7 @@ async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
     ));
 
     let missing_id = NodeBuilder::new("message")
-        .attr("from", "15551234567@s.whatsapp.net")
+        .attr("from", "12025550111@s.whatsapp.net")
         .build();
     assert!(matches!(
         client
@@ -6113,6 +6113,29 @@ async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
             .await,
         Err(crate::features::RetryRequestError::MissingAttribute("id"))
     ));
+
+    let empty_id = retry_request_stanza("");
+    assert!(matches!(
+        client
+            .request_message_retry(
+                &empty_id.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await,
+        Err(crate::features::RetryRequestError::InvalidStanza(_))
+    ));
+    let retry_sender: Jid = EXPLICIT_RETRY_SENDER.parse().expect("sender");
+    let empty_id_cache_key = client
+        .make_retry_cache_key(&retry_sender.to_non_ad(), "", &retry_sender)
+        .await;
+    assert!(
+        client
+            .message_retry_counts
+            .get(&empty_id_cache_key)
+            .await
+            .is_none(),
+        "an empty stanza id must be rejected before retry accounting"
+    );
 
     let missing_from = NodeBuilder::new("message")
         .attr("id", "MISSING-FROM")

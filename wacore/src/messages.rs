@@ -919,6 +919,12 @@ pub fn parse_message_info(
     use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
     let mut attrs = node.attrs();
+    let id = attrs.required_string("id")?;
+    anyhow::ensure!(
+        !id.is_empty(),
+        "message stanza has an empty required 'id' attribute"
+    );
+    let id = id.into_owned();
     let from = attrs.required_jid("from")?;
     let addressing_mode = attrs
         .optional_string("addressing_mode")
@@ -1029,7 +1035,6 @@ pub fn parse_message_info(
         .map(|s| MessageCategory::from(s.as_ref()))
         .unwrap_or_default();
 
-    let id = attrs.required_string("id")?.to_string();
     let server_id = attrs
         .optional_u64("server_id")
         .filter(|&v| (99..=2_147_476_647).contains(&v))
@@ -1315,9 +1320,13 @@ mod parse_message_info_tests {
     use wacore_binary::builder::NodeBuilder;
 
     #[test]
-    fn invalid_routing_jids_are_rejected() {
+    fn invalid_routing_and_identity_attributes_are_rejected() {
         let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
         let cases = [
+            NodeBuilder::new("message")
+                .attr("from", "559980000001@s.whatsapp.net")
+                .attr("id", "")
+                .build(),
             NodeBuilder::new("message")
                 .attr("from", "not-a-jid")
                 .attr("id", "INVALID-FROM")
@@ -1341,7 +1350,7 @@ mod parse_message_info_tests {
         for node in &cases {
             assert!(
                 parse_message_info(&node.as_node_ref(), &own_pn, None).is_err(),
-                "invalid routing attributes must not produce default JIDs: {node:?}"
+                "invalid identity or routing attributes must be rejected: {node:?}"
             );
         }
     }
