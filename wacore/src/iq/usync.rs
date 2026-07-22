@@ -563,7 +563,6 @@ pub struct DeviceListSpec {
     /// returns only CHANGED users (WA Web `syncDeviceList`). Users the server omits
     /// from the response are UNCHANGED and their cached devices must be preserved.
     pub hashes: std::collections::HashMap<Jid, (String, i64)>,
-    require_complete_response: bool,
 }
 
 impl DeviceListSpec {
@@ -572,7 +571,6 @@ impl DeviceListSpec {
             jids,
             sid: sid.into(),
             hashes: std::collections::HashMap::new(),
-            require_complete_response: false,
         }
     }
 
@@ -587,18 +585,25 @@ impl DeviceListSpec {
             jids,
             sid: sid.into(),
             hashes,
-            require_complete_response: false,
         }
     }
 
     /// Reject a response that omits any requested user or returns no devices
     /// for one. Use for authoritative refreshes; ordinary fanout remains
     /// best-effort when an individual user cannot be resolved.
-    pub fn require_complete_response(mut self) -> Self {
-        self.require_complete_response = true;
-        self
+    pub fn require_complete_response(self) -> CompleteDeviceListSpec {
+        CompleteDeviceListSpec(self)
     }
 }
+
+/// A device-list query whose response must contain a usable entry for every
+/// requested user.
+///
+/// This wrapper keeps [`DeviceListSpec`]'s public data model unchanged while
+/// making authoritative refresh semantics explicit in the type system. It has
+/// no additional runtime state.
+#[derive(Debug, Clone)]
+pub struct CompleteDeviceListSpec(DeviceListSpec);
 
 pub(crate) fn device_list_query(
     jids: &[Jid],
@@ -718,17 +723,31 @@ impl IqSpec for DeviceListSpec {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        let parsed = project_device_list_response(parse_usync_response(response)?)?;
-        if self.require_complete_response {
-            for expected in &self.jids {
-                let Some(returned) = parsed.device_lists.iter().find(|returned| {
-                    returned.user.user == expected.user && returned.user.server == expected.server
-                }) else {
-                    anyhow::bail!("device-list response omitted user {expected}");
-                };
-                if returned.devices.is_empty() {
-                    anyhow::bail!("device-list response returned no devices for {expected}");
-                }
+        project_device_list_response(parse_usync_response(response)?)
+    }
+}
+
+impl IqSpec for CompleteDeviceListSpec {
+    type Response = DeviceListResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        self.0.build_iq()
+    }
+
+    fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+        self.0.encode_iq_direct(request_id, out)
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+        let parsed = self.0.parse_response(response)?;
+        for expected in &self.0.jids {
+            let Some(returned) = parsed.device_lists.iter().find(|returned| {
+                returned.user.user == expected.user && returned.user.server == expected.server
+            }) else {
+                anyhow::bail!("device-list response omitted user {expected}");
+            };
+            if returned.devices.is_empty() {
+                anyhow::bail!("device-list response returned no devices for {expected}");
             }
         }
         Ok(parsed)
@@ -1362,6 +1381,21 @@ mod tests {
         } else {
             panic!("Expected NodeContent::Nodes");
         }
+    }
+
+    #[test]
+    fn device_list_spec_preserves_its_public_data_shape() {
+        let jid = Jid::pn("1234567890");
+        let spec = DeviceListSpec {
+            jids: vec![jid.clone()],
+            sid: "test-sid".to_string(),
+            hashes: std::collections::HashMap::new(),
+        };
+
+        let DeviceListSpec { jids, sid, hashes } = spec;
+        assert_eq!(jids, [jid]);
+        assert_eq!(sid, "test-sid");
+        assert!(hashes.is_empty());
     }
 
     #[test]

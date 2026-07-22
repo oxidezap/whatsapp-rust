@@ -408,6 +408,26 @@ pub(crate) fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>
     (edit, has_attr.then(|| meta.build()))
 }
 
+fn validate_status_message_id(
+    message: &wa::Message,
+    outer_id: Option<&str>,
+) -> Result<(), SendError> {
+    let Some(outer_id) = outer_id else {
+        return Ok(());
+    };
+    if outer_id.is_empty() {
+        return Err(SendError::InvalidRequest(
+            "status message ID must not be empty".into(),
+        ));
+    }
+    if wacore::send::status_revoke_target_id(message) == Some(outer_id) {
+        return Err(SendError::InvalidRequest(
+            "status revoke stanza ID must differ from the revoked message ID".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Offset subtracted from the current unix timestamp to produce the
 /// `privacy_mode_ts` attr value on a `<biz>` stanza. Empirically confirmed
 /// against live WhatsApp servers.
@@ -853,11 +873,7 @@ impl Client {
             ));
         }
         validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
-        if options.message_id.as_ref().is_some_and(String::is_empty) {
-            return Err(SendError::InvalidRequest(
-                "status message ID must not be empty".into(),
-            ));
-        }
+        validate_status_message_id(&message, options.message_id.as_deref())?;
 
         // Status posts don't go through send_message_with_options, so count them here.
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
@@ -2474,6 +2490,29 @@ mod tests {
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;
+
+    #[test]
+    fn status_revoke_requires_a_distinct_outer_stanza_id() {
+        let target_id = "3EB0REVOKETARGET";
+        let revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some(target_id.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            validate_status_message_id(&revoke, Some(target_id)),
+            Err(SendError::InvalidRequest(_))
+        ));
+        assert!(validate_status_message_id(&revoke, Some("3EB0NEWSTANZAID")).is_ok());
+        assert!(validate_status_message_id(&revoke, None).is_ok());
+    }
 
     #[test]
     fn dm_stanza_to_follows_resolved_wire_namespace() {

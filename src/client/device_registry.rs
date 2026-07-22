@@ -637,8 +637,7 @@ impl Client {
                 } else {
                     // Filter stale devices by valid_indexes. A raw_id reset already
                     // removed every companion while preserving primary metadata.
-                    record.devices =
-                        wacore::adv::filter_devices_by_key_index(&record.devices, &decoded);
+                    wacore::adv::retain_devices_by_key_index(&mut record.devices, &decoded);
                 }
                 record.raw_id = Some(decoded.raw_id);
 

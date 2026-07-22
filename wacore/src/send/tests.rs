@@ -307,6 +307,52 @@ mod status_carries_privacy_meta {
     }
 }
 
+mod status_revoke_target_id {
+    use super::*;
+
+    #[test]
+    fn returns_embedded_target_for_revoke() {
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("target-id".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(status_revoke_target_id(&msg), Some("target-id"));
+    }
+
+    #[test]
+    fn ignores_other_or_incomplete_protocol_messages() {
+        let non_revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("not-a-revoke".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let incomplete_revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(status_revoke_target_id(&non_revoke), None);
+        assert_eq!(status_revoke_target_id(&incomplete_revoke), None);
+    }
+}
+
 #[test]
 fn build_member_label_message_sets_fields() {
     let msg = build_member_label_message("VIP".to_string(), 1_766_847_151);
