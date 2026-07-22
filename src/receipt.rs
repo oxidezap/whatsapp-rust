@@ -307,17 +307,11 @@ impl NackSource for NodeRef<'_> {
     }
 
     fn id(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
-        self.get_attr("id")
-            .map(|value| value.to_node_value())
-            .ok_or(crate::features::StanzaResponseError::MissingAttribute("id"))
+        crate::features::required_stanza_attr(self, "id").map(|value| value.to_node_value())
     }
 
     fn to(&self) -> Result<NodeValue, crate::features::StanzaResponseError> {
-        self.get_attr("from")
-            .map(|value| value.to_node_value())
-            .ok_or(crate::features::StanzaResponseError::MissingAttribute(
-                "from",
-            ))
+        crate::features::required_stanza_attr(self, "from").map(|value| value.to_node_value())
     }
 
     fn participant(&self) -> Option<NodeValue> {

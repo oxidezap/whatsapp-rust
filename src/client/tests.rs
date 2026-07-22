@@ -2396,12 +2396,40 @@ fn test_encode_ack_bytes_requires_public_response_inputs() {
         Err(crate::features::StanzaResponseError::MissingAttribute("id"))
     ));
 
+    let empty_id = NodeBuilder::new("receipt")
+        .attr("id", "")
+        .attr("from", "12025550111@s.whatsapp.net")
+        .build();
+    assert!(matches!(
+        encode_ack_bytes(
+            &empty_id.as_node_ref(),
+            None,
+            AckParticipantPolicy::Preserve,
+        ),
+        Err(crate::features::StanzaResponseError::MissingAttribute("id"))
+    ));
+
     let without_from = NodeBuilder::new("receipt")
         .attr("id", "MISSING-FROM")
         .build();
     assert!(matches!(
         encode_ack_bytes(
             &without_from.as_node_ref(),
+            None,
+            AckParticipantPolicy::Preserve,
+        ),
+        Err(crate::features::StanzaResponseError::MissingAttribute(
+            "from"
+        ))
+    ));
+
+    let empty_from = NodeBuilder::new("receipt")
+        .attr("id", "EMPTY-FROM")
+        .attr("from", "")
+        .build();
+    assert!(matches!(
+        encode_ack_bytes(
+            &empty_from.as_node_ref(),
             None,
             AckParticipantPolicy::Preserve,
         ),

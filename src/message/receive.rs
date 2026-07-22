@@ -146,26 +146,11 @@ impl Client {
 
         let unavailable_node = nr.get_optional_child("unavailable");
 
+        let own_jid = nr
+            .get_optional_child("participants")
+            .and_then(|_| self.get_pn());
         let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
-
-        let direct_enc_nodes = nr.get_children_by_tag("enc");
-        all_enc_nodes.extend(direct_enc_nodes);
-
-        let participants = nr.get_optional_child_by_tag(&["participants"]);
-        if let Some(participants_node) = participants {
-            let own_jid = self.get_pn();
-            let to_nodes = participants_node.get_children_by_tag("to");
-            for to_node in to_nodes {
-                let to_jid = match to_node.attrs().optional_jid("jid") {
-                    Some(jid) => jid,
-                    None => continue,
-                };
-                if own_jid.as_ref().is_some_and(|ours| *ours == to_jid) {
-                    let enc_children = to_node.get_children_by_tag("enc");
-                    all_enc_nodes.extend(enc_children);
-                }
-            }
-        }
+        all_enc_nodes.extend(message_enc_nodes_for_device(nr, own_jid.as_ref()));
 
         if all_enc_nodes.is_empty() && unavailable_node.is_none() {
             log::warn!(
@@ -246,7 +231,7 @@ impl Client {
         let mut session_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut bot_payloads = Vec::with_capacity(all_enc_nodes.len());
-        let mut max_sender_retry_count: u8 = 0;
+        let mut max_sender_retry_count = 0;
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
         let mut had_custom_handler = false;
@@ -257,14 +242,7 @@ impl Client {
         let custom_enc_handlers = self.custom_enc_handlers.get();
 
         for enc_node in &all_enc_nodes {
-            // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
-            // Clamp to MAX_DECRYPT_RETRIES to prevent u64→u8 truncation on unexpected values.
-            let sender_count = enc_node
-                .attrs()
-                .optional_u64("count")
-                .map(|c| c.min(MAX_DECRYPT_RETRIES as u64) as u8)
-                .unwrap_or(0);
-            max_sender_retry_count = max_sender_retry_count.max(sender_count);
+            max_sender_retry_count = max_sender_retry_count.max(sender_retry_count(enc_node));
 
             // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
             if enc_node

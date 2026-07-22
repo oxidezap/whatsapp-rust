@@ -78,6 +78,7 @@ pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 
 pub use signal::{Signal, SignalError, SignalSessionInfo, SignalSessionMigration};
+pub(crate) use stanza::required_stanza_attr;
 pub use stanza::{
     NackReason, RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome,
     StanzaRejection, StanzaResponseError,

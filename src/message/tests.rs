@@ -4587,6 +4587,35 @@ async fn test_enc_count_preseeds_retry_cache() {
     );
 }
 
+#[test]
+fn message_enc_selection_includes_only_the_local_device_envelopes() {
+    const OWN_JID: &str = "5511000000001@s.whatsapp.net";
+    const OWN_WIRE_JID: &str = "5511000000001:0@s.whatsapp.net";
+    let message = NodeBuilder::new("message")
+        .children([
+            NodeBuilder::new("enc").attr("count", "1").build(),
+            NodeBuilder::new("participants")
+                .children([
+                    NodeBuilder::new("to")
+                        .attr("jid", OWN_WIRE_JID)
+                        .children([NodeBuilder::new("enc").attr("count", "2").build()])
+                        .build(),
+                    NodeBuilder::new("to")
+                        .attr("jid", "13125550112@s.whatsapp.net")
+                        .children([NodeBuilder::new("enc").attr("count", "5").build()])
+                        .build(),
+                ])
+                .build(),
+        ])
+        .build();
+    let own_jid: Jid = OWN_JID.parse().expect("local JID");
+    let counts = message_enc_nodes_for_device(&message.as_node_ref(), Some(&own_jid))
+        .map(sender_retry_count)
+        .collect::<Vec<_>>();
+
+    assert_eq!(counts, [1, 2]);
+}
+
 #[tokio::test]
 async fn test_enc_no_count_cache_empty() {
     let client = create_test_client_for_retry_with_id("enc_no_count").await;
@@ -5704,6 +5733,17 @@ async fn explicit_stanza_responses_reject_incomplete_input_without_sending() {
         Err(crate::features::StanzaResponseError::MissingAttribute("id"))
     ));
 
+    let ack_with_empty_id = NodeBuilder::new("receipt")
+        .attr("id", "")
+        .attr("from", "12025550111@s.whatsapp.net")
+        .build();
+    assert!(matches!(
+        client
+            .acknowledge_stanza(&ack_with_empty_id.as_node_ref())
+            .await,
+        Err(crate::features::StanzaResponseError::MissingAttribute("id"))
+    ));
+
     let nack_without_from = NodeBuilder::new("message").attr("id", "NO-FROM").build();
     assert!(matches!(
         client
@@ -5715,6 +5755,20 @@ async fn explicit_stanza_responses_reject_incomplete_input_without_sending() {
         Err(crate::features::StanzaResponseError::MissingAttribute(
             "from"
         ))
+    ));
+
+    let nack_with_empty_id = NodeBuilder::new("message")
+        .attr("id", "")
+        .attr("from", "12025550111@s.whatsapp.net")
+        .build();
+    assert!(matches!(
+        client
+            .reject_stanza(
+                &nack_with_empty_id.as_node_ref(),
+                crate::features::StanzaRejection::new(NackReason::ParsingError),
+            )
+            .await,
+        Err(crate::features::StanzaResponseError::MissingAttribute("id"))
     ));
 
     assert_eq!(transport.sent_count(), 0);
@@ -5903,6 +5957,42 @@ async fn explicit_retry_includes_keys_at_the_normal_threshold() {
             )
             .await
             .expect("second retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 2,
+            included_keys: true,
+        }
+    );
+}
+
+#[tokio::test]
+async fn explicit_retry_continues_the_sender_echoed_count() {
+    let (client, _transport) = capturing_client("explicit_retry_sender_count").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    let stanza = NodeBuilder::new("message")
+        .attr("id", "EXPLICIT-RETRY-SENDER-COUNT")
+        .attr("from", EXPLICIT_RETRY_SENDER)
+        .attr("t", "1")
+        .attr("type", "text")
+        .children([NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .attr("count", "1")
+            .bytes([0_u8])
+            .build()])
+        .build();
+
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("sender count should seed the shared retry state"),
         crate::features::RetryRequestOutcome::Sent {
             retry_count: 2,
             included_keys: true,

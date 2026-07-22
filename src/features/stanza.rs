@@ -4,6 +4,16 @@ use thiserror::Error;
 
 use crate::client::ClientError;
 
+pub(crate) fn required_stanza_attr<'node, 'data>(
+    node: &'node wacore_binary::NodeRef<'data>,
+    name: &'static str,
+) -> Result<&'node wacore_binary::node::ValueRef<'data>, StanzaResponseError> {
+    match node.get_attr(name) {
+        Some(value) if value != "" => Ok(value),
+        _ => Err(StanzaResponseError::MissingAttribute(name)),
+    }
+}
+
 pub use wacore::protocol::nack::NackReason;
 pub use wacore::protocol::retry::RetryReason;
 

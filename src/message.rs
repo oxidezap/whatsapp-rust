@@ -17,10 +17,53 @@ use wacore::protocol::nack::NackReason;
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore_binary::Jid;
 use wacore_binary::JidExt as _;
+use wacore_binary::node::ValueRef;
 use wacore_binary::{NodeRef, OwnedNodeRef};
 use waproto::whatsapp::{self as wa};
 
 use wacore::protocol::retry::MAX_RETRY_COUNT as MAX_DECRYPT_RETRIES;
+
+#[inline]
+fn sender_retry_count(enc_node: &NodeRef<'_>) -> u8 {
+    enc_node
+        .get_attr("count")
+        .and_then(|value| match value {
+            ValueRef::String(value) => value.parse::<u64>().ok(),
+            ValueRef::Jid(_) => None,
+        })
+        .map(|count| count.min(MAX_DECRYPT_RETRIES as u64) as u8)
+        .unwrap_or(0)
+}
+
+#[inline]
+fn attr_matches_jid(value: &ValueRef<'_>, jid: &Jid) -> bool {
+    match value {
+        ValueRef::String(value) => wacore_binary::jid::parse_jid_ref(value)
+            .map(|parsed| jid == &parsed)
+            .unwrap_or_else(|| value.parse::<Jid>().is_ok_and(|parsed| jid == &parsed)),
+        ValueRef::Jid(value) => jid == value,
+    }
+}
+
+fn message_enc_nodes_for_device<'node, 'data: 'node>(
+    node: &'node NodeRef<'data>,
+    own_jid: Option<&'node Jid>,
+) -> impl Iterator<Item = &'node NodeRef<'data>> + 'node {
+    let per_device = node
+        .get_optional_child("participants")
+        .into_iter()
+        .flat_map(|participants| participants.get_children_by_tag("to"))
+        .filter(move |to_node| {
+            own_jid.is_some_and(|ours| {
+                to_node
+                    .get_attr("jid")
+                    .is_some_and(|value| attr_matches_jid(value, ours))
+            })
+        })
+        .flat_map(|to_node| to_node.get_children_by_tag("enc"));
+
+    node.get_children_by_tag("enc").chain(per_device)
+}
 
 /// Pre-extracted enc node payload. Holds owned copies of the fields needed for
 /// decryption so the async decrypt phase doesn't borrow the original NodeRef tree.

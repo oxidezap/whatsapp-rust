@@ -37,10 +37,19 @@ impl Client {
             .ok_or(crate::features::RetryRequestError::MissingLocalIdentity)?;
         let info = wacore::messages::parse_message_info(stanza, own_pn, device.lid.as_ref())
             .map_err(crate::features::RetryRequestError::InvalidStanza)?;
+        let max_sender_retry_count = message_enc_nodes_for_device(stanza, Some(own_pn))
+            .map(sender_retry_count)
+            .max()
+            .unwrap_or(0);
         let info = Arc::new(info);
         drop(device);
 
-        self.request_retry_for_info(&info, options).await
+        self.request_retry_for_info(
+            &info,
+            options,
+            (max_sender_retry_count > 0).then_some(max_sender_retry_count),
+        )
+        .await
     }
 
     /// Dispatch an `UndecryptableMessage` event at most once per `(chat, id)`
@@ -261,11 +270,17 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         options: crate::features::RetryRequestOptions,
+        sender_retry_count: Option<u8>,
     ) -> Result<crate::features::RetryRequestOutcome, crate::features::RetryRequestError> {
         let reason = options.reason();
         let cache_key = self
             .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
             .await;
+
+        if let Some(sender_retry_count) = sender_retry_count {
+            self.preseed_retry_count(&cache_key, sender_retry_count)
+                .await;
+        }
 
         let Some(retry_count) = self.increment_retry_count(&cache_key, reason).await else {
             log::debug!(
@@ -346,6 +361,7 @@ impl Client {
             .request_retry_for_info(
                 info,
                 crate::features::RetryRequestOptions::new().with_reason(reason),
+                None,
             )
             .await
         {

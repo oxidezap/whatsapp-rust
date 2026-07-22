@@ -1104,14 +1104,8 @@ fn encode_ack_bytes(
 ) -> Result<Vec<u8>, crate::features::StanzaResponseError> {
     use wacore_binary::encoder::{ByteWriter, EncodeNode, Encoder};
 
-    let id_val = node
-        .get_attr("id")
-        .ok_or(crate::features::StanzaResponseError::MissingAttribute("id"))?;
-    let from_val =
-        node.get_attr("from")
-            .ok_or(crate::features::StanzaResponseError::MissingAttribute(
-                "from",
-            ))?;
+    let id_val = crate::features::required_stanza_attr(node, "id")?;
+    let from_val = crate::features::required_stanza_attr(node, "from")?;
     let tag = node.tag.as_ref();
     let participant_val = ack_participant(node, from_val, participant_policy);
     // Server expects `recipient` echoed back so it can route the ack to the

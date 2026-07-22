@@ -791,6 +791,24 @@ impl<'a> JidRef<'a> {
     }
 }
 
+impl PartialEq<JidRef<'_>> for Jid {
+    #[inline]
+    fn eq(&self, other: &JidRef<'_>) -> bool {
+        self.user.as_str() == other.user.as_ref()
+            && self.server == other.server
+            && self.agent == other.agent
+            && self.device == other.device
+            && self.integrator == other.integrator
+    }
+}
+
+impl PartialEq<Jid> for JidRef<'_> {
+    #[inline]
+    fn eq(&self, other: &Jid) -> bool {
+        other == self
+    }
+}
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for JidRef<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1272,6 +1290,33 @@ mod tests {
             ..borrowed.clone()
         };
         assert!(borrowed.display_eq_jid(&borrowed_same_display));
+    }
+
+    #[test]
+    fn owned_and_borrowed_jids_compare_without_conversion() {
+        let owned = Jid {
+            user: "12025550111".into(),
+            server: Server::Pn,
+            agent: 0,
+            device: 7,
+            integrator: 0,
+        };
+        let borrowed = JidRef {
+            user: NodeStr::Borrowed("12025550111"),
+            server: Server::Pn,
+            agent: 0,
+            device: 7,
+            integrator: 0,
+        };
+
+        assert_eq!(owned, borrowed);
+        assert_eq!(borrowed, owned);
+
+        let other_device = JidRef {
+            device: 8,
+            ..borrowed.clone()
+        };
+        assert_ne!(owned, other_device);
     }
 
     #[cfg(feature = "serde")]
