@@ -141,7 +141,6 @@ impl Client {
             let response = self
                 .execute(DeviceListSpec::new(jids, sid).require_complete_response())
                 .await?;
-            self.learn_device_list_mappings(&response).await;
 
             if let Some(devices) = self
                 .try_process_refreshed_device_list_response(
@@ -173,11 +172,16 @@ impl Client {
         unreachable!("bounded device refresh loop always returns")
     }
 
-    async fn learn_device_list_mappings(&self, response: &DeviceListResponse) {
+    async fn learn_device_list_mappings_guarded(
+        &self,
+        response: &DeviceListResponse,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> Result<(), anyhow::Error> {
         // Learn LID↔PN mappings via the same batched, guarded learner query_info
         // uses (one detached transaction, skipping already-durable pairs), so
-        // per-mapping DB writes stay off the send's critical path. Falls back to
-        // the per-mapping path if the owning Arc<Client> isn't available.
+        // per-mapping DB writes stay off the send's critical path. Client
+        // construction always installs `self_weak`; failing the impossible
+        // upgrade keeps mapping and registry publication atomic.
         //
         // Ordering: the old per-mapping path AWAITED migrate_signal_sessions_on_lid_discovery.
         // Detaching it can let a standalone usync (sync_own_device_list /
@@ -187,38 +191,27 @@ impl Client {
         // barrier (they can't interleave). The group-send path is unchanged:
         // query_info already learns these same pairs detached upstream.
         if response.lid_mappings.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-            let mappings: Vec<(String, String)> = response
-                .lid_mappings
-                .iter()
-                .map(|m| (m.lid.to_string(), m.phone_number.to_string()))
-                .collect();
-            client
-                .learn_lid_pn_mappings_batch(
-                    mappings,
-                    crate::lid_pn_cache::LearningSource::Usync,
-                    false,
-                )
-                .await;
-        } else {
-            for mapping in &response.lid_mappings {
-                if let Err(err) = self
-                    .add_lid_pn_mapping(
-                        &mapping.lid,
-                        &mapping.phone_number,
-                        crate::lid_pn_cache::LearningSource::Usync,
-                    )
-                    .await
-                {
-                    warn!(
-                        "Failed to persist LID {} -> {} from usync: {err}",
-                        mapping.lid, mapping.phone_number,
-                    );
-                }
-            }
-        }
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during device sync"))?;
+        let mappings: Vec<(String, String)> = response
+            .lid_mappings
+            .iter()
+            .map(|mapping| (mapping.lid.to_string(), mapping.phone_number.to_string()))
+            .collect();
+        client
+            .learn_lid_pn_mappings_batch_guarded(
+                mappings,
+                crate::lid_pn_cache::LearningSource::Usync,
+                false,
+                guard,
+            )
+            .await;
+        Ok(())
     }
 
     /// Apply a usync device-list response to the registry: persist LID mappings,
@@ -235,9 +228,13 @@ impl Client {
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
-        self.learn_device_list_mappings(response).await;
-        let guard = self.device_topology.lock_registry().await;
-        self.process_device_list_response_guarded(response, freshness, &guard)
+        // Keep this order stable: mapping writers never acquire the registry
+        // guard while holding their lock, so mapping -> registry cannot cycle.
+        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
+        let registry_guard = self.device_topology.lock_registry().await;
+        self.learn_device_list_mappings_guarded(response, &mapping_guard)
+            .await?;
+        self.process_device_list_response_guarded(response, freshness, &registry_guard)
             .await
     }
 
@@ -247,16 +244,21 @@ impl Client {
         freshness: crate::cache::Freshness,
         topology_generation: u64,
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
-        let guard = self.device_topology.lock_registry().await;
+        // Serialize both mutation classes across the CAS and publication. The
+        // response's own mappings are deliberately learned only after the CAS.
+        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
+        let registry_guard = self.device_topology.lock_registry().await;
         if !self
             .device_topology
-            .registry_unchanged_for(topology_generation, |user| {
+            .unchanged_for(topology_generation, |user| {
                 device_response_contains_user(response, user)
             })
         {
             return Ok(None);
         }
-        self.process_device_list_response_guarded(response, freshness, &guard)
+        self.learn_device_list_mappings_guarded(response, &mapping_guard)
+            .await?;
+        self.process_device_list_response_guarded(response, freshness, &registry_guard)
             .await
             .map(Some)
     }
@@ -874,6 +876,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_refresh_does_not_overwrite_a_newer_lid_mapping() {
+        use wacore::usync::UsyncLidMapping;
+
+        let client = create_test_client().await;
+        let phone = "12025550110";
+        let current_lid = "100000000000110";
+        let stale_lid = "100000000000111";
+        let refresh_started_at = client.device_topology.current();
+
+        client
+            .add_lid_pn_mapping(
+                current_lid,
+                phone,
+                crate::lid_pn_cache::LearningSource::PeerPnMessage,
+            )
+            .await
+            .unwrap();
+
+        let stale_response = DeviceListResponse {
+            device_lists: Vec::new(),
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: phone.into(),
+                lid: stale_lid.into(),
+            }],
+        };
+        let published = client
+            .try_process_refreshed_device_list_response(
+                &stale_response,
+                Freshness::Refresh,
+                refresh_started_at,
+            )
+            .await
+            .unwrap();
+
+        assert!(published.is_none(), "the stale response must be retried");
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(current_lid),
+            "the mapping learned after the refresh started must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_commits_its_own_lid_mapping_after_the_cas() {
+        use wacore::usync::UsyncLidMapping;
+
+        let client = create_test_client().await;
+        let phone = "12025550112";
+        let lid = "100000000000112";
+        let refresh_started_at = client.device_topology.current();
+        let response = DeviceListResponse {
+            device_lists: Vec::new(),
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: phone.into(),
+                lid: lid.into(),
+            }],
+        };
+
+        let published = client
+            .try_process_refreshed_device_list_response(
+                &response,
+                Freshness::Refresh,
+                refresh_started_at,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            published.is_some(),
+            "the response must not conflict with itself"
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid)
+        );
+    }
+
+    #[tokio::test]
     async fn unrelated_registry_change_does_not_restart_a_refresh() {
         use wacore::usync::{UserDeviceList, UsyncDevice};
 
@@ -908,6 +988,43 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(published.is_some());
+    }
+
+    #[tokio::test]
+    async fn unrelated_mapping_change_does_not_restart_a_refresh() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let refreshed = Jid::pn("12025550113");
+        let refresh_started_at = client.device_topology.current();
+        client
+            .add_lid_pn_mapping(
+                "100000000000114",
+                "12025550114",
+                crate::lid_pn_cache::LearningSource::PeerPnMessage,
+            )
+            .await
+            .unwrap();
+
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: refreshed,
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+        let published = client
+            .try_process_refreshed_device_list_response(
+                &response,
+                Freshness::Refresh,
+                refresh_started_at,
+            )
+            .await
+            .unwrap();
+
         assert!(published.is_some());
     }
 

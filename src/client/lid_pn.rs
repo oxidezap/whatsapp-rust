@@ -293,11 +293,33 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
+        let outcome = self.record_lid_pn_batch_in_memory(mappings, source).await;
+        self.finish_lid_pn_batch_learning(outcome, is_offline);
+    }
+
+    pub(crate) async fn learn_lid_pn_mappings_batch_guarded(
+        self: &Arc<Self>,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        is_offline: bool,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) {
+        let outcome = self
+            .record_lid_pn_batch_in_memory_guarded(mappings, source, guard)
+            .await;
+        self.finish_lid_pn_batch_learning(outcome, is_offline);
+    }
+
+    fn finish_lid_pn_batch_learning(
+        self: &Arc<Self>,
+        outcome: BatchRecordOutcome,
+        is_offline: bool,
+    ) {
         let BatchRecordOutcome {
             entries,
             migration_flags,
             usync_phones,
-        } = self.record_lid_pn_batch_in_memory(mappings, source).await;
+        } = outcome;
 
         // Conflicting observational pairs re-resolve live, independent of the
         // flush gate (WA Web fires syncContactListJob regardless of
@@ -383,6 +405,17 @@ impl Client {
         mappings: Vec<(String, String)>,
         source: LearningSource,
     ) -> BatchRecordOutcome {
+        let guard = self.lid_pn_cache.lock_mutation().await;
+        self.record_lid_pn_batch_in_memory_guarded(mappings, source, &guard)
+            .await
+    }
+
+    async fn record_lid_pn_batch_in_memory_guarded(
+        &self,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> BatchRecordOutcome {
         let cap = mappings.len();
         let mut deduped: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(cap);
@@ -395,7 +428,7 @@ impl Client {
         let mut usync_phones: Vec<String> = Vec::new();
         for (phone_number, lid) in deduped {
             match self
-                .record_lid_pn_in_memory(&lid, &phone_number, source)
+                .record_lid_pn_in_memory_guarded(&lid, &phone_number, source, guard)
                 .await
             {
                 RecordOutcome::Skipped => {}
@@ -425,6 +458,18 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> RecordOutcome {
+        let guard = self.lid_pn_cache.lock_mutation().await;
+        self.record_lid_pn_in_memory_guarded(lid, phone_number, source, &guard)
+            .await
+    }
+
+    async fn record_lid_pn_in_memory_guarded(
+        &self,
+        lid: &str,
+        phone_number: &str,
+        source: LearningSource,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> RecordOutcome {
         // Fully durable and resolvable both ways: nothing to re-add or persist.
         if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
             return RecordOutcome::Skipped;
@@ -451,7 +496,7 @@ impl Client {
             };
             return match existing {
                 Some(entry) => {
-                    self.lid_pn_cache.add(&entry).await;
+                    self.lid_pn_cache.add_guarded(&entry, guard).await;
                     RecordOutcome::Written {
                         entry,
                         needs_migration,
@@ -472,7 +517,7 @@ impl Client {
                 wacore::time::now_secs()
             };
             let entry = LidPnEntry::with_timestamp(lid, phone_number, created_at, source);
-            self.lid_pn_cache.add(&entry).await;
+            self.lid_pn_cache.add_guarded(&entry, guard).await;
             return RecordOutcome::Written {
                 entry,
                 needs_migration: current_lid.is_none(),

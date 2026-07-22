@@ -337,19 +337,26 @@ impl Client {
             request.recipient.as_ref(),
         )?;
 
-        if matches!(route, RetransmissionRoute::Direct) && request.recipient.is_none() {
+        if matches!(route, RetransmissionRoute::Direct) {
             let snapshot = self.persistence_manager.get_device_snapshot();
-            if is_own_account_jid(
+            let requester_is_local = is_own_account_jid(
                 &request.requester,
                 snapshot.pn.as_ref(),
                 snapshot.lid.as_ref(),
-            ) {
+            );
+            if request.recipient.is_some() {
+                if !requester_is_local && !request.requester.is_bot() {
+                    return Err(SendError::InvalidRequest(
+                        "a direct retransmission recipient is only valid for a local device or bot"
+                            .into(),
+                    ));
+                }
+            } else if requester_is_local {
                 return Err(SendError::InvalidRequest(
                     "a direct retransmission to another local device requires a recipient".into(),
                 ));
             }
-        }
-        if matches!(route, RetransmissionRoute::Direct) {
+
             let routing_chat = request.recipient.as_ref().unwrap_or(&request.requester);
             if !self
                 .jids_share_user_identity(&request.chat, routing_chat)
@@ -3448,18 +3455,19 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let chat = Jid::pn("12025550104");
         let requester = Jid::pn_device("12025550105", 7);
+        let bot_requester: Jid = "200000000000002@bot".parse().unwrap();
 
         for request in [
             MessageRetransmission::new(
                 chat.clone(),
-                requester.clone(),
+                requester,
                 wa::Message::default(),
                 "DIRECT-CHAT-MISMATCH-1".to_string(),
                 1,
             ),
             MessageRetransmission::new(
                 chat.clone(),
-                requester.clone(),
+                bot_requester,
                 wa::Message::default(),
                 "DIRECT-RECIPIENT-MISMATCH-1".to_string(),
                 1,
@@ -3473,6 +3481,27 @@ mod tests {
             assert!(matches!(error, SendError::InvalidRequest(_)));
             assert!(error.to_string().contains("routing identity"));
         }
+    }
+
+    #[tokio::test]
+    async fn public_direct_recipient_rejects_an_unrelated_requester() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat = Jid::pn("12025550108");
+        let request = MessageRetransmission::new(
+            chat.clone(),
+            Jid::pn_device("12025550109", 7),
+            wa::Message::default(),
+            "DIRECT-RECIPIENT-SOURCE-1".to_string(),
+            1,
+        )
+        .with_recipient(chat);
+
+        let error = client
+            .retransmit_message(request)
+            .await
+            .expect_err("a normal remote user cannot declare a recipient route");
+        assert!(matches!(error, SendError::InvalidRequest(_)));
+        assert!(error.to_string().contains("local device or bot"));
     }
 
     #[tokio::test]

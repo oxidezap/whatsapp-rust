@@ -23,17 +23,9 @@ use wacore_binary::CompactString;
 /// group) still fits; overflow just disables the scoped-revalidation fast
 /// path until affected memos recompute once.
 const TOPOLOGY_LOG_CAPACITY: usize = 256;
-/// Stored in the log entry's generation word, preserving the existing compact
-/// tuple layout while distinguishing registry writes from mapping-only changes.
-const REGISTRY_CHANGE_FLAG: u64 = 1 << 63;
-
-#[inline]
-const fn change_generation(entry: u64) -> u64 {
-    entry & !REGISTRY_CHANGE_FLAG
-}
 
 struct TopologyLog {
-    /// (generation plus registry-kind flag, canonical user touched).
+    /// (generation, canonical user touched).
     entries: VecDeque<(u64, CompactString)>,
     /// Highest generation evicted from `entries` (0 = nothing evicted).
     /// A memo older than this cannot be proven clean and must recompute.
@@ -80,25 +72,20 @@ impl DeviceTopology {
     /// namespaces of an identity when known: a mapping change alters which
     /// canonical record either key resolves to).
     pub(crate) fn record<'a>(&self, users: impl IntoIterator<Item = &'a str>) {
-        self.record_change(users, false);
+        self.record_change(users);
     }
 
-    fn record_change<'a>(&self, users: impl IntoIterator<Item = &'a str>, registry_change: bool) {
+    fn record_change<'a>(&self, users: impl IntoIterator<Item = &'a str>) {
         let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.generation.load(Ordering::Acquire) + 1;
-        let entry_generation = if registry_change {
-            generation | REGISTRY_CHANGE_FLAG
-        } else {
-            generation
-        };
         for user in users {
             if log.entries.len() == TOPOLOGY_LOG_CAPACITY
                 && let Some((evicted_gen, _)) = log.entries.pop_front()
             {
-                log.floor = change_generation(evicted_gen);
+                log.floor = evicted_gen;
             }
             log.entries
-                .push_back((entry_generation, CompactString::from(user)));
+                .push_back((generation, CompactString::from(user)));
         }
         // Publish the generation only after the log holds the users, so a
         // reader that observes the new generation can always find (or rule
@@ -106,15 +93,14 @@ impl DeviceTopology {
         self.generation.store(generation, Ordering::Release);
     }
 
-    /// Record a registry mutation in both the broad topology tracker and the
-    /// registry-only revision. Callers hold [`DeviceRegistryMutationGuard`], so
-    /// a refresh can compare-and-publish without a check/write race.
+    /// Record a registry mutation while holding its serialization guard, so a
+    /// refresh can compare-and-publish without a check/write race.
     pub(crate) fn record_registry<'a>(
         &self,
         _guard: &DeviceRegistryMutationGuard<'_>,
         users: impl IntoIterator<Item = &'a str>,
     ) {
-        self.record_change(users, true);
+        self.record_change(users);
     }
 
     /// Record a change whose blast radius is unknown (bulk warm-up, cache
@@ -138,27 +124,7 @@ impl DeviceTopology {
         }
         log.entries
             .iter()
-            .filter(|(generation, _)| change_generation(*generation) > since)
-            .all(|(_, user)| !is_member(user))
-    }
-
-    /// Registry-scoped variant used by authoritative device refreshes. Mapping
-    /// observations and mutations for unrelated users do not force another IQ;
-    /// overflow remains conservative and requests a retry.
-    pub(crate) fn registry_unchanged_for(
-        &self,
-        since: u64,
-        is_member: impl Fn(&str) -> bool,
-    ) -> bool {
-        let log = self.log.lock().unwrap_or_else(|p| p.into_inner());
-        if log.floor > since {
-            return false;
-        }
-        log.entries
-            .iter()
-            .filter(|(generation, _)| {
-                *generation & REGISTRY_CHANGE_FLAG != 0 && change_generation(*generation) > since
-            })
+            .filter(|(generation, _)| *generation > since)
             .all(|(_, user)| !is_member(user))
     }
 }
