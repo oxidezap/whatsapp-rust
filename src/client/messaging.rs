@@ -108,12 +108,10 @@ impl Client {
         self.send_message_impl(
             to,
             &edit_container_message,
-            None,
-            false,
-            false,
-            Some(crate::types::message::EditAttribute::MessageEdit),
-            vec![],
-            None,
+            crate::send::SendPipelineOptions {
+                edit: Some(crate::types::message::EditAttribute::MessageEdit),
+                ..Default::default()
+            },
         )
         .await
         .map_err(crate::send::SendError::from_anyhow)?;
@@ -196,12 +194,10 @@ impl Client {
         self.send_message_impl(
             to,
             &envelope,
-            None,
-            false,
-            false,
-            Some(crate::types::message::EditAttribute::MessageEdit),
-            vec![],
-            None,
+            crate::send::SendPipelineOptions {
+                edit: Some(crate::types::message::EditAttribute::MessageEdit),
+                ..Default::default()
+            },
         )
         .await
         .map_err(SendError::from_anyhow)?;

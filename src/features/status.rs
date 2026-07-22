@@ -2,9 +2,11 @@ use wacore::WireEnum;
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
+use crate::cache::Freshness;
 use crate::client::Client;
 use crate::send::{SendError, SendResult};
 use crate::upload::UploadResponse;
+use wacore_binary::Node;
 
 /// Privacy setting sent in the `<meta>` node of the status stanza.
 /// Matches WhatsApp Web's `status_setting` attribute.
@@ -28,6 +30,12 @@ pub enum StatusPrivacySetting {
 pub struct StatusSendOptions {
     /// Privacy setting for this status. Sent in the `<meta>` stanza node.
     pub privacy: StatusPrivacySetting,
+    /// Override the generated message ID.
+    pub message_id: Option<String>,
+    /// Extra child nodes appended to the status stanza.
+    pub extra_stanza_nodes: Vec<Node>,
+    /// Freshness policy for the recipient device lists used by this send.
+    pub device_freshness: Freshness,
 }
 
 /// High-level API for WhatsApp status/story updates.

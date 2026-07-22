@@ -299,7 +299,24 @@ impl<'a> Groups<'a> {
     }
 
     pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, GroupError> {
-        if let Some(cached) = self.client.get_group_cache().await.get(jid).await {
+        self.query_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
+            .await
+    }
+
+    /// Query group metadata using the requested cache freshness policy.
+    ///
+    /// A refresh leaves the current snapshot readable while the network request
+    /// is in flight, then atomically replaces it after a successful response.
+    pub async fn query_info_with_freshness(
+        &self,
+        jid: &Jid,
+        freshness: crate::cache::Freshness,
+    ) -> Result<Arc<GroupInfo>, GroupError> {
+        let cache = self.client.get_group_cache().await;
+        let cached = cache.get(jid).await;
+        if freshness == crate::cache::Freshness::CachePreferred
+            && let Some(cached) = cached
+        {
             return Ok(cached);
         }
 
@@ -308,11 +325,18 @@ impl<'a> Groups<'a> {
         // group, letting us reuse the persisted metadata instead of re-parsing it.
         let jid_str = jid.to_string();
         let backend = self.client.persistence_manager.backend();
-        let persisted: Option<GroupInfo> = match backend.get_group_metadata(&jid_str).await {
-            Ok(Some(blob)) => serde_json::from_slice(&blob).ok(),
-            _ => None,
+        // A refresh with a warm L1 can use that immutable snapshot directly as
+        // the not-modified fallback, avoiding a DB read and deserialize.
+        let persisted: Option<GroupInfo> = if cached.is_some() {
+            None
+        } else {
+            match backend.get_group_metadata(&jid_str).await {
+                Ok(Some(blob)) => serde_json::from_slice(&blob).ok(),
+                _ => None,
+            }
         };
-        let phash = persisted.as_ref().and_then(|info| {
+        let phash_source = cached.as_deref().or(persisted.as_ref());
+        let phash = phash_source.and_then(|info| {
             wacore::messages::MessageUtils::participant_list_hash(&info.participants).ok()
         });
 
@@ -322,16 +346,15 @@ impl<'a> Groups<'a> {
             .await?
         {
             GroupInfoOutcome::NotModified => {
-                let info = Arc::new(persisted.ok_or_else(|| {
-                    GroupError::InvalidRequest(
-                        "server returned not-modified group but nothing was cached".into(),
-                    )
-                })?);
-                self.client
-                    .get_group_cache()
-                    .await
-                    .insert(jid.clone(), info.clone())
-                    .await;
+                let info = match cached {
+                    Some(cached) => cached,
+                    None => Arc::new(persisted.ok_or_else(|| {
+                        GroupError::InvalidRequest(
+                            "server returned not-modified group but nothing was cached".into(),
+                        )
+                    })?),
+                };
+                cache.insert(jid.clone(), info.clone()).await;
                 return Ok(info);
             }
             GroupInfoOutcome::Full(group) => *group,
@@ -395,11 +418,7 @@ impl<'a> Groups<'a> {
         }
 
         let info = Arc::new(info);
-        self.client
-            .get_group_cache()
-            .await
-            .insert(jid.clone(), info.clone())
-            .await;
+        cache.insert(jid.clone(), info.clone()).await;
 
         Ok(info)
     }
@@ -1147,12 +1166,11 @@ impl<'a> Groups<'a> {
             .send_message_impl(
                 group_jid.clone(),
                 &msg,
-                Some(message_id.clone()),
-                false,
-                false,
-                None,
-                meta.into_iter().collect(),
-                None,
+                crate::send::SendPipelineOptions {
+                    request_id: Some(message_id.clone()),
+                    extra_stanza_nodes: meta.into_iter().collect(),
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(message_id)
@@ -1534,6 +1552,33 @@ mod tests {
         // not a deep copy of the participant list and LID/PN maps.
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.participants.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_previous_group_snapshot_on_source_failure() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000099@g.us".parse().unwrap();
+        let previous = Arc::new(GroupInfo::new(
+            vec!["15550000001@s.whatsapp.net".parse().unwrap()],
+            AddressingMode::Pn,
+        ));
+        let cache = client.get_group_cache().await;
+        cache.insert(group.clone(), Arc::clone(&previous)).await;
+
+        let result = client
+            .groups()
+            .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+            .await;
+        assert!(
+            result.is_err(),
+            "the offline fixture proves refresh consulted the source"
+        );
+
+        let preserved = cache
+            .get(&group)
+            .await
+            .expect("refresh failure must not clear the current snapshot");
+        assert!(Arc::ptr_eq(&previous, &preserved));
     }
 
     #[tokio::test]

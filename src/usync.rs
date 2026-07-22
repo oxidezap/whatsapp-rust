@@ -5,7 +5,6 @@
 use crate::client::Client;
 use crate::request::IqError;
 use log::{debug, warn};
-use std::collections::HashSet;
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::Jid;
 
@@ -34,55 +33,76 @@ impl Client {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.usync.get_user_devices", level = "debug", skip_all, fields(users = jids.len()), err(Debug)))]
     pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
-        let mut jids_to_fetch: HashSet<Jid> = HashSet::with_capacity(jids.len());
-        let mut all_devices = Vec::with_capacity(jids.len() * 2);
+        let mut owned = Vec::with_capacity(jids.len());
+        owned.extend(jids.iter().map(Jid::to_non_ad));
+        self.get_user_devices_owned(owned).await
+    }
+
+    pub(crate) async fn get_user_devices_owned(
+        &self,
+        jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        let input_len = jids.len();
+        let mut jids_to_fetch: Vec<Jid> = Vec::with_capacity(input_len);
+        let mut all_devices = Vec::with_capacity(input_len * 2);
 
         // Resolve the LOCAL registry scan concurrently (the network usync below is
         // already one batched IQ) — a cold-cache large group would otherwise
         // serialize 256+ per-user cache/DB reads. Order is irrelevant (phash sorts,
         // encrypt fan-out is order-agnostic). A None result means an empty/corrupt
         // record, which falls through to the network below (WA Web always keeps
-        // device 0). Materialize to an owned Vec first so the stream doesn't borrow
-        // `jids` through buffer_unordered (Send bound).
+        // device 0). The stream owns each JID and is drained incrementally, so
+        // no second result Vec is materialized.
         use futures::StreamExt;
         // Bounded fan-out over the independent per-user registry reads.
         const DEVICE_LIST_RESOLVE_CONCURRENCY: usize = 16;
-        let non_ad: Vec<Jid> = jids.iter().map(|j| j.to_non_ad()).collect();
-        let resolved: Vec<(Jid, Option<Vec<Jid>>)> = futures::stream::iter(non_ad)
+        let mut resolved = futures::stream::iter(jids.into_iter().map(Jid::into_non_ad))
             .map(|jid| async move {
                 let devices = self.get_devices_from_registry(&jid).await;
                 (jid, devices)
             })
-            .buffer_unordered(DEVICE_LIST_RESOLVE_CONCURRENCY)
-            .collect()
-            .await;
+            .buffer_unordered(DEVICE_LIST_RESOLVE_CONCURRENCY);
 
-        for (jid, devices) in resolved {
+        while let Some((jid, devices)) = resolved.next().await {
             match devices {
                 Some(devices) => all_devices.extend(devices),
                 None => {
-                    jids_to_fetch.insert(jid);
+                    jids_to_fetch.push(jid);
                 }
             }
         }
 
         if !jids_to_fetch.is_empty() {
+            wacore::types::jid::sort_dedup_by_user(&mut jids_to_fetch);
             debug!(
                 "get_user_devices: Cache miss, fetching from network for {} unique users",
                 jids_to_fetch.len()
             );
-
-            let sid = self.generate_request_id();
-            let jids_vec: Vec<Jid> = jids_to_fetch.into_iter().collect();
-            let spec = DeviceListSpec::new(jids_vec, sid);
-
-            let response = self.execute(spec).await?;
-
-            let fetched_devices = self.process_device_list_response(&response).await;
-            all_devices.extend(fetched_devices);
+            all_devices.extend(self.fetch_user_devices(jids_to_fetch).await?);
         }
 
         Ok(all_devices)
+    }
+
+    pub(crate) async fn refresh_user_devices(
+        &self,
+        mut jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        for jid in &mut jids {
+            jid.agent = 0;
+            jid.device = 0;
+        }
+        wacore::types::jid::sort_dedup_by_user(&mut jids);
+        self.fetch_user_devices(jids).await
+    }
+
+    async fn fetch_user_devices(&self, jids: Vec<Jid>) -> Result<Vec<Jid>, anyhow::Error> {
+        if jids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sid = self.generate_request_id();
+        let response = self.execute(DeviceListSpec::new(jids, sid)).await?;
+        Ok(self.process_device_list_response(&response).await)
     }
 
     /// Apply a usync device-list response to the registry: persist LID mappings,
@@ -372,6 +392,45 @@ mod tests {
         assert!(devices.iter().any(|d| d.device == 0));
         assert!(devices.iter().any(|d| d.device == 3));
         assert!(devices.iter().all(|d| d.is_pn()));
+    }
+
+    #[tokio::test]
+    async fn refresh_bypasses_a_warm_registry_without_clearing_it_first() {
+        let client = create_test_client().await;
+        let user: Jid = "1234567891@s.whatsapp.net".parse().unwrap();
+        client
+            .update_device_list(DeviceListRecord {
+                user: "1234567891".into(),
+                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(8, None)],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        let cached = client
+            .get_user_devices(std::slice::from_ref(&user))
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.len(),
+            2,
+            "cache-preferred must use the warm snapshot"
+        );
+
+        let refresh = client.refresh_user_devices(vec![user.clone()]).await;
+        assert!(
+            refresh.is_err(),
+            "the offline fixture proves refresh consulted the source"
+        );
+
+        let preserved = client
+            .get_devices_from_registry(&user)
+            .await
+            .expect("a failed refresh must leave the previous snapshot readable");
+        assert_eq!(preserved.len(), 2);
+        assert!(preserved.iter().any(|device| device.device == 8));
     }
 
     #[tokio::test]

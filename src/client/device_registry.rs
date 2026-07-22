@@ -132,8 +132,12 @@ impl Client {
         // doesn't hold there, so it is disabled and every send resolves.
         if !self.group_devices_memo_enabled {
             return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(
-                self.resolve_group_devices_uncached(group_info, own_sending_jid)
-                    .await?,
+                self.resolve_group_devices_uncached(
+                    group_info,
+                    own_sending_jid,
+                    crate::cache::Freshness::CachePreferred,
+                )
+                .await?,
             )));
         }
         // Load the generation BEFORE resolving (do NOT move this after
@@ -175,7 +179,11 @@ impl Client {
         }
 
         let devices = self
-            .resolve_group_devices_uncached(group_info, own_sending_jid)
+            .resolve_group_devices_uncached(
+                group_info,
+                own_sending_jid,
+                crate::cache::Freshness::CachePreferred,
+            )
             .await?;
 
         // Member identifiers in both namespaces, so the scoped-invalidation
@@ -221,10 +229,11 @@ impl Client {
     /// (participants + LID normalization, appending self when the server
     /// snapshot omitted it — mirroring `ensure_self_in_group`, so keying the
     /// memo off the pre-ensure Arc stays equivalent) and resolve it.
-    async fn resolve_group_devices_uncached(
+    pub(crate) async fn resolve_group_devices_uncached(
         &self,
-        group_info: &Arc<wacore::client::context::GroupInfo>,
+        group_info: &wacore::client::context::GroupInfo,
         own_sending_jid: &Jid,
+        freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let mut jids_to_resolve: Vec<Jid> = group_info
@@ -256,7 +265,12 @@ impl Client {
             jids_to_resolve.push(own);
         }
 
-        let mut devices = self.get_user_devices(&jids_to_resolve).await?;
+        let mut devices = match freshness {
+            crate::cache::Freshness::CachePreferred => {
+                self.get_user_devices_owned(jids_to_resolve).await?
+            }
+            crate::cache::Freshness::Refresh => self.refresh_user_devices(jids_to_resolve).await?,
+        };
         if is_lid_mode {
             // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
             devices = devices

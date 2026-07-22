@@ -2,7 +2,6 @@ use crate::client::Client;
 use crate::types::message::EditAttribute;
 use anyhow::anyhow;
 use log::debug;
-use wacore::client::context::SendContextResolver;
 use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::send::StanzaType;
 use wacore::types::jid::JidExt;
@@ -157,6 +156,41 @@ struct SendBranchOutput {
     dm_phash: Option<String>,
 }
 
+struct GroupBranchRequest<'a> {
+    to: Jid,
+    message: &'a wa::Message,
+    request_id: String,
+    force_key_distribution: bool,
+    edit: Option<crate::types::message::EditAttribute>,
+    extra_stanza_nodes: &'a [Node],
+    group_metadata_freshness: crate::cache::Freshness,
+    device_freshness: crate::cache::Freshness,
+}
+
+struct DmBranchRequest<'a> {
+    to: Jid,
+    message: &'a wa::Message,
+    request_id: String,
+    edit: Option<crate::types::message::EditAttribute>,
+    extra_stanza_nodes: Vec<Node>,
+    is_status_addon: bool,
+    device_freshness: crate::cache::Freshness,
+}
+
+enum GroupDeviceSnapshot {
+    Owned(wacore::send::ResolvedGroupDevices),
+    Shared(std::sync::Arc<wacore::send::ResolvedGroupDevices>),
+}
+
+impl AsRef<wacore::send::ResolvedGroupDevices> for GroupDeviceSnapshot {
+    fn as_ref(&self) -> &wacore::send::ResolvedGroupDevices {
+        match self {
+            Self::Owned(devices) => devices,
+            Self::Shared(devices) => devices,
+        }
+    }
+}
+
 /// Keep each branch future out of the shared send frame. In tracing builds the
 /// dedicated span lets allocation profilers distinguish this deliberate box
 /// from work performed while polling the selected branch.
@@ -189,6 +223,23 @@ fn skdm_needs_only_own_devices(needs: &[Jid], own_pn: Option<&Jid>, own_lid: Opt
         })
 }
 
+const RESERVED_EXTRA_STANZA_CHILDREN: &[&str] =
+    &["enc", "participants", "device-identity", "plaintext"];
+
+fn validate_extra_stanza_nodes(nodes: &[Node]) -> Result<(), SendError> {
+    if let Some(node) = nodes.iter().find(|node| {
+        RESERVED_EXTRA_STANZA_CHILDREN
+            .iter()
+            .any(|reserved| node.tag == *reserved)
+    }) {
+        return Err(SendError::InvalidRequest(format!(
+            "extra stanza child <{}> is reserved by the send pipeline",
+            node.tag
+        )));
+    }
+    Ok(())
+}
+
 impl SendBranchOutput {
     fn stanza_only(node: Node) -> Self {
         Self {
@@ -218,6 +269,22 @@ pub struct SendOptions {
     /// Force the `<message type="...">` attribute instead of deriving it from
     /// content. Escape hatch for a type the classifier can't infer.
     pub stanza_type_override: Option<StanzaType>,
+    /// Freshness policy for group metadata used by this send.
+    pub group_metadata_freshness: crate::cache::Freshness,
+    /// Freshness policy for recipient device lists used by this send.
+    pub device_freshness: crate::cache::Freshness,
+}
+
+#[derive(Default)]
+pub(crate) struct SendPipelineOptions {
+    pub(crate) request_id: Option<String>,
+    pub(crate) peer: bool,
+    pub(crate) force_key_distribution: bool,
+    pub(crate) edit: Option<crate::types::message::EditAttribute>,
+    pub(crate) extra_stanza_nodes: Vec<Node>,
+    pub(crate) stanza_type: Option<StanzaType>,
+    pub(crate) group_metadata_freshness: crate::cache::Freshness,
+    pub(crate) device_freshness: crate::cache::Freshness,
 }
 
 /// Result of a successfully sent message.
@@ -667,6 +734,13 @@ impl Client {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 
+        validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
+        if options.message_id.as_ref().is_some_and(String::is_empty) {
+            return Err(SendError::InvalidRequest(
+                "message ID must not be empty".into(),
+            ));
+        }
+
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         self.stats.record_message_sent();
         wacore::telemetry::send(match to.server {
@@ -686,6 +760,8 @@ impl Client {
         }
 
         let stanza_type_override = options.stanza_type_override;
+        let group_metadata_freshness = options.group_metadata_freshness;
+        let device_freshness = options.device_freshness;
         let request_id = match options.message_id {
             Some(id) => id,
             None => self.generate_message_id(),
@@ -737,12 +813,15 @@ impl Client {
         self.send_message_impl(
             to,
             &message,
-            Some(request_id),
-            false,
-            false,
-            edit,
-            extra_nodes,
-            stanza_type_override,
+            SendPipelineOptions {
+                request_id: Some(request_id),
+                edit,
+                extra_stanza_nodes: extra_nodes,
+                stanza_type: stanza_type_override,
+                group_metadata_freshness,
+                device_freshness,
+                ..Default::default()
+            },
         )
         .await
         .map_err(SendError::from_anyhow)?;
@@ -763,7 +842,7 @@ impl Client {
         &self,
         message: wa::Message,
         recipients: &[Jid],
-        options: crate::features::status::StatusSendOptions,
+        mut options: crate::features::status::StatusSendOptions,
     ) -> Result<SendResult, SendError> {
         use wacore::client::context::GroupInfo;
         use wacore_binary::builder::NodeBuilder;
@@ -773,6 +852,12 @@ impl Client {
                 "cannot send status with no recipients".into(),
             ));
         }
+        validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
+        if options.message_id.as_ref().is_some_and(String::is_empty) {
+            return Err(SendError::InvalidRequest(
+                "status message ID must not be empty".into(),
+            ));
+        }
 
         // Status posts don't go through send_message_with_options, so count them here.
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
@@ -780,7 +865,10 @@ impl Client {
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
-        let request_id = self.generate_message_id();
+        let request_id = options
+            .message_id
+            .take()
+            .unwrap_or_else(|| self.generate_message_id());
 
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -878,13 +966,19 @@ impl Client {
         // Determine which devices need SKDM using the unified per-device map.
         // Status keeps the prior phash behavior, so we drop the full device set
         // and only use the SKDM-target subset.
-        let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
-            None
-        } else {
-            self.resolve_skdm_targets(&to_str, &group_info, own_lid)
-                .await
-                .map(|(_all, needs)| needs)
-        };
+        let skdm_target_devices =
+            if !force_skdm || options.device_freshness == crate::cache::Freshness::Refresh {
+                self.resolve_status_skdm_targets(
+                    &to_str,
+                    &group_info,
+                    own_lid,
+                    options.device_freshness,
+                    force_skdm,
+                )
+                .await?
+            } else {
+                None
+            };
 
         // prepare_group_stanza and ensure_status_participants both read the
         // participant list and expect self present. Done after SKDM resolution
@@ -902,35 +996,34 @@ impl Client {
         // status. Reactions go through WA Web's addon path and never visit
         // `WAWebEncryptAndSendStatusMsg`; attaching the meta on a reaction
         // gets the stanza NACK'd with 479 (SmaxInvalid). Revokes also skip it.
-        let extra_stanza_nodes = if wacore::send::status_carries_privacy_meta(&message) {
-            vec![
+        let mut extra_stanza_nodes = options.extra_stanza_nodes;
+        if wacore::send::status_carries_privacy_meta(&message) {
+            extra_stanza_nodes.push(
                 NodeBuilder::new("meta")
                     .attr("status_setting", options.privacy.as_str())
                     .build(),
-            ]
-        } else {
-            vec![]
-        };
+            );
+        }
 
         let prepared = match wacore::send::prepare_group_stanza(
             &*self.runtime,
             &mut stores,
             self,
-            &group_info,
-            own_jid,
-            own_lid,
-            account_info.as_deref(),
-            to.clone(),
-            &message,
-            request_id.clone(),
-            force_skdm,
-            skdm_target_devices,
-            // Status broadcasts keep the prior phash behavior (no full-set/self
-            // augmentation) — that path is group-only.
-            None,
-            None,
-            &extra_stanza_nodes,
-            shared_content.clone(),
+            wacore::send::GroupStanzaRequest {
+                group: &group_info,
+                own_jid,
+                own_lid,
+                account: account_info.as_deref(),
+                to: &to,
+                message: &message,
+                message_id: &request_id,
+                force_distribution: force_skdm,
+                distribution_targets: skdm_target_devices,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &extra_stanza_nodes,
+                pre_encoded: shared_content.as_deref().map(Vec::as_slice),
+            },
         )
         .await
         {
@@ -951,19 +1044,21 @@ impl Client {
                         &*self.runtime,
                         &mut stores_retry,
                         self,
-                        &group_info,
-                        own_jid,
-                        own_lid,
-                        account_info.as_deref(),
-                        to.clone(),
-                        &message,
-                        request_id.clone(),
-                        true,
-                        None,
-                        None,
-                        None,
-                        &extra_stanza_nodes,
-                        shared_content.clone(),
+                        wacore::send::GroupStanzaRequest {
+                            group: &group_info,
+                            own_jid,
+                            own_lid,
+                            account: account_info.as_deref(),
+                            to: &to,
+                            message: &message,
+                            message_id: &request_id,
+                            force_distribution: true,
+                            distribution_targets: None,
+                            phash_devices: None,
+                            edit: None,
+                            extra_nodes: &extra_stanza_nodes,
+                            pre_encoded: shared_content.as_deref().map(Vec::as_slice),
+                        },
                     )
                     .await?
                 } else {
@@ -1097,13 +1192,19 @@ impl Client {
     /// SKDM target resolution for the status path, whose `GroupInfo` is built
     /// fresh per send (no stable identity to memoize against).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
-    async fn resolve_skdm_targets(
+    async fn resolve_status_skdm_targets(
         &self,
         group_jid: &str,
         group_info: &wacore::client::context::GroupInfo,
         own_sending_jid: &Jid,
-    ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
-        let cached_map = self.skdm_device_map(group_jid).await;
+        freshness: crate::cache::Freshness,
+        force_distribution: bool,
+    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+        let cached_map = if force_distribution {
+            None
+        } else {
+            Some(self.skdm_device_map(group_jid).await)
+        };
 
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let jids_to_resolve: Vec<Jid> = group_info
@@ -1120,34 +1221,45 @@ impl Client {
             })
             .collect();
 
-        match SendContextResolver::resolve_devices(self, &jids_to_resolve).await {
-            Ok(all_devices) => {
-                let all_devices: Vec<Jid> = if is_lid_mode {
-                    all_devices
-                        .into_iter()
-                        .map(|d| group_info.phone_device_jid_into_lid(d))
-                        .collect()
-                } else {
-                    all_devices
-                };
-                let all_devices =
-                    std::sync::Arc::new(wacore::send::ResolvedGroupDevices::new(all_devices));
-                let needs_skdm = self.filter_skdm_targets(
-                    group_jid,
-                    all_devices.devices(),
-                    &cached_map,
-                    own_sending_jid,
-                );
-                Some((all_devices, needs_skdm))
+        let resolved = match freshness {
+            crate::cache::Freshness::CachePreferred => {
+                self.get_user_devices_owned(jids_to_resolve).await
             }
-            Err(e) => {
+            crate::cache::Freshness::Refresh => self.refresh_user_devices(jids_to_resolve).await,
+        };
+        match resolved {
+            Ok(mut devices) => {
+                if is_lid_mode {
+                    for device in &mut devices {
+                        *device = group_info.phone_device_jid_into_lid(std::mem::take(device));
+                    }
+                }
+                if force_distribution {
+                    wacore::send::retain_skdm_distribution_targets(&mut devices, own_sending_jid);
+                } else if let Some(cached_map) = cached_map {
+                    devices.retain(|device| {
+                        !device.is_hosted()
+                            && !(device.user == own_sending_jid.user
+                                && device.device == own_sending_jid.device)
+                            && !cached_map.device_and_primary_warm(&device.user, device.device)
+                    });
+                }
+                log::debug!(
+                    "Resolved {} status devices needing SKDM for {}",
+                    devices.len(),
+                    group_jid
+                );
+                Ok(Some(devices))
+            }
+            Err(error) if freshness == crate::cache::Freshness::CachePreferred => {
                 log::warn!(
                     "Failed to resolve devices for SKDM check in {}: {:?}",
                     group_jid,
-                    e
+                    error
                 );
-                None
+                Ok(None)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1256,7 +1368,7 @@ impl Client {
     /// would be one-directional: the retry-receipt forget path also excludes own
     /// devices (to stop an inbound retry tearing down our own session), so an own
     /// companion whose one SKDM encryption failed could never be re-sent one.
-    async fn update_sender_key_devices(&self, group_jid: &str, devices: &[Jid]) {
+    pub(crate) async fn update_sender_key_devices(&self, group_jid: &str, devices: &[Jid]) {
         if devices.is_empty() {
             return;
         }
@@ -1403,18 +1515,26 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_message_impl(
         &self,
         to: Jid,
         message: &wa::Message,
-        request_id_override: Option<String>,
-        peer: bool,
-        force_key_distribution: bool,
-        edit: Option<crate::types::message::EditAttribute>,
-        extra_stanza_nodes: Vec<Node>,
-        stanza_type_override: Option<StanzaType>,
+        options: SendPipelineOptions,
     ) -> Result<(), anyhow::Error> {
+        let SendPipelineOptions {
+            request_id: request_id_override,
+            peer,
+            force_key_distribution,
+            edit,
+            extra_stanza_nodes,
+            stanza_type: stanza_type_override,
+            group_metadata_freshness,
+            device_freshness,
+        } = options;
+        validate_extra_stanza_nodes(&extra_stanza_nodes)?;
+        if request_id_override.as_ref().is_some_and(String::is_empty) {
+            return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
+        }
         // Newsletters are plaintext channels and never use the E2E path. Text
         // sends go through the <plaintext> branch in send_message_with_options;
         // edit/revoke have dedicated plaintext methods (newsletter().edit_message
@@ -1479,24 +1599,27 @@ impl Client {
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
-            box_send_branch(self.send_group_branch(
+            box_send_branch(self.send_group_branch(GroupBranchRequest {
                 to,
                 message,
                 request_id,
                 force_key_distribution,
                 edit,
-                &extra_stanza_nodes,
-            ))
+                extra_stanza_nodes: &extra_stanza_nodes,
+                group_metadata_freshness,
+                device_freshness,
+            }))
             .await?
         } else {
-            box_send_branch(self.send_dm_branch(
+            box_send_branch(self.send_dm_branch(DmBranchRequest {
                 to,
                 message,
                 request_id,
                 edit,
                 extra_stanza_nodes,
                 is_status_addon,
-            ))
+                device_freshness,
+            }))
             .await?
         };
 
@@ -1635,13 +1758,18 @@ impl Client {
     /// SKDM distribution and the cold/rotation single-flight.
     async fn send_group_branch(
         &self,
-        to: Jid,
-        message: &wa::Message,
-        request_id: String,
-        force_key_distribution: bool,
-        edit: Option<crate::types::message::EditAttribute>,
-        extra_stanza_nodes: &[Node],
+        request: GroupBranchRequest<'_>,
     ) -> Result<SendBranchOutput, anyhow::Error> {
+        let GroupBranchRequest {
+            to,
+            message,
+            request_id,
+            force_key_distribution,
+            edit,
+            extra_stanza_nodes,
+            group_metadata_freshness,
+            device_freshness,
+        } = request;
         // Every arm of the prepare match below assigns these three.
         let outbound_msg_secret: Option<[u8; 32]>;
         let outbound_group_sender_identity: Option<Jid>;
@@ -1650,7 +1778,10 @@ impl Client {
         let node = {
             // No send-level lock: encrypt_group_message serializes the
             // sender-key chain advance per (group, sender) at the cipher.
-            let group_info = self.groups().query_info(&to).await?;
+            let group_info = self
+                .groups()
+                .query_info_with_freshness(&to, group_metadata_freshness)
+                .await?;
 
             // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
             let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -1686,6 +1817,18 @@ impl Client {
             // would make the memo miss on every send to such groups. The memoized
             // resolver applies the same self-append internally.
             let group_info_for_memo = std::sync::Arc::clone(&group_info);
+            let refreshed_devices = if device_freshness == crate::cache::Freshness::Refresh {
+                Some(
+                    self.resolve_group_devices_uncached(
+                        &group_info_for_memo,
+                        &own_sending_jid,
+                        crate::cache::Freshness::Refresh,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
             // resolve_skdm_targets and prepare_group_stanza both read the
             // participant list and expect self to be present.
             let group_info = ensure_self_in_group(group_info, &own_sending_jid);
@@ -1759,20 +1902,45 @@ impl Client {
             // still missing the key. On the cold/`force_skdm` path both are
             // `None` and `prepare_group_stanza` resolves the set itself.
             let (all_devices_for_phash, skdm_target_devices): (
-                Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
+                Option<GroupDeviceSnapshot>,
                 Option<Vec<Jid>>,
             ) = if force_skdm {
-                (None, None)
+                match refreshed_devices {
+                    Some(mut targets) => {
+                        wacore::send::retain_skdm_distribution_targets(
+                            &mut targets,
+                            &own_sending_jid,
+                        );
+                        (None, Some(targets))
+                    }
+                    None => (None, None),
+                }
             } else {
-                match self
-                    .resolve_skdm_targets_memoized(
-                        &to,
-                        &to_str,
-                        &group_info_for_memo,
-                        &own_sending_jid,
-                    )
-                    .await
-                {
+                let initial_targets = match refreshed_devices {
+                    Some(all) => {
+                        let all = GroupDeviceSnapshot::Owned(
+                            wacore::send::ResolvedGroupDevices::new(all),
+                        );
+                        let cached_map = self.skdm_device_map(&to_str).await;
+                        let needs = self.filter_skdm_targets(
+                            &to_str,
+                            all.as_ref().devices(),
+                            &cached_map,
+                            &own_sending_jid,
+                        );
+                        Some((all, needs))
+                    }
+                    None => self
+                        .resolve_skdm_targets_memoized(
+                            &to,
+                            &to_str,
+                            &group_info_for_memo,
+                            &own_sending_jid,
+                        )
+                        .await
+                        .map(|(all, needs)| (GroupDeviceSnapshot::Shared(all), needs)),
+                };
+                match initial_targets {
                     Some((all, needs)) if needs.is_empty() => (Some(all), Some(needs)),
                     // Own devices are never memoized warm, so they re-receive
                     // their SKDM on every send by design — own-only needs IS
@@ -1818,7 +1986,7 @@ impl Client {
                                 {
                                     distribution_guard = None;
                                 }
-                                (Some(all), Some(needs))
+                                (Some(GroupDeviceSnapshot::Shared(all)), Some(needs))
                             }
                             // Transient re-resolve failure: keep the first
                             // resolve's targets rather than silently sending
@@ -1835,19 +2003,21 @@ impl Client {
                 &*self.runtime,
                 &mut stores,
                 self,
-                &group_info,
-                own_jid,
-                own_lid,
-                account_info.as_deref(),
-                to.clone(),
-                message,
-                request_id.clone(),
-                force_skdm,
-                skdm_target_devices,
-                all_devices_for_phash,
-                edit.clone(),
-                extra_stanza_nodes,
-                shared_content.clone(),
+                wacore::send::GroupStanzaRequest {
+                    group: &group_info,
+                    own_jid,
+                    own_lid,
+                    account: account_info.as_deref(),
+                    to: &to,
+                    message,
+                    message_id: &request_id,
+                    force_distribution: force_skdm,
+                    distribution_targets: skdm_target_devices,
+                    phash_devices: all_devices_for_phash.as_ref().map(AsRef::as_ref),
+                    edit: edit.as_ref(),
+                    extra_nodes: extra_stanza_nodes,
+                    pre_encoded: shared_content.as_deref().map(Vec::as_slice),
+                },
             )
             .await
             {
@@ -1895,7 +2065,9 @@ impl Client {
                             None
                         };
                         let (retry_force, retry_targets, retry_all) = match warm_targets {
-                            Some((all, needs)) => (false, Some(needs), Some(all)),
+                            Some((all, needs)) => {
+                                (false, Some(needs), Some(GroupDeviceSnapshot::Shared(all)))
+                            }
                             None => {
                                 self.reset_sender_key_device_tracking(&to_str).await?;
                                 (true, None, None)
@@ -1910,19 +2082,21 @@ impl Client {
                             &*self.runtime,
                             &mut stores_retry,
                             self,
-                            &group_info,
-                            own_jid,
-                            own_lid,
-                            account_info.as_deref(),
-                            to,
-                            message,
-                            request_id,
-                            retry_force,
-                            retry_targets,
-                            retry_all,
-                            edit.clone(),
-                            extra_stanza_nodes,
-                            shared_content.clone(),
+                            wacore::send::GroupStanzaRequest {
+                                group: &group_info,
+                                own_jid,
+                                own_lid,
+                                account: account_info.as_deref(),
+                                to: &to,
+                                message,
+                                message_id: &request_id,
+                                force_distribution: retry_force,
+                                distribution_targets: retry_targets,
+                                phash_devices: retry_all.as_ref().map(AsRef::as_ref),
+                                edit: edit.as_ref(),
+                                extra_nodes: extra_stanza_nodes,
+                                pre_encoded: shared_content.as_deref().map(Vec::as_slice),
+                            },
                         )
                         .await?;
 
@@ -1955,13 +2129,17 @@ impl Client {
     /// with device fan-out (also used by status-reaction add-ons).
     async fn send_dm_branch(
         &self,
-        to: Jid,
-        message: &wa::Message,
-        request_id: String,
-        edit: Option<crate::types::message::EditAttribute>,
-        extra_stanza_nodes: Vec<Node>,
-        is_status_addon: bool,
+        request: DmBranchRequest<'_>,
     ) -> Result<SendBranchOutput, anyhow::Error> {
+        let DmBranchRequest {
+            to,
+            message,
+            request_id,
+            edit,
+            extra_stanza_nodes,
+            is_status_addon,
+            device_freshness,
+        } = request;
         let mut should_issue_tc_token_after_send = false;
         let prepared = {
             // Per-device locking to match decrypt path (message.rs:684),
@@ -2036,6 +2214,11 @@ impl Client {
             let recipient_is_lid = recipient_bare.is_lid();
 
             let stanza_to = dm_stanza_to(&recipient_bare, &to);
+
+            if device_freshness == crate::cache::Freshness::Refresh {
+                self.refresh_user_devices(vec![recipient_bare.to_non_ad(), own_jid.to_non_ad()])
+                    .await?;
+            }
 
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
@@ -2137,16 +2320,18 @@ impl Client {
                 &*self.runtime,
                 &mut stores,
                 self,
-                own_jid,
-                device_snapshot.lid.as_ref(),
-                device_snapshot.account.as_deref(),
-                stanza_to,
-                message,
-                request_id,
-                edit,
-                &extra_stanza_nodes,
-                all_dm_jids,
-                shared_content,
+                wacore::send::DmStanzaRequest {
+                    own_jid,
+                    own_lid: device_snapshot.lid.as_ref(),
+                    account: device_snapshot.account.as_deref(),
+                    to: &stanza_to,
+                    message,
+                    message_id: &request_id,
+                    edit: edit.as_ref(),
+                    extra_nodes: &extra_stanza_nodes,
+                    devices: all_dm_jids,
+                    pre_encoded: shared_content.as_deref().map(Vec::as_slice),
+                },
             )
             .await?
         };
@@ -3050,18 +3235,23 @@ mod tests {
 
         let group_info = GroupInfo::new(participants.clone(), AddressingMode::Lid);
 
-        let (all_devices, needs_skdm) = client
-            .resolve_skdm_targets(group_jid, &group_info, &own_lid)
+        let needs_skdm = client
+            .resolve_status_skdm_targets(
+                group_jid,
+                &group_info,
+                &own_lid,
+                crate::cache::Freshness::CachePreferred,
+                false,
+            )
             .await
-            .expect("None means device resolution failed");
+            .expect("device resolution must succeed")
+            .expect("missing targets means device resolution failed");
 
         // Empty cache → every participant needs SKDM, and the full set equals
         // the target set on this cold path.
         assert_eq!(needs_skdm.len(), participants.len());
-        assert_eq!(all_devices.devices().len(), participants.len());
         for user in &participant_users {
             assert!(needs_skdm.iter().any(|j| j.user == *user));
-            assert!(all_devices.devices().iter().any(|j| j.user == *user));
         }
     }
 
@@ -4044,6 +4234,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn structural_extra_children_are_rejected_before_send_work() {
+        for tag in RESERVED_EXTRA_STANZA_CHILDREN {
+            let error = validate_extra_stanza_nodes(&[NodeBuilder::new(tag).build()])
+                .expect_err("send-owned child must be rejected");
+            assert!(error.to_string().contains(tag));
+        }
+
+        validate_extra_stanza_nodes(&[
+            NodeBuilder::new("meta").build(),
+            NodeBuilder::new("biz").build(),
+            NodeBuilder::new("custom-extension").build(),
+        ])
+        .expect("non-structural protocol extensions remain available");
+    }
+
     /// Regression tests for #462: send path session lock keys must match decrypt path.
     mod session_lock_regression {
         use super::*;
@@ -4340,12 +4546,11 @@ mod tests {
             .send_message_impl(
                 peer,
                 &msg,
-                Some(request_id.to_string()),
-                true,
-                false,
-                None,
-                vec![],
-                None,
+                SendPipelineOptions {
+                    request_id: Some(request_id.to_string()),
+                    peer: true,
+                    ..Default::default()
+                },
             )
             .await;
         assert!(
@@ -4394,12 +4599,12 @@ mod tests {
             .send_message_impl(
                 peer,
                 &msg,
-                Some(request_id.to_string()),
-                true,
-                false,
-                None,
-                vec![],
-                Some(wacore::send::StanzaType::Poll),
+                SendPipelineOptions {
+                    request_id: Some(request_id.to_string()),
+                    peer: true,
+                    stanza_type: Some(wacore::send::StanzaType::Poll),
+                    ..Default::default()
+                },
             )
             .await;
         assert!(
@@ -4559,12 +4764,10 @@ mod tests {
             .send_message_impl(
                 peer_pn,
                 &msg,
-                Some(request_id.to_string()),
-                false,
-                false,
-                None,
-                vec![],
-                None,
+                SendPipelineOptions {
+                    request_id: Some(request_id.to_string()),
+                    ..Default::default()
+                },
             )
             .await;
         assert!(
@@ -4637,12 +4840,10 @@ mod tests {
             .send_message_impl(
                 peer_pn.clone(),
                 &msg,
-                Some(request_id.to_string()),
-                false,
-                false,
-                None,
-                vec![],
-                None,
+                SendPipelineOptions {
+                    request_id: Some(request_id.to_string()),
+                    ..Default::default()
+                },
             )
             .await;
         assert!(
@@ -4705,7 +4906,7 @@ mod tests {
             ..Default::default()
         };
         let err = client
-            .send_message_impl(channel, &msg, None, false, false, None, vec![], None)
+            .send_message_impl(channel, &msg, SendPipelineOptions::default())
             .await
             .expect_err("newsletter JID must be rejected on the E2E send path");
         assert!(

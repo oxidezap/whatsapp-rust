@@ -126,7 +126,11 @@ impl SenderKeyDeviceCache {
     /// cold, so it is skipped. The DB write is the source of truth; this only
     /// keeps a live cache entry consistent with it. On a cache miss the next
     /// send rebuilds from the DB, which already carries the write.
-    pub(crate) async fn mark_forgotten(&self, group_jid: &str, devices: &[Jid]) {
+    pub(crate) async fn mark_forgotten<'a>(
+        &self,
+        group_jid: &str,
+        devices: impl Iterator<Item = &'a Jid> + Send,
+    ) {
         let Some(map) = self.inner.get(group_jid).await else {
             return;
         };
@@ -219,7 +223,7 @@ mod tests {
         let gen_before = map0.generation();
 
         let dev5: Jid = "111:5@lid".parse().unwrap();
-        c.mark_forgotten(group, std::slice::from_ref(&dev5)).await;
+        c.mark_forgotten(group, std::iter::once(&dev5)).await;
 
         // Still cached (no whole-group invalidation): reading it must not run
         // the init closure.
@@ -241,7 +245,7 @@ mod tests {
         // generation must not advance (no spurious memo miss).
         let gen_after = map.generation();
         let absent: Jid = "999:0@lid".parse().unwrap();
-        c.mark_forgotten(group, std::slice::from_ref(&absent)).await;
+        c.mark_forgotten(group, std::iter::once(&absent)).await;
         assert_eq!(
             map.generation(),
             gen_after,
@@ -250,7 +254,7 @@ mod tests {
 
         // Re-marking an already-cold device it DOES hold is also a no-op: the
         // flag is already false, so a retry storm must not churn the generation.
-        c.mark_forgotten(group, std::slice::from_ref(&dev5)).await;
+        c.mark_forgotten(group, std::iter::once(&dev5)).await;
         assert_eq!(
             map.generation(),
             gen_after,
@@ -279,7 +283,8 @@ mod tests {
         let d0: Jid = "111:0@lid".parse().unwrap();
         let d5: Jid = "111:5@lid".parse().unwrap();
         let absent: Jid = "333:0@lid".parse().unwrap();
-        c.mark_forgotten(group, &[d0, d5, absent]).await;
+        c.mark_forgotten(group, [&d0, &d5, &absent].into_iter())
+            .await;
 
         assert_eq!(map.device_has_key("111", 0), Some(false));
         assert_eq!(map.device_has_key("111", 5), Some(false));
@@ -340,7 +345,7 @@ mod tests {
         let c = cache();
         let dev: Jid = "111:0@lid".parse().unwrap();
         // No entry for this group: must not panic or create one.
-        c.mark_forgotten("120363000000000009@g.us", std::slice::from_ref(&dev))
+        c.mark_forgotten("120363000000000009@g.us", std::iter::once(&dev))
             .await;
         let map = c
             .get_or_init("120363000000000009@g.us", async {

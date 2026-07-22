@@ -363,12 +363,11 @@ impl Client {
         self.send_message_impl(
             requester.clone(),
             message,
-            Some(message_id.to_owned()),
-            true,
-            false,
-            None,
-            Vec::new(),
-            None,
+            crate::send::SendPipelineOptions {
+                request_id: Some(message_id.to_owned()),
+                peer: true,
+                ..Default::default()
+            },
         )
         .await
     }

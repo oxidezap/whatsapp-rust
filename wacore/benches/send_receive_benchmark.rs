@@ -15,7 +15,7 @@ use std::hint::black_box;
 use wacore::client::context::{GroupInfo, SendContextResolver};
 use wacore::messages::MessageUtils;
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::send::{SignalStores, prepare_group_stanza, prepare_peer_stanza};
+use wacore::send::{GroupStanzaRequest, SignalStores, prepare_group_stanza, prepare_peer_stanza};
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore::types::message::AddressingMode;
 use wacore_binary::JidExt as _;
@@ -733,23 +733,26 @@ fn setup_group_recv() -> GrpRecvData {
     };
 
     let runtime = BenchRuntime;
+    let message = text_msg();
     let result = futures::executor::block_on(prepare_group_stanza(
         &runtime,
         &mut stores,
         &resolver,
-        &group_info,
-        &own_jid,
-        &own_jid,
-        None,
-        group_jid.clone(),
-        &text_msg(),
-        "bench-grp-recv".into(),
-        false,
-        None,
-        None,
-        None,
-        &[],
-        None,
+        GroupStanzaRequest {
+            group: &group_info,
+            own_jid: &own_jid,
+            own_lid: &own_jid,
+            account: None,
+            to: &group_jid,
+            message: &message,
+            message_id: "bench-grp-recv",
+            force_distribution: false,
+            distribution_targets: None,
+            phash_devices: None,
+            edit: None,
+            extra_nodes: &[],
+            pre_encoded: None,
+        },
     ))
     .unwrap();
 
@@ -803,7 +806,6 @@ fn run_group_send(d: &mut GrpSendData) {
     // only emits a phash if it gets the full device set. Mirror the real
     // warm-send caller by passing it; the cold/force_skdm path resolves the set
     // itself and keeps None.
-    let all_devices_for_phash = d.resolved_for_phash.clone();
     let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
     let own_base = own_jid.to_non_ad();
     if !group_info
@@ -825,19 +827,21 @@ fn run_group_send(d: &mut GrpSendData) {
         &d.runtime,
         &mut stores,
         &d.resolver,
-        &group_info,
-        &own_jid,
-        &own_jid,
-        None,
-        d.group_jid.clone(),
-        &d.msg,
-        "b-grp".into(),
-        d.force_skdm,
-        None,
-        all_devices_for_phash,
-        None,
-        &[],
-        None,
+        GroupStanzaRequest {
+            group: &group_info,
+            own_jid: &own_jid,
+            own_lid: &own_jid,
+            account: None,
+            to: &d.group_jid,
+            message: &d.msg,
+            message_id: "b-grp",
+            force_distribution: d.force_skdm,
+            distribution_targets: None,
+            phash_devices: d.resolved_for_phash.as_deref(),
+            edit: None,
+            extra_nodes: &[],
+            pre_encoded: None,
+        },
     ))
     .unwrap();
 

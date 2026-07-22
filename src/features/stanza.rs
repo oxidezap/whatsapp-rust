@@ -2,7 +2,10 @@
 
 use thiserror::Error;
 
+use crate::cache::Freshness;
 use crate::client::ClientError;
+use wacore_binary::Jid;
+use waproto::whatsapp as wa;
 
 pub(crate) fn required_stanza_attr<'node, 'data>(
     node: &'node wacore_binary::NodeRef<'data>,
@@ -156,6 +159,84 @@ pub enum RetryRequestError {
     Client(#[from] ClientError),
     #[error("failed to prepare retry request")]
     Internal(#[from] anyhow::Error),
+}
+
+/// A request to retransmit an already-sent message to one requesting device.
+///
+/// The client derives the wire stanza and owns all routing, encryption, session,
+/// sender-key, and persistence decisions. This type never accepts a pre-built
+/// retry stanza.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct MessageRetransmission {
+    pub(crate) chat: Jid,
+    pub(crate) requester: Jid,
+    pub(crate) message: wa::Message,
+    pub(crate) message_id: String,
+    pub(crate) retry_count: u8,
+    pub(crate) recipient: Option<Jid>,
+    pub(crate) group_metadata_freshness: Freshness,
+}
+
+impl MessageRetransmission {
+    /// Describe a retransmission to the device that requested it.
+    pub fn new(
+        chat: Jid,
+        requester: Jid,
+        message: wa::Message,
+        message_id: String,
+        retry_count: u8,
+    ) -> Self {
+        Self {
+            chat,
+            requester,
+            message,
+            message_id,
+            retry_count,
+            recipient: None,
+            group_metadata_freshness: Freshness::CachePreferred,
+        }
+    }
+
+    /// Preserve the receipt's recipient for self-device and bot retry routes.
+    pub fn with_recipient(mut self, recipient: Jid) -> Self {
+        self.recipient = Some(recipient);
+        self
+    }
+
+    /// Select how group metadata is obtained for this operation.
+    pub fn with_group_metadata_freshness(mut self, freshness: Freshness) -> Self {
+        self.group_metadata_freshness = freshness;
+        self
+    }
+
+    pub fn chat(&self) -> &Jid {
+        &self.chat
+    }
+
+    pub fn requester(&self) -> &Jid {
+        &self.requester
+    }
+
+    pub fn message(&self) -> &wa::Message {
+        &self.message
+    }
+
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    pub const fn retry_count(&self) -> u8 {
+        self.retry_count
+    }
+
+    pub fn recipient(&self) -> Option<&Jid> {
+        self.recipient.as_ref()
+    }
+
+    pub const fn group_metadata_freshness(&self) -> Freshness {
+        self.group_metadata_freshness
+    }
 }
 
 #[cfg(test)]

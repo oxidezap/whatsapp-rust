@@ -67,6 +67,7 @@ pub use wacore::chrono;
 pub use waproto::buffa;
 
 pub mod cache;
+pub use cache::Freshness;
 pub mod portable_cache;
 pub(crate) mod resend_rate_limiter;
 
@@ -150,13 +151,13 @@ pub use features::{
     GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo,
     InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex,
-    MexError, MexErrorExtensions, MexRequest, MexResponse, NackReason, Newsletter, NewsletterError,
-    NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
-    NewsletterRole, NewsletterState, NewsletterVerification, ParticipantChangeResponse,
-    ParticipantType, PictureType, PollError, Presence, PresenceError, PresenceStatus, Profile,
-    ProfileError, ProfilePicture, ReachoutTimelock, RetryReason, RetryRequestError,
-    RetryRequestOptions, RetryRequestOutcome, SecretEncKind, SecretEncrypted,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    MessageRetransmission, Mex, MexError, MexErrorExtensions, MexRequest, MexResponse, NackReason,
+    Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
+    NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
+    ParticipantChangeResponse, ParticipantType, PictureType, PollError, Presence, PresenceError,
+    PresenceStatus, Profile, ProfileError, ProfilePicture, ReachoutTimelock, RetryReason,
+    RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind, SecretEncrypted,
     SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
     StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
     SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo,

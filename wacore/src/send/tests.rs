@@ -1355,18 +1355,22 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group.clone(),
-            p.clone(),
-            p.clone(),
-            &wa::Message::default(),
-            "3EB0ABC".into(),
-            1,
-            Some(&account),
-            AddressingMode::Pn,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group.clone(),
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Pn),
+                },
+                encryption_jid: p.clone(),
+                message: &wa::Message::default(),
+                message_id: "3EB0ABC".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1419,18 +1423,22 @@ mod group_retry {
             .serialize()
             .expect("serialize before");
 
-        let result = prepare_group_retry_stanza(
+        let result = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p.clone(),
-            &wa::Message::default(),
-            "grp-retry-no-account".into(),
-            1,
-            None,
-            AddressingMode::Pn,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Pn),
+                },
+                encryption_jid: p.clone(),
+                message: &wa::Message::default(),
+                message_id: "grp-retry-no-account".into(),
+                retry_count: 1,
+                account: None,
+                edit: None,
+            },
         )
         .await;
         let err = result.expect_err("group retry pkmsg must reject missing account");
@@ -1465,17 +1473,21 @@ mod group_retry {
         let recipient: Jid = "100000000000456@lid".parse().unwrap();
         let requester: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(recipient.clone()),
-            requester,
-            &wa::Message::default(),
-            "dm-retry-format-1".into(),
-            1,
-            Some(&account),
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(recipient.clone()),
+                },
+                encryption_jid: requester,
+                message: &wa::Message::default(),
+                message_id: "dm-retry-format-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1511,17 +1523,21 @@ mod group_retry {
         let encryption = jid.clone();
         let account = pkmsg_account_proto();
 
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to.clone()),
-            encryption,
-            &wa::Message::default(),
-            "dm-retry-1".into(),
-            1,
-            Some(&account),
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to.clone()),
+                },
+                encryption_jid: encryption,
+                message: &wa::Message::default(),
+                message_id: "dm-retry-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1568,17 +1584,21 @@ mod group_retry {
             ..Default::default()
         };
 
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to),
-            jid,
-            &wa::Message::default(),
-            "dm-retry-2".into(),
-            2,
-            Some(&acc),
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to),
+                },
+                encryption_jid: jid,
+                message: &wa::Message::default(),
+                message_id: "dm-retry-2".into(),
+                retry_count: 2,
+                account: Some(&acc),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1601,18 +1621,22 @@ mod group_retry {
             details: Some(b"t".to_vec()),
             ..Default::default()
         };
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "id2".into(),
-            2,
-            Some(&acc),
-            AddressingMode::Pn,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Pn),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "id2".into(),
+                retry_count: 2,
+                account: Some(&acc),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1641,18 +1665,22 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         // Fresh session → pkmsg (pre-key), with LID addressing
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "m2".into(),
-            3,
-            Some(&wa::ADVSignedDeviceIdentity::default()),
-            AddressingMode::Lid,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Lid),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "m2".into(),
+                retry_count: 3,
+                account: Some(&wa::ADVSignedDeviceIdentity::default()),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1673,18 +1701,22 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "revoke-1".into(),
-            1,
-            Some(&account),
-            AddressingMode::Lid,
-            Some(crate::types::message::EditAttribute::AdminRevoke),
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Lid),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "revoke-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: Some(crate::types::message::EditAttribute::AdminRevoke),
+            },
         )
         .await
         .unwrap();
@@ -1696,21 +1728,226 @@ mod group_retry {
         let (mut ss, mut is, jid) = setup_session().await;
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to),
-            jid,
-            &wa::Message::default(),
-            "edit-1".into(),
-            1,
-            Some(&account),
-            Some(crate::types::message::EditAttribute::MessageEdit),
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to),
+                },
+                encryption_jid: jid,
+                message: &wa::Message::default(),
+                message_id: "edit-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: Some(crate::types::message::EditAttribute::MessageEdit),
+            },
         )
         .await
         .unwrap();
         assert_eq!(n.attrs().optional_string("edit").unwrap().as_ref(), "1");
+        assert_eq!(
+            n.get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .optional_string("decrypt-fail")
+                .unwrap()
+                .as_ref(),
+            "hide"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_retry_preserves_target_and_omits_group_addressing() {
+        let (mut ss, mut is, jid) = setup_session().await;
+        let broadcast: Jid = "1234567890@broadcast".parse().unwrap();
+        let participant = jid.clone();
+        let account = pkmsg_account_proto();
+        let node = prepare_pairwise_retry_stanza(
+            &mut ss,
+            &mut is,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: broadcast.clone(),
+                    participant: participant.clone(),
+                    addressing_mode: None,
+                },
+                encryption_jid: jid,
+                message: &wa::Message::default(),
+                message_id: "broadcast-retry-1".into(),
+                retry_count: 2,
+                account: Some(&account),
+                edit: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut attrs = node.attrs();
+        assert_eq!(
+            attrs.optional_string("to").unwrap().as_ref(),
+            broadcast.to_string()
+        );
+        assert_eq!(
+            attrs.optional_string("participant").unwrap().as_ref(),
+            participant.to_string()
+        );
+        assert!(attrs.optional_string("recipient").is_none());
+        assert!(attrs.optional_string("addressing_mode").is_none());
+        assert_eq!(
+            node.get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .optional_string("count")
+                .unwrap()
+                .as_ref(),
+            "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_retry_identity_is_rejected_before_ratchet_advance() {
+        let cases = [
+            ("", 1, "message ID"),
+            ("retry-count-zero", 0, "retry count"),
+            (
+                "retry-count-max",
+                crate::protocol::retry::MAX_RETRY_COUNT,
+                "retry count",
+            ),
+        ];
+
+        for (message_id, retry_count, expected_error) in cases {
+            let (mut sessions, mut identities, jid) = setup_session().await;
+            let address = jid.to_protocol_address();
+            let before = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            let result = prepare_pairwise_retry_stanza(
+                &mut sessions,
+                &mut identities,
+                PairwiseRetryRequest {
+                    destination: PairwiseRetryDestination::Direct {
+                        to: jid.clone(),
+                        recipient: None,
+                    },
+                    encryption_jid: jid,
+                    message: &wa::Message::default(),
+                    message_id: message_id.into(),
+                    retry_count,
+                    account: Some(&pkmsg_account_proto()),
+                    edit: None,
+                },
+            )
+            .await;
+            let error = result.expect_err("invalid retry must be rejected");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {message_id:?}/{retry_count}: {error:#}"
+            );
+            let after = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "validation must run before the Signal ratchet for {message_id:?}/{retry_count}"
+            );
+        }
+
+        enum InvalidRoute {
+            DirectGroup,
+            GroupWithoutAddressingMode,
+            BroadcastWithAddressingMode,
+            ParticipantOnDirectChat,
+        }
+
+        for (case, expected_error) in [
+            (InvalidRoute::DirectGroup, "direct retry destination"),
+            (
+                InvalidRoute::GroupWithoutAddressingMode,
+                "group retry requires an addressing mode",
+            ),
+            (
+                InvalidRoute::BroadcastWithAddressingMode,
+                "broadcast retry must not carry",
+            ),
+            (
+                InvalidRoute::ParticipantOnDirectChat,
+                "participant retry destination",
+            ),
+        ] {
+            let (mut sessions, mut identities, encryption_jid) = setup_session().await;
+            let address = encryption_jid.to_protocol_address();
+            let before = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            let group: Jid = "120363098765432100@g.us".parse().unwrap();
+            let broadcast: Jid = "1234567890@broadcast".parse().unwrap();
+            let destination = match case {
+                InvalidRoute::DirectGroup => PairwiseRetryDestination::Direct {
+                    to: group,
+                    recipient: None,
+                },
+                InvalidRoute::GroupWithoutAddressingMode => PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: encryption_jid.clone(),
+                    addressing_mode: None,
+                },
+                InvalidRoute::BroadcastWithAddressingMode => {
+                    PairwiseRetryDestination::Participant {
+                        to: broadcast,
+                        participant: encryption_jid.clone(),
+                        addressing_mode: Some(AddressingMode::Pn),
+                    }
+                }
+                InvalidRoute::ParticipantOnDirectChat => PairwiseRetryDestination::Participant {
+                    to: encryption_jid.clone(),
+                    participant: encryption_jid.clone(),
+                    addressing_mode: None,
+                },
+            };
+
+            let result = prepare_pairwise_retry_stanza(
+                &mut sessions,
+                &mut identities,
+                PairwiseRetryRequest {
+                    destination,
+                    encryption_jid,
+                    message: &wa::Message::default(),
+                    message_id: "invalid-route".into(),
+                    retry_count: 1,
+                    account: Some(&pkmsg_account_proto()),
+                    edit: None,
+                },
+            )
+            .await;
+            let error = result.expect_err("invalid route must be rejected");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected invalid-route error: {error:#}"
+            );
+            let after = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            assert_eq!(before, after, "route validation must precede the ratchet");
+        }
     }
 
     #[tokio::test]
@@ -1719,18 +1956,22 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "plain-1".into(),
-            1,
-            Some(&account),
-            AddressingMode::Lid,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Lid),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "plain-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+            },
         )
         .await
         .unwrap();
@@ -1961,17 +2202,21 @@ mod group_retry {
             .expect("serialize before");
 
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-        let result = prepare_dm_retry_stanza(
+        let result = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to),
-            jid.clone(),
-            &wa::Message::default(),
-            "dm-retry-no-account".into(),
-            1,
-            None,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to),
+                },
+                encryption_jid: jid.clone(),
+                message: &wa::Message::default(),
+                message_id: "dm-retry-no-account".into(),
+                retry_count: 1,
+                account: None,
+                edit: None,
+            },
         )
         .await;
         let err = result.expect_err("DM retry pkmsg path must reject missing account");
@@ -3015,6 +3260,108 @@ mod mark_full_distribution_list {
     }
 
     #[tokio::test]
+    async fn targeted_status_retry_sends_only_the_requesting_device() {
+        let status = Jid::status_broadcast();
+        let own_pn: Jid = "559900000000:7@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000:7@lid".parse().unwrap();
+        let requester: Jid = "100000000000001:11@lid".parse().unwrap();
+        let (mut sessions, mut identities) = established_stores(&requester).await;
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let group = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let message = wa::Message {
+            conversation: Some("status retry".into()),
+            ..Default::default()
+        };
+        let account = wa::ADVSignedDeviceIdentity::default();
+        let extension = NodeBuilder::new("custom-extension")
+            .attr("version", "1")
+            .build();
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &MockSendContextResolver::new(),
+            GroupStanzaRequest {
+                group: &group,
+                own_jid: &own_pn,
+                own_lid: &own_lid,
+                account: Some(&account),
+                to: &status,
+                message: &message,
+                message_id: "STATUS-RETRY-1",
+                force_distribution: false,
+                distribution_targets: Some(vec![requester.clone()]),
+                phash_devices: None,
+                edit: None,
+                extra_nodes: std::slice::from_ref(&extension),
+                pre_encoded: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut attrs = prepared.node.attrs();
+        assert_eq!(
+            attrs.optional_string("to").unwrap().as_ref(),
+            "status@broadcast"
+        );
+        assert_eq!(
+            attrs.optional_string("id").unwrap().as_ref(),
+            "STATUS-RETRY-1"
+        );
+        assert!(attrs.optional_string("participant").is_none());
+        assert!(attrs.optional_string("recipient").is_none());
+        assert!(attrs.optional_string("addressing_mode").is_none());
+        assert!(attrs.optional_string("phash").is_none());
+        assert_eq!(
+            prepared
+                .node
+                .get_optional_child("custom-extension")
+                .unwrap()
+                .attrs()
+                .optional_string("version")
+                .unwrap()
+                .as_ref(),
+            "1"
+        );
+
+        let skmsg = prepared.node.get_optional_child("enc").unwrap();
+        let mut skmsg_attrs = skmsg.attrs();
+        assert_eq!(
+            skmsg_attrs.optional_string("type").unwrap().as_ref(),
+            stanza::ENC_TYPE_SKMSG
+        );
+        assert!(skmsg_attrs.optional_string("count").is_none());
+
+        let participants = prepared.node.get_optional_child("participants").unwrap();
+        let targets = participants.children().unwrap();
+        assert_eq!(targets.len(), 1, "status retry must not fan out");
+        assert_eq!(
+            targets[0].attrs().optional_string("jid").unwrap().as_ref(),
+            requester.to_string()
+        );
+        assert!(
+            targets[0]
+                .get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .optional_string("count")
+                .is_none(),
+            "captured status SKDM encryption has no retry count"
+        );
+        assert_eq!(prepared.skdm_devices, [requester]);
+    }
+
+    #[tokio::test]
     async fn failed_device_is_still_marked_has_key() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
@@ -3054,19 +3401,21 @@ mod mark_full_distribution_list {
             &rt,
             &mut stores,
             &resolver,
-            &group_info,
-            &own_jid,
-            &own_lid,
-            None,
-            group,
-            &msg,
-            "TESTREQID".into(),
-            false,
-            Some(vec![a.clone(), b.clone()]),
-            None,
-            None,
-            &[],
-            None,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID",
+                force_distribution: false,
+                distribution_targets: Some(vec![a.clone(), b.clone()]),
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
         )
         .await
         .expect("prepare_group_stanza should succeed even when a device fails to encrypt");
@@ -3139,19 +3488,21 @@ mod mark_full_distribution_list {
                 &rt,
                 &mut stores,
                 &resolver,
-                group_info,
-                own_jid,
-                own_lid,
-                None,
-                group.clone(),
-                msg,
-                req.into(),
-                false,
-                Some(vec![a.clone()]),
-                None,
-                None,
-                &[],
-                None,
+                GroupStanzaRequest {
+                    group: group_info,
+                    own_jid,
+                    own_lid,
+                    account: None,
+                    to: group,
+                    message: msg,
+                    message_id: req,
+                    force_distribution: false,
+                    distribution_targets: Some(vec![a.clone()]),
+                    phash_devices: None,
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
             )
             .await
             .expect("prepare_group_stanza should succeed");
@@ -3263,19 +3614,21 @@ mod mark_full_distribution_list {
             &rt,
             &mut stores,
             &resolver,
-            &group_info,
-            &own_jid,
-            &own_lid,
-            None,
-            group,
-            &msg,
-            "TESTREQID2".into(),
-            false,
-            Some(vec![b.clone()]),
-            None,
-            None,
-            &[],
-            None,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID2",
+                force_distribution: false,
+                distribution_targets: Some(vec![b.clone()]),
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
         )
         .await
         .expect("prepare_group_stanza should succeed");
@@ -3358,19 +3711,21 @@ mod mark_full_distribution_list {
             &rt,
             &mut stores,
             &resolver,
-            &group_info,
-            &own_jid,
-            &own_lid,
-            None,
-            group,
-            &msg,
-            "TESTREQID_ISO".into(),
-            false,
-            Some(vec![good.clone(), bad.clone()]),
-            None,
-            None,
-            &[],
-            None,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID_ISO",
+                force_distribution: false,
+                distribution_targets: Some(vec![good.clone(), bad.clone()]),
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
         )
         .await
         .expect("prepare_group_stanza must succeed despite one device's setup failure");

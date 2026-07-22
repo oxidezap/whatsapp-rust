@@ -1,6 +1,7 @@
 //! 1:1 (DM) stanza preparation and DM retry stanzas.
 
 use super::*;
+use anyhow::Context as _;
 
 fn is_exact_dm_sender_device(device_jid: &Jid, own_jid: &Jid, own_lid: Option<&Jid>) -> bool {
     (device_jid.is_same_user_as(own_jid) && device_jid.device == own_jid.device)
@@ -75,25 +76,41 @@ pub struct PreparedDmStanza {
     pub message_secret: Option<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>,
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.dm_prepare", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
-#[allow(clippy::too_many_arguments)]
+pub struct DmStanzaRequest<'a> {
+    pub own_jid: &'a Jid,
+    pub own_lid: Option<&'a Jid>,
+    pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
+    pub to: &'a Jid,
+    pub message: &'a wa::Message,
+    pub message_id: &'a str,
+    pub edit: Option<&'a crate::types::message::EditAttribute>,
+    pub extra_nodes: &'a [Node],
+    pub devices: Vec<Jid>,
+    pub pre_encoded: Option<&'a [u8]>,
+}
+
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.dm_prepare", level = "debug", skip_all, err(Debug))
+)]
 pub async fn prepare_dm_stanza(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
-    own_jid: &Jid,
-    own_lid: Option<&Jid>,
-    account: Option<&wa::ADVSignedDeviceIdentity>,
-    to_jid: Jid,
-    message: &wa::Message,
-    request_id: String,
-    edit: Option<crate::types::message::EditAttribute>,
-    extra_stanza_nodes: &[Node],
-    all_devices: Vec<Jid>,
-    // Avoids a second full encode when the caller already serialized the message;
-    // ignored on the mci-hoist path (see `shared_content`).
-    pre_encoded: Option<std::sync::Arc<Vec<u8>>>,
+    request: DmStanzaRequest<'_>,
 ) -> Result<PreparedDmStanza> {
+    let DmStanzaRequest {
+        own_jid,
+        own_lid,
+        account,
+        to: to_jid,
+        message,
+        message_id: request_id,
+        edit,
+        extra_nodes: extra_stanza_nodes,
+        devices: all_devices,
+        pre_encoded,
+    } = request;
     // Encode the message at most once (reusing the caller's `pre_encoded` bytes when
     // provided) and thread those bytes through both the reporting token
     // (whitelisted-field extraction) and the wire plaintext below. The rare mci-hoist
@@ -101,7 +118,10 @@ pub async fn prepare_dm_stanza(
     // plaintext folds the reporting secret into the existing mci, diverging from the
     // bytes the token is computed over, so it re-encodes.
     let shared_content = message.message_context_info.is_unset().then(|| {
-        pre_encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)))
+        pre_encoded.map_or_else(
+            || std::borrow::Cow::Owned(waproto::codec::message_to_vec(message)),
+            std::borrow::Cow::Borrowed,
+        )
     });
 
     // sender is the author's own jid, remote is the chat jid (WAWebReportingTokenUtils:
@@ -115,12 +135,12 @@ pub async fn prepare_dm_stanza(
         Some(content) => generate_reporting_token_from_encoded(
             message,
             content,
-            &request_id,
+            request_id,
             own_jid,
-            &to_jid,
+            to_jid,
             existing_secret,
         ),
-        None => generate_reporting_token(message, &request_id, own_jid, &to_jid, existing_secret),
+        None => generate_reporting_token(message, request_id, own_jid, to_jid, existing_secret),
     };
 
     // The reporting token's MessageContextInfo (message_secret + version) is spliced
@@ -164,7 +184,7 @@ pub async fn prepare_dm_stanza(
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
 
-    let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
+    let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
 
     let mediatype = media_type_from_message(message);
 
@@ -248,7 +268,7 @@ pub async fn prepare_dm_stanza(
         .attr("type", stanza_type);
 
     if let Some(edit_attr) = edit
-        && edit_attr != crate::types::message::EditAttribute::Empty
+        && *edit_attr != crate::types::message::EditAttribute::Empty
     {
         stanza_builder = stanza_builder.attr("edit", edit_attr.to_string_val());
     }
@@ -297,41 +317,134 @@ where
         session
             .commit()
             .await
-            .map_err(|e| anyhow!("restoring checked-out session after pre-flight: {e}"))?;
+            .context("restoring checked-out session after pairwise retry pre-flight")?;
     }
     Ok(needs_pkmsg)
 }
 
+/// Structural destination for the canonical pairwise retry encoder.
+#[derive(Debug)]
+pub enum PairwiseRetryDestination {
+    Direct {
+        to: Jid,
+        recipient: Option<Jid>,
+    },
+    Participant {
+        to: Jid,
+        participant: Jid,
+        addressing_mode: Option<crate::types::message::AddressingMode>,
+    },
+}
+
+/// Native inputs for one pairwise retransmission. Grouping them prevents
+/// positional argument drift without allocating or introducing an intermediate
+/// wire representation.
+pub struct PairwiseRetryRequest<'a> {
+    pub destination: PairwiseRetryDestination,
+    pub encryption_jid: Jid,
+    pub message: &'a wa::Message,
+    pub message_id: String,
+    pub retry_count: u8,
+    pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
+    pub edit: Option<crate::types::message::EditAttribute>,
+}
+
+#[inline]
+fn is_pairwise_user(jid: &Jid) -> bool {
+    !jid.is_empty()
+        && matches!(
+            jid.server,
+            wacore_binary::Server::Pn
+                | wacore_binary::Server::Lid
+                | wacore_binary::Server::Hosted
+                | wacore_binary::Server::HostedLid
+                | wacore_binary::Server::Bot
+        )
+}
+
+fn validate_pairwise_retry_route(
+    destination: &PairwiseRetryDestination,
+    encryption_jid: &Jid,
+) -> Result<()> {
+    if !is_pairwise_user(encryption_jid) {
+        bail!("pairwise retry encryption target must be a user device JID");
+    }
+
+    match destination {
+        PairwiseRetryDestination::Direct { to, recipient } => {
+            if !is_pairwise_user(to) {
+                bail!("direct retry destination must be a user JID");
+            }
+            if recipient.as_ref().is_some_and(|jid| !is_pairwise_user(jid)) {
+                bail!("direct retry recipient must be a user JID");
+            }
+        }
+        PairwiseRetryDestination::Participant {
+            to,
+            participant,
+            addressing_mode,
+        } => {
+            if !is_pairwise_user(participant) {
+                bail!("participant retry target must be a user device JID");
+            }
+            if to.is_group() {
+                if addressing_mode.is_none() {
+                    bail!("group retry requires an addressing mode");
+                }
+            } else if to.is_broadcast_list() {
+                if addressing_mode.is_some() {
+                    bail!("broadcast retry must not carry a group addressing mode");
+                }
+            } else {
+                bail!("participant retry destination must be a group or broadcast list");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Mirrors `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`.
-/// `<enc>` goes directly under `<message>`; the fanout wrapper
-/// (`<participants><to>`) is server-rejected with 479 on retries.
-/// `recipient_jid` is propagated verbatim from the retry receipt
-/// (`f && (k.recipient = f)` in `WAWebHandleRetryRequest`); pass `None`
-/// when the incoming receipt didn't carry it.
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.dm_retry", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
-#[allow(clippy::too_many_arguments)]
-pub async fn prepare_dm_retry_stanza<S, I>(
+/// `<enc>` goes directly under `<message>`; the fanout wrapper is rejected for
+/// retries. Routing stays typed and structural attributes remain core-owned.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.pairwise_retry", level = "debug", skip_all, err(Debug))
+)]
+pub async fn prepare_pairwise_retry_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
-    to_jid: Jid,
-    recipient_jid: Option<Jid>,
-    encryption_jid: Jid,
-    message: &wa::Message,
-    message_id: String,
-    retry_count: u8,
-    account: Option<&wa::ADVSignedDeviceIdentity>,
-    edit: Option<crate::types::message::EditAttribute>,
+    request: PairwiseRetryRequest<'_>,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
 {
+    let PairwiseRetryRequest {
+        destination,
+        encryption_jid,
+        message,
+        message_id,
+        retry_count,
+        account,
+        edit,
+    } = request;
+    if message_id.is_empty() {
+        bail!("retry message ID must not be empty");
+    }
+    if !(1..crate::protocol::retry::MAX_RETRY_COUNT).contains(&retry_count) {
+        bail!(
+            "retry count {retry_count} must be in 1..{}",
+            crate::protocol::retry::MAX_RETRY_COUNT
+        );
+    }
+    validate_pairwise_retry_route(&destination, &encryption_jid)?;
+
     let plaintext = MessageUtils::encode_and_pad(message);
     let signal_address = encryption_jid.to_protocol_address();
 
     if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {
         bail!(
-            "DM retry pkmsg requires <device-identity> (account is None); \
+            "pairwise retry pkmsg requires <device-identity> (account is None); \
              refusing before message_encrypt to avoid advancing the sender chain"
         );
     }
@@ -340,7 +453,7 @@ where
         message_encrypt(&plaintext, &signal_address, session_store, identity_store).await?;
 
     let (enc_type, is_prekey, serialized) = extract_ciphertext(encrypted)
-        .ok_or_else(|| anyhow!("Unexpected encryption message type for DM retry"))?;
+        .ok_or_else(|| anyhow!("Unexpected encryption message type for pairwise retry"))?;
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
     let mut enc_builder = NodeBuilder::new("enc")
@@ -366,13 +479,30 @@ where
         );
     }
 
-    let mut stanza_builder = NodeBuilder::new("message")
-        .attr("to", to_jid)
+    let mut stanza_builder = NodeBuilder::new("message");
+    match destination {
+        PairwiseRetryDestination::Direct { to, recipient } => {
+            stanza_builder = stanza_builder.attr("to", to);
+            if let Some(recipient) = recipient {
+                stanza_builder = stanza_builder.attr("recipient", recipient);
+            }
+        }
+        PairwiseRetryDestination::Participant {
+            to,
+            participant,
+            addressing_mode,
+        } => {
+            stanza_builder = stanza_builder
+                .attr("to", to)
+                .attr("participant", participant);
+            if let Some(addressing_mode) = addressing_mode {
+                stanza_builder = stanza_builder.attr("addressing_mode", addressing_mode.as_str());
+            }
+        }
+    }
+    stanza_builder = stanza_builder
         .attr("id", message_id)
         .attr("type", stanza_type_from_message(message));
-    if let Some(r) = recipient_jid {
-        stanza_builder = stanza_builder.attr("recipient", r);
-    }
 
     // Without `edit`, the resend looks like a normal message and the client never
     // applies the revoke/edit.
