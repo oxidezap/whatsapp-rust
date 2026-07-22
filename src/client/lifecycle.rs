@@ -313,13 +313,6 @@ impl Client {
             }))
             .detach();
 
-        // Background shutdown-awaiter; Weak so it never pins the client (and its
-        // store handle) past teardown, like the event drainer's downgrade.
-        let cleanup_weak = Arc::downgrade(&arc);
-        arc.runtime
-            .spawn(Box::pin(Self::device_registry_cleanup_loop(cleanup_weak)))
-            .detach();
-
         (arc, rx)
     }
 
