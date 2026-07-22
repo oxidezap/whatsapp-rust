@@ -3409,6 +3409,28 @@ async fn terminal_disconnect_propagates_to_per_connection_signal() {
     );
 }
 
+/// Dropping the last owner must release persistence handles promptly.
+#[tokio::test]
+async fn dropping_fresh_client_releases_it_without_shutdown() {
+    let client = crate::test_utils::create_test_client().await;
+    let weak = Arc::downgrade(&client);
+
+    drop(client);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while weak.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "client is still retained by a background task (strong_count={})",
+            weak.strong_count()
+        )
+    });
+}
+
 /// Locks the zero-allocation property of the ack miss path: id resolution and
 /// the waiter probe must borrow from the node buffer. An `into_owned()` here
 /// costs one String per received ack, which the e2e dhat profile caught live.

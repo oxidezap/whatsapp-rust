@@ -313,14 +313,6 @@ impl Client {
             }))
             .detach();
 
-        // Start background task to clean up stale device registry entries
-        let cleanup_arc = arc.clone();
-        arc.runtime
-            .spawn(Box::pin(async move {
-                cleanup_arc.device_registry_cleanup_loop().await;
-            }))
-            .detach();
-
         (arc, rx)
     }
 

@@ -988,18 +988,6 @@ impl Client {
         devices
     }
 
-    /// Background loop placeholder for device registry cleanup.
-    /// Note: Cleanup functionality was removed as part of trait simplification.
-    /// Device registry entries are managed through normal update/get operations.
-    pub(super) async fn device_registry_cleanup_loop(&self) {
-        // Simply wait for shutdown signal
-        self.shutdown_notifier.listen().await;
-        debug!(
-            target: "Client/DeviceRegistry",
-            "Shutdown signaled, exiting cleanup loop"
-        );
-    }
-
     /// Migrate device registry entries from PN key to LID key.
     #[cfg_attr(
         feature = "tracing",
