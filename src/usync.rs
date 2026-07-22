@@ -397,10 +397,10 @@ mod tests {
     #[tokio::test]
     async fn refresh_bypasses_a_warm_registry_without_clearing_it_first() {
         let client = create_test_client().await;
-        let user: Jid = "1234567891@s.whatsapp.net".parse().unwrap();
+        let user: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
         client
             .update_device_list(DeviceListRecord {
-                user: "1234567891".into(),
+                user: "12025550102".into(),
                 devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(8, None)],
                 timestamp: wacore::time::now_secs(),
                 phash: None,

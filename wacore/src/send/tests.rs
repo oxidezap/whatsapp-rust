@@ -3262,7 +3262,7 @@ mod mark_full_distribution_list {
     #[tokio::test]
     async fn targeted_status_retry_sends_only_the_requesting_device() {
         let status = Jid::status_broadcast();
-        let own_pn: Jid = "559900000000:7@s.whatsapp.net".parse().unwrap();
+        let own_pn: Jid = "12025550120:7@s.whatsapp.net".parse().unwrap();
         let own_lid: Jid = "100000000000000:7@lid".parse().unwrap();
         let requester: Jid = "100000000000001:11@lid".parse().unwrap();
         let (mut sessions, mut identities) = established_stores(&requester).await;
@@ -3365,7 +3365,7 @@ mod mark_full_distribution_list {
     #[tokio::test]
     async fn required_targeted_distribution_rejects_a_missing_session() {
         let status = Jid::status_broadcast();
-        let own_pn: Jid = "559900000002:7@s.whatsapp.net".parse().unwrap();
+        let own_pn: Jid = "12025550121:7@s.whatsapp.net".parse().unwrap();
         let own_lid: Jid = "100000000000002:7@lid".parse().unwrap();
         let requester: Jid = "100000000000003:11@lid".parse().unwrap();
         let mut sessions = MemSessionStore::default();

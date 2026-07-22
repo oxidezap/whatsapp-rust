@@ -2601,14 +2601,14 @@ mod tests {
         )
         .await;
         let group = "120363000000000006@g.us";
-        let requester_pn: Jid = "15550000088:33@s.whatsapp.net".parse().unwrap();
+        let requester_pn: Jid = "12025550108:33@s.whatsapp.net".parse().unwrap();
         let resolved_lid: Jid = "100000000000088:33@lid".parse().unwrap();
         client
             .persistence_manager
             .set_sender_key_status(
                 group,
                 &[
-                    ("15550000088:33@s.whatsapp.net", true),
+                    ("12025550108:33@s.whatsapp.net", true),
                     ("100000000000088:33@lid", true),
                 ],
             )
@@ -2650,7 +2650,7 @@ mod tests {
         );
 
         assert_eq!(cached.device_has_key("100000000000088", 33), Some(false));
-        assert_eq!(cached.device_has_key("15550000088", 33), Some(true));
+        assert_eq!(cached.device_has_key("12025550108", 33), Some(true));
         let persisted = crate::sender_key_device_cache::SenderKeyDeviceMap::from_db_rows(
             &client
                 .persistence_manager
@@ -2659,7 +2659,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(persisted.device_has_key("100000000000088", 33), Some(false));
-        assert_eq!(persisted.device_has_key("15550000088", 33), Some(true));
+        assert_eq!(persisted.device_has_key("12025550108", 33), Some(true));
     }
 
     #[tokio::test]
@@ -2671,21 +2671,21 @@ mod tests {
         client
             .add_lid_pn_mapping(
                 "100000000000089",
-                "15550000089",
+                "12025550109",
                 crate::lid_pn_cache::LearningSource::Usync,
             )
             .await
             .unwrap();
         client.lid_pn_cache.clear().await;
 
-        let mapped_pn: Jid = "15550000089:19@s.whatsapp.net".parse().unwrap();
+        let mapped_pn: Jid = "12025550109:19@s.whatsapp.net".parse().unwrap();
         let mapped = client
             .resolve_retransmission_encryption_jid(RetransmissionRoute::Status, &mapped_pn)
             .await
             .unwrap();
         assert_eq!(mapped, "100000000000089:19@lid".parse::<Jid>().unwrap());
 
-        let unmapped_pn: Jid = "15550000090:20@s.whatsapp.net".parse().unwrap();
+        let unmapped_pn: Jid = "12025550110:20@s.whatsapp.net".parse().unwrap();
         let fallback = client
             .resolve_retransmission_encryption_jid(RetransmissionRoute::Status, &unmapped_pn)
             .await
@@ -3311,8 +3311,8 @@ mod tests {
 
     #[test]
     fn retransmission_route_validation_is_strict_and_typed() {
-        let direct: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
-        let requester: Jid = "15550000001:7@s.whatsapp.net".parse().unwrap();
+        let direct: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+        let requester: Jid = "12025550100:7@s.whatsapp.net".parse().unwrap();
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let status = Jid::status_broadcast();
         let broadcast: Jid = "1234567890@broadcast".parse().unwrap();
@@ -3353,7 +3353,7 @@ mod tests {
     #[test]
     fn resolve_retry_chat_info_broadcast_uses_participant_device() {
         let broadcast = "1234567890@broadcast";
-        let participant = "15550000001:9@s.whatsapp.net";
+        let participant = "12025550101:9@s.whatsapp.net";
         let node = NodeBuilder::new("receipt")
             .attr("participant", participant)
             .build();

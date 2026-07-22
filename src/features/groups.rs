@@ -1559,7 +1559,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let group: Jid = "120363000000000099@g.us".parse().unwrap();
         let previous = Arc::new(GroupInfo::new(
-            vec!["15550000001@s.whatsapp.net".parse().unwrap()],
+            vec!["12025550101@s.whatsapp.net".parse().unwrap()],
             AddressingMode::Pn,
         ));
         let cache = client.get_group_cache().await;
@@ -1589,7 +1589,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let parent: Jid = "120363000000000001@g.us".parse().unwrap();
         let unrelated: Jid = "120363000000000002@g.us".parse().unwrap();
-        let removed: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
+        let removed: Jid = "12025550103@s.whatsapp.net".parse().unwrap();
         let cache = client.get_group_cache().await;
         for jid in [&parent, &unrelated] {
             cache
