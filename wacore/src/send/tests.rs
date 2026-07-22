@@ -422,6 +422,7 @@ struct MockSendContextResolver {
     /// JIDs reported via `on_local_identity_change` (send-path detection).
     identity_changes: std::sync::Mutex<Vec<Jid>>,
     chain_lock_probe: Option<ChainLockProbe>,
+    prekey_error_code: Option<u16>,
 }
 
 impl MockSendContextResolver {
@@ -432,6 +433,7 @@ impl MockSendContextResolver {
             phone_to_lid: HashMap::new(),
             identity_changes: std::sync::Mutex::new(Vec::new()),
             chain_lock_probe: None,
+            prekey_error_code: None,
         }
     }
 
@@ -463,6 +465,11 @@ impl MockSendContextResolver {
         self.phone_to_lid.insert(phone.to_string(), lid.to_string());
         self
     }
+
+    fn with_prekey_error(mut self, code: u16) -> Self {
+        self.prekey_error_code = Some(code);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -487,6 +494,14 @@ impl SendContextResolver for MockSendContextResolver {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>> {
+        if let Some(code) = self.prekey_error_code {
+            return Err(anyhow::Error::new(crate::request::ServerErrorCode {
+                code,
+                text: "injected pre-key failure".to_string(),
+                error_type: None,
+                backoff: None,
+            }));
+        }
         if let Some(probe) = &self.chain_lock_probe {
             probe
                 .fetch_calls
@@ -3409,7 +3424,7 @@ mod mark_full_distribution_list {
     }
 
     #[tokio::test]
-    async fn required_targeted_distribution_rejects_a_missing_session() {
+    async fn required_targeted_distribution_reports_an_unregistered_target() {
         let status = Jid::status_broadcast();
         let own_pn: Jid = "12025550121:7@s.whatsapp.net".parse().unwrap();
         let own_lid: Jid = "100000000000002:7@lid".parse().unwrap();
@@ -3440,7 +3455,7 @@ mod mark_full_distribution_list {
         let result = prepare_group_stanza(
             &TokioTestRuntime,
             &mut stores,
-            &MockSendContextResolver::new(),
+            &MockSendContextResolver::new().with_prekey_error(406),
             GroupStanzaRequest {
                 group: &group,
                 own_jid: &own_pn,
@@ -3450,7 +3465,7 @@ mod mark_full_distribution_list {
                 message: &message,
                 message_id: "STATUS-RETRY-MISSING-SESSION",
                 force_distribution: false,
-                distribution_targets: Some(vec![requester]),
+                distribution_targets: Some(vec![requester.clone()]),
                 distribution_policy: SenderKeyDistributionPolicy::Required,
                 phash_devices: None,
                 edit: None,
@@ -3467,6 +3482,15 @@ mod mark_full_distribution_list {
         assert!(
             format!("{error:#}").contains("required sender-key distribution failed"),
             "unexpected error chain: {error:#}"
+        );
+        let failure = error
+            .downcast_ref::<RequiredSenderKeyDistributionError>()
+            .expect("required failures must retain typed stale-target metadata");
+        assert_eq!(failure.stale_device_users(), [requester.user.as_str()]);
+        assert_eq!(
+            crate::request::ServerErrorCode::from_anyhow(&error).map(|server| server.code),
+            Some(406),
+            "the typed failure must preserve the original server error chain"
         );
     }
 

@@ -1516,7 +1516,7 @@ impl Client {
                 .await;
         }
         if invalidate_group_cache {
-            self.get_group_cache().await.invalidate(jid).await;
+            self.lock_group_metadata(jid).await.invalidate().await;
         }
     }
 

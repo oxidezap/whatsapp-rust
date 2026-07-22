@@ -493,6 +493,10 @@ pub async fn ensure_sessions_for_devices(
                     jids_for_fetch.len()
                 );
                 had_406 = true;
+                // Best-effort callers still skip these devices, while a required
+                // distribution can surface the typed server failure without
+                // reconstructing it or reducing the source chain to a string.
+                first_error = Some(e);
                 std::collections::HashMap::new()
             }
             Err(e) => return Err(e),

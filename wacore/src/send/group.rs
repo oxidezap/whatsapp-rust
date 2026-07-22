@@ -39,6 +39,32 @@ pub struct PreparedGroupStanza {
     pub sender_identity: Jid,
 }
 
+/// A required sender-key distribution that could not reach every target.
+///
+/// The source chain preserves the concrete crypto or transport failure. When
+/// the failure followed a 406 pre-key response, `stale_device_users` identifies
+/// registry entries the caller should invalidate before the next resolution.
+#[derive(Debug, thiserror::Error)]
+#[error("required sender-key distribution failed")]
+pub struct RequiredSenderKeyDistributionError {
+    #[source]
+    source: anyhow::Error,
+    stale_device_users: Vec<String>,
+}
+
+impl RequiredSenderKeyDistributionError {
+    fn new(source: anyhow::Error, stale_device_users: Vec<String>) -> Self {
+        Self {
+            source,
+            stale_device_users,
+        }
+    }
+
+    pub fn stale_device_users(&self) -> &[String] {
+        &self.stale_device_users
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SenderKeyDistributionPolicy {
     /// Preserve normal fanout semantics by skipping devices that cannot receive
@@ -419,7 +445,20 @@ pub async fn prepare_group_stanza(
                                 distribution_list.len()
                             )
                         });
-                        return Err(error.context("required sender-key distribution failed"));
+                        let stale_device_users = if had_unregistered_device {
+                            collect_stale_device_users(
+                                Some(distribution_list),
+                                &encrypted_devices,
+                                group_info,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        return Err(RequiredSenderKeyDistributionError::new(
+                            error,
+                            stale_device_users,
+                        )
+                        .into());
                     }
 
                     includes_prekey_message |= result_includes_prekey;
@@ -454,7 +493,7 @@ pub async fn prepare_group_stanza(
                     }
                 }
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
-                    return Err(error.context("required sender-key distribution failed"));
+                    return Err(RequiredSenderKeyDistributionError::new(error, Vec::new()).into());
                 }
                 Err(e) => {
                     log::warn!(
