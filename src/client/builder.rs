@@ -72,6 +72,10 @@ pub enum ClientBuilderError {
     InvalidBackgroundSaverInterval,
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    #[error("plugin install timeout must be greater than zero")]
+    InvalidPluginInstallTimeout,
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     #[error("plugin callback timeout must be greater than zero")]
     InvalidPluginCallbackTimeout,
     #[cfg(feature = "plugins")]
@@ -96,7 +100,7 @@ pub enum ClientBuilderError {
 
 /// Runtime-validated, low-level builder for [`Client`].
 ///
-/// Unlike [`crate::BotBuilder`], this builder deliberately does not use
+/// Unlike [`crate::bot::BotBuilder`], this builder deliberately does not use
 /// typestate. FFI and embedded hosts can populate dependencies dynamically and
 /// receive a typed error without encoding Rust generic state in their wrapper.
 pub struct ClientBuilder {
@@ -346,7 +350,10 @@ impl ClientBuilder {
     /// Register an already-shared manifest-ID-keyed plugin.
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
-    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin + ?Sized>(
+        mut self,
+        plugin: Arc<P>,
+    ) -> Self {
         self.plugins
             .push(PluginRegistration::new_untyped_arc(plugin));
         self
@@ -404,6 +411,10 @@ impl ClientBuilder {
                 return Err(ClientBuilderError::InvalidBackgroundSaverInterval);
             }
 
+            #[cfg(feature = "plugins")]
+            if self.plugin_host_config.install_timeout() == Duration::ZERO {
+                return Err(ClientBuilderError::InvalidPluginInstallTimeout);
+            }
             #[cfg(feature = "plugins")]
             if self.plugin_host_config.callback_timeout() == Duration::ZERO {
                 return Err(ClientBuilderError::InvalidPluginCallbackTimeout);

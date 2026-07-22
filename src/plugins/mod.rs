@@ -41,6 +41,7 @@ const CAP_TASKS: u8 = 1 << 1;
 const CAP_MESSAGING: u8 = 1 << 2;
 const CAP_IQ: u8 = 1 << 3;
 const CAP_PLUGIN_EVENTS: u8 = 1 << 4;
+const DEFAULT_PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -96,6 +97,7 @@ impl PluginCapabilities {
 /// Deadlines applied by the native plugin host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginHostConfig {
+    install_timeout: Duration,
     callback_timeout: Duration,
     task_drain_timeout: Duration,
 }
@@ -103,9 +105,16 @@ pub struct PluginHostConfig {
 impl PluginHostConfig {
     pub const fn new() -> Self {
         Self {
+            install_timeout: DEFAULT_PLUGIN_INSTALL_TIMEOUT,
             callback_timeout: DEFAULT_PLUGIN_CALLBACK_TIMEOUT,
             task_drain_timeout: DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT,
         }
+    }
+
+    /// Bound each plugin and upstream lifecycle installation.
+    pub const fn with_install_timeout(mut self, timeout: Duration) -> Self {
+        self.install_timeout = timeout;
+        self
     }
 
     /// Bound each `on_ready`, `on_closed`, and `shutdown` callback.
@@ -118,6 +127,10 @@ impl PluginHostConfig {
     pub const fn with_task_drain_timeout(mut self, timeout: Duration) -> Self {
         self.task_drain_timeout = timeout;
         self
+    }
+
+    pub const fn install_timeout(self) -> Duration {
+        self.install_timeout
     }
 
     pub const fn callback_timeout(self) -> Duration {
@@ -1565,9 +1578,9 @@ impl<P: ClientPlugin> ErasedClientPlugin for PluginAdapter<P> {
     }
 }
 
-struct UntypedPluginAdapter<P>(Arc<P>);
+struct UntypedPluginAdapter<P: ?Sized>(Arc<P>);
 
-impl<P: UntypedClientPlugin> ErasedClientPlugin for UntypedPluginAdapter<P> {
+impl<P: UntypedClientPlugin + ?Sized> ErasedClientPlugin for UntypedPluginAdapter<P> {
     fn marker_type_id(&self) -> Option<TypeId> {
         None
     }
@@ -1619,7 +1632,7 @@ impl PluginRegistration {
         Self::new_untyped_arc(Arc::new(plugin))
     }
 
-    pub(crate) fn new_untyped_arc<P: UntypedClientPlugin>(plugin: Arc<P>) -> Self {
+    pub(crate) fn new_untyped_arc<P: UntypedClientPlugin + ?Sized>(plugin: Arc<P>) -> Self {
         Self {
             plugin: Arc::new(UntypedPluginAdapter(plugin)),
         }
@@ -2187,11 +2200,16 @@ impl PluginHost {
             PluginInstallRollback::new(runtime.clone(), self.ordered.len(), self.config);
         self.abort_install_if_terminal(&mut rollback).await?;
         if let Some(upstream) = &self.upstream {
-            if let Err(error) = plugin_callback(|| upstream.install(client.clone())).await {
-                rollback.disarm();
+            rollback.upstream = Some(upstream.clone());
+            if let Err(error) =
+                bounded_plugin_install(&*runtime, self.config.install_timeout(), || {
+                    upstream.install(client.clone())
+                })
+                .await
+            {
+                rollback.rollback().await;
                 return Err(error);
             }
-            rollback.upstream = Some(upstream.clone());
             self.abort_install_if_terminal(&mut rollback).await?;
         }
 
@@ -2224,7 +2242,11 @@ impl PluginHost {
             }
             let terminal = self.terminal_notifier.subscribe();
             let cancelled = Box::pin(wait_for_shutdown(&terminal));
-            let install = Box::pin(plugin_install(|| planned.plugin.install(context)));
+            let install = Box::pin(bounded_plugin_install(
+                &*runtime,
+                self.config.install_timeout(),
+                || planned.plugin.install(context),
+            ));
             let install_result = match futures::future::select(cancelled, install).await {
                 futures::future::Either::Left((_, install)) => {
                     if std::panic::catch_unwind(AssertUnwindSafe(|| drop(install))).is_err() {
@@ -2702,6 +2724,29 @@ async fn plugin_install<'a, T>(
     result?
 }
 
+async fn bounded_plugin_install<'a, T>(
+    runtime: &dyn Runtime,
+    timeout: Duration,
+    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let install = Box::pin(plugin_install(make_future));
+    match futures::future::select(install, runtime.sleep(timeout)).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), install)) => {
+            if std::panic::catch_unwind(AssertUnwindSafe(|| drop(install))).is_err() {
+                anyhow::bail!(
+                    "install timed out after {:.3} seconds and panicked while being cancelled",
+                    timeout.as_secs_f64()
+                );
+            }
+            anyhow::bail!(
+                "install timed out after {:.3} seconds",
+                timeout.as_secs_f64()
+            )
+        }
+    }
+}
+
 fn finish_callbacks(stage: &str, failures: Vec<String>) -> anyhow::Result<()> {
     if failures.is_empty() {
         Ok(())
@@ -2783,6 +2828,16 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_zero_plugin_host_deadlines() {
+        let install = complete_builder()
+            .await
+            .with_plugin_host_config(PluginHostConfig::new().with_install_timeout(Duration::ZERO))
+            .build()
+            .await;
+        assert!(matches!(
+            install,
+            Err(ClientBuilderError::InvalidPluginInstallTimeout)
+        ));
+
         let callback = complete_builder()
             .await
             .with_plugin_host_config(PluginHostConfig::new().with_callback_timeout(Duration::ZERO))
@@ -2845,6 +2900,10 @@ mod tests {
     }
 
     struct ShutdownDuringPluginInstall;
+
+    struct FailingInstallLifecycle {
+        log: Log,
+    }
 
     struct CaptureInstallClient {
         client: async_channel::Sender<Weak<Client>>,
@@ -2962,6 +3021,24 @@ mod tests {
         }
     }
 
+    impl ClientLifecycle for FailingInstallLifecycle {
+        fn install(&self, _client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
+            let log = Arc::clone(&self.log);
+            Box::pin(async move {
+                record(&log, "install:failing-upstream");
+                anyhow::bail!("injected upstream install failure")
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let log = Arc::clone(&self.log);
+            Box::pin(async move {
+                record(&log, "shutdown:failing-upstream");
+                Ok(())
+            })
+        }
+    }
+
     impl ClientPlugin for FoundationPlugin {
         type Api = String;
 
@@ -2992,6 +3069,11 @@ mod tests {
     #[tokio::test]
     async fn untyped_instances_share_an_adapter_type_and_remain_manifest_keyed() {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let foundation: Arc<dyn UntypedClientPlugin> = Arc::new(RuntimePluginAdapter {
+            id: "runtime-foundation",
+            dependency: None,
+            log: Arc::clone(&log),
+        });
         let client = complete_builder()
             .await
             .with_untyped_plugin(RuntimePluginAdapter {
@@ -2999,11 +3081,7 @@ mod tests {
                 dependency: Some("runtime-foundation"),
                 log: Arc::clone(&log),
             })
-            .with_untyped_plugin(RuntimePluginAdapter {
-                id: "runtime-foundation",
-                dependency: None,
-                log: Arc::clone(&log),
-            })
+            .with_untyped_plugin_arc(foundation)
             .build()
             .await
             .expect("untyped plugin plan")
@@ -3049,6 +3127,27 @@ mod tests {
             log.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_install_failure_runs_partial_rollback() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let result = complete_builder()
+            .await
+            .with_lifecycle(FailingInstallLifecycle {
+                log: Arc::clone(&log),
+            })
+            .with_plugin(FoundationPlugin {
+                log: Arc::clone(&log),
+            })
+            .build()
+            .await;
+
+        assert!(matches!(result, Err(ClientBuilderError::PluginInstall(_))));
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["install:failing-upstream", "shutdown:failing-upstream"]
         );
     }
 
@@ -3176,6 +3275,31 @@ mod tests {
         assert!(install_dropped.load(Ordering::Acquire));
         assert!(shutdown_called.load(Ordering::Acquire));
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn install_timeout_rolls_back_the_partial_plugin() {
+        let (started_tx, started_rx) = async_channel::unbounded();
+        let install_dropped = Arc::new(AtomicBool::new(false));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let result = complete_builder()
+            .await
+            .with_plugin_host_config(
+                PluginHostConfig::new().with_install_timeout(Duration::from_millis(10)),
+            )
+            .with_plugin(TerminalBlockingInstallPlugin {
+                started: started_tx,
+                install_dropped: install_dropped.clone(),
+                shutdown_called: shutdown_called.clone(),
+            })
+            .build()
+            .await;
+
+        let resource_shutdown = started_rx.recv().await.expect("plugin install started");
+        assert!(matches!(result, Err(ClientBuilderError::PluginInstall(_))));
+        assert!(resource_shutdown.is_fired());
+        assert!(install_dropped.load(Ordering::Acquire));
+        assert!(shutdown_called.load(Ordering::Acquire));
     }
 
     struct DependentPlugin {

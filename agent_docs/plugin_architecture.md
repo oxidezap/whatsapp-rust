@@ -131,6 +131,8 @@ An adapter that represents runtime-defined plugins implements
 share one concrete Rust adapter type, and do not appear in
 `Client::plugin::<P>()`. Native plugins keep the typed path above; a future
 bridge multiplexes its language-specific handles behind the untyped adapter.
+`with_untyped_plugin_arc(...)` also accepts a trait object when a host needs to
+erase multiple adapter implementations before configuring the client.
 
 During installation, `PluginContext::plugin::<P>()` exposes only directly
 declared dependencies. The context keeps a weak dependency view so an API that
@@ -199,14 +201,16 @@ host waits only through the configured task-drain deadline, then proceeds and
 marks the plugin degraded if work remains. Plugin tasks must not block an
 executor thread or detach untracked work.
 
-`PluginHostConfig` independently configures per-callback and per-task-drain
-deadlines; both default to five seconds and reject zero. Callbacks are
-serialized, bounded by those timeouts, and isolated from panics,
-including panics while constructing, polling, cancelling, or destroying their
-futures. One faulty plugin must not suppress later callbacks. Stale `Ready`
-work is bounded under reconnect pressure; every accepted `Closed` callback is
-lossless and precedes terminal `Shutdown`, so the queue may temporarily exceed
-its target to preserve cleanup.
+`PluginHostConfig` independently configures installation, per-callback, and
+per-task-drain deadlines. Installation defaults to thirty seconds; callbacks
+and drains default to five seconds; all reject zero. A timed-out partial
+installation is cancelled and follows the same LIFO rollback as an explicit
+failure. Callbacks are serialized, bounded by their timeout, and isolated from
+panics, including panics while constructing, polling, cancelling, or destroying
+their futures. One faulty plugin must not suppress later callbacks. Stale
+`Ready` work is bounded under reconnect pressure; every accepted `Closed`
+callback is lossless and precedes terminal `Shutdown`, so the queue may
+temporarily exceed its target to preserve cleanup.
 
 `signal_shutdown_sync()` closes tasks, subscriptions, event routes, and
 capability handles promptly. `disconnect().await` remains required for async

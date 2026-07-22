@@ -846,7 +846,10 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Register an already-shared manifest-ID-keyed plugin.
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
-    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin + ?Sized>(
+        mut self,
+        plugin: Arc<P>,
+    ) -> Self {
         self.plugins
             .push(PluginRegistration::new_untyped_arc(plugin));
         self
