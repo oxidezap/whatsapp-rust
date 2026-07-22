@@ -2,7 +2,7 @@ use crate::cache_config::CacheConfig;
 use crate::client::{Client, ClientBuilderError};
 use crate::pair_code::PairCodeOptions;
 #[cfg(feature = "plugins")]
-use crate::plugins::{ClientPlugin, PluginRegistration};
+use crate::plugins::{ClientPlugin, PluginRegistration, UntypedClientPlugin};
 use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
@@ -826,6 +826,23 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
         self.plugins.push(PluginRegistration::new_arc(plugin));
+        self
+    }
+
+    /// Register a manifest-ID-keyed plugin that exposes no Rust typed API.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_untyped_plugin<P: UntypedClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(PluginRegistration::new_untyped(plugin));
+        self
+    }
+
+    /// Register an already-shared manifest-ID-keyed plugin.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+        self.plugins
+            .push(PluginRegistration::new_untyped_arc(plugin));
         self
     }
 

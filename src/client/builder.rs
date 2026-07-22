@@ -10,7 +10,9 @@ use super::{ClientLifecycle, LifecycleRegistration};
 use crate::cache_config::CacheConfig;
 use crate::http::HttpClient;
 #[cfg(feature = "plugins")]
-use crate::plugins::{ClientPlugin, PluginHost, PluginPlan, PluginPlanError, PluginRegistration};
+use crate::plugins::{
+    ClientPlugin, PluginHost, PluginPlan, PluginPlanError, PluginRegistration, UntypedClientPlugin,
+};
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::sync_task::MajorSyncTask;
@@ -317,6 +319,23 @@ impl ClientBuilder {
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
         self.plugins.push(PluginRegistration::new_arc(plugin));
+        self
+    }
+
+    /// Register a manifest-ID-keyed plugin that exposes no Rust typed API.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_untyped_plugin<P: UntypedClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(PluginRegistration::new_untyped(plugin));
+        self
+    }
+
+    /// Register an already-shared manifest-ID-keyed plugin.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+        self.plugins
+            .push(PluginRegistration::new_untyped_arc(plugin));
         self
     }
 

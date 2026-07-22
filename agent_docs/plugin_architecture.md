@@ -125,6 +125,13 @@ plugins may therefore expose the same API type without colliding.
 is selected at runtime by the builder. Encoding that set in `Client` generics
 would make the client type viral and substantially increase monomorphization.
 
+An adapter that represents runtime-defined plugins implements
+`UntypedClientPlugin` and registers each instance with
+`with_untyped_plugin(...)`. Those instances are keyed only by manifest ID, may
+share one concrete Rust adapter type, and do not appear in
+`Client::plugin::<P>()`. Native plugins keep the typed path above; a future
+bridge multiplexes its language-specific handles behind the untyped adapter.
+
 During installation, `PluginContext::plugin::<P>()` exposes only directly
 declared dependencies. The context keeps a weak dependency view so an API that
 retains its context cannot create a registry ownership cycle. APIs should keep
@@ -251,7 +258,10 @@ phone numbers, or message bodies. See `observability.md` for accounting rules.
 ## Future foreign-language adapter seam
 
 A future bridge should be a Rust adapter at the host boundary, not a second
-client lifecycle. It can map a foreign endpoint onto the existing semantics:
+client lifecycle. Each runtime-defined instance can use
+`UntypedClientPlugin`, so one adapter type can host multiple manifest IDs
+without colliding in the native `TypeId` API registry. It can map a foreign
+endpoint onto the existing semantics:
 
 - build-time registration and stable install-scoped handles across reconnects;
 - explicit capability grants checked for every foreign command;

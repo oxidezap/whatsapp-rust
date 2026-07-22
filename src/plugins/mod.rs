@@ -166,6 +166,29 @@ pub trait ClientPlugin: MaybeSendSync + 'static {
     }
 }
 
+/// A trusted plugin instance identified only by its manifest ID.
+///
+/// Unlike [`ClientPlugin`], this trait publishes no Rust type-indexed API, so
+/// multiple instances of the same adapter type may be registered. It is the
+/// intended host seam for runtime-defined or foreign-language plugins.
+pub trait UntypedClientPlugin: MaybeSendSync + 'static {
+    fn manifest(&self) -> PluginManifest;
+
+    fn install(&self, context: PluginContext) -> PluginFuture<'_, anyhow::Result<()>>;
+
+    fn on_ready(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn on_closed(&self, _scope: PluginConnectionScope) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Manifest validation or dependency-ordering failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -1248,10 +1271,10 @@ fn downcast_api<T: MaybeSendSync + 'static>(api: &ErasedApi) -> Option<Arc<T>> {
 }
 
 trait ErasedClientPlugin: MaybeSendSync {
-    fn marker_type_id(&self) -> TypeId;
+    fn marker_type_id(&self) -> Option<TypeId>;
     fn marker_type_name(&self) -> &'static str;
     fn manifest(&self) -> PluginManifest;
-    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<ErasedApi>>;
+    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Option<ErasedApi>>>;
     fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>>;
     fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>>;
     fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>>;
@@ -1260,8 +1283,8 @@ trait ErasedClientPlugin: MaybeSendSync {
 struct PluginAdapter<P>(Arc<P>);
 
 impl<P: ClientPlugin> ErasedClientPlugin for PluginAdapter<P> {
-    fn marker_type_id(&self) -> TypeId {
-        TypeId::of::<P>()
+    fn marker_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<P>())
     }
 
     fn marker_type_name(&self) -> &'static str {
@@ -1272,10 +1295,45 @@ impl<P: ClientPlugin> ErasedClientPlugin for PluginAdapter<P> {
         self.0.manifest()
     }
 
-    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<ErasedApi>> {
+    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Option<ErasedApi>>> {
         Box::pin(async move {
             let api = self.0.install(context).await?;
-            Ok(Arc::new(TypedApi(api)) as ErasedApi)
+            Ok(Some(Arc::new(TypedApi(api)) as ErasedApi))
+        })
+    }
+
+    fn on_ready(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.0.on_ready(scope)
+    }
+
+    fn on_closed(&self, scope: PluginConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.0.on_closed(scope)
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.0.shutdown()
+    }
+}
+
+struct UntypedPluginAdapter<P>(Arc<P>);
+
+impl<P: UntypedClientPlugin> ErasedClientPlugin for UntypedPluginAdapter<P> {
+    fn marker_type_id(&self) -> Option<TypeId> {
+        None
+    }
+
+    fn marker_type_name(&self) -> &'static str {
+        std::any::type_name::<P>()
+    }
+
+    fn manifest(&self) -> PluginManifest {
+        self.0.manifest()
+    }
+
+    fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Option<ErasedApi>>> {
+        Box::pin(async move {
+            self.0.install(context).await?;
+            Ok(None)
         })
     }
 
@@ -1306,6 +1364,16 @@ impl PluginRegistration {
             plugin: Arc::new(PluginAdapter(plugin)),
         }
     }
+
+    pub(crate) fn new_untyped<P: UntypedClientPlugin>(plugin: P) -> Self {
+        Self::new_untyped_arc(Arc::new(plugin))
+    }
+
+    pub(crate) fn new_untyped_arc<P: UntypedClientPlugin>(plugin: Arc<P>) -> Self {
+        Self {
+            plugin: Arc::new(UntypedPluginAdapter(plugin)),
+        }
+    }
 }
 
 struct PlannedPlugin {
@@ -1332,8 +1400,9 @@ impl PluginPlan {
 
         for registration in registrations {
             let plugin = registration.plugin;
-            let marker = plugin.marker_type_id();
-            if !marker_types.insert(marker) {
+            if let Some(marker) = plugin.marker_type_id()
+                && !marker_types.insert(marker)
+            {
                 return Err(PluginPlanError::DuplicateType {
                     plugin_type: plugin.marker_type_name(),
                 });
@@ -1376,8 +1445,9 @@ impl PluginPlan {
                 };
                 indegree[plugin_index] += 1;
                 dependents[dependency_index].push(plugin_index);
-                dependency_markers[plugin_index]
-                    .push(plugins[dependency_index].plugin.marker_type_id());
+                if let Some(marker) = plugins[dependency_index].plugin.marker_type_id() {
+                    dependency_markers[plugin_index].push(marker);
+                }
             }
         }
         for (planned, markers) in plugins.iter_mut().zip(dependency_markers) {
@@ -1895,7 +1965,17 @@ impl PluginHost {
                     );
                 }
             };
-            staging.insert(planned.plugin.marker_type_id(), api);
+            match (planned.plugin.marker_type_id(), api) {
+                (Some(marker), Some(api)) => staging.insert(marker, api),
+                (None, None) => {}
+                _ => {
+                    rollback.rollback().await;
+                    anyhow::bail!(
+                        "plugin `{}` returned an API inconsistent with its registration",
+                        planned.manifest.id
+                    );
+                }
+            }
             self.abort_install_if_terminal(&mut rollback).await?;
             let Some(installed) = rollback.current.take() else {
                 rollback.rollback().await;
@@ -2320,9 +2400,9 @@ async fn plugin_callback<'a>(
     result?
 }
 
-async fn plugin_install<'a>(
-    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<ErasedApi>>,
-) -> anyhow::Result<ErasedApi> {
+async fn plugin_install<'a, T>(
+    make_future: impl FnOnce() -> BoxFuture<'a, anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     let mut future = std::panic::catch_unwind(AssertUnwindSafe(make_future))
         .map_err(|_| anyhow::anyhow!("install panicked before returning a future"))?;
     let result = AssertUnwindSafe(std::future::poll_fn(|context| {
@@ -2419,6 +2499,40 @@ mod tests {
 
     struct FoundationPlugin {
         log: Log,
+    }
+
+    struct RuntimePluginAdapter {
+        id: &'static str,
+        dependency: Option<&'static str>,
+        log: Log,
+    }
+
+    impl UntypedClientPlugin for RuntimePluginAdapter {
+        fn manifest(&self) -> PluginManifest {
+            let manifest = PluginManifest::new(self.id, "0.1.0");
+            match self.dependency {
+                Some(dependency) => manifest.with_dependency(dependency),
+                None => manifest,
+            }
+        }
+
+        fn install(&self, _context: PluginContext) -> BoxFuture<'_, anyhow::Result<()>> {
+            let id = self.id;
+            let log = Arc::clone(&self.log);
+            Box::pin(async move {
+                record(&log, format!("install:{id}"));
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+            let id = self.id;
+            let log = Arc::clone(&self.log);
+            Box::pin(async move {
+                record(&log, format!("shutdown:{id}"));
+                Ok(())
+            })
+        }
     }
 
     struct ShutdownDuringPluginInstall;
@@ -2564,6 +2678,51 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn untyped_instances_share_an_adapter_type_and_remain_manifest_keyed() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = complete_builder()
+            .await
+            .with_untyped_plugin(RuntimePluginAdapter {
+                id: "runtime-dependent",
+                dependency: Some("runtime-foundation"),
+                log: Arc::clone(&log),
+            })
+            .with_untyped_plugin(RuntimePluginAdapter {
+                id: "runtime-foundation",
+                dependency: None,
+                log: Arc::clone(&log),
+            })
+            .build()
+            .await
+            .expect("untyped plugin plan")
+            .into_client();
+
+        assert_eq!(
+            client
+                .plugin_manifests()
+                .iter()
+                .map(PluginManifest::id)
+                .collect::<Vec<_>>(),
+            vec!["runtime-foundation", "runtime-dependent"]
+        );
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["install:runtime-foundation", "install:runtime-dependent"]
+        );
+
+        client.disconnect().await;
+        assert_eq!(
+            *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                "install:runtime-foundation",
+                "install:runtime-dependent",
+                "shutdown:runtime-dependent",
+                "shutdown:runtime-foundation"
+            ]
+        );
     }
 
     #[tokio::test]
