@@ -92,6 +92,20 @@ impl<'a> AttrParserRef<'a> {
         })
     }
 
+    /// Get a required JID attribute, failing immediately when it is missing or invalid.
+    ///
+    /// Structured JIDs are converted directly from their decoded representation;
+    /// string attributes are parsed exactly once.
+    pub fn required_jid(&mut self, key: &str) -> Result<Jid> {
+        match self
+            .get_raw(key, false)
+            .ok_or_else(|| BinaryError::MissingAttr(key.to_string()))?
+        {
+            ValueRef::Jid(jid) => Ok(jid.to_owned()),
+            ValueRef::String(value) => Jid::from_str(value).map_err(BinaryError::from),
+        }
+    }
+
     pub fn jid(&mut self, key: &str) -> Jid {
         self.get_raw(key, true);
         self.optional_jid(key).unwrap_or_default()
@@ -246,6 +260,17 @@ impl<'a> AttrParser<'a> {
                 }
             },
         })
+    }
+
+    /// Get a required JID attribute, failing immediately when it is missing or invalid.
+    pub fn required_jid(&mut self, key: &str) -> Result<Jid> {
+        match self
+            .get_raw(key, false)
+            .ok_or_else(|| BinaryError::MissingAttr(key.to_string()))?
+        {
+            NodeValue::Jid(jid) => Ok(jid.clone()),
+            NodeValue::String(value) => Jid::from_str(value).map_err(BinaryError::from),
+        }
     }
 
     pub fn jid(&mut self, key: &str) -> Jid {

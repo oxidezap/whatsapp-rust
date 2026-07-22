@@ -5567,6 +5567,7 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
     let message = NodeBuilder::new("message")
         .attr("id", "EXPLICIT-ACK")
         .attr("from", "15551234567:7@s.whatsapp.net")
+        .attr("participant", "15557654321:4@s.whatsapp.net")
         .attr("recipient", "5511000000001@s.whatsapp.net")
         .attr("type", "text")
         .build();
@@ -5612,7 +5613,18 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
         ack.get_attr("from")
             .is_some_and(|value| value.as_str() == "5511000000001@s.whatsapp.net")
     );
-    assert!(ack.get_attr("type").is_none());
+    assert!(
+        ack.get_attr("participant")
+            .is_some_and(|value| value.as_str() == "15557654321:4@s.whatsapp.net")
+    );
+    assert!(
+        ack.get_attr("recipient")
+            .is_some_and(|value| value.as_str() == "5511000000001@s.whatsapp.net")
+    );
+    assert!(
+        ack.get_attr("type")
+            .is_some_and(|value| value.as_str() == "text")
+    );
 
     let nack_bytes = decode_frame(1, &frames[1]).expect("nack frame should decrypt");
     let nack =

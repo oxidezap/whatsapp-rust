@@ -715,6 +715,15 @@ impl Jid {
         jid_display_eq(&self.user, self.server, self.agent, self.device, other)
     }
 
+    /// Compare two JIDs by the representation emitted by [`fmt::Display`].
+    #[inline]
+    pub fn display_eq_jid(&self, other: &Self) -> bool {
+        jid_displays_equal(
+            (&self.user, self.server, self.agent, self.device),
+            (&other.user, other.server, other.agent, other.device),
+        )
+    }
+
     /// Compare device identity (user, server, device) without allocation.
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
@@ -770,6 +779,15 @@ impl<'a> JidRef<'a> {
     #[inline]
     pub fn display_eq(&self, other: &str) -> bool {
         jid_display_eq(&self.user, self.server, self.agent, self.device, other)
+    }
+
+    /// Compare two borrowed JIDs by the representation emitted by [`fmt::Display`].
+    #[inline]
+    pub fn display_eq_jid(&self, other: &Self) -> bool {
+        jid_displays_equal(
+            (&self.user, self.server, self.agent, self.device),
+            (&other.user, other.server, other.agent, other.device),
+        )
     }
 }
 
@@ -1007,6 +1025,20 @@ fn jid_display_eq(user: &str, server: Server, agent: u8, device: u16, other: &st
     written && writer.matches && writer.position == other.len()
 }
 
+#[inline]
+fn jid_displays_equal(left: (&str, Server, u8, u16), right: (&str, Server, u8, u16)) -> bool {
+    let (left_user, left_server, left_agent, left_device) = left;
+    let (right_user, right_server, right_agent, right_device) = right;
+    if left_user.is_empty() || right_user.is_empty() {
+        return left_user.is_empty() && right_user.is_empty() && left_server == right_server;
+    }
+
+    left_user == right_user
+        && left_server == right_server
+        && left_device == right_device
+        && (!left_server.renders_agent() || left_agent == right_agent)
+}
+
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut w = JidStackWriter::new();
@@ -1174,6 +1206,72 @@ mod tests {
         let long_jid = Jid::lid(long_user);
         assert!(long_jid.display_eq(&long_value));
         assert!(!long_jid.display_eq(&format!("{long_value}x")));
+    }
+
+    #[test]
+    fn display_eq_jid_uses_only_rendered_components() {
+        let pn = Jid {
+            user: "15551234567".into(),
+            server: Server::Pn,
+            agent: 1,
+            device: 7,
+            integrator: 3,
+        };
+        let pn_same_display = Jid {
+            agent: 2,
+            integrator: 9,
+            ..pn.clone()
+        };
+        assert_eq!(pn.to_string(), pn_same_display.to_string());
+        assert!(pn.display_eq_jid(&pn_same_display));
+
+        let pn_other_device = Jid {
+            device: 8,
+            ..pn.clone()
+        };
+        assert!(!pn.display_eq_jid(&pn_other_device));
+
+        let bot = Jid {
+            user: "13136555001".into(),
+            server: Server::Bot,
+            agent: 1,
+            device: 0,
+            integrator: 0,
+        };
+        let other_bot_agent = Jid {
+            agent: 2,
+            ..bot.clone()
+        };
+        assert!(!bot.display_eq_jid(&other_bot_agent));
+
+        let server_only = Jid {
+            user: "".into(),
+            server: Server::Pn,
+            agent: 1,
+            device: 7,
+            integrator: 3,
+        };
+        let same_server_only = Jid {
+            agent: 2,
+            device: 9,
+            integrator: 4,
+            ..server_only.clone()
+        };
+        assert_eq!(server_only.to_string(), same_server_only.to_string());
+        assert!(server_only.display_eq_jid(&same_server_only));
+
+        let borrowed = JidRef {
+            user: NodeStr::Borrowed("15551234567"),
+            server: Server::Pn,
+            agent: 1,
+            device: 7,
+            integrator: 0,
+        };
+        let borrowed_same_display = JidRef {
+            agent: 2,
+            ..borrowed.clone()
+        };
+        assert!(borrowed.display_eq_jid(&borrowed_same_display));
     }
 
     #[cfg(feature = "serde")]

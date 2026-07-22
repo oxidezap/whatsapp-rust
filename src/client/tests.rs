@@ -2081,9 +2081,9 @@ fn test_device_notification_is_not_encrypt_identity() {
 }
 
 #[test]
-fn test_build_ack_node_for_message_omits_type_includes_from() {
-    // Whatsmeow: message acks do NOT echo type (node.Tag != "message" guard).
-    // They DO include `from` with own device PN.
+fn test_build_ack_node_for_message_preserves_type_and_includes_from() {
+    // Generic message acknowledgements echo the stanza type and identify the
+    // local device in `from`.
     let incoming = NodeBuilder::new("message")
         .attr("from", "120363161500776365@g.us")
         .attr("id", "A5791A5392EF60E3FB0670098DE010D4")
@@ -2117,8 +2117,8 @@ fn test_build_ack_node_for_message_omits_type_includes_from() {
             .is_some_and(|v| v == "181531758878822@lid")
     );
     assert!(
-        !ack.attrs.contains_key("type"),
-        "message ACK must NOT echo type (matches whatsmeow behavior)"
+        ack.attrs.get("type").is_some_and(|v| v == "text"),
+        "message ACK must echo its explicit type"
     );
 }
 
@@ -2351,6 +2351,12 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
             .is_some_and(|v| v.as_str() == "146991363395800@lid"),
         "encode_ack_bytes must echo `recipient` onto the wire"
     );
+    assert!(
+        decoded
+            .get_attr("type")
+            .is_some_and(|value| value.as_str() == "text"),
+        "generic message ACK must echo its explicit type"
+    );
 
     let without_recipient = NodeBuilder::new("message")
         .attr("from", "120363161500776365@g.us")
@@ -2439,6 +2445,37 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         ack.get_attr("participant")
             .is_some_and(|value| value.as_str() == "15551234567@s.whatsapp.net"),
         "generic ack must not inherit the receipt-only participant rule"
+    );
+}
+
+#[test]
+fn test_encode_ack_bytes_compares_jid_participants_by_display() {
+    let from = Jid {
+        user: "15551234567".into(),
+        server: wacore_binary::Server::Hosted,
+        agent: 1,
+        device: 7,
+        integrator: 0,
+    };
+    let participant = Jid {
+        agent: 2,
+        ..from.clone()
+    };
+    assert_eq!(from.to_string(), participant.to_string());
+
+    let receipt = NodeBuilder::new("receipt")
+        .attr("id", "DISPLAY-EQUIVALENT-PARTICIPANT")
+        .attr("from", &from)
+        .attr("participant", &participant)
+        .build();
+    let bytes = encode_ack_bytes(&receipt.as_node_ref(), None)
+        .expect("complete receipt should produce an ack");
+    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+        .expect("encoded receipt ack should decode");
+
+    assert!(
+        ack.get_attr("participant").is_none(),
+        "receipt ack must omit display-equivalent participant JIDs"
     );
 }
 

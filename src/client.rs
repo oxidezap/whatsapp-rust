@@ -1054,7 +1054,7 @@ fn value_refs_display_equal(
 
     match (left, right) {
         (ValueRef::String(left), ValueRef::String(right)) => left == right,
-        (ValueRef::Jid(left), ValueRef::Jid(right)) => left == right,
+        (ValueRef::Jid(left), ValueRef::Jid(right)) => left.display_eq_jid(right),
         (ValueRef::String(left), ValueRef::Jid(right)) => right.display_eq(left),
         (ValueRef::Jid(left), ValueRef::String(right)) => left.display_eq(right),
     }
@@ -1065,8 +1065,8 @@ fn value_refs_display_equal(
 /// - `class` = original stanza tag
 /// - `id`, `to` (flipped from `from`), `participant` copied from original
 /// - `from` = own device PN, only for message acks
-/// - `type` echoed for non-message stanzas (whatsmeow: `node.Tag != "message"`),
-///   except `notification type="encrypt"` with `<identity/>` child (WA Web drops type there).
+/// - `type` echoed when present, except `notification type="encrypt"` with
+///   an `<identity/>` child
 ///
 /// For receipt acks, WA Web uses `MAYBE_CUSTOM_STRING(ackString)` where
 /// `ackString = maybeAttrString("type")` — so `type` is only included when
@@ -1104,7 +1104,7 @@ fn encode_ack_bytes(
     // Dropping it makes the server close the stream with `<stream:error><ack/>`.
     let recipient_val = node.get_attr("recipient");
 
-    let typ_val = if tag != "message" && !is_encrypt_identity_notification(node) {
+    let typ_val = if !is_encrypt_identity_notification(node) {
         node.get_attr("type")
     } else {
         None
@@ -1234,7 +1234,7 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
         .filter(|participant| tag != "receipt" || !value_refs_display_equal(participant, from_ref))
         .map(|v| v.to_node_value());
     let recipient = node.get_attr("recipient").map(|v| v.to_node_value());
-    let typ = if tag != "message" && !is_encrypt_identity_notification(node) {
+    let typ = if !is_encrypt_identity_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())
     } else {
         None

@@ -919,13 +919,13 @@ pub fn parse_message_info(
     use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
     let mut attrs = node.attrs();
-    let from = attrs.jid("from");
+    let from = attrs.required_jid("from")?;
     let addressing_mode = attrs
         .optional_string("addressing_mode")
         .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
 
     let mut source = if from.server == Server::Broadcast {
-        let participant = attrs.jid("participant");
+        let participant = attrs.required_jid("participant")?;
         let is_from_me = participant.matches_user_or_lid(own_jid, own_lid);
 
         // Match WAWebMsgParser: read participant_lid/_pn unconditionally so
@@ -952,7 +952,7 @@ pub fn parse_message_info(
             ..Default::default()
         }
     } else if from.is_group() {
-        let sender = attrs.jid("participant");
+        let sender = attrs.required_jid("participant")?;
         let sender_alt = match addressing_mode {
             Some(AddressingMode::Lid) => attrs.optional_jid("participant_pn"),
             Some(AddressingMode::Pn) => attrs.optional_jid("participant_lid"),
@@ -1313,6 +1313,33 @@ mod parse_message_info_tests {
     use std::str::FromStr;
     use wacore_binary::Jid;
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn invalid_routing_jids_are_rejected() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let cases = [
+            NodeBuilder::new("message")
+                .attr("from", "not-a-jid")
+                .attr("id", "INVALID-FROM")
+                .build(),
+            NodeBuilder::new("message")
+                .attr("from", "120363021033254949@g.us")
+                .attr("id", "MISSING-PARTICIPANT")
+                .build(),
+            NodeBuilder::new("message")
+                .attr("from", "120363021033254949@g.us")
+                .attr("participant", "not-a-jid")
+                .attr("id", "INVALID-PARTICIPANT")
+                .build(),
+        ];
+
+        for node in &cases {
+            assert!(
+                parse_message_info(&node.as_node_ref(), &own_pn, None).is_err(),
+                "invalid routing attributes must not produce default JIDs: {node:?}"
+            );
+        }
+    }
 
     #[test]
     fn status_broadcast_with_participant_lid_populates_sender_alt() {

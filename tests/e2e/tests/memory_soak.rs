@@ -207,10 +207,10 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
 
     #[cfg(feature = "dhat-heap")]
     {
-        let heap_growth = last.heap_bytes.saturating_sub(first.heap_bytes);
+        let heap_delta = last.heap_bytes as i128 - first.heap_bytes as i128;
         info!(
-            "  Tracked heap: {}B -> {}B (delta: +{}B)",
-            first.heap_bytes, last.heap_bytes, heap_growth
+            "  Tracked heap: {}B -> {}B (delta: {heap_delta:+}B)",
+            first.heap_bytes, last.heap_bytes
         );
     }
 

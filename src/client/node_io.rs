@@ -589,6 +589,17 @@ impl Client {
         }
     }
 
+    #[inline]
+    fn encode_ack_from_snapshot(
+        &self,
+        node: &wacore_binary::NodeRef<'_>,
+    ) -> Result<Vec<u8>, crate::features::StanzaResponseError> {
+        let device = self.persistence_manager.get_device_snapshot();
+        let encoded = encode_ack_bytes(node, device.pn.as_ref());
+        drop(device);
+        encoded
+    }
+
     /// Build and send an <ack/> node corresponding to the given stanza.
     #[cfg_attr(
         feature = "tracing",
@@ -604,15 +615,13 @@ impl Client {
         if !self.is_connected() {
             return Err(ClientError::NotConnected);
         }
-        let device = self.persistence_manager.get_device_snapshot();
-        let buf = match encode_ack_bytes(node, device.pn.as_ref()) {
+        let buf = match self.encode_ack_from_snapshot(node) {
             Ok(buf) => buf,
             Err(e) => {
                 log::warn!("Failed to encode ack: {e}");
                 return Ok(());
             }
         };
-        drop(device);
         self.send_raw_bytes(buf).await
     }
 
@@ -629,9 +638,7 @@ impl Client {
         &self,
         stanza: &wacore_binary::NodeRef<'_>,
     ) -> Result<(), crate::features::StanzaResponseError> {
-        let device = self.persistence_manager.get_device_snapshot();
-        let bytes = encode_ack_bytes(stanza, device.pn.as_ref())?;
-        drop(device);
+        let bytes = self.encode_ack_from_snapshot(stanza)?;
         self.send_raw_bytes(bytes).await?;
         Ok(())
     }
@@ -641,9 +648,7 @@ impl Client {
     /// in a single flushed task.
     pub(crate) async fn send_transport_ack(&self, info: &crate::types::message::MessageInfo) {
         let source = message_ack_source_node(info);
-        let device = self.persistence_manager.get_device_snapshot();
-        let encoded = encode_ack_bytes(&source.as_node_ref(), device.pn.as_ref());
-        drop(device);
+        let encoded = self.encode_ack_from_snapshot(&source.as_node_ref());
         match encoded {
             Ok(buf) => {
                 if let Err(e) = self.send_raw_bytes(buf).await
@@ -676,15 +681,13 @@ impl Client {
         self: &Arc<Self>,
         node: &wacore_binary::NodeRef<'_>,
     ) {
-        let device = self.persistence_manager.get_device_snapshot();
-        let buf = match encode_ack_bytes(node, device.pn.as_ref()) {
+        let buf = match self.encode_ack_from_snapshot(node) {
             Ok(buf) => buf,
             Err(e) => {
                 log::warn!("Failed to encode node transport ack: {e}");
                 return;
             }
         };
-        drop(device);
         let client = Arc::clone(self);
         self.outbound_flush.spawn(&*self.runtime, async move {
             if let Err(e) = client.send_raw_bytes(buf).await
