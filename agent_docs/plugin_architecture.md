@@ -54,7 +54,8 @@ Construction follows one publication boundary:
 
 Plugin tasks requested during installation remain parked until activation. A
 client leaked through an installation `Weak<Client>` cannot run before the
-construction gate opens.
+construction gate opens. Plugin APIs, manifests, diagnostics, and custom-event
+routing also remain hidden until that final publication succeeds.
 
 Installation is transactional. Duplicate IDs or marker types, malformed
 versions, missing/duplicate dependencies, and cycles fail before client

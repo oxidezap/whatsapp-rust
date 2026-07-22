@@ -1552,12 +1552,17 @@ struct PluginContextParts {
     diagnostics: Arc<PluginDiagnostics>,
 }
 
+struct InstalledPlugins {
+    plugins: Vec<InstalledPlugin>,
+    staged_apis: Mutex<Option<HashMap<TypeId, ErasedApi>>>,
+}
+
 pub(crate) struct PluginHost {
     ordered: Vec<PlannedPlugin>,
     manifests: Vec<PluginManifest>,
     diagnostics: Vec<Arc<PluginDiagnostics>>,
     upstream: Option<Arc<dyn ClientLifecycle>>,
-    installed: OnceLock<Vec<InstalledPlugin>>,
+    installed: OnceLock<InstalledPlugins>,
     apis: OnceLock<HashMap<TypeId, ErasedApi>>,
     runtime: OnceLock<Arc<dyn Runtime>>,
     event_router: Option<PluginEventRouter>,
@@ -1614,6 +1619,17 @@ impl PluginHost {
 
     pub(crate) fn plugin<P: ClientPlugin>(&self) -> Option<Arc<P::Api>> {
         downcast_api::<P::Api>(self.apis.get()?.get(&TypeId::of::<P>())?)
+    }
+
+    fn is_published(&self) -> bool {
+        self.apis.get().is_some()
+    }
+
+    fn installed_plugins(&self) -> &[InstalledPlugin] {
+        self.installed
+            .get()
+            .map(|installed| installed.plugins.as_slice())
+            .unwrap_or_default()
     }
 
     pub(crate) fn manifests(&self) -> &[PluginManifest] {
@@ -1860,12 +1876,13 @@ impl PluginHost {
         }
         self.abort_install_if_terminal(&mut rollback).await?;
 
-        self.apis
-            .set(staging.snapshot())
-            .map_err(|_| anyhow::anyhow!("plugin APIs were published more than once"))?;
         let installed = rollback.take_installed();
+        let installed = InstalledPlugins {
+            plugins: installed,
+            staged_apis: Mutex::new(Some(staging.snapshot())),
+        };
         if let Err(installed) = self.installed.set(installed) {
-            rollback.restore_installed(installed);
+            rollback.restore_installed(installed.plugins);
             anyhow::bail!("plugins were installed more than once");
         }
         rollback.disarm();
@@ -1921,7 +1938,7 @@ impl PluginHost {
             self.close_installed_resources();
             return false;
         }
-        for plugin in self.installed.get().into_iter().flatten() {
+        for plugin in self.installed_plugins() {
             plugin.resources.activate();
         }
         if self.terminal.load(Ordering::Acquire) {
@@ -1932,8 +1949,28 @@ impl PluginHost {
         }
     }
 
+    pub(crate) fn publish_apis(&self) -> bool {
+        let Some(installed) = self.installed.get() else {
+            return false;
+        };
+        let mut staged = installed
+            .staged_apis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(apis) = staged.take() else {
+            return self.apis.get().is_some();
+        };
+        match self.apis.set(apis) {
+            Ok(()) => true,
+            Err(apis) => {
+                *staged = Some(apis);
+                false
+            }
+        }
+    }
+
     fn close_installed_resources(&self) {
-        for plugin in self.installed.get().into_iter().flatten().rev() {
+        for plugin in self.installed_plugins().iter().rev() {
             close_plugin_resources(&plugin.manifest.id, &plugin.resources);
         }
     }
@@ -1962,7 +1999,7 @@ impl ClientLifecycle for PluginHost {
             {
                 failures.push(format!("upstream: {error:#}"));
             }
-            for plugin in self.installed.get().into_iter().flatten() {
+            for plugin in self.installed_plugins() {
                 let task_tracker = plugin
                     .manifest
                     .capabilities
@@ -1996,7 +2033,7 @@ impl ClientLifecycle for PluginHost {
     fn on_closed(&self, scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
             let mut failures = Vec::new();
-            for plugin in self.installed.get().into_iter().flatten().rev() {
+            for plugin in self.installed_plugins().iter().rev() {
                 let task_tracker = plugin
                     .manifest
                     .capabilities
@@ -2053,7 +2090,7 @@ impl ClientLifecycle for PluginHost {
         Box::pin(async move {
             let mut failures = Vec::new();
             self.signal_shutdown();
-            for plugin in self.installed.get().into_iter().flatten().rev() {
+            for plugin in self.installed_plugins().iter().rev() {
                 let task_result = self
                     .wait_for_tasks(plugin.resources.task_completion_signals())
                     .await;
@@ -2268,13 +2305,17 @@ impl Client {
     pub fn plugin_manifests(&self) -> &[PluginManifest] {
         self.plugin_host
             .as_ref()
+            .filter(|host| host.is_published())
             .map(|host| host.manifests())
             .unwrap_or_default()
     }
 
     /// Snapshot lifecycle, task, subscription, and custom-event health for installed plugins.
     pub fn plugin_stats(&self) -> Option<PluginHostStats> {
-        self.plugin_host.as_ref().map(|host| host.stats())
+        self.plugin_host
+            .as_ref()
+            .filter(|host| host.is_published())
+            .map(|host| host.stats())
     }
 
     /// Subscribe to custom events emitted by installed plugins.
@@ -2283,12 +2324,15 @@ impl Client {
     pub fn plugin_event_router(&self) -> Option<PluginEventRouter> {
         self.plugin_host
             .as_ref()
+            .filter(|host| host.is_published())
             .and_then(|host| host.event_router.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
@@ -2332,6 +2376,41 @@ mod tests {
         client: async_channel::Sender<Weak<Client>>,
     }
 
+    struct BlockingFirstSpawnRuntime {
+        blocked: AtomicBool,
+        entered: async_channel::Sender<()>,
+        release: Arc<Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for BlockingFirstSpawnRuntime {
+        fn spawn(
+            &self,
+            future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> wacore::runtime::AbortHandle {
+            if !self.blocked.swap(true, Ordering::AcqRel) {
+                self.entered.try_send(()).expect("first spawn observer");
+                self.release.wait();
+            }
+            TokioRuntime.spawn(future)
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            TokioRuntime.sleep(duration)
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            TokioRuntime.spawn_blocking(f)
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            TokioRuntime.yield_now()
+        }
+    }
+
     impl ClientLifecycle for CaptureInstallClient {
         fn install(&self, client: Weak<Client>) -> BoxFuture<'_, anyhow::Result<()>> {
             let sender = self.client.clone();
@@ -2339,6 +2418,24 @@ mod tests {
                 sender.send(client).await?;
                 Ok(())
             })
+        }
+    }
+
+    struct PublicationProbePlugin;
+
+    impl ClientPlugin for PublicationProbePlugin {
+        type Api = String;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("publication-probe", "0.1.0")
+                .with_capability(PluginCapability::PluginEvents)
+        }
+
+        fn install(
+            &self,
+            _context: PluginContext,
+        ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async { Ok(Arc::new("published-api".to_string())) })
         }
     }
 
@@ -2434,6 +2531,95 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_surfaces_publish_only_after_final_activation() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let release = Arc::new(Barrier::new(2));
+        let builder = complete_builder()
+            .await
+            .with_runtime(BlockingFirstSpawnRuntime {
+                blocked: AtomicBool::new(false),
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            })
+            .with_lifecycle(CaptureInstallClient { client: client_tx })
+            .with_plugin(PublicationProbePlugin);
+
+        let build = tokio::spawn(async move { builder.build().await });
+        let leaked_client = client_rx
+            .recv()
+            .await
+            .expect("captured install client")
+            .upgrade()
+            .expect("client under construction");
+        entered_rx.recv().await.expect("client service startup");
+
+        assert!(leaked_client.plugin::<PublicationProbePlugin>().is_none());
+        assert!(leaked_client.plugin_manifests().is_empty());
+        assert!(leaked_client.plugin_stats().is_none());
+        assert!(leaked_client.plugin_event_router().is_none());
+
+        release.wait();
+        let client = build
+            .await
+            .expect("builder task")
+            .expect("successful build")
+            .into_client();
+        assert_eq!(
+            client
+                .plugin::<PublicationProbePlugin>()
+                .as_deref()
+                .map(String::as_str),
+            Some("published-api")
+        );
+        assert_eq!(client.plugin_manifests().len(), 1);
+        assert!(client.plugin_stats().is_some());
+        assert!(client.plugin_event_router().is_some());
+        client.disconnect().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_construction_never_publishes_staged_plugin_surfaces() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let release = Arc::new(Barrier::new(2));
+        let builder = complete_builder()
+            .await
+            .with_runtime(BlockingFirstSpawnRuntime {
+                blocked: AtomicBool::new(false),
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            })
+            .with_lifecycle(CaptureInstallClient { client: client_tx })
+            .with_plugin(PublicationProbePlugin);
+
+        let build = tokio::spawn(async move { builder.build().await });
+        let leaked_client = client_rx
+            .recv()
+            .await
+            .expect("captured install client")
+            .upgrade()
+            .expect("client under construction");
+        entered_rx.recv().await.expect("client service startup");
+        leaked_client.signal_shutdown_sync();
+
+        assert!(leaked_client.plugin::<PublicationProbePlugin>().is_none());
+        assert!(leaked_client.plugin_manifests().is_empty());
+        assert!(leaked_client.plugin_stats().is_none());
+        assert!(leaked_client.plugin_event_router().is_none());
+
+        release.wait();
+        assert!(matches!(
+            build.await.expect("builder task"),
+            Err(ClientBuilderError::PluginInstall(_))
+        ));
+        assert!(leaked_client.plugin::<PublicationProbePlugin>().is_none());
+        assert!(leaked_client.plugin_manifests().is_empty());
+        assert!(leaked_client.plugin_stats().is_none());
+        assert!(leaked_client.plugin_event_router().is_none());
     }
 
     #[tokio::test]
@@ -3405,7 +3591,8 @@ mod tests {
         let client = build.into_client();
         wait_for_flag(&install_started).await;
         let host = client.plugin_host.as_ref().expect("plugin host").clone();
-        let resources = Arc::clone(&host.installed.get().expect("installed plugins")[0].resources);
+        let resources =
+            Arc::clone(&host.installed.get().expect("installed plugins").plugins[0].resources);
         let stats = client.plugin_stats().expect("plugin stats");
         assert_eq!(stats.health, PluginHealth::Healthy);
         assert_eq!(stats.plugins[0].state, PluginState::Active);

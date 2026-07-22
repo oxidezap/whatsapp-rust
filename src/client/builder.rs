@@ -516,6 +516,16 @@ impl ClientBuilder {
                 "client shutdown raced lifecycle activation"
             )));
         }
+        #[cfg(feature = "plugins")]
+        if let Some(plugin_host) = &client.plugin_host
+            && !plugin_host.publish_apis()
+        {
+            client.signal_shutdown_sync();
+            client.shutdown_lifecycle().await;
+            return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
+                "plugin APIs could not be published"
+            )));
+        }
         #[cfg(feature = "client-lifecycle")]
         construction.disarm();
         Ok(build)
