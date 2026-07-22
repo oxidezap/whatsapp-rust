@@ -169,6 +169,7 @@ pub(super) struct LifecycleRegistration {
     shutdown_notifier: ShutdownNotifier,
     callback_timeout: Duration,
     terminal: AtomicBool,
+    construction_transition: std::sync::Mutex<()>,
     construction_state: AtomicU8,
     construction_notifier: ShutdownNotifier,
 }
@@ -198,31 +199,32 @@ struct CallbackQueue {
 }
 
 impl CallbackQueue {
-    fn push_with_pressure_policy(
-        &mut self,
-        callback: LifecycleCallback,
-    ) -> Option<LifecycleCallback> {
-        if self.pending.len() < CALLBACK_QUEUE_TARGET_CAPACITY {
+    fn push_with_pressure_policy(&mut self, callback: LifecycleCallback) -> Vec<LifecycleCallback> {
+        if self.pending.len() < CALLBACK_QUEUE_TARGET_CAPACITY && !self.overflowed {
             self.pending.push_back(callback);
-            return None;
+            return Vec::new();
         }
 
-        self.overflowed = true;
-        let ready_position = self
-            .pending
-            .iter()
-            .position(|pending| matches!(pending, LifecycleCallback::Ready { .. }));
-        match (callback, ready_position) {
-            (callback @ LifecycleCallback::Ready { .. }, None) => Some(callback),
-            (callback, Some(position)) => {
-                let dropped = self.pending.remove(position);
+        self.overflowed |= self.pending.len() >= CALLBACK_QUEUE_TARGET_CAPACITY;
+        match callback {
+            callback @ LifecycleCallback::Ready { .. } => {
+                let mut dropped = Vec::new();
+                let mut retained = VecDeque::with_capacity(self.pending.len());
+                for pending in self.pending.drain(..) {
+                    if matches!(pending, LifecycleCallback::Ready { .. }) {
+                        dropped.push(pending);
+                    } else {
+                        retained.push_back(pending);
+                    }
+                }
+                self.pending = retained;
                 self.pending.push_back(callback);
                 dropped
             }
-            (callback, None) => {
-                // Every closed scope must reach the extension even when a callback stalls.
+            callback => {
+                // Closures are lossless, so the target remains soft under backlog.
                 self.pending.push_back(callback);
-                None
+                Vec::new()
             }
         }
     }
@@ -307,6 +309,7 @@ impl LifecycleRegistration {
             shutdown_notifier: ShutdownNotifier::new(),
             callback_timeout,
             terminal: AtomicBool::new(false),
+            construction_transition: std::sync::Mutex::new(()),
             construction_state: AtomicU8::new(CONSTRUCTION_INSTALLING),
             construction_notifier: ShutdownNotifier::new(),
         }
@@ -359,7 +362,22 @@ impl LifecycleRegistration {
     }
 
     pub(super) fn activate(&self) -> bool {
+        self.activate_with(|| true)
+    }
+
+    pub(super) fn activate_with(&self, commit: impl FnOnce() -> bool) -> bool {
+        let _transition = self
+            .construction_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.terminal.load(Ordering::Acquire) {
+            self.reject_construction();
+            return false;
+        }
+        if self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_ACTIVE {
+            return true;
+        }
+        if !commit() {
             self.reject_construction();
             return false;
         }
@@ -373,7 +391,7 @@ impl LifecycleRegistration {
             Err(CONSTRUCTION_ACTIVE) => {}
             Err(_) => return false,
         }
-        !self.terminal.load(Ordering::Acquire)
+        true
     }
 
     pub(super) async fn wait_until_active(&self) -> bool {
@@ -558,13 +576,20 @@ impl LifecycleRegistration {
     }
 
     pub(super) fn signal_shutdown_sync(&self) {
-        self.reject_construction();
-        let first_signal = if ready_publication_active(self) {
-            self.mark_terminal_and_cancel_scopes()
+        let first_signal = {
+            let _transition = self
+                .construction_transition
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.reject_construction();
+            !self.terminal.swap(true, Ordering::AcqRel)
+        };
+        if ready_publication_active(self) {
+            self.cancel_all_scopes()
         } else {
             let _publication = self.ready_publication();
-            self.mark_terminal_and_cancel_scopes()
-        };
+            self.cancel_all_scopes()
+        }
         if first_signal
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.handler.signal_shutdown();
@@ -579,7 +604,7 @@ impl LifecycleRegistration {
         let (should_spawn, dropped) = {
             let mut queue = self.callback_queue();
             if queue.shutdown_requested || self.terminal.load(Ordering::Acquire) {
-                (false, Some(callback))
+                (false, vec![callback])
             } else {
                 let dropped = queue.push_with_pressure_policy(callback);
                 let should_spawn = !queue.drain_scheduled;
@@ -587,7 +612,7 @@ impl LifecycleRegistration {
                 (should_spawn, dropped)
             }
         };
-        warn_dropped_callbacks(dropped.into_iter().collect());
+        warn_dropped_callbacks(dropped);
         self.spawn_callback_driver(should_spawn);
     }
 
@@ -753,8 +778,7 @@ impl LifecycleRegistration {
         }
     }
 
-    fn mark_terminal_and_cancel_scopes(&self) -> bool {
-        let first_signal = !self.terminal.swap(true, Ordering::AcqRel);
+    fn cancel_all_scopes(&self) {
         let scopes = self.scopes();
         if let Some(scope) = &scopes.active {
             scope.cancel();
@@ -762,7 +786,6 @@ impl LifecycleRegistration {
         for scope in &scopes.retired {
             scope.cancel();
         }
-        first_signal
     }
 
     fn scope_for(&self, generation: u64) -> Option<ConnectionScope> {
@@ -1253,6 +1276,58 @@ mod tests {
         assert!(!published.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn terminal_signal_waits_for_construction_commit() {
+        let registration = Arc::new(LifecycleRegistration::new(
+            Arc::new(RecordingLifecycle::default()),
+            Arc::new(TokioRuntime),
+        ));
+        let (commit_started_tx, commit_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_commit_tx, release_commit_rx) = std::sync::mpsc::sync_channel(1);
+        let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(1);
+        let activation_registration = registration.clone();
+        let activation = std::thread::spawn(move || {
+            let activated = activation_registration.activate_with(|| {
+                commit_started_tx.send(()).expect("publish commit start");
+                release_commit_rx.recv().expect("release publish commit");
+                true
+            });
+            activation_tx.send(activated).expect("activation result");
+        });
+        commit_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("construction commit started");
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown_registration = registration.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutdown_registration.signal_shutdown_sync();
+            shutdown_tx.send(()).expect("shutdown result");
+        });
+        assert!(
+            shutdown_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        release_commit_tx.send(()).expect("finish publish commit");
+        assert!(
+            activation_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("construction activated")
+        );
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal signal completed");
+        activation.join().expect("activation thread");
+        shutdown.join().expect("shutdown thread");
+        assert_eq!(
+            registration.construction_state.load(Ordering::Acquire),
+            CONSTRUCTION_ACTIVE
+        );
+        assert!(registration.terminal.load(Ordering::Acquire));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_cancellation_waits_for_ready_publication() {
         let registration = Arc::new(LifecycleRegistration::new(
@@ -1731,6 +1806,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn callback_queue_retains_latest_ready_with_lossless_close_backlog() {
+        let mut queue = CallbackQueue::default();
+        for generation in 1..=CALLBACK_QUEUE_TARGET_CAPACITY as u64 {
+            let scope = ConnectionScope::new(generation);
+            scope.close();
+            assert!(
+                queue
+                    .push_with_pressure_policy(LifecycleCallback::Closed(scope))
+                    .is_empty()
+            );
+        }
+
+        let (first_done, _first_completion) = async_channel::bounded(1);
+        assert!(
+            queue
+                .push_with_pressure_policy(LifecycleCallback::Ready {
+                    scope: ConnectionScope::new(100),
+                    done: first_done,
+                })
+                .is_empty()
+        );
+        assert_eq!(queue.pending.len(), CALLBACK_QUEUE_TARGET_CAPACITY + 1);
+
+        let (latest_done, _latest_completion) = async_channel::bounded(1);
+        let mut dropped = queue.push_with_pressure_policy(LifecycleCallback::Ready {
+            scope: ConnectionScope::new(101),
+            done: latest_done,
+        });
+        assert_eq!(dropped.len(), 1);
+        let dropped = dropped.pop().expect("older ready callback is replaceable");
+        assert!(matches!(
+            dropped,
+            LifecycleCallback::Ready { scope, .. } if scope.generation() == 100
+        ));
+
+        let extra_closed = ConnectionScope::new(102);
+        extra_closed.close();
+        assert!(
+            queue
+                .push_with_pressure_policy(LifecycleCallback::Closed(extra_closed))
+                .is_empty()
+        );
+        assert_eq!(queue.pending.len(), CALLBACK_QUEUE_TARGET_CAPACITY + 2);
+        assert_eq!(
+            queue
+                .pending
+                .iter()
+                .filter(|callback| matches!(callback, LifecycleCallback::Ready { .. }))
+                .count(),
+            1
+        );
+        assert!(queue.pending.iter().any(|callback| {
+            matches!(callback, LifecycleCallback::Ready { scope, .. } if scope.generation() == 101)
+        }));
+    }
+
     #[tokio::test]
     async fn callback_queue_preserves_every_scope_closure_before_shutdown() {
         let (ready_started_tx, ready_started_rx) = async_channel::bounded(1);
@@ -1773,7 +1905,7 @@ mod tests {
         }
         assert_eq!(
             registration.callback_queue().pending.len(),
-            usize::try_from(closed_callbacks).expect("closure count fits usize")
+            usize::try_from(closed_callbacks + 1).expect("callback count fits usize")
         );
 
         let shutdown_registration = registration.clone();

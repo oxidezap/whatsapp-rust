@@ -278,6 +278,8 @@ pub struct PluginStats {
 pub struct PluginHostStats {
     pub terminal: bool,
     pub health: PluginHealth,
+    pub upstream_callback_failures: u64,
+    pub upstream_callback_timeouts: u64,
     pub plugins: Vec<PluginStats>,
     pub event_router: Option<PluginEventRouterStats>,
 }
@@ -407,12 +409,23 @@ impl PluginResources {
         })
     }
 
+    #[cfg(test)]
     fn activate(&self) {
+        self.prepare_activation();
+        self.publish_activation();
+    }
+
+    fn prepare_activation(&self) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
         self.active.store(true, Ordering::Release);
-        self.activation.notify();
+    }
+
+    fn publish_activation(&self) {
+        if self.active.load(Ordering::Acquire) && !self.closed.load(Ordering::Acquire) {
+            self.activation.notify();
+        }
     }
 
     fn ensure_active(&self) -> Result<(), PluginResourceError> {
@@ -809,6 +822,12 @@ struct PluginCoreEventHandler {
 
 impl EventHandler for PluginCoreEventHandler {
     fn handle_event(&self, event: Arc<wacore::types::events::Event>) {
+        let Some(resources) = self.resources.upgrade() else {
+            return;
+        };
+        if resources.ensure_active().is_err() {
+            return;
+        }
         let Some(inner) = &self.inner else {
             return;
         };
@@ -1570,6 +1589,8 @@ pub(crate) struct PluginHost {
     terminal: AtomicBool,
     terminal_notifier: ShutdownNotifier,
     installing_resources: Mutex<Vec<Weak<PluginResources>>>,
+    upstream_callback_failures: AtomicU64,
+    upstream_callback_timeouts: AtomicU64,
 }
 
 impl PluginHost {
@@ -1614,6 +1635,8 @@ impl PluginHost {
             terminal: AtomicBool::new(false),
             terminal_notifier: ShutdownNotifier::new(),
             installing_resources: Mutex::new(Vec::new()),
+            upstream_callback_failures: AtomicU64::new(0),
+            upstream_callback_timeouts: AtomicU64::new(0),
         })
     }
 
@@ -1638,6 +1661,8 @@ impl PluginHost {
 
     pub(crate) fn stats(&self) -> PluginHostStats {
         let terminal = self.terminal.load(Ordering::Acquire);
+        let upstream_callback_failures = self.upstream_callback_failures.load(Ordering::Relaxed);
+        let upstream_callback_timeouts = self.upstream_callback_timeouts.load(Ordering::Relaxed);
         let plugins = self
             .manifests
             .iter()
@@ -1650,9 +1675,11 @@ impl PluginHost {
                 diagnostics.snapshot(&manifest.id, terminal, events)
             })
             .collect::<Vec<_>>();
-        let health = if plugins
-            .iter()
-            .any(|plugin| plugin.health == PluginHealth::Degraded)
+        let health = if upstream_callback_failures > 0
+            || upstream_callback_timeouts > 0
+            || plugins
+                .iter()
+                .any(|plugin| plugin.health == PluginHealth::Degraded)
         {
             PluginHealth::Degraded
         } else {
@@ -1661,6 +1688,8 @@ impl PluginHost {
         PluginHostStats {
             terminal,
             health,
+            upstream_callback_failures,
+            upstream_callback_timeouts,
             plugins,
             event_router: self.event_router.as_ref().map(PluginEventRouter::stats),
         }
@@ -1933,23 +1962,11 @@ impl PluginHost {
         }
     }
 
-    pub(crate) fn activate(&self) -> bool {
+    pub(crate) fn commit(&self) -> bool {
         if self.terminal.load(Ordering::Acquire) {
             self.close_installed_resources();
             return false;
         }
-        for plugin in self.installed_plugins() {
-            plugin.resources.activate();
-        }
-        if self.terminal.load(Ordering::Acquire) {
-            self.close_installed_resources();
-            false
-        } else {
-            true
-        }
-    }
-
-    pub(crate) fn publish_apis(&self) -> bool {
         let Some(installed) = self.installed.get() else {
             return false;
         };
@@ -1957,16 +1974,22 @@ impl PluginHost {
             .staged_apis
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(apis) = staged.take() else {
-            return self.apis.get().is_some();
-        };
-        match self.apis.set(apis) {
-            Ok(()) => true,
-            Err(apis) => {
-                *staged = Some(apis);
-                false
-            }
+        if let Some(apis) = staged.take()
+            && let Err(apis) = self.apis.set(apis)
+        {
+            *staged = Some(apis);
+            return false;
         }
+        if self.apis.get().is_none() {
+            return false;
+        }
+        for plugin in &installed.plugins {
+            plugin.resources.prepare_activation();
+        }
+        for plugin in &installed.plugins {
+            plugin.resources.publish_activation();
+        }
+        true
     }
 
     fn close_installed_resources(&self) {
@@ -1984,6 +2007,26 @@ impl PluginHost {
         })?;
         bounded_plugin_callback(&**runtime, self.callback_timeout, make_future).await
     }
+
+    fn record_upstream_callback(&self, result: &Result<(), PluginCallbackError>) {
+        match result {
+            Ok(()) => {}
+            Err(PluginCallbackError::Timeout { .. }) => {
+                self.upstream_callback_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PluginCallbackError::TimeoutCancellationPanic { .. }) => {
+                self.upstream_callback_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                self.upstream_callback_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PluginCallbackError::Callback(_)) => {
+                self.upstream_callback_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 impl ClientLifecycle for PluginHost {
@@ -1994,10 +2037,12 @@ impl ClientLifecycle for PluginHost {
     fn on_ready(&self, scope: ConnectionScope) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
             let mut failures = Vec::new();
-            if let Some(upstream) = &self.upstream
-                && let Err(error) = self.run_callback(|| upstream.on_ready(scope.clone())).await
-            {
-                failures.push(format!("upstream: {error:#}"));
+            if let Some(upstream) = &self.upstream {
+                let result = self.run_callback(|| upstream.on_ready(scope.clone())).await;
+                self.record_upstream_callback(&result);
+                if let Err(error) = result {
+                    failures.push(format!("upstream: {error:#}"));
+                }
             }
             for plugin in self.installed_plugins() {
                 let task_tracker = plugin
@@ -2062,10 +2107,12 @@ impl ClientLifecycle for PluginHost {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
-            if let Some(upstream) = &self.upstream
-                && let Err(error) = self.run_callback(|| upstream.on_closed(scope)).await
-            {
-                failures.push(format!("upstream: {error:#}"));
+            if let Some(upstream) = &self.upstream {
+                let result = self.run_callback(|| upstream.on_closed(scope)).await;
+                self.record_upstream_callback(&result);
+                if let Err(error) = result {
+                    failures.push(format!("upstream: {error:#}"));
+                }
             }
             finish_callbacks("closed", failures)
         })
@@ -2082,6 +2129,8 @@ impl ClientLifecycle for PluginHost {
         if let Some(upstream) = &self.upstream
             && std::panic::catch_unwind(AssertUnwindSafe(|| upstream.signal_shutdown())).is_err()
         {
+            self.upstream_callback_failures
+                .fetch_add(1, Ordering::Relaxed);
             log::warn!("Upstream lifecycle synchronous shutdown signal panicked");
         }
     }
@@ -2105,10 +2154,12 @@ impl ClientLifecycle for PluginHost {
                     failures.push(format!("{}: {error:#}", plugin.manifest.id));
                 }
             }
-            if let Some(upstream) = &self.upstream
-                && let Err(error) = self.run_callback(|| upstream.shutdown()).await
-            {
-                failures.push(format!("upstream: {error:#}"));
+            if let Some(upstream) = &self.upstream {
+                let result = self.run_callback(|| upstream.shutdown()).await;
+                self.record_upstream_callback(&result);
+                if let Err(error) = result {
+                    failures.push(format!("upstream: {error:#}"));
+                }
             }
             finish_callbacks("shutdown", failures)
         })
@@ -3938,6 +3989,11 @@ mod tests {
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec!["ready:ready-probe"]
         );
+        let stats = client.plugin_stats().expect("plugin host stats");
+        assert_eq!(stats.health, PluginHealth::Degraded);
+        assert_eq!(stats.upstream_callback_failures, 1);
+        assert_eq!(stats.upstream_callback_timeouts, 0);
+        assert_eq!(stats.plugins[0].health, PluginHealth::Healthy);
         client.disconnect().await;
     }
 

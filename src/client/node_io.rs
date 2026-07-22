@@ -679,6 +679,7 @@ impl Client {
         tracing::instrument(name = "wa.conn.success", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_success(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
+        #[cfg(feature = "client-lifecycle")]
         let login_transition = self
             .login_transition
             .lock()
@@ -713,6 +714,7 @@ impl Client {
                 return;
             }
         }
+        #[cfg(feature = "client-lifecycle")]
         drop(login_transition);
 
         info!(

@@ -114,6 +114,7 @@ impl Client {
             }
         }
 
+        #[cfg(feature = "client-lifecycle")]
         let _login_transition = self
             .login_transition
             .lock()
@@ -228,6 +229,7 @@ impl Client {
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
             is_logged_in: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "client-lifecycle")]
             login_transition: std::sync::Mutex::new(()),
             is_connecting: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
@@ -940,6 +942,7 @@ impl Client {
     }
 
     async fn cleanup_connection_state_inner(&self) {
+        #[cfg(feature = "client-lifecycle")]
         let login_transition = self
             .login_transition
             .lock()
@@ -984,6 +987,7 @@ impl Client {
         // outgoing stanzas, which are transport-scoped.
         self.clear_sent_node_waiters();
         self.is_logged_in.store(false, Ordering::Relaxed);
+        #[cfg(feature = "client-lifecycle")]
         drop(login_transition);
         self.is_ready.store(false, Ordering::Relaxed);
         // Publish the disconnected state BEFORE draining VoIP calls (it used to be cleared only after

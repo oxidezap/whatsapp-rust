@@ -490,41 +490,29 @@ impl ClientBuilder {
             );
             let _ = build.client.saver_handle.set(saver_handle);
         }
-        #[cfg(feature = "plugins")]
-        if let Some(plugin_host) = &client.plugin_host
-            && !plugin_host.activate()
-        {
-            client.signal_shutdown_sync();
-            client.shutdown_lifecycle().await;
-            return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
-                "client shutdown began before plugin activation"
-            )));
-        }
         #[cfg(feature = "client-lifecycle")]
-        if let Some(lifecycle) = &client.lifecycle
-            && !lifecycle.activate()
-        {
-            client.signal_shutdown_sync();
-            client.shutdown_lifecycle().await;
+        if let Some(lifecycle) = &client.lifecycle {
             #[cfg(feature = "plugins")]
-            if client.plugin_host.is_some() {
-                return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
-                    "client shutdown raced plugin activation"
+            let activated = if let Some(plugin_host) = &client.plugin_host {
+                lifecycle.activate_with(|| plugin_host.commit())
+            } else {
+                lifecycle.activate()
+            };
+            #[cfg(not(feature = "plugins"))]
+            let activated = lifecycle.activate();
+            if !activated {
+                client.signal_shutdown_sync();
+                client.shutdown_lifecycle().await;
+                #[cfg(feature = "plugins")]
+                if client.plugin_host.is_some() {
+                    return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
+                        "client shutdown raced plugin publication"
+                    )));
+                }
+                return Err(ClientBuilderError::LifecycleInstall(anyhow::anyhow!(
+                    "client shutdown raced lifecycle activation"
                 )));
             }
-            return Err(ClientBuilderError::LifecycleInstall(anyhow::anyhow!(
-                "client shutdown raced lifecycle activation"
-            )));
-        }
-        #[cfg(feature = "plugins")]
-        if let Some(plugin_host) = &client.plugin_host
-            && !plugin_host.publish_apis()
-        {
-            client.signal_shutdown_sync();
-            client.shutdown_lifecycle().await;
-            return Err(ClientBuilderError::PluginInstall(anyhow::anyhow!(
-                "plugin APIs could not be published"
-            )));
         }
         #[cfg(feature = "client-lifecycle")]
         construction.disarm();

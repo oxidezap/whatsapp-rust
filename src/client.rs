@@ -704,6 +704,7 @@ pub struct Client {
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
     pub(crate) is_logged_in: Arc<AtomicBool>,
+    #[cfg(feature = "client-lifecycle")]
     pub(crate) login_transition: std::sync::Mutex<()>,
     pub(crate) is_connecting: Arc<AtomicBool>,
     pub(crate) is_running: Arc<AtomicBool>,
