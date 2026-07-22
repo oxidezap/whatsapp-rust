@@ -186,24 +186,23 @@ impl Client {
         let mut fetched_devices = Vec::with_capacity(response.device_lists.len());
         let mut device_records: Vec<wacore::store::traits::DeviceListRecord> =
             Vec::with_capacity(response.device_lists.len());
+        struct PendingIdentityReset<'a> {
+            user: &'a Jid,
+            previous: wacore::store::traits::DeviceListRecord,
+            invalidate_registry: bool,
+        }
+        // Identity changes are rare, so this stays allocation-free for the
+        // ordinary response. More importantly, deferring the destructive work
+        // lets an authoritative refresh validate every user before any prior
+        // Signal sessions or registry snapshot are discarded.
+        let mut pending_identity_resets = Vec::new();
 
         for user_list in &response.device_lists {
             // Update device registry (single source of truth for device lists).
             // Preserve key_index values from existing records (set via account_sync)
             // Use alias-aware lookup (resolves LID ↔ PN) to find
             // existing record regardless of which key it was stored under
-            let existing_record = self.load_device_record(&user_list.user.user).await;
-
-            let mut existing_key_indices: std::collections::HashMap<u32, Option<u32>> =
-                existing_record
-                    .as_ref()
-                    .map(|r| {
-                        r.devices
-                            .iter()
-                            .map(|d| (d.device_id, d.key_index))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+            let mut existing_record = self.load_device_record(&user_list.user.user).await;
 
             // Decode key-index-list if present (WA Web: handleKeyIndexResult)
             let decoded_key_index = user_list
@@ -214,32 +213,29 @@ impl Client {
             // Check raw_id mismatch for identity change detection
             // TODO: also check advAccountType mismatch (see patch_device_add TODO)
             let mut raw_id = decoded_key_index.as_ref().map(|d| d.raw_id);
-            if let Some(ref decoded) = decoded_key_index
+            let pending_identity_reset = if let Some(ref decoded) = decoded_key_index
                 && let Some(ref existing) = existing_record
                 && let Some(stored_raw_id) = existing.raw_id
                 && stored_raw_id != decoded.raw_id
             {
                 log::info!(
-                    "raw_id mismatch for user {} in usync: stored={stored_raw_id}, received={}. Clearing record.",
+                    "raw_id mismatch for user {} in usync: stored={stored_raw_id}, received={}. Scheduling record reset.",
                     user_list.user.user,
                     decoded.raw_id
                 );
-                self.clear_device_record(
-                    &user_list.user.user,
-                    user_list.user.server.as_str(),
-                    existing,
-                )
-                .await;
-                // Old key indices are from the previous identity — don't reuse
-                existing_key_indices.clear();
-            }
+                existing_record.take()
+            } else {
+                None
+            };
 
             // Preserve raw_id from existing when usync didn't provide one
-            // (no key-index-list) and no mismatch cleared the indices.
-            // existing_key_indices is empty after a mismatch clear, so this
-            // correctly skips preservation after identity change.
-            if raw_id.is_none() && !existing_key_indices.is_empty() {
-                raw_id = existing_record.as_ref().and_then(|r| r.raw_id);
+            // (no key-index-list). An identity change takes the old record out
+            // above, so its raw_id and key indices cannot leak into the new one.
+            if raw_id.is_none() {
+                raw_id = existing_record
+                    .as_ref()
+                    .filter(|record| !record.devices.is_empty())
+                    .and_then(|record| record.raw_id);
             }
 
             let mut devices: Vec<wacore::store::traits::DeviceInfo> = user_list
@@ -248,10 +244,16 @@ impl Client {
                 .map(|d| {
                     // Server-returned key_index takes priority over cached
                     let key_index = d.key_index.or_else(|| {
-                        existing_key_indices
-                            .get(&(d.device as u32))
-                            .copied()
-                            .flatten()
+                        // Accounts ordinarily have only a handful of companion
+                        // devices; a short scan avoids allocating a HashMap for
+                        // every user in a large fanout response.
+                        existing_record.as_ref().and_then(|record| {
+                            record
+                                .devices
+                                .iter()
+                                .find(|cached| cached.device_id == d.device as u32)
+                                .and_then(|cached| cached.key_index)
+                        })
                     });
                     wacore::store::traits::DeviceInfo::new(d.device as u32, key_index)
                         .with_hosting(d.is_hosted)
@@ -274,7 +276,25 @@ impl Client {
                         user_list.user
                     );
                 }
+                if let Some(previous) = pending_identity_reset {
+                    pending_identity_resets.push(PendingIdentityReset {
+                        user: &user_list.user,
+                        previous,
+                        // No replacement record will be written. Keeping the old
+                        // snapshot would pair a new identity with stale devices
+                        // and suppress the next authoritative network fetch.
+                        invalidate_registry: true,
+                    });
+                }
                 continue;
+            }
+
+            if let Some(previous) = pending_identity_reset {
+                pending_identity_resets.push(PendingIdentityReset {
+                    user: &user_list.user,
+                    previous,
+                    invalidate_registry: false,
+                });
             }
 
             // Convert filtered DeviceInfo list back to JIDs for return
@@ -290,6 +310,21 @@ impl Client {
                 phash: user_list.phash.clone(),
                 raw_id,
             });
+        }
+
+        // All strict validation has completed. Apply identity cleanup before
+        // publishing replacement snapshots so no send can pair a new registry
+        // record with sessions established under the previous identity.
+        for reset in pending_identity_resets {
+            self.clear_device_record(
+                &reset.user.user,
+                reset.user.server.as_str(),
+                &reset.previous,
+            )
+            .await;
+            if reset.invalidate_registry {
+                self.invalidate_device_cache(&reset.user.user).await;
+            }
         }
 
         // One batched backend write for the whole usync response — for
@@ -400,7 +435,9 @@ mod tests {
     use super::*;
     use crate::cache::Freshness;
     use crate::test_utils::create_test_client;
+    use wacore::libsignal::protocol::{ProtocolAddress, SessionRecord};
     use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+    use wacore::types::jid::JidExt;
 
     fn signed_key_index_bytes(valid_indexes: Vec<u32>, current_index: u32) -> Vec<u8> {
         let key_index = waproto::whatsapp::ADVKeyIndexList {
@@ -415,6 +452,24 @@ mod tests {
             ..Default::default()
         };
         waproto::codec::adv_signed_key_index_list_to_vec(&signed)
+    }
+
+    async fn seed_fresh_session(client: &Client, jid: &Jid) -> ProtocolAddress {
+        let address = jid.to_protocol_address();
+        client
+            .signal_cache
+            .put_session(&address, SessionRecord::new_fresh())
+            .await;
+        address
+    }
+
+    async fn has_session(client: &Client, address: &ProtocolAddress) -> bool {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        client
+            .signal_cache
+            .has_session(address, &*snapshot.backend)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -767,6 +822,109 @@ mod tests {
             .expect("a rejected refresh must preserve the previous snapshot");
         assert_eq!(preserved.len(), 2);
         assert!(preserved.iter().any(|device| device.device == 7));
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_defers_identity_cleanup_for_every_user() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let identity_changed = Jid::pn("4444444451");
+        let invalid = Jid::pn("4444444452");
+
+        for (user, raw_id) in [(&identity_changed, 2), (&invalid, 1)] {
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.to_string(),
+                    devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                    timestamp: wacore::time::now_secs(),
+                    phash: Some("2:previous".to_string()),
+                    raw_id: Some(raw_id),
+                })
+                .await
+                .unwrap();
+        }
+
+        let previous_session = seed_fresh_session(&client, &identity_changed.with_device(7)).await;
+        let response = DeviceListResponse {
+            device_lists: vec![
+                UserDeviceList {
+                    user: identity_changed.clone(),
+                    // A primary device survives key-index filtering, so this
+                    // first user schedules a valid identity replacement.
+                    devices: vec![UsyncDevice::new(0, None)],
+                    phash: Some("1:changed".to_string()),
+                    key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
+                },
+                UserDeviceList {
+                    user: invalid,
+                    // The second user makes the authoritative response invalid
+                    // only after key-index projection.
+                    devices: vec![UsyncDevice::new(7, Some(3))],
+                    phash: Some("1:invalid".to_string()),
+                    key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
+                },
+            ],
+            lid_mappings: Vec::new(),
+        };
+
+        client
+            .process_device_list_response(&response, Freshness::Refresh)
+            .await
+            .expect_err("the second user must reject the whole authoritative refresh");
+
+        assert!(
+            has_session(&client, &previous_session).await,
+            "validation failure must not partially clear an earlier user's sessions"
+        );
+        let preserved = client
+            .get_devices_from_registry(&identity_changed)
+            .await
+            .expect("validation failure must preserve the earlier registry snapshot");
+        assert!(preserved.iter().any(|device| device.device == 7));
+    }
+
+    #[tokio::test]
+    async fn filtered_identity_change_invalidates_the_stale_registry() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("4444444453");
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.to_string(),
+                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                timestamp: wacore::time::now_secs(),
+                phash: Some("2:previous".to_string()),
+                raw_id: Some(2),
+            })
+            .await
+            .unwrap();
+        let previous_session = seed_fresh_session(&client, &user.with_device(7)).await;
+
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(7, Some(3))],
+                phash: Some("1:changed".to_string()),
+                key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
+            }],
+            lid_mappings: Vec::new(),
+        };
+
+        let fetched = client
+            .process_device_list_response(&response, Freshness::CachePreferred)
+            .await
+            .unwrap();
+        assert!(fetched.is_empty());
+        assert!(
+            !has_session(&client, &previous_session).await,
+            "an accepted identity change must clear sessions from the old identity"
+        );
+        assert!(
+            client.get_devices_from_registry(&user).await.is_none(),
+            "without a replacement snapshot, the stale registry must be invalidated"
+        );
     }
 
     /// The batched LID-PN learn path warms the in-memory cache SYNCHRONOUSLY

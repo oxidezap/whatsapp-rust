@@ -346,16 +346,35 @@ impl<'a> Groups<'a> {
             .await?
         {
             GroupInfoOutcome::NotModified => {
-                let info = match cached {
-                    Some(cached) => cached,
-                    None => Arc::new(persisted.ok_or_else(|| {
+                // A participant notification can replace or invalidate the
+                // snapshot while the IQ is in flight. Prefer whatever is current
+                // after the response instead of re-inserting the stale Arc whose
+                // phash was sent before the request.
+                if let Some(current) = cache.get(jid).await {
+                    return Ok(current);
+                }
+
+                if cached.is_some() {
+                    // The warm snapshot used for the conditional request was
+                    // invalidated concurrently. A full query is the only safe
+                    // fallback; resurrecting it would lose the notification.
+                    match self.client.execute(GroupQueryIq::new(jid)).await? {
+                        GroupInfoOutcome::Full(group) => *group,
+                        GroupInfoOutcome::NotModified => {
+                            return Err(GroupError::InvalidRequest(
+                                "group query returned not-modified without a phash".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    let info = Arc::new(persisted.ok_or_else(|| {
                         GroupError::InvalidRequest(
                             "server returned not-modified group but nothing was cached".into(),
                         )
-                    })?),
-                };
-                cache.insert(jid.clone(), info.clone()).await;
-                return Ok(info);
+                    })?);
+                    cache.insert(jid.clone(), info.clone()).await;
+                    return Ok(info);
+                }
             }
             GroupInfoOutcome::Full(group) => *group,
         };
