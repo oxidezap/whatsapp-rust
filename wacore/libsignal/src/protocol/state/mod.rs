@@ -8,6 +8,6 @@ mod signed_prekey;
 
 pub use bundle::{PreKeyBundle, PreKeyBundleContent};
 pub use prekey::{PreKeyId, PreKeyRecord};
-pub(crate) use session::DecryptSnapshot;
+pub(crate) use session::{DecryptSnapshot, ReceiverChainState};
 pub use session::{InvalidSessionError, SessionRecord, SessionState};
 pub use signed_prekey::{GenericSignedPreKey, SignedPreKeyId, SignedPreKeyRecord};

@@ -75,7 +75,7 @@ const fn forward_jump_limit(is_self: bool) -> usize {
 }
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey, UsePQRatchet};
-use crate::protocol::state::{DecryptSnapshot, PreKeyId, SessionState};
+use crate::protocol::state::{DecryptSnapshot, PreKeyId, ReceiverChainState, SessionState};
 use crate::protocol::{
     CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
     PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionCheckout,
@@ -1281,7 +1281,8 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let counter = message.counter();
 
     // Deferring the common in-order advance keeps cancellation rollback free.
-    if let Some(chain_key) = state.get_receiver_chain_key(&their_ephemeral)?
+    let receiver_chain = state.receiver_chain_state(&their_ephemeral)?;
+    if let Some(ReceiverChainState::Open(chain_key)) = receiver_chain
         && chain_key.index() == counter
     {
         let (message_key_gen, next_chain) = chain_key.step_with_message_keys()?;
@@ -1312,6 +1313,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         remote_address,
         csprng,
         &their_ephemeral,
+        receiver_chain,
         counter,
     );
     match result {
@@ -1335,10 +1337,30 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
     csprng: &mut R,
     their_ephemeral: &PublicKey,
+    receiver_chain: Option<ReceiverChainState>,
     counter: u32,
 ) -> Result<Vec<u8>> {
+    if let Some(ReceiverChainState::Closed { next_index }) = receiver_chain {
+        if counter >= next_index {
+            return Err(SignalProtocolError::InvalidSessionStructure(
+                "receiver chain is closed",
+            ));
+        }
+        let message_key_gen = state
+            .get_message_keys(their_ephemeral, counter)?
+            .ok_or(SignalProtocolError::DuplicatedMessage(next_index, counter))?;
+        return decrypt_with_message_keys(
+            current_or_previous,
+            state,
+            ciphertext,
+            original_message_type,
+            remote_address,
+            message_key_gen,
+        );
+    }
+
     let (chain_key, deferred_ratchet) =
-        get_or_create_chain_key(state, their_ephemeral, remote_address)?;
+        get_or_create_chain_key(state, their_ephemeral, remote_address, receiver_chain)?;
 
     let message_key_gen = get_or_create_message_key(
         state,
@@ -1460,9 +1482,16 @@ fn get_or_create_chain_key(
     state: &mut SessionState,
     their_ephemeral: &PublicKey,
     remote_address: &ProtocolAddress,
+    receiver_chain: Option<ReceiverChainState>,
 ) -> Result<(ChainKey, Option<DeferredSenderRatchet>)> {
-    if let Some(chain) = state.get_receiver_chain_key(their_ephemeral)? {
-        return Ok((chain, None));
+    match receiver_chain {
+        Some(ReceiverChainState::Open(chain)) => return Ok((chain, None)),
+        Some(ReceiverChainState::Closed { .. }) => {
+            return Err(SignalProtocolError::InvalidSessionStructure(
+                "receiver chain is closed",
+            ));
+        }
+        None => {}
     }
 
     log::debug!("{remote_address} creating new chains.");
@@ -1942,6 +1971,100 @@ mod tests {
             bob_prekeys,
             bob_signed,
         }
+    }
+
+    #[test]
+    fn closed_receiver_chain_can_consume_a_persisted_skipped_key() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        futures::executor::block_on(async {
+            let reply = message_encrypt(
+                b"ratchet reply",
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+            )
+            .await
+            .expect("encrypt reply");
+            let CiphertextMessage::SignalMessage(reply) = reply else {
+                panic!("established responder sends a signal message");
+            };
+            message_decrypt_signal(
+                &reply,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+                &mut rng,
+            )
+            .await
+            .expect("decrypt reply");
+
+            let first = message_encrypt(
+                b"first",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt first");
+            let second = message_encrypt(
+                b"second",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt second");
+            let CiphertextMessage::SignalMessage(first) = first else {
+                panic!("pending pre-key was acknowledged");
+            };
+            let CiphertextMessage::SignalMessage(second) = second else {
+                panic!("pending pre-key was acknowledged");
+            };
+
+            message_decrypt_signal(
+                &second,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect("decrypt out of order");
+
+            let stored = tp
+                .bob_sessions
+                .0
+                .remove(tp.alice_addr.as_str())
+                .expect("stored session");
+            let mut components = stored.into_components().expect("components");
+            let current = components.current_session.as_mut().expect("current");
+            let receiver = current
+                .receiver_chains
+                .iter_mut()
+                .find(|chain| {
+                    chain.sender_ratchet_key.as_deref()
+                        == Some(first.sender_ratchet_key().serialize().as_slice())
+                })
+                .expect("matching receiver chain");
+            receiver.chain_key.as_mut().expect("chain key").key = None;
+            tp.bob_sessions.0.insert(
+                tp.alice_addr.as_str().to_owned(),
+                SessionRecord::from_components(components).expect("closed-chain record"),
+            );
+
+            let decrypted = message_decrypt_signal(
+                &first,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect("consume skipped key from closed chain");
+            assert_eq!(decrypted.plaintext, b"first");
+        });
     }
 
     #[test]
