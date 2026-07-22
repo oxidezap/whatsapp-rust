@@ -424,13 +424,6 @@ impl Client {
                 }
             }))
             .detach();
-
-        let cleanup_shutdown = self.shutdown_signal();
-        self.runtime
-            .spawn(Box::pin(async move {
-                Client::device_registry_cleanup_loop(cleanup_shutdown).await;
-            }))
-            .detach();
     }
 
     // Deliberately NOT instrumented: this span would live for the entire client

@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
         let build = assembly.start();
-        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
         build.into_client().signal_shutdown_sync();
     }
 
@@ -1102,7 +1102,7 @@ mod tests {
                 .is_some_and(|installed| Arc::ptr_eq(installed, &meter))
         );
         assert!(client.saver_handle.get().is_some());
-        assert_eq!(spawns.load(Ordering::SeqCst), 4);
+        assert_eq!(spawns.load(Ordering::SeqCst), 3);
         client.signal_shutdown_sync();
     }
 
