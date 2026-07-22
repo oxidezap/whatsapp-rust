@@ -961,12 +961,18 @@ impl Client {
             .collect()
     }
 
-    /// Background loop placeholder for device registry cleanup.
-    /// Note: Cleanup functionality was removed as part of trait simplification.
-    /// Device registry entries are managed through normal update/get operations.
-    pub(super) async fn device_registry_cleanup_loop(&self) {
-        // Simply wait for shutdown signal
-        self.shutdown_notifier.listen().await;
+    /// Background task placeholder: waits for the shutdown signal, then exits.
+    /// (Cleanup was removed with trait simplification; entries are managed via
+    /// normal update/get.) Holds the client Weak, not strong, so it never keeps
+    /// the client - and its store's file handle - alive past teardown, exactly
+    /// like the event-delivery drainer's `Arc::downgrade`.
+    pub(super) async fn device_registry_cleanup_loop(client: std::sync::Weak<Self>) {
+        // Grab the 'static shutdown future without holding the client across the
+        // wait; if the client is already gone there is nothing to wait for.
+        let Some(shutdown) = client.upgrade().map(|c| c.shutdown_notifier.listen()) else {
+            return;
+        };
+        shutdown.await;
         debug!(
             target: "Client/DeviceRegistry",
             "Shutdown signaled, exiting cleanup loop"

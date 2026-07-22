@@ -314,12 +314,11 @@ impl Client {
             }))
             .detach();
 
-        // Start background task to clean up stale device registry entries
-        let cleanup_arc = arc.clone();
+        // Background shutdown-awaiter; Weak so it never pins the client (and its
+        // store handle) past teardown, like the event drainer's downgrade.
+        let cleanup_weak = Arc::downgrade(&arc);
         arc.runtime
-            .spawn(Box::pin(async move {
-                cleanup_arc.device_registry_cleanup_loop().await;
-            }))
+            .spawn(Box::pin(Self::device_registry_cleanup_loop(cleanup_weak)))
             .detach();
 
         (arc, rx)
