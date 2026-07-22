@@ -970,7 +970,7 @@ pub fn parse_message_info(
             ..Default::default()
         }
     } else if from.matches_user_or_lid(own_jid, own_lid) {
-        let recipient = attrs.optional_jid("recipient");
+        let recipient = attrs.optional_jid_result("recipient")?;
         let chat = recipient
             .as_ref()
             .map(|r| r.to_non_ad())
@@ -1330,6 +1330,11 @@ mod parse_message_info_tests {
                 .attr("from", "120363021033254949@g.us")
                 .attr("participant", "not-a-jid")
                 .attr("id", "INVALID-PARTICIPANT")
+                .build(),
+            NodeBuilder::new("message")
+                .attr("from", "559900000000:4@s.whatsapp.net")
+                .attr("recipient", "not-a-jid")
+                .attr("id", "INVALID-SELF-RECIPIENT")
                 .build(),
         ];
 

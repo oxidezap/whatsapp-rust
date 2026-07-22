@@ -4568,24 +4568,13 @@ async fn test_enc_count_preseeds_retry_cache() {
     let chat_jid: Jid = "5551234567@s.whatsapp.net".parse().unwrap();
     let msg_id = "ENC_COUNT_MSG1";
 
-    // Pre-seed via the same logic used in handle_incoming_message
     let max_sender_retry_count: u8 = 3;
     let cache_key = client
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
-    // Insert only if absent (get-then-insert; the cache has no atomic upsert)
-    if client
-        .message_retry_counts
-        .get(&cache_key)
-        .await
-        .map(|(c, _)| c)
-        .is_none()
-    {
-        client
-            .message_retry_counts
-            .insert(cache_key.clone(), (max_sender_retry_count, None))
-            .await;
-    }
+    client
+        .preseed_retry_count(&cache_key, max_sender_retry_count)
+        .await;
 
     assert_eq!(
         client
@@ -4611,18 +4600,9 @@ async fn test_enc_no_count_cache_empty() {
         let cache_key = client
             .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
             .await;
-        if client
-            .message_retry_counts
-            .get(&cache_key)
-            .await
-            .map(|(c, _)| c)
-            .is_none()
-        {
-            client
-                .message_retry_counts
-                .insert(cache_key, (max_sender_retry_count, None))
-                .await;
-        }
+        client
+            .preseed_retry_count(&cache_key, max_sender_retry_count)
+            .await;
     }
 
     let cache_key = client
@@ -4656,20 +4636,10 @@ async fn test_enc_count_does_not_overwrite_higher() {
         .insert(cache_key.clone(), (4, None))
         .await;
 
-    // max(existing, incoming) should NOT overwrite with a lower value
     let max_sender_retry_count: u8 = 2;
-    let existing = client
-        .message_retry_counts
-        .get(&cache_key)
-        .await
-        .map(|(c, _)| c)
-        .unwrap_or(0);
-    if max_sender_retry_count > existing {
-        client
-            .message_retry_counts
-            .insert(cache_key.clone(), (max_sender_retry_count, None))
-            .await;
-    }
+    client
+        .preseed_retry_count(&cache_key, max_sender_retry_count)
+        .await;
 
     assert_eq!(
         client
@@ -4693,36 +4663,47 @@ async fn test_enc_count_updates_when_sender_higher() {
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
 
-    // Pre-insert a lower value
+    // Pre-insert a lower value and a local reason that the echoed count must preserve.
     client
         .message_retry_counts
-        .insert(cache_key.clone(), (1, None))
+        .insert(cache_key.clone(), (1, Some(RetryReason::BadMac)))
         .await;
 
-    // max(existing, incoming) SHOULD update with a higher value
     let max_sender_retry_count: u8 = 3;
-    let existing = client
-        .message_retry_counts
-        .get(&cache_key)
-        .await
-        .map(|(c, _)| c)
-        .unwrap_or(0);
-    if max_sender_retry_count > existing {
-        client
-            .message_retry_counts
-            .insert(cache_key.clone(), (max_sender_retry_count, None))
-            .await;
-    }
+    client
+        .preseed_retry_count(&cache_key, max_sender_retry_count)
+        .await;
 
     assert_eq!(
-        client
-            .message_retry_counts
-            .get(&cache_key)
-            .await
-            .map(|(c, _)| c),
-        Some(3),
-        "should update to higher sender count"
+        client.message_retry_counts.get(&cache_key).await,
+        Some((3, Some(RetryReason::BadMac))),
+        "should update to the higher sender count without losing the local reason"
     );
+}
+
+#[tokio::test]
+async fn test_enc_count_preseed_cannot_overwrite_concurrent_increments() {
+    let client = create_test_client_for_retry_with_id("enc_atomic_preseed").await;
+    let cache_key = "enc_atomic_preseed:msg:sender";
+    client
+        .message_retry_counts
+        .insert(cache_key.to_owned(), (3, Some(RetryReason::NoSession)))
+        .await;
+
+    let (_, first, second) = futures::join!(
+        client.preseed_retry_count(cache_key, 4),
+        client.increment_retry_count(cache_key, RetryReason::BadMac),
+        client.increment_retry_count(cache_key, RetryReason::InvalidMessage),
+    );
+
+    assert!(first.is_some() || second.is_some());
+    let final_state = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .expect("retry state");
+    assert_eq!(final_state.0, MAX_DECRYPT_RETRIES);
+    assert!(final_state.1.is_some(), "a local reason must be retained");
 }
 
 /// Shared helper: the OLD semaphore acquire logic that silently dropped tasks
@@ -5550,9 +5531,8 @@ async fn capturing_client(
         write_key,
         read_key,
     );
-    // send_node only needs noise_socket Some; is_connected is read by
-    // other layers but not on this path.
     *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.set_connected_for_test(true);
     seed_test_pn(&client).await;
     // Live-path semantics by default; drain tests re-enter drain state
     // themselves.
@@ -6092,6 +6072,21 @@ async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
         Err(crate::features::RetryRequestError::MissingAttribute("from"))
     ));
 
+    let invalid_self_recipient = NodeBuilder::new("message")
+        .attr("id", "INVALID-SELF-RECIPIENT")
+        .attr("from", "5511000000001:9@s.whatsapp.net")
+        .attr("recipient", "not-a-jid")
+        .build();
+    assert!(matches!(
+        client
+            .request_message_retry(
+                &invalid_self_recipient.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await,
+        Err(crate::features::RetryRequestError::InvalidStanza(_))
+    ));
+
     let stanza = retry_request_stanza("RETRY-LIMIT");
     let sender: Jid = "15551234567:7@s.whatsapp.net".parse().expect("sender");
     let chat = sender.to_non_ad();
@@ -6113,6 +6108,50 @@ async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
         crate::features::RetryRequestOutcome::LimitReached
     );
     assert_eq!(transport.sent_count(), 0);
+}
+
+#[tokio::test]
+async fn explicit_retry_while_disconnected_preserves_budget_and_prekeys() {
+    let (client, transport) = capturing_client("explicit_retry_disconnected").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    client.set_connected_for_test(false);
+
+    let stanza = retry_request_stanza("EXPLICIT-RETRY-DISCONNECTED");
+    let before = client.persistence_manager.get_device_snapshot();
+    let before_next_pre_key_id = before.next_pre_key_id;
+    let before_first_unupload_pre_key_id = before.first_unupload_pre_key_id;
+    drop(before);
+
+    assert!(matches!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::new().with_force_include_keys(true),
+            )
+            .await,
+        Err(crate::features::RetryRequestError::Client(
+            crate::client::ClientError::NotConnected
+        ))
+    ));
+
+    let sender: Jid = "15551234567:7@s.whatsapp.net".parse().expect("sender");
+    let cache_key = client
+        .make_retry_cache_key(&sender.to_non_ad(), "EXPLICIT-RETRY-DISCONNECTED", &sender)
+        .await;
+    assert!(client.message_retry_counts.get(&cache_key).await.is_none());
+    assert_eq!(transport.sent_count(), 0);
+
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_eq!(after.next_pre_key_id, before_next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id,
+        before_first_unupload_pre_key_id
+    );
 }
 
 #[tokio::test]
@@ -8078,6 +8117,40 @@ async fn own_bot_author_dm_acks_not_sender_receipt() {
             "must NOT route to a sender <receipt> (would diverge from WA Web's bot-invoke-response ack path)"
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_group_envelopes_are_rejected_from_the_original_stanza() {
+    let (client, transport) = capturing_client("malformed_group_envelope").await;
+    let expected_error =
+        u32::try_from(NackReason::ParsingError.code()).expect("NACK error codes are positive");
+
+    for (id, participant) in [
+        ("GROUP-MISSING-PARTICIPANT", None),
+        ("GROUP-INVALID-PARTICIPANT", Some("not-a-jid")),
+    ] {
+        let mut builder = NodeBuilder::new("message")
+            .attr("from", "120363021033254949@g.us")
+            .attr("id", id)
+            .attr("type", "text");
+        if let Some(participant) = participant {
+            builder = builder.attr("participant", participant);
+        }
+        let owned = node_to_arc(builder.build());
+
+        assert!(client.classify_incoming_message(&owned).await.is_none());
+
+        let mut nack_error = None;
+        for _ in 0..80 {
+            nack_error = find_message_nack_error(&transport.sent(), id);
+            if nack_error.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_error, Some(expected_error));
+        assert_eq!(message_acks_for(&transport.sent(), id), 0);
     }
 }
 

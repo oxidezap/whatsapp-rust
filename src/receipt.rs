@@ -743,6 +743,48 @@ impl Client {
             .detach();
     }
 
+    fn build_nack_from_snapshot<S: NackSource + ?Sized>(
+        &self,
+        source: &S,
+        reason: NackReason,
+        failure_reason: Option<i32>,
+    ) -> Result<wacore_binary::Node, crate::features::StanzaResponseError> {
+        let device = self.persistence_manager.get_device_snapshot();
+        let own_pn = device
+            .pn
+            .as_ref()
+            .ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?;
+        let nack = build_nack_node(source, own_pn, reason, failure_reason);
+        drop(device);
+        nack
+    }
+
+    /// Reject a malformed stanza without retaining or cloning its decoded tree.
+    pub(crate) fn spawn_stanza_nack(
+        self: &Arc<Self>,
+        stanza: &NodeRef<'_>,
+        reason: NackReason,
+        failure_reason: Option<i32>,
+    ) {
+        let nack = match self.build_nack_from_snapshot(stanza, reason, failure_reason) {
+            Ok(nack) => nack,
+            Err(error) => {
+                log::warn!(target: "Client/Receipt", "Failed to build stanza nack: {error}");
+                return;
+            }
+        };
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Err(error) = client.send_node(nack).await
+                    && !matches!(error, crate::client::ClientError::NotConnected)
+                {
+                    log::warn!(target: "Client/Receipt", "Failed to send stanza nack: {error:?}");
+                }
+            }))
+            .detach();
+    }
+
     /// Emits a nack so the server stops retransmitting an unrecoverable
     /// failure. Prefer [`Client::send_retry_receipt`] for recoverable
     /// errors (BadMac, NoSession, etc).
@@ -756,25 +798,22 @@ impl Client {
         if info.id.is_empty() {
             return;
         }
-        let device = self.persistence_manager.get_device_snapshot();
-        let Some(own_pn) = device.pn.as_ref() else {
-            log::debug!(
-                "[msg:{}] Skipping nack ({:?}): own PN not yet set",
-                info.id,
-                reason
-            );
-            return;
-        };
-
-        let nack = match build_nack_node(info, own_pn, reason, failure_reason) {
+        let nack = match self.build_nack_from_snapshot(info, reason, failure_reason) {
             Ok(nack) => nack,
+            Err(crate::features::StanzaResponseError::MissingLocalIdentity) => {
+                log::debug!(
+                    "[msg:{}] Skipping nack ({:?}): own PN not yet set",
+                    info.id,
+                    reason
+                );
+                return;
+            }
             Err(error) => {
                 log::warn!(target: "Client/Receipt",
                     "Failed to build nack for message {}: {error}", info.id);
                 return;
             }
         };
-        drop(device);
         debug!(target: "Client/Receipt",
             "Sending nack (reason={:?}, code={}) for message {} from {}",
             reason, reason.code(), info.id, info.source.sender.observe());
@@ -802,18 +841,8 @@ impl Client {
         stanza: &NodeRef<'_>,
         rejection: crate::features::StanzaRejection,
     ) -> Result<(), crate::features::StanzaResponseError> {
-        let device = self.persistence_manager.get_device_snapshot();
-        let own_pn = device
-            .pn
-            .as_ref()
-            .ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?;
-        let nack = build_nack_node(
-            stanza,
-            own_pn,
-            rejection.reason(),
-            rejection.failure_reason(),
-        )?;
-        drop(device);
+        let nack =
+            self.build_nack_from_snapshot(stanza, rejection.reason(), rejection.failure_reason())?;
         self.send_node(nack).await?;
         Ok(())
     }

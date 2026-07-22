@@ -26,6 +26,9 @@ impl Client {
         if stanza.get_attr("from").is_none() {
             return Err(crate::features::RetryRequestError::MissingAttribute("from"));
         }
+        if !self.is_connected() {
+            return Err(crate::client::ClientError::NotConnected.into());
+        }
 
         let device = self.persistence_manager.get_device_snapshot();
         let own_pn = device
@@ -177,6 +180,18 @@ impl Client {
                 (Some((count, Some(reason))), Some(count))
             })
             .await
+    }
+
+    /// Raise the local retry count to a sender-echoed count without allowing a
+    /// concurrent local increment to be overwritten.
+    pub(crate) async fn preseed_retry_count(&self, cache_key: &str, sender_count: u8) {
+        self.message_retry_counts
+            .upsert_with_by_ref(cache_key, |current| match current {
+                Some((count, _)) if *count >= sender_count => (None, ()),
+                Some((_, reason)) => (Some((sender_count, *reason)), ()),
+                None => (Some((sender_count, None)), ()),
+            })
+            .await;
     }
 
     /// Generate consistent cache key for retry logic.

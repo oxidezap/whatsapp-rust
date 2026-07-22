@@ -92,18 +92,24 @@ impl<'a> AttrParserRef<'a> {
         })
     }
 
+    /// Get an optional JID attribute, failing when a present value is invalid.
+    pub fn optional_jid_result(&mut self, key: &str) -> Result<Option<Jid>> {
+        match self.get_raw(key, false) {
+            None => Ok(None),
+            Some(ValueRef::Jid(jid)) => Ok(Some(jid.to_owned())),
+            Some(ValueRef::String(value)) => {
+                Jid::from_str(value).map(Some).map_err(BinaryError::from)
+            }
+        }
+    }
+
     /// Get a required JID attribute, failing immediately when it is missing or invalid.
     ///
     /// Structured JIDs are converted directly from their decoded representation;
     /// string attributes are parsed exactly once.
     pub fn required_jid(&mut self, key: &str) -> Result<Jid> {
-        match self
-            .get_raw(key, false)
-            .ok_or_else(|| BinaryError::MissingAttr(key.to_string()))?
-        {
-            ValueRef::Jid(jid) => Ok(jid.to_owned()),
-            ValueRef::String(value) => Jid::from_str(value).map_err(BinaryError::from),
-        }
+        self.optional_jid_result(key)?
+            .ok_or_else(|| BinaryError::MissingAttr(key.to_string()))
     }
 
     pub fn jid(&mut self, key: &str) -> Jid {

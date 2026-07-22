@@ -125,6 +125,7 @@ impl Client {
                 let id = nr.get_attr("id").map(|v| v.as_str());
                 let from = nr.get_attr("from").map(|v| v.as_str());
                 log::warn!("Failed to parse message info (id={id:?}, from={from:?}): {e:?}");
+                self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
                 return None;
             }
         };
@@ -414,14 +415,8 @@ impl Client {
             let cache_key = self
                 .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
                 .await;
-            let existing = self.message_retry_counts.get(&cache_key).await;
-            if max_sender_retry_count > existing.map_or(0, |(count, _)| count) {
-                // Keep any locally recorded reason; the echoed count carries none.
-                let reason = existing.and_then(|(_, reason)| reason);
-                self.message_retry_counts
-                    .insert(cache_key, (max_sender_retry_count, reason))
-                    .await;
-            }
+            self.preseed_retry_count(&cache_key, max_sender_retry_count)
+                .await;
             log::debug!(
                 "[msg:{}] Sender retry count {} pre-seeded into cache",
                 info.id,
