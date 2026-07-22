@@ -74,12 +74,11 @@ impl Client {
         self.send_message_impl(
             to,
             &revoke_message,
-            None,
-            false,
-            force_skdm,
-            Some(edit_attr),
-            vec![],
-            None,
+            SendPipelineOptions {
+                force_key_distribution: force_skdm,
+                edit: Some(edit_attr),
+                ..Default::default()
+            },
         )
         .await
         .map_err(SendError::from_anyhow)?;
@@ -163,12 +162,10 @@ impl Client {
         self.send_message_impl(
             chat,
             &message,
-            None,
-            false,
-            false,
-            Some(crate::types::message::EditAttribute::PinInChat),
-            vec![],
-            None,
+            SendPipelineOptions {
+                edit: Some(crate::types::message::EditAttribute::PinInChat),
+                ..Default::default()
+            },
         )
         .await
         .map_err(SendError::from_anyhow)?;

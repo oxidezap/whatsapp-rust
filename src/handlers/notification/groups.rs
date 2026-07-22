@@ -135,21 +135,6 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         .unwrap_or_else(wacore::time::now_utc);
 
     let actions = std::mem::take(&mut notification.actions);
-    let group_cache = actions
-        .iter()
-        .any(|action| {
-            matches!(
-                action,
-                GroupNotificationAction::Add { .. }
-                    | GroupNotificationAction::Remove { .. }
-                    | GroupNotificationAction::Modify { .. }
-            )
-        })
-        .then(|| client.get_group_cache());
-    let group_cache = match group_cache {
-        Some(cache) => Some(cache.await),
-        None => None,
-    };
     let action_count = actions.len();
 
     for (action_index, action) in actions.into_iter().enumerate() {
@@ -158,22 +143,15 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         // group metadata IQ round-trip.
         match &action {
             GroupNotificationAction::Add { participants, .. } => {
-                let group_cache = group_cache
-                    .as_ref()
-                    .expect("participant actions initialize the group cache");
-                if let Some(info) = group_cache.get(&notification.group_jid).await {
+                let metadata = client.lock_group_metadata(&notification.group_jid).await;
+                if let Some(info) = metadata.current().await {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.add_participants(
                         participants
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
-                    client
-                        .persist_group_metadata(&notification.group_jid, &info)
-                        .await;
-                    group_cache
-                        .insert(notification.group_jid.clone(), Arc::new(info))
-                        .await;
+                    metadata.publish(Arc::new(info)).await;
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: added {} participants",
@@ -186,25 +164,16 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                         "Group cache expired for {}: invalidating persisted metadata (add)",
                         notification.group_jid.observe()
                     );
-                    client
-                        .invalidate_persisted_group_metadata(&notification.group_jid)
-                        .await;
+                    metadata.invalidate().await;
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
                 let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
-                let group_cache = group_cache
-                    .as_ref()
-                    .expect("participant actions initialize the group cache");
-                if let Some(info) = group_cache.get(&notification.group_jid).await {
+                let metadata = client.lock_group_metadata(&notification.group_jid).await;
+                if let Some(info) = metadata.current().await {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
-                    client
-                        .persist_group_metadata(&notification.group_jid, &info)
-                        .await;
-                    group_cache
-                        .insert(notification.group_jid.clone(), Arc::new(info))
-                        .await;
+                    metadata.publish(Arc::new(info)).await;
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: removed {} participants",
@@ -217,10 +186,9 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                         "Group cache expired for {}: invalidating persisted metadata (remove)",
                         notification.group_jid.observe()
                     );
-                    client
-                        .invalidate_persisted_group_metadata(&notification.group_jid)
-                        .await;
+                    metadata.invalidate().await;
                 }
+                drop(metadata);
                 client
                     .rotate_sender_key_on_participant_remove(&notification.group_jid, &users)
                     .await;
@@ -240,18 +208,9 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                     "Group modify (number/LID migration) for {}: invalidating metadata and rotating sender key",
                     notification.group_jid.observe()
                 );
-                client
-                    .invalidate_persisted_group_metadata(&notification.group_jid)
-                    .await;
-                // Also drop the in-memory blob: query_info() checks group_cache
-                // before storage, so a stale Arc<GroupInfo> here would let the
-                // next send rebuild the sender key against the old participant
-                // list (missing the migrated JID, still targeting the old one).
-                group_cache
-                    .as_ref()
-                    .expect("participant actions initialize the group cache")
-                    .invalidate(&notification.group_jid)
-                    .await;
+                let metadata = client.lock_group_metadata(&notification.group_jid).await;
+                metadata.invalidate().await;
+                drop(metadata);
                 client
                     .force_rotate_own_sender_key(&notification.group_jid)
                     .await;

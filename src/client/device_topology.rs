@@ -25,7 +25,7 @@ use wacore_binary::CompactString;
 const TOPOLOGY_LOG_CAPACITY: usize = 256;
 
 struct TopologyLog {
-    /// (generation that the change produced, canonical user touched).
+    /// (generation, canonical user touched).
     entries: VecDeque<(u64, CompactString)>,
     /// Highest generation evicted from `entries` (0 = nothing evicted).
     /// A memo older than this cannot be proven clean and must recompute.
@@ -36,6 +36,14 @@ struct TopologyLog {
 pub(crate) struct DeviceTopology {
     generation: AtomicU64,
     log: std::sync::Mutex<TopologyLog>,
+    registry_mutation: async_lock::Mutex<()>,
+}
+
+/// Proof that a device-registry mutation is serialized with authoritative
+/// refresh publication. The cache write API requires this token so new write
+/// paths cannot accidentally bypass the ordering invariant.
+pub(crate) struct DeviceRegistryMutationGuard<'a> {
+    _guard: async_lock::MutexGuard<'a, ()>,
 }
 
 impl DeviceTopology {
@@ -46,6 +54,7 @@ impl DeviceTopology {
                 entries: VecDeque::with_capacity(TOPOLOGY_LOG_CAPACITY),
                 floor: 0,
             }),
+            registry_mutation: async_lock::Mutex::new(()),
         })
     }
 
@@ -53,10 +62,20 @@ impl DeviceTopology {
         self.generation.load(Ordering::Acquire)
     }
 
+    pub(crate) async fn lock_registry(&self) -> DeviceRegistryMutationGuard<'_> {
+        DeviceRegistryMutationGuard {
+            _guard: self.registry_mutation.lock().await,
+        }
+    }
+
     /// Record one topology change touching the given users (pass BOTH
     /// namespaces of an identity when known: a mapping change alters which
     /// canonical record either key resolves to).
     pub(crate) fn record<'a>(&self, users: impl IntoIterator<Item = &'a str>) {
+        self.record_change(users);
+    }
+
+    fn record_change<'a>(&self, users: impl IntoIterator<Item = &'a str>) {
         let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.generation.load(Ordering::Acquire) + 1;
         for user in users {
@@ -72,6 +91,16 @@ impl DeviceTopology {
         // reader that observes the new generation can always find (or rule
         // out) the corresponding entries.
         self.generation.store(generation, Ordering::Release);
+    }
+
+    /// Record a registry mutation while holding its serialization guard, so a
+    /// refresh can compare-and-publish without a check/write race.
+    pub(crate) fn record_registry<'a>(
+        &self,
+        _guard: &DeviceRegistryMutationGuard<'_>,
+        users: impl IntoIterator<Item = &'a str>,
+    ) {
+        self.record_change(users);
     }
 
     /// Record a change whose blast radius is unknown (bulk warm-up, cache
@@ -130,17 +159,18 @@ impl DeviceRegistryCache {
     /// canonical flipped).
     pub(crate) async fn insert<'a>(
         &self,
+        guard: &DeviceRegistryMutationGuard<'_>,
         key: String,
         record: Arc<wacore::store::traits::DeviceListRecord>,
         touched: impl IntoIterator<Item = &'a str>,
     ) {
         self.cache.insert(key, record).await;
-        self.topology.record(touched);
+        self.topology.record_registry(guard, touched);
     }
 
-    pub(crate) async fn invalidate(&self, key: &str) {
+    pub(crate) async fn invalidate(&self, guard: &DeviceRegistryMutationGuard<'_>, key: &str) {
         self.cache.invalidate(key).await;
-        self.topology.record([key]);
+        self.topology.record_registry(guard, [key]);
     }
 
     /// Cache-fill from the DB row the fallback path would have returned: the
@@ -178,5 +208,10 @@ impl DeviceRegistryCache {
         record: Arc<wacore::store::traits::DeviceListRecord>,
     ) {
         self.cache.insert(key, record).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn raw_invalidate_for_tests(&self, key: &str) {
+        self.cache.invalidate(key).await;
     }
 }

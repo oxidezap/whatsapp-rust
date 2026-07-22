@@ -287,6 +287,75 @@ pub struct Groups<'a> {
     client: &'a Client,
 }
 
+/// Serializes one group's metadata publication with participant mutations and
+/// sender-key distribution, reusing the client's existing per-group lane.
+/// Keeping the guard in the type prevents persistence and cache publication
+/// from accidentally being split across an unlocked await.
+pub(crate) struct GroupMetadataGuard<'a> {
+    client: &'a Client,
+    jid: &'a Jid,
+    _guard: async_lock::MutexGuardArc<()>,
+}
+
+impl GroupMetadataGuard<'_> {
+    pub(crate) async fn current(&self) -> Option<Arc<GroupInfo>> {
+        self.client.get_group_cache().await.get(self.jid).await
+    }
+
+    async fn cache(&self, info: Arc<GroupInfo>) {
+        self.client
+            .get_group_cache()
+            .await
+            .insert(self.jid.clone(), info)
+            .await;
+    }
+
+    pub(crate) async fn publish(&self, info: Arc<GroupInfo>) {
+        let jid = self.jid.to_string();
+        match serde_json::to_vec(info.as_ref()) {
+            Ok(blob) => {
+                if let Err(error) = self
+                    .client
+                    .persistence_manager
+                    .backend()
+                    .put_group_metadata(&jid, &blob)
+                    .await
+                {
+                    log::warn!("Failed to persist group metadata for {}: {error}", self.jid);
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "Failed to serialize group metadata for {}: {error}",
+                    self.jid
+                );
+            }
+        }
+
+        self.cache(info).await;
+    }
+
+    pub(crate) async fn invalidate(&self) {
+        if let Err(error) = self
+            .client
+            .persistence_manager
+            .backend()
+            .delete_group_metadata(&self.jid.to_string())
+            .await
+        {
+            log::warn!(
+                "Failed to invalidate persisted group metadata for {}: {error}",
+                self.jid
+            );
+        }
+        self.client
+            .get_group_cache()
+            .await
+            .invalidate(self.jid)
+            .await;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ParticipantRemovalScope {
     Group,
@@ -299,109 +368,179 @@ impl<'a> Groups<'a> {
     }
 
     pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, GroupError> {
-        if let Some(cached) = self.client.get_group_cache().await.get(jid).await {
+        self.query_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
+            .await
+    }
+
+    /// Query group metadata using the requested cache freshness policy.
+    ///
+    /// A refresh leaves the current snapshot readable while the network request
+    /// is in flight, then atomically replaces it after a successful response.
+    pub async fn query_info_with_freshness(
+        &self,
+        jid: &Jid,
+        freshness: crate::cache::Freshness,
+    ) -> Result<Arc<GroupInfo>, GroupError> {
+        let cache = self.client.get_group_cache().await;
+        let mut cached = cache.get(jid).await;
+        if freshness == crate::cache::Freshness::CachePreferred
+            && let Some(cached) = cached.take()
+        {
             return Ok(cached);
         }
 
-        // Send the persisted participant phash (WA Web queryGroup phash) so the
-        // server can answer "not-modified" by omitting <group> for an unchanged
-        // group, letting us reuse the persisted metadata instead of re-parsing it.
-        let jid_str = jid.to_string();
-        let backend = self.client.persistence_manager.backend();
-        let persisted: Option<GroupInfo> = match backend.get_group_metadata(&jid_str).await {
-            Ok(Some(blob)) => serde_json::from_slice(&blob).ok(),
-            _ => None,
-        };
-        let phash = persisted.as_ref().and_then(|info| {
-            wacore::messages::MessageUtils::participant_list_hash(&info.participants).ok()
-        });
+        self.query_info_from_source(jid, cached).await
+    }
 
-        let group = match self
-            .client
-            .execute(GroupQueryIq::with_phash(jid, phash))
-            .await?
-        {
-            GroupInfoOutcome::NotModified => {
-                let info = Arc::new(persisted.ok_or_else(|| {
-                    GroupError::InvalidRequest(
-                        "server returned not-modified group but nothing was cached".into(),
-                    )
-                })?);
-                self.client
-                    .get_group_cache()
-                    .await
-                    .insert(jid.clone(), info.clone())
-                    .await;
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the explicit async block keeps the network-bound state machine out of line"
+    )]
+    fn query_info_from_source<'b>(
+        &'b self,
+        jid: &'b Jid,
+        mut cached: Option<Arc<GroupInfo>>,
+    ) -> impl Future<Output = Result<Arc<GroupInfo>, GroupError>> + 'b {
+        // Keep the large, network-bound state machine shared between refresh
+        // and cache-miss callers. The cache-hit fast path stays in
+        // `query_info_with_freshness`, while this boundary prevents LTO from
+        // cloning the slow path for each statically known freshness policy.
+        #[inline(never)]
+        async move {
+            let jid_str = jid.to_string();
+            let backend = self.client.persistence_manager.backend();
+            loop {
+                // Send the persisted participant phash (WA Web queryGroup phash) so
+                // the server can omit <group> for an unchanged snapshot. On a cold
+                // L1, keep the lane through the request: without an Arc to compare,
+                // this is the only way to distinguish "still absent" from a
+                // notification that invalidated an already-absent snapshot.
+                let (persisted, mut cold_metadata) = if cached.is_some() {
+                    (None, None)
+                } else {
+                    let metadata = self.client.lock_group_metadata(jid).await;
+                    if let Some(current) = metadata.current().await {
+                        cached = Some(current);
+                        drop(metadata);
+                        continue;
+                    }
+                    let persisted = match backend.get_group_metadata(&jid_str).await {
+                        Ok(Some(blob)) => serde_json::from_slice(&blob).ok(),
+                        _ => None,
+                    };
+                    (persisted, Some(metadata))
+                };
+                let phash = cached.as_deref().or(persisted.as_ref()).and_then(|info| {
+                    wacore::messages::MessageUtils::participant_list_hash(&info.participants).ok()
+                });
+
+                let group = match self
+                    .client
+                    .execute(GroupQueryIq::with_phash(jid, phash))
+                    .await?
+                {
+                    GroupInfoOutcome::NotModified => {
+                        if let Some(metadata) = cold_metadata.take() {
+                            let info = Arc::new(persisted.ok_or_else(|| {
+                                GroupError::InvalidRequest(
+                                    "server returned not-modified group but nothing was cached"
+                                        .into(),
+                                )
+                            })?);
+                            metadata.cache(Arc::clone(&info)).await;
+                            return Ok(info);
+                        }
+
+                        // Participant mutations use the same per-group lane, so the
+                        // snapshot and its persisted blob cannot change between this
+                        // check and the decision below.
+                        let metadata = self.client.lock_group_metadata(jid).await;
+                        if let Some(current) = metadata.current().await {
+                            return Ok(current);
+                        }
+
+                        // The warm snapshot used for the conditional request was
+                        // invalidated while the IQ was in flight. Retry without it
+                        // instead of resurrecting pre-notification membership.
+                        drop(metadata);
+                        cached = None;
+                        continue;
+                    }
+                    GroupInfoOutcome::Full(group) => *group,
+                };
+
+                // Single pass: move participants out and build lid_to_pn_map alongside.
+                let participant_count = group.participants.len();
+                let is_lid = group.addressing_mode == AddressingMode::Lid;
+                let mut participants = Vec::with_capacity(participant_count);
+                let mut lid_to_pn_map: HashMap<wacore_binary::CompactString, Jid> = if is_lid {
+                    HashMap::with_capacity(participant_count)
+                } else {
+                    HashMap::new()
+                };
+                for participant in group.participants {
+                    if is_lid && let Some(pn) = participant.phone_number {
+                        lid_to_pn_map.insert(participant.jid.user.clone(), pn);
+                    }
+                    participants.push(participant.jid);
+                }
+
+                // Populate lid_pn_cache so silent-observer participants (no messages
+                // from them) get their mapping; otherwise `invalidate_device_cache`
+                // can't resolve the PN alias and leaves zombie registry entries.
+                if !lid_to_pn_map.is_empty()
+                    && let Some(client_arc) = self.client.self_weak.get().and_then(|w| w.upgrade())
+                {
+                    let mut batch = Vec::with_capacity(lid_to_pn_map.len());
+                    for (lid_user, pn_jid) in &lid_to_pn_map {
+                        if pn_jid.is_pn() {
+                            batch.push((lid_user.as_str().to_string(), pn_jid.user.to_string()));
+                        }
+                    }
+                    client_arc
+                        .learn_lid_pn_mappings_batch(
+                            batch,
+                            crate::lid_pn_cache::LearningSource::Other,
+                            false,
+                        )
+                        .await;
+                }
+
+                let mut info = GroupInfo::new(participants, group.addressing_mode);
+                info.is_community_announce = Some(group.is_default_sub_group);
+                if !lid_to_pn_map.is_empty() {
+                    info.set_lid_to_pn_map(lid_to_pn_map);
+                }
+                let info = Arc::new(info);
+
+                // Compare and publish while holding the same lane as participant
+                // mutations. Persisting inside the guard prevents the durable blob
+                // and L1 snapshot from being committed in opposite orders.
+                let metadata = match cold_metadata {
+                    Some(metadata) => metadata,
+                    None => {
+                        let metadata = self.client.lock_group_metadata(jid).await;
+                        let current = metadata.current().await;
+                        let unchanged = matches!(
+                            (cached.as_ref(), current.as_ref()),
+                            (Some(expected), Some(current)) if Arc::ptr_eq(expected, current)
+                        );
+                        if !unchanged {
+                            drop(metadata);
+                            if let Some(current) = current {
+                                return Ok(current);
+                            }
+                            cached = None;
+                            continue;
+                        }
+                        metadata
+                    }
+                };
+
+                metadata.publish(Arc::clone(&info)).await;
                 return Ok(info);
             }
-            GroupInfoOutcome::Full(group) => *group,
-        };
-
-        // Single pass: move participants out and build lid_to_pn_map alongside.
-        let n = group.participants.len();
-        let is_lid = group.addressing_mode == AddressingMode::Lid;
-        let mut participants: Vec<Jid> = Vec::with_capacity(n);
-        let mut lid_to_pn_map: HashMap<wacore_binary::CompactString, Jid> = if is_lid {
-            HashMap::with_capacity(n)
-        } else {
-            HashMap::new()
-        };
-        for p in group.participants {
-            if is_lid && let Some(pn) = p.phone_number {
-                lid_to_pn_map.insert(p.jid.user.clone(), pn);
-            }
-            participants.push(p.jid);
         }
-
-        // Populate lid_pn_cache so silent-observer participants (no messages
-        // from them) get their mapping; otherwise `invalidate_device_cache`
-        // can't resolve the PN alias and leaves zombie registry entries.
-        // One batched call mirrors WA Web's single `createLidPnMappings`
-        // invocation from `QueryGroupJob`, so N participants = 1 persist
-        // task + 1 DB transaction instead of N detached tasks.
-        if !lid_to_pn_map.is_empty()
-            && let Some(client_arc) = self.client.self_weak.get().and_then(|w| w.upgrade())
-        {
-            let mut batch: Vec<(String, String)> = Vec::with_capacity(lid_to_pn_map.len());
-            for (lid_user, pn_jid) in &lid_to_pn_map {
-                if pn_jid.is_pn() {
-                    batch.push((lid_user.as_str().to_string(), pn_jid.user.to_string()));
-                }
-            }
-            client_arc
-                .learn_lid_pn_mappings_batch(
-                    batch,
-                    crate::lid_pn_cache::LearningSource::Other,
-                    false,
-                )
-                .await;
-        }
-
-        let mut info = GroupInfo::new(participants, group.addressing_mode);
-        info.is_community_announce = Some(group.is_default_sub_group);
-        if !lid_to_pn_map.is_empty() {
-            info.set_lid_to_pn_map(lid_to_pn_map);
-        }
-
-        // Persist so the next query can send this group's participant phash and
-        // skip the full re-query when membership is unchanged.
-        match serde_json::to_vec(&info) {
-            Ok(blob) => {
-                if let Err(e) = backend.put_group_metadata(&jid_str, &blob).await {
-                    log::warn!("Failed to persist group metadata for {jid}: {e}");
-                }
-            }
-            Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
-        }
-
-        let info = Arc::new(info);
-        self.client
-            .get_group_cache()
-            .await
-            .insert(jid.clone(), info.clone())
-            .await;
-
-        Ok(info)
     }
 
     /// Backfills each LID participant's `phone_number` from the client's LID-PN
@@ -561,18 +700,11 @@ impl<'a> Groups<'a> {
     pub async fn leave(&self, jid: impl Into<Jid>) -> Result<(), GroupError> {
         let jid = &jid.into();
         self.client.execute(LeaveGroupIq::new(jid)).await?;
-        self.client.get_group_cache().await.invalidate(jid).await;
-        // Drop the persisted blob too: we're no longer in the group, so a stale
-        // phash from it would only force a needless full re-query if ever read.
-        if let Err(e) = self
-            .client
-            .persistence_manager
-            .backend()
-            .delete_group_metadata(&jid.to_string())
+        self.client
+            .lock_group_metadata(jid)
             .await
-        {
-            log::warn!("Failed to delete persisted group metadata for {jid}: {e}");
-        }
+            .invalidate()
+            .await;
         Ok(())
     }
 
@@ -596,8 +728,8 @@ impl<'a> Groups<'a> {
 
         let result = self.client.execute(iq).await?;
         if result.iter().any(|r| r.is_ok()) {
-            let group_cache = self.client.get_group_cache().await;
-            if let Some(info) = group_cache.get(jid).await {
+            let metadata = self.client.lock_group_metadata(jid).await;
+            if let Some(info) = metadata.current().await {
                 let mut info = Arc::unwrap_or_clone(info);
                 info.add_participants(
                     result
@@ -605,11 +737,10 @@ impl<'a> Groups<'a> {
                         .filter(|r| r.is_ok())
                         .map(|r| (&r.jid, r.phone_number.as_ref())),
                 );
-                self.client.persist_group_metadata(jid, &info).await;
-                group_cache.insert(jid.clone(), Arc::new(info)).await;
+                metadata.publish(Arc::new(info)).await;
             } else {
                 // Cache expired: can't patch in place, so drop the now-stale blob.
-                self.client.invalidate_persisted_group_metadata(jid).await;
+                metadata.invalidate().await;
             }
         }
         Ok(result)
@@ -642,17 +773,16 @@ impl<'a> Groups<'a> {
             .map(|r| r.jid.user.as_str())
             .collect();
         if !accepted.is_empty() {
-            let group_cache = self.client.get_group_cache().await;
             match scope {
                 ParticipantRemovalScope::Group => {
-                    if let Some(info) = group_cache.get(jid).await {
+                    let metadata = self.client.lock_group_metadata(jid).await;
+                    if let Some(info) = metadata.current().await {
                         let mut info = Arc::unwrap_or_clone(info);
                         info.remove_participants(&accepted);
-                        self.client.persist_group_metadata(jid, &info).await;
-                        group_cache.insert(jid.clone(), Arc::new(info)).await;
+                        metadata.publish(Arc::new(info)).await;
                     } else {
                         // Cache expired: can't patch in place, so drop the now-stale blob.
-                        self.client.invalidate_persisted_group_metadata(jid).await;
+                        metadata.invalidate().await;
                     }
                 }
                 ParticipantRemovalScope::LinkedGroups => {
@@ -662,8 +792,11 @@ impl<'a> Groups<'a> {
                     // carry the affected JIDs, patch their own cache entries,
                     // and rotate their sender-key chains without evicting
                     // unrelated groups.
-                    group_cache.invalidate(jid).await;
-                    self.client.invalidate_persisted_group_metadata(jid).await;
+                    self.client
+                        .lock_group_metadata(jid)
+                        .await
+                        .invalidate()
+                        .await;
                 }
             }
             self.client
@@ -1147,12 +1280,11 @@ impl<'a> Groups<'a> {
             .send_message_impl(
                 group_jid.clone(),
                 &msg,
-                Some(message_id.clone()),
-                false,
-                false,
-                None,
-                meta.into_iter().collect(),
-                None,
+                crate::send::SendPipelineOptions {
+                    request_id: Some(message_id.clone()),
+                    extra_stanza_nodes: meta.into_iter().collect(),
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(message_id)
@@ -1266,35 +1398,11 @@ impl Client {
         Groups::new(self)
     }
 
-    /// Re-serialize and persist a group's metadata after a local membership change
-    /// so the phash fast-path stays consistent: the in-memory cache expires after
-    /// ~1h, after which a stale persisted blob would force a needless full re-query
-    /// (or be compared against the server as an out-of-date phash). Shared by the
-    /// participant-mutation API and the inbound group-notification handler.
-    pub(crate) async fn persist_group_metadata(&self, jid: &Jid, info: &GroupInfo) {
-        let backend = self.persistence_manager.backend();
-        match serde_json::to_vec(info) {
-            Ok(blob) => {
-                if let Err(e) = backend.put_group_metadata(&jid.to_string(), &blob).await {
-                    log::warn!("Failed to persist group metadata for {jid}: {e}");
-                }
-            }
-            Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
-        }
-    }
-
-    /// Drop the persisted group metadata on a membership change we can't patch in
-    /// place (the in-memory cache had already expired), so the next query re-fetches
-    /// fresh instead of comparing a now-stale phash. Without this, persisting only on
-    /// a cache hit would miss the exact post-expiry case this fix targets.
-    pub(crate) async fn invalidate_persisted_group_metadata(&self, jid: &Jid) {
-        if let Err(e) = self
-            .persistence_manager
-            .backend()
-            .delete_group_metadata(&jid.to_string())
-            .await
-        {
-            log::warn!("Failed to invalidate persisted group metadata for {jid}: {e}");
+    pub(crate) async fn lock_group_metadata<'a>(&'a self, jid: &'a Jid) -> GroupMetadataGuard<'a> {
+        GroupMetadataGuard {
+            client: self,
+            jid,
+            _guard: self.group_distribution_lock(jid).await,
         }
     }
 }
@@ -1537,6 +1645,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_keeps_the_previous_group_snapshot_on_source_failure() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000099@g.us".parse().unwrap();
+        let previous = Arc::new(GroupInfo::new(
+            vec!["12025550101@s.whatsapp.net".parse().unwrap()],
+            AddressingMode::Pn,
+        ));
+        let cache = client.get_group_cache().await;
+        cache.insert(group.clone(), Arc::clone(&previous)).await;
+
+        let result = client
+            .groups()
+            .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+            .await;
+        assert!(
+            result.is_err(),
+            "the offline fixture proves refresh consulted the source"
+        );
+
+        let preserved = cache
+            .get(&group)
+            .await
+            .expect("refresh failure must not clear the current snapshot");
+        assert!(Arc::ptr_eq(&previous, &preserved));
+    }
+
+    #[tokio::test]
     async fn linked_removal_preserves_unrelated_group_cache_entries() {
         use wacore::protocol::ProtocolNode;
         use wacore_binary::builder::NodeBuilder;
@@ -1544,7 +1679,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let parent: Jid = "120363000000000001@g.us".parse().unwrap();
         let unrelated: Jid = "120363000000000002@g.us".parse().unwrap();
-        let removed: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
+        let removed: Jid = "12025550103@s.whatsapp.net".parse().unwrap();
         let cache = client.get_group_cache().await;
         for jid in [&parent, &unrelated] {
             cache
@@ -1590,7 +1725,11 @@ mod tests {
                 .is_some()
         );
 
-        client.invalidate_persisted_group_metadata(&group_jid).await;
+        client
+            .lock_group_metadata(&group_jid)
+            .await
+            .invalidate()
+            .await;
 
         assert!(
             backend

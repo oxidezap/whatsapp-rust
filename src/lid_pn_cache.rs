@@ -46,6 +46,11 @@ pub struct LidPnCache {
     lid_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
     /// Phone number -> Entry mapping (stores the most recent LID for that PN)
     pn_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
+    /// Serializes mapping writers. Reads remain lock-free; the guard exists so
+    /// an authoritative device refresh can compare topology and publish its
+    /// mappings plus registry snapshot without a concurrent writer slipping
+    /// between those steps.
+    mutation: async_lock::Mutex<()>,
     /// Device-topology tracker (attached by Client construction): a mapping
     /// change alters which canonical record either key resolves to, so adds
     /// record both identifiers. Recording lives here, at the write
@@ -59,6 +64,11 @@ pub struct LidPnCache {
     /// clones a refcount and compares in place, no payload copy. In-memory only;
     /// mappings loaded from persistent storage are marked during warm-up.
     persisted: TypedCache<Arc<str>, Arc<str>>,
+}
+
+/// Proof that LID/PN mapping mutations are serialized.
+pub(crate) struct LidPnMutationGuard<'a> {
+    _guard: async_lock::MutexGuard<'a, ()>,
 }
 
 impl Default for LidPnCache {
@@ -87,6 +97,7 @@ impl LidPnCache {
             Some(s) => Self {
                 lid_to_entry: TypedCache::from_store(s.clone(), NS_LID, config.timeout),
                 pn_to_entry: TypedCache::from_store(s, NS_PN, config.timeout),
+                mutation: async_lock::Mutex::new(()),
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
                 persisted: TypedCache::from_local(config.build_with_tti()),
@@ -95,6 +106,7 @@ impl LidPnCache {
             None => Self {
                 lid_to_entry: TypedCache::from_local(config.build_with_tti()),
                 pn_to_entry: TypedCache::from_local(config.build_with_tti()),
+                mutation: async_lock::Mutex::new(()),
                 persisted: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
@@ -109,6 +121,12 @@ impl LidPnCache {
         topology: Arc<crate::client::device_topology::DeviceTopology>,
     ) {
         let _ = self.topology.set(topology);
+    }
+
+    pub(crate) async fn lock_mutation(&self) -> LidPnMutationGuard<'_> {
+        LidPnMutationGuard {
+            _guard: self.mutation.lock().await,
+        }
     }
 
     /// Approximate entry counts plus estimated retained bytes for the LID and
@@ -211,11 +229,14 @@ impl LidPnCache {
     /// For the PN -> Entry map, this only updates if the new entry has a
     /// newer or equal `created_at` timestamp (matching WhatsApp Web behavior).
     ///
-    /// Note: the get-then-insert on the PN map is not atomic. With external
-    /// backends (e.g., Redis), concurrent `add()` calls for the same phone
-    /// number can race. This is acceptable because the cache is best-effort
-    /// and backed by persistent storage for correctness.
+    /// The writer guard keeps the get-then-insert sequence ordered within this
+    /// client, including when the cache uses an external backend.
     pub async fn add(&self, entry: &LidPnEntry) {
+        let guard = self.lock_mutation().await;
+        self.add_guarded(entry, &guard).await;
+    }
+
+    pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, _guard: &LidPnMutationGuard<'_>) {
         let should_update_pn = match self.pn_to_entry.get(&*entry.phone_number).await {
             Some(existing) => existing.created_at <= entry.created_at,
             None => true,
@@ -262,9 +283,10 @@ impl LidPnCache {
     pub async fn warm_up(&self, entries: impl IntoIterator<Item = LidPnEntry>) {
         let start = wacore::time::Instant::now();
         let mut count = 0;
+        let guard = self.lock_mutation().await;
 
         for entry in entries {
-            self.add(&entry).await;
+            self.add_guarded(&entry, &guard).await;
             // `warm_up` only accepts durable rows. Mark the pair that won the
             // PN-side timestamp resolution so a live re-learn neither writes
             // it again nor repeats discovery migrations.
@@ -291,6 +313,7 @@ impl LidPnCache {
     /// Awaits the actual clear operation on custom backends (unlike
     /// `invalidate_all` which is fire-and-forget).
     pub async fn clear(&self) {
+        let _guard = self.lock_mutation().await;
         self.lid_to_entry.clear().await;
         self.pn_to_entry.clear().await;
         self.persisted.clear().await;

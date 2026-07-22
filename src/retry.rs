@@ -1,6 +1,7 @@
 use crate::client::Client;
-use crate::features::RetryRequestError;
+use crate::features::{MessageRetransmission, RetryRequestError};
 use crate::message::RetryReason;
+use crate::send::SendError;
 use crate::types::events::Receipt;
 use log::{debug, info, warn};
 use wacore::types::message::MessageCategory;
@@ -18,6 +19,7 @@ use wacore_binary::NodeContent;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, OwnedNodeRef};
 use wacore_binary::{NodeContentRef, NodeRef};
+use waproto::whatsapp as wa;
 
 /// Helper to extract bytes content from a Node (used in tests).
 #[cfg(test)]
@@ -39,6 +41,140 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
 /// Throttle for the "no-keys + retry≥2" forced-recreate fallback. Mirrors
 /// whatsmeow's `recreateSessionTimeout` (`retry.go:156`).
 const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[derive(Clone, Copy)]
+enum RetransmissionRoute {
+    Direct,
+    Group,
+    Status,
+    BroadcastList,
+}
+
+impl RetransmissionRoute {
+    const fn uses_sender_key(self) -> bool {
+        matches!(self, Self::Group | Self::Status)
+    }
+}
+
+#[inline]
+fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) -> bool {
+    own_pn.is_some_and(|pn| jid.is_same_user_as(pn))
+        || own_lid.is_some_and(|lid| jid.is_same_user_as(lid))
+}
+
+struct PreparedRetransmission {
+    route: RetransmissionRoute,
+    chat: Jid,
+    wire_requester: Jid,
+    encryption_jid: Jid,
+    message: wa::Message,
+    message_id: String,
+    retry_count: u8,
+    recipient: Option<Jid>,
+    group_info: Option<Arc<wacore::client::context::GroupInfo>>,
+    /// Canonical unpadded protobuf bytes shared with the recent-message cache.
+    /// Public retransmissions provide them; the automatic path may fall back
+    /// to its already-decoded message when the cache bytes are unavailable.
+    pre_encoded: Option<Arc<Vec<u8>>>,
+}
+
+fn validate_retransmission(
+    chat: &Jid,
+    requester: &Jid,
+    message_id: &str,
+    retry_count: u8,
+    recipient: Option<&Jid>,
+) -> Result<RetransmissionRoute, SendError> {
+    if chat.is_empty() || requester.is_empty() {
+        return Err(SendError::InvalidRequest(
+            "retransmission JIDs must not be empty".into(),
+        ));
+    }
+    if message_id.is_empty() {
+        return Err(SendError::InvalidRequest(
+            "retransmission message ID must not be empty".into(),
+        ));
+    }
+    if !(1..MAX_RETRY_COUNT).contains(&retry_count) {
+        return Err(SendError::InvalidRequest(format!(
+            "retry count must be in 1..{MAX_RETRY_COUNT}"
+        )));
+    }
+
+    let requester_is_user = matches!(
+        requester.server,
+        wacore_binary::Server::Pn
+            | wacore_binary::Server::Lid
+            | wacore_binary::Server::Hosted
+            | wacore_binary::Server::HostedLid
+            | wacore_binary::Server::Bot
+    );
+    if !requester_is_user {
+        return Err(SendError::InvalidRequest(
+            "retransmission requester must be a user device JID".into(),
+        ));
+    }
+
+    let route = if chat.is_group() {
+        RetransmissionRoute::Group
+    } else if chat.is_status_broadcast() {
+        if !matches!(
+            requester.server,
+            wacore_binary::Server::Pn | wacore_binary::Server::Lid
+        ) {
+            return Err(SendError::InvalidRequest(
+                "status retransmission requester must be a PN or LID device".into(),
+            ));
+        }
+        RetransmissionRoute::Status
+    } else if chat.is_broadcast_list() {
+        if !matches!(
+            requester.server,
+            wacore_binary::Server::Pn | wacore_binary::Server::Lid
+        ) {
+            return Err(SendError::InvalidRequest(
+                "broadcast retransmission requester must be a PN or LID device".into(),
+            ));
+        }
+        RetransmissionRoute::BroadcastList
+    } else if matches!(
+        chat.server,
+        wacore_binary::Server::Pn
+            | wacore_binary::Server::Lid
+            | wacore_binary::Server::Hosted
+            | wacore_binary::Server::HostedLid
+            | wacore_binary::Server::Bot
+    ) {
+        RetransmissionRoute::Direct
+    } else {
+        return Err(SendError::InvalidRequest(
+            "unsupported retransmission chat class".into(),
+        ));
+    };
+
+    if recipient.is_some() && !matches!(route, RetransmissionRoute::Direct) {
+        return Err(SendError::InvalidRequest(
+            "recipient is only valid for direct retransmissions".into(),
+        ));
+    }
+    if recipient.is_some_and(|recipient| {
+        recipient.is_empty()
+            || !matches!(
+                recipient.server,
+                wacore_binary::Server::Pn
+                    | wacore_binary::Server::Lid
+                    | wacore_binary::Server::Hosted
+                    | wacore_binary::Server::HostedLid
+                    | wacore_binary::Server::Bot
+            )
+    }) {
+        return Err(SendError::InvalidRequest(
+            "retransmission recipient must be a user JID".into(),
+        ));
+    }
+
+    Ok(route)
+}
 
 pub(crate) enum RetryReceiptSendOutcome {
     Sent { included_keys: bool },
@@ -80,8 +216,8 @@ fn resolve_retry_chat_info(
 ) -> Option<RetryChatInfo> {
     let from = &receipt.source.chat;
 
-    if from.is_group() || from.is_status_broadcast() {
-        // Groups/status: chat is already the group/broadcast JID.
+    if from.is_group() || from.is_status_broadcast() || from.is_broadcast_list() {
+        // Group-like chats: chat is already the group/broadcast JID.
         // Requester is the participant attr (the actual retrying device).
         let participant = node.attrs().optional_jid("participant");
         let is_fbid_bot_retry =
@@ -106,8 +242,7 @@ fn resolve_retry_chat_info(
         // 2. Peer device + recipient → chat = recipient
         // 3. Peer device without recipient → WA Web aborts (returns null).
         // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_non_ad()
-        let is_peer = own_pn.is_some_and(|pn| from.is_same_user_as(pn))
-            || own_lid.is_some_and(|lid| from.is_same_user_as(lid));
+        let is_peer = is_own_account_jid(from, own_pn, own_lid);
 
         let chat = if is_bot && let Some(r) = recipient.as_ref() {
             r.to_non_ad()
@@ -163,6 +298,126 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    async fn resolve_retransmission_encryption_jid(
+        &self,
+        route: RetransmissionRoute,
+        requester: &Jid,
+    ) -> Result<Jid, anyhow::Error> {
+        if matches!(route, RetransmissionRoute::Status) && requester.is_pn() {
+            return match self.get_lid_pn_entry(requester).await? {
+                Some(mapping) => Ok(Jid {
+                    user: wacore_binary::CompactString::new(&mapping.lid),
+                    server: wacore_binary::Server::Lid,
+                    device: requester.device,
+                    agent: requester.agent,
+                    integrator: requester.integrator,
+                }),
+                // WAWebResendStatusMsg explicitly falls back to the PN device
+                // when no LID mapping is available.
+                None => Ok(requester.clone()),
+            };
+        }
+        Ok(self.resolve_encryption_jid(requester).await)
+    }
+
+    /// Retransmit a message to one requesting device.
+    ///
+    /// The client derives the stanza from native protocol data and retains
+    /// ownership of routing, encryption, sender-key tracking, persistence, and
+    /// transport. The original message ID and retry count are preserved.
+    pub async fn retransmit_message(
+        &self,
+        request: MessageRetransmission,
+    ) -> Result<(), SendError> {
+        let route = validate_retransmission(
+            &request.chat,
+            &request.requester,
+            &request.message_id,
+            request.retry_count,
+            request.recipient.as_ref(),
+        )?;
+
+        if matches!(route, RetransmissionRoute::Direct) {
+            let snapshot = self.persistence_manager.get_device_snapshot();
+            let requester_is_local = is_own_account_jid(
+                &request.requester,
+                snapshot.pn.as_ref(),
+                snapshot.lid.as_ref(),
+            );
+            if request.recipient.is_some() {
+                if !requester_is_local && !request.requester.is_bot() {
+                    return Err(SendError::InvalidRequest(
+                        "a direct retransmission recipient is only valid for a local device or bot"
+                            .into(),
+                    ));
+                }
+            } else if requester_is_local {
+                return Err(SendError::InvalidRequest(
+                    "a direct retransmission to another local device requires a recipient".into(),
+                ));
+            }
+
+            let routing_chat = request.recipient.as_ref().unwrap_or(&request.requester);
+            if !self
+                .jids_share_user_identity(&request.chat, routing_chat)
+                .await
+                .map_err(SendError::from_anyhow)?
+            {
+                return Err(SendError::InvalidRequest(
+                    "direct retransmission chat does not match its routing identity".into(),
+                ));
+            }
+        }
+
+        let group_info = if matches!(route, RetransmissionRoute::Group) {
+            Some(
+                self.groups()
+                    .query_info_with_freshness(&request.chat, request.group_metadata_freshness)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let encryption_jid = self
+            .resolve_retransmission_encryption_jid(route, &request.requester)
+            .await
+            .map_err(SendError::from_anyhow)?;
+        if route.uses_sender_key() {
+            let chat_key = request.chat.to_string();
+            self.mark_forget_sender_key(&chat_key, std::slice::from_ref(&encryption_jid))
+                .await
+                .map_err(SendError::from_anyhow)?;
+        }
+
+        let MessageRetransmission {
+            chat,
+            requester: wire_requester,
+            message,
+            message_id,
+            retry_count,
+            recipient,
+            group_metadata_freshness: _,
+        } = request;
+        let pre_encoded = Arc::new(waproto::codec::message_to_vec(&message));
+        self.add_recent_message(&chat, &message_id, &message, Some(Arc::clone(&pre_encoded)))
+            .await;
+        self.retransmit_message_prepared(PreparedRetransmission {
+            route,
+            wire_requester,
+            encryption_jid,
+            chat,
+            message,
+            message_id,
+            retry_count,
+            recipient,
+            group_info,
+            pre_encoded: Some(pre_encoded),
+        })
+        .await
+        .map_err(SendError::from_anyhow)
+    }
+
     /// Handle an inbound `<receipt type="retry">`.
     ///
     /// WA Web authorizes these through `isRetryEligible` (`WAWebApiMessageInfoStore`).
@@ -224,7 +479,20 @@ impl Client {
         ) else {
             return Ok(());
         };
-        let is_group_or_status = info.chat.is_group() || info.chat.is_status_broadcast();
+        let route = match validate_retransmission(
+            &info.chat,
+            &info.requester,
+            &message_id,
+            retry_count,
+            info.recipient.as_ref(),
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                debug!("Ignoring malformed retry request: {error}");
+                return Ok(());
+            }
+        };
+        let uses_sender_key = route.uses_sender_key();
 
         // WA Web doesn't dedupe receipts (Message/Queue.js just serializes per-chat);
         // MAX_RETRY_COUNT covers loop prevention. This lock only guards against
@@ -301,7 +569,7 @@ impl Client {
         // WA Web: `e.from.isBot() ? (p = e.from) : (p = d.isLid() ? toLid(e.from) : toPn(e.from))`
         // Bots skip namespace normalization (WAWebHandleRetryRequest:311-312).
         let resolved_jid = if let Some(alt_chat) = alt_chat
-            && !is_group_or_status
+            && !uses_sender_key
             && !info.is_bot
         {
             let requester = &info.requester;
@@ -314,7 +582,8 @@ impl Client {
             };
             info.requester.clone()
         } else {
-            self.resolve_encryption_jid(&info.requester).await
+            self.resolve_retransmission_encryption_jid(route, &info.requester)
+                .await?
         };
 
         let keys_node_present = nr.get_optional_child("keys").is_some();
@@ -330,20 +599,17 @@ impl Client {
         }
 
         // Check if this is a retry from our own device (peer).
-        let is_peer = device_snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|our_pn| info.requester.is_same_user_as(our_pn))
-            || device_snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|our_lid| info.requester.is_same_user_as(our_lid));
+        let is_peer = is_own_account_jid(
+            &info.requester,
+            device_snapshot.pn.as_ref(),
+            device_snapshot.lid.as_ref(),
+        );
 
         // Volume-throttling inbound retries diverges from WA Web (which
         // processes every receipt), so it is an operator opt-in, gated here
         // before the expensive repair stages below. Own devices (`is_peer`) and
         // DMs are never gated: dropping their retries has no safe SKDM fallback.
-        if is_group_or_status
+        if uses_sender_key
             && !is_peer
             && let Some(policy) = self.retry_admission.get()
             && !policy.admit(&info.chat, &info.requester, retry_count)
@@ -378,7 +644,7 @@ impl Client {
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
         let mut rotated_sender_key = false;
-        if is_group_or_status && !info.requester.is_lid() && !info.chat.is_status_broadcast() {
+        if matches!(route, RetransmissionRoute::Group) && !info.requester.is_lid() {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
                 .as_ref()
@@ -486,17 +752,6 @@ impl Client {
             }
         }
 
-        // Status broadcasts can't resend (requires explicit recipient list).
-        // Participant already marked for fresh SKDM above; next status send includes them.
-        if info.chat.is_status_broadcast() {
-            info!(
-                "Status broadcast retry for {} — participant marked for fresh SKDM, \
-                 will be included in next status send",
-                message_id
-            );
-            return Ok(());
-        }
-
         // Bound the aggregate resend rate per group (the anti-abuse signal): a
         // PN to LID fan-out has many distinct devices retry the same messages,
         // which per-device/per-message caps miss. Group-only: the requester was
@@ -520,87 +775,24 @@ impl Client {
             retry_count
         );
 
-        if info.chat.is_group() {
-            // Group retry: pairwise encrypt to failing device only (RetryMsgJob.js:71).
-            // Using sender-key broadcast would resend to ALL participants → duplicates.
-            //
-            // WA Web calls ensureE2ESessions for all chat types, not just DMs
-            // (RetryRequest.js:200). Without this, a reg-ID mismatch or unknown
-            // device whose session was deleted above would fail `prepare_group_retry_stanza`
-            // with "session not found", silencing subsequent retries via the duplicate filter.
-            self.ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
-                .await?;
-
-            let device_snapshot = self.persistence_manager.get_device_snapshot();
-
-            let addressing_mode = cached_group_info
-                .as_ref()
-                .map(|g| g.addressing_mode)
-                .unwrap_or_default();
-
-            let signal_address = resolved_jid.to_protocol_address();
-            let session_mutex = self.session_lock_for(signal_address.as_str()).await;
-            let _session_guard = session_mutex.lock().await;
-            let mut store_adapter = self.signal_adapter().await;
-
-            let edit_attr =
-                wacore::types::message::EditAttribute::infer_from_message(&original_msg);
-            let stanza = wacore::send::prepare_group_retry_stanza(
-                &mut store_adapter.session_store,
-                &mut store_adapter.identity_store,
-                info.chat,
-                info.requester,
-                resolved_jid.clone(),
-                &original_msg,
-                message_id,
-                retry_count,
-                device_snapshot.account.as_deref(),
-                addressing_mode,
-                edit_attr,
-            )
-            .await?;
-
-            // The pre-wire gate can take the processing permit, whose holder
-            // may need this session lock.
-            drop(_session_guard);
-            self.send_retry_stanza(stanza).await?;
+        let wire_requester = if matches!(route, RetransmissionRoute::Direct) {
+            info.original_from
         } else {
-            // DM retry: pairwise resend to the requesting device only.
-            // Use _resolved variant: resolved_jid is already in the correct
-            // namespace (including alternate PN/LID normalization).
-            // WA Web's ensureE2ESessions also uses already-normalized JIDs.
-            self.ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
-                .await?;
-
-            let device_snapshot = self.persistence_manager.get_device_snapshot();
-            let signal_address = resolved_jid.to_protocol_address();
-            let session_mutex = self.session_lock_for(signal_address.as_str()).await;
-            let _session_guard = session_mutex.lock().await;
-            let mut store_adapter = self.signal_adapter().await;
-
-            let edit_attr =
-                wacore::types::message::EditAttribute::infer_from_message(&original_msg);
-            // WA Web forwards the receipt's `recipient` verbatim
-            // (`f && (k.recipient = f)` in handleRetryRequest); for non-self
-            // DM receipts the attribute is absent and the resend drops it.
-            let stanza = wacore::send::prepare_dm_retry_stanza(
-                &mut store_adapter.session_store,
-                &mut store_adapter.identity_store,
-                info.original_from,
-                info.recipient.clone(),
-                resolved_jid.clone(),
-                &original_msg,
-                message_id,
-                retry_count,
-                device_snapshot.account.as_deref(),
-                edit_attr,
-            )
-            .await?;
-
-            // Same lock-ordering rule as the group branch above.
-            drop(_session_guard);
-            self.send_retry_stanza(stanza).await?;
-        }
+            info.requester
+        };
+        self.retransmit_message_prepared(PreparedRetransmission {
+            route,
+            chat: info.chat,
+            wire_requester,
+            encryption_jid: resolved_jid,
+            message: original_msg,
+            message_id,
+            retry_count,
+            recipient: info.recipient,
+            group_info: cached_group_info,
+            pre_encoded: None,
+        })
+        .await?;
 
         Ok(())
     }
@@ -608,6 +800,186 @@ impl Client {
     async fn send_retry_stanza(&self, stanza: Node) -> Result<(), anyhow::Error> {
         self.persist_signal_state_pre_wire().await?;
         self.send_node(stanza).await?;
+        Ok(())
+    }
+
+    async fn retransmit_message_prepared(
+        &self,
+        request: PreparedRetransmission,
+    ) -> Result<(), anyhow::Error> {
+        let PreparedRetransmission {
+            route,
+            chat,
+            wire_requester,
+            encryption_jid,
+            message,
+            message_id,
+            retry_count,
+            recipient,
+            group_info,
+            pre_encoded,
+        } = request;
+
+        if matches!(route, RetransmissionRoute::Status) {
+            return self
+                .retransmit_status_message(
+                    chat,
+                    encryption_jid,
+                    message,
+                    message_id,
+                    pre_encoded.as_deref().map(Vec::as_slice),
+                )
+                .await;
+        }
+
+        // Every remaining route is pairwise, including broadcast-list
+        // participants, and shares the normal session recovery path.
+        self.ensure_e2e_sessions_resolved(std::slice::from_ref(&encryption_jid))
+            .await?;
+        let signal_address = encryption_jid.to_protocol_address();
+        let session_mutex = self.session_lock_for(signal_address.as_str()).await;
+        let session_guard = session_mutex.lock().await;
+        let mut store_adapter = self.signal_adapter().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let edit = wacore::types::message::EditAttribute::infer_from_message(&message);
+
+        let destination = match route {
+            RetransmissionRoute::Direct => wacore::send::PairwiseRetryDestination::Direct {
+                to: wire_requester,
+                recipient,
+            },
+            RetransmissionRoute::Group => {
+                let addressing_mode = group_info
+                    .as_ref()
+                    .map(|info| info.addressing_mode)
+                    .unwrap_or_default();
+                wacore::send::PairwiseRetryDestination::Participant {
+                    to: chat,
+                    participant: wire_requester,
+                    addressing_mode: Some(addressing_mode),
+                }
+            }
+            RetransmissionRoute::BroadcastList => {
+                wacore::send::PairwiseRetryDestination::Participant {
+                    to: chat,
+                    participant: wire_requester,
+                    addressing_mode: None,
+                }
+            }
+            RetransmissionRoute::Status => unreachable!("status handled above"),
+        };
+        let stanza = wacore::send::prepare_pairwise_retry_stanza(
+            &mut store_adapter.session_store,
+            &mut store_adapter.identity_store,
+            wacore::send::PairwiseRetryRequest {
+                destination,
+                encryption_jid,
+                message: &message,
+                message_id,
+                retry_count,
+                account: device_snapshot.account.as_deref(),
+                edit,
+                pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
+            },
+        )
+        .await?;
+
+        // Persistence may need the processing permit, whose holder may in turn
+        // need this session lock. Release it before the durability gate.
+        drop(session_guard);
+        self.send_retry_stanza(stanza).await
+    }
+
+    /// Rebuild a status message for exactly the requesting device. The retry
+    /// count remains an operation-level guard; the captured status wire does not
+    /// encode it on either the skmsg or SKDM `<enc>` node.
+    async fn retransmit_status_message(
+        &self,
+        chat: Jid,
+        requester: Jid,
+        message: wa::Message,
+        message_id: String,
+        pre_encoded: Option<&[u8]>,
+    ) -> Result<(), anyhow::Error> {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        let own_pn = snapshot
+            .pn
+            .as_ref()
+            .ok_or(crate::client::ClientError::NotLoggedIn)?;
+        let own_lid = snapshot
+            .lid
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cannot retransmit status without a device LID"))?;
+        let is_sending_device = (requester.is_same_user_as(own_pn)
+            && requester.device == own_pn.device)
+            || (requester.is_same_user_as(own_lid) && requester.device == own_lid.device);
+        if is_sending_device {
+            anyhow::bail!("cannot retransmit a status to the sending device itself");
+        }
+
+        let chat_key = chat.to_string();
+        let distribution_guard = self.group_distribution_lock(&chat).await;
+        let group_info = wacore::client::context::GroupInfo::new(
+            Vec::new(),
+            wacore::types::message::AddressingMode::Lid,
+        );
+
+        let can_reuse_encoding = message.message_context_info.is_unset();
+        let encoded_fallback = (pre_encoded.is_none() && can_reuse_encoding)
+            .then(|| waproto::codec::message_to_vec(&message));
+        let encoded = pre_encoded
+            .filter(|_| can_reuse_encoding)
+            .or(encoded_fallback.as_deref());
+        let device_store = self.persistence_manager.get_device_arc().await;
+        let mut store_adapter = self.signal_adapter_from(device_store);
+        let mut stores = store_adapter.as_signal_stores();
+        let edit = wacore::types::message::EditAttribute::infer_from_message(&message);
+        let prepared = match wacore::send::prepare_group_stanza(
+            &*self.runtime,
+            &mut stores,
+            self,
+            wacore::send::GroupStanzaRequest {
+                group: &group_info,
+                own_jid: own_pn,
+                own_lid,
+                account: snapshot.account.as_deref(),
+                to: &chat,
+                message: &message,
+                message_id: &message_id,
+                force_distribution: false,
+                distribution_targets: Some(vec![requester]),
+                distribution_policy: wacore::send::SenderKeyDistributionPolicy::Required,
+                phash_devices: None,
+                edit: edit.as_ref(),
+                extra_nodes: &[],
+                pre_encoded: encoded,
+            },
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Do not hold the sender-key distribution lane across registry
+                // I/O. The typed failure retains the original source chain and
+                // identifies only users whose pre-key lookup returned 406.
+                drop(distribution_guard);
+                if let Some(failure) =
+                    error.downcast_ref::<wacore::send::RequiredSenderKeyDistributionError>()
+                {
+                    for user in failure.stale_device_users() {
+                        self.invalidate_device_cache(user).await;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        self.send_retry_stanza(prepared.node).await?;
+        self.update_sender_key_devices(&chat_key, &prepared.skdm_devices)
+            .await;
+        drop(distribution_guard);
+        for user in &prepared.stale_device_users {
+            self.invalidate_device_cache(user).await;
+        }
         Ok(())
     }
 
@@ -641,7 +1013,7 @@ impl Client {
         if info.chat.is_group() || info.chat.is_status_broadcast() {
             let group_jid = info.chat.to_string();
             match self
-                .mark_forget_sender_key(&group_jid, std::slice::from_ref(&info.requester))
+                .mark_forget_sender_key(&group_jid, std::slice::from_ref(resolved_jid))
                 .await
             {
                 Ok(()) => {
@@ -655,7 +1027,7 @@ impl Client {
                     // (WA Web logs the same event at its verbose LOG level).
                     debug!(
                         "Marked {} for fresh SKDM in {} {} due to retry receipt",
-                        info.requester.observe(),
+                        resolved_jid.observe(),
                         chat_type,
                         group_jid
                     );
@@ -2293,6 +2665,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_local_signal_session_cools_resolved_sender_key_namespace() {
+        let client = crate::test_utils::create_test_client_with_failing_http(
+            "retry_sender_key_resolved_namespace",
+        )
+        .await;
+        let group = "120363000000000006@g.us";
+        let requester_pn: Jid = "12025550108:33@s.whatsapp.net".parse().unwrap();
+        let resolved_lid: Jid = "100000000000088:33@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .set_sender_key_status(
+                group,
+                &[
+                    ("12025550108:33@s.whatsapp.net", true),
+                    ("100000000000088:33@lid", true),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let cached = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(crate::sender_key_device_cache::SenderKeyDeviceMap::from_db_rows(&rows))
+            })
+            .await;
+
+        let info = RetryChatInfo {
+            chat: group.parse().unwrap(),
+            requester: requester_pn,
+            original_from: group.parse().unwrap(),
+            recipient: None,
+            is_bot: false,
+            is_fbid_bot_retry: false,
+        };
+        let node = build_retry_receipt_without_keys();
+        assert!(
+            client
+                .update_local_signal_session(
+                    &info,
+                    &resolved_lid,
+                    "MSG-GRP-NAMESPACE",
+                    1,
+                    &node.as_node_ref(),
+                    false,
+                )
+                .await
+        );
+
+        assert_eq!(cached.device_has_key("100000000000088", 33), Some(false));
+        assert_eq!(cached.device_has_key("12025550108", 33), Some(true));
+        let persisted = crate::sender_key_device_cache::SenderKeyDeviceMap::from_db_rows(
+            &client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(persisted.device_has_key("100000000000088", 33), Some(false));
+        assert_eq!(persisted.device_has_key("12025550108", 33), Some(true));
+    }
+
+    #[tokio::test]
+    async fn status_retransmission_resolution_is_cache_aside_with_pn_fallback() {
+        let client = crate::test_utils::create_test_client_with_failing_http(
+            "retry_status_requester_resolution",
+        )
+        .await;
+        client
+            .add_lid_pn_mapping(
+                "100000000000089",
+                "12025550109",
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        client.lid_pn_cache.clear().await;
+
+        let mapped_pn: Jid = "12025550109:19@s.whatsapp.net".parse().unwrap();
+        let mapped = client
+            .resolve_retransmission_encryption_jid(RetransmissionRoute::Status, &mapped_pn)
+            .await
+            .unwrap();
+        assert_eq!(mapped, "100000000000089:19@lid".parse::<Jid>().unwrap());
+
+        let unmapped_pn: Jid = "12025550110:20@s.whatsapp.net".parse().unwrap();
+        let fallback = client
+            .resolve_retransmission_encryption_jid(RetransmissionRoute::Status, &unmapped_pn)
+            .await
+            .unwrap();
+        assert_eq!(fallback, unmapped_pn);
+    }
+
     /// `should_recreate_session` mirrors whatsmeow `shouldRecreateSession`:
     /// 1) no session → always recreate;
     /// 2) session exists + retry<2 → never recreate;
@@ -2907,6 +3378,204 @@ mod tests {
 
         // DM should NOT trigger sender key deletion
         assert!(!(dm.is_group() || dm.is_status_broadcast()));
+    }
+
+    #[test]
+    fn retransmission_route_validation_is_strict_and_typed() {
+        let direct: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+        let requester: Jid = "12025550100:7@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let status = Jid::status_broadcast();
+        let broadcast: Jid = "1234567890@broadcast".parse().unwrap();
+
+        assert!(matches!(
+            validate_retransmission(&direct, &requester, "DM1", 1, Some(&direct)),
+            Ok(RetransmissionRoute::Direct)
+        ));
+        assert!(matches!(
+            validate_retransmission(&group, &requester, "GROUP1", 1, None),
+            Ok(RetransmissionRoute::Group)
+        ));
+        assert!(matches!(
+            validate_retransmission(&status, &requester, "STATUS1", 1, None),
+            Ok(RetransmissionRoute::Status)
+        ));
+        assert!(matches!(
+            validate_retransmission(&broadcast, &requester, "BROADCAST1", 1, None),
+            Ok(RetransmissionRoute::BroadcastList)
+        ));
+
+        for (id, count) in [("ZERO", 0), ("", 1), ("MAX", MAX_RETRY_COUNT)] {
+            assert!(
+                validate_retransmission(&direct, &requester, id, count, None).is_err(),
+                "invalid id/count pair must fail: {id:?}/{count}"
+            );
+        }
+        assert!(
+            validate_retransmission(&group, &requester, "GROUP2", 1, Some(&direct)).is_err(),
+            "recipient is only meaningful on a direct retry"
+        );
+        assert!(
+            validate_retransmission(&status, &group, "STATUS2", 1, None).is_err(),
+            "a group JID cannot be a requesting status device"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_peer_retransmission_requires_a_recipient() {
+        let client = crate::test_utils::create_test_client().await;
+        let own_pn: Jid = "12025550100:13@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                own_pn.clone(),
+            )))
+            .await;
+
+        let chat: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
+        let requester = own_pn.with_device(7);
+        let request = MessageRetransmission::new(
+            chat,
+            requester,
+            wa::Message::default(),
+            "PEER-RETRY-1".to_string(),
+            1,
+        );
+
+        let error = client
+            .retransmit_message(request)
+            .await
+            .expect_err("a peer route without its actual chat cannot be sent");
+        assert!(matches!(error, SendError::InvalidRequest(_)));
+        assert!(error.to_string().contains("requires a recipient"));
+    }
+
+    #[tokio::test]
+    async fn public_direct_retransmission_binds_chat_to_routing_identity() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat = Jid::pn("12025550104");
+        let requester = Jid::pn_device("12025550105", 7);
+        let bot_requester: Jid = "200000000000002@bot".parse().unwrap();
+
+        for request in [
+            MessageRetransmission::new(
+                chat.clone(),
+                requester,
+                wa::Message::default(),
+                "DIRECT-CHAT-MISMATCH-1".to_string(),
+                1,
+            ),
+            MessageRetransmission::new(
+                chat.clone(),
+                bot_requester,
+                wa::Message::default(),
+                "DIRECT-RECIPIENT-MISMATCH-1".to_string(),
+                1,
+            )
+            .with_recipient(Jid::pn("12025550106")),
+        ] {
+            let error = client
+                .retransmit_message(request)
+                .await
+                .expect_err("an unrelated routing identity must be rejected");
+            assert!(matches!(error, SendError::InvalidRequest(_)));
+            assert!(error.to_string().contains("routing identity"));
+        }
+    }
+
+    #[tokio::test]
+    async fn public_direct_recipient_rejects_an_unrelated_requester() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat = Jid::pn("12025550108");
+        let request = MessageRetransmission::new(
+            chat.clone(),
+            Jid::pn_device("12025550109", 7),
+            wa::Message::default(),
+            "DIRECT-RECIPIENT-SOURCE-1".to_string(),
+            1,
+        )
+        .with_recipient(chat);
+
+        let error = client
+            .retransmit_message(request)
+            .await
+            .expect_err("a normal remote user cannot declare a recipient route");
+        assert!(matches!(error, SendError::InvalidRequest(_)));
+        assert!(error.to_string().contains("local device or bot"));
+    }
+
+    #[tokio::test]
+    async fn direct_retransmission_chat_accepts_known_pn_lid_alias() {
+        let client = crate::test_utils::create_test_client().await;
+        let pn = Jid::pn("12025550107");
+        let lid = Jid::lid("100000000000107");
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: lid.user.as_str().into(),
+                phone_number: pn.user.as_str().into(),
+                created_at: 1,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+
+        assert!(client.jids_share_user_identity(&pn, &lid).await.unwrap());
+        assert!(client.jids_share_user_identity(&lid, &pn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_retransmission_recaches_the_supplied_message() {
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 16;
+        let client = crate::test_utils::create_test_client_with_config(
+            "public_retransmission_cache",
+            Arc::new(MockHttpClient),
+            config,
+        )
+        .await;
+        let chat = Jid::pn("12025550103");
+        let requester = chat.with_device(7);
+        crate::test_utils::seed_peer_session(&client, &requester).await;
+        let message = wa::Message {
+            conversation: Some("retry me".into()),
+            ..Default::default()
+        };
+        let message_id = "PUBLIC-RETRY-CACHE-1";
+
+        // The fresh test session emits pkmsg and this client intentionally has
+        // no device identity, so the wire attempt fails after the public API has
+        // accepted and cached the supplied message.
+        let result = client
+            .retransmit_message(MessageRetransmission::new(
+                chat.clone(),
+                requester,
+                message,
+                message_id.to_string(),
+                1,
+            ))
+            .await;
+        assert!(result.is_err());
+
+        let (cached, alternate) = client
+            .peek_recent_message(&chat, message_id)
+            .await
+            .expect("a later retry count must find the retransmitted message");
+        assert!(alternate.is_none());
+        assert_eq!(cached.conversation.as_deref(), Some("retry me"));
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_broadcast_uses_participant_device() {
+        let broadcast = "1234567890@broadcast";
+        let participant = "12025550101:9@s.whatsapp.net";
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", participant)
+            .build();
+        let receipt = make_test_receipt(broadcast);
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.chat.is_broadcast_list());
+        assert_eq!(info.requester, participant.parse::<Jid>().unwrap());
     }
 
     /// The key-bundle policy is driven only by explicit force, stateless routing,

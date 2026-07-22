@@ -272,12 +272,11 @@ impl Client {
         self.send_message_impl(
             to,
             msg,
-            Some(msg_id.clone()),
-            true,  // is_peer_message
-            false, // is_retry
-            None,
-            vec![], // No extra stanza nodes for peer messages
-            None,
+            crate::send::SendPipelineOptions {
+                request_id: Some(msg_id.clone()),
+                peer: true,
+                ..Default::default()
+            },
         )
         .await?;
 

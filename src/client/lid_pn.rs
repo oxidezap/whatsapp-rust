@@ -293,11 +293,33 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
+        let outcome = self.record_lid_pn_batch_in_memory(mappings, source).await;
+        self.finish_lid_pn_batch_learning(outcome, is_offline);
+    }
+
+    pub(crate) async fn learn_lid_pn_mappings_batch_guarded(
+        self: &Arc<Self>,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        is_offline: bool,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) {
+        let outcome = self
+            .record_lid_pn_batch_in_memory_guarded(mappings, source, guard)
+            .await;
+        self.finish_lid_pn_batch_learning(outcome, is_offline);
+    }
+
+    fn finish_lid_pn_batch_learning(
+        self: &Arc<Self>,
+        outcome: BatchRecordOutcome,
+        is_offline: bool,
+    ) {
         let BatchRecordOutcome {
             entries,
             migration_flags,
             usync_phones,
-        } = self.record_lid_pn_batch_in_memory(mappings, source).await;
+        } = outcome;
 
         // Conflicting observational pairs re-resolve live, independent of the
         // flush gate (WA Web fires syncContactListJob regardless of
@@ -383,6 +405,17 @@ impl Client {
         mappings: Vec<(String, String)>,
         source: LearningSource,
     ) -> BatchRecordOutcome {
+        let guard = self.lid_pn_cache.lock_mutation().await;
+        self.record_lid_pn_batch_in_memory_guarded(mappings, source, &guard)
+            .await
+    }
+
+    async fn record_lid_pn_batch_in_memory_guarded(
+        &self,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> BatchRecordOutcome {
         let cap = mappings.len();
         let mut deduped: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(cap);
@@ -395,7 +428,7 @@ impl Client {
         let mut usync_phones: Vec<String> = Vec::new();
         for (phone_number, lid) in deduped {
             match self
-                .record_lid_pn_in_memory(&lid, &phone_number, source)
+                .record_lid_pn_in_memory_guarded(&lid, &phone_number, source, guard)
                 .await
             {
                 RecordOutcome::Skipped => {}
@@ -425,6 +458,18 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> RecordOutcome {
+        let guard = self.lid_pn_cache.lock_mutation().await;
+        self.record_lid_pn_in_memory_guarded(lid, phone_number, source, &guard)
+            .await
+    }
+
+    async fn record_lid_pn_in_memory_guarded(
+        &self,
+        lid: &str,
+        phone_number: &str,
+        source: LearningSource,
+        guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> RecordOutcome {
         // Fully durable and resolvable both ways: nothing to re-add or persist.
         if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
             return RecordOutcome::Skipped;
@@ -451,7 +496,7 @@ impl Client {
             };
             return match existing {
                 Some(entry) => {
-                    self.lid_pn_cache.add(&entry).await;
+                    self.lid_pn_cache.add_guarded(&entry, guard).await;
                     RecordOutcome::Written {
                         entry,
                         needs_migration,
@@ -472,7 +517,7 @@ impl Client {
                 wacore::time::now_secs()
             };
             let entry = LidPnEntry::with_timestamp(lid, phone_number, created_at, source);
-            self.lid_pn_cache.add(&entry).await;
+            self.lid_pn_cache.add_guarded(&entry, guard).await;
             return RecordOutcome::Written {
                 entry,
                 needs_migration: current_lid.is_none(),
@@ -1048,12 +1093,26 @@ impl Client {
     /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_lid_pn_entry", level = "trace", skip_all, fields(peer = %jid.observe()), err(Debug)))]
     pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
-        let (hit, is_lid) = if jid.is_lid() {
-            (self.lid_pn_cache.get_entry_by_lid(&jid.user).await, true)
+        let is_lid = if jid.is_lid() {
+            true
         } else if jid.is_pn() {
-            (self.lid_pn_cache.get_entry_by_phone(&jid.user).await, false)
+            false
         } else {
             return Ok(None);
+        };
+
+        self.get_lid_pn_entry_by_user(&jid.user, is_lid).await
+    }
+
+    async fn get_lid_pn_entry_by_user(
+        &self,
+        user: &str,
+        is_lid: bool,
+    ) -> Result<Option<LidPnEntry>> {
+        let hit = if is_lid {
+            self.lid_pn_cache.get_entry_by_lid(user).await
+        } else {
+            self.lid_pn_cache.get_entry_by_phone(user).await
         };
 
         if let Some(entry) = hit {
@@ -1062,9 +1121,9 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
         let mapping = if is_lid {
-            backend.get_lid_mapping(&jid.user).await?
+            backend.get_lid_mapping(user).await?
         } else {
-            backend.get_pn_mapping(&jid.user).await?
+            backend.get_pn_mapping(user).await?
         };
 
         let Some(mapping) = mapping else {
@@ -1074,6 +1133,43 @@ impl Client {
         let entry = mapping_to_entry(mapping);
         self.lid_pn_cache.add(&entry).await;
         Ok(Some(entry))
+    }
+
+    /// Whether two user JIDs identify the same account, ignoring device
+    /// suffixes and resolving PN/LID aliases through the canonical mapping
+    /// cache-aside path. Hosted namespaces belong to their corresponding PN or
+    /// LID family; unrelated namespaces only match exactly.
+    pub(crate) async fn jids_share_user_identity(&self, left: &Jid, right: &Jid) -> Result<bool> {
+        if left.is_same_chat_as(right) {
+            return Ok(true);
+        }
+
+        let same_user_and_integrator =
+            left.user == right.user && left.integrator == right.integrator;
+        if same_user_and_integrator
+            && ((left.server.is_pn_family() && right.server.is_pn_family())
+                || (left.server.is_lid_family() && right.server.is_lid_family()))
+        {
+            return Ok(true);
+        }
+
+        let (lid, pn) = if left.server.is_lid_family() && right.server.is_pn_family() {
+            (left, right)
+        } else if right.server.is_lid_family() && left.server.is_pn_family() {
+            (right, left)
+        } else {
+            return Ok(false);
+        };
+        if lid.integrator != pn.integrator {
+            return Ok(false);
+        }
+
+        Ok(self
+            .get_lid_pn_entry_by_user(&lid.user, true)
+            .await?
+            .is_some_and(|mapping| {
+                &*mapping.lid == lid.user.as_str() && &*mapping.phone_number == pn.user.as_str()
+            }))
     }
 
     /// Resolve any user JID to its bare LID form, or `None` when no LID is

@@ -365,10 +365,22 @@ pub mod codec {
     }
 
     #[inline(never)]
+    pub fn adv_signed_key_index_list_to_vec(
+        key_index: &whatsapp::ADVSignedKeyIndexList,
+    ) -> Vec<u8> {
+        key_index.encode_to_vec()
+    }
+
+    #[inline(never)]
     pub fn adv_key_index_list_decode(
         bytes: &[u8],
     ) -> Result<whatsapp::ADVKeyIndexList, buffa::DecodeError> {
         whatsapp::ADVKeyIndexList::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn adv_key_index_list_to_vec(key_index: &whatsapp::ADVKeyIndexList) -> Vec<u8> {
+        key_index.encode_to_vec()
     }
 
     #[inline(never)]

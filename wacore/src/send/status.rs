@@ -95,6 +95,19 @@ pub fn status_carries_privacy_meta(message: &wa::Message) -> bool {
     !is_revoke && !is_reaction
 }
 
+/// Return the message ID targeted by a status revoke, if this is a structurally
+/// complete revoke protocol message.
+///
+/// The target ID belongs to the embedded protocol key. It is distinct from the
+/// outer stanza ID generated for the revoke itself.
+pub fn status_revoke_target_id(message: &wa::Message) -> Option<&str> {
+    let protocol_message = unwrap_message(message).protocol_message.as_option()?;
+    if protocol_message.r#type != Some(wa::message::protocol_message::Type::Revoke) {
+        return None;
+    }
+    protocol_message.key.as_option()?.id.as_deref()
+}
+
 /// Dedup a pre-resolved status recipient list by user, then anchor the sender's
 /// own LID. Errors when no recipient was resolvable (matches WA Web's
 /// `WAWebLidMigrationUtils.toUserLid` + `compactMap` dropping unresolvable

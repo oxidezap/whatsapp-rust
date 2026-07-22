@@ -1066,12 +1066,11 @@ impl Client {
                     self.send_message_impl(
                         peer,
                         msg,
-                        Some(self.generate_message_id()),
-                        true,
-                        false,
-                        None,
-                        Vec::new(),
-                        None,
+                        crate::send::SendPipelineOptions {
+                            request_id: Some(self.generate_message_id()),
+                            peer: true,
+                            ..Default::default()
+                        },
                     )
                     .await
                 }

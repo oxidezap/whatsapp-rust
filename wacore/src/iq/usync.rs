@@ -286,6 +286,16 @@ fn project_business(
 
 pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapping> {
     let user_jid = user.id.as_ref()?;
+    if user_jid.server.is_lid_family() {
+        let pn_jid = user
+            .pn_jid
+            .as_ref()
+            .filter(|jid| jid.server.is_pn_family())?;
+        return Some(UsyncLidMapping {
+            phone_number: pn_jid.user.clone(),
+            lid: user_jid.user.clone(),
+        });
+    }
     if !user_jid.server.is_pn_family() {
         return None;
     }
@@ -297,6 +307,28 @@ pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapp
     Some(UsyncLidMapping {
         phone_number: user_jid.user.clone(),
         lid: lid.user.clone(),
+    })
+}
+
+#[inline]
+fn device_list_identity_matches(
+    returned: &Jid,
+    expected: &Jid,
+    mappings: &[UsyncLidMapping],
+) -> bool {
+    if returned.user == expected.user && returned.server == expected.server {
+        return true;
+    }
+
+    mappings.iter().any(|mapping| {
+        (returned.server.is_lid_family()
+            && expected.server.is_pn_family()
+            && returned.user == mapping.lid
+            && expected.user == mapping.phone_number)
+            || (returned.server.is_pn_family()
+                && expected.server.is_lid_family()
+                && returned.user == mapping.phone_number
+                && expected.user == mapping.lid)
     })
 }
 
@@ -587,7 +619,23 @@ impl DeviceListSpec {
             hashes,
         }
     }
+
+    /// Reject a response that omits any requested user or returns no devices
+    /// for one. Use for authoritative refreshes; ordinary fanout remains
+    /// best-effort when an individual user cannot be resolved.
+    pub fn require_complete_response(self) -> CompleteDeviceListSpec {
+        CompleteDeviceListSpec(self)
+    }
 }
+
+/// A device-list query whose response must contain a usable entry for every
+/// requested user.
+///
+/// This wrapper keeps [`DeviceListSpec`]'s public data model unchanged while
+/// making authoritative refresh semantics explicit in the type system. It has
+/// no additional runtime state.
+#[derive(Debug, Clone)]
+pub struct CompleteDeviceListSpec(DeviceListSpec);
 
 pub(crate) fn device_list_query(
     jids: &[Jid],
@@ -708,6 +756,33 @@ impl IqSpec for DeviceListSpec {
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
         project_device_list_response(parse_usync_response(response)?)
+    }
+}
+
+impl IqSpec for CompleteDeviceListSpec {
+    type Response = DeviceListResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        self.0.build_iq()
+    }
+
+    fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+        self.0.encode_iq_direct(request_id, out)
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+        let parsed = self.0.parse_response(response)?;
+        for expected in &self.0.jids {
+            let Some(returned) = parsed.device_lists.iter().find(|returned| {
+                device_list_identity_matches(&returned.user, expected, &parsed.lid_mappings)
+            }) else {
+                anyhow::bail!("device-list response omitted user {expected}");
+            };
+            if returned.devices.is_empty() {
+                anyhow::bail!("device-list response returned no devices for {expected}");
+            }
+        }
+        Ok(parsed)
     }
 }
 
@@ -1341,6 +1416,21 @@ mod tests {
     }
 
     #[test]
+    fn device_list_spec_preserves_its_public_data_shape() {
+        let jid = Jid::pn("1234567890");
+        let spec = DeviceListSpec {
+            jids: vec![jid.clone()],
+            sid: "test-sid".to_string(),
+            hashes: std::collections::HashMap::new(),
+        };
+
+        let DeviceListSpec { jids, sid, hashes } = spec;
+        assert_eq!(jids, [jid]);
+        assert_eq!(sid, "test-sid");
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
     fn test_device_list_spec_build_iq_with_device_hash() {
         let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let mut hashes = std::collections::HashMap::new();
@@ -1384,7 +1474,11 @@ mod tests {
         // keeps the omitted user's cached devices (device_hash merge-safety).
         let a: Jid = "1111111111@s.whatsapp.net".parse().unwrap();
         let b: Jid = "2222222222@s.whatsapp.net".parse().unwrap();
-        let spec = DeviceListSpec::new(vec![a, b], "sid-omit");
+        let best_effort = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-best-effort");
+        let complete = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-complete")
+            .require_complete_response();
+        let incremental =
+            DeviceListSpec::with_hashes(vec![a, b], "sid-omit", std::collections::HashMap::new());
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
@@ -1403,9 +1497,15 @@ mod tests {
                 .build()])
             .build();
 
-        let result = spec.parse_response(&response.as_node_ref()).unwrap();
-        assert_eq!(result.device_lists.len(), 1, "omitted user must not appear");
-        assert_eq!(result.device_lists[0].user.user, "1111111111");
+        assert!(
+            complete.parse_response(&response.as_node_ref()).is_err(),
+            "a complete query must not accept a partial snapshot"
+        );
+        for spec in [best_effort, incremental] {
+            let result = spec.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(result.device_lists.len(), 1, "omitted user must not appear");
+            assert_eq!(result.device_lists[0].user.user, "1111111111");
+        }
     }
 
     #[test]
@@ -1459,7 +1559,15 @@ mod tests {
     fn device_list_devices_error_skips_only_that_user() {
         let jid1: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let jid2: Jid = "9876543210@s.whatsapp.net".parse().unwrap();
-        let spec = DeviceListSpec::new(vec![jid1, jid2], "test-sid");
+        let best_effort =
+            DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-best-effort");
+        let complete = DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-complete")
+            .require_complete_response();
+        let incremental = DeviceListSpec::with_hashes(
+            vec![jid1, jid2],
+            "test-sid",
+            std::collections::HashMap::new(),
+        );
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
@@ -1494,9 +1602,15 @@ mod tests {
                 .build()])
             .build();
 
-        let result = spec.parse_response(&response.as_node_ref()).unwrap();
-        assert_eq!(result.device_lists.len(), 1);
-        assert_eq!(result.device_lists[0].user.user, "9876543210");
+        assert!(
+            complete.parse_response(&response.as_node_ref()).is_err(),
+            "a per-user error makes a complete snapshot unusable"
+        );
+        for spec in [best_effort, incremental] {
+            let result = spec.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(result.device_lists.len(), 1);
+            assert_eq!(result.device_lists[0].user.user, "9876543210");
+        }
     }
 
     #[test]
@@ -1595,7 +1709,46 @@ mod tests {
             let mapping = project_lid_mapping(&user).expect("expected LID mapping");
             assert_eq!(mapping.phone_number, "13135550100");
             assert_eq!(mapping.lid, "100000000000100");
+
+            let canonicalized = UsyncUserResult {
+                id: Some(Jid::new("100000000000100", lid_server)),
+                pn_jid: Some(Jid::new("13135550100", pn_server)),
+                protocols: Vec::new(),
+            };
+            let mapping = project_lid_mapping(&canonicalized).expect("expected pn_jid mapping");
+            assert_eq!(mapping.phone_number, "13135550100");
+            assert_eq!(mapping.lid, "100000000000100");
         }
+    }
+
+    #[test]
+    fn complete_device_list_accepts_server_canonicalized_lid() {
+        let requested = Jid::pn("12025550100");
+        let spec =
+            DeviceListSpec::new(vec![requested], "sid-canonicalized").require_complete_response();
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "100000000000100@lid")
+                        .attr("pn_jid", "12025550100@s.whatsapp.net")
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let parsed = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(parsed.device_lists[0].user, Jid::lid("100000000000100"));
+        assert_eq!(parsed.lid_mappings.len(), 1);
+        assert_eq!(parsed.lid_mappings[0].phone_number, "12025550100");
+        assert_eq!(parsed.lid_mappings[0].lid, "100000000000100");
     }
 
     #[test]

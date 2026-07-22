@@ -149,23 +149,22 @@ pub fn filter_devices_by_key_index(
     devices: &[DeviceInfo],
     decoded: &DecodedKeyIndex,
 ) -> Vec<DeviceInfo> {
-    let valid_set: std::collections::HashSet<u32> = decoded.valid_indexes.iter().copied().collect();
-
     devices
         .iter()
-        .filter(|d| {
-            // Primary device always kept
-            if d.device_id == 0 {
-                return true;
-            }
-            match d.key_index {
-                Some(ki) => valid_set.contains(&ki) || ki > decoded.current_index,
-                // WA Web: h.has(null) → false, null > y → false → device removed
-                None => false,
-            }
-        })
+        .filter(|device| should_retain_device(device, decoded))
         .cloned()
         .collect()
+}
+
+/// Filter a device list in place using the same ADV key-index rules as
+/// [`filter_devices_by_key_index`]. This avoids allocating and copying a second
+/// list when the caller already owns its device snapshot.
+pub fn retain_devices_by_key_index(devices: &mut Vec<DeviceInfo>, decoded: &DecodedKeyIndex) {
+    devices.retain(|device| should_retain_device(device, decoded));
+}
+
+fn should_retain_device(device: &DeviceInfo, decoded: &DecodedKeyIndex) -> bool {
+    device.device_id == 0 || is_key_index_valid(device.key_index, decoded)
 }
 
 /// Check if a key_index is accepted by the decoded ADV list.

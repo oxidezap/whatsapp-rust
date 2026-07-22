@@ -30,20 +30,20 @@ impl Client {
             .and_then(|s| s.pn.as_ref())
             .map(|j| j.user.as_str());
 
-        let kept: Vec<&Jid> = device_jids
+        let keep = |jid: &&Jid| {
+            !exclude_own_devices
+                || !(own_lid_user.is_some_and(|user| user == jid.user)
+                    || own_pn_user.is_some_and(|user| user == jid.user))
+        };
+        let device_ids: Vec<String> = device_jids
             .iter()
-            .filter(|jid| {
-                !exclude_own_devices
-                    || !(own_lid_user.is_some_and(|u| u == jid.user)
-                        || own_pn_user.is_some_and(|u| u == jid.user))
-            })
+            .filter(keep)
+            .map(ToString::to_string)
             .collect();
-
-        if kept.is_empty() {
+        if device_ids.is_empty() {
             return Ok(());
         }
 
-        let device_ids: Vec<String> = kept.iter().map(|jid| jid.to_string()).collect();
         let entries: Vec<(&str, bool)> = device_ids.iter().map(|s| (s.as_str(), has_key)).collect();
         self.persistence_manager
             .set_sender_key_status(group_jid, &entries)
@@ -61,9 +61,8 @@ impl Client {
             // the skdm_warm_memo compares, so a warm send re-runs its target
             // filter and re-sends the now-cold device's SKDM — no separate memo
             // invalidation, hence no cross-cache ordering window.
-            let jids: Vec<Jid> = kept.into_iter().cloned().collect();
             self.sender_key_device_cache
-                .mark_forgotten(group_jid, &jids)
+                .mark_forgotten(group_jid, device_jids.iter().filter(keep))
                 .await;
         }
         Ok(())

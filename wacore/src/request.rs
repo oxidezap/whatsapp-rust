@@ -122,7 +122,7 @@ pub struct ServerErrorCode {
 
 impl ServerErrorCode {
     pub fn from_anyhow(err: &anyhow::Error) -> Option<&Self> {
-        err.downcast_ref::<Self>()
+        err.chain().find_map(|cause| cause.downcast_ref::<Self>())
     }
 }
 
