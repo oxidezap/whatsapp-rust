@@ -1048,12 +1048,26 @@ impl Client {
     /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_lid_pn_entry", level = "trace", skip_all, fields(peer = %jid.observe()), err(Debug)))]
     pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
-        let (hit, is_lid) = if jid.is_lid() {
-            (self.lid_pn_cache.get_entry_by_lid(&jid.user).await, true)
+        let is_lid = if jid.is_lid() {
+            true
         } else if jid.is_pn() {
-            (self.lid_pn_cache.get_entry_by_phone(&jid.user).await, false)
+            false
         } else {
             return Ok(None);
+        };
+
+        self.get_lid_pn_entry_by_user(&jid.user, is_lid).await
+    }
+
+    async fn get_lid_pn_entry_by_user(
+        &self,
+        user: &str,
+        is_lid: bool,
+    ) -> Result<Option<LidPnEntry>> {
+        let hit = if is_lid {
+            self.lid_pn_cache.get_entry_by_lid(user).await
+        } else {
+            self.lid_pn_cache.get_entry_by_phone(user).await
         };
 
         if let Some(entry) = hit {
@@ -1062,9 +1076,9 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
         let mapping = if is_lid {
-            backend.get_lid_mapping(&jid.user).await?
+            backend.get_lid_mapping(user).await?
         } else {
-            backend.get_pn_mapping(&jid.user).await?
+            backend.get_pn_mapping(user).await?
         };
 
         let Some(mapping) = mapping else {
@@ -1074,6 +1088,43 @@ impl Client {
         let entry = mapping_to_entry(mapping);
         self.lid_pn_cache.add(&entry).await;
         Ok(Some(entry))
+    }
+
+    /// Whether two user JIDs identify the same account, ignoring device
+    /// suffixes and resolving PN/LID aliases through the canonical mapping
+    /// cache-aside path. Hosted namespaces belong to their corresponding PN or
+    /// LID family; unrelated namespaces only match exactly.
+    pub(crate) async fn jids_share_user_identity(&self, left: &Jid, right: &Jid) -> Result<bool> {
+        if left.is_same_chat_as(right) {
+            return Ok(true);
+        }
+
+        let same_user_and_integrator =
+            left.user == right.user && left.integrator == right.integrator;
+        if same_user_and_integrator
+            && ((left.server.is_pn_family() && right.server.is_pn_family())
+                || (left.server.is_lid_family() && right.server.is_lid_family()))
+        {
+            return Ok(true);
+        }
+
+        let (lid, pn) = if left.server.is_lid_family() && right.server.is_pn_family() {
+            (left, right)
+        } else if right.server.is_lid_family() && left.server.is_pn_family() {
+            (right, left)
+        } else {
+            return Ok(false);
+        };
+        if lid.integrator != pn.integrator {
+            return Ok(false);
+        }
+
+        Ok(self
+            .get_lid_pn_entry_by_user(&lid.user, true)
+            .await?
+            .is_some_and(|mapping| {
+                &*mapping.lid == lid.user.as_str() && &*mapping.phone_number == pn.user.as_str()
+            }))
     }
 
     /// Resolve any user JID to its bare LID form, or `None` when no LID is

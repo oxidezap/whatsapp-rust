@@ -349,6 +349,18 @@ impl Client {
                 ));
             }
         }
+        if matches!(route, RetransmissionRoute::Direct) {
+            let routing_chat = request.recipient.as_ref().unwrap_or(&request.requester);
+            if !self
+                .jids_share_user_identity(&request.chat, routing_chat)
+                .await
+                .map_err(SendError::from_anyhow)?
+            {
+                return Err(SendError::InvalidRequest(
+                    "direct retransmission chat does not match its routing identity".into(),
+                ));
+            }
+        }
 
         let group_info = if matches!(route, RetransmissionRoute::Group) {
             Some(
@@ -3429,6 +3441,57 @@ mod tests {
             .expect_err("a peer route without its actual chat cannot be sent");
         assert!(matches!(error, SendError::InvalidRequest(_)));
         assert!(error.to_string().contains("requires a recipient"));
+    }
+
+    #[tokio::test]
+    async fn public_direct_retransmission_binds_chat_to_routing_identity() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat = Jid::pn("12025550104");
+        let requester = Jid::pn_device("12025550105", 7);
+
+        for request in [
+            MessageRetransmission::new(
+                chat.clone(),
+                requester.clone(),
+                wa::Message::default(),
+                "DIRECT-CHAT-MISMATCH-1".to_string(),
+                1,
+            ),
+            MessageRetransmission::new(
+                chat.clone(),
+                requester.clone(),
+                wa::Message::default(),
+                "DIRECT-RECIPIENT-MISMATCH-1".to_string(),
+                1,
+            )
+            .with_recipient(Jid::pn("12025550106")),
+        ] {
+            let error = client
+                .retransmit_message(request)
+                .await
+                .expect_err("an unrelated routing identity must be rejected");
+            assert!(matches!(error, SendError::InvalidRequest(_)));
+            assert!(error.to_string().contains("routing identity"));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_retransmission_chat_accepts_known_pn_lid_alias() {
+        let client = crate::test_utils::create_test_client().await;
+        let pn = Jid::pn("12025550107");
+        let lid = Jid::lid("100000000000107");
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: lid.user.as_str().into(),
+                phone_number: pn.user.as_str().into(),
+                created_at: 1,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+
+        assert!(client.jids_share_user_identity(&pn, &lid).await.unwrap());
+        assert!(client.jids_share_user_identity(&lid, &pn).await.unwrap());
     }
 
     #[tokio::test]
