@@ -2451,7 +2451,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
 #[test]
 fn test_encode_ack_bytes_compares_jid_participants_by_display() {
     let from = Jid {
-        user: "15551234567".into(),
+        user: "12025550111".into(),
         server: wacore_binary::Server::Hosted,
         agent: 1,
         device: 7,

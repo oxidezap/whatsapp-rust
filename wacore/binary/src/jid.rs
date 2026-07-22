@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn display_eq_jid_uses_only_rendered_components() {
         let pn = Jid {
-            user: "15551234567".into(),
+            user: "12025550111".into(),
             server: Server::Pn,
             agent: 1,
             device: 7,
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(server_only.display_eq_jid(&same_server_only));
 
         let borrowed = JidRef {
-            user: NodeStr::Borrowed("15551234567"),
+            user: NodeStr::Borrowed("12025550111"),
             server: Server::Pn,
             agent: 1,
             device: 7,
