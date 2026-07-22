@@ -563,6 +563,13 @@ pub struct DeviceListSpec {
     /// returns only CHANGED users (WA Web `syncDeviceList`). Users the server omits
     /// from the response are UNCHANGED and their cached devices must be preserved.
     pub hashes: std::collections::HashMap<Jid, (String, i64)>,
+    response_shape: DeviceListResponseShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceListResponseShape {
+    Complete,
+    Incremental,
 }
 
 impl DeviceListSpec {
@@ -571,6 +578,7 @@ impl DeviceListSpec {
             jids,
             sid: sid.into(),
             hashes: std::collections::HashMap::new(),
+            response_shape: DeviceListResponseShape::Complete,
         }
     }
 
@@ -585,6 +593,7 @@ impl DeviceListSpec {
             jids,
             sid: sid.into(),
             hashes,
+            response_shape: DeviceListResponseShape::Incremental,
         }
     }
 }
@@ -707,7 +716,20 @@ impl IqSpec for DeviceListSpec {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        project_device_list_response(parse_usync_response(response)?)
+        let parsed = project_device_list_response(parse_usync_response(response)?)?;
+        if self.response_shape == DeviceListResponseShape::Complete {
+            for expected in &self.jids {
+                let Some(returned) = parsed.device_lists.iter().find(|returned| {
+                    returned.user.user == expected.user && returned.user.server == expected.server
+                }) else {
+                    anyhow::bail!("device-list response omitted user {expected}");
+                };
+                if returned.devices.is_empty() {
+                    anyhow::bail!("device-list response returned no devices for {expected}");
+                }
+            }
+        }
+        Ok(parsed)
     }
 }
 
@@ -1384,7 +1406,9 @@ mod tests {
         // keeps the omitted user's cached devices (device_hash merge-safety).
         let a: Jid = "1111111111@s.whatsapp.net".parse().unwrap();
         let b: Jid = "2222222222@s.whatsapp.net".parse().unwrap();
-        let spec = DeviceListSpec::new(vec![a, b], "sid-omit");
+        let complete = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-complete");
+        let incremental =
+            DeviceListSpec::with_hashes(vec![a, b], "sid-omit", std::collections::HashMap::new());
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
@@ -1403,7 +1427,11 @@ mod tests {
                 .build()])
             .build();
 
-        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert!(
+            complete.parse_response(&response.as_node_ref()).is_err(),
+            "a complete query must not accept a partial snapshot"
+        );
+        let result = incremental.parse_response(&response.as_node_ref()).unwrap();
         assert_eq!(result.device_lists.len(), 1, "omitted user must not appear");
         assert_eq!(result.device_lists[0].user.user, "1111111111");
     }
@@ -1459,7 +1487,12 @@ mod tests {
     fn device_list_devices_error_skips_only_that_user() {
         let jid1: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let jid2: Jid = "9876543210@s.whatsapp.net".parse().unwrap();
-        let spec = DeviceListSpec::new(vec![jid1, jid2], "test-sid");
+        let complete = DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-complete");
+        let incremental = DeviceListSpec::with_hashes(
+            vec![jid1, jid2],
+            "test-sid",
+            std::collections::HashMap::new(),
+        );
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
@@ -1494,7 +1527,11 @@ mod tests {
                 .build()])
             .build();
 
-        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert!(
+            complete.parse_response(&response.as_node_ref()).is_err(),
+            "a per-user error makes a complete snapshot unusable"
+        );
+        let result = incremental.parse_response(&response.as_node_ref()).unwrap();
         assert_eq!(result.device_lists.len(), 1);
         assert_eq!(result.device_lists[0].user.user, "9876543210");
     }

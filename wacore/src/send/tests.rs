@@ -3300,6 +3300,7 @@ mod mark_full_distribution_list {
                 message_id: "STATUS-RETRY-1",
                 force_distribution: false,
                 distribution_targets: Some(vec![requester.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::Required,
                 phash_devices: None,
                 edit: None,
                 extra_nodes: std::slice::from_ref(&extension),
@@ -3362,6 +3363,68 @@ mod mark_full_distribution_list {
     }
 
     #[tokio::test]
+    async fn required_targeted_distribution_rejects_a_missing_session() {
+        let status = Jid::status_broadcast();
+        let own_pn: Jid = "559900000002:7@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000002:7@lid".parse().unwrap();
+        let requester: Jid = "100000000000003:11@lid".parse().unwrap();
+        let mut sessions = MemSessionStore::default();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut identities = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let group = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let message = wa::Message {
+            conversation: Some("status retry".into()),
+            ..Default::default()
+        };
+
+        let result = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &MockSendContextResolver::new(),
+            GroupStanzaRequest {
+                group: &group,
+                own_jid: &own_pn,
+                own_lid: &own_lid,
+                account: Some(&wa::ADVSignedDeviceIdentity::default()),
+                to: &status,
+                message: &message,
+                message_id: "STATUS-RETRY-MISSING-SESSION",
+                force_distribution: false,
+                distribution_targets: Some(vec![requester]),
+                distribution_policy: SenderKeyDistributionPolicy::Required,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a targeted retry must not send without its SKDM"),
+        };
+
+        assert!(
+            format!("{error:#}").contains("required sender-key distribution failed"),
+            "unexpected error chain: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_device_is_still_marked_has_key() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
@@ -3411,6 +3474,7 @@ mod mark_full_distribution_list {
                 message_id: "TESTREQID",
                 force_distribution: false,
                 distribution_targets: Some(vec![a.clone(), b.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                 phash_devices: None,
                 edit: None,
                 extra_nodes: &[],
@@ -3498,6 +3562,7 @@ mod mark_full_distribution_list {
                     message_id: req,
                     force_distribution: false,
                     distribution_targets: Some(vec![a.clone()]),
+                    distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                     phash_devices: None,
                     edit: None,
                     extra_nodes: &[],
@@ -3624,6 +3689,7 @@ mod mark_full_distribution_list {
                 message_id: "TESTREQID2",
                 force_distribution: false,
                 distribution_targets: Some(vec![b.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                 phash_devices: None,
                 edit: None,
                 extra_nodes: &[],
@@ -3721,6 +3787,7 @@ mod mark_full_distribution_list {
                 message_id: "TESTREQID_ISO",
                 force_distribution: false,
                 distribution_targets: Some(vec![good.clone(), bad.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                 phash_devices: None,
                 edit: None,
                 extra_nodes: &[],

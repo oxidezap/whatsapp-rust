@@ -89,6 +89,11 @@ pub struct EncryptResult {
     pub had_unregistered_device: bool,
 }
 
+pub(crate) struct EncryptAttempt {
+    pub result: EncryptResult,
+    pub first_error: Option<anyhow::Error>,
+}
+
 /// One device's encrypted ciphertext, node-agnostic. The DM/peer paths map this
 /// into a `<to><enc>` node; the voip offer maps it into an `<enc>` per device.
 pub struct EncryptedDevice {
@@ -106,6 +111,11 @@ pub struct EncryptForDevicesRaw {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+}
+
+struct RawEncryptAttempt {
+    result: EncryptForDevicesRaw,
+    first_error: Option<anyhow::Error>,
 }
 
 /// Resolve the `<device-identity>` blob a stanza must carry. A pkmsg recipient
@@ -246,7 +256,7 @@ async fn encrypt_one_device(
     session_store: &mut dyn crate::libsignal::protocol::SessionStore,
     identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
     device_jid: Jid,
-) -> (Jid, Result<Option<EncryptOneResult>, String>) {
+) -> (Jid, Result<Option<EncryptOneResult>>) {
     match message_encrypt(plaintext, addr, session_store, identity_store).await {
         Ok(encrypted_payload) => {
             let Some((enc_type, is_prekey, serialized_bytes)) =
@@ -264,7 +274,10 @@ async fn encrypt_one_device(
                 })),
             )
         }
-        Err(e) => (device_jid, Err(format!("{addr}: {e}"))),
+        Err(error) => (
+            device_jid,
+            Err(anyhow::Error::new(error).context(format!("failed to encrypt for {addr}"))),
+        ),
     }
 }
 
@@ -272,9 +285,10 @@ async fn encrypt_one_device(
 /// on success, a logged skip on failure. Node-agnostic so both the message
 /// `<to>` map and the voip offer share it.
 fn push_raw_result(
-    (device_jid, res): (Jid, Result<Option<EncryptOneResult>, String>),
+    (device_jid, res): (Jid, Result<Option<EncryptOneResult>>),
     devices: &mut Vec<EncryptedDevice>,
     includes_prekey_message: &mut bool,
+    first_error: &mut Option<anyhow::Error>,
 ) {
     match res {
         Ok(Some(one)) => {
@@ -287,7 +301,12 @@ fn push_raw_result(
             });
         }
         Ok(None) => {}
-        Err(msg) => log::warn!("Failed to encrypt for device: {msg}. Skipping."),
+        Err(error) => {
+            log::warn!("Failed to encrypt for device: {error:#}. Skipping.");
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
     }
 }
 
@@ -360,6 +379,7 @@ pub async fn encrypt_for_devices(
 pub struct SessionPlan {
     encryption_overrides: Vec<Option<Jid>>,
     pub had_unregistered_device: bool,
+    first_error: Option<anyhow::Error>,
 }
 
 impl SessionPlan {
@@ -371,6 +391,7 @@ impl SessionPlan {
         Self {
             encryption_overrides: vec![None; device_count],
             had_unregistered_device: false,
+            first_error: None,
         }
     }
 }
@@ -395,6 +416,7 @@ pub async fn ensure_sessions_for_devices(
     // Indices into `devices` for those needing prekey fetch.
     let mut indices_needing_prekeys: Vec<usize> = Vec::with_capacity(devices.len());
     let mut had_406 = false;
+    let mut first_error = None;
 
     let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
 
@@ -537,11 +559,8 @@ pub async fn ensure_sessions_for_devices(
                     // (resolver has no 'static handle into this spawned task).
                     Ok(IdentityChange::ReplacedExisting) => Ok(Some(encryption_jid)),
                     Ok(IdentityChange::NewOrUnchanged) => Ok(None),
-                    Err(e) => Err(anyhow::anyhow!(
-                        "Failed to process pre-key bundle for {}: {:?}",
-                        addr,
-                        e
-                    )),
+                    Err(error) => Err(anyhow::Error::new(error)
+                        .context(format!("failed to process pre-key bundle for {addr}"))),
                 }
             })
         };
@@ -563,11 +582,17 @@ pub async fn ensure_sessions_for_devices(
                 // fan-out below.
                 Ok(Err(e)) => {
                     log::warn!("Group session setup failed for a device, skipping it: {e}");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
-                Err(SpawnCanceled) => {
+                Err(error) => {
                     log::warn!(
                         "Session-establishment task did not deliver a result; skipping device."
                     );
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::Error::new(error));
+                    }
                 }
             }
             if next_spawn < total {
@@ -580,6 +605,7 @@ pub async fn ensure_sessions_for_devices(
     Ok(SessionPlan {
         encryption_overrides,
         had_unregistered_device: had_406,
+        first_error,
     })
 }
 
@@ -589,7 +615,6 @@ pub async fn ensure_sessions_for_devices(
 /// under locks that must not span I/O. A device whose session is still
 /// missing (e.g. its bundle was absent) fails its encrypt and is skipped,
 /// matching the combined path's behavior.
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
 pub async fn encrypt_for_devices_with_sessions(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
@@ -599,9 +624,40 @@ pub async fn encrypt_for_devices_with_sessions(
     mediatype: Option<&str>,
     plan: SessionPlan,
 ) -> Result<EncryptResult> {
-    let raw =
-        encrypt_for_devices_with_sessions_raw(runtime, stores, devices, plaintext_to_encrypt, plan)
-            .await?;
+    Ok(encrypt_for_devices_with_sessions_detailed(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        hide_decrypt_fail,
+        mediatype,
+        plan,
+    )
+    .await?
+    .result)
+}
+
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    hide_decrypt_fail: bool,
+    mediatype: Option<&str>,
+    plan: SessionPlan,
+) -> Result<EncryptAttempt> {
+    let RawEncryptAttempt {
+        result: raw,
+        first_error,
+    } = encrypt_for_devices_with_sessions_raw_detailed(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        plan,
+    )
+    .await?;
 
     // Map each ciphertext to the message path's `<to><enc>` node, preserving the
     // raw fan-out order so the wire output is identical to the pre-split path.
@@ -617,11 +673,14 @@ pub async fn encrypt_for_devices_with_sessions(
         ));
     }
 
-    Ok(EncryptResult {
-        participant_nodes,
-        includes_prekey_message: raw.includes_prekey_message,
-        encrypted_devices,
-        had_unregistered_device: raw.had_unregistered_device,
+    Ok(EncryptAttempt {
+        result: EncryptResult {
+            participant_nodes,
+            includes_prekey_message: raw.includes_prekey_message,
+            encrypted_devices,
+            had_unregistered_device: raw.had_unregistered_device,
+        },
+        first_error,
     })
 }
 
@@ -632,7 +691,6 @@ pub async fn encrypt_for_devices_with_sessions(
 /// run under locks that must not span I/O. A device whose session is still
 /// missing (e.g. its bundle was absent) fails its encrypt and is skipped.
 /// Same parallel fan-out + skip-on-fail contract as the message path.
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
 pub async fn encrypt_for_devices_with_sessions_raw(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
@@ -640,6 +698,25 @@ pub async fn encrypt_for_devices_with_sessions_raw(
     plaintext_to_encrypt: &[u8],
     plan: SessionPlan,
 ) -> Result<EncryptForDevicesRaw> {
+    Ok(encrypt_for_devices_with_sessions_raw_detailed(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        plan,
+    )
+    .await?
+    .result)
+}
+
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout_raw", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+async fn encrypt_for_devices_with_sessions_raw_detailed(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    plan: SessionPlan,
+) -> Result<RawEncryptAttempt> {
     debug_assert_eq!(
         plan.encryption_overrides.len(),
         devices.len(),
@@ -648,6 +725,7 @@ pub async fn encrypt_for_devices_with_sessions_raw(
     let SessionPlan {
         encryption_overrides,
         had_unregistered_device,
+        mut first_error,
     } = plan;
 
     let mut encrypted = Vec::with_capacity(devices.len());
@@ -675,7 +753,12 @@ pub async fn encrypt_for_devices_with_sessions_raw(
             device_jid,
         )
         .await;
-        push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
+        push_raw_result(
+            res,
+            &mut encrypted,
+            &mut includes_prekey_message,
+            &mut first_error,
+        );
     } else {
         // One task per chunk, not per device: the per-device fan-out allocated a
         // task + oneshot + two store clones for every recipient. Same parallelism,
@@ -730,24 +813,35 @@ pub async fn encrypt_for_devices_with_sessions_raw(
             match spawn_result {
                 Ok(results) => {
                     for res in results {
-                        push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
+                        push_raw_result(
+                            res,
+                            &mut encrypted,
+                            &mut includes_prekey_message,
+                            &mut first_error,
+                        );
                     }
                 }
-                Err(SpawnCanceled) => {
+                Err(error) => {
                     // A whole chunk drops (not one device); its members stay
                     // un-warm and are re-targeted next send.
                     log::warn!(
                         "Encrypt chunk did not deliver a result; up to ~{} device(s) skipped this send.",
                         total.div_ceil(num_chunks)
                     );
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::Error::new(error));
+                    }
                 }
             }
         }
     }
 
-    Ok(EncryptForDevicesRaw {
-        devices: encrypted,
-        includes_prekey_message,
-        had_unregistered_device,
+    Ok(RawEncryptAttempt {
+        result: EncryptForDevicesRaw {
+            devices: encrypted,
+            includes_prekey_message,
+            had_unregistered_device,
+        },
+        first_error,
     })
 }

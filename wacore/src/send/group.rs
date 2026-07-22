@@ -39,6 +39,16 @@ pub struct PreparedGroupStanza {
     pub sender_identity: Jid,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SenderKeyDistributionPolicy {
+    /// Preserve normal fanout semantics by skipping devices that cannot receive
+    /// the distribution in this send.
+    #[default]
+    BestEffort,
+    /// Abort unless every requested device receives its distribution.
+    Required,
+}
+
 pub struct GroupStanzaRequest<'a> {
     pub group: &'a GroupInfo,
     pub own_jid: &'a Jid,
@@ -49,6 +59,7 @@ pub struct GroupStanzaRequest<'a> {
     pub message_id: &'a str,
     pub force_distribution: bool,
     pub distribution_targets: Option<Vec<Jid>>,
+    pub distribution_policy: SenderKeyDistributionPolicy,
     pub phash_devices: Option<&'a super::ResolvedGroupDevices>,
     pub edit: Option<&'a crate::types::message::EditAttribute>,
     pub extra_nodes: &'a [Node],
@@ -75,6 +86,7 @@ pub async fn prepare_group_stanza(
         message_id: request_id,
         force_distribution: force_skdm_distribution,
         distribution_targets: skdm_target_devices,
+        distribution_policy,
         phash_devices: all_devices_for_phash,
         edit,
         extra_nodes: extra_stanza_nodes,
@@ -243,6 +255,11 @@ pub async fn prepare_group_stanza(
     } else {
         None
     };
+    if distribution_policy == SenderKeyDistributionPolicy::Required
+        && distribution_list.as_ref().is_none_or(Vec::is_empty)
+    {
+        bail!("required sender-key distribution has no targets");
+    }
 
     // Phash (groups): cover the FULL participant device set + the sending device
     // on EVERY send, matching WA Web `phashV2([].concat(A, [B]))`. Verified
@@ -305,6 +322,9 @@ pub async fn prepare_group_stanza(
             let _setup_guard = setup_lock.lock().await;
             match ensure_sessions_for_devices(runtime, stores, resolver, list).await {
                 Ok(plan) => Some(plan),
+                Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
+                    return Err(error.context("required sender-key session setup failed"));
+                }
                 Err(e) => {
                     log::warn!(
                         "SKDM session setup failed for group {}, continuing without distribution: {e}",
@@ -367,7 +387,7 @@ pub async fn prepare_group_stanza(
             // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
             // without a sender key never decrypt the skmsg and the revoke is silently dropped.
             let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
-            match encrypt_for_devices_with_sessions(
+            match encrypt_for_devices_with_sessions_detailed(
                 runtime,
                 stores,
                 distribution_list,
@@ -378,27 +398,53 @@ pub async fn prepare_group_stanza(
             )
             .await
             {
-                Ok(result) => {
-                    includes_prekey_message =
-                        includes_prekey_message || result.includes_prekey_message;
-                    if result.had_unregistered_device {
+                Ok(EncryptAttempt {
+                    result,
+                    first_error,
+                }) => {
+                    let EncryptResult {
+                        participant_nodes,
+                        includes_prekey_message: result_includes_prekey,
+                        encrypted_devices,
+                        had_unregistered_device,
+                    } = result;
+                    if distribution_policy == SenderKeyDistributionPolicy::Required
+                        && (encrypted_devices.len() != distribution_list.len()
+                            || first_error.is_some())
+                    {
+                        let error = first_error.unwrap_or_else(|| {
+                            anyhow!(
+                                "sender-key distribution encrypted {} of {} required targets",
+                                encrypted_devices.len(),
+                                distribution_list.len()
+                            )
+                        });
+                        return Err(error.context("required sender-key distribution failed"));
+                    }
+
+                    includes_prekey_message |= result_includes_prekey;
+                    if had_unregistered_device {
                         had_unregistered_devices = true;
                     }
-                    skdm_encrypted_devices = result.encrypted_devices;
+                    skdm_encrypted_devices = encrypted_devices;
 
-                    if !result.participant_nodes.is_empty() {
+                    if !participant_nodes.is_empty() {
                         message_children.push(
                             NodeBuilder::new("participants")
-                                .children(result.participant_nodes)
+                                .children(participant_nodes)
                                 .build(),
                         );
-                        // Lenient (matches the DM fan-out): a no-account pkmsg
-                        // omits the node rather than failing the whole send.
-                        if let Some(device_identity_bytes) =
-                            needs_device_identity(includes_prekey_message, account)
-                                .ok()
-                                .flatten()
-                        {
+                        let device_identity = match distribution_policy {
+                            SenderKeyDistributionPolicy::BestEffort => {
+                                needs_device_identity(includes_prekey_message, account)
+                                    .ok()
+                                    .flatten()
+                            }
+                            SenderKeyDistributionPolicy::Required => {
+                                needs_device_identity(includes_prekey_message, account)?
+                            }
+                        };
+                        if let Some(device_identity_bytes) = device_identity {
                             message_children.push(
                                 NodeBuilder::new("device-identity")
                                     .bytes(device_identity_bytes)
@@ -406,6 +452,9 @@ pub async fn prepare_group_stanza(
                             );
                         }
                     }
+                }
+                Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
+                    return Err(error.context("required sender-key distribution failed"));
                 }
                 Err(e) => {
                     log::warn!(

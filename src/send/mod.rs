@@ -1019,6 +1019,7 @@ impl Client {
                 message_id: &request_id,
                 force_distribution: force_skdm,
                 distribution_targets: skdm_target_devices,
+                distribution_policy: wacore::send::SenderKeyDistributionPolicy::BestEffort,
                 phash_devices: None,
                 edit: None,
                 extra_nodes: &extra_stanza_nodes,
@@ -1054,6 +1055,8 @@ impl Client {
                             message_id: &request_id,
                             force_distribution: true,
                             distribution_targets: None,
+                            distribution_policy:
+                                wacore::send::SenderKeyDistributionPolicy::BestEffort,
                             phash_devices: None,
                             edit: None,
                             extra_nodes: &extra_stanza_nodes,
@@ -2013,6 +2016,7 @@ impl Client {
                     message_id: &request_id,
                     force_distribution: force_skdm,
                     distribution_targets: skdm_target_devices,
+                    distribution_policy: wacore::send::SenderKeyDistributionPolicy::BestEffort,
                     phash_devices: all_devices_for_phash.as_ref().map(AsRef::as_ref),
                     edit: edit.as_ref(),
                     extra_nodes: extra_stanza_nodes,
@@ -2092,6 +2096,8 @@ impl Client {
                                 message_id: &request_id,
                                 force_distribution: retry_force,
                                 distribution_targets: retry_targets,
+                                distribution_policy:
+                                    wacore::send::SenderKeyDistributionPolicy::BestEffort,
                                 phash_devices: retry_all.as_ref().map(AsRef::as_ref),
                                 edit: edit.as_ref(),
                                 extra_nodes: extra_stanza_nodes,

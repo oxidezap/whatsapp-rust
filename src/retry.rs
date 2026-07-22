@@ -50,6 +50,12 @@ enum RetransmissionRoute {
     BroadcastList,
 }
 
+impl RetransmissionRoute {
+    const fn uses_sender_key(self) -> bool {
+        matches!(self, Self::Group | Self::Status)
+    }
+}
+
 struct PreparedRetransmission {
     route: RetransmissionRoute,
     chat: Jid,
@@ -283,6 +289,28 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    async fn resolve_retransmission_encryption_jid(
+        &self,
+        route: RetransmissionRoute,
+        requester: &Jid,
+    ) -> Result<Jid, anyhow::Error> {
+        if matches!(route, RetransmissionRoute::Status) && requester.is_pn() {
+            return match self.get_lid_pn_entry(requester).await? {
+                Some(mapping) => Ok(Jid {
+                    user: wacore_binary::CompactString::new(&mapping.lid),
+                    server: wacore_binary::Server::Lid,
+                    device: requester.device,
+                    agent: requester.agent,
+                    integrator: requester.integrator,
+                }),
+                // WAWebResendStatusMsg explicitly falls back to the PN device
+                // when no LID mapping is available.
+                None => Ok(requester.clone()),
+            };
+        }
+        Ok(self.resolve_encryption_jid(requester).await)
+    }
+
     /// Retransmit a message to one requesting device.
     ///
     /// The client derives the stanza from native protocol data and retains
@@ -310,13 +338,13 @@ impl Client {
             None
         };
 
-        let encryption_jid = self.resolve_encryption_jid(&request.requester).await;
-        if matches!(
-            route,
-            RetransmissionRoute::Group | RetransmissionRoute::Status
-        ) {
+        let encryption_jid = self
+            .resolve_retransmission_encryption_jid(route, &request.requester)
+            .await
+            .map_err(SendError::from_anyhow)?;
+        if route.uses_sender_key() {
             let chat_key = request.chat.to_string();
-            self.mark_forget_sender_key(&chat_key, std::slice::from_ref(&request.requester))
+            self.mark_forget_sender_key(&chat_key, std::slice::from_ref(&encryption_jid))
                 .await
                 .map_err(SendError::from_anyhow)?;
         }
@@ -419,7 +447,7 @@ impl Client {
                 return Ok(());
             }
         };
-        let is_group_or_status = info.chat.is_group() || info.chat.is_status_broadcast();
+        let uses_sender_key = route.uses_sender_key();
 
         // WA Web doesn't dedupe receipts (Message/Queue.js just serializes per-chat);
         // MAX_RETRY_COUNT covers loop prevention. This lock only guards against
@@ -496,7 +524,7 @@ impl Client {
         // WA Web: `e.from.isBot() ? (p = e.from) : (p = d.isLid() ? toLid(e.from) : toPn(e.from))`
         // Bots skip namespace normalization (WAWebHandleRetryRequest:311-312).
         let resolved_jid = if let Some(alt_chat) = alt_chat
-            && !is_group_or_status
+            && !uses_sender_key
             && !info.is_bot
         {
             let requester = &info.requester;
@@ -509,7 +537,8 @@ impl Client {
             };
             info.requester.clone()
         } else {
-            self.resolve_encryption_jid(&info.requester).await
+            self.resolve_retransmission_encryption_jid(route, &info.requester)
+                .await?
         };
 
         let keys_node_present = nr.get_optional_child("keys").is_some();
@@ -538,7 +567,7 @@ impl Client {
         // processes every receipt), so it is an operator opt-in, gated here
         // before the expensive repair stages below. Own devices (`is_peer`) and
         // DMs are never gated: dropping their retries has no safe SKDM fallback.
-        if is_group_or_status
+        if uses_sender_key
             && !is_peer
             && let Some(policy) = self.retry_admission.get()
             && !policy.admit(&info.chat, &info.requester, retry_count)
@@ -573,7 +602,7 @@ impl Client {
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
         let mut rotated_sender_key = false;
-        if is_group_or_status && !info.requester.is_lid() && !info.chat.is_status_broadcast() {
+        if matches!(route, RetransmissionRoute::Group) && !info.requester.is_lid() {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
                 .as_ref()
@@ -753,8 +782,8 @@ impl Client {
                 .await;
         }
 
-        // Pairwise retry encryption advances one session ratchet, so the same
-        // per-address lock used by normal sends spans the canonical builder.
+        // Every remaining route is pairwise, including broadcast-list
+        // participants, and shares the normal session recovery path.
         self.ensure_e2e_sessions_resolved(std::slice::from_ref(&encryption_jid))
             .await?;
         let signal_address = encryption_jid.to_protocol_address();
@@ -865,6 +894,7 @@ impl Client {
                 message_id: &message_id,
                 force_distribution: false,
                 distribution_targets: Some(vec![requester]),
+                distribution_policy: wacore::send::SenderKeyDistributionPolicy::Required,
                 phash_devices: None,
                 edit: edit.as_ref(),
                 extra_nodes: &[],
@@ -912,7 +942,7 @@ impl Client {
         if info.chat.is_group() || info.chat.is_status_broadcast() {
             let group_jid = info.chat.to_string();
             match self
-                .mark_forget_sender_key(&group_jid, std::slice::from_ref(&info.requester))
+                .mark_forget_sender_key(&group_jid, std::slice::from_ref(resolved_jid))
                 .await
             {
                 Ok(()) => {
@@ -926,7 +956,7 @@ impl Client {
                     // (WA Web logs the same event at its verbose LOG level).
                     debug!(
                         "Marked {} for fresh SKDM in {} {} due to retry receipt",
-                        info.requester.observe(),
+                        resolved_jid.observe(),
                         chat_type,
                         group_jid
                     );
@@ -2562,6 +2592,105 @@ mod tests {
                 .is_some(),
             "group retry at #1 should not delete the session"
         );
+    }
+
+    #[tokio::test]
+    async fn update_local_signal_session_cools_resolved_sender_key_namespace() {
+        let client = crate::test_utils::create_test_client_with_failing_http(
+            "retry_sender_key_resolved_namespace",
+        )
+        .await;
+        let group = "120363000000000006@g.us";
+        let requester_pn: Jid = "15550000088:33@s.whatsapp.net".parse().unwrap();
+        let resolved_lid: Jid = "100000000000088:33@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .set_sender_key_status(
+                group,
+                &[
+                    ("15550000088:33@s.whatsapp.net", true),
+                    ("100000000000088:33@lid", true),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let cached = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(crate::sender_key_device_cache::SenderKeyDeviceMap::from_db_rows(&rows))
+            })
+            .await;
+
+        let info = RetryChatInfo {
+            chat: group.parse().unwrap(),
+            requester: requester_pn,
+            original_from: group.parse().unwrap(),
+            recipient: None,
+            is_bot: false,
+            is_fbid_bot_retry: false,
+        };
+        let node = build_retry_receipt_without_keys();
+        assert!(
+            client
+                .update_local_signal_session(
+                    &info,
+                    &resolved_lid,
+                    "MSG-GRP-NAMESPACE",
+                    1,
+                    &node.as_node_ref(),
+                    false,
+                )
+                .await
+        );
+
+        assert_eq!(cached.device_has_key("100000000000088", 33), Some(false));
+        assert_eq!(cached.device_has_key("15550000088", 33), Some(true));
+        let persisted = crate::sender_key_device_cache::SenderKeyDeviceMap::from_db_rows(
+            &client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(persisted.device_has_key("100000000000088", 33), Some(false));
+        assert_eq!(persisted.device_has_key("15550000088", 33), Some(true));
+    }
+
+    #[tokio::test]
+    async fn status_retransmission_resolution_is_cache_aside_with_pn_fallback() {
+        let client = crate::test_utils::create_test_client_with_failing_http(
+            "retry_status_requester_resolution",
+        )
+        .await;
+        client
+            .add_lid_pn_mapping(
+                "100000000000089",
+                "15550000089",
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        client.lid_pn_cache.clear().await;
+
+        let mapped_pn: Jid = "15550000089:19@s.whatsapp.net".parse().unwrap();
+        let mapped = client
+            .resolve_retransmission_encryption_jid(RetransmissionRoute::Status, &mapped_pn)
+            .await
+            .unwrap();
+        assert_eq!(mapped, "100000000000089:19@lid".parse::<Jid>().unwrap());
+
+        let unmapped_pn: Jid = "15550000090:20@s.whatsapp.net".parse().unwrap();
+        let fallback = client
+            .resolve_retransmission_encryption_jid(RetransmissionRoute::Status, &unmapped_pn)
+            .await
+            .unwrap();
+        assert_eq!(fallback, unmapped_pn);
     }
 
     /// `should_recreate_session` mirrors whatsmeow `shouldRecreateSession`:

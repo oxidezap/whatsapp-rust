@@ -15,7 +15,10 @@ use std::hint::black_box;
 use wacore::client::context::{GroupInfo, SendContextResolver};
 use wacore::messages::MessageUtils;
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::send::{GroupStanzaRequest, SignalStores, prepare_group_stanza, prepare_peer_stanza};
+use wacore::send::{
+    GroupStanzaRequest, SenderKeyDistributionPolicy, SignalStores, prepare_group_stanza,
+    prepare_peer_stanza,
+};
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore::types::message::AddressingMode;
 use wacore_binary::JidExt as _;
@@ -748,6 +751,7 @@ fn setup_group_recv() -> GrpRecvData {
             message_id: "bench-grp-recv",
             force_distribution: false,
             distribution_targets: None,
+            distribution_policy: SenderKeyDistributionPolicy::BestEffort,
             phash_devices: None,
             edit: None,
             extra_nodes: &[],
@@ -837,6 +841,7 @@ fn run_group_send(d: &mut GrpSendData) {
             message_id: "b-grp",
             force_distribution: d.force_skdm,
             distribution_targets: None,
+            distribution_policy: SenderKeyDistributionPolicy::BestEffort,
             phash_devices: d.resolved_for_phash.as_deref(),
             edit: None,
             extra_nodes: &[],
