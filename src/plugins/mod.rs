@@ -36,11 +36,11 @@ use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState, RawN
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
 
-const CAP_CORE_EVENTS: u8 = 1 << 0;
-const CAP_TASKS: u8 = 1 << 1;
-const CAP_MESSAGING: u8 = 1 << 2;
-const CAP_IQ: u8 = 1 << 3;
-const CAP_PLUGIN_EVENTS: u8 = 1 << 4;
+const CAP_CORE_EVENTS: u64 = 1 << 0;
+const CAP_TASKS: u64 = 1 << 1;
+const CAP_MESSAGING: u64 = 1 << 2;
+const CAP_IQ: u64 = 1 << 3;
+const CAP_PLUGIN_EVENTS: u64 = 1 << 4;
 const DEFAULT_PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,7 +67,7 @@ impl PluginCapability {
         }
     }
 
-    const fn bit(self) -> u8 {
+    const fn bit(self) -> u64 {
         match self {
             Self::CoreEvents => CAP_CORE_EVENTS,
             Self::Tasks => CAP_TASKS,
@@ -80,7 +80,7 @@ impl PluginCapability {
 
 /// Compact set of capabilities requested by one plugin.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PluginCapabilities(u8);
+pub struct PluginCapabilities(u64);
 
 impl PluginCapabilities {
     pub const NONE: Self = Self(0);
@@ -2844,6 +2844,27 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    #[test]
+    fn capability_bits_are_distinct_and_composable() {
+        let capabilities = [
+            PluginCapability::CoreEvents,
+            PluginCapability::Tasks,
+            PluginCapability::Messaging,
+            PluginCapability::Iq,
+            PluginCapability::PluginEvents,
+        ];
+        let combined = capabilities
+            .into_iter()
+            .fold(PluginCapabilities::NONE, PluginCapabilities::with);
+
+        assert!(
+            capabilities
+                .into_iter()
+                .all(|capability| combined.contains(capability))
+        );
+        assert_eq!(combined.0.count_ones(), capabilities.len() as u32);
     }
 
     #[tokio::test]
