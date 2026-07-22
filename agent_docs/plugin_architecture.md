@@ -166,6 +166,12 @@ Capability handles keep `Weak<Client>` internally and reject calls before
 activation or after shutdown. This avoids `Client -> plugin API -> Client`
 cycles and gives terminal resource invalidation a synchronous boundary.
 
+`PluginCoreEvents::subscribe` returns the ownership token for its registration.
+Dropping or explicitly unsubscribing that token removes the handler, any
+`RawNodeLease`, and its host registry entry immediately. The host indexes live
+tokens weakly so terminal shutdown can invalidate retained tokens without
+extending the lifetime of registrations that plugins already released.
+
 ## Lifecycle and task ownership
 
 The host maps the client's existing `connection_generation` to
