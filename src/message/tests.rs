@@ -378,7 +378,7 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
     .await;
 
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let sender_jid: Jid = "1234567890@s.whatsapp.net"
         .parse()
@@ -5016,7 +5016,7 @@ fn build_unavailable_stanza(sender: &str, msg_id: &str, with_enc: bool) -> Arc<O
 async fn test_undecryptable_fires_before_retry_task() {
     let client = create_test_client_for_retry_with_id("undec_sync").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let info = Arc::new(create_test_message_info(
         "5511999998888@s.whatsapp.net",
@@ -5076,7 +5076,7 @@ async fn test_undecryptable_fires_before_retry_task() {
 async fn test_undecryptable_dedup_is_atomic() {
     let client = create_test_client_for_retry_with_id("undec_atomic").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let info = Arc::new(create_test_message_info(
         "5511999998888@s.whatsapp.net",
@@ -5110,7 +5110,7 @@ async fn test_undecryptable_dedup_is_atomic() {
 async fn test_undecryptable_deduped_across_resends() {
     let client = create_test_client_for_retry_with_id("undec_double").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let info = Arc::new(create_test_message_info(
         "5511999998888@s.whatsapp.net",
@@ -5265,7 +5265,7 @@ async fn test_pdo_rejects_just_past_14d_boundary() {
 async fn test_unavailable_with_enc_skips_unavailable_shortcut() {
     let client = create_test_client_for_retry_with_id("unavailable_with_enc").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let node = build_unavailable_stanza("5511777776666@s.whatsapp.net", "UNAV_WITH_ENC_1", true);
     client.clone().handle_incoming_message(node).await;
@@ -5287,7 +5287,7 @@ async fn test_unavailable_with_enc_skips_unavailable_shortcut() {
 async fn test_unavailable_without_enc_dispatches_view_once_event() {
     let client = create_test_client_for_retry_with_id("unavailable_stub").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let node = build_unavailable_stanza("5511777776666@s.whatsapp.net", "UNAV_STUB_1", false);
     client.clone().handle_incoming_message(node).await;
@@ -5310,7 +5310,7 @@ async fn test_unavailable_without_enc_dispatches_view_once_event() {
 async fn view_once_stub_acks_without_pdo() {
     let (client, transport) = capturing_client("view_once_ack").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let node = build_unavailable_stanza("5511777776666@s.whatsapp.net", "VIEW_ONCE_ACK_1", false);
     client.clone().handle_incoming_message(node).await;
@@ -5356,7 +5356,7 @@ async fn bot_unavailable_stub_acks_without_pdo() {
     use crate::types::events::UnavailableType;
     let (client, transport) = capturing_client("bot_unavail_ack").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let node = build_unavailable_kind_stanza(
         "5511777776666@s.whatsapp.net",
@@ -5384,7 +5384,7 @@ async fn hosted_unavailable_stub_acks_without_pdo() {
     use crate::types::events::UnavailableType;
     let (client, transport) = capturing_client("hosted_unavail_ack").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let node = build_unavailable_kind_stanza(
         "5511777776666@s.whatsapp.net",
@@ -5412,7 +5412,7 @@ async fn hosted_numeric_bool_unavailable_stub_acks_without_pdo() {
     use crate::types::events::UnavailableType;
     let (client, transport) = capturing_client("hosted_num_ack").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let t = wacore::time::now_secs().to_string();
     let node = node_to_arc(
@@ -5447,7 +5447,7 @@ async fn plain_unavailable_stub_classifies_as_unknown() {
     use crate::types::events::UnavailableType;
     let (client, _transport) = capturing_client("plain_unavail").await;
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let node = build_unavailable_kind_stanza(
         "5511777776666@s.whatsapp.net",
@@ -7264,7 +7264,7 @@ async fn skdm_only_group_session_acknowledged_once_without_message_event() {
 
     let (client, transport) = capturing_client("skdm_only_group_ack").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7326,9 +7326,9 @@ async fn session_plaintext_decode_error_is_not_acked_as_skdm_only() {
 
     let (client, transport) = capturing_client("bad_plaintext_no_skdm_ack").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7390,9 +7390,9 @@ async fn mixed_skdm_and_bad_plaintext_session_is_nacked_not_positive_acked() {
 
     let (client, transport) = capturing_client("mixed_skdm_bad_plaintext").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7455,9 +7455,9 @@ async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
 
     let (client, transport) = capturing_client("bad_session_skips_skmsg").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7530,7 +7530,7 @@ async fn group_skmsg_decrypts_under_sender_key_lock() {
 
     let (client, _transport) = capturing_client("group_skmsg_lock_happy").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7725,9 +7725,9 @@ async fn group_skmsg_without_sender_key_takes_retry_path() {
 
     let (client, _transport) = capturing_client("group_skmsg_lock_bad").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
     let recorder = Arc::new(EventRecorder::default());
-    client.register_handler(recorder.clone());
+    client.subscribe_handler(recorder.clone()).detach();
 
     let mut alice = AlicePeer::new("146824178450541@lid").await;
     let group: Jid = "120363408782575461@g.us".parse().expect("group");
@@ -7826,7 +7826,7 @@ async fn session_content_group_message_acknowledged_once_without_fallback() {
 
     let (client, transport) = capturing_client("session_content_group_ack").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7877,7 +7877,7 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
 
     let (client, transport) = capturing_client("status_skdm_only_ack").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -7982,7 +7982,7 @@ async fn skdm_session_with_skmsg_sibling_acknowledged_once() {
 
     let (client, transport) = capturing_client("skdm_plus_skmsg_ack").await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
 
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
@@ -9277,7 +9277,7 @@ fn encrypted_message_edit(
 async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
     let (client, _transport) = capturing_client("secret_edit_dispatch").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "5511777776666@s.whatsapp.net";
     let parent_id = "PARENT_EDIT";
@@ -9336,7 +9336,7 @@ async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
 async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
     let (client, _transport) = capturing_client("secret_peer_edit_dispatch").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let group = "123456789012345678@g.us";
     let peer = "5511777776666@s.whatsapp.net";
@@ -9398,7 +9398,7 @@ async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
 async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset: i64) -> bool {
     let (client, _transport) = capturing_client(test_id).await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "5511777776666@s.whatsapp.net";
     let parent_id = "WINDOW_PARENT";
@@ -9533,7 +9533,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
     seed_test_pn(&client).await;
 
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     assert!(
         client
@@ -9597,7 +9597,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
 async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
     let (client, _transport) = capturing_client("secret_edit_chain").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "5511777776666@s.whatsapp.net";
     let parent_id = "PARENT_EDIT";
@@ -9690,7 +9690,7 @@ async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
 
     let (client, _transport) = capturing_client("secret_edit_alt_group").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "120363021033254949@g.us";
     let parent_id = "GROUP_PARENT_EDIT";
@@ -9770,7 +9770,7 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
 
     let (client, _transport) = capturing_client("secret_edit_alt_refresh").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "120363021033254949@g.us";
     let parent_id = "GROUP_PARENT_EDIT";
@@ -9898,7 +9898,7 @@ async fn msmsg_decrypts_when_secret_is_stored() {
     use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
     let (client, _transport) = capturing_client("msmsg_ok").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_pn = "5511000000001@s.whatsapp.net";
@@ -9974,7 +9974,7 @@ async fn msmsg_decrypts_when_secret_is_stored() {
 async fn msmsg_without_stored_secret_nacks_495() {
     let (client, transport) = capturing_client("msmsg_nosecret").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let bot_reply_id = "BOT_REPLY_NS";
     let outbound_id = "OUTBOUND_NS";
@@ -10090,7 +10090,7 @@ async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
     use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
     let (client, _transport) = capturing_client("msmsg_edit").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_pn = "5511000000001@s.whatsapp.net";
@@ -10239,7 +10239,7 @@ async fn msmsg_bot_edit_first_keeps_info_id() {
     use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
     let (client, _transport) = capturing_client("msmsg_first").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_pn = "5511000000001@s.whatsapp.net";
@@ -10311,7 +10311,7 @@ async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
     use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
     let (client, _transport) = capturing_client("msmsg_fb_to_info").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_pn = "5511000000001@s.whatsapp.net";
@@ -10397,7 +10397,7 @@ async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
     use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
     let (client, _transport) = capturing_client("msmsg_fb_to_edit").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_pn = "5511000000001@s.whatsapp.net";
@@ -11077,7 +11077,7 @@ async fn mixed_msmsg_and_unknown_enc_still_decrypts_msmsg() {
         )))
         .await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_lid = "999888777666555@lid";
@@ -11164,7 +11164,7 @@ async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
 
     let (client, _transport) = capturing_client("msmsg_alt_lookup").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_lid_user = "999888777666555";
@@ -11269,7 +11269,7 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
         )))
         .await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
     let our_lid_str = "999888777666555@lid";
@@ -11391,7 +11391,7 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
         )))
         .await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
     let outbound_id = "OUT_LID";
@@ -11479,7 +11479,7 @@ async fn msmsg_with_bot_device_suffix_round_trips() {
     use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
     let (client, _transport) = capturing_client("msmsg_bot_device").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone());
+    client.subscribe_handler(collector.clone()).detach();
 
     let chat = "867051314767696@bot";
     let our_pn = "5511000000001@s.whatsapp.net";
@@ -11677,7 +11677,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     let (client, _transport) = capturing_client("enc_comment_inbound").await;
     ensure_bob_paired(&client).await;
     let (handler, rx) = ChannelEventHandler::new();
-    client.core.event_bus.add_handler(handler);
+    client.core.event_bus.subscribe_handler(handler).detach();
 
     let group: Jid = "120363400000000002@g.us".parse().expect("group");
     let author: Jid = "5511888887777@s.whatsapp.net".parse().expect("author");

@@ -1,6 +1,8 @@
 use crate::cache_config::CacheConfig;
-use crate::client::Client;
+use crate::client::{Client, ClientBuilderError};
 use crate::pair_code::PairCodeOptions;
+#[cfg(feature = "plugins")]
+use crate::plugins::{ClientPlugin, PluginHostConfig, PluginRegistration, UntypedClientPlugin};
 use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
@@ -87,49 +89,8 @@ pub enum BotBuilderError {
     /// Initializing the device row in the storage backend failed.
     #[error("failed to initialize the device store: {0}")]
     Store(#[from] StoreError),
-    /// An inbound durability hook was registered with a backend that does not
-    /// implement the pending-inbound buffer it requires.
-    #[error("the configured backend does not support the inbound durability hook: {0}")]
-    UnsupportedDurabilityBackend(String),
-}
-
-/// Verify the backend round-trips a pending-inbound buffer entry before we accept
-/// an inbound durability hook. A backend relying on the no-op/`Err` trait
-/// defaults fails here instead of silently looping every inbound message unacked.
-async fn probe_durability_backend(
-    backend: &std::sync::Arc<dyn Backend>,
-) -> std::result::Result<(), BotBuilderError> {
-    // A real JID (a backend may validate the format) and an id unique per probe
-    // invocation (pid + atomic counter) so concurrent builders on the same store
-    // never race on a shared probe row and false-fail.
-    use portable_atomic::{AtomicU64, Ordering};
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
-    const PROBE_JID: &str = "0@s.whatsapp.net";
-    const PROBE_PAYLOAD: &[u8] = b"probe";
-    let probe_id = format!(
-        "__wa_durability_probe_{}_{}__",
-        std::process::id(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let map_err = |e: StoreError| BotBuilderError::UnsupportedDurabilityBackend(e.to_string());
-    backend
-        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
-        .await
-        .map_err(map_err)?;
-    let got = backend
-        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    backend
-        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    if got.as_deref() != Some(PROBE_PAYLOAD) {
-        return Err(BotBuilderError::UnsupportedDurabilityBackend(
-            "pending-inbound buffer did not round-trip".to_string(),
-        ));
-    }
-    Ok(())
+    #[error(transparent)]
+    Client(#[from] ClientBuilderError),
 }
 
 /// `message` is `Arc` so cloning the context across spawned tasks only bumps a
@@ -585,60 +546,22 @@ impl Bot {
         } = self;
 
         if let Some(receiver) = sync_task_receiver {
-            // This channel carries only HistorySync tasks: app-state sync runs via
-            // its own direct path (fetch_app_state_with_retry), nothing enqueues
-            // AppStateSync here. Chunks are independent (order-free upserts; the
-            // event carries chunk_order), so ingest concurrently, bounded low — each
-            // in-flight chunk decompresses a blob and the connect path is peak-
-            // memory-conscious (WA Web caps at histSyncChunk=3). Taking the permit in
-            // the recv loop backpressures history intake on a burst; since no
-            // app-state task flows here, that can't head-of-line block one.
-            const HISTORY_SYNC_CONCURRENCY: usize = 2;
-            let worker_client = Arc::downgrade(&client);
-            let history_permits = Arc::new(async_lock::Semaphore::new(HISTORY_SYNC_CONCURRENCY));
-            client
-                .runtime
-                .spawn(Box::pin(async move {
-                    while let Ok(task) = receiver.recv().await {
-                        let Some(worker_client) = worker_client.upgrade() else {
-                            break;
-                        };
-
-                        if matches!(task, crate::sync_task::MajorSyncTask::HistorySync { .. }) {
-                            let permit = history_permits.acquire_arc().await;
-                            let task_client = worker_client.clone();
-                            worker_client
-                                .runtime
-                                .spawn(Box::pin(async move {
-                                    let _permit = permit;
-                                    task_client.process_sync_task(task).await;
-                                }))
-                                .detach();
-                        } else {
-                            // Defensive: nothing enqueues AppStateSync today, but if
-                            // that changes it must run serially (ordered patches).
-                            worker_client.process_sync_task(task).await;
-                        }
-                    }
-                    info!(
-                        "Sync worker intake loop finished (detached history-sync tasks may still be running)."
-                    );
-                }))
-                .detach();
+            client.start_sync_task_worker(receiver);
         }
 
         if !event_handlers.is_empty() {
             client
                 .core
                 .event_bus
-                .add_handler(Arc::new(CallbackBusAdapter::new(
+                .subscribe_handler(Arc::new(CallbackBusAdapter::new(
                     client.clone(),
                     event_handlers,
                     event_delivery,
-                )));
+                )))
+                .detach();
         }
         for handler in raw_handlers {
-            client.core.event_bus.add_handler(handler);
+            client.core.event_bus.subscribe_handler(handler).detach();
         }
 
         // If pair code options are set, spawn a task to request pair code after socket is ready
@@ -711,6 +634,10 @@ pub struct BotBuilder<
     resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
+    #[cfg(feature = "plugins")]
+    plugins: Vec<PluginRegistration>,
+    #[cfg(feature = "plugins")]
+    plugin_host_config: PluginHostConfig,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -736,6 +663,10 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             resend_rate_limit: None,
             task_instrument: None,
             alloc_meter: None,
+            #[cfg(feature = "plugins")]
+            plugins: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_host_config: PluginHostConfig::default(),
             _marker: PhantomData,
         }
     }
@@ -765,6 +696,10 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             resend_rate_limit: self.resend_rate_limit,
             task_instrument: self.task_instrument,
             alloc_meter: self.alloc_meter,
+            #[cfg(feature = "plugins")]
+            plugins: self.plugins,
+            #[cfg(feature = "plugins")]
+            plugin_host_config: self.plugin_host_config,
             _marker: PhantomData,
         }
     }
@@ -881,6 +816,50 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     pub fn with_alloc_meter(mut self, meter: Arc<wacore::stats::AllocMeter>) -> Self {
         self.task_instrument = Some(meter.clone());
         self.alloc_meter = Some(meter);
+        self
+    }
+
+    /// Register a native plugin without changing the builder's typestate.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(PluginRegistration::new(plugin));
+        self
+    }
+
+    /// Register an already-shared native plugin without changing its marker type.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
+        self.plugins.push(PluginRegistration::new_arc(plugin));
+        self
+    }
+
+    /// Register a manifest-ID-keyed plugin that exposes no Rust typed API.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_untyped_plugin<P: UntypedClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(PluginRegistration::new_untyped(plugin));
+        self
+    }
+
+    /// Register an already-shared manifest-ID-keyed plugin.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_untyped_plugin_arc<P: UntypedClientPlugin + ?Sized>(
+        mut self,
+        plugin: Arc<P>,
+    ) -> Self {
+        self.plugins
+            .push(PluginRegistration::new_untyped_arc(plugin));
+        self
+    }
+
+    /// Configure plugin lifecycle and tracked-task deadlines.
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub fn with_plugin_host_config(mut self, config: PluginHostConfig) -> Self {
+        self.plugin_host_config = config;
         self
     }
 
@@ -1278,18 +1257,8 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             unreachable!("typestate guarantees all required fields are Provided")
         };
 
-        // Instrument the runtime before anything spawns through it, so every
-        // internal task (noise sender, saver, workers) reports to the hook.
-        // Default (None): the original runtime is used untouched. The Bot
-        // keeps its own copy for the `run()` path (see the field doc).
         let task_instrument = self.task_instrument;
         let alloc_meter = self.alloc_meter;
-        let runtime: Arc<dyn Runtime> = match task_instrument.clone() {
-            Some(instrument) => {
-                Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
-            }
-            None => runtime,
-        };
 
         // Note: For multi-account mode, create the backend with SqliteStore::new_for_device()
         // before passing it to with_backend_arc()
@@ -1331,57 +1300,42 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
 
         info!("Creating client...");
-        let (client, sync_task_receiver) = Client::new_with_cache_config(
-            runtime.clone(),
-            persistence_manager.clone(),
-            transport_factory,
-            http_client,
-            self.override_version,
-            self.cache_config,
-        )
-        .await;
+        let client_builder = Client::builder()
+            .with_runtime_arc(runtime)
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory_arc(transport_factory)
+            .with_http_client_arc(http_client)
+            .with_cache_config(self.cache_config)
+            .with_custom_enc_handlers(self.custom_enc_handlers)
+            .with_skip_history_sync(self.skip_history_sync)
+            .with_background_saver_interval(std::time::Duration::from_secs(30));
+        #[cfg(feature = "plugins")]
+        let client_builder = client_builder
+            .with_plugin_registrations(self.plugins)
+            .with_plugin_host_config(self.plugin_host_config);
+        let mut client_builder = client_builder;
 
-        let saver_handle = persistence_manager.run_background_saver(
-            runtime,
-            std::time::Duration::from_secs(30),
-            client.shutdown_signal(),
-        );
-        // Tie the saver task to Arc<Client> so extracting client() and outliving
-        // Bot keeps periodic persistence alive. Client::drop on the last Arc
-        // drops the AbortHandle and aborts the task.
-        let _ = client.saver_handle.set(saver_handle);
-
-        // Typed alloc-meter handle for resource_report (its poll hooks are
-        // already wired via task_instrument above).
-        if let Some(meter) = alloc_meter {
-            let _ = client.alloc_meter.set(meter);
+        if let Some(version) = self.override_version {
+            client_builder = client_builder.with_version_override(version);
         }
-
-        // Register custom enc handlers. Immutable after build, so set the whole
-        // map once; the receive hot path then reads it lock-free.
-        let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
-
-        // Inbound durability hook (opt-in). Immutable after build; the receive
-        // path reads it lock-free. Probe the backend first: a backend that does
-        // not implement the pending-inbound buffer would otherwise leave every
-        // inbound message unacked and looping forever at runtime, so reject it
-        // here with a clear error instead.
         if let Some(hook) = self.inbound_durability_hook {
-            probe_durability_backend(&client.persistence_manager.backend()).await?;
-            let _ = client.inbound_durability_hook.set(hook);
+            client_builder = client_builder.with_inbound_durability_hook_arc(hook);
         }
-
-        if self.skip_history_sync {
-            client.set_skip_history_sync(true);
-        }
-
         if let Some(count) = self.wanted_pre_key_count {
-            client.set_wanted_pre_key_count(count);
+            client_builder = client_builder.with_wanted_pre_key_count(count);
         }
-
         if let Some((burst, refill_per_min)) = self.resend_rate_limit {
-            client.set_resend_rate_limit(burst, refill_per_min);
+            client_builder = client_builder.with_resend_rate_limit(burst, refill_per_min);
         }
+        client_builder = match alloc_meter {
+            Some(meter) => client_builder.with_alloc_meter(meter),
+            None => match task_instrument.clone() {
+                Some(instrument) => client_builder.with_task_instrument(instrument),
+                None => client_builder,
+            },
+        };
+
+        let (client, sync_task_receiver) = client_builder.build().await?.into_parts();
 
         Ok(Bot {
             client,
@@ -1453,6 +1407,44 @@ mod tests {
             .await
             .expect("build")
             .client()
+    }
+
+    #[cfg(feature = "plugins")]
+    struct BotBuilderPlugin;
+
+    #[cfg(feature = "plugins")]
+    impl ClientPlugin for BotBuilderPlugin {
+        type Api = &'static str;
+
+        fn manifest(&self) -> crate::plugins::PluginManifest {
+            crate::plugins::PluginManifest::new("bot-builder-test", "0.1.0")
+        }
+
+        fn install(
+            &self,
+            _context: crate::plugins::PluginContext,
+        ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async { Ok(Arc::new("installed")) })
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn typestate_builder_preserves_registered_plugins() {
+        let bot = Bot::builder()
+            .with_plugin(BotBuilderPlugin)
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("bot plugin build");
+        assert_eq!(
+            bot.client().plugin::<BotBuilderPlugin>().as_deref(),
+            Some(&"installed")
+        );
+        bot.client().disconnect().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {

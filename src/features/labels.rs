@@ -252,7 +252,7 @@ mod tests {
     fn run(m: &Mutation) -> (bool, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
-        bus.add_handler(rec.clone());
+        bus.subscribe_handler(rec.clone()).detach();
         let handled = dispatch_label_mutation(&bus, m, false);
         let events = rec.events.lock().unwrap().clone();
         (handled, events)

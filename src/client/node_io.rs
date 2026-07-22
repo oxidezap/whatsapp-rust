@@ -192,13 +192,13 @@ impl Client {
                                             // observes these events or every raw node.
                                             "receipt" => {
                                                 !self.synchronous_ack
-                                                    && !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                    && !self.raw_node_forwarding_enabled()
                                                     && !self.core.event_bus.has_handler_for(
                                                         wacore::types::events::EventKind::Receipt,
                                                     )
                                             }
                                             "ack" => {
-                                                !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                !self.raw_node_forwarding_enabled()
                                                     && !self.core.event_bus.has_handler_for(
                                                         wacore::types::events::EventKind::ServerAck,
                                                     )
@@ -326,7 +326,7 @@ impl Client {
         // ACKs need shared ownership only for opt-in raw/node observers. The
         // usual response-waiter path borrows the node and can skip the Arc.
         if node.tag() == "ack"
-            && !self.raw_node_forwarding.load(Ordering::Relaxed)
+            && !self.raw_node_forwarding_enabled()
             && self.node_waiter_count.load(Ordering::Acquire) == 0
             && !self.offline_sync_metrics.active.load(Ordering::Acquire)
         {
@@ -457,7 +457,7 @@ impl Client {
 
         // Emit raw node before any early returns so all decoded stanzas
         // (including IQ responses and xmlstreamend) reach external observers
-        if self.raw_node_forwarding.load(Ordering::Relaxed) {
+        if self.raw_node_forwarding_enabled() {
             self.core
                 .event_bus
                 .dispatch(Event::RawNode(Arc::clone(&node)));
@@ -707,6 +707,11 @@ impl Client {
         tracing::instrument(name = "wa.conn.success", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_success(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
+        #[cfg(feature = "client-lifecycle")]
+        let login_transition = self
+            .login_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Skip processing if an expected disconnect is pending (e.g., 515 received).
         // This prevents race conditions where a spawned success handler runs after
         // cleanup_connection_state has already reset is_logged_in.
@@ -725,6 +730,20 @@ impl Client {
         // Increment connection generation to invalidate any stale post-login tasks
         // from previous connections (e.g., during 515 reconnect cycles).
         let current_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle {
+            let opened = lifecycle.begin_scope_if_current(current_generation, || {
+                self.connection_generation.load(Ordering::SeqCst) == current_generation
+                    && !self.expected_disconnect.load(Ordering::Acquire)
+            });
+            if !opened {
+                self.is_logged_in.store(false, Ordering::SeqCst);
+                debug!("Ignoring <success> stanza retired during lifecycle publication");
+                return;
+            }
+        }
+        #[cfg(feature = "client-lifecycle")]
+        drop(login_transition);
 
         info!(
             "Successfully authenticated with WhatsApp servers! (gen={})",
@@ -1132,7 +1151,7 @@ impl Client {
                         // Presence is NOT sent here — WhatsApp Web sends presence from the
                         // setting_pushName mutation handler (WAWebPushNameSync), not from
                         // criticalSyncDone. Our setting_pushName handler already does this.
-                        client_clone.dispatch_connected();
+                        client_clone.dispatch_connected(task_generation).await;
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
@@ -1194,7 +1213,7 @@ impl Client {
                 // for an outdated connection that was replaced mid-await.
                 check_generation!();
 
-                client_clone.dispatch_connected();
+                client_clone.dispatch_connected(task_generation).await;
             }
         })).detach();
     }

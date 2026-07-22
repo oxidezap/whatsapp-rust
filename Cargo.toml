@@ -9,11 +9,16 @@ repository = "https://github.com/jlucaso1/whatsapp-rust"
 readme = "README.md"
 description = "Rust client for WhatsApp Web"
 
+[package.metadata.docs.rs]
+features = ["plugins"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [workspace]
 members = [
     ".",
     "examples/voip-cli",
     "http_clients/ureq-client",
+    "plugins/metrics",
     "storages/chat-store",
     "storages/sqlite-storage",
     "tests/bench-integration",
@@ -48,6 +53,9 @@ disallowed_methods = "deny"
 # Ban std 64-bit atomic types: absent on 32-bit targets (Xtensa/ESP32). Use
 # portable_atomic. Host-only test/bench counters carry an inline allow.
 disallowed_types = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
 
 [workspace.dependencies]
 # Shared dependencies
@@ -112,6 +120,12 @@ zlib-rs = { version = "0.6.5", default-features = false, features = ["std", "rus
 
 [features]
 debug-snapshots = ["wacore/debug-snapshots"]
+# Generation-scoped extension lifecycle. Kept opt-in so ordinary clients do not
+# retain lifecycle state or branches when no extension host is present.
+client-lifecycle = []
+# Build-time native plugin host. Kept opt-in so clients that do not use plugins
+# retain the pre-host binary footprint.
+plugins = ["client-lifecycle", "dep:bon"]
 # Optional observability. Off by default: no `tracing` dep, zero overhead.
 # Emits tracing spans/events only; the application installs the subscriber
 # (and any OpenTelemetry bridge). See examples/observability.rs.
@@ -170,6 +184,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
+bon = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["clock"] }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }

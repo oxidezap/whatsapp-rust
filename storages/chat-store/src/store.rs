@@ -58,7 +58,7 @@ pub(crate) enum WriterMsg {
 /// Wire-up:
 /// ```ignore
 /// let chat_store = ChatStore::new(&sqlite_store).await?;
-/// client.register_handler(chat_store.handler());
+/// let _chat_subscription = client.subscribe_handler(chat_store.handler());
 /// let mut changes = chat_store.subscribe();
 /// ```
 pub struct ChatStore {

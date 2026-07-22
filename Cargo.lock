@@ -4313,6 +4313,7 @@ dependencies = [
  "async-lock",
  "async-trait",
  "base64",
+ "bon",
  "buffa",
  "bytes",
  "cbc 0.2.1",
@@ -4375,6 +4376,19 @@ dependencies = [
  "wacore-binary",
  "waproto",
  "whatsapp-rust-sqlite-storage",
+]
+
+[[package]]
+name = "whatsapp-rust-plugin-metrics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "portable-atomic",
+ "serde",
+ "serde_json",
+ "tokio",
+ "whatsapp-rust",
 ]
 
 [[package]]

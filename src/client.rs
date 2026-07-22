@@ -1,9 +1,12 @@
 mod accessors;
 mod adapters;
 mod app_state;
+mod builder;
 mod context_impl;
 mod device_registry;
 pub(crate) mod device_topology;
+#[cfg(feature = "client-lifecycle")]
+mod extension_lifecycle;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -13,6 +16,13 @@ pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
 mod voip;
+use builder::{ClientAssembly, ClientExtensions};
+pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+#[cfg(feature = "client-lifecycle")]
+use extension_lifecycle::LifecycleRegistration;
+#[cfg(feature = "client-lifecycle")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
+pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
@@ -50,6 +60,25 @@ use wacore_binary::Jid;
 use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+/// Lease that keeps raw decoded stanza events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+#[must_use = "dropping the lease immediately releases raw-node forwarding"]
+pub struct RawNodeLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for RawNodeLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let previous = client.raw_node_forwarding.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "raw-node forwarding lease underflow");
+    }
+}
 
 /// Filter for matching incoming stanzas (nodes) by tag and attributes.
 ///
@@ -267,15 +296,31 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
+    #[cfg(feature = "plugins")]
+    pub plugins: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_install_tasks: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_connection_tasks: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_connection_generations: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_core_event_subscriptions: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_event_endpoints: u64,
+    #[cfg(feature = "plugins")]
+    pub plugin_event_endpoint_capacity: u64,
+    /// Unique custom-event envelopes and payload bytes still retained in endpoint queues.
+    #[cfg(feature = "plugins")]
+    pub plugin_event_queue: CollectionStats,
     // -- Misc --
     pub chatstate_handlers: usize,
     pub custom_enc_handlers: usize,
 }
 
 impl MemoryReport {
-    /// Every byte-carrying collection with its display name — the single list
-    /// [`Self::total_estimated_bytes`] and `Display` derive from, so a new
-    /// collection cannot be summed but not shown (or vice versa).
+    /// Common byte-carrying collections used by both totals and `Display`.
+    /// Feature-specific collections stay beside their gated report section.
     fn collections(&self) -> [(&'static str, &CollectionStats); 11] {
         [
             ("group_cache:", &self.group_cache),
@@ -294,7 +339,10 @@ impl MemoryReport {
 
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
-        self.collections().iter().map(|(_, c)| c.bytes).sum()
+        let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
+        #[cfg(feature = "plugins")]
+        let total = total.saturating_add(self.plugin_event_queue.bytes);
+        total
     }
 }
 
@@ -376,6 +424,28 @@ impl std::fmt::Display for MemoryReport {
             "  peak payload storage:   {} B",
             self.history_sync_payload_bytes_peak
         )?;
+        #[cfg(feature = "plugins")]
+        {
+            writeln!(f, "--- Plugins ---")?;
+            writeln!(f, "  installed:              {}", self.plugins)?;
+            writeln!(f, "  install tasks:          {}", self.plugin_install_tasks)?;
+            writeln!(
+                f,
+                "  connection tasks:       {} (generations: {})",
+                self.plugin_connection_tasks, self.plugin_connection_generations
+            )?;
+            writeln!(
+                f,
+                "  core subscriptions:     {}",
+                self.plugin_core_event_subscriptions
+            )?;
+            writeln!(
+                f,
+                "  event endpoints:        {} (capacity: {})",
+                self.plugin_event_endpoints, self.plugin_event_endpoint_capacity
+            )?;
+            line(f, "event_queue:", &self.plugin_event_queue)?;
+        }
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
@@ -634,6 +704,8 @@ pub struct Client {
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
     pub(crate) is_logged_in: Arc<AtomicBool>,
+    #[cfg(feature = "client-lifecycle")]
+    pub(crate) login_transition: std::sync::Mutex<()>,
     pub(crate) is_connecting: Arc<AtomicBool>,
     pub(crate) is_running: Arc<AtomicBool>,
     /// Whether the noise socket is established (connected to WhatsApp servers).
@@ -662,6 +734,12 @@ pub struct Client {
     /// error / connect_failure / disconnect. Per-connection subscribers
     /// (keepalive, request waiters, read loop, offline flush) observe this.
     pub(crate) connection_shutdown: std::sync::Mutex<wacore::runtime::ShutdownNotifier>,
+    /// Allocated only when an extension host installs lifecycle callbacks.
+    #[cfg(feature = "client-lifecycle")]
+    lifecycle: Option<Arc<LifecycleRegistration>>,
+    /// Allocated only when at least one build-time plugin is registered.
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_host: Option<Arc<crate::plugins::PluginHost>>,
     /// Per-session wire I/O and activity counters. Written at the transport
     /// chokepoints (noise sender task, read loop); the keepalive dead-socket
     /// watchdog reads its activity timestamps. Snapshot via [`Client::stats`].
@@ -1012,9 +1090,8 @@ pub struct Client {
     /// its allocation-churn snapshot. Unset unless that builder method was used.
     pub(crate) alloc_meter: std::sync::OnceLock<Arc<wacore::stats::AllocMeter>>,
 
-    /// When true, emit `Event::RawNode` for every decoded stanza before router dispatch.
-    /// Default false — only enable when external consumers need raw protocol access.
-    raw_node_forwarding: AtomicBool,
+    /// Number of consumers currently requesting `Event::RawNode` forwarding.
+    raw_node_forwarding: AtomicUsize,
 
     /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
     /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the

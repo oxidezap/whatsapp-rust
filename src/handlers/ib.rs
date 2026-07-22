@@ -1,6 +1,6 @@
 use super::traits::StanzaHandler;
 use crate::client::Client;
-use crate::types::events::{DirtyState, Event, OfflineSyncPreview};
+use crate::types::events::{DirtyState, Event, EventKind, OfflineSyncPreview};
 use async_trait::async_trait;
 use futures::FutureExt;
 use log::{debug, info, warn};
@@ -68,12 +68,14 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 );
                 let needs_resync = bit.dirty_type == DirtyType::SyncdAppState;
 
-                client.core.event_bus.dispatch(Event::DirtyState(
-                    DirtyState::builder()
-                        .dirty_type(bit.dirty_type.clone())
-                        .maybe_timestamp(bit.timestamp)
-                        .build(),
-                ));
+                if client.core.event_bus.has_handler_for(EventKind::DirtyState) {
+                    client.core.event_bus.dispatch(Event::DirtyState(
+                        DirtyState::builder()
+                            .dirty_type(bit.dirty_type.clone())
+                            .maybe_timestamp(bit.timestamp)
+                            .build(),
+                    ));
+                }
 
                 debug!(
                     "Received dirty state notification for type: '{dirty_type_str}'. Sending clean IQ."
@@ -234,7 +236,7 @@ mod tests {
     async fn valid_dirty_marker_dispatches_typed_event() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone());
+        let _subscription = client.subscribe_handler(collector.clone());
         let node = NodeBuilder::new("ib")
             .children([NodeBuilder::new("dirty")
                 .attr("type", "account_sync")

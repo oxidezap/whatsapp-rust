@@ -234,7 +234,7 @@ mod tests {
         // Redelivery once the commit succeeds clears the buffer AND finally
         // dispatches the event (the original batch never did).
         let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
         hook.succeed.store(true, Ordering::SeqCst);
         client.ack_or_replay_to_hook(&info).await;
         assert_eq!(hook.calls.load(Ordering::SeqCst), 3);

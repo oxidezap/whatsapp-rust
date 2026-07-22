@@ -27,17 +27,41 @@ impl Client {
         cache
     }
 
-    /// Registers an external event handler to the core event bus.
-    pub fn register_handler(&self, handler: Arc<dyn wacore::types::events::EventHandler>) {
-        self.core.event_bus.add_handler(handler);
+    /// Subscribe an external event handler with an explicit event filter.
+    pub fn subscribe(
+        &self,
+        interest: wacore::types::events::EventInterest,
+        handler: Arc<dyn wacore::types::events::EventHandler>,
+    ) -> wacore::types::events::Subscription {
+        self.core.event_bus.subscribe(interest, handler)
     }
 
-    /// Enable or disable raw node forwarding.
-    /// When enabled, `Event::RawNode` is emitted for every decoded stanza before
-    /// the stanza router dispatches it. Only enable when external consumers need
-    /// raw protocol access (e.g. voice call stanzas).
-    pub fn set_raw_node_forwarding(&self, enabled: bool) {
-        self.raw_node_forwarding.store(enabled, Ordering::Relaxed);
+    /// Subscribe using the handler's current registration-time interest hint.
+    pub fn subscribe_handler(
+        &self,
+        handler: Arc<dyn wacore::types::events::EventHandler>,
+    ) -> wacore::types::events::Subscription {
+        self.core.event_bus.subscribe_handler(handler)
+    }
+
+    /// Acquire raw decoded stanza forwarding for one consumer.
+    ///
+    /// `Event::RawNode` remains enabled until every acquired lease is dropped.
+    pub fn acquire_raw_node_forwarding(self: &Arc<Self>) -> RawNodeLease {
+        let incremented = self
+            .raw_node_forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(incremented, "raw-node forwarding lease counter overflow");
+        RawNodeLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn raw_node_forwarding_enabled(&self) -> bool {
+        self.raw_node_forwarding.load(Ordering::Relaxed) != 0
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.
@@ -169,6 +193,43 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
+        #[cfg(feature = "plugins")]
+        let plugin_stats = self.plugin_stats();
+        #[cfg(feature = "plugins")]
+        let (
+            plugins,
+            plugin_install_tasks,
+            plugin_connection_tasks,
+            plugin_connection_generations,
+            plugin_core_event_subscriptions,
+        ) = plugin_stats
+            .as_ref()
+            .map(|host| {
+                host.plugins.iter().fold(
+                    (
+                        u64::try_from(host.plugins.len()).unwrap_or(u64::MAX),
+                        0u64,
+                        0u64,
+                        0u64,
+                        0u64,
+                    ),
+                    |(plugins, install, connection, generations, subscriptions), plugin| {
+                        (
+                            plugins,
+                            install.saturating_add(plugin.install_tasks),
+                            connection.saturating_add(plugin.connection_tasks),
+                            generations.saturating_add(plugin.connection_generations),
+                            subscriptions.saturating_add(plugin.core_event_subscriptions),
+                        )
+                    },
+                )
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "plugins")]
+        let plugin_event_router = plugin_stats
+            .as_ref()
+            .and_then(|host| host.event_router)
+            .unwrap_or_default();
 
         MemoryReport {
             group_cache,
@@ -200,6 +261,25 @@ impl Client {
             signal_sessions,
             signal_identities,
             signal_sender_keys,
+            #[cfg(feature = "plugins")]
+            plugins,
+            #[cfg(feature = "plugins")]
+            plugin_install_tasks,
+            #[cfg(feature = "plugins")]
+            plugin_connection_tasks,
+            #[cfg(feature = "plugins")]
+            plugin_connection_generations,
+            #[cfg(feature = "plugins")]
+            plugin_core_event_subscriptions,
+            #[cfg(feature = "plugins")]
+            plugin_event_endpoints: plugin_event_router.active_endpoints,
+            #[cfg(feature = "plugins")]
+            plugin_event_endpoint_capacity: plugin_event_router.endpoint_capacity,
+            #[cfg(feature = "plugins")]
+            plugin_event_queue: CollectionStats::new(
+                plugin_event_router.queued_events,
+                plugin_event_router.queued_payload_bytes,
+            ),
             chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
         }
@@ -513,6 +593,24 @@ impl Client {
         router.register(Arc::new(crate::handlers::presence::PresenceHandler));
 
         router
+    }
+}
+
+#[cfg(test)]
+mod raw_node_tests {
+    #[tokio::test]
+    async fn raw_node_forwarding_stays_enabled_until_the_last_lease_drops() {
+        let client = crate::test_utils::create_test_client().await;
+        assert!(!client.raw_node_forwarding_enabled());
+
+        let first = client.acquire_raw_node_forwarding();
+        let second = client.acquire_raw_node_forwarding();
+        assert!(client.raw_node_forwarding_enabled());
+
+        drop(first);
+        assert!(client.raw_node_forwarding_enabled());
+        drop(second);
+        assert!(!client.raw_node_forwarding_enabled());
     }
 }
 

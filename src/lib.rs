@@ -1,6 +1,7 @@
 // Compile-checks the README examples as doctests, so the advertised quick
 // start can never silently rot.
 #![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Instrumenting large async fns (e.g. process_sync_task) wraps them in deep
 // `Instrumented` future types; the default depth limit overflows when the
 // `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
@@ -84,7 +85,6 @@ pub mod types;
 
 pub mod client;
 pub(crate) mod flush_scope;
-pub use client::Client;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;
@@ -94,6 +94,10 @@ pub use client::{
     StatsSnapshot, StorageResourceReport, TransportResourceReport,
 };
 pub use client::{CallError, Voip};
+pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError, RawNodeLease};
+#[cfg(feature = "client-lifecycle")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
+pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
@@ -108,6 +112,23 @@ pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
 pub mod passkey;
+#[cfg(feature = "plugins")]
+#[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+pub mod plugins;
+#[cfg(feature = "plugins")]
+#[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+pub use plugins::{
+    ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
+    PluginConnectionTasks, PluginContext, PluginCoreEventSubscription, PluginCoreEvents,
+    PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
+    PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,
+    PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
+    PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
+    PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
+    PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginIq, PluginIqError,
+    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
+    PluginState, PluginStats, PluginTasks, UntypedClientPlugin,
+};
 pub mod request;
 pub(crate) mod signal_flush;
 pub use request::IqError;
@@ -177,7 +198,19 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
-    pub use crate::client::{Client, ClientError};
+    pub use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientError, RawNodeLease};
+    #[cfg(feature = "client-lifecycle")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
+    pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
+    pub use crate::plugins::{
+        ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext,
+        PluginCoreEventSubscription, PluginEventEndpointConfig, PluginEventOverflow,
+        PluginEventPayloadEncoding, PluginEventRouter, PluginEventSelector,
+        PluginEventSubscription, PluginEventTopic, PluginEvents, PluginFuture, PluginHostConfig,
+        PluginManifest, UntypedClientPlugin,
+    };
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;
@@ -186,7 +219,10 @@ pub mod prelude {
     pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
     pub use crate::store::SqliteStore;
-    pub use crate::types::events::{BatchOrigin, Event, EventKind, InboundMessage, MessageBatch};
+    pub use crate::types::events::{
+        BatchOrigin, ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
+        InboundMessage, MessageBatch, Subscription,
+    };
     pub use crate::types::message::MessageInfo;
     pub use crate::{Jid, Server};
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};

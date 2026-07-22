@@ -889,7 +889,9 @@ mod tests {
     async fn passkey_prologue_request_emits_event_without_committing_rotation() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
 
         let before = client
             .persistence_manager
@@ -926,7 +928,9 @@ mod tests {
     async fn passkey_prologue_request_from_non_server_is_ignored() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
 
         let child = NodeBuilder::new(TAG_PASSKEY_REQUEST_OPTIONS)
             .bytes(b"{}".to_vec())
@@ -951,7 +955,9 @@ mod tests {
     async fn passkey_prologue_request_without_inline_options_falls_back_to_fetch() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
 
         // No inline options: the handler falls back to an IQ fetch. The test client
         // isn't connected, so the fetch fails and surfaces a non-continuation error.
@@ -973,7 +979,9 @@ mod tests {
     async fn passkey_continuation_without_session_emits_error() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
-        client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
 
         let primary = wa::PrimaryEphemeralIdentity {
             public_key: Some(vec![0xAB; 32]),

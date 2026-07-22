@@ -1660,7 +1660,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
     // accept flow, so the raw-node-forwarding crutch the old hand-rolled inbound path needed is gone.
     let manages_media = accept || target.is_some();
     let observer = Arc::new(CallObserver::new(client.clone(), accept, video, audio));
-    client.register_handler(observer.clone());
+    let _observer_subscription = client.subscribe_handler(observer.clone());
 
     if let Some(peer) = target {
         let client2 = client.clone();

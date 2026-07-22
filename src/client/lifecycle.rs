@@ -6,10 +6,21 @@ use super::*;
 /// accounts in more groups; an evicted entry just recomputes on next send.
 const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.signal_shutdown_sync();
+    }
+}
+
 impl Client {
     /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
     /// long is the reconnect backoff counter reset to its base.
     pub(crate) const STABLE_CONNECTION_RESET_MS: i64 = 30_000;
+
+    /// Create a runtime-validated low-level client builder.
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::new()
+    }
 
     pub fn shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.shutdown_notifier.subscribe()
@@ -25,6 +36,10 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.signal_shutdown_sync();
+        }
         self.notify_connection_shutdown();
     }
 
@@ -66,14 +81,74 @@ impl Client {
         self.is_connected() && self.is_logged_in() && self.is_ready.load(Ordering::Relaxed)
     }
 
-    /// Dispatch the Connected event and notify waiters.
-    pub(crate) fn dispatch_connected(&self) {
+    /// Dispatch the Connected event and notify waiters for the originating connection.
+    pub(crate) async fn dispatch_connected(&self, expected_generation: u64) {
+        #[cfg(feature = "client-lifecycle")]
+        {
+            if let Some(lifecycle) = &self.lifecycle {
+                if !lifecycle.ready(expected_generation).await {
+                    debug!(
+                        "Skipping Connected dispatch for retired generation {expected_generation}"
+                    );
+                    return;
+                }
+
+                // Cleanup takes the same lock before retiring the generation, so the final
+                // validation and publication form one transition with its generation bump.
+                let _login_transition = self
+                    .login_transition
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if self.connection_generation.load(Ordering::SeqCst) != expected_generation
+                    || self.expected_disconnect.load(Ordering::Acquire)
+                {
+                    debug!(
+                        "Skipping Connected dispatch after generation {expected_generation} retired"
+                    );
+                    return;
+                }
+                if !lifecycle.publish_ready(expected_generation, || self.publish_connected()) {
+                    debug!("Skipping Connected dispatch after lifecycle cancellation");
+                }
+                return;
+            }
+        }
+
+        #[cfg(feature = "client-lifecycle")]
+        let _login_transition = self
+            .login_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.connection_generation.load(Ordering::SeqCst) != expected_generation
+            || self.expected_disconnect.load(Ordering::Acquire)
+        {
+            debug!("Skipping Connected dispatch after its connection retired");
+            return;
+        }
+        self.publish_connected();
+    }
+
+    fn publish_connected(&self) {
         self.is_ready.store(true, Ordering::Relaxed);
         wacore::telemetry::set_connected(true);
         self.core.event_bus.dispatch(Event::Connected(
             crate::types::events::Connected::builder().build(),
         ));
         self.connected_notifier.notify(usize::MAX);
+    }
+
+    #[cfg(feature = "client-lifecycle")]
+    pub(super) async fn shutdown_lifecycle(&self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.shutdown().await;
+        }
+    }
+
+    #[cfg(feature = "client-lifecycle")]
+    fn request_lifecycle_shutdown(&self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.request_shutdown();
+        }
     }
 
     /// Create a new `Client` with default cache configuration.
@@ -87,7 +162,7 @@ impl Client {
         http_client: Arc<dyn crate::http::HttpClient>,
         override_version: Option<(u32, u32, u32)>,
     ) -> (Arc<Self>, async_channel::Receiver<MajorSyncTask>) {
-        Self::new_with_cache_config(
+        ClientBuilder::build_required(
             runtime,
             persistence_manager,
             transport_factory,
@@ -96,6 +171,7 @@ impl Client {
             CacheConfig::default(),
         )
         .await
+        .into_parts()
     }
 
     /// Create a new `Client` with a custom [`CacheConfig`].
@@ -107,6 +183,33 @@ impl Client {
         override_version: Option<(u32, u32, u32)>,
         cache_config: CacheConfig,
     ) -> (Arc<Self>, async_channel::Receiver<MajorSyncTask>) {
+        ClientBuilder::build_required(
+            runtime,
+            persistence_manager,
+            transport_factory,
+            http_client,
+            override_version,
+            cache_config,
+        )
+        .await
+        .into_parts()
+    }
+
+    pub(super) fn assemble(
+        runtime: Arc<dyn Runtime>,
+        persistence_manager: Arc<PersistenceManager>,
+        transport_factory: Arc<dyn crate::transport::TransportFactory>,
+        http_client: Arc<dyn crate::http::HttpClient>,
+        override_version: Option<(u32, u32, u32)>,
+        cache_config: CacheConfig,
+        extensions: ClientExtensions,
+    ) -> ClientAssembly {
+        let ClientExtensions {
+            #[cfg(feature = "client-lifecycle")]
+            lifecycle,
+            #[cfg(feature = "plugins")]
+            plugin_host,
+        } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
@@ -126,6 +229,8 @@ impl Client {
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
             is_logged_in: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "client-lifecycle")]
+            login_transition: std::sync::Mutex::new(()),
             is_connecting: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             is_connected: Arc::new(AtomicBool::new(false)),
@@ -133,6 +238,10 @@ impl Client {
             ik_handshake_failures: Arc::new(AtomicU32::new(0)),
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
+            #[cfg(feature = "client-lifecycle")]
+            lifecycle,
+            #[cfg(feature = "plugins")]
+            plugin_host,
             stats: Arc::new(wacore::stats::SessionStats::new()),
 
             transport: Arc::new(Mutex::new(None)),
@@ -287,7 +396,7 @@ impl Client {
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),
             alloc_meter: std::sync::OnceLock::new(),
-            raw_node_forwarding: AtomicBool::new(false),
+            raw_node_forwarding: AtomicUsize::new(0),
             #[cfg(feature = "voip-runtime")]
             call_registry: std::sync::Arc::new(wacore::voip::CallRegistry::new()),
             #[cfg(feature = "voip-runtime")]
@@ -303,17 +412,18 @@ impl Client {
             .attach_topology(Arc::clone(&arc.device_topology));
         let _ = arc.self_weak.set(Arc::downgrade(&arc));
 
-        // Warm up the LID-PN cache from persistent storage
-        let warm_up_arc = arc.clone();
-        arc.runtime
+        ClientAssembly::new(arc, rx)
+    }
+
+    pub(super) fn start_services(self: &Arc<Self>) {
+        let warm_up_arc = self.clone();
+        self.runtime
             .spawn(Box::pin(async move {
                 if let Err(e) = warm_up_arc.warm_up_lid_pn_cache().await {
                     warn!("Failed to warm up LID-PN cache: {e}");
                 }
             }))
             .detach();
-
-        (arc, rx)
     }
 
     // Deliberately NOT instrumented: this span would live for the entire client
@@ -321,8 +431,24 @@ impl Client {
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
     // per-operation spans (send/request), which record it themselves.
     pub async fn run(self: &Arc<Self>) {
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle
+            && !lifecycle.wait_until_active().await
+        {
+            warn!("Client `run` rejected before construction completed.");
+            return;
+        }
+        let shutdown = self.shutdown_signal();
+        if shutdown.is_fired() {
+            warn!("Client `run` called after shutdown.");
+            return;
+        }
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
+            return;
+        }
+        if shutdown.is_fired() {
+            self.is_running.store(false, Ordering::SeqCst);
             return;
         }
         // Reconnects are counted at iteration start: every pass after the
@@ -436,6 +562,8 @@ impl Client {
             );
             self.runtime.sleep(delay).await;
         }
+        #[cfg(feature = "client-lifecycle")]
+        self.shutdown_lifecycle().await;
         info!("Client run loop has shut down.");
     }
 
@@ -443,6 +571,12 @@ impl Client {
     /// across crates, so consumers awaiting the connect graph directly would
     /// re-codegen it; the box makes them poll through a vtable instead.
     pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle
+            && !lifecycle.wait_until_active().await
+        {
+            return Err(anyhow!("client construction did not activate"));
+        }
         self.connect_boxed().await
     }
 
@@ -598,14 +732,14 @@ impl Client {
             warn!("Failed to send logout IQ: {e}");
         }
 
-        self.disconnect().await;
-
         self.core.event_bus.dispatch(Event::LoggedOut(
             crate::types::events::LoggedOut::builder()
                 .on_connect(false)
                 .reason(ConnectFailureReason::LoggedOut)
                 .build(),
         ));
+
+        self.disconnect().await;
 
         Ok(())
     }
@@ -620,6 +754,8 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        #[cfg(feature = "client-lifecycle")]
+        self.request_lifecycle_shutdown();
 
         // Drain buffered offline receipts into the flush window before
         // closing it, so a disconnect mid-offline-sync still acks the
@@ -666,6 +802,8 @@ impl Client {
         // final flush below and then be acked.
         self.msg_secret_buffer.seal();
         self.msg_secret_buffer.flush().await;
+        #[cfg(feature = "client-lifecycle")]
+        self.shutdown_lifecycle().await;
     }
 
     /// Backoff step used by [`reconnect()`] to create an offline window.
@@ -694,6 +832,10 @@ impl Client {
     )]
     pub async fn reconnect(self: &Arc<Self>) {
         info!("Reconnecting: dropping transport for auto-reconnect.");
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_active_scope();
+        }
         wacore::telemetry::reconnect();
         self.intentional_reconnect.store(true, Ordering::Relaxed);
         self.auto_reconnect_errors
@@ -730,6 +872,10 @@ impl Client {
     )]
     pub async fn reconnect_immediately(self: &Arc<Self>) {
         info!("Reconnecting immediately (expected disconnect).");
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_active_scope();
+        }
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().
@@ -754,7 +900,46 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
     )]
-    pub(crate) async fn cleanup_connection_state(&self) {
+    #[cfg(not(feature = "client-lifecycle"))]
+    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
+        self.cleanup_connection_state_inner().await;
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
+    )]
+    #[cfg(feature = "client-lifecycle")]
+    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
+        if self.lifecycle.is_none() {
+            self.cleanup_connection_state_inner().await;
+            return;
+        }
+
+        // Scope closure must survive a caller dropping its cleanup waiter.
+        let (completed, completion) = futures::channel::oneshot::channel();
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                let result = std::panic::AssertUnwindSafe(client.cleanup_connection_state_inner())
+                    .catch_unwind()
+                    .await;
+                let _ = completed.send(result);
+            }))
+            .detach();
+        match completion.await {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => error!("Detached connection cleanup stopped before completion"),
+        }
+    }
+
+    async fn cleanup_connection_state_inner(&self) {
+        #[cfg(feature = "client-lifecycle")]
+        let login_transition = self
+            .login_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Bump the generation FIRST: it is the "this connection is over"
         // signal every per-connection loop already polls. Chat-lane workers
         // stop draining their queues (their remaining stanzas were never
@@ -763,7 +948,28 @@ impl Client {
         // process_classified_message — no decrypt can START after the
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
+        #[cfg(feature = "client-lifecycle")]
+        let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        #[cfg(not(feature = "client-lifecycle"))]
         self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "client-lifecycle")]
+        let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
+            let lifecycle = Arc::clone(lifecycle);
+            scopeguard::guard((lifecycle, closed_generation), |(lifecycle, generation)| {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    lifecycle.close_scope(generation);
+                }))
+                .is_err()
+                {
+                    error!("Client lifecycle scope closure panicked");
+                }
+            })
+        });
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_scope(closed_generation);
+        }
+        self.notify_connection_shutdown();
         // The coalesced-flush scheduler needs no explicit reset: its state is
         // generation-scoped, so the bump above already hands ownership to the
         // next connection's first request and retires any stale worker.
@@ -774,6 +980,8 @@ impl Client {
         // outgoing stanzas, which are transport-scoped.
         self.clear_sent_node_waiters();
         self.is_logged_in.store(false, Ordering::Relaxed);
+        #[cfg(feature = "client-lifecycle")]
+        drop(login_transition);
         self.is_ready.store(false, Ordering::Relaxed);
         // Publish the disconnected state BEFORE draining VoIP calls (it used to be cleared only after
         // the socket teardown below): a concurrent accept()/call() setup that finishes its async work
@@ -789,11 +997,6 @@ impl Client {
             // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
             crate::voip::facade::drain_pending_outgoing_on_disconnect(self);
         }
-        // Signal the keepalive loop (and any other per-connection tasks) to
-        // exit promptly. Without this, a stale keepalive loop can overlap
-        // with the next one after reconnect. Uses the PER-CONNECTION signal
-        // so the terminal shutdown_notifier stays clean for reconnects.
-        self.notify_connection_shutdown();
         // Close the socket as part of cleanup so this path is authoritative
         // even when reached via the run loop's graceful-exit flow (not just
         // `Client::disconnect()`). Transport impls make `disconnect()`
@@ -923,6 +1126,8 @@ impl Client {
         if let Some(proc) = self.app_state_processor.lock().await.as_ref() {
             proc.clear_key_cache().await;
         }
+        #[cfg(feature = "client-lifecycle")]
+        drop(scope_close);
     }
 
     /// Waits for the noise socket to be established.

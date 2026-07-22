@@ -293,7 +293,9 @@ async fn test_ack_dispatches_server_ack_event() {
 
     let client = crate::test_utils::create_test_client().await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
-    client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
 
     // Plain message ack (no waiter registered): event fires with the ack's
     // class, from and server timestamp; error is None.
@@ -1597,7 +1599,7 @@ async fn connect_failure_403_dispatches_account_locked_logout() {
     use wacore::types::events::ChannelEventHandler;
     let client = create_offline_sync_test_client().await;
     let (handler, events) = ChannelEventHandler::new();
-    client.register_handler(handler);
+    client.subscribe_handler(handler).detach();
 
     // location="rva" is a region routing token and must not change the verdict.
     let failure = NodeBuilder::new("failure")

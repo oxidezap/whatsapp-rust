@@ -4,6 +4,7 @@ use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
+use portable_atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -204,7 +205,7 @@ impl Serialize for LazyHistorySync {
 /// Discriminant for each [`Event`] variant, used to express handler interest
 /// without materializing the event. One per `Event` variant, in declaration
 /// order; the value doubles as a bit index in [`EventInterest`], so there can
-/// be at most 64 kinds.
+/// be at most 128 kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -282,9 +283,9 @@ impl EventKind {
 // fails compilation instead of silently corrupting the mask at runtime.
 const _: () = assert!((EventKind::ServerAck as u8) < EventKind::CAPACITY);
 
-/// A set of [`EventKind`]s a handler wants delivered. The event bus skips
-/// materializing and dispatching events whose kind no handler wants, so a
-/// handler that subscribes to a few kinds never pays for boxing the others.
+/// A set of [`EventKind`]s a handler wants delivered. Producers can query the
+/// aggregate interest before building expensive payloads, and dispatch avoids
+/// allocating an `Arc<Event>` when no handler wants the kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventInterest(u128);
 
@@ -324,14 +325,18 @@ impl EventInterest {
     pub const fn union(self, other: Self) -> Self {
         EventInterest(self.0 | other.0)
     }
+
+    const fn words(self) -> (u64, u64) {
+        (self.0 as u64, (self.0 >> 64) as u64)
+    }
 }
 
 pub trait EventHandler: crate::sync_marker::MaybeSendSync {
     fn handle_event(&self, event: Arc<Event>);
 
-    /// Which event kinds this handler wants. Defaults to all kinds, so the bus
-    /// keeps delivering everything to handlers that don't opt into a narrower
-    /// set. Override to let the bus skip materializing unwanted events.
+    /// Registration-time interest hint used by
+    /// [`CoreEventBus::subscribe_handler`]. The bus captures it once; use
+    /// [`Subscription::update_interest`] for later changes.
     fn interest(&self) -> EventInterest {
         EventInterest::ALL
     }
@@ -342,7 +347,7 @@ pub trait EventHandler: crate::sync_marker::MaybeSendSync {
 /// # Example
 /// ```ignore
 /// let (handler, rx) = ChannelEventHandler::new();
-/// client.register_handler(handler);
+/// let _subscription = client.subscribe_handler(handler);
 /// while let Ok(event) = rx.recv().await {
 ///     if matches!(&*event, Event::Connected(_)) { break; }
 /// }
@@ -364,22 +369,176 @@ impl EventHandler for ChannelEventHandler {
     }
 }
 
+#[derive(Clone)]
+struct HandlerEntry {
+    id: u64,
+    interest: EventInterest,
+    handler: Arc<dyn EventHandler>,
+}
+
 /// Immutable snapshot of the registered handlers. `dispatch` clones only the
 /// outer `Arc` (one refcount bump, no `Vec` allocation), then drops the lock and
-/// iterates the snapshot. Handler interest is re-evaluated per dispatch so a
-/// handler whose `interest()` widens at runtime still receives the new kinds.
+/// iterates it. Interests change only through the subscription that owns an
+/// entry, so one snapshot always contains a coherent handler/filter pair.
 #[derive(Default)]
 struct HandlerSnapshot {
-    handlers: Vec<Arc<dyn EventHandler>>,
+    handlers: Vec<HandlerEntry>,
+}
+
+struct CoreEventBusInner {
+    handlers: RwLock<Arc<HandlerSnapshot>>,
+    next_id: AtomicU64,
+    interest_low: AtomicU64,
+    interest_high: AtomicU64,
+}
+
+impl Default for CoreEventBusInner {
+    fn default() -> Self {
+        Self {
+            handlers: RwLock::new(Arc::new(HandlerSnapshot::default())),
+            next_id: AtomicU64::new(1),
+            interest_low: AtomicU64::new(0),
+            interest_high: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CoreEventBusInner {
+    fn snapshot(&self) -> Arc<HandlerSnapshot> {
+        self.handlers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn publish_interest(&self, interest: EventInterest) {
+        let (low, high) = interest.words();
+        if low != 0 {
+            self.interest_low.fetch_or(low, Ordering::Release);
+        }
+        if high != 0 {
+            self.interest_high.fetch_or(high, Ordering::Release);
+        }
+    }
+
+    fn store_aggregate(&self, snapshot: &HandlerSnapshot) {
+        let aggregate = snapshot
+            .handlers
+            .iter()
+            .fold(EventInterest::none(), |all, entry| {
+                all.union(entry.interest)
+            });
+        let (low, high) = aggregate.words();
+        self.interest_low.store(low, Ordering::Release);
+        self.interest_high.store(high, Ordering::Release);
+    }
+
+    fn remove(&self, id: u64) -> bool {
+        let mut guard = self
+            .handlers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = &**guard;
+        let Some(position) = current.handlers.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let mut handlers = Vec::with_capacity(current.handlers.len() - 1);
+        handlers.extend(current.handlers[..position].iter().cloned());
+        handlers.extend(current.handlers[position + 1..].iter().cloned());
+        let snapshot = Arc::new(HandlerSnapshot { handlers });
+        // Retire the entry before clearing bits; an early read may only be a
+        // harmless false positive.
+        let retired = std::mem::replace(&mut *guard, Arc::clone(&snapshot));
+        self.store_aggregate(&snapshot);
+        drop(guard);
+        drop(retired);
+        true
+    }
+
+    fn update_interest(&self, id: u64, interest: EventInterest) -> bool {
+        let mut guard = self
+            .handlers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = &**guard;
+        let Some(position) = current.handlers.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        if current.handlers[position].interest == interest {
+            return true;
+        }
+
+        // Publish additions first so a completed snapshot update can never be
+        // hidden by the lock-free producer filter.
+        self.publish_interest(interest);
+        let mut handlers = current.handlers.clone();
+        handlers[position].interest = interest;
+        let snapshot = Arc::new(HandlerSnapshot { handlers });
+        *guard = Arc::clone(&snapshot);
+        self.store_aggregate(&snapshot);
+        true
+    }
+
+    fn has_handler_for(&self, kind: EventKind) -> bool {
+        let bit = kind as u8;
+        if bit < 64 {
+            self.interest_low.load(Ordering::Acquire) & (1u64 << bit) != 0
+        } else {
+            self.interest_high.load(Ordering::Acquire) & (1u64 << (bit - 64)) != 0
+        }
+    }
+}
+
+/// Removal token for one event-handler registration.
+///
+/// Dropping it removes the handler. A dispatch that already cloned the old
+/// snapshot may still complete once, while later dispatches cannot see it.
+#[must_use = "dropping the subscription immediately unregisters the event handler"]
+pub struct Subscription {
+    bus: std::sync::Weak<CoreEventBusInner>,
+    id: u64,
+    active: bool,
+}
+
+impl Subscription {
+    /// Replace this registration's filter without re-registering its handler.
+    /// Returns `false` if the bus no longer exists or the entry was removed.
+    pub fn update_interest(&self, interest: EventInterest) -> bool {
+        self.active
+            && self
+                .bus
+                .upgrade()
+                .is_some_and(|bus| bus.update_interest(self.id, interest))
+    }
+
+    /// Remove the handler now instead of waiting for `Drop`.
+    pub fn unsubscribe(mut self) -> bool {
+        let removed = self.remove();
+        self.active = false;
+        removed
+    }
+
+    /// Keep this registration for the remaining lifetime of the event bus.
+    pub fn detach(mut self) {
+        self.active = false;
+    }
+
+    fn remove(&self) -> bool {
+        self.bus.upgrade().is_some_and(|bus| bus.remove(self.id))
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if self.active {
+            self.remove();
+        }
+    }
 }
 
 #[derive(Default, Clone)]
 pub struct CoreEventBus {
-    // Copy-on-write: the snapshot is only swapped (under the lock) when a
-    // handler is added, which happens at startup. `dispatch` takes a cheap
-    // outer-Arc clone and then drops the lock, so a concurrent `add_handler`
-    // can never invalidate a snapshot a dispatch is iterating.
-    handlers: Arc<RwLock<Arc<HandlerSnapshot>>>,
+    inner: Arc<CoreEventBusInner>,
 }
 
 impl CoreEventBus {
@@ -388,22 +547,43 @@ impl CoreEventBus {
     }
 
     fn snapshot(&self) -> Arc<HandlerSnapshot> {
-        self.handlers
-            .read()
-            .expect("RwLock should not be poisoned")
-            .clone()
+        self.inner.snapshot()
     }
 
-    pub fn add_handler(&self, handler: Arc<dyn EventHandler>) {
+    /// Register `handler` with an explicit, stable filter.
+    pub fn subscribe(
+        &self,
+        interest: EventInterest,
+        handler: Arc<dyn EventHandler>,
+    ) -> Subscription {
         let mut guard = self
+            .inner
             .handlers
             .write()
-            .expect("RwLock should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = &**guard;
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut handlers = Vec::with_capacity(current.handlers.len() + 1);
         handlers.extend(current.handlers.iter().cloned());
-        handlers.push(handler);
+        handlers.push(HandlerEntry {
+            id,
+            interest,
+            handler,
+        });
+        // An early bit only takes the slow path against the previous snapshot.
+        self.inner.publish_interest(interest);
         *guard = Arc::new(HandlerSnapshot { handlers });
+        Subscription {
+            bus: Arc::downgrade(&self.inner),
+            id,
+            active: true,
+        }
+    }
+
+    /// Register using the handler's current [`EventHandler::interest`] hint.
+    pub fn subscribe_handler(&self, handler: Arc<dyn EventHandler>) -> Subscription {
+        let interest = handler.interest();
+        self.subscribe(interest, handler)
     }
 
     /// Returns true if there are any event handlers registered.
@@ -416,25 +596,19 @@ impl CoreEventBus {
     /// skip producing an event nobody would receive (e.g. retaining a large
     /// `HistorySync` blob when only message-only handlers are registered).
     pub fn has_handler_for(&self, kind: EventKind) -> bool {
-        self.snapshot()
-            .handlers
-            .iter()
-            .any(|h| h.interest().wants(kind))
+        self.inner.has_handler_for(kind)
     }
 
     pub fn dispatch(&self, event: Event) {
-        let snapshot = self.snapshot();
-        // Skip materializing the event (Arc) when no handler wants this kind. The
-        // interest is re-evaluated here (not read from a cached aggregate) so a
-        // handler whose interest() widens at runtime is never short-circuited out.
         let kind = event.kind();
-        if !snapshot.handlers.iter().any(|h| h.interest().wants(kind)) {
+        if !self.has_handler_for(kind) {
             return;
         }
+        let snapshot = self.snapshot();
         let event = Arc::new(event);
-        for handler in &snapshot.handlers {
-            if handler.interest().wants(kind) {
-                handler.handle_event(Arc::clone(&event));
+        for entry in &snapshot.handlers {
+            if entry.interest.wants(kind) {
+                entry.handler.handle_event(Arc::clone(&event));
             }
         }
     }
@@ -737,7 +911,7 @@ pub enum Event {
 
     /// Raw decoded stanza, emitted before router dispatch.
     /// Library extension — no WA Web equivalent (WA Web has no raw stanza observer).
-    /// Gated by `Client::set_raw_node_forwarding(true)` to avoid overhead when unused.
+    /// Gated by `Client::acquire_raw_node_forwarding()` to avoid overhead when unused.
     #[serde(skip)]
     RawNode(Arc<OwnedNodeRef>),
 
@@ -1954,8 +2128,8 @@ mod tests {
             kinds: Mutex::new(Vec::new()),
             interest: EventInterest::ALL,
         });
-        bus.add_handler(only_msg.clone());
-        bus.add_handler(all.clone());
+        let _only_msg = bus.subscribe_handler(only_msg.clone());
+        let _all = bus.subscribe_handler(all.clone());
 
         bus.dispatch(Event::Connected(Connected::builder().build()));
 
@@ -1976,53 +2150,48 @@ mod tests {
             }
         }
         let bus2 = CoreEventBus::new();
-        bus2.add_handler(Arc::new(Counter));
+        let _counter = bus2.subscribe_handler(Arc::new(Counter));
         bus2.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn dispatch_respects_dynamically_widened_interest() {
-        use std::sync::Mutex;
+    fn subscription_updates_interest_explicitly() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // A handler whose interest() widens after registration. dispatch must
-        // re-read interest each time (never a stale cached aggregate), so the
-        // newly-wanted kind is delivered.
         struct Dynamic {
-            interest: Mutex<EventInterest>,
             hits: AtomicUsize,
         }
         impl EventHandler for Dynamic {
             fn handle_event(&self, _: Arc<Event>) {
                 self.hits.fetch_add(1, Ordering::SeqCst);
             }
-            fn interest(&self) -> EventInterest {
-                *self.interest.lock().unwrap()
-            }
         }
 
         let bus = CoreEventBus::new();
         let h = Arc::new(Dynamic {
-            interest: Mutex::new(EventInterest::of(&[EventKind::Messages])),
             hits: AtomicUsize::new(0),
         });
-        bus.add_handler(h.clone());
+        let subscription = bus.subscribe(EventInterest::of(&[EventKind::Messages]), h.clone());
 
         // Not yet interested in Connected: dropped before materialization.
         bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(h.hits.load(Ordering::SeqCst), 0);
         assert!(!bus.has_handler_for(EventKind::Connected));
 
-        // Widen interest at runtime.
-        *h.interest.lock().unwrap() = EventInterest::ALL;
+        assert!(subscription.update_interest(EventInterest::ALL));
         assert!(bus.has_handler_for(EventKind::Connected));
         bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(
             h.hits.load(Ordering::SeqCst),
             1,
-            "a handler whose interest widened at runtime must receive the newly-wanted kind"
+            "the updated subscription must receive the newly-wanted kind"
         );
+
+        assert!(subscription.update_interest(EventInterest::none()));
+        assert!(!bus.has_handler_for(EventKind::Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
+        assert_eq!(h.hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2041,13 +2210,15 @@ mod tests {
         assert!(!bus.has_handler_for(EventKind::Messages));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
-        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Messages]))));
+        let _messages =
+            bus.subscribe_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Messages]))));
         assert!(bus.has_handlers());
         assert!(bus.has_handler_for(EventKind::Messages));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
         // has_handler_for is true once any registered handler wants the kind.
-        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
+        let _receipt =
+            bus.subscribe_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
         assert!(bus.has_handler_for(EventKind::Messages));
         assert!(bus.has_handler_for(EventKind::Receipt));
         assert!(!bus.has_handler_for(EventKind::Connected));
@@ -2069,11 +2240,12 @@ mod tests {
 
         let bus = CoreEventBus::new();
         let log = Arc::new(Mutex::new(Vec::new()));
+        let mut subscriptions = Vec::new();
         for id in 0..5u32 {
-            bus.add_handler(Arc::new(Tagged {
+            subscriptions.push(bus.subscribe_handler(Arc::new(Tagged {
                 id,
                 log: log.clone(),
-            }));
+            })));
         }
         bus.dispatch(Event::Connected(Connected::builder().build()));
         // Copy-on-write rebuilds must keep registration order intact.
@@ -2107,14 +2279,15 @@ mod tests {
                         }
                     }
                     self.bus
-                        .add_handler(Arc::new(Late(self.invocations.clone())));
+                        .subscribe_handler(Arc::new(Late(self.invocations.clone())))
+                        .detach();
                 }
             }
         }
 
         let bus = CoreEventBus::new();
         let invocations = Arc::new(AtomicUsize::new(0));
-        bus.add_handler(Arc::new(AddsDuringDispatch {
+        let _registration = bus.subscribe_handler(Arc::new(AddsDuringDispatch {
             bus: bus.clone(),
             invocations: invocations.clone(),
             added: Mutex::new(false),
@@ -2129,5 +2302,107 @@ mod tests {
         // Second dispatch sees both handlers (original adds nothing new now).
         bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(invocations.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn dropping_subscription_unregisters_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(Arc<AtomicUsize>);
+        impl EventHandler for Counter {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let subscription = bus.subscribe_handler(Arc::new(Counter(Arc::clone(&calls))));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(subscription);
+        assert!(!bus.has_handlers());
+        assert!(!bus.has_handler_for(EventKind::Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn handler_drop_can_unsubscribe_from_the_same_bus() {
+        use std::sync::Mutex;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct OwnsSubscription(Mutex<Option<Subscription>>);
+        impl EventHandler for OwnsSubscription {
+            fn handle_event(&self, _: Arc<Event>) {}
+        }
+        impl Drop for OwnsSubscription {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let owned = bus.subscribe_handler(ChannelEventHandler::new().0);
+        let owner = Arc::new(OwnsSubscription(Mutex::new(Some(owned))));
+        let outer = bus.subscribe_handler(owner.clone());
+        drop(owner);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(outer);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler drop re-entered event-bus removal");
+        assert!(!bus.has_handlers());
+    }
+
+    #[test]
+    fn in_flight_dispatch_can_finish_after_unsubscribe() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Blocking {
+            started: Arc<Barrier>,
+            release: Arc<Barrier>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl EventHandler for Blocking {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.wait();
+                self.release.wait();
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let subscription = bus.subscribe_handler(Arc::new(Blocking {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            calls: Arc::clone(&calls),
+        }));
+        let dispatch_bus = bus.clone();
+        let dispatch = std::thread::spawn(move || {
+            dispatch_bus.dispatch(Event::Connected(Connected::builder().build()));
+        });
+
+        started.wait();
+        drop(subscription);
+        release.wait();
+        dispatch.join().expect("dispatch thread");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        bus.dispatch(Event::Connected(Connected::builder().build()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

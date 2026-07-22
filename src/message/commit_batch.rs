@@ -915,7 +915,7 @@ mod tests {
         });
         let _ = client.inbound_durability_hook.set(hook.clone());
         let (handler, rx) = ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
 
         client.inbound_commit_batch.reset();
         for id in ["B1", "B2", "B3"] {
@@ -962,7 +962,7 @@ mod tests {
         });
         let _ = client.inbound_durability_hook.set(hook.clone());
         let (handler, rx) = ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
         client.commit_or_batch_inbound(item("L1"), false).await;
 
         assert_eq!(
@@ -1008,7 +1008,7 @@ mod tests {
         let client = create_test_client_with_failing_http("batch_no_hook").await;
         client.inbound_commit_batch.reset();
         let (handler, rx) = ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
 
         client.commit_or_batch_inbound(item("N1"), false).await;
         client.commit_or_batch_inbound(item("N2"), false).await;
@@ -1038,7 +1038,7 @@ mod tests {
         });
         let _ = client.inbound_durability_hook.set(hook.clone());
         let (handler, rx) = ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
 
         client.commit_or_batch_inbound(item("T1"), false).await;
         client.commit_or_batch_inbound(item("T2"), false).await;
@@ -1077,7 +1077,7 @@ mod tests {
         });
         let _ = client.inbound_durability_hook.set(hook.clone());
         let (handler, rx) = ChannelEventHandler::new();
-        client.core.event_bus.add_handler(handler);
+        client.core.event_bus.subscribe_handler(handler).detach();
 
         client.commit_or_batch_inbound(item("C1"), false).await;
         client.inbound_commit_batch.reset();

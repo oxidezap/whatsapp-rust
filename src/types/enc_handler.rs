@@ -151,7 +151,7 @@ mod tests {
             .await
             .expect("Failed to build bot");
 
-        // Verify no custom handlers are registered (the map is set, just empty)
-        assert_eq!(bot.client().custom_enc_handlers.get().unwrap().len(), 0);
+        // Keep the hot-path map unallocated when no extension uses it.
+        assert!(bot.client().custom_enc_handlers.get().is_none());
     }
 }
