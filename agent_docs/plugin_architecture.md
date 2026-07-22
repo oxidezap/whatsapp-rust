@@ -215,9 +215,10 @@ Core events remain the sealed `wacore::types::events::Event` contract.
 Subscriptions use explicit `EventInterest`; interest changes go through the
 retained `Subscription`, and the aggregate 128-bit mask provides the producer
 fast path. Plugin core handlers run inline, must not block, and should hand work
-to a task capability. `PluginCoreEvents` retains its subscriptions for the
-plugin lifetime; early removal is not part of the initial plugin API. Requesting
-`RawNode` retains a forwarding lease for the same lifetime.
+to a task capability. `PluginCoreEvents::subscribe` returns an owned token;
+dropping or explicitly unsubscribing it removes the handler immediately, while
+host shutdown invalidates tokens retained by plugin APIs. Updating its interest
+also acquires or releases the `RawNode` forwarding lease in the same operation.
 
 Custom events never enter the core enum or consume an `EventInterest` bit.
 `PluginEventRouter` routes exact `(plugin_id, topic)` selectors and gives each

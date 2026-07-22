@@ -314,7 +314,7 @@ struct PluginResources {
     shutdown: ShutdownNotifier,
     install_tasks: Arc<TaskTracker>,
     connection_tasks: Mutex<ConnectionTaskRegistry>,
-    subscriptions: Mutex<Vec<PluginCoreEventSubscription>>,
+    subscriptions: Mutex<Vec<Arc<PluginCoreEventSubscriptionInner>>>,
     teardown_panics: AtomicU64,
 }
 
@@ -413,9 +413,134 @@ impl Drop for TaskLease {
     }
 }
 
-struct PluginCoreEventSubscription {
-    _subscription: Subscription,
-    _raw_node_lease: Option<RawNodeLease>,
+struct PluginCoreEventSubscriptionState {
+    subscription: Option<Subscription>,
+    raw_node_lease: Option<RawNodeLease>,
+    interest: EventInterest,
+}
+
+struct PluginCoreEventSubscriptionInner {
+    client: Weak<Client>,
+    resources: Weak<PluginResources>,
+    plugin_id: Arc<str>,
+    state: Mutex<PluginCoreEventSubscriptionState>,
+}
+
+impl PluginCoreEventSubscriptionInner {
+    fn is_active(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .subscription
+            .is_some()
+    }
+
+    fn update_interest(&self, interest: EventInterest) -> Result<bool, PluginResourceError> {
+        let resources = self
+            .resources
+            .upgrade()
+            .ok_or(PluginResourceError::ShuttingDown)?;
+        if resources.closed.load(Ordering::Acquire) {
+            return Err(PluginResourceError::ShuttingDown);
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let wants_raw_node = interest.wants(EventKind::RawNode);
+        let acquired_raw_node_lease = if wants_raw_node && state.raw_node_lease.is_none() {
+            Some(
+                self.client
+                    .upgrade()
+                    .ok_or(PluginResourceError::ClientUnavailable)?
+                    .acquire_raw_node_forwarding(),
+            )
+        } else {
+            None
+        };
+        let Some(subscription) = state.subscription.as_ref() else {
+            return Ok(false);
+        };
+        if !subscription.update_interest(interest) {
+            let registration = (state.subscription.take(), state.raw_node_lease.take());
+            drop(state);
+            drop(acquired_raw_node_lease);
+            drop(registration);
+            return Ok(false);
+        }
+
+        state.interest = interest;
+        if let Some(lease) = acquired_raw_node_lease {
+            state.raw_node_lease = Some(lease);
+        }
+        let retired_raw_node_lease = (!wants_raw_node)
+            .then(|| state.raw_node_lease.take())
+            .flatten();
+        drop(state);
+        drop(retired_raw_node_lease);
+        Ok(true)
+    }
+
+    fn close(&self) -> bool {
+        let registration = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.subscription.take(), state.raw_node_lease.take())
+        };
+        let active = registration.0.is_some();
+        if std::panic::catch_unwind(AssertUnwindSafe(|| drop(registration))).is_err() {
+            if let Some(resources) = self.resources.upgrade() {
+                resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            log::warn!(
+                "Plugin `{}` core-event subscription panicked while closing",
+                self.plugin_id
+            );
+        }
+        active
+    }
+}
+
+/// Ownership token for one plugin core-event subscription.
+///
+/// Dropping the token unsubscribes immediately. Host shutdown also invalidates
+/// a retained token, so keeping it in a plugin API cannot extend client work.
+#[must_use = "dropping the token immediately unregisters the plugin event handler"]
+pub struct PluginCoreEventSubscription {
+    inner: Arc<PluginCoreEventSubscriptionInner>,
+}
+
+impl PluginCoreEventSubscription {
+    pub fn interest(&self) -> EventInterest {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .interest
+    }
+
+    /// Replace the filter while preserving the handler registration.
+    pub fn update_interest(&self, interest: EventInterest) -> Result<bool, PluginResourceError> {
+        self.inner.update_interest(interest)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    /// Remove the handler now instead of waiting for `Drop`.
+    pub fn unsubscribe(&self) -> bool {
+        self.inner.close()
+    }
+}
+
+impl Drop for PluginCoreEventSubscription {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
 }
 
 impl PluginResources {
@@ -463,30 +588,43 @@ impl PluginResources {
 
     fn retain_subscription(
         &self,
+        client: Weak<Client>,
+        resources: Weak<PluginResources>,
+        plugin_id: Arc<str>,
+        interest: EventInterest,
         subscription: Subscription,
         raw_node_lease: Option<RawNodeLease>,
-    ) -> Result<(), PluginResourceError> {
-        let registration = PluginCoreEventSubscription {
-            _subscription: subscription,
-            _raw_node_lease: raw_node_lease,
-        };
+    ) -> Result<PluginCoreEventSubscription, PluginResourceError> {
+        let registration = Arc::new(PluginCoreEventSubscriptionInner {
+            client,
+            resources,
+            plugin_id,
+            state: Mutex::new(PluginCoreEventSubscriptionState {
+                subscription: Some(subscription),
+                raw_node_lease,
+                interest,
+            }),
+        });
         let rejected = {
             let mut subscriptions = self
                 .subscriptions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.closed.load(Ordering::Acquire) {
-                Some(registration)
+                true
             } else {
-                subscriptions.push(registration);
-                None
+                subscriptions.retain(|subscription| subscription.is_active());
+                subscriptions.push(Arc::clone(&registration));
+                false
             }
         };
-        if let Some(rejected) = rejected {
-            drop(rejected);
+        if rejected {
+            registration.close();
             Err(PluginResourceError::ShuttingDown)
         } else {
-            Ok(())
+            Ok(PluginCoreEventSubscription {
+                inner: registration,
+            })
         }
     }
 
@@ -594,10 +732,7 @@ impl PluginResources {
             std::mem::take(&mut *subscriptions)
         };
         for subscription in subscriptions {
-            if std::panic::catch_unwind(AssertUnwindSafe(|| drop(subscription))).is_err() {
-                self.teardown_panics.fetch_add(1, Ordering::Relaxed);
-                log::warn!("Plugin core-event subscription panicked while being dropped");
-            }
+            subscription.close();
         }
     }
 }
@@ -634,7 +769,9 @@ impl PluginResources {
                 .subscriptions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
+                .iter()
+                .filter(|subscription| subscription.is_active())
+                .count(),
             teardown_panics: self.teardown_panics.load(Ordering::Relaxed),
         }
     }
@@ -888,7 +1025,7 @@ impl PluginCoreEvents {
         &self,
         interest: EventInterest,
         handler: Arc<dyn EventHandler>,
-    ) -> Result<(), PluginResourceError> {
+    ) -> Result<PluginCoreEventSubscription, PluginResourceError> {
         let client = self
             .client
             .upgrade()
@@ -903,8 +1040,14 @@ impl PluginCoreEvents {
             diagnostics: Arc::clone(&self.diagnostics),
         });
         let subscription = client.subscribe(interest, handler);
-        self.resources
-            .retain_subscription(subscription, raw_node_lease)
+        self.resources.retain_subscription(
+            self.client.clone(),
+            Arc::downgrade(&self.resources),
+            Arc::clone(&self.plugin_id),
+            interest,
+            subscription,
+            raw_node_lease,
+        )
     }
 }
 
@@ -4317,7 +4460,7 @@ mod tests {
     struct PanickingCoreEventPlugin;
 
     impl ClientPlugin for PanickingCoreEventPlugin {
-        type Api = ();
+        type Api = PluginCoreEventSubscription;
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("panicking-core-event", "0.1.0")
@@ -4326,14 +4469,14 @@ mod tests {
 
         fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
             Box::pin(async move {
-                context
+                let subscription = context
                     .core_events()
                     .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
                     .subscribe(
                         EventInterest::of(&[EventKind::Connected]),
                         Arc::new(PanickingCoreEventHandler),
                     )?;
-                Ok(Arc::new(()))
+                Ok(Arc::new(subscription))
             })
         }
     }
@@ -4341,7 +4484,7 @@ mod tests {
     struct PanickingSubscriptionPlugin;
 
     impl ClientPlugin for PanickingSubscriptionPlugin {
-        type Api = ();
+        type Api = PluginCoreEventSubscription;
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("panicking-subscription", "0.1.0")
@@ -4350,14 +4493,14 @@ mod tests {
 
         fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
             Box::pin(async move {
-                context
+                let subscription = context
                     .core_events()
                     .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
                     .subscribe(
                         EventInterest::of(&[EventKind::Connected]),
                         Arc::new(PanickingDropEventHandler),
                     )?;
-                Ok(Arc::new(()))
+                Ok(Arc::new(subscription))
             })
         }
     }
@@ -4391,7 +4534,7 @@ mod tests {
     }
 
     impl ClientPlugin for EventSubscriptionPlugin {
-        type Api = ();
+        type Api = PluginCoreEventSubscription;
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("event-subscription", "0.1.0")
@@ -4400,14 +4543,14 @@ mod tests {
 
         fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
             Box::pin(async move {
-                context
+                let subscription = context
                     .core_events()
                     .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?
                     .subscribe(
                         EventInterest::of(&[EventKind::Connected, EventKind::RawNode]),
                         Arc::new(NoopEventHandler),
                     )?;
-                Ok(Arc::new(()))
+                Ok(Arc::new(subscription))
             })
         }
     }
@@ -4431,8 +4574,13 @@ mod tests {
 
     struct ReentrantSubscriptionPlugin;
 
+    struct ReentrantSubscriptionApi {
+        events: PluginCoreEvents,
+        _subscription: PluginCoreEventSubscription,
+    }
+
     impl ClientPlugin for ReentrantSubscriptionPlugin {
-        type Api = PluginCoreEvents;
+        type Api = ReentrantSubscriptionApi;
 
         fn manifest(&self) -> PluginManifest {
             PluginManifest::new("reentrant-subscription", "0.1.0")
@@ -4445,13 +4593,16 @@ mod tests {
                     .core_events()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("core events capability missing"))?;
-                events.subscribe(
+                let subscription = events.subscribe(
                     EventInterest::of(&[EventKind::Connected]),
                     Arc::new(ReentrantSubscriptionHandler {
                         events: events.clone(),
                     }),
                 )?;
-                Ok(Arc::new(events))
+                Ok(Arc::new(ReentrantSubscriptionApi {
+                    events,
+                    _subscription: subscription,
+                }))
             })
         }
     }
@@ -4481,6 +4632,56 @@ mod tests {
                 .has_handler_for(wacore::types::events::EventKind::Connected)
         );
         assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    #[tokio::test]
+    async fn plugin_subscription_updates_interest_and_can_unsubscribe_early() {
+        let client = complete_builder()
+            .await
+            .with_plugin(EventSubscriptionPlugin)
+            .build()
+            .await
+            .expect("event subscription plugin")
+            .into_client();
+        let subscription = client
+            .plugin::<EventSubscriptionPlugin>()
+            .expect("subscription API");
+
+        assert!(subscription.is_active());
+        assert!(subscription.interest().wants(EventKind::RawNode));
+        assert!(client.raw_node_forwarding_enabled());
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::Connected]))
+                .expect("interest update")
+        );
+        assert!(!client.raw_node_forwarding_enabled());
+        assert!(!subscription.interest().wants(EventKind::RawNode));
+        assert!(client.core.event_bus.has_handler_for(EventKind::Connected));
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::RawNode]))
+                .expect("raw-node interest update")
+        );
+        assert!(client.raw_node_forwarding_enabled());
+        assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
+
+        assert!(subscription.unsubscribe());
+        assert!(!subscription.is_active());
+        assert!(!subscription.unsubscribe());
+        assert!(!client.raw_node_forwarding_enabled());
+        assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
+        assert_eq!(
+            client
+                .plugin_stats()
+                .expect("plugin stats")
+                .plugins
+                .first()
+                .expect("plugin stats entry")
+                .core_event_subscriptions,
+            0
+        );
+        client.disconnect().await;
     }
 
     #[tokio::test]
@@ -4615,10 +4816,10 @@ mod tests {
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         let subscribe_events = events.clone();
         let subscribe = std::thread::spawn(move || {
-            let result = subscribe_events.subscribe(
+            let result = subscribe_events.events.subscribe(
                 EventInterest::of(&[EventKind::Connected]),
                 Arc::new(ReentrantSubscriptionHandler {
-                    events: (*subscribe_events).clone(),
+                    events: subscribe_events.events.clone(),
                 }),
             );
             let _ = completed_tx.send(result);

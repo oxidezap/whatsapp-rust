@@ -27,8 +27,9 @@ use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use whatsapp_rust::wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 use whatsapp_rust::{
-    ClientPlugin, PluginCapability, PluginConnectionScope, PluginEventPayloadEncoding,
-    PluginEventSelector, PluginEventTopic, PluginEvents, PluginFuture, PluginManifest, PluginTasks,
+    ClientPlugin, PluginCapability, PluginConnectionScope, PluginCoreEventSubscription,
+    PluginEventPayloadEncoding, PluginEventSelector, PluginEventTopic, PluginEvents, PluginFuture,
+    PluginManifest, PluginTasks,
 };
 
 pub const METRICS_PLUGIN_ID: &str = "wa.metrics";
@@ -159,6 +160,7 @@ impl EventHandler for MetricsEventHandler {
 pub struct MetricsApi {
     state: Arc<MetricsState>,
     tick_selector: PluginEventSelector,
+    _core_events: PluginCoreEventSubscription,
 }
 
 impl MetricsApi {
@@ -233,7 +235,7 @@ impl ClientPlugin for MetricsPlugin {
                 .set(state.clone())
                 .map_err(|_| anyhow::anyhow!("metrics plugin was installed more than once"))?;
 
-            core_events.subscribe(
+            let core_events = core_events.subscribe(
                 EventInterest::of(&[
                     EventKind::Messages,
                     EventKind::Receipt,
@@ -246,6 +248,7 @@ impl ClientPlugin for MetricsPlugin {
             let api = Arc::new(MetricsApi {
                 state: state.clone(),
                 tick_selector: plugin_events.selector(&tick),
+                _core_events: core_events,
             });
             spawn_install_ticker(tasks, plugin_events, tick, state, self.interval)?;
             Ok(api)

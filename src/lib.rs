@@ -119,15 +119,15 @@ pub mod plugins;
 #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
 pub use plugins::{
     ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
-    PluginConnectionTasks, PluginContext, PluginCoreEvents, PluginEventEndpointConfig,
-    PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow, PluginEventPayloadEncoding,
-    PluginEventPublishError, PluginEventPublishReport, PluginEventPublisherStats,
-    PluginEventReceiveError, PluginEventRouteError, PluginEventRouter, PluginEventRouterStats,
-    PluginEventSelector, PluginEventSubscribeError, PluginEventSubscription, PluginEventTopic,
-    PluginEventTryReceiveError, PluginEvents, PluginFuture, PluginHealth, PluginHostStats,
-    PluginIq, PluginIqError, PluginManifest, PluginMessaging, PluginMessagingError,
-    PluginPlanError, PluginResourceError, PluginState, PluginStats, PluginTasks,
-    UntypedClientPlugin,
+    PluginConnectionTasks, PluginContext, PluginCoreEventSubscription, PluginCoreEvents,
+    PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
+    PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,
+    PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
+    PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
+    PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
+    PluginFuture, PluginHealth, PluginHostStats, PluginIq, PluginIqError, PluginManifest,
+    PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError, PluginState,
+    PluginStats, PluginTasks, UntypedClientPlugin,
 };
 pub mod request;
 pub(crate) mod signal_flush;
@@ -206,9 +206,10 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub use crate::plugins::{
         ClientPlugin, PluginCapability, PluginConnectionScope, PluginContext,
-        PluginEventEndpointConfig, PluginEventOverflow, PluginEventPayloadEncoding,
-        PluginEventRouter, PluginEventSelector, PluginEventSubscription, PluginEventTopic,
-        PluginEvents, PluginFuture, PluginManifest, UntypedClientPlugin,
+        PluginCoreEventSubscription, PluginEventEndpointConfig, PluginEventOverflow,
+        PluginEventPayloadEncoding, PluginEventRouter, PluginEventSelector,
+        PluginEventSubscription, PluginEventTopic, PluginEvents, PluginFuture, PluginManifest,
+        UntypedClientPlugin,
     };
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]
