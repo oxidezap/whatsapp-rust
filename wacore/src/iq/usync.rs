@@ -286,6 +286,16 @@ fn project_business(
 
 pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapping> {
     let user_jid = user.id.as_ref()?;
+    if user_jid.server.is_lid_family() {
+        let pn_jid = user
+            .pn_jid
+            .as_ref()
+            .filter(|jid| jid.server.is_pn_family())?;
+        return Some(UsyncLidMapping {
+            phone_number: pn_jid.user.clone(),
+            lid: user_jid.user.clone(),
+        });
+    }
     if !user_jid.server.is_pn_family() {
         return None;
     }
@@ -297,6 +307,28 @@ pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapp
     Some(UsyncLidMapping {
         phone_number: user_jid.user.clone(),
         lid: lid.user.clone(),
+    })
+}
+
+#[inline]
+fn device_list_identity_matches(
+    returned: &Jid,
+    expected: &Jid,
+    mappings: &[UsyncLidMapping],
+) -> bool {
+    if returned.user == expected.user && returned.server == expected.server {
+        return true;
+    }
+
+    mappings.iter().any(|mapping| {
+        (returned.server.is_lid_family()
+            && expected.server.is_pn_family()
+            && returned.user == mapping.lid
+            && expected.user == mapping.phone_number)
+            || (returned.server.is_pn_family()
+                && expected.server.is_lid_family()
+                && returned.user == mapping.phone_number
+                && expected.user == mapping.lid)
     })
 }
 
@@ -742,7 +774,7 @@ impl IqSpec for CompleteDeviceListSpec {
         let parsed = self.0.parse_response(response)?;
         for expected in &self.0.jids {
             let Some(returned) = parsed.device_lists.iter().find(|returned| {
-                returned.user.user == expected.user && returned.user.server == expected.server
+                device_list_identity_matches(&returned.user, expected, &parsed.lid_mappings)
             }) else {
                 anyhow::bail!("device-list response omitted user {expected}");
             };
@@ -1677,7 +1709,46 @@ mod tests {
             let mapping = project_lid_mapping(&user).expect("expected LID mapping");
             assert_eq!(mapping.phone_number, "13135550100");
             assert_eq!(mapping.lid, "100000000000100");
+
+            let canonicalized = UsyncUserResult {
+                id: Some(Jid::new("100000000000100", lid_server)),
+                pn_jid: Some(Jid::new("13135550100", pn_server)),
+                protocols: Vec::new(),
+            };
+            let mapping = project_lid_mapping(&canonicalized).expect("expected pn_jid mapping");
+            assert_eq!(mapping.phone_number, "13135550100");
+            assert_eq!(mapping.lid, "100000000000100");
         }
+    }
+
+    #[test]
+    fn complete_device_list_accepts_server_canonicalized_lid() {
+        let requested = Jid::pn("12025550100");
+        let spec =
+            DeviceListSpec::new(vec![requested], "sid-canonicalized").require_complete_response();
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "100000000000100@lid")
+                        .attr("pn_jid", "12025550100@s.whatsapp.net")
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let parsed = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(parsed.device_lists[0].user, Jid::lid("100000000000100"));
+        assert_eq!(parsed.lid_mappings.len(), 1);
+        assert_eq!(parsed.lid_mappings[0].phone_number, "12025550100");
+        assert_eq!(parsed.lid_mappings[0].lid, "100000000000100");
     }
 
     #[test]

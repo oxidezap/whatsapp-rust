@@ -8,6 +8,23 @@ use log::{debug, warn};
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::Jid;
 
+/// An authoritative refresh retries when a newer registry mutation wins while
+/// its IQ is in flight. Bound retries so a continuously changing account never
+/// turns one send into an unbounded request loop.
+const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
+
+#[inline]
+fn device_response_contains_user(response: &DeviceListResponse, user: &str) -> bool {
+    response
+        .device_lists
+        .iter()
+        .any(|device_list| device_list.user.user == user)
+        || response
+            .lid_mappings
+            .iter()
+            .any(|mapping| mapping.phone_number == user || mapping.lid == user)
+}
+
 pub use wacore::iq::usync::{
     UsyncAddressingMode, UsyncBotCommand, UsyncBotProfessionalType, UsyncBotProfileResult,
     UsyncBotPrompt, UsyncBusinessResult, UsyncContactResult, UsyncContext, UsyncDeviceListResult,
@@ -104,24 +121,104 @@ impl Client {
 
     async fn fetch_user_devices_with_freshness(
         &self,
-        jids: Vec<Jid>,
+        mut jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
-        let sid = self.generate_request_id();
-        let response = match freshness {
-            crate::cache::Freshness::CachePreferred => {
-                self.execute(DeviceListSpec::new(jids, sid)).await?
+        if freshness == crate::cache::Freshness::CachePreferred {
+            let sid = self.generate_request_id();
+            let response = self.execute(DeviceListSpec::new(jids, sid)).await?;
+            return self
+                .process_device_list_response(&response, freshness)
+                .await;
+        }
+
+        for attempt in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+            let topology_generation = self.device_topology.current();
+            let sid = self.generate_request_id();
+            let response = self
+                .execute(DeviceListSpec::new(jids, sid).require_complete_response())
+                .await?;
+            self.learn_device_list_mappings(&response).await;
+
+            if let Some(devices) = self
+                .try_process_refreshed_device_list_response(
+                    &response,
+                    freshness,
+                    topology_generation,
+                )
+                .await?
+            {
+                return Ok(devices);
             }
-            crate::cache::Freshness::Refresh => {
-                self.execute(DeviceListSpec::new(jids, sid).require_complete_response())
-                    .await?
+
+            if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
+                anyhow::bail!(
+                    "device registry kept changing while an authoritative refresh was in flight"
+                );
             }
-        };
-        self.process_device_list_response(&response, freshness)
-            .await
+
+            // The complete response contains every requested identity. Move its
+            // canonical JIDs into the next attempt only on this rare race path;
+            // the ordinary refresh performs no duplicate query-vector clone.
+            jids = response
+                .device_lists
+                .into_iter()
+                .map(|user| user.user)
+                .collect();
+        }
+
+        unreachable!("bounded device refresh loop always returns")
+    }
+
+    async fn learn_device_list_mappings(&self, response: &DeviceListResponse) {
+        // Learn LID↔PN mappings via the same batched, guarded learner query_info
+        // uses (one detached transaction, skipping already-durable pairs), so
+        // per-mapping DB writes stay off the send's critical path. Falls back to
+        // the per-mapping path if the owning Arc<Client> isn't available.
+        //
+        // Ordering: the old per-mapping path AWAITED migrate_signal_sessions_on_lid_discovery.
+        // Detaching it can let a standalone usync (sync_own_device_list /
+        // flush_pending_device_sync) that is the FIRST learner of a LID for a
+        // contact with prior PN Signal state encrypt before the PN-wins migration
+        // runs — but the per-address session_lock_for both take is the real
+        // barrier (they can't interleave). The group-send path is unchanged:
+        // query_info already learns these same pairs detached upstream.
+        if response.lid_mappings.is_empty() {
+            return;
+        }
+        if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+            let mappings: Vec<(String, String)> = response
+                .lid_mappings
+                .iter()
+                .map(|m| (m.lid.to_string(), m.phone_number.to_string()))
+                .collect();
+            client
+                .learn_lid_pn_mappings_batch(
+                    mappings,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                    false,
+                )
+                .await;
+        } else {
+            for mapping in &response.lid_mappings {
+                if let Err(err) = self
+                    .add_lid_pn_mapping(
+                        &mapping.lid,
+                        &mapping.phone_number,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to persist LID {} -> {} from usync: {err}",
+                        mapping.lid, mapping.phone_number,
+                    );
+                }
+            }
+        }
     }
 
     /// Apply a usync device-list response to the registry: persist LID mappings,
@@ -138,51 +235,38 @@ impl Client {
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
-        // Learn LID↔PN mappings via the same batched, guarded learner query_info
-        // uses (one detached transaction, skipping already-durable pairs), so
-        // per-mapping DB writes stay off the send's critical path. Falls back to
-        // the per-mapping path if the owning Arc<Client> isn't available.
-        //
-        // Ordering: the old per-mapping path AWAITED migrate_signal_sessions_on_lid_discovery.
-        // Detaching it can let a standalone usync (sync_own_device_list /
-        // flush_pending_device_sync) that is the FIRST learner of a LID for a
-        // contact with prior PN Signal state encrypt before the PN-wins migration
-        // runs — but the per-address session_lock_for both take is the real
-        // barrier (they can't interleave). The group-send path is unchanged:
-        // query_info already learns these same pairs detached upstream.
-        if !response.lid_mappings.is_empty() {
-            if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                let mappings: Vec<(String, String)> = response
-                    .lid_mappings
-                    .iter()
-                    .map(|m| (m.lid.to_string(), m.phone_number.to_string()))
-                    .collect();
-                client
-                    .learn_lid_pn_mappings_batch(
-                        mappings,
-                        crate::lid_pn_cache::LearningSource::Usync,
-                        false,
-                    )
-                    .await;
-            } else {
-                for mapping in &response.lid_mappings {
-                    if let Err(err) = self
-                        .add_lid_pn_mapping(
-                            &mapping.lid,
-                            &mapping.phone_number,
-                            crate::lid_pn_cache::LearningSource::Usync,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Failed to persist LID {} -> {} from usync: {err}",
-                            mapping.lid, mapping.phone_number,
-                        );
-                    }
-                }
-            }
-        }
+        self.learn_device_list_mappings(response).await;
+        let guard = self.device_topology.lock_registry().await;
+        self.process_device_list_response_guarded(response, freshness, &guard)
+            .await
+    }
 
+    async fn try_process_refreshed_device_list_response(
+        &self,
+        response: &DeviceListResponse,
+        freshness: crate::cache::Freshness,
+        topology_generation: u64,
+    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+        let guard = self.device_topology.lock_registry().await;
+        if !self
+            .device_topology
+            .registry_unchanged_for(topology_generation, |user| {
+                device_response_contains_user(response, user)
+            })
+        {
+            return Ok(None);
+        }
+        self.process_device_list_response_guarded(response, freshness, &guard)
+            .await
+            .map(Some)
+    }
+
+    async fn process_device_list_response_guarded(
+        &self,
+        response: &DeviceListResponse,
+        freshness: crate::cache::Freshness,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
         let mut fetched_devices = Vec::with_capacity(response.device_lists.len());
         let mut device_records: Vec<wacore::store::traits::DeviceListRecord> =
             Vec::with_capacity(response.device_lists.len());
@@ -323,14 +407,18 @@ impl Client {
             )
             .await;
             if reset.invalidate_registry {
-                self.invalidate_device_cache(&reset.user.user).await;
+                self.invalidate_device_cache_guarded(&reset.user.user, guard)
+                    .await;
             }
         }
 
         // One batched backend write for the whole usync response — for
         // large groups this collapses N spawn_blocking SQLite hops into
         // a single transaction, which dominated the per-send wall-clock.
-        if let Err(e) = self.update_device_lists(device_records).await {
+        if let Err(e) = self
+            .update_device_lists_guarded(device_records, guard)
+            .await
+        {
             warn!("Failed to update device registry batch: {e}");
         }
 
@@ -574,7 +662,10 @@ mod tests {
         client.update_device_list(record).await.unwrap();
 
         // Evict from registry cache to force DB path
-        client.device_registry_cache.invalidate("9876543210").await;
+        client
+            .device_registry_cache
+            .raw_invalidate_for_tests("9876543210")
+            .await;
         client.device_registry_cache.run_pending_tasks().await;
 
         // Should still resolve from DB
@@ -723,6 +814,101 @@ mod tests {
                 .iter()
                 .any(|jid| jid.device == 7 && jid.server == wacore_binary::Server::Hosted)
         );
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_does_not_overwrite_a_newer_device_notification() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550102");
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.to_string(),
+                devices: vec![DeviceInfo::new(0, None)],
+                timestamp: wacore::time::now_secs(),
+                phash: Some("1:before".to_string()),
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        let refresh_started_at = client.device_topology.current();
+        let stale_response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: Some("1:stale".to_string()),
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+
+        client
+            .patch_device_add(
+                &user.user,
+                &wacore::stanza::devices::DeviceElement {
+                    jid: user.with_device(7),
+                    key_index: None,
+                    lid: None,
+                },
+                None,
+            )
+            .await;
+
+        let published = client
+            .try_process_refreshed_device_list_response(
+                &stale_response,
+                Freshness::Refresh,
+                refresh_started_at,
+            )
+            .await
+            .unwrap();
+        assert!(published.is_none(), "the stale response must be retried");
+
+        let retained = client
+            .get_devices_from_registry(&user)
+            .await
+            .expect("notification snapshot must remain available");
+        assert!(retained.iter().any(|device| device.device == 7));
+    }
+
+    #[tokio::test]
+    async fn unrelated_registry_change_does_not_restart_a_refresh() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let refreshed = Jid::pn("12025550104");
+        let refresh_started_at = client.device_topology.current();
+        client
+            .update_device_list(DeviceListRecord {
+                user: "12025550105".to_string(),
+                devices: vec![DeviceInfo::new(0, None)],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: refreshed,
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+        let published = client
+            .try_process_refreshed_device_list_response(
+                &response,
+                Freshness::Refresh,
+                refresh_started_at,
+            )
+            .await
+            .unwrap();
+        assert!(published.is_some());
     }
 
     /// A usync that returns an empty device list for a user is transient or

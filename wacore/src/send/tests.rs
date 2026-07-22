@@ -1431,6 +1431,7 @@ mod group_retry {
                 retry_count: 1,
                 account: Some(&account),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1499,6 +1500,7 @@ mod group_retry {
                 retry_count: 1,
                 account: None,
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await;
@@ -1548,6 +1550,7 @@ mod group_retry {
                 retry_count: 1,
                 account: Some(&account),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1598,6 +1601,7 @@ mod group_retry {
                 retry_count: 1,
                 account: Some(&account),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1659,6 +1663,7 @@ mod group_retry {
                 retry_count: 2,
                 account: Some(&acc),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1697,6 +1702,7 @@ mod group_retry {
                 retry_count: 2,
                 account: Some(&acc),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1741,6 +1747,7 @@ mod group_retry {
                 retry_count: 3,
                 account: Some(&wa::ADVSignedDeviceIdentity::default()),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1777,6 +1784,7 @@ mod group_retry {
                 retry_count: 1,
                 account: Some(&account),
                 edit: Some(crate::types::message::EditAttribute::AdminRevoke),
+                pre_encoded: None,
             },
         )
         .await
@@ -1803,6 +1811,7 @@ mod group_retry {
                 retry_count: 1,
                 account: Some(&account),
                 edit: Some(crate::types::message::EditAttribute::MessageEdit),
+                pre_encoded: None,
             },
         )
         .await
@@ -1840,6 +1849,7 @@ mod group_retry {
                 retry_count: 2,
                 account: Some(&account),
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await
@@ -1903,6 +1913,7 @@ mod group_retry {
                     retry_count,
                     account: Some(&pkmsg_account_proto()),
                     edit: None,
+                    pre_encoded: None,
                 },
             )
             .await;
@@ -1992,6 +2003,7 @@ mod group_retry {
                     retry_count: 1,
                     account: Some(&pkmsg_account_proto()),
                     edit: None,
+                    pre_encoded: None,
                 },
             )
             .await;
@@ -2017,6 +2029,8 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
+        let message = wa::Message::default();
+        let encoded = waproto::codec::message_to_vec(&message);
         let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
@@ -2027,11 +2041,12 @@ mod group_retry {
                     addressing_mode: Some(AddressingMode::Lid),
                 },
                 encryption_jid: p,
-                message: &wa::Message::default(),
+                message: &message,
                 message_id: "plain-1".into(),
                 retry_count: 1,
                 account: Some(&account),
                 edit: None,
+                pre_encoded: Some(&encoded),
             },
         )
         .await
@@ -2277,6 +2292,7 @@ mod group_retry {
                 retry_count: 1,
                 account: None,
                 edit: None,
+                pre_encoded: None,
             },
         )
         .await;

@@ -347,6 +347,10 @@ pub struct PairwiseRetryRequest<'a> {
     pub retry_count: u8,
     pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
     pub edit: Option<crate::types::message::EditAttribute>,
+    /// Canonical, unpadded protobuf bytes for `message`, when the caller already
+    /// encoded it for persistence or another stanza. Reusing them avoids a
+    /// second tree walk and allocation before padding.
+    pub pre_encoded: Option<&'a [u8]>,
 }
 
 #[inline]
@@ -427,6 +431,7 @@ where
         retry_count,
         account,
         edit,
+        pre_encoded,
     } = request;
     if message_id.is_empty() {
         bail!("retry message ID must not be empty");
@@ -439,7 +444,10 @@ where
     }
     validate_pairwise_retry_route(&destination, &encryption_jid)?;
 
-    let plaintext = MessageUtils::encode_and_pad(message);
+    let plaintext = match pre_encoded {
+        Some(content) => MessageUtils::pad_with_context_from_encoded(content, None),
+        None => MessageUtils::encode_and_pad(message),
+    };
     let signal_address = encryption_jid.to_protocol_address();
 
     if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {

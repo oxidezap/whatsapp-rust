@@ -409,7 +409,16 @@ impl Client {
     )]
     pub(crate) async fn update_device_list(
         &self,
+        record: wacore::store::traits::DeviceListRecord,
+    ) -> Result<()> {
+        let guard = self.device_topology.lock_registry().await;
+        self.update_device_list_guarded(record, &guard).await
+    }
+
+    pub(crate) async fn update_device_list_guarded(
+        &self,
         mut record: wacore::store::traits::DeviceListRecord,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
     ) -> Result<()> {
         use anyhow::Context;
 
@@ -427,6 +436,7 @@ impl Client {
         // (whose member set only knows the PN side) would re-stamp stale.
         self.device_registry_cache
             .insert(
+                guard,
                 canonical_key.clone(),
                 Arc::new(record_for_cache),
                 lookup
@@ -447,14 +457,18 @@ impl Client {
             // gets cleared. Run the second invalidate unconditionally: even
             // if delete fails, the cache may have been repopulated with data
             // that no longer reflects our intent.
-            self.device_registry_cache.invalidate(&original_user).await;
+            self.device_registry_cache
+                .invalidate(guard, &original_user)
+                .await;
             if let Err(e) = backend.delete_devices(&original_user).await {
                 warn!(
                     "Failed to delete stale device row under {} after canonical flip: {e}",
                     original_user
                 );
             }
-            self.device_registry_cache.invalidate(&original_user).await;
+            self.device_registry_cache
+                .invalidate(guard, &original_user)
+                .await;
             debug!(
                 "Device registry: stored under LID {} (resolved from {})",
                 canonical_key, original_user
@@ -469,10 +483,20 @@ impl Client {
     /// collapses into a single transaction. Used by usync after fetching
     /// device lists for many users at once, where the per-row commit
     /// dominated wall-clock time on large groups.
+    #[cfg(test)]
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.update_device_lists", level = "debug", skip_all, fields(count = records.len()), err(Debug)))]
     pub(crate) async fn update_device_lists(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
+    ) -> Result<()> {
+        let guard = self.device_topology.lock_registry().await;
+        self.update_device_lists_guarded(records, &guard).await
+    }
+
+    pub(crate) async fn update_device_lists_guarded(
+        &self,
+        records: Vec<wacore::store::traits::DeviceListRecord>,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
     ) -> Result<()> {
         use anyhow::Context;
 
@@ -493,6 +517,7 @@ impl Client {
             // Same alias rule as update_device_list: record every lookup key.
             self.device_registry_cache
                 .insert(
+                    guard,
                     canonical_key.clone(),
                     Arc::new(record_for_cache),
                     lookup
@@ -518,14 +543,18 @@ impl Client {
         // rather than batching deletes. On error we log and continue so a
         // single bad row doesn't drop the rest of the batch.
         for original_user in to_delete {
-            self.device_registry_cache.invalidate(&original_user).await;
+            self.device_registry_cache
+                .invalidate(guard, &original_user)
+                .await;
             if let Err(e) = backend.delete_devices(&original_user).await {
                 warn!(
                     "Failed to delete stale device row under {} after canonical flip: {e}",
                     original_user
                 );
             }
-            self.device_registry_cache.invalidate(&original_user).await;
+            self.device_registry_cache
+                .invalidate(guard, &original_user)
+                .await;
         }
 
         Ok(())
@@ -567,10 +596,19 @@ impl Client {
         )
     )]
     pub(crate) async fn invalidate_device_cache(&self, user: &str) {
+        let guard = self.device_topology.lock_registry().await;
+        self.invalidate_device_cache_guarded(user, &guard).await;
+    }
+
+    pub(crate) async fn invalidate_device_cache_guarded(
+        &self,
+        user: &str,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+    ) {
         let lookup = self.resolve_lookup_keys(user).await;
 
         for key in lookup.all_keys() {
-            self.device_registry_cache.invalidate(key).await;
+            self.device_registry_cache.invalidate(guard, key).await;
             // Also delete from DB so get_devices_from_registry doesn't
             // fall back to stale persisted data — forces a network re-fetch
             if let Err(e) = self.persistence_manager.backend().delete_devices(key).await {
@@ -580,7 +618,7 @@ impl Client {
             // the doomed DB row can promote() it back between the first
             // invalidate and the delete commit (same guard as the canonical
             // flip path in update_device_list).
-            self.device_registry_cache.invalidate(key).await;
+            self.device_registry_cache.invalidate(guard, key).await;
         }
 
         debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
@@ -609,6 +647,7 @@ impl Client {
         device: &wacore::stanza::devices::DeviceElement,
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) {
+        let guard = self.device_topology.lock_registry().await;
         let device_id = device.device_id();
         let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
 
@@ -679,7 +718,7 @@ impl Client {
         // unknown device → `device_has_key()` returns `None` → falls into
         // `needs_skdm`. No global cache invalidation needed.
 
-        if let Err(e) = self.update_device_list(record).await {
+        if let Err(e) = self.update_device_list_guarded(record, &guard).await {
             warn!("patch_device_add: failed to persist: {e}");
         }
     }
@@ -776,6 +815,7 @@ impl Client {
         if device_id == 0 {
             return;
         }
+        let guard = self.device_topology.lock_registry().await;
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
             record.devices.retain(|d| d.device_id != device_id);
@@ -788,7 +828,7 @@ impl Client {
                         "patch_device_remove: device_id {device_id} > u16::MAX — skipping \
                          session/SKDM cleanup but still persisting registry removal"
                     );
-                    if let Err(e) = self.update_device_list(record).await {
+                    if let Err(e) = self.update_device_list_guarded(record, &guard).await {
                         warn!("patch_device_remove: failed to persist: {e}");
                     }
                     return;
@@ -813,7 +853,7 @@ impl Client {
                     );
                     return;
                 }
-                if let Err(e) = self.update_device_list(record).await {
+                if let Err(e) = self.update_device_list_guarded(record, &guard).await {
                     warn!("patch_device_remove: failed to persist: {e}");
                 }
             }
@@ -878,13 +918,14 @@ impl Client {
         user: &str,
         device: &wacore::stanza::devices::DeviceElement,
     ) {
+        let guard = self.device_topology.lock_registry().await;
         let device_id = device.device_id();
 
         if let Some(mut record) = self.load_device_record(user).await
             && let Some(d) = record.devices.iter_mut().find(|d| d.device_id == device_id)
         {
             d.key_index = device.key_index;
-            if let Err(e) = self.update_device_list(record).await {
+            if let Err(e) = self.update_device_list_guarded(record, &guard).await {
                 warn!("patch_device_update: failed to persist: {e}");
             }
         }
@@ -1011,6 +1052,7 @@ impl Client {
         )
     )]
     pub(crate) async fn migrate_device_registry_on_lid_discovery(&self, pn: &str, lid: &str) {
+        let guard = self.device_topology.lock_registry().await;
         let backend = self.persistence_manager.backend();
 
         match backend.get_devices(pn).await {
@@ -1028,13 +1070,13 @@ impl Client {
                     // The backend row may have changed even on error, so the
                     // change is recorded before the early return; the success
                     // path records once via the fused cache insert below.
-                    self.device_topology.record([pn, lid]);
+                    self.device_topology.record_registry(&guard, [pn, lid]);
                     warn!("Failed to migrate device registry to LID: {}", e);
                     return;
                 }
 
                 self.device_registry_cache
-                    .insert(lid.to_string(), Arc::new(record), [lid, pn])
+                    .insert(&guard, lid.to_string(), Arc::new(record), [lid, pn])
                     .await;
 
                 // Drop the PN-keyed row in both cache and DB. Invalidate
@@ -1042,11 +1084,11 @@ impl Client {
                 // resurrect the cache from the DB row between the two calls.
                 // Always run the second invalidate; even if delete fails, the
                 // cache may carry resurrected data that shouldn't stick.
-                self.device_registry_cache.invalidate(pn).await;
+                self.device_registry_cache.invalidate(&guard, pn).await;
                 if let Err(e) = backend.delete_devices(pn).await {
                     warn!("Failed to delete PN-keyed device row during LID migration: {e}");
                 }
-                self.device_registry_cache.invalidate(pn).await;
+                self.device_registry_cache.invalidate(&guard, pn).await;
             }
             Ok(None) => {}
             Err(e) => {

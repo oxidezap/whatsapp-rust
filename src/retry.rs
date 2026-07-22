@@ -72,6 +72,10 @@ struct PreparedRetransmission {
     retry_count: u8,
     recipient: Option<Jid>,
     group_info: Option<Arc<wacore::client::context::GroupInfo>>,
+    /// Canonical unpadded protobuf bytes shared with the recent-message cache.
+    /// Public retransmissions provide them; the automatic path may fall back
+    /// to its already-decoded message when the cache bytes are unavailable.
+    pre_encoded: Option<Arc<Vec<u8>>>,
 }
 
 fn validate_retransmission(
@@ -376,6 +380,9 @@ impl Client {
             recipient,
             group_metadata_freshness: _,
         } = request;
+        let pre_encoded = Arc::new(waproto::codec::message_to_vec(&message));
+        self.add_recent_message(&chat, &message_id, &message, Some(Arc::clone(&pre_encoded)))
+            .await;
         self.retransmit_message_prepared(PreparedRetransmission {
             route,
             wire_requester,
@@ -386,6 +393,7 @@ impl Client {
             retry_count,
             recipient,
             group_info,
+            pre_encoded: Some(pre_encoded),
         })
         .await
         .map_err(SendError::from_anyhow)
@@ -763,6 +771,7 @@ impl Client {
             retry_count,
             recipient: info.recipient,
             group_info: cached_group_info,
+            pre_encoded: None,
         })
         .await?;
 
@@ -789,11 +798,18 @@ impl Client {
             retry_count,
             recipient,
             group_info,
+            pre_encoded,
         } = request;
 
         if matches!(route, RetransmissionRoute::Status) {
             return self
-                .retransmit_status_message(chat, encryption_jid, message, message_id)
+                .retransmit_status_message(
+                    chat,
+                    encryption_jid,
+                    message,
+                    message_id,
+                    pre_encoded.as_deref().map(Vec::as_slice),
+                )
                 .await;
         }
 
@@ -844,6 +860,7 @@ impl Client {
                 retry_count,
                 account: device_snapshot.account.as_deref(),
                 edit,
+                pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
             },
         )
         .await?;
@@ -863,6 +880,7 @@ impl Client {
         requester: Jid,
         message: wa::Message,
         message_id: String,
+        pre_encoded: Option<&[u8]>,
     ) -> Result<(), anyhow::Error> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = snapshot
@@ -887,10 +905,12 @@ impl Client {
             wacore::types::message::AddressingMode::Lid,
         );
 
-        let encoded = message
-            .message_context_info
-            .is_unset()
+        let can_reuse_encoding = message.message_context_info.is_unset();
+        let encoded_fallback = (pre_encoded.is_none() && can_reuse_encoding)
             .then(|| waproto::codec::message_to_vec(&message));
+        let encoded = pre_encoded
+            .filter(|_| can_reuse_encoding)
+            .or(encoded_fallback.as_deref());
         let device_store = self.persistence_manager.get_device_arc().await;
         let mut store_adapter = self.signal_adapter_from(device_store);
         let mut stores = store_adapter.as_signal_stores();
@@ -913,7 +933,7 @@ impl Client {
                 phash_devices: None,
                 edit: edit.as_ref(),
                 extra_nodes: &[],
-                pre_encoded: encoded.as_deref(),
+                pre_encoded: encoded,
             },
         )
         .await
@@ -3409,6 +3429,47 @@ mod tests {
             .expect_err("a peer route without its actual chat cannot be sent");
         assert!(matches!(error, SendError::InvalidRequest(_)));
         assert!(error.to_string().contains("requires a recipient"));
+    }
+
+    #[tokio::test]
+    async fn public_retransmission_recaches_the_supplied_message() {
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 16;
+        let client = crate::test_utils::create_test_client_with_config(
+            "public_retransmission_cache",
+            Arc::new(MockHttpClient),
+            config,
+        )
+        .await;
+        let chat = Jid::pn("12025550103");
+        let requester = chat.with_device(7);
+        crate::test_utils::seed_peer_session(&client, &requester).await;
+        let message = wa::Message {
+            conversation: Some("retry me".into()),
+            ..Default::default()
+        };
+        let message_id = "PUBLIC-RETRY-CACHE-1";
+
+        // The fresh test session emits pkmsg and this client intentionally has
+        // no device identity, so the wire attempt fails after the public API has
+        // accepted and cached the supplied message.
+        let result = client
+            .retransmit_message(MessageRetransmission::new(
+                chat.clone(),
+                requester,
+                message,
+                message_id.to_string(),
+                1,
+            ))
+            .await;
+        assert!(result.is_err());
+
+        let (cached, alternate) = client
+            .peek_recent_message(&chat, message_id)
+            .await
+            .expect("a later retry count must find the retransmitted message");
+        assert!(alternate.is_none());
+        assert_eq!(cached.conversation.as_deref(), Some("retry me"));
     }
 
     #[test]
