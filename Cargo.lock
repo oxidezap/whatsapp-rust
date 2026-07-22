@@ -4048,6 +4048,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "uuid",
+ "wacore-derive",
  "waproto",
  "x25519-dalek 3.0.0",
 ]

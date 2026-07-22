@@ -33,6 +33,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+wacore-derive = { workspace = true }
 waproto = { workspace = true }
 x25519-dalek = { version = "3.0.0-rc.1", features = ["static_secrets"] }
 

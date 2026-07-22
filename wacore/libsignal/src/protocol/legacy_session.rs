@@ -20,66 +20,46 @@ use crate::protocol::{
 
 const LEGACY_CHAIN_COUNTER_OFFSET: i64 = 1;
 const LEGACY_KEY_MATERIAL_LEN: usize = 32;
-const LEGACY_BASE_KEY_LOCAL: u32 = 1;
-const LEGACY_BASE_KEY_REMOTE: u32 = 2;
-const LEGACY_CHAIN_SENDING: u32 = 1;
-const LEGACY_CHAIN_RECEIVING: u32 = 2;
 const LEGACY_CURRENT_SESSION: i64 = -1;
 const OPERATIONAL_CREATED_AT_MS: u64 = 0;
 
 /// Whether the session base key was generated locally or remotely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, wacore_derive::WireEnum)]
+#[wire(kind = "int")]
 pub enum LegacySessionBaseKeyRoleV1 {
+    #[wire = 1]
     Local,
+    #[wire = 2]
     Remote,
-}
-
-impl LegacySessionBaseKeyRoleV1 {
-    pub const fn discriminant(self) -> u32 {
-        match self {
-            Self::Local => LEGACY_BASE_KEY_LOCAL,
-            Self::Remote => LEGACY_BASE_KEY_REMOTE,
-        }
-    }
 }
 
 impl TryFrom<u32> for LegacySessionBaseKeyRoleV1 {
     type Error = LegacySessionInteropError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            LEGACY_BASE_KEY_LOCAL => Ok(Self::Local),
-            LEGACY_BASE_KEY_REMOTE => Ok(Self::Remote),
-            value => Err(LegacySessionInteropError::UnknownBaseKeyRole(value)),
-        }
+        let code = i32::try_from(value)
+            .map_err(|_| LegacySessionInteropError::UnknownBaseKeyRole(value))?;
+        Self::try_from(code).map_err(|_| LegacySessionInteropError::UnknownBaseKeyRole(value))
     }
 }
 
 /// Semantic role of a ratchet chain in `SessionRecord` v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, wacore_derive::WireEnum)]
+#[wire(kind = "int")]
 pub enum LegacySessionChainRoleV1 {
+    #[wire = 1]
     Sending,
+    #[wire = 2]
     Receiving,
-}
-
-impl LegacySessionChainRoleV1 {
-    pub const fn discriminant(self) -> u32 {
-        match self {
-            Self::Sending => LEGACY_CHAIN_SENDING,
-            Self::Receiving => LEGACY_CHAIN_RECEIVING,
-        }
-    }
 }
 
 impl TryFrom<u32> for LegacySessionChainRoleV1 {
     type Error = LegacySessionInteropError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            LEGACY_CHAIN_SENDING => Ok(Self::Sending),
-            LEGACY_CHAIN_RECEIVING => Ok(Self::Receiving),
-            value => Err(LegacySessionInteropError::UnknownChainRole(value)),
-        }
+        let code =
+            i32::try_from(value).map_err(|_| LegacySessionInteropError::UnknownChainRole(value))?;
+        Self::try_from(code).map_err(|_| LegacySessionInteropError::UnknownChainRole(value))
     }
 }
 
@@ -727,14 +707,10 @@ fn import_session(
 
     let pending_pre_key = pending_pre_key
         .map(|pending| {
-            let signed_pre_key_id = i32::try_from(pending.signed_pre_key_id).map_err(|_| {
-                LegacySessionInteropError::InvalidSignedPreKeyId {
-                    session: session_index,
-                }
-            })?;
             Ok(PendingPreKeyComponents {
                 pre_key_id: pending.pre_key_id,
-                signed_pre_key_id: Some(signed_pre_key_id),
+                // The protobuf stores the unsigned ID's bits in an i32.
+                signed_pre_key_id: Some(pending.signed_pre_key_id as i32),
                 base_key: Some(pending.base_key.into()),
                 kyber_pre_key_id: None,
                 kyber_ciphertext: None,
@@ -816,22 +792,17 @@ fn validate_session(
             session: session_index,
         });
     }
-    if let Some(pending) = session.pending_pre_key.as_ref() {
-        if pending.base_key != session.index.base_key {
-            validate_public_key(
-                &pending.base_key,
-                session_index,
-                LegacySessionFieldV1::PendingPreKeyBaseKey,
-            )?;
-            return Err(LegacySessionInteropError::PendingPreKeyBaseMismatch {
-                session: session_index,
-            });
-        }
-        if i32::try_from(pending.signed_pre_key_id).is_err() {
-            return Err(LegacySessionInteropError::InvalidSignedPreKeyId {
-                session: session_index,
-            });
-        }
+    if let Some(pending) = session.pending_pre_key.as_ref()
+        && pending.base_key != session.index.base_key
+    {
+        validate_public_key(
+            &pending.base_key,
+            session_index,
+            LegacySessionFieldV1::PendingPreKeyBaseKey,
+        )?;
+        return Err(LegacySessionInteropError::PendingPreKeyBaseMismatch {
+            session: session_index,
+        });
     }
 
     let sender_count = session
@@ -1165,7 +1136,7 @@ fn project_pending_pre_key(
     }
     let signed_pre_key_id = pending
         .signed_pre_key_id
-        .and_then(|value| u32::try_from(value).ok())
+        .map(|value| value as u32)
         .ok_or(LegacySessionInteropError::InvalidSignedPreKeyId { session })?;
     Ok(LegacySessionPendingPreKeyV1 {
         pre_key_id: pending.pre_key_id,
@@ -1355,20 +1326,23 @@ mod tests {
 
     #[test]
     fn roles_and_lifecycle_decode_only_known_values() {
+        assert_eq!(LegacySessionBaseKeyRoleV1::Local.code(), 1);
+        assert_eq!(LegacySessionChainRoleV1::Receiving.code(), 2);
+        assert!(LegacySessionBaseKeyRoleV1::try_from(3_i32).is_err());
         assert_eq!(
-            LegacySessionBaseKeyRoleV1::try_from(1).expect("local"),
+            LegacySessionBaseKeyRoleV1::try_from(1_u32).expect("local"),
             LegacySessionBaseKeyRoleV1::Local
         );
         assert_eq!(
-            LegacySessionChainRoleV1::try_from(2).expect("receiving"),
+            LegacySessionChainRoleV1::try_from(2_u32).expect("receiving"),
             LegacySessionChainRoleV1::Receiving
         );
         assert!(matches!(
-            LegacySessionBaseKeyRoleV1::try_from(3),
+            LegacySessionBaseKeyRoleV1::try_from(3_u32),
             Err(LegacySessionInteropError::UnknownBaseKeyRole(3))
         ));
         assert!(matches!(
-            LegacySessionChainRoleV1::try_from(0),
+            LegacySessionChainRoleV1::try_from(0_u32),
             Err(LegacySessionInteropError::UnknownChainRole(0))
         ));
         assert_eq!(
@@ -1495,18 +1469,47 @@ mod tests {
             record(vec![local]).into_session_record(local_context()),
             Err(LegacySessionInteropError::PendingPreKeyBaseMismatch { .. })
         ));
+    }
 
-        let mut overflow = reference_session(13, LegacySessionDispositionV1::Current);
-        overflow.index.base_key_role = LegacySessionBaseKeyRoleV1::Local;
-        overflow.pending_pre_key = Some(LegacySessionPendingPreKeyV1 {
+    #[test]
+    fn signed_pre_key_id_preserves_the_full_unsigned_range() {
+        let mut session = reference_session(13, LegacySessionDispositionV1::Current);
+        session.index.base_key_role = LegacySessionBaseKeyRoleV1::Local;
+        session.pending_pre_key = Some(LegacySessionPendingPreKeyV1 {
             pre_key_id: None,
-            signed_pre_key_id: i32::MAX as u32 + 1,
-            base_key: overflow.index.base_key.clone(),
+            signed_pre_key_id: u32::MAX,
+            base_key: session.index.base_key.clone(),
         });
-        assert!(matches!(
-            record(vec![overflow]).into_session_record(local_context()),
-            Err(LegacySessionInteropError::InvalidSignedPreKeyId { .. })
-        ));
+
+        let canonical = record(vec![session])
+            .into_session_record(local_context())
+            .expect("import full-range signed pre-key ID");
+        let canonical_id: u32 = canonical
+            .session_state()
+            .expect("current session")
+            .unacknowledged_pre_key_message_items()
+            .expect("valid pending pre-key")
+            .expect("pending pre-key")
+            .signed_pre_key_id()
+            .into();
+        assert_eq!(
+            canonical_id,
+            u32::MAX,
+            "canonical accessors must preserve the ID's bit pattern"
+        );
+
+        let projected = canonical
+            .into_legacy_session_v1_operational()
+            .expect("project full-range signed pre-key ID");
+        assert_eq!(
+            projected.sessions[0]
+                .session
+                .pending_pre_key
+                .as_ref()
+                .expect("pending pre-key")
+                .signed_pre_key_id,
+            u32::MAX
+        );
     }
 
     #[test]
@@ -2045,6 +2048,6 @@ mod tests {
         let session = reference_session(80, LegacySessionDispositionV1::Current);
         let output = format!("{session:?}");
         assert!(output.contains("<redacted>"));
-        assert!(!output.contains("80, 80, 80"));
+        assert!(!output.contains("84, 84, 84"));
     }
 }

@@ -75,7 +75,9 @@ const fn forward_jump_limit(is_self: bool) -> usize {
 }
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey, UsePQRatchet};
-use crate::protocol::state::{DecryptSnapshot, PreKeyId, ReceiverChainState, SessionState};
+use crate::protocol::state::{
+    DecryptSnapshot, InvalidSessionError, PreKeyId, ReceiverChainState, SessionState,
+};
 use crate::protocol::{
     CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
     PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionCheckout,
@@ -1043,19 +1045,38 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                     }
                 };
             }
-            Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
+            Err(StateDecryptError::MissingClosedChainMessageKey {
+                next_index,
+                counter,
+            }) if original_message_type == CiphertextMessageType::Whisper => {
+                let error = SignalProtocolError::DuplicatedMessage(next_index, counter);
+                log_decryption_failure(ciphertext.signal_message(), &current_state, &error);
+                errs.push(error);
+                record.set_session_state(current_state);
+            }
+            Err(StateDecryptError::MissingClosedChainMessageKey {
+                next_index,
+                counter,
+            }) => {
+                record.set_session_state(current_state);
+                return Err(SignalProtocolError::DuplicatedMessage(next_index, counter));
+            }
+            Err(StateDecryptError::Protocol(SignalProtocolError::DuplicatedMessage(
+                chain,
+                counter,
+            ))) => {
                 // Restore state before returning error
                 record.set_session_state(current_state);
                 return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
             }
-            Err(e) if !ciphertext.is_available() => {
+            Err(StateDecryptError::Protocol(e)) if !ciphertext.is_available() => {
                 // Authentication succeeded, but the provider rejected the
                 // caller-owned body after it had been consumed for in-place
                 // decryption. No other session can validly authenticate it.
                 record.set_session_state(current_state);
                 return Err(e);
             }
-            Err(e) => {
+            Err(StateDecryptError::Protocol(e)) => {
                 log_decryption_failure(ciphertext.signal_message(), &current_state, &e);
                 errs.push(e);
                 match original_message_type {
@@ -1142,16 +1163,36 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                     plaintext: result.plaintext,
                 }));
             }
-            Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
+            Err(StateDecryptError::MissingClosedChainMessageKey {
+                next_index,
+                counter,
+            }) if original_message_type == CiphertextMessageType::Whisper => {
+                let error = SignalProtocolError::DuplicatedMessage(next_index, counter);
+                log_decryption_failure(ciphertext.signal_message(), &previous, &error);
+                errs.push(error);
+                record.restore_previous_session(idx, previous);
+                idx += 1;
+            }
+            Err(StateDecryptError::MissingClosedChainMessageKey {
+                next_index,
+                counter,
+            }) => {
+                record.restore_previous_session(idx, previous);
+                return Err(SignalProtocolError::DuplicatedMessage(next_index, counter));
+            }
+            Err(StateDecryptError::Protocol(SignalProtocolError::DuplicatedMessage(
+                chain,
+                counter,
+            ))) => {
                 // Restore the session before returning error
                 record.restore_previous_session(idx, previous);
                 return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
             }
-            Err(e) if !ciphertext.is_available() => {
+            Err(StateDecryptError::Protocol(e)) if !ciphertext.is_available() => {
                 record.restore_previous_session(idx, previous);
                 return Err(e);
             }
-            Err(e) => {
+            Err(StateDecryptError::Protocol(e)) => {
                 log_decryption_failure(ciphertext.signal_message(), &previous, &e);
                 errs.push(e);
                 // Restore the session at the same index and move to next
@@ -1195,6 +1236,12 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     {
         return Err(SignalProtocolError::BadMac(original_message_type));
     }
+    if let Some((chain, counter)) = errs.iter().find_map(|error| match error {
+        SignalProtocolError::DuplicatedMessage(chain, counter) => Some((*chain, *counter)),
+        _ => None,
+    }) {
+        return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
+    }
 
     Err(SignalProtocolError::InvalidMessage(
         original_message_type,
@@ -1220,6 +1267,23 @@ impl std::fmt::Display for CurrentOrPrevious {
 struct StateDecryptResult {
     plaintext: Vec<u8>,
     effect: StateDecryptEffect,
+}
+
+enum StateDecryptError {
+    Protocol(SignalProtocolError),
+    MissingClosedChainMessageKey { next_index: u32, counter: u32 },
+}
+
+impl From<SignalProtocolError> for StateDecryptError {
+    fn from(error: SignalProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<InvalidSessionError> for StateDecryptError {
+    fn from(error: InvalidSessionError) -> Self {
+        Self::Protocol(error.into())
+    }
 }
 
 enum StateDecryptEffect {
@@ -1260,7 +1324,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     original_message_type: CiphertextMessageType,
     remote_address: &ProtocolAddress,
     csprng: &mut R,
-) -> Result<StateDecryptResult> {
+) -> std::result::Result<StateDecryptResult, StateDecryptError> {
     // Check for a completely empty or invalid session state before we do anything else.
     let _ = state.root_key().map_err(|_| {
         SignalProtocolError::InvalidMessage(
@@ -1272,9 +1336,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let message = ciphertext.signal_message();
     let ciphertext_version = message.message_version() as u32;
     if ciphertext_version != state.session_version()? {
-        return Err(SignalProtocolError::UnrecognizedMessageVersion(
-            ciphertext_version,
-        ));
+        return Err(SignalProtocolError::UnrecognizedMessageVersion(ciphertext_version).into());
     }
 
     let their_ephemeral = *message.sender_ratchet_key();
@@ -1339,16 +1401,19 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     their_ephemeral: &PublicKey,
     receiver_chain: Option<ReceiverChainState>,
     counter: u32,
-) -> Result<Vec<u8>> {
+) -> std::result::Result<Vec<u8>, StateDecryptError> {
     if let Some(ReceiverChainState::Closed { next_index }) = receiver_chain {
         if counter >= next_index {
-            return Err(SignalProtocolError::InvalidSessionStructure(
-                "receiver chain is closed",
-            ));
+            return Err(
+                SignalProtocolError::InvalidSessionStructure("receiver chain is closed").into(),
+            );
         }
-        let message_key_gen = state
-            .get_message_keys(their_ephemeral, counter)?
-            .ok_or(SignalProtocolError::DuplicatedMessage(next_index, counter))?;
+        let Some(message_key_gen) = state.get_message_keys(their_ephemeral, counter)? else {
+            return Err(StateDecryptError::MissingClosedChainMessageKey {
+                next_index,
+                counter,
+            });
+        };
         return decrypt_with_message_keys(
             current_or_previous,
             state,
@@ -1356,7 +1421,8 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
             original_message_type,
             remote_address,
             message_key_gen,
-        );
+        )
+        .map_err(Into::into);
     }
 
     let (chain_key, deferred_ratchet) =
@@ -1974,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_receiver_chain_can_consume_a_persisted_skipped_key() {
+    fn closed_receiver_chain_searches_archives_for_a_persisted_skipped_key() {
         let mut tp = setup_established_session();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
@@ -2040,6 +2106,7 @@ mod tests {
                 .expect("stored session");
             let mut components = stored.into_components().expect("components");
             let current = components.current_session.as_mut().expect("current");
+            let mut previous = current.clone();
             let receiver = current
                 .receiver_chains
                 .iter_mut()
@@ -2049,6 +2116,17 @@ mod tests {
                 })
                 .expect("matching receiver chain");
             receiver.chain_key.as_mut().expect("chain key").key = None;
+            receiver.message_keys.clear();
+            let previous_receiver = previous
+                .receiver_chains
+                .iter_mut()
+                .find(|chain| {
+                    chain.sender_ratchet_key.as_deref()
+                        == Some(first.sender_ratchet_key().serialize().as_slice())
+                })
+                .expect("matching archived receiver chain");
+            previous_receiver.chain_key.as_mut().expect("chain key").key = None;
+            components.previous_sessions.push(previous);
             tp.bob_sessions.0.insert(
                 tp.alice_addr.as_str().to_owned(),
                 SessionRecord::from_components(components).expect("closed-chain record"),
@@ -2062,8 +2140,22 @@ mod tests {
                 &mut rng,
             )
             .await
-            .expect("consume skipped key from closed chain");
+            .expect("consume skipped key from archived closed chain");
             assert_eq!(decrypted.plaintext, b"first");
+
+            let replay = message_decrypt_signal(
+                &first,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect_err("consumed key remains a duplicate after every session is searched");
+            assert!(matches!(
+                replay,
+                SignalProtocolError::DuplicatedMessage(_, _)
+            ));
         });
     }
 
