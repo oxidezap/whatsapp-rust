@@ -651,6 +651,45 @@ mod tests {
     }
 
     #[cfg(feature = "client-lifecycle")]
+    struct ConnectDuringInstallLifecycle {
+        client: async_channel::Sender<Arc<Client>>,
+        release: async_channel::Receiver<()>,
+        connect_invoked: async_channel::Sender<()>,
+        connect_finished: async_channel::Sender<bool>,
+    }
+
+    #[cfg(feature = "client-lifecycle")]
+    struct BlockingTransportFactory {
+        started: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    #[cfg(feature = "client-lifecycle")]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl TransportFactory for BlockingTransportFactory {
+        async fn create_transport(
+            &self,
+        ) -> Result<
+            (
+                Arc<dyn crate::transport::Transport>,
+                async_channel::Receiver<crate::transport::TransportEvent>,
+            ),
+            anyhow::Error,
+        > {
+            self.started
+                .send(())
+                .await
+                .map_err(|_| anyhow::anyhow!("transport-start receiver closed"))?;
+            self.release
+                .recv()
+                .await
+                .map_err(|_| anyhow::anyhow!("transport release closed"))?;
+            Err(anyhow::anyhow!("injected transport stop"))
+        }
+    }
+
+    #[cfg(feature = "client-lifecycle")]
     impl ClientLifecycle for RunDuringInstallLifecycle {
         fn install<'a>(
             &'a self,
@@ -667,6 +706,40 @@ mod tests {
                     .spawn(Box::pin(async move {
                         run_client.run().await;
                         let _ = run_finished.send(()).await;
+                    }))
+                    .detach();
+                self.client
+                    .send(client)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test client receiver closed"))?;
+                self.release
+                    .recv()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test install release closed"))?;
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(feature = "client-lifecycle")]
+    impl ClientLifecycle for ConnectDuringInstallLifecycle {
+        fn install<'a>(
+            &'a self,
+            client: std::sync::Weak<Client>,
+        ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                let client = client
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("client unavailable during install"))?;
+                let connect_client = client.clone();
+                let connect_invoked = self.connect_invoked.clone();
+                let connect_finished = self.connect_finished.clone();
+                client
+                    .runtime
+                    .spawn(Box::pin(async move {
+                        let _ = connect_invoked.send(()).await;
+                        let failed = connect_client.connect().await.is_err();
+                        let _ = connect_finished.send(failed).await;
                     }))
                     .detach();
                 self.client
@@ -846,6 +919,120 @@ mod tests {
             .await
             .expect("run stop timeout")
             .expect("run stopped");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "client-lifecycle")]
+    async fn connect_leaked_during_install_waits_for_complete_construction() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (install_release_tx, install_release_rx) = async_channel::bounded(1);
+        let (connect_invoked_tx, connect_invoked_rx) = async_channel::bounded(1);
+        let (connect_finished_tx, connect_finished_rx) = async_channel::bounded(1);
+        let (transport_started_tx, transport_started_rx) = async_channel::bounded(1);
+        let (transport_release_tx, transport_release_rx) = async_channel::bounded(1);
+        let builder = complete_builder()
+            .await
+            .with_transport_factory(BlockingTransportFactory {
+                started: transport_started_tx,
+                release: transport_release_rx,
+            })
+            .with_lifecycle(ConnectDuringInstallLifecycle {
+                client: client_tx,
+                release: install_release_rx,
+                connect_invoked: connect_invoked_tx,
+                connect_finished: connect_finished_tx,
+            });
+        let build = tokio::spawn(async move { builder.build().await });
+        let leaked_client = client_rx
+            .recv()
+            .await
+            .expect("client leaked during install");
+        connect_invoked_rx
+            .recv()
+            .await
+            .expect("direct connect invoked");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), transport_started_rx.recv())
+                .await
+                .is_err(),
+            "transport started before construction activation"
+        );
+        assert!(!leaked_client.is_connecting.load(Ordering::Acquire));
+
+        install_release_tx
+            .send(())
+            .await
+            .expect("release installation");
+        let client = build
+            .await
+            .expect("builder task")
+            .expect("successful build")
+            .into_client();
+        tokio::time::timeout(Duration::from_secs(1), transport_started_rx.recv())
+            .await
+            .expect("connect remained gated after activation")
+            .expect("transport-start sender closed");
+        transport_release_tx
+            .send(())
+            .await
+            .expect("release transport");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), connect_finished_rx.recv())
+                .await
+                .expect("direct connect did not finish")
+                .expect("connect-finished sender closed")
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "client-lifecycle")]
+    async fn shutdown_during_install_rejects_leaked_connect() {
+        let (client_tx, client_rx) = async_channel::bounded(1);
+        let (_install_release_tx, install_release_rx) = async_channel::bounded(1);
+        let (connect_invoked_tx, connect_invoked_rx) = async_channel::bounded(1);
+        let (connect_finished_tx, connect_finished_rx) = async_channel::bounded(1);
+        let (transport_started_tx, transport_started_rx) = async_channel::bounded(1);
+        let (_transport_release_tx, transport_release_rx) = async_channel::bounded(1);
+        let builder = complete_builder()
+            .await
+            .with_transport_factory(BlockingTransportFactory {
+                started: transport_started_tx,
+                release: transport_release_rx,
+            })
+            .with_lifecycle(ConnectDuringInstallLifecycle {
+                client: client_tx,
+                release: install_release_rx,
+                connect_invoked: connect_invoked_tx,
+                connect_finished: connect_finished_tx,
+            });
+        let build = tokio::spawn(async move { builder.build().await });
+        let leaked_client = client_rx
+            .recv()
+            .await
+            .expect("client leaked during install");
+        connect_invoked_rx
+            .recv()
+            .await
+            .expect("direct connect invoked");
+        leaked_client.signal_shutdown_sync();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), build)
+                .await
+                .expect("lifecycle install ignored terminal shutdown")
+                .expect("builder task"),
+            Err(ClientBuilderError::LifecycleInstall(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), connect_finished_rx.recv())
+                .await
+                .expect("direct connect did not observe rejection")
+                .expect("connect-finished sender closed")
+        );
+        assert!(transport_started_rx.try_recv().is_err());
+        assert!(!leaked_client.is_connecting.load(Ordering::Acquire));
     }
 
     #[tokio::test]

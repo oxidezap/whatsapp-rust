@@ -576,6 +576,12 @@ impl Client {
     /// across crates, so consumers awaiting the connect graph directly would
     /// re-codegen it; the box makes them poll through a vtable instead.
     pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle
+            && !lifecycle.wait_until_active().await
+        {
+            return Err(anyhow!("client construction did not activate"));
+        }
         self.connect_boxed().await
     }
 
