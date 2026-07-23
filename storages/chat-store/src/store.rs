@@ -47,6 +47,7 @@ pub(crate) enum WriterMsg {
         text: Option<String>,
         timestamp_ms: i64,
     },
+    Reconcile(Jid),
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
     Flush(oneshot::Sender<std::result::Result<(), String>>),
@@ -147,6 +148,12 @@ impl ChatStore {
     /// it cannot race the server ack / receipts that follow it in event order.
     /// Status starts at [`MessageStatus::Pending`](crate::types::MessageStatus::Pending)
     /// and is lifted by acks/receipts.
+    ///
+    /// `chat` may be either of a 1:1 peer's identities (phone number or LID):
+    /// the row is stored on the peer's one thread regardless — an existing
+    /// thread keeps its key, a brand-new chat with a known LID mapping is
+    /// keyed by the LID (WA Web behavior) — and every query resolves the
+    /// alias, so reads by either identity keep working.
     pub fn record_outgoing(
         &self,
         chat: &Jid,
@@ -164,6 +171,21 @@ impl ChatStore {
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Reconcile a 1:1 peer's PN- and LID-keyed rows into a single thread.
+    ///
+    /// Receipts dropped under the wrong identity (before this crate resolved
+    /// PN/LID aliases) left some stores with a split pair: a populated chat
+    /// under the phone-number key plus a stray `@lid` twin. Live traffic for
+    /// the peer now heals such a pair on its own; this makes the repair
+    /// on-demand for embedders that want it eagerly. Idempotent — a peer with
+    /// one thread (or no LID mapping yet) is a no-op. Goes through the writer
+    /// queue; use [`flush`](Self::flush) to await completion.
+    pub fn reconcile_chat(&self, chat: &Jid) -> Result<()> {
+        self.tx
+            .send(WriterMsg::Reconcile(chat.clone()))
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
 
@@ -386,10 +408,10 @@ fn count_uncovered_incoming(
 
 /// Chats/contacts touched by a batch, accumulated for post-commit invalidation.
 #[derive(Default)]
-struct ChangeSet {
-    chats: bool,
-    contacts: bool,
-    message_chats: BTreeSet<String>,
+pub(crate) struct ChangeSet {
+    pub(crate) chats: bool,
+    pub(crate) contacts: bool,
+    pub(crate) message_chats: BTreeSet<String>,
 }
 
 async fn writer_loop(
@@ -485,6 +507,13 @@ fn apply_writer_msg(
 ) -> QueryResult<()> {
     match msg {
         WriterMsg::Event(event) => apply_event(conn, device_id, event, cs),
+        WriterMsg::Reconcile(chat) => {
+            let wire = chat.to_string();
+            if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {
+                crate::lid::merge_split_chat(conn, device_id, &wire, &alt, cs)?;
+            }
+            Ok(())
+        }
         WriterMsg::Outgoing {
             chat,
             msg_id,
@@ -493,7 +522,11 @@ fn apply_writer_msg(
             text,
             timestamp_ms,
         } => {
-            let chat_str = chat.to_string();
+            let wire = chat.to_string();
+            let chat_str = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
+            if chat_str != wire {
+                cs.message_chats.insert(wire);
+            }
             let stored = insert_message(
                 conn,
                 device_id,
@@ -549,7 +582,11 @@ fn apply_event(
         Event::Receipt(receipt) => apply_receipt(conn, device_id, receipt, cs),
         Event::ServerAck(ack) => apply_server_ack(conn, device_id, ack, cs),
         Event::UndecryptableMessage(undec) => {
-            let chat = undec.info.source.chat.to_string();
+            let wire = undec.info.source.chat.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
+            if chat != wire {
+                cs.message_chats.insert(wire);
+            }
             let sender = undec.info.source.sender.to_string();
             let inserted = insert_message(
                 conn,
@@ -616,7 +653,7 @@ fn apply_event(
                 .pinned
                 .unwrap_or(false)
                 .then(|| update.timestamp.timestamp_millis());
-            let chat = update.jid.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::pinned_at.eq(pinned_at))
@@ -638,7 +675,7 @@ fn apply_event(
             } else {
                 None
             };
-            let chat = update.jid.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::muted_until.eq(muted_until))
@@ -647,7 +684,7 @@ fn apply_event(
             Ok(())
         }
         Event::ArchiveUpdate(update) => {
-            let chat = update.jid.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::archived.eq(update.action.archived.unwrap_or(false)))
@@ -656,7 +693,7 @@ fn apply_event(
             Ok(())
         }
         Event::MarkChatAsReadUpdate(update) => {
-            let chat = update.jid.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
             if update.action.read.unwrap_or(false) {
                 // A delayed replay only covers messages up to its range;
@@ -721,7 +758,8 @@ fn apply_event(
             Ok(())
         }
         Event::StarUpdate(update) => {
-            let chat = update.chat_jid.to_string();
+            let chat =
+                crate::lid::route_chat_key(conn, device_id, &update.chat_jid.to_string(), cs)?;
             diesel::update(message_row(device_id, &chat, &update.message_id))
                 .set(schema::messages::starred.eq(update.action.starred.unwrap_or(false)))
                 .execute(conn)?;
@@ -729,7 +767,7 @@ fn apply_event(
             Ok(())
         }
         Event::DeleteChatUpdate(update) => {
-            let chat = update.jid.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             let bound = range_bound(&update.action.message_range);
             delete_chat_rows(conn, device_id, &chat, true, bound.as_ref())?;
             // A delayed delete only covers up to its range: when newer
@@ -753,7 +791,7 @@ fn apply_event(
             Ok(())
         }
         Event::ClearChatUpdate(update) => {
-            let chat = update.jid.to_string();
+            let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             let bound = range_bound(&update.action.message_range);
             delete_chat_rows(
                 conn,
@@ -780,7 +818,8 @@ fn apply_event(
             Ok(())
         }
         Event::DeleteMessageForMeUpdate(update) => {
-            let chat = update.chat_jid.to_string();
+            let chat =
+                crate::lid::route_chat_key(conn, device_id, &update.chat_jid.to_string(), cs)?;
             // Capture the victim's read state before it goes: deleting an
             // unread inbound row must also drop its badge (sentinel -1 and
             // already-read rows are untouched).
@@ -833,7 +872,11 @@ fn apply_inbound(
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
     let info = &inbound.info;
-    let chat = info.source.chat.to_string();
+    let wire = info.source.chat.to_string();
+    let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
+    if chat != wire {
+        cs.message_chats.insert(wire);
+    }
     let sender = info.source.sender.to_string();
     let ts_ms = info.timestamp.timestamp_millis();
 
@@ -1220,6 +1263,14 @@ fn apply_receipt(
         ReceiptType::Read => wa::web_message_info::Status::READ as i32,
         ReceiptType::Played => wa::web_message_info::Status::PLAYED as i32,
         ReceiptType::ReadSelf | ReceiptType::PlayedSelf => {
+            // Self receipts are LID-addressed once the peer is; the thread may
+            // be keyed by either identity (or split) — route to where it lives
+            // so the read state lands on the real rows, not a stray twin.
+            let wire = chat;
+            let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
+            if chat != wire {
+                cs.message_chats.insert(wire);
+            }
             // Read on another of our devices — up to the covered messages.
             // WA read state is "read up to X": the boundary is the newest
             // covered row (falling back to the receipt's own timestamp).
@@ -1276,10 +1327,11 @@ fn apply_receipt(
     };
 
     let user = receipt.source.sender.to_string();
+    let mut missed: Vec<&String> = Vec::new();
     for msg_id in &receipt.message_ids {
         // Peer receipts only ever advance the delivery state of our own
         // messages, and never backwards.
-        diesel::update(
+        let updated = diesel::update(
             message_row(device_id, &chat, msg_id).filter(
                 schema::messages::from_me
                     .eq(true)
@@ -1288,6 +1340,9 @@ fn apply_receipt(
         )
         .set(schema::messages::status.eq(status))
         .execute(conn)?;
+        if updated == 0 {
+            missed.push(msg_id);
+        }
 
         // Derived from the JID: the library's receipt parser leaves
         // `source.is_group` defaulted, so the flag can't be trusted here.
@@ -1317,6 +1372,32 @@ fn apply_receipt(
             )
             .set((dsl::receipt_type.eq(status), dsl::ts_ms.eq(ts_ms)))
             .execute(conn)?;
+        }
+    }
+    // A modern peer addresses the receipt by whichever identity it has for
+    // the thread — LID receipts for PN-keyed rows or vice versa. Retry the
+    // misses under the mapped counterpart key (WA Web's alternate-key
+    // fallback, `fixMsgKeysWithPnMapping`); costs one indexed lookup and only
+    // on the miss path, so the already-consistent case stays free.
+    if !missed.is_empty()
+        && !receipt.source.chat.is_group()
+        && let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &chat)?
+    {
+        let mut matched_alt = false;
+        for msg_id in missed {
+            matched_alt |= diesel::update(
+                message_row(device_id, &alt, msg_id).filter(
+                    schema::messages::from_me
+                        .eq(true)
+                        .and(schema::messages::status.lt(status)),
+                ),
+            )
+            .set(schema::messages::status.eq(status))
+            .execute(conn)?
+                > 0;
+        }
+        if matched_alt {
+            cs.message_chats.insert(alt);
         }
     }
     cs.message_chats.insert(chat);
@@ -1363,18 +1444,19 @@ fn apply_server_ack(
         .execute(conn)?
     };
     if updated > 0 {
-        // Acks usually carry the chat; when they don't, resolve it from the
-        // row we just updated so consumers still get invalidated.
-        let chat = match &ack.from {
-            Some(from) => Some(from.to_string()),
-            None => dsl::messages
-                .filter(dsl::device_id.eq(device_id).and(dsl::msg_id.eq(&ack.id)))
-                .select(dsl::chat_jid)
-                .first(conn)
-                .optional()?,
-        };
-        if let Some(chat) = chat {
+        // Resolve the chat from the row itself: the ack's `from` is the wire
+        // identity, which may not be the key the row is stored under (PN/LID
+        // aliasing). Emit both so consumers keyed by either get invalidated.
+        let row_chat: Option<String> = dsl::messages
+            .filter(dsl::device_id.eq(device_id).and(dsl::msg_id.eq(&ack.id)))
+            .select(dsl::chat_jid)
+            .first(conn)
+            .optional()?;
+        if let Some(chat) = row_chat {
             cs.message_chats.insert(chat);
+        }
+        if let Some(from) = &ack.from {
+            cs.message_chats.insert(from.to_string());
         }
     }
     Ok(())
@@ -1427,7 +1509,7 @@ fn apply_history_conversation(
     conv: &wa::Conversation,
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
-    let chat = conv.id.as_str();
+    let chat = &crate::lid::route_chat_key(conn, device_id, conv.id.as_str(), cs)?;
     let last_ts_ms = conv
         .conversation_timestamp
         .map(|s| (s as i64).saturating_mul(1000))
@@ -1740,6 +1822,90 @@ fn ensure_chat(conn: &mut SqliteConnection, device_id: i32, chat: &str) -> Query
     Ok(())
 }
 
+/// Union a split pair's chat rows into `dest` and drop `src` (the message
+/// rows have already moved). Activity and preview re-derive from the merged
+/// messages; the self-read state is the union of both sides so neither
+/// side's covered messages re-badge; sticky user prefs (pin/mute/archive,
+/// name, ephemeral) keep dest's value and fall back to src's. A manual-unread
+/// marker on either side survives; otherwise the badge is recounted.
+pub(crate) fn merge_chat_metadata(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    src: &str,
+    dest: &str,
+) -> QueryResult<()> {
+    use schema::chats::dsl;
+    type PrefRow = (
+        i64,
+        i32,
+        Option<i64>,
+        Option<i64>,
+        bool,
+        Option<i32>,
+        Option<String>,
+    );
+    let prefs = |conn: &mut SqliteConnection, key: &str| -> QueryResult<Option<PrefRow>> {
+        chat_row(device_id, key)
+            .select((
+                dsl::last_message_ts,
+                dsl::unread_count,
+                dsl::pinned_at,
+                dsl::muted_until,
+                dsl::archived,
+                dsl::ephemeral_expiration,
+                dsl::name,
+            ))
+            .first(conn)
+            .optional()
+    };
+    let Some(src_row) = prefs(conn, src)? else {
+        return Ok(());
+    };
+    let src_state = read_state(conn, device_id, src)?;
+    ensure_chat(conn, device_id, dest)?;
+    let dest_row = prefs(conn, dest)?.unwrap_or((0, 0, None, None, false, None, None));
+    let dest_state = read_state(conn, device_id, dest)?;
+
+    let mut merged = ReadState {
+        watermark_ms: src_state.watermark_ms.max(dest_state.watermark_ms),
+        extra_ids: dest_state.extra_ids,
+    };
+    for id in src_state.extra_ids {
+        if !merged.extra_ids.contains(&id) {
+            merged.extra_ids.push(id);
+        }
+    }
+    if merged.extra_ids.len() > READ_EXTRA_IDS_CAP {
+        let overflow = merged.extra_ids.len() - READ_EXTRA_IDS_CAP;
+        merged.extra_ids.drain(..overflow);
+    }
+    let ids_json = (!merged.extra_ids.is_empty())
+        .then(|| serde_json::to_string(&merged.extra_ids).ok())
+        .flatten();
+
+    let unread = if src_row.1 == UNREAD_MARKER || dest_row.1 == UNREAD_MARKER {
+        UNREAD_MARKER
+    } else {
+        count_unread(conn, device_id, dest, &merged)?
+    };
+    diesel::update(chat_row(device_id, dest))
+        .set((
+            dsl::last_message_ts.eq(src_row.0.max(dest_row.0)),
+            dsl::unread_count.eq(unread),
+            dsl::pinned_at.eq(dest_row.2.or(src_row.2)),
+            dsl::muted_until.eq(dest_row.3.or(src_row.3)),
+            dsl::archived.eq(dest_row.4 || src_row.4),
+            dsl::ephemeral_expiration.eq(dest_row.5.or(src_row.5)),
+            dsl::name.eq(dest_row.6.or(src_row.6)),
+            dsl::read_boundary_ms.eq(merged.watermark_ms),
+            dsl::read_boundary_ids.eq(ids_json),
+        ))
+        .execute(conn)?;
+    recompute_chat_preview(conn, device_id, dest)?;
+    diesel::delete(chat_row(device_id, src)).execute(conn)?;
+    Ok(())
+}
+
 fn upsert_contact_push_name(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1905,7 +2071,7 @@ fn chat_row(device_id: i32, chat: &str) -> ChatRowFilter<'_> {
     )
 }
 
-type MessageRowFilter<'a> = diesel::dsl::Filter<
+pub(crate) type MessageRowFilter<'a> = diesel::dsl::Filter<
     schema::messages::table,
     diesel::dsl::And<
         diesel::dsl::And<
@@ -1916,7 +2082,11 @@ type MessageRowFilter<'a> = diesel::dsl::Filter<
     >,
 >;
 
-fn message_row<'a>(device_id: i32, chat: &'a str, msg_id: &'a str) -> MessageRowFilter<'a> {
+pub(crate) fn message_row<'a>(
+    device_id: i32,
+    chat: &'a str,
+    msg_id: &'a str,
+) -> MessageRowFilter<'a> {
     schema::messages::table.filter(
         schema::messages::device_id
             .eq(device_id)

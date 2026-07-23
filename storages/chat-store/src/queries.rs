@@ -174,6 +174,9 @@ impl ChatStore {
 
     /// One page of a chat's messages, newest first. Pass the cursor of the
     /// oldest message you already have to get the page before it.
+    ///
+    /// A 1:1 chat may be addressed by either of the peer's identities (phone
+    /// number or LID); the query resolves the alias, so both find the thread.
     pub async fn messages(
         &self,
         chat: &Jid,
@@ -187,8 +190,10 @@ impl ChatStore {
         let rows: Vec<MessageRow> = self
             .db()
             .run(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 let mut query = dsl::messages
-                    .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(&chat)))
+                    .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
                     .into_boxed();
                 if let Some(cursor) = &before {
                     query = query.filter(
@@ -217,11 +222,13 @@ impl ChatStore {
         let row: Option<MessageRow> = self
             .db()
             .run(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 dsl::messages
                     .filter(
                         dsl::device_id
                             .eq(device_id)
-                            .and(dsl::chat_jid.eq(&chat))
+                            .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
                     .first(conn)
@@ -240,11 +247,13 @@ impl ChatStore {
         let rows: Vec<(String, String, i64)> = self
             .db()
             .run(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 dsl::reactions
                     .filter(
                         dsl::device_id
                             .eq(device_id)
-                            .and(dsl::chat_jid.eq(&chat))
+                            .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
                     .select((dsl::sender_jid, dsl::emoji, dsl::ts_ms))
@@ -272,11 +281,13 @@ impl ChatStore {
         let rows: Vec<(String, i32, i64)> = self
             .db()
             .run(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 dsl::message_receipts
                     .filter(
                         dsl::device_id
                             .eq(device_id)
-                            .and(dsl::chat_jid.eq(&chat))
+                            .and(dsl::chat_jid.eq_any(keys))
                             .and(dsl::msg_id.eq(&msg_id)),
                     )
                     .select((dsl::user_jid, dsl::receipt_type, dsl::ts_ms))

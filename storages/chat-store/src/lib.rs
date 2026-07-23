@@ -31,6 +31,7 @@
 mod error;
 #[cfg(feature = "search")]
 mod fts;
+mod lid;
 mod materialize;
 mod queries;
 mod schema;

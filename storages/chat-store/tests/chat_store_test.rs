@@ -2589,3 +2589,417 @@ async fn server_nack_marks_outgoing_failed() {
         .unwrap();
     assert_eq!(msg.status, MessageStatus::ServerAck);
 }
+
+// ── LID/PN identity resolution (issue #1078) ────────────────────────────────
+
+const PEER_LID: &str = "111000011112222@lid";
+
+/// Learn PEER <-> PEER_LID in the device store's mapping table, the alias
+/// index the chat-store resolves against.
+async fn add_lid_mapping(store: &SqliteStore) {
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+    // The mapping table's FK needs the device row the client normally creates.
+    store.create_new_device().await.expect("create device");
+    store
+        .put_lid_mapping(&LidPnMappingEntry {
+            lid: "111000011112222".into(),
+            phone_number: "559900000001".into(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            learning_source: "usync".into(),
+        })
+        .await
+        .expect("put mapping");
+}
+
+fn read_receipt(chat: &str, ids: Vec<&str>, ts: i64) -> Event {
+    Event::Receipt(
+        Receipt::builder()
+            .source(MessageSource {
+                chat: jid(chat),
+                sender: jid(chat),
+                ..Default::default()
+            })
+            .message_ids(ids.into_iter().map(String::from).collect())
+            .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+            .r#type(ReceiptType::Read)
+            .offline(false)
+            .build(),
+    )
+}
+
+/// The issue #1078 scenario: rows stored under the phone-number key before
+/// any mapping was known, delivered/read receipts arriving LID-keyed.
+#[tokio::test]
+async fn lid_receipt_advances_pn_keyed_rows() {
+    let (store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-SPLIT",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-SPLIT".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .build(),
+        )],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [read_receipt(PEER_LID, vec!["OUT-SPLIT"], 1_700_000_200)],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&chat, "OUT-SPLIT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+    // No stray @lid twin was created by the receipt.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, chat);
+    // Either identity reads the same thread.
+    let via_lid = chat_store
+        .message(&jid(PEER_LID), "OUT-SPLIT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(via_lid.status, MessageStatus::Read);
+}
+
+/// The mirror direction: LID-keyed rows, PN-keyed receipt.
+#[tokio::test]
+async fn pn_receipt_advances_lid_keyed_rows() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-L",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [read_receipt(PEER, vec!["OUT-L"], 1_700_000_200)],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&jid(PEER_LID), "OUT-L")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+}
+
+/// Without a mapping the receipt still can't be attributed (the pre-fix
+/// behavior); once the mapping is learned, a replayed receipt heals the row.
+#[tokio::test]
+async fn receipt_heals_once_mapping_is_learned() {
+    let (store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-H",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [read_receipt(PEER_LID, vec!["OUT-H"], 1_700_000_200)],
+    )
+    .await;
+    let msg = chat_store.message(&chat, "OUT-H").await.unwrap().unwrap();
+    assert_eq!(msg.status, MessageStatus::Pending);
+
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [read_receipt(PEER_LID, vec!["OUT-H"], 1_700_000_300)],
+    )
+    .await;
+    let msg = chat_store.message(&chat, "OUT-H").await.unwrap().unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+}
+
+/// With the mapping known up front, a brand-new chat is keyed by the LID (WA
+/// Web `selectChatForOneOnOneMessage`) even when addressed by phone number,
+/// so later LID-keyed receipts hit exactly.
+#[tokio::test]
+async fn known_mapping_keys_new_chat_by_lid() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-NEW",
+            &wa::Message::text("primeira"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [read_receipt(PEER_LID, vec!["OUT-NEW"], 1_700_000_200)],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, jid(PEER_LID));
+    // The embedder still addresses (and reads) by phone number.
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-NEW")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+}
+
+/// An inbound LID-addressed message joins the peer's existing PN-keyed
+/// thread instead of opening a twin chat.
+#[tokio::test]
+async fn inbound_lid_message_joins_existing_pn_thread() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("antes"),
+            incoming_info(PEER, PEER, "MSG-P1", 1_700_000_000),
+        )],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("depois"),
+            incoming_info(PEER_LID, PEER_LID, "MSG-L1", 1_700_000_100),
+        )],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, jid(PEER));
+    assert_eq!(chats[0].unread_count, 2);
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("depois"));
+    let messages = chat_store.messages(&jid(PEER_LID), None, 10).await.unwrap();
+    assert_eq!(messages.len(), 2);
+}
+
+/// A read-self receipt arriving LID-keyed clears the PN-keyed thread's badge
+/// instead of materializing an empty @lid chat row.
+#[tokio::test]
+async fn lid_read_self_clears_pn_thread_badge() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("um"),
+                incoming_info(PEER, PEER, "MSG-RS-A", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("dois"),
+                incoming_info(PEER, PEER, "MSG-RS-B", 1_700_000_010),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    feed(
+        &chat_store,
+        [Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER_LID),
+                    sender: jid(PEER_LID),
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-RS-A".to_string(), "MSG-RS-B".to_string()])
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, jid(PEER));
+    assert_eq!(chats[0].unread_count, 0);
+}
+
+/// Splits left behind by the pre-fix behavior merge on demand: messages fold
+/// into the newer-activity side, the badge is recounted, sticky prefs
+/// survive, and the repair is idempotent.
+#[tokio::test]
+async fn reconcile_merges_split_pair() {
+    let (store, chat_store) = test_store().await;
+
+    // No mapping yet: two independent chats form (the split).
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("via pn"),
+                incoming_info(PEER, PEER, "MSG-SP-A", 1_700_000_000),
+            ),
+            Event::PinUpdate(
+                wacore::types::events::PinUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                    .action(Box::new(wa::sync_action_value::PinAction {
+                        pinned: Some(true),
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            message_event(
+                wa::Message::text("via lid"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-SP-B", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 2);
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    // Newest activity was on the LID side, so that key survives.
+    assert_eq!(chats[0].jid, jid(PEER_LID));
+    assert_eq!(chats[0].unread_count, 2);
+    assert!(chats[0].pinned_at.is_some());
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("via lid"));
+    let messages = chat_store.messages(&jid(PEER), None, 10).await.unwrap();
+    assert_eq!(messages.len(), 2);
+
+    // Idempotent.
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].unread_count, 2);
+}
+
+/// The same message stored under both keys keeps the most advanced status
+/// after the merge.
+#[tokio::test]
+async fn merge_advances_duplicate_row_status() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-DUP",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-DUP",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    // Only the LID copy saw the read receipt.
+    feed(
+        &chat_store,
+        [read_receipt(PEER_LID, vec!["OUT-DUP"], 1_700_000_200)],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    // PN side had the newer activity, so it is the surviving key…
+    assert_eq!(chats[0].jid, jid(PEER));
+    // …and the duplicate's Read status survived onto it.
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-DUP")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+}
+
+/// A reaction addressed by the peer's other identity lands on the stored
+/// message (routing picks the existing thread).
+#[tokio::test]
+async fn lid_reaction_reaches_pn_keyed_message() {
+    let (store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("alvo"),
+            incoming_info(PEER, PEER, "MSG-R1", 1_700_000_000),
+        )],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+
+    let reaction = wa::Message {
+        reaction_message: MessageField::some(wa::message::ReactionMessage {
+            key: MessageField::some(wa::MessageKey {
+                remote_jid: Some(PEER_LID.to_string()),
+                from_me: Some(false),
+                id: Some("MSG-R1".to_string()),
+                ..Default::default()
+            }),
+            text: Some("👍".to_string()),
+            sender_timestamp_ms: Some(1_700_000_100_000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            reaction,
+            incoming_info(PEER_LID, PEER_LID, "MSG-R1-REACT", 1_700_000_100),
+        )],
+    )
+    .await;
+
+    let reactions = chat_store.reactions(&jid(PEER), "MSG-R1").await.unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+    // No twin chat was opened for the reaction.
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 1);
+}
