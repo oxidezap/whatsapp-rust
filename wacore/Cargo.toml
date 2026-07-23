@@ -71,7 +71,7 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
-md5 = "0.8.0"
+md5 = "0.8.1"
 metrics = { workspace = true, optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
