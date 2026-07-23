@@ -110,6 +110,70 @@ async fn live_text_message_materializes_chat_and_message() {
 }
 
 #[tokio::test]
+async fn business_verified_name_is_learned_from_live_messages() {
+    let (_store, chat_store) = test_store().await;
+
+    let mut info = incoming_info(PEER, PEER, "MSG-BIZ-1", 1_700_000_000);
+    info.verified_name = Some(Box::new(wacore::stanza::business::VerifiedName {
+        name: Some("Fictitious Biz Ltd".into()),
+        serial: Some("12345".into()),
+        issuer: Some("smb:wa".into()),
+        certificate: None,
+    }));
+    feed(
+        &chat_store,
+        [message_event(wa::Message::text("promo"), info)],
+    )
+    .await;
+
+    let contact = chat_store.contact(&jid(PEER)).await.unwrap().unwrap();
+    assert_eq!(contact.business_name.as_deref(), Some("Fictitious Biz Ltd"));
+    // No address-book or push name: the verified name is the display name.
+    assert_eq!(contact.display_name(), Some("Fictitious Biz Ltd"));
+}
+
+#[tokio::test]
+async fn later_message_without_verified_name_keeps_business_name() {
+    let (_store, chat_store) = test_store().await;
+
+    let mut info = incoming_info(PEER, PEER, "MSG-BIZ-2", 1_700_000_000);
+    info.verified_name = Some(Box::new(wacore::stanza::business::VerifiedName {
+        name: Some("Fictitious Biz Ltd".into()),
+        serial: None,
+        issuer: None,
+        certificate: None,
+    }));
+    let plain = incoming_info(PEER, PEER, "MSG-BIZ-3", 1_700_000_100);
+    feed(
+        &chat_store,
+        [
+            message_event(wa::Message::text("promo"), info),
+            message_event(wa::Message::text("follow-up"), plain),
+        ],
+    )
+    .await;
+
+    let contact = chat_store.contact(&jid(PEER)).await.unwrap().unwrap();
+    assert_eq!(contact.business_name.as_deref(), Some("Fictitious Biz Ltd"));
+}
+
+#[tokio::test]
+async fn nameless_verified_cert_creates_no_contact_row() {
+    let (_store, chat_store) = test_store().await;
+
+    let mut info = incoming_info(PEER, PEER, "MSG-BIZ-4", 1_700_000_000);
+    info.verified_name = Some(Box::new(wacore::stanza::business::VerifiedName {
+        name: None,
+        serial: None,
+        issuer: None,
+        certificate: Some(vec![0xff, 0x13]),
+    }));
+    feed(&chat_store, [message_event(wa::Message::text("hi"), info)]).await;
+
+    assert!(chat_store.contact(&jid(PEER)).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn outgoing_status_advances_monotonically() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
