@@ -1164,7 +1164,7 @@ fn expand_wire_enum_int(
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);
@@ -1177,7 +1177,7 @@ fn expand_wire_enum_int(
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);
@@ -1190,7 +1190,7 @@ fn expand_wire_enum_int(
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);

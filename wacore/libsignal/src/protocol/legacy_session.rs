@@ -148,7 +148,9 @@ pub struct LegacySessionV1 {
 pub struct LegacySessionRatchetV1 {
     pub key_pair: LegacySessionKeyPairV1,
     pub last_remote_ephemeral_key: Bytes,
-    pub previous_counter: u32,
+    /// v1 seeds sending chains at counter -1, so a ratchet step over a chain
+    /// that never sent persists -1 here; import floors it at zero.
+    pub previous_counter: i64,
     pub root_key: Bytes,
 }
 
@@ -412,8 +414,8 @@ pub enum LegacySessionInteropError {
     InvalidPendingPreKeyRole { session: usize },
     #[error("legacy session {session} pending pre-key does not match its base key")]
     PendingPreKeyBaseMismatch { session: usize },
-    #[error("legacy session {session} signed pre-key id is out of range")]
-    InvalidSignedPreKeyId { session: usize },
+    #[error("legacy session {session} is missing its signed pre-key id")]
+    MissingSignedPreKeyId { session: usize },
     #[error("legacy session {session} chain {chain} has too many skipped message keys")]
     TooManyMessageKeys { session: usize, chain: usize },
     #[error("canonical session {session} exceeds the receiver-chain limit")]
@@ -671,6 +673,12 @@ fn import_session(
         public: sender_ratchet_public,
         private: sender_ratchet_private,
     } = key_pair;
+
+    let previous_counter = match previous_counter {
+        -1 => 0,
+        value => u32::try_from(value)
+            .map_err(|_| LegacySessionInteropError::InvalidChainCounter(value))?,
+    };
 
     let sender_index = chains
         .iter()
@@ -1057,6 +1065,15 @@ fn project_session(
         .pending_pre_key
         .map(|pending| project_pending_pre_key(pending, session_index))
         .transpose()?;
+    // The importer rejects this mismatch, so emitting it would produce v1
+    // state that cannot be loaded back.
+    if let Some(pending) = pending_pre_key.as_ref()
+        && pending.base_key != base_key
+    {
+        return Err(LegacySessionInteropError::PendingPreKeyBaseMismatch {
+            session: session_index,
+        });
+    }
     let base_key_role = if pending_pre_key.is_some() {
         LegacySessionBaseKeyRoleV1::Local
     } else {
@@ -1108,7 +1125,7 @@ fn project_session(
                 private: sender_ratchet_private,
             },
             last_remote_ephemeral_key,
-            previous_counter,
+            previous_counter: i64::from(previous_counter),
             root_key,
         },
         index: LegacySessionIndexV1 {
@@ -1137,7 +1154,7 @@ fn project_pending_pre_key(
     let signed_pre_key_id = pending
         .signed_pre_key_id
         .map(|value| value as u32)
-        .ok_or(LegacySessionInteropError::InvalidSignedPreKeyId { session })?;
+        .ok_or(LegacySessionInteropError::MissingSignedPreKeyId { session })?;
     Ok(LegacySessionPendingPreKeyV1 {
         pre_key_id: pending.pre_key_id,
         signed_pre_key_id,
@@ -1282,7 +1299,7 @@ mod tests {
                     private: vec![seed.wrapping_add(4); 32].into(),
                 },
                 last_remote_ephemeral_key: public_key(remote_ratchet),
-                previous_counter: u32::from(seed),
+                previous_counter: i64::from(seed),
                 root_key: vec![seed.wrapping_add(5); 32].into(),
             },
             index: LegacySessionIndexV1 {
@@ -1990,6 +2007,68 @@ mod tests {
         assert!(matches!(
             native.into_legacy_session_v1_operational(),
             Err(LegacySessionInteropError::InvalidCanonicalReceiverChainCount { .. })
+        ));
+    }
+
+    #[test]
+    fn previous_counter_floor_matches_the_reference_ratchet_seed() {
+        let mut seeded = reference_session(30, LegacySessionDispositionV1::Current);
+        seeded.ratchet.previous_counter = -1;
+        let canonical = record(vec![seeded])
+            .into_session_record(local_context())
+            .expect("import seeded previous counter");
+        let components = canonical.into_components().expect("components");
+        assert_eq!(
+            components
+                .current_session
+                .expect("current")
+                .previous_counter,
+            Some(0)
+        );
+
+        let mut corrupt = reference_session(31, LegacySessionDispositionV1::Current);
+        corrupt.ratchet.previous_counter = -2;
+        assert!(matches!(
+            record(vec![corrupt]).into_session_record(local_context()),
+            Err(LegacySessionInteropError::InvalidChainCounter(-2))
+        ));
+    }
+
+    #[test]
+    fn operational_projection_rejects_a_mismatched_pending_pre_key_base() {
+        let mut components = canonical_components(72);
+        let current = components.current_session.as_mut().expect("current");
+        let mut wrong_base = current.alice_base_key.clone().expect("base key");
+        wrong_base[1] ^= 0x01;
+        current.pending_pre_key = Some(PendingPreKeyComponents {
+            pre_key_id: None,
+            signed_pre_key_id: Some(1),
+            base_key: Some(wrong_base),
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
+        });
+        let native = SessionRecord::from_components(components).expect("canonical record");
+        assert!(matches!(
+            native.into_legacy_session_v1_operational(),
+            Err(LegacySessionInteropError::PendingPreKeyBaseMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn operational_projection_requires_a_signed_pre_key_id() {
+        let mut components = canonical_components(73);
+        let current = components.current_session.as_mut().expect("current");
+        current.pending_pre_key = Some(PendingPreKeyComponents {
+            pre_key_id: None,
+            signed_pre_key_id: None,
+            base_key: current.alice_base_key.clone(),
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
+        });
+        let native = SessionRecord::from_components(components).expect("canonical record");
+        assert!(matches!(
+            native.into_legacy_session_v1_operational(),
+            Err(LegacySessionInteropError::MissingSignedPreKeyId { .. })
         ));
     }
 
