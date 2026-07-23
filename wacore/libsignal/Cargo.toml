@@ -7,6 +7,11 @@ license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Signal Protocol implementation for the WhatsApp platform"
 
+[features]
+# Typed interop with the decoded libsignal SessionRecord v1 model. Off by
+# default so native consumers carry no migration surface.
+legacy-session-interop = []
+
 [dependencies]
 aes = { workspace = true }
 arrayref = "0.3.9"

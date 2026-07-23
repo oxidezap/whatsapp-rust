@@ -22,6 +22,7 @@ mod crypto;
 pub mod error;
 mod group_cipher;
 mod identity_key;
+#[cfg(feature = "legacy-session-interop")]
 mod legacy_session;
 mod local_field;
 #[allow(clippy::module_inception)]
@@ -49,6 +50,7 @@ pub use group_cipher::{
     process_sender_key_distribution_message,
 };
 pub use identity_key::{IdentityKey, IdentityKeyPair};
+#[cfg(feature = "legacy-session-interop")]
 pub use legacy_session::{
     LegacyIndexedSessionV1, LegacySessionBaseKeyRoleV1, LegacySessionChainCounterV1,
     LegacySessionChainKeyV1, LegacySessionChainRoleV1, LegacySessionChainV1,
