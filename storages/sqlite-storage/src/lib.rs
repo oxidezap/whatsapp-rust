@@ -9,4 +9,4 @@ mod sqlite_store;
 mod wire;
 
 pub use shared::SharedSqlite;
-pub use sqlite_store::{SqliteStore, SqliteStoreConfig, Synchronous};
+pub use sqlite_store::{ConnectionInitHook, SqliteStore, SqliteStoreConfig, Synchronous};
