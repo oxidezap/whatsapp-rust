@@ -70,6 +70,22 @@ pub(crate) fn message_kind(base: &wa::Message) -> &'static str {
         "event"
     } else if base.group_invite_message.is_set() {
         "group_invite"
+    } else if base.template_message.is_set() {
+        "template"
+    } else if base.template_button_reply_message.is_set() {
+        "template_reply"
+    } else if base.buttons_message.is_set() {
+        "buttons"
+    } else if base.buttons_response_message.is_set() {
+        "buttons_response"
+    } else if base.list_message.is_set() {
+        "list"
+    } else if base.list_response_message.is_set() {
+        "list_response"
+    } else if base.interactive_message.is_set() {
+        "interactive"
+    } else if base.interactive_response_message.is_set() {
+        "interactive_response"
     } else {
         "unknown"
     }
@@ -137,7 +153,51 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
 pub(crate) fn extract_text(base: &wa::Message) -> Option<String> {
     base.text_content()
         .or_else(|| base.get_caption())
+        .or_else(|| business_text(base))
         .map(str::to_owned)
+}
+
+/// Body text of the business content carriers. Extraction mirrors WA Web's
+/// per-type parsers; footers/buttons stay display-side (readable from the proto).
+fn business_text(base: &wa::Message) -> Option<&str> {
+    if let Some(tpl) = base.template_message.as_option() {
+        use wa::message::template_message::Format;
+        // WA Web reads hydratedTemplate ?? format's hydratedFourRowTemplate.
+        return tpl
+            .hydrated_template
+            .as_option()
+            .or_else(|| match tpl.format.as_ref() {
+                Some(Format::HydratedFourRowTemplate(t)) => Some(t.as_ref()),
+                _ => None,
+            })
+            .and_then(|t| t.hydrated_content_text.as_deref());
+    }
+    if let Some(reply) = base.template_button_reply_message.as_option() {
+        return reply.selected_display_text.as_deref();
+    }
+    if let Some(buttons) = base.buttons_message.as_option() {
+        return buttons.content_text.as_deref();
+    }
+    if let Some(resp) = base.buttons_response_message.as_option() {
+        use wa::message::buttons_response_message::Response;
+        return match resp.response.as_ref() {
+            Some(Response::SelectedDisplayText(text)) => Some(text.as_str()),
+            None => None,
+        };
+    }
+    if let Some(list) = base.list_message.as_option() {
+        return list.description.as_deref();
+    }
+    if let Some(resp) = base.list_response_message.as_option() {
+        return resp.title.as_deref();
+    }
+    if let Some(interactive) = base.interactive_message.as_option() {
+        return interactive.body.as_option().and_then(|b| b.text.as_deref());
+    }
+    if let Some(resp) = base.interactive_response_message.as_option() {
+        return resp.body.as_option().and_then(|b| b.text.as_deref());
+    }
+    None
 }
 
 /// Whether the unwrapped message carries anything a chat log should show.
@@ -196,6 +256,170 @@ mod tests {
             }
             other => panic!("expected Store, got {other:?}"),
         }
+    }
+
+    fn store_result(msg: &wa::Message) -> (&'static str, Option<String>) {
+        match classify(msg) {
+            MessageOp::Store { kind, text } => (kind, text),
+            other => panic!("expected Store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_hydrated_template_via_field() {
+        let msg = wa::Message {
+            template_message: MessageField::some(wa::message::TemplateMessage {
+                hydrated_template: MessageField::some(
+                    wa::message::template_message::HydratedFourRowTemplate {
+                        hydrated_content_text: Some("Dear customer, your bill is ready".into()),
+                        hydrated_footer_text: Some("footer stays display-side".into()),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (kind, text) = store_result(&msg);
+        assert_eq!(kind, "template");
+        assert_eq!(text.as_deref(), Some("Dear customer, your bill is ready"));
+    }
+
+    #[test]
+    fn classifies_hydrated_template_via_format_oneof() {
+        use wa::message::template_message::Format;
+        let msg = wa::Message {
+            template_message: MessageField::some(wa::message::TemplateMessage {
+                format: Some(Format::HydratedFourRowTemplate(Box::new(
+                    wa::message::template_message::HydratedFourRowTemplate {
+                        hydrated_content_text: Some("Your OTP is 000000".into()),
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (kind, text) = store_result(&msg);
+        assert_eq!(kind, "template");
+        assert_eq!(text.as_deref(), Some("Your OTP is 000000"));
+    }
+
+    /// Non-hydrated template (placeholders not filled): stored as a template
+    /// row, just without extractable text.
+    #[test]
+    fn template_without_hydrated_content_stores_with_null_text() {
+        use wa::message::template_message::Format;
+        let msg = wa::Message {
+            template_message: MessageField::some(wa::message::TemplateMessage {
+                format: Some(Format::FourRowTemplate(Box::default())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (kind, text) = store_result(&msg);
+        assert_eq!(kind, "template");
+        assert!(text.is_none());
+    }
+
+    #[test]
+    fn classifies_buttons_list_and_interactive_bodies() {
+        let buttons = wa::Message {
+            buttons_message: MessageField::some(wa::message::ButtonsMessage {
+                content_text: Some("Choose an option".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&buttons),
+            ("buttons", Some("Choose an option".to_owned()))
+        );
+
+        let list = wa::Message {
+            list_message: MessageField::some(wa::message::ListMessage {
+                description: Some("Pick a plan".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&list),
+            ("list", Some("Pick a plan".to_owned()))
+        );
+
+        let interactive = wa::Message {
+            interactive_message: MessageField::some(wa::message::InteractiveMessage {
+                body: MessageField::some(wa::message::interactive_message::Body {
+                    text: Some("Confirm your order".into()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&interactive),
+            ("interactive", Some("Confirm your order".to_owned()))
+        );
+    }
+
+    #[test]
+    fn classifies_business_response_messages() {
+        use wa::message::buttons_response_message::Response;
+        let buttons_resp = wa::Message {
+            buttons_response_message: MessageField::some(wa::message::ButtonsResponseMessage {
+                response: Some(Response::SelectedDisplayText("Yes, confirm".into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&buttons_resp),
+            ("buttons_response", Some("Yes, confirm".to_owned()))
+        );
+
+        let list_resp = wa::Message {
+            list_response_message: MessageField::some(wa::message::ListResponseMessage {
+                title: Some("Basic plan".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&list_resp),
+            ("list_response", Some("Basic plan".to_owned()))
+        );
+
+        let tpl_reply = wa::Message {
+            template_button_reply_message: MessageField::some(
+                wa::message::TemplateButtonReplyMessage {
+                    selected_display_text: Some("Track order".into()),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&tpl_reply),
+            ("template_reply", Some("Track order".to_owned()))
+        );
+
+        let interactive_resp = wa::Message {
+            interactive_response_message: MessageField::some(
+                wa::message::InteractiveResponseMessage {
+                    body: MessageField::some(wa::message::interactive_response_message::Body {
+                        text: Some("flow reply".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            store_result(&interactive_resp),
+            ("interactive_response", Some("flow reply".to_owned()))
+        );
     }
 
     #[test]
