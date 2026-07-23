@@ -350,6 +350,7 @@ pub const MESSENGER_SERVER: &str = "msgr";
 pub const INTEROP_SERVER: &str = "interop";
 pub const BOT_SERVER: &str = "bot";
 pub const STATUS_BROADCAST_USER: &str = "status";
+pub const PSA_USER: &str = "0";
 
 pub type MessageId = String;
 pub type MessageServerId = i32;
@@ -418,6 +419,13 @@ pub trait JidExt {
 
     fn is_status_broadcast(&self) -> bool {
         self.server() == Server::Broadcast && self.user() == STATUS_BROADCAST_USER
+    }
+
+    /// The system/announcements account (`0@s.whatsapp.net` / `0@c.us`).
+    /// It never answers user-directed IQs, so requests must be short-circuited
+    /// client-side (WA Web excludes it via `isPSA` before hitting the server).
+    fn is_psa(&self) -> bool {
+        matches!(self.server(), Server::Pn | Server::Legacy) && self.user() == PSA_USER
     }
 
     fn is_bot(&self) -> bool {
@@ -1207,6 +1215,21 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn is_psa_matches_system_jid_in_both_user_namespaces() {
+        assert!(Jid::from_str("0@s.whatsapp.net").unwrap().is_psa());
+        assert!(Jid::from_str("0@c.us").unwrap().is_psa());
+        assert!(parse_jid_ref("0@s.whatsapp.net").unwrap().is_psa());
+    }
+
+    #[test]
+    fn is_psa_rejects_regular_and_non_pn_jids() {
+        assert!(!Jid::from_str("10@s.whatsapp.net").unwrap().is_psa());
+        assert!(!Jid::from_str("0@lid").unwrap().is_psa());
+        assert!(!Jid::from_str("status@broadcast").unwrap().is_psa());
+        assert!(!Jid::from_str("0@g.us").unwrap().is_psa());
+    }
 
     #[test]
     fn display_eq_matches_owned_and_borrowed_jids_without_normalizing() {

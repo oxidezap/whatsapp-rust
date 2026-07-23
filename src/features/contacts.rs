@@ -209,6 +209,12 @@ impl<'a> Contacts<'a> {
         preview: bool,
         timeout: Option<Duration>,
     ) -> Result<Option<ProfilePicture>, ContactError> {
+        // The system JID never answers this IQ, so sending would burn the whole
+        // request timeout; WA Web resolves it locally without a server round-trip.
+        if jid.is_psa() {
+            return Ok(None);
+        }
+
         debug!(
             "get_profile_picture: fetching {} picture for {}",
             if preview { "preview" } else { "full" },
@@ -263,37 +269,42 @@ impl<'a> Contacts<'a> {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, UserInfo>, ContactError> {
-        if jids.is_empty() {
+        // Usync never targets the system JID (WA Web filters it out before
+        // querying), so drop it here instead of asking about a user that can't answer.
+        let queried: Vec<Jid> = jids.iter().filter(|jid| !jid.is_psa()).cloned().collect();
+        if queried.is_empty() {
             return Ok(HashMap::new());
         }
 
-        debug!("get_user_info: fetching info for {} JIDs", jids.len());
+        debug!("get_user_info: fetching info for {} JIDs", queried.len());
 
         let request_id = self.client.generate_request_id();
-        let mut spec = UserInfoSpec::new(jids.to_vec(), request_id);
 
         // Attach per-user tctokens so the status/about of privacy-restricted
         // contacts is returned, matching WA Web's USyncStatusProtocol.getUserElement.
+        let mut tc_tokens: HashMap<String, Vec<u8>> = HashMap::new();
         if self
             .client
             .ab_props()
             .is_enabled(wacore::iq::abprops::web::PROFILE_SCRAPING_PRIVACY_TOKEN_IN_ABOUT_USYNC)
             .await
         {
-            let lookups = futures::future::join_all(jids.iter().map(|jid| async move {
+            let lookups = futures::future::join_all(queried.iter().map(|jid| async move {
                 (
                     jid.to_non_ad().to_string(),
                     self.client.lookup_tc_token_for_jid(jid).await,
                 )
             }))
             .await;
-            let tc_tokens: HashMap<String, Vec<u8>> = lookups
+            tc_tokens = lookups
                 .into_iter()
                 .filter_map(|(key, token)| token.map(|t| (key, t)))
                 .collect();
-            if !tc_tokens.is_empty() {
-                spec = spec.with_tc_tokens(tc_tokens);
-            }
+        }
+
+        let mut spec = UserInfoSpec::new(queried, request_id);
+        if !tc_tokens.is_empty() {
+            spec = spec.with_tc_tokens(tc_tokens);
         }
 
         let info = self.client.execute(spec).await?;
@@ -339,5 +350,58 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("only supports PN and LID JIDs"));
+    }
+
+    fn psa_jid() -> Jid {
+        Jid::pn("0")
+    }
+
+    #[tokio::test]
+    async fn profile_picture_for_system_jid_short_circuits_without_iq() {
+        let client = crate::test_utils::create_test_client().await;
+
+        let result = client
+            .contacts()
+            .get_profile_picture(&psa_jid(), false)
+            .await;
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn profile_picture_for_regular_jid_still_hits_the_wire() {
+        let client = crate::test_utils::create_test_client().await;
+
+        // Disconnected client: reaching the send path is what produces this error,
+        // proving the short-circuit is scoped to the system JID.
+        let err = client
+            .contacts()
+            .get_profile_picture(&Jid::pn("15550000001"), false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ContactError::Iq(IqError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn user_info_with_only_system_jid_returns_empty_without_iq() {
+        let client = crate::test_utils::create_test_client().await;
+
+        let info = client.contacts().get_user_info(&[psa_jid()]).await.unwrap();
+
+        assert!(info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_info_still_queries_remaining_jids_after_filtering() {
+        let client = crate::test_utils::create_test_client().await;
+
+        let err = client
+            .contacts()
+            .get_user_info(&[psa_jid(), Jid::pn("15550000001")])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ContactError::Iq(IqError::NotConnected)));
     }
 }
