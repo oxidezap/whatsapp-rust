@@ -8,7 +8,9 @@ pub mod traits;
 
 // Re-export from the sqlite-storage crate when the feature is enabled
 #[cfg(feature = "sqlite-storage")]
-pub use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig, Synchronous};
+pub use whatsapp_rust_sqlite_storage::{
+    ConnectionInitHook, SqliteStore, SqliteStoreConfig, Synchronous,
+};
 
 pub use crate::store::traits::*;
 use std::ops::{Deref, DerefMut};

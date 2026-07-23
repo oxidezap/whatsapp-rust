@@ -123,6 +123,24 @@ impl Synchronous {
     }
 }
 
+/// Per-connection initialization hook, run at the start of `on_acquire` — before any
+/// of the store's own pragmas, and (because WAL setup and migrations run on a pooled
+/// connection) before those too. This ordering is what makes the hook usable for
+/// SQLCipher-style keying, where `PRAGMA key` must be the first statement on a fresh
+/// connection; it equally serves loading extensions or custom per-connection pragmas.
+///
+/// The hook must be idempotent per connection and cheap: r2d2 calls it once for every
+/// connection it opens, including replacements after errors. Return `Err` to reject
+/// the connection (surfaces as a pool/build error) — e.g. when key verification
+/// (`SELECT count(*) FROM sqlite_master`) fails on a wrongly-keyed database.
+pub type ConnectionInitHook = Arc<
+    dyn Fn(
+            &mut SqliteConnection,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + Sync,
+>;
+
 /// Per-store connection tuning. [`Default`] is a low-memory profile sized for one
 /// `SqliteStore` per WhatsApp session on a single process: a single pooled connection
 /// (operations are serialized internally, so a second would only idle) sharing one
@@ -154,6 +172,10 @@ pub struct SqliteStoreConfig {
     /// r2d2 connection-management thread pool. `None` shares one process-wide pool so many
     /// stores don't each spawn their own threads.
     pub thread_pool: Option<Arc<scheduled_thread_pool::ScheduledThreadPool>>,
+    /// Optional hook run first on every new pooled connection, before the store's own
+    /// pragmas, WAL setup, and migrations. See [`ConnectionInitHook`] for the contract;
+    /// set via [`SqliteStoreConfig::with_connection_init`].
+    pub connection_init: Option<ConnectionInitHook>,
 }
 
 impl Default for SqliteStoreConfig {
@@ -165,6 +187,7 @@ impl Default for SqliteStoreConfig {
             busy_timeout: Duration::from_secs(30),
             synchronous: Synchronous::Normal,
             thread_pool: None,
+            connection_init: None,
         }
     }
 }
@@ -177,14 +200,64 @@ impl SqliteStoreConfig {
         self.mmap_size = Some(bytes);
         self
     }
+
+    /// Install a per-connection init hook, run before the store's pragmas, WAL setup,
+    /// and migrations on every pooled connection (see [`ConnectionInitHook`]).
+    ///
+    /// The canonical use is SQLCipher keying, where the key must be applied — and
+    /// ideally verified — before anything else touches the database:
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+    /// use diesel::prelude::*;
+    ///
+    /// let config = SqliteStoreConfig::default().with_connection_init(move |conn| {
+    ///     diesel::sql_query("PRAGMA key = 'my-passphrase';").execute(conn)?;
+    ///     // Verify the key: this fails on a wrongly-keyed database.
+    ///     diesel::sql_query("SELECT count(*) FROM sqlite_master;").execute(conn)?;
+    ///     Ok(())
+    /// });
+    /// ```
+    ///
+    /// Linking a SQLCipher-enabled SQLite is the caller's responsibility: disable this
+    /// crate's default `bundled-sqlite` feature and depend on `libsqlite3-sys` with a
+    /// SQLCipher build (e.g. its `bundled-sqlcipher` feature) instead.
+    pub fn with_connection_init<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(
+                &mut SqliteConnection,
+            ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.connection_init = Some(Arc::new(hook));
+        self
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ConnectionOptions {
     cache_size_kib: u32,
     mmap_size: Option<u64>,
     busy_timeout_ms: u64,
     synchronous: Synchronous,
+    connection_init: Option<ConnectionInitHook>,
+}
+
+impl std::fmt::Debug for ConnectionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionOptions")
+            .field("cache_size_kib", &self.cache_size_kib)
+            .field("mmap_size", &self.mmap_size)
+            .field("busy_timeout_ms", &self.busy_timeout_ms)
+            .field("synchronous", &self.synchronous)
+            .field(
+                "connection_init",
+                &self.connection_init.as_ref().map(|_| ()),
+            )
+            .finish()
+    }
 }
 
 impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
@@ -194,6 +267,13 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
         &self,
         conn: &mut SqliteConnection,
     ) -> std::result::Result<(), diesel::r2d2::Error> {
+        // Must run before any pragma: SQLCipher-style hooks can't have the pool touch
+        // the database (even pragmas) before the connection is keyed.
+        if let Some(init) = &self.connection_init {
+            init(conn).map_err(|e| {
+                diesel::r2d2::Error::QueryError(diesel::result::Error::QueryBuilderError(e))
+            })?;
+        }
         // cache_size negative = KiB (page-size independent). temp_store/foreign_keys are
         // fixed: they guard correctness, not memory, so they're not user-tunable.
         let mut pragmas = vec![
@@ -318,6 +398,7 @@ impl SqliteStore {
                 config.busy_timeout.as_millis().clamp(1, i32::MAX as u128) as u64
             },
             synchronous: config.synchronous,
+            connection_init: config.connection_init,
         };
 
         // r2d2's build() synchronously opens the pool's initial connection, so build the
@@ -3758,6 +3839,7 @@ mod tests {
                     .num_threads(1)
                     .build(),
             )),
+            connection_init: None,
         };
         let store = SqliteStore::with_config(&db_name, config)
             .await
@@ -3804,6 +3886,115 @@ mod tests {
         assert_eq!(cs.cache, -4096, "cache_size_kib applied as negative KiB");
         assert_eq!(cs.sync, 2, "synchronous = FULL");
         assert_eq!(busy.timeout, 7000, "busy_timeout = 7s");
+    }
+
+    #[tokio::test]
+    async fn connection_init_runs_before_pragmas_and_migrations() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_name = format!(
+            "file:memdb_init_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
+        );
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let saw_migrations_table = Arc::new(AtomicBool::new(false));
+        let saw_store_pragmas = Arc::new(AtomicBool::new(false));
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let config = {
+            let calls = calls.clone();
+            let saw_migrations_table = saw_migrations_table.clone();
+            let saw_store_pragmas = saw_store_pragmas.clone();
+            SqliteStoreConfig::default().with_connection_init(move |conn| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let migrated: Count = diesel::sql_query(
+                    "SELECT count(*) AS n FROM sqlite_master \
+                     WHERE name = '__diesel_schema_migrations'",
+                )
+                .get_result(conn)?;
+                if migrated.n > 0 {
+                    saw_migrations_table.store(true, Ordering::Relaxed);
+                }
+                // busy_timeout is still SQLite's default (0) here: the store's own
+                // pragmas (30s default) haven't run yet.
+                let busy: Count = diesel::sql_query("SELECT timeout AS n FROM pragma_busy_timeout")
+                    .get_result(conn)?;
+                if busy.n != 0 {
+                    saw_store_pragmas.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            })
+        };
+
+        let store = SqliteStore::with_config(&db_name, config)
+            .await
+            .expect("store with connection_init");
+
+        assert!(calls.load(Ordering::Relaxed) >= 1, "hook ran");
+        assert!(
+            !saw_migrations_table.load(Ordering::Relaxed),
+            "hook ran before migrations on the first connection"
+        );
+        assert!(
+            !saw_store_pragmas.load(Ordering::Relaxed),
+            "hook ran before the store's own pragmas"
+        );
+
+        // The store still works normally after the hook.
+        let mac = AppStateMutationMAC {
+            index_mac: vec![3u8; 32],
+            value_mac: vec![4u8; 32],
+        };
+        store
+            .put_app_state_mutation_macs_for_device("ci", 1, std::slice::from_ref(&mac), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_app_state_mutation_mac_for_device("ci", &mac.index_mac, 1)
+                .await
+                .unwrap(),
+            Some(mac.value_mac)
+        );
+    }
+
+    #[test]
+    fn connection_init_error_rejects_connection_before_pragmas() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("raw connection");
+        let options = ConnectionOptions {
+            cache_size_kib: 512,
+            mmap_size: None,
+            busy_timeout_ms: 30_000,
+            synchronous: Synchronous::Normal,
+            connection_init: Some(Arc::new(|_conn: &mut SqliteConnection| {
+                Err("wrong key".into())
+            })),
+        };
+
+        use diesel::r2d2::CustomizeConnection;
+        let err = options
+            .on_acquire(&mut conn)
+            .expect_err("hook error surfaces");
+        assert!(err.to_string().contains("wrong key"));
+
+        // The failure short-circuited before the store's pragmas ran.
+        #[derive(diesel::QueryableByName)]
+        struct Busy {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            timeout: i64,
+        }
+        let busy: Busy = diesel::sql_query("PRAGMA busy_timeout")
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(busy.timeout, 0);
     }
 
     #[tokio::test]
