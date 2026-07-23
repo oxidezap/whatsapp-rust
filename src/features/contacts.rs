@@ -209,8 +209,7 @@ impl<'a> Contacts<'a> {
         preview: bool,
         timeout: Option<Duration>,
     ) -> Result<Option<ProfilePicture>, ContactError> {
-        // The system JID never answers this IQ, so sending would burn the whole
-        // request timeout; WA Web resolves it locally without a server round-trip.
+        // The system JID never answers this IQ; skip it to save the full timeout.
         if jid.is_psa() {
             return Ok(None);
         }
@@ -269,8 +268,7 @@ impl<'a> Contacts<'a> {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, UserInfo>, ContactError> {
-        // Usync never targets the system JID (WA Web filters it out before
-        // querying), so drop it here instead of asking about a user that can't answer.
+        // The system JID is not usync-eligible and would never answer.
         let queried: Vec<Jid> = jids.iter().filter(|jid| !jid.is_psa()).cloned().collect();
         if queried.is_empty() {
             return Ok(HashMap::new());
@@ -376,7 +374,7 @@ mod tests {
         // proving the short-circuit is scoped to the system JID.
         let err = client
             .contacts()
-            .get_profile_picture(&Jid::pn("15550000001"), false)
+            .get_profile_picture(&Jid::pn("12025550111"), false)
             .await
             .unwrap_err();
 
@@ -398,7 +396,7 @@ mod tests {
 
         let err = client
             .contacts()
-            .get_user_info(&[psa_jid(), Jid::pn("15550000001")])
+            .get_user_info(&[psa_jid(), Jid::pn("12025550111")])
             .await
             .unwrap_err();
 
