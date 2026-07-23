@@ -553,7 +553,8 @@ fn is_option_type(ty: &syn::Type) -> bool {
 //   3. int          (enum has #[wire(kind = "int")])
 //      Unit variants + optional #[wire_fallback] tuple with i32. Each variant
 //      has #[wire = NUM].
-//      Emits: code(), From<i32>, Serialize (as i32), Deserialize (from i32).
+//      Emits: code(), Serialize (as i32), Deserialize (from i32), and either
+//             From<i32> with a fallback or strict TryFrom<i32> without one.
 //
 // The wire string/number lives exactly once per variant, in the #[wire = ...]
 // attribute. Everything else is derived.
@@ -1158,21 +1159,12 @@ fn expand_wire_enum_int(
         }
     }
 
-    let Some(fb) = fallback else {
-        return syn::Error::new_spanned(
-            name,
-            "int-mode WireEnum requires a #[wire_fallback] variant like Unknown(i32)",
-        )
-        .to_compile_error();
-    };
-    let fb_ident = &fb.ident;
-
     let code_arms: Vec<_> = infos
         .iter()
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);
@@ -1185,7 +1177,7 @@ fn expand_wire_enum_int(
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);
@@ -1193,25 +1185,78 @@ fn expand_wire_enum_int(
         })
         .collect();
 
+    let strict_from_arms: Vec<_> = infos
+        .iter()
+        .filter(|i| !i.is_fallback)
+        .map(|i| {
+            let id = &i.ident;
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
+                unreachable!()
+            };
+            let lit = proc_macro2::Literal::i32_suffixed(*n);
+            quote! { #lit => ::core::result::Result::Ok(#name::#id) }
+        })
+        .collect();
+
+    let conversion = if let Some(fallback) = fallback {
+        let fallback_ident = &fallback.ident;
+        quote! {
+            impl ::core::convert::From<i32> for #name {
+                fn from(code: i32) -> Self {
+                    match code {
+                        #(#from_arms,)*
+                        other => #name::#fallback_ident(other),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl ::core::convert::TryFrom<i32> for #name {
+                type Error = i32;
+
+                fn try_from(code: i32) -> ::core::result::Result<Self, Self::Error> {
+                    match code {
+                        #(#strict_from_arms,)*
+                        other => ::core::result::Result::Err(other),
+                    }
+                }
+            }
+        }
+    };
+
+    let fallback_code_arm = fallback.map(|fallback| {
+        let fallback_ident = &fallback.ident;
+        quote! { #name::#fallback_ident(n) => *n, }
+    });
+
+    let deserialize = if fallback.is_some() {
+        quote! {
+            ::core::result::Result::Ok(<Self as ::core::convert::From<i32>>::from(n))
+        }
+    } else {
+        quote! {
+            <Self as ::core::convert::TryFrom<i32>>::try_from(n).map_err(|unknown| {
+                <D::Error as ::serde::de::Error>::custom(::core::format_args!(
+                    "unknown numeric wire code {unknown} for {}",
+                    ::core::stringify!(#name),
+                ))
+            })
+        }
+    };
+
     quote! {
         impl #name {
             /// Numeric wire code for this variant (single source of truth).
             pub fn code(&self) -> i32 {
                 match self {
                     #(#code_arms,)*
-                    #name::#fb_ident(n) => *n,
+                    #fallback_code_arm
                 }
             }
         }
 
-        impl ::core::convert::From<i32> for #name {
-            fn from(code: i32) -> Self {
-                match code {
-                    #(#from_arms,)*
-                    other => #name::#fb_ident(other),
-                }
-            }
-        }
+        #conversion
 
         impl ::serde::Serialize for #name {
             fn serialize<S: ::serde::Serializer>(
@@ -1227,7 +1272,7 @@ fn expand_wire_enum_int(
                 deserializer: D,
             ) -> ::core::result::Result<Self, D::Error> {
                 let n = <i32 as ::serde::Deserialize>::deserialize(deserializer)?;
-                ::core::result::Result::Ok(<Self as ::core::convert::From<i32>>::from(n))
+                #deserialize
             }
         }
     }

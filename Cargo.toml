@@ -120,6 +120,10 @@ zlib-rs = { version = "0.6.5", default-features = false, features = ["std", "rus
 
 [features]
 debug-snapshots = ["wacore/debug-snapshots"]
+# Typed interop with the decoded legacy SessionRecord v1 model, for migrating
+# externally produced auth state. Off by default so native clients carry no
+# migration surface.
+legacy-session-interop = ["wacore/legacy-session-interop"]
 # Generation-scoped extension lifecycle. Kept opt-in so ordinary clients do not
 # retain lifecycle state or branches when no extension host is present.
 client-lifecycle = []

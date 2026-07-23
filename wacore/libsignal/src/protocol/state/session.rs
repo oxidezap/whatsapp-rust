@@ -91,6 +91,12 @@ pub struct DecryptSnapshot {
     sender_chain: Option<session_structure::Chain>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ReceiverChainState {
+    Open(ChainKey),
+    Closed { next_index: u32 },
+}
+
 impl SessionState {
     pub fn from_session_structure(session: SessionStructure) -> Self {
         Self { session }
@@ -313,6 +319,19 @@ impl SessionState {
         &self,
         sender: &PublicKey,
     ) -> Result<Option<ChainKey>, InvalidSessionError> {
+        match self.receiver_chain_state(sender)? {
+            Some(ReceiverChainState::Open(chain_key)) => Ok(Some(chain_key)),
+            Some(ReceiverChainState::Closed { .. }) => {
+                Err(InvalidSessionError("missing receiver chain key bytes"))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn receiver_chain_state(
+        &self,
+        sender: &PublicKey,
+    ) -> Result<Option<ReceiverChainState>, InvalidSessionError> {
         let Some(idx) = self.get_receiver_chain_index(sender)? else {
             return Ok(None);
         };
@@ -321,17 +340,19 @@ impl SessionState {
             .chain_key
             .as_option()
             .ok_or(InvalidSessionError("missing receiver chain key"))?;
-        let key_bytes = chain_key
-            .key
-            .as_ref()
-            .ok_or(InvalidSessionError("missing receiver chain key bytes"))?;
-        let chain_key_bytes = key_bytes[..]
-            .try_into()
-            .map_err(|_| InvalidSessionError("invalid receiver chain key"))?;
         let index = chain_key
             .index
             .ok_or(InvalidSessionError("missing receiver chain key index"))?;
-        Ok(Some(ChainKey::new(chain_key_bytes, index)))
+        let Some(key_bytes) = chain_key.key.as_ref() else {
+            return Ok(Some(ReceiverChainState::Closed { next_index: index }));
+        };
+        let chain_key_bytes = key_bytes[..]
+            .try_into()
+            .map_err(|_| InvalidSessionError("invalid receiver chain key"))?;
+        Ok(Some(ReceiverChainState::Open(ChainKey::new(
+            chain_key_bytes,
+            index,
+        ))))
     }
 
     pub fn add_receiver_chain(&mut self, sender: &PublicKey, chain_key: &ChainKey) {

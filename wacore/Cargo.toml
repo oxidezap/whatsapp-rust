@@ -19,6 +19,8 @@ ignored = ["getrandom"]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
 debug-snapshots = []
+# Typed interop with the decoded libsignal SessionRecord v1 model.
+legacy-session-interop = ["wacore-libsignal/legacy-session-interop"]
 # Expose the InMemoryBackend fault-injection / call-count hooks used by the e2e
 # suite. Off by default so normal builds carry no extra fields or per-call
 # bookkeeping. Enabled only from test crates.
