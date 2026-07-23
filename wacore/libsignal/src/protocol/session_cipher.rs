@@ -1055,8 +1055,10 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 record.set_session_state(current_state);
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
+                let error = SignalProtocolError::DuplicatedMessage(chain, counter);
+                log_decryption_failure(ciphertext.signal_message(), &current_state, &error);
                 record.set_session_state(current_state);
-                return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
+                return Err(error);
             }
             Err(e) if !ciphertext.is_available() => {
                 // Authentication succeeded, but the provider rejected the
@@ -1162,8 +1164,10 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 idx += 1;
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
+                let error = SignalProtocolError::DuplicatedMessage(chain, counter);
+                log_decryption_failure(ciphertext.signal_message(), &previous, &error);
                 record.restore_previous_session(idx, previous);
-                return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
+                return Err(error);
             }
             Err(e) if !ciphertext.is_available() => {
                 record.restore_previous_session(idx, previous);
