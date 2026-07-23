@@ -1057,6 +1057,11 @@ pub fn parse_message_info(
     let verified_name_serial = attrs
         .optional_u64("verified_name")
         .and_then(|v| i64::try_from(v).ok());
+    // The display name only exists inside the <verified_name> child's cert protobuf.
+    let verified_name = node
+        .get_optional_child("verified_name")
+        .and_then(|vn| crate::stanza::business::VerifiedName::try_from_node(vn).ok())
+        .map(Box::new);
     let peer_recipient_pn = attrs.optional_jid("peer_recipient_pn");
 
     // <meta> child attrs (WAWebHandleMsgParser b()) and <reporting> children
@@ -1127,6 +1132,7 @@ pub fn parse_message_info(
         is_offline,
         server_timestamp_us,
         verified_level,
+        verified_name,
         verified_name_serial,
         peer_recipient_pn,
         meta_info,
@@ -1413,6 +1419,66 @@ mod parse_message_info_tests {
         );
     }
 
+    /// The `<verified_name>` child cert decodes into the business display
+    /// name (WAWebHandleMsgParser reads the same child into
+    /// `verifiedNameCert`; the name lives in the cert's details protobuf).
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn envelope_verified_name_cert_is_decoded() {
+        use buffa::Message;
+        let details = wa::verified_name_certificate::Details {
+            verified_name: Some("Fictitious Biz Ltd".into()),
+            issuer: Some("smb:wa".into()),
+            serial: Some(12345),
+            ..Default::default()
+        };
+        let cert = wa::VerifiedNameCertificate {
+            details: Some(details.encode_to_vec()),
+            ..Default::default()
+        };
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-VN-1")
+            .attr("t", "1777415965")
+            .attr("verified_name", "12345")
+            .children([NodeBuilder::new("verified_name")
+                .attr("v", "2")
+                .bytes(cert.encode_to_vec())
+                .build()])
+            .build();
+
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+
+        let vn = info.verified_name.expect("cert must reach MessageInfo");
+        assert_eq!(vn.name.as_deref(), Some("Fictitious Biz Ltd"));
+        assert_eq!(vn.serial.as_deref(), Some("12345"));
+        assert_eq!(vn.issuer.as_deref(), Some("smb:wa"));
+        assert_eq!(info.verified_name_serial, Some(12345));
+    }
+
+    /// Undecodable cert bytes must not fail message parsing; the node is
+    /// still surfaced, just without a decoded name.
+    #[test]
+    fn envelope_verified_name_bad_cert_does_not_fail_parse() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-VN-2")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("verified_name")
+                .bytes(vec![0xff, 0x00, 0x13, 0x37])
+                .build()])
+            .build();
+
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+
+        let vn = info.verified_name.expect("node presence is surfaced");
+        assert!(vn.name.is_none());
+    }
+
     /// Envelope without any of the optional enrichment attrs leaves all
     /// four fields as `None`. Regression guard against accidentally
     /// defaulting them.
@@ -1429,6 +1495,7 @@ mod parse_message_info_tests {
 
         assert!(info.server_timestamp_us.is_none());
         assert!(info.verified_level.is_none());
+        assert!(info.verified_name.is_none());
         assert!(info.verified_name_serial.is_none());
         assert!(info.peer_recipient_pn.is_none());
     }

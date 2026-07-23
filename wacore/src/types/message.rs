@@ -325,8 +325,10 @@ pub struct MessageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_info: Option<MsgBotInfo>,
     pub meta_info: MsgMetaInfo,
+    /// Decoded `<verified_name>` child cert of business senders; the display
+    /// name is in `.name`. Boxed: most messages carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub verified_name: Option<wa::VerifiedNameCertificate>,
+    pub verified_name: Option<Box<crate::stanza::business::VerifiedName>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_sent_meta: Option<DeviceSentMeta>,
     /// Ephemeral duration in seconds, extracted from `contextInfo.expiration`.

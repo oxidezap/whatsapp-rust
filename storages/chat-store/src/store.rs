@@ -843,6 +843,18 @@ fn apply_inbound(
         cs.contacts = true;
     }
 
+    // Same for business verified names, so display_name() can fall back to them.
+    if !info.source.is_from_me
+        && let Some(name) = info
+            .verified_name
+            .as_ref()
+            .and_then(|vn| vn.name.as_deref())
+        && !name.is_empty()
+    {
+        upsert_contact_business_name(conn, device_id, &sender, name)?;
+        cs.contacts = true;
+    }
+
     match classify(&inbound.message) {
         MessageOp::Store { kind, text } => {
             let inserted = insert_message(
@@ -1744,6 +1756,26 @@ fn upsert_contact_push_name(
         .on_conflict((dsl::device_id, dsl::jid))
         .do_update()
         .set(dsl::push_name.eq(push_name))
+        .execute(conn)?;
+    Ok(())
+}
+
+fn upsert_contact_business_name(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+    business_name: &str,
+) -> QueryResult<()> {
+    use schema::contacts::dsl;
+    diesel::insert_into(dsl::contacts)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(jid),
+            dsl::business_name.eq(business_name),
+        ))
+        .on_conflict((dsl::device_id, dsl::jid))
+        .do_update()
+        .set(dsl::business_name.eq(business_name))
         .execute(conn)?;
     Ok(())
 }
