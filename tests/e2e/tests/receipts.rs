@@ -271,8 +271,9 @@ async fn test_no_delivery_receipt_for_fully_offline() -> anyhow::Result<()> {
 
     let jid_b = client_b.jid().await;
 
-    // TestClient::disconnect awaits the run task, so B's socket is already
-    // closed when this returns.
+    // Nothing reconnects B afterwards, so the assert_no_event window below is
+    // what actually establishes "never came back" — disconnect() only has to get
+    // B off the socket, and it logs a WARN if its own wait times out.
     client_b.disconnect().await;
     info!("B fully disconnected");
 
