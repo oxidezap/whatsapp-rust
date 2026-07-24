@@ -703,7 +703,7 @@ mod tests {
             match session_exists(jid) {
                 Ok(true) => {}                                        // Skip - session exists
                 Ok(false) => jids_needing_sessions.push(jid.clone()), // Needs session
-                Err(e) => eprintln!("Warning: failed to check {}: {}", jid, e), // Skip on error
+                Err(e) => log::warn!("failed to check session for {}: {e:#}", jid.observe()), // Skip on error
             }
         }
 

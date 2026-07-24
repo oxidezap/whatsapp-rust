@@ -62,6 +62,50 @@ enum PendingEntries {
     One(Option<MsgSecretEntry>),
 }
 
+/// Entries a `queue_iter` call still owns while it waits for capacity.
+///
+/// A message secret must never be lost silently: if the queueing future is
+/// dropped mid-backpressure (caller timeout, task abort, teardown), `Drop`
+/// force-buffers whatever remains, accepting temporary overshoot of the
+/// high-water mark rather than dropping a secret later decrypts depend on.
+struct QueuedEntries<'a> {
+    buffer: &'a Arc<MsgSecretWriteBuffer>,
+    entries: PendingEntries,
+    blocked: Option<MsgSecretEntry>,
+}
+
+impl Drop for QueuedEntries<'_> {
+    fn drop(&mut self) {
+        let leftover = match (&self.blocked, &self.entries) {
+            (None, PendingEntries::One(None)) => false,
+            (None, PendingEntries::Batch(batch)) => batch.len() > 0,
+            _ => true,
+        };
+        if !leftover {
+            return;
+        }
+
+        let mut count = 0usize;
+        {
+            let mut pending = self
+                .buffer
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let drained = self.blocked.take().into_iter().chain(&mut self.entries);
+            for entry in drained {
+                MsgSecretWriteBuffer::try_insert_pending(&mut pending, entry, usize::MAX);
+                count += 1;
+            }
+        }
+        log::warn!(
+            "message-secret queue dropped mid-backpressure; force-buffered {count} entr{} past the high-water mark",
+            if count == 1 { "y" } else { "ies" }
+        );
+        self.buffer.schedule_drain();
+    }
+}
+
 impl Iterator for PendingEntries {
     type Item = MsgSecretEntry;
 
@@ -154,13 +198,17 @@ impl MsgSecretWriteBuffer {
         self.queue_iter(PendingEntries::One(Some(entry))).await;
     }
 
-    async fn queue_iter(self: &Arc<Self>, mut entries: PendingEntries) {
-        let mut blocked_entry = None;
+    async fn queue_iter(self: &Arc<Self>, entries: PendingEntries) {
+        let mut queued = QueuedEntries {
+            buffer: self,
+            entries,
+            blocked: None,
+        };
 
         loop {
             let capacity_wait = {
                 let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-                let mut next = blocked_entry.take().or_else(|| entries.next());
+                let mut next = queued.blocked.take().or_else(|| queued.entries.next());
 
                 loop {
                     let Some(entry) = next else {
@@ -172,9 +220,9 @@ impl MsgSecretWriteBuffer {
                             // takes the same mutex before notifying waiters.
                             break Some(self.capacity_available.listen());
                         }
-                        PendingInsert::Buffered => next = entries.next(),
+                        PendingInsert::Buffered => next = queued.entries.next(),
                         PendingInsert::Full(entry) => {
-                            blocked_entry = Some(entry);
+                            queued.blocked = Some(entry);
                             break Some(self.capacity_available.listen());
                         }
                     }
@@ -396,6 +444,57 @@ mod tests {
             Arc::new(crate::runtime_impl::TokioRuntime),
             pending_limit,
         )
+    }
+
+    /// A queueing future dropped mid-backpressure (caller timeout/abort) must
+    /// not lose the secret it was still holding: the drop guard force-buffers
+    /// it past the high-water mark and the next drain persists it.
+    #[tokio::test]
+    async fn dropped_backpressured_queue_force_buffers_entries() {
+        use futures::FutureExt;
+
+        let buf = buffer_with_pending_limit(1).await;
+
+        // Fills the buffer to the limit and parks awaiting capacity; dropping
+        // it here leaves no leftovers (the entry was already inserted).
+        assert!(
+            buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11))
+                .now_or_never()
+                .is_none(),
+            "first queue must block on the high-water mark"
+        );
+        assert_eq!(buf.pending_len(), 1);
+
+        // Full buffer: the second entry is held as blocked_entry across the
+        // capacity wait; dropping the future is the cancellation under test.
+        assert!(
+            buf.queue_one(entry("g@g.us", "b@s.whatsapp.net", "M2", 0x22))
+                .now_or_never()
+                .is_none(),
+            "second queue must block behind the full buffer"
+        );
+        assert_eq!(
+            buf.pending_len(),
+            2,
+            "cancelled queue must force-buffer its blocked entry"
+        );
+        assert_eq!(
+            buf.lookup("g@g.us", "b@s.whatsapp.net", "M2"),
+            Some((vec![0x22; 32], 7)),
+            "force-buffered entry must be readable"
+        );
+
+        // Recovery: the guard-scheduled drain persists both entries.
+        buf.wait_flushed().await;
+        for (sender, byte) in [("a@s.whatsapp.net", 0x11u8), ("b@s.whatsapp.net", 0x22u8)] {
+            let stored = buf
+                .backend
+                .get_msg_secret("g@g.us", sender, if byte == 0x11 { "M1" } else { "M2" })
+                .await
+                .unwrap()
+                .expect("entry must reach the backend after the drain");
+            assert_eq!(stored, vec![byte; 32]);
+        }
     }
 
     /// The point of the buffer: a queued secret is readable BEFORE any flush

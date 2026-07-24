@@ -873,7 +873,7 @@ pub struct Client {
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
-    pub(crate) app_state_syncing: Arc<Mutex<HashSet<WAPatchName>>>,
+    pub(crate) app_state_syncing: Arc<app_state::SyncInFlight>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
 

@@ -186,7 +186,7 @@ impl Client {
         let response_waiters = self.response_waiters_guard().len();
         let presence_subscriptions = self.presence_subscriptions.lock().await.len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
-        let app_state_syncing = self.app_state_syncing.lock().await.len();
+        let app_state_syncing = self.app_state_syncing.len();
         let chatstate_handlers = self.chatstate_handlers.read().await.len();
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(

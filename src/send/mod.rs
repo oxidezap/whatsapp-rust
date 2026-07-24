@@ -2290,7 +2290,11 @@ impl Client {
             // unnecessary LID-migration side effects from get_user_devices
             let mut recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
             if recipient_cached.is_none() {
-                let _ = self.get_user_devices(std::slice::from_ref(&to)).await;
+                if let Err(e) = self.get_user_devices(std::slice::from_ref(&to)).await {
+                    // The bare-JID fallback below can drop companion devices, so
+                    // leave a trace when the warmup that would prevent it fails.
+                    log::warn!("device-list warmup for {} failed: {e:#}", to.observe());
+                }
                 recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
             }
 
@@ -2308,7 +2312,9 @@ impl Client {
             } else {
                 let mut cached = self.get_devices_from_registry(own_jid).await;
                 if cached.is_none() {
-                    let _ = self.get_user_devices(std::slice::from_ref(own_jid)).await;
+                    if let Err(e) = self.get_user_devices(std::slice::from_ref(own_jid)).await {
+                        log::warn!("own device-list warmup failed: {e:#}");
+                    }
                     cached = self.get_devices_from_registry(own_jid).await;
                 }
                 cached
