@@ -19,7 +19,7 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
     // at ~5s, so the drain filters it out.
     client_b.client.reconnect().await;
     info!("B disconnected (will auto-reconnect after backoff)");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");
@@ -58,7 +58,7 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     // well within the 3s TTL window
     client_b.client.reconnect_immediately().await;
     info!("B disconnected (will reconnect immediately)");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");

@@ -1,16 +1,10 @@
 //! status@broadcast send: must go out as `<message>` (not `<status>`) with no
 //! addressing_mode, matching WA Web. The gate is status-specific — groups keep it.
 
-use e2e_tests::{TestClient, text_msg};
+use e2e_tests::{TestClient, has_child, text_msg};
 use wacore_binary::node::Node;
 use whatsapp_rust::Jid;
 use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
-
-fn has_child(node: &Node, tag: &str) -> bool {
-    node.children()
-        .map(|children| children.iter().any(|child| child.tag == tag))
-        .unwrap_or(false)
-}
 
 fn child_attr(node: &Node, child_tag: &str, attr: &str) -> Option<String> {
     node.children()?

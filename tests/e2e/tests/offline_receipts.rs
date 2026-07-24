@@ -14,7 +14,6 @@ async fn test_deferred_delivery_receipt() -> anyhow::Result<()> {
 
     client_b.disconnect().await;
     info!("Client B fully disconnected");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let text = "Hello offline B!";
     let msg_id = client_a
@@ -60,7 +59,7 @@ async fn test_bidirectional_offline_receipt() -> anyhow::Result<()> {
 
     client_b.client.reconnect().await;
     info!("B disconnected");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     let text = "Bidirectional offline test";
     let msg_id = client_a
@@ -72,7 +71,7 @@ async fn test_bidirectional_offline_receipt() -> anyhow::Result<()> {
 
     client_a.client.reconnect().await;
     info!("A disconnected");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_a.wait_for_disconnected(5).await?;
 
     // B reconnects and receives the message
     client_b.wait_for_text(text, 30).await?;
@@ -111,7 +110,7 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
 
     client_b.client.reconnect().await;
     info!("B disconnected (will auto-reconnect)");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     let text = "Waiting for delivery receipt";
     let msg_id = client_a
@@ -184,16 +183,16 @@ async fn test_offline_presence_coalescing() -> anyhow::Result<()> {
 
     client_b.client.reconnect().await;
     info!("B disconnected (will auto-reconnect)");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
-    // A changes presence multiple times while B is offline
+    // A changes presence multiple times while B is offline. Both stanzas go out
+    // over A's single socket, so the server already sees them in send order —
+    // no pacing needed for the coalescing check below.
     client_a.client.presence().set_unavailable().await?;
     info!("A set unavailable");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     client_a.client.presence().set_available().await?;
     info!("A set available again");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // B reconnects — coalescing means only the latest state arrives, not all 3
     let presence_event = client_b

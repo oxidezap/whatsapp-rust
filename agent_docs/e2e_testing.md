@@ -64,12 +64,15 @@ Reference: `groups.rs` uses zero sleeps and runs at ~2.2s/test. Follow this patt
 
 ## Offline Testing Pattern
 
-When testing offline event delivery, use short sleeps (100ms) after `reconnect()` or `disconnect()` to let the server detect the TCP close. Localhost connections close nearly instantly:
+`reconnect()` tears the socket down in a background task, so the client is still
+online when it returns. Poll for the transition with `wait_for_disconnected()`
+instead of sleeping — `Event::Disconnected` is suppressed for expected
+disconnects, so the connection flag is the observable:
 
 ```rust
 // Client goes offline (triggers auto-reconnect in background)
 client_b.client.reconnect().await;
-tokio::time::sleep(Duration::from_millis(100)).await;
+client_b.wait_for_disconnected(5).await?;
 
 // Now send while client is offline — server queues it
 client_a.client.send_message(jid_b.clone(), message).await?;
@@ -78,10 +81,11 @@ client_a.client.send_message(jid_b.clone(), message).await?;
 let event = client_b.wait_for_event(30, |e| matches!(e, Event::Messages(_))).await?;
 ```
 
-For full disconnects (no auto-reconnect):
+Full disconnects need nothing: `TestClient::disconnect()` awaits the run task, so
+the client is already offline when it returns.
+
 ```rust
 client_b.disconnect().await;
-tokio::time::sleep(Duration::from_millis(100)).await;
 ```
 
 ## `reconnect_and_wait()` Helper
@@ -100,13 +104,16 @@ Do NOT use this for offline tests — it waits for the client to be back online,
 - **Event waits in online flows**: 10-15s (events arrive in <1s normally)
 - **Event waits after offline reconnect**: 30s (reconnect + offline queue drain)
 - **Negative assertions** (event should NOT arrive): 3-5s
-- **Post-disconnect sleeps**: 100ms (TCP close detection)
-- **Sequential processing delays**: 50ms (ensure server ordering)
+- **Going offline** (`wait_for_disconnected`): 5s
+
+Never synchronize on a fixed sleep: long enough to be reliable is slow, short
+enough to be fast is flaky. Wait on the condition itself — an event, or a poll
+with a bounded deadline that fails with a clear message.
 
 ## Writing New E2E Tests
 
 1. Use `TestClient::connect("unique_prefix")` with a unique prefix per client per test.
-2. Use `wait_for_event()` for all assertions — avoid polling or sleeping.
+2. Use `wait_for_event()` for all assertions; for state with no event, poll it with a bounded deadline. Never sleep.
 3. Always call `disconnect()` on all clients at the end (cleanup).
 4. Return `anyhow::Result<()>` for clean error propagation.
 5. Use `env_logger` for debug output: `let _ = env_logger::builder().is_test(true).try_init();`

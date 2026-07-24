@@ -42,7 +42,7 @@ async fn test_offline_group_notification() -> anyhow::Result<()> {
 
     client_c.client.reconnect().await;
     info!("C disconnected (will auto-reconnect)");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_c.wait_for_disconnected(5).await?;
 
     let add_result = client_a
         .client
@@ -105,7 +105,7 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
 
     client_c.client.reconnect().await;
     info!("C disconnected");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_c.wait_for_disconnected(5).await?;
 
     let text_1 = "First message while C offline";
     client_a
@@ -114,10 +114,9 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
         .await?;
     info!("A sent first message");
 
+    // B receiving text_1 is the server-side confirmation that it was processed,
+    // so the add below is already ordered after it.
     client_b.wait_for_text(text_1, 10).await?;
-
-    // Small delay to ensure server processes sequentially
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // A adds D to group
     let add_result = client_a
@@ -129,8 +128,6 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
     info!("A added D to group");
 
     client_b.wait_for_group_notification(10).await?;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let text_2 = "Second message after D was added";
     client_a
@@ -231,7 +228,7 @@ async fn test_offline_group_message_delivery() -> anyhow::Result<()> {
 
     client_c.client.reconnect().await;
     info!("C disconnected");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_c.wait_for_disconnected(5).await?;
 
     let text = "Group message while C offline";
     client_a
@@ -343,12 +340,12 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
 
     // Take C offline. We use reconnect() (NOT reconnect_and_wait()) because we
     // need C to be offline while messages are sent. reconnect() triggers a
-    // disconnect + background auto-reconnect; the 100ms sleep gives the server
-    // time to detect the TCP close and start queuing messages for C.
+    // disconnect + background auto-reconnect; waiting for the teardown to land
+    // is what makes the server queue the messages below for C.
     // This is the standard offline simulation pattern used by all offline tests.
     client_c.client.reconnect().await;
     info!("C disconnected (will auto-reconnect)");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_c.wait_for_disconnected(5).await?;
 
     // Send multiple messages from multiple senders across both groups while C is offline.
     // This creates the conditions for the semaphore transition bug:
