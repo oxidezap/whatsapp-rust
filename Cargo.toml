@@ -260,7 +260,7 @@ hmac = { workspace = true }
 libc = "0.2"
 metrics-exporter-prometheus = "0.18"
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 wacore = { workspace = true, features = ["test-util"] }

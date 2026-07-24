@@ -61,7 +61,7 @@ use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
 #[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::{AudioCodec, EncodedAudioFrame};
-use whatsapp_rust::voip::{AudioFormat, CallHandle, VideoState};
+use whatsapp_rust::voip::{AudioFormat, CallHandle, VideoState, VideoUpgradeToken};
 
 mod video;
 use video::VideoOpts;
@@ -983,7 +983,7 @@ struct CallState {
 #[derive(Clone, Copy, PartialEq)]
 enum VideoUi {
     /// The peer asked for video (`UpgradeRequestV2`); `v` accepts it.
-    PendingPeerRequest,
+    PendingPeerRequest(VideoUpgradeToken),
     /// Our video plane is up; `v` downgrades.
     Active,
 }
@@ -1086,12 +1086,14 @@ impl EventHandler for CallObserver {
                     let audio = self.audio;
                     // Only answer with video when we're allowed to AND the offer is actually a video
                     // call; advertising `<video>` on an audio offer would be wrong.
-                    let video = self.video && *is_video;
+                    let initial_video = self.video && *is_video;
+                    let auto_video = self.video;
                     let state = self.state.clone();
                     let cid = call_id.clone();
                     begin_call_startup(&state, &cid);
                     tokio::spawn(async move {
-                        if let Err(e) = respond_to_offer(&client, &call, accept, video, audio).await
+                        if let Err(e) =
+                            respond_to_offer(&client, &call, accept, initial_video, audio).await
                         {
                             error!("call signaling failed: {e}");
                             complete_call_startup(&state, &cid);
@@ -1101,7 +1103,9 @@ impl EventHandler for CallObserver {
                             complete_call_startup(&state, &cid);
                             return;
                         }
-                        match start_media(&client, &call, video, audio, &state).await {
+                        match start_media(&client, &call, initial_video, auto_video, audio, &state)
+                            .await
+                        {
                             Ok(handle) => register_handle(&state, cid.clone(), handle).await,
                             Err(e) => {
                                 let peer_ended = peer_terminated_during_startup(&state, &cid);
@@ -1147,7 +1151,8 @@ impl EventHandler for CallObserver {
 async fn start_media(
     client: &Arc<Client>,
     call: &IncomingCall,
-    video: bool,
+    initial_video: bool,
+    auto_video: bool,
     audio: AudioMode,
     state: &Arc<Mutex<CallState>>,
 ) -> Result<Arc<CallHandle>> {
@@ -1155,7 +1160,7 @@ async fn start_media(
     let speaker = spawn_speaker()?;
     let event_speaker = speaker.clone();
     info!("🔌 connecting media via client.voip().accept(..)…");
-    let video_endpoints = if video {
+    let video_endpoints = if initial_video {
         let opts = VideoOpts::from_env().await?;
         let cid = call.action.call_id();
         Some((
@@ -1168,7 +1173,7 @@ async fn start_media(
     if peer_terminated_during_startup(state, call.action.call_id()) {
         bail!("peer ended the call during media preparation");
     }
-    send_final_accept(client, call, video, audio).await?;
+    send_final_accept(client, call, initial_video, audio).await?;
     let voip = client.voip();
     let mut builder = match audio {
         #[cfg(feature = "voip-mlow")]
@@ -1191,13 +1196,13 @@ async fn start_media(
         "🎙  {} media flow live for call {} — speak into the mic.{}",
         audio.name(),
         handle.call_id(),
-        if video { " 🎥 video on." } else { "" }
+        if initial_video { " 🎥 video on." } else { "" }
     );
     let handle = Arc::new(handle);
-    if video {
+    if initial_video {
         mark_video(state, handle.call_id(), Some(VideoUi::Active));
     }
-    spawn_call_event_listener(handle.clone(), event_speaker, video, state.clone());
+    spawn_call_event_listener(handle.clone(), event_speaker, auto_video, state.clone());
     Ok(handle)
 }
 
@@ -1261,6 +1266,29 @@ fn mark_video(state: &Arc<Mutex<CallState>>, call_id: &str, ui: Option<VideoUi>)
         None => {
             st.video_ui.remove(call_id);
         }
+    }
+}
+
+fn clear_pending_peer_video(state: &Arc<Mutex<CallState>>, call_id: &str) {
+    let mut st = lock_call_state(state);
+    if matches!(
+        st.video_ui.get(call_id),
+        Some(VideoUi::PendingPeerRequest(_))
+    ) {
+        st.video_ui.remove(call_id);
+    }
+}
+
+fn activate_peer_video_request(
+    state: &Arc<Mutex<CallState>>,
+    call_id: &str,
+    request: VideoUpgradeToken,
+) {
+    let mut st = lock_call_state(state);
+    if let Some(ui) = st.video_ui.get_mut(call_id)
+        && *ui == VideoUi::PendingPeerRequest(request)
+    {
+        *ui = VideoUi::Active;
     }
 }
 
@@ -1386,25 +1414,51 @@ fn spawn_call_event_listener(
                         "🎥 relay-send backpressure: dropped {video_access_units} complete video AUs / {packets} packets"
                     );
                 }
-                CallEvent::VideoStateChanged { state: vs, .. } => match vs {
+                CallEvent::VideoStateChanged {
+                    state: vs,
+                    upgrade_token,
+                    ..
+                } => match vs {
                     VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
+                        let Some(request) = upgrade_token else {
+                            info!("🎥 concurrent video upgrade resolved automatically");
+                            continue;
+                        };
+                        mark_video(
+                            &state,
+                            handle.call_id(),
+                            Some(VideoUi::PendingPeerRequest(request)),
+                        );
                         if auto_video {
                             info!("🎥 peer asked for video — auto-accepting (--video)");
-                            if let Err(e) = accept_peer_video(&handle).await {
-                                warn!("accepting peer video failed: {e}");
-                            } else {
-                                mark_video(&state, handle.call_id(), Some(VideoUi::Active));
-                            }
+                            let handle = handle.clone();
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = accept_peer_video(&handle, request).await {
+                                    warn!("accepting peer video failed: {e}");
+                                } else {
+                                    activate_peer_video_request(&state, handle.call_id(), request);
+                                }
+                            });
                         } else {
                             info!("🎥 peer asked for video — press `v` + Enter to accept");
-                            mark_video(&state, handle.call_id(), Some(VideoUi::PendingPeerRequest));
                         }
                     }
                     VideoState::UpgradeAccept | VideoState::Enabled => {
                         info!("🎥 peer video {vs:?} — inbound video should start flowing");
                     }
-                    VideoState::Stopped | VideoState::Disabled => {
+                    VideoState::Stopped => {
                         info!("🎥 peer stopped its video");
+                        clear_pending_peer_video(&state, handle.call_id());
+                    }
+                    VideoState::Disabled
+                    | VideoState::UpgradeReject
+                    | VideoState::UpgradeRejectByTimeout
+                    | VideoState::UpgradeCancel
+                    | VideoState::UpgradeCancelByTimeout
+                    | VideoState::Error => {
+                        info!("🎥 video upgrade ended ({vs:?})");
+                        mark_video(&state, handle.call_id(), None);
                     }
                     other => info!("🎥 peer video state: {other:?}"),
                 },
@@ -1416,12 +1470,12 @@ fn spawn_call_event_listener(
 }
 
 /// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
-async fn accept_peer_video(handle: &CallHandle) -> Result<()> {
+async fn accept_peer_video(handle: &CallHandle, request: VideoUpgradeToken) -> Result<()> {
     let opts = VideoOpts::from_env().await?;
     let src = video::spawn_video_source(&opts).await?;
     let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
     handle
-        .accept_video(src, sink)
+        .accept_video(request, src, sink)
         .await
         .map_err(|e| anyhow!("accept_video: {e}"))
 }
@@ -1586,12 +1640,12 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
                             mark_video(&state, &cid, None);
                         }
                     }
-                    Some(VideoUi::PendingPeerRequest) => {
+                    Some(VideoUi::PendingPeerRequest(request)) => {
                         info!("🎥 accepting the peer's video request");
-                        if let Err(e) = accept_peer_video(&handle).await {
+                        if let Err(e) = accept_peer_video(&handle, request).await {
                             warn!("accept_video failed: {e}");
                         } else {
-                            mark_video(&state, &cid, Some(VideoUi::Active));
+                            activate_peer_video_request(&state, &cid, request);
                         }
                     }
                     None => {

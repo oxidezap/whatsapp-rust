@@ -68,6 +68,10 @@ pub enum CallError {
     #[cfg(feature = "voip-runtime")]
     #[error("media offer error: {0}")]
     Media(&'static str),
+    /// The peer cancelled or replaced the upgrade before its video source became ready.
+    #[cfg(feature = "voip-runtime")]
+    #[error("video upgrade request is no longer current")]
+    VideoUpgradeExpired,
     /// `call(peer)` resolved zero devices for the peer (nothing to address an offer to).
     #[cfg(feature = "voip-runtime")]
     #[error("peer has no resolvable devices")]

@@ -29,10 +29,10 @@ pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use facade::{AcceptCall, CallHandle, OutgoingCall};
 pub use video::{VideoFrame, VideoSink, VideoSource};
 // CallHandle::events() yields these, so surface them next to CallHandle (they live in wacore).
-pub use wacore::voip::CallEvent;
 pub use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
     OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
+pub use wacore::voip::{CallEvent, VideoUpgradeToken};
 // `CallEvent::VideoStateChanged` carries this; surface it next to CallEvent (it lives in wacore).
 pub use wacore::types::call::VideoState;
