@@ -101,11 +101,9 @@ impl ReceiptType {
         }
     }
 
-    /// Variant name as it appears in the serde form (`"ReadSelf"`, not the
-    /// wire `"read-self"`). Exposed so consumers that observe the serialized
-    /// event shape can name a variant without round-tripping through a
-    /// serializer or duplicating the list of this `#[non_exhaustive]` enum.
-    /// The [`Serialize`] impl is built on it, so the two cannot drift.
+    /// Serde variant name (`"ReadSelf"`, not the wire `"read-self"`). The
+    /// [`Serialize`] impl is built on this rather than the reverse, so the
+    /// accessor cannot drift from the serialized form.
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::Delivered => "Delivered",
