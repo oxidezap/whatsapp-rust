@@ -565,37 +565,51 @@ pub fn peer_session_addr(user: &str, server: &str, device: u16) -> String {
 }
 
 /// Scan the backend for sessions matching `user` across device IDs 0..=99,
-/// returning `(address, has_pending_pre_key)` for each one found.
+/// returning `(address, pending_pre_key)` for each stored record.
 ///
 /// The range must cover the peer's real companion device (a paired client is a
 /// non-zero device, e.g. 33), not just low ids — otherwise the only session
 /// found is the phantom device-0 one, whose pending_pre_key never clears
 /// (device 0 never completes the X3DH handshake).
 ///
-/// A record that deserializes without a current state is still reported (with
-/// `has_pending_pre_key = false`), so absence in the result means "no session
-/// stored", which is what the LID-only assertions rely on.
+/// Every stored record is reported, so absence from the result means "no session
+/// stored" — what the LID-only assertions key on. `pending_pre_key` is `None` for
+/// a record with no current state, which is not the same as "no pending pre-key":
+/// callers asserting on handshake progress must ignore those rather than read
+/// them as established.
 pub async fn scan_sessions(
     backend: &dyn wacore::store::traits::SignalStore,
     user: &str,
     server: &str,
-) -> anyhow::Result<Vec<(String, bool)>> {
+) -> anyhow::Result<Vec<(String, Option<bool>)>> {
     let mut results = Vec::new();
     for device_id in 0..=99u16 {
         let addr = peer_session_addr(user, server, device_id);
         if let Some(data) = backend.get_session(&addr).await? {
             let record = wacore::libsignal::protocol::SessionRecord::deserialize(&data)?;
-            let has_pending = match record.session_state() {
-                Some(state) => state
-                    .unacknowledged_pre_key_message_items()
-                    .map_err(|e| anyhow::anyhow!("invalid session state: {e}"))?
-                    .is_some(),
-                None => false,
+            let pending = match record.session_state() {
+                Some(state) => Some(
+                    state
+                        .unacknowledged_pre_key_message_items()
+                        .map_err(|e| anyhow::anyhow!("invalid session state: {e}"))?
+                        .is_some(),
+                ),
+                None => None,
             };
-            results.push((addr, has_pending));
+            results.push((addr, pending));
         }
     }
     Ok(results)
+}
+
+/// Sessions from [`scan_sessions`] that carry a current state, paired with their
+/// pending-pre-key flag. Records without one are dropped: they say nothing about
+/// handshake progress.
+pub fn established_sessions(sessions: &[(String, Option<bool>)]) -> Vec<(String, bool)> {
+    sessions
+        .iter()
+        .filter_map(|(addr, pending)| pending.map(|p| (addr.clone(), p)))
+        .collect()
 }
 
 /// Build a simple text message.

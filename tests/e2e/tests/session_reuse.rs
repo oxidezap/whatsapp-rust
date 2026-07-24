@@ -1,6 +1,6 @@
 //! Signal session management e2e tests.
 
-use e2e_tests::{TestClient, scan_sessions, send_and_expect_text};
+use e2e_tests::{TestClient, established_sessions, scan_sessions, send_and_expect_text};
 use log::info;
 use wacore::libsignal::protocol::SessionRecord;
 
@@ -324,7 +324,7 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
     let backend = client_a.client.persistence_manager().backend();
 
     // PN sessions: may exist with stale pending_pre_key (orphaned after LID migration)
-    let pn_sessions = scan_sessions(&*backend, &jid_b.user, "c.us").await?;
+    let pn_sessions = established_sessions(&scan_sessions(&*backend, &jid_b.user, "c.us").await?);
     for (addr, pending) in &pn_sessions {
         info!("PN session {addr}: pending_pre_key={pending}");
     }
@@ -332,7 +332,7 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
     // LID sessions: the active sessions used by encrypt_for_devices
     let mut lid_sessions = Vec::new();
     if let Some(lid) = client_b.client.lid() {
-        lid_sessions = scan_sessions(&*backend, &lid.user, "lid").await?;
+        lid_sessions = established_sessions(&scan_sessions(&*backend, &lid.user, "lid").await?);
         for (addr, pending) in &lid_sessions {
             info!("LID session {addr}: pending_pre_key={pending}");
         }
@@ -389,7 +389,7 @@ async fn test_session_persistence() -> anyhow::Result<()> {
     let backend = client_a.client.persistence_manager().backend();
 
     // No session should exist before first contact
-    let pre_send = scan_sessions(&*backend, &jid_b.user, "c.us").await?;
+    let pre_send = established_sessions(&scan_sessions(&*backend, &jid_b.user, "c.us").await?);
     assert!(
         pre_send.is_empty(),
         "No PN session should exist before first send, found: {pre_send:?}"
@@ -412,11 +412,11 @@ async fn test_session_persistence() -> anyhow::Result<()> {
 
     // Session may be under PN (c.us) or LID (lid) depending on whether
     // PN→LID mapping was resolved before encryption.
-    let mut post_send = scan_sessions(&*backend, &jid_b.user, "c.us").await?;
+    let mut post_send = established_sessions(&scan_sessions(&*backend, &jid_b.user, "c.us").await?);
     if post_send.is_empty()
         && let Some(lid_b) = client_b.client.lid()
     {
-        post_send = scan_sessions(&*backend, &lid_b.user, "lid").await?;
+        post_send = established_sessions(&scan_sessions(&*backend, &lid_b.user, "lid").await?);
     }
     assert!(
         !post_send.is_empty(),
