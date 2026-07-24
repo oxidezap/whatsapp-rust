@@ -199,11 +199,9 @@ pub(crate) fn merge_split_chat(
         return Ok(dest.to_string());
     }
 
-    // Same message stored under both keys (fanout echo vs. history overlap):
-    // fold the source copy into the surviving row under the live-path rules —
-    // status/starred advance-only, a source tombstone wins (`apply_revoke`),
-    // a strictly newer source edit brings its content (`apply_edit`); short
-    // of those, the destination row keeps its content.
+    // A message duplicated across the pair folds by the live-path precedence
+    // rules — anything less loses receipts, stars, tombstones or edits that
+    // reached only the losing side before the split healed.
     let dups: Vec<DupMessage> = diesel::sql_query(
         "SELECT m.msg_id AS id, m.status AS status, m.starred AS starred, \
                 m.edited_at_ms AS edited_at_ms, m.revoked AS revoked, \
@@ -241,7 +239,9 @@ pub(crate) fn merge_split_chat(
             diesel::update(
                 crate::store::message_row(device_id, dest, &dup.id)
                     .filter(dsl::revoked.eq(false))
-                    .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.le(edited))),
+                    // Strictly newer: on a timestamp tie the destination keeps
+                    // its content (the copies carry the same edit anyway).
+                    .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.lt(edited))),
             )
             .set((
                 dsl::text_content.eq(dup.text_content.as_deref()),

@@ -3094,3 +3094,92 @@ async fn merge_folds_src_side_edit_and_revoke() {
     assert!(revoked.revoked);
     assert!(revoked.text.is_none());
 }
+
+/// Competing edits on both copies of the same message: the strictly newer
+/// edit wins the merge in either direction.
+#[tokio::test]
+async fn merge_keeps_strictly_newer_edit_across_sides() {
+    let (store, chat_store) = test_store().await;
+
+    // No mapping: duplicate copies under each identity, then both sides edit.
+    for chat in [PEER, PEER_LID] {
+        feed(
+            &chat_store,
+            [
+                message_event(
+                    wa::Message::text("v0-a"),
+                    incoming_info(chat, chat, "MSG-CE1", 1_700_000_000),
+                ),
+                message_event(
+                    wa::Message::text("v0-b"),
+                    incoming_info(chat, chat, "MSG-CE2", 1_700_000_010),
+                ),
+            ],
+        )
+        .await;
+    }
+    let edit = |target: &str, text: &str| wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some(target.into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::from_box(Box::new(wa::Message::text(text))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [
+            // CE1: the PN (destination) side carries the newer edit.
+            message_event(
+                edit("MSG-CE1", "lid antiga"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-CE1-EL", 1_700_000_050),
+            ),
+            message_event(
+                edit("MSG-CE1", "pn mais nova"),
+                incoming_info(PEER, PEER, "MSG-CE1-EP", 1_700_000_080),
+            ),
+            // CE2: the LID (source) side carries the newer edit.
+            message_event(
+                edit("MSG-CE2", "pn antiga"),
+                incoming_info(PEER, PEER, "MSG-CE2-EP", 1_700_000_050),
+            ),
+            message_event(
+                edit("MSG-CE2", "lid mais nova"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-CE2-EL", 1_700_000_080),
+            ),
+            // Newest activity keeps the PN side as merge destination.
+            message_event(
+                wa::Message::text("mais nova"),
+                incoming_info(PEER, PEER, "MSG-CE-NW", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let ce1 = chat_store
+        .message(&jid(PEER), "MSG-CE1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ce1.text.as_deref(), Some("pn mais nova"));
+    assert_eq!(
+        ce1.edited_at.map(|t| t.timestamp()),
+        Some(1_700_000_080),
+        "destination's newer edit must not be clobbered by the source's older one"
+    );
+    let ce2 = chat_store
+        .message(&jid(PEER), "MSG-CE2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ce2.text.as_deref(), Some("lid mais nova"));
+    assert_eq!(ce2.edited_at.map(|t| t.timestamp()), Some(1_700_000_080));
+}
