@@ -14,8 +14,6 @@ use crate::protocol::{
     KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::IdentityKeyPairStructure,
 };
 
-// Used for domain separation between alternate-identity signatures and other key-to-key signatures.
-
 /// A public key that represents the identity of a user.
 ///
 /// Wrapper for [`PublicKey`].
