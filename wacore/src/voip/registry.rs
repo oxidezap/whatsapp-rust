@@ -899,7 +899,7 @@ mod tests {
         reg.set_video_channels("CID", generation, event_tx.clone(), ctl_tx, Box::new(|| {}));
 
         let event = || CallEvent::VideoStateChanged {
-            state: crate::types::call::VideoState::Enabled,
+            state: VideoState::Enabled,
             orientation: None,
             upgrade_token: None,
         };
