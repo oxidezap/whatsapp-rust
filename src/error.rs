@@ -17,6 +17,14 @@
 //! It is a read-only view over the existing errors. It defines no new error
 //! type, and the per-domain enums remain the return types.
 //!
+//! # Rendering
+//!
+//! A wrapping variant renders exactly what it wraps, so each error's own
+//! `Display` is unchanged. A caller that concatenates the whole chain will see
+//! consecutive nodes repeat the same sentence, which is the cosmetic price of
+//! keeping the wrapped error downcastable. Print the innermost cause, or
+//! collapse equal neighbours, rather than joining every node.
+//!
 //! # Scope
 //!
 //! Only questions the crate already answers internally are exposed. There is
@@ -125,7 +133,10 @@ pub trait ErrorChainExt {
         self.sources().find_map(server_rejection_of)
     }
 
-    /// Whether a request went out and no answer came back in time.
+    /// Whether the operation ran out of time waiting for the server.
+    ///
+    /// Covers a request that got no answer and a connect or handshake step
+    /// that never completed.
     fn is_timeout(&self) -> bool {
         self.sources().any(|cause| {
             matches!(
@@ -134,6 +145,12 @@ pub trait ErrorChainExt {
             ) || matches!(
                 cause.downcast_ref::<CoreIqError>(),
                 Some(CoreIqError::Timeout)
+            ) || matches!(
+                cause.downcast_ref::<crate::client::ConnectError>(),
+                Some(crate::client::ConnectError::Timeout { .. })
+            ) || matches!(
+                cause.downcast_ref::<crate::handshake::HandshakeError>(),
+                Some(crate::handshake::HandshakeError::Timeout)
             )
         })
     }
@@ -154,11 +171,9 @@ pub trait ErrorChainExt {
             if let Some(encrypt) = cause.downcast_ref::<crate::socket::error::EncryptSendError>() {
                 return encrypt.is_transport_unavailable();
             }
-            matches!(
-                cause.downcast_ref::<CoreIqError>(),
-                Some(CoreIqError::NotConnected | CoreIqError::Disconnected(_))
-                    | Some(CoreIqError::InternalChannelClosed)
-            )
+            cause
+                .downcast_ref::<CoreIqError>()
+                .is_some_and(CoreIqError::is_transport_unavailable)
         })
     }
 

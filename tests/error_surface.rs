@@ -7,6 +7,10 @@
 
 use std::error::Error as StdError;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use whatsapp_rust::client::{ConnectError, ConnectStage};
+use whatsapp_rust::handshake::HandshakeError;
 
 use wacore::request::{IqError as CoreIqError, ServerErrorCode};
 use wacore::store::error::StoreError;
@@ -79,6 +83,12 @@ fn is_error_enum(lines: &[&str], index: usize) -> bool {
 /// `#[error(transparent)]` delegates `source()` to the *wrapped error's own*
 /// source, so a wrapped leaf disappears from the chain entirely and can never
 /// be downcast. `#[error("{0}")]` renders identically and keeps it reachable.
+///
+/// This is a blanket policy, deliberately wider than the reported symptom: it
+/// covers private enums too, because today's private error is tomorrow's public
+/// one and the attribute is invisible at the point where it hurts. Waiving it
+/// for a case where erasure is genuinely wanted is a decision to argue for in
+/// review, not to make silently.
 #[test]
 fn surface_has_no_transparent_error_attribute() {
     let mut offenders = Vec::new();
@@ -294,6 +304,25 @@ fn timeout_is_recovered_across_domains() {
     assert!(ProfileError::Iq(IqError::Timeout).is_timeout());
     assert!(CommunityError::Group(GroupError::Iq(IqError::Timeout)).is_timeout());
     assert!(!GroupError::Iq(rejected(403)).is_timeout());
+}
+
+/// Connect and handshake run out of time without any `IqError` involved, and
+/// the crate already tells those apart from every other connect failure.
+#[test]
+fn connect_and_handshake_timeouts_are_recovered_too() {
+    let connect = ConnectError::Timeout {
+        stage: ConnectStage::Socket,
+        timeout: Duration::from_secs(10),
+    };
+    assert!(connect.is_timeout());
+    assert!(HandshakeError::Timeout.is_timeout());
+    // Reached through the wrapper as well.
+    assert!(ConnectError::Handshake(HandshakeError::Timeout).is_timeout());
+
+    // Neighbouring failures of the same flow are not timeouts.
+    assert!(!ConnectError::AlreadyConnected.is_timeout());
+    assert!(!HandshakeError::StreamClosed.is_timeout());
+    assert!(!ConnectError::Handshake(HandshakeError::Disconnected).is_timeout());
 }
 
 #[test]
