@@ -371,10 +371,10 @@ impl<'a> Groups<'a> {
     ///
     /// Returns the slim [`GroupInfo`] the encryption path needs: participant
     /// JIDs, the group's addressing mode, the LID/PN mapping, and whether it is
-    /// a community announcement group. Results are shared through the group
-    /// cache and refreshed with the persisted participant phash, so a repeated
-    /// call is usually free and a stale entry costs a `not-modified` round trip
-    /// instead of a full metadata download.
+    /// a community announcement group. A cached entry is returned as-is, so a
+    /// repeated call is free. Only a cache miss goes to the network, and it
+    /// sends the persisted participant phash, so an unchanged group costs a
+    /// `not-modified` answer instead of a full metadata download.
     ///
     /// This is the right call for routing and encrypting a message. For the
     /// user-facing fields (subject, description, admin roles, group settings)
@@ -625,9 +625,11 @@ impl<'a> Groups<'a> {
     /// Fetch the complete, user-facing metadata of a group.
     ///
     /// Returns an owned [`GroupMetadata`]: subject, description, creator,
-    /// per-participant admin roles, ephemeral and membership settings, plus the
-    /// participants' phone numbers resolved from their LIDs. The query always
-    /// hits the network (no phash is sent, so the server never answers
+    /// per-participant admin roles, and ephemeral and membership settings. In a
+    /// LID-addressed group, participant phone numbers the server left out are
+    /// backfilled from known LID/PN mappings on a best-effort basis; a
+    /// participant with no known mapping keeps `phone_number: None`. The query
+    /// always hits the network (no phash is sent, so the server never answers
     /// `not-modified`) and the result does not populate the group cache.
     ///
     /// This is the right call for displaying or auditing a group. When you only
