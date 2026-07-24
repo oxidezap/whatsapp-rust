@@ -109,7 +109,7 @@ impl SenderKeyDeviceCache {
     /// Concurrent callers for the same key share the single init result.
     pub(crate) async fn get_or_init<F>(&self, group_jid: &str, init: F) -> Arc<SenderKeyDeviceMap>
     where
-        F: std::future::Future<Output = Arc<SenderKeyDeviceMap>>,
+        F: std::future::Future<Output = Arc<SenderKeyDeviceMap>> + wacore::sync_marker::MaybeSend,
     {
         self.inner.get_with_by_ref(group_jid, init).await
     }

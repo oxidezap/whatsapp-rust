@@ -11,9 +11,11 @@
 use async_lock::{Mutex as AsyncMutex, RwLock};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::Arc;
 use std::time::Duration;
+use wacore::runtime::BoxFuture;
+use wacore::sync_marker::MaybeSend;
 use wacore::time::Instant;
 
 struct CacheEntry<V> {
@@ -41,7 +43,7 @@ pub(crate) struct CapacityStats {
 pub struct PortableCache<K, V> {
     inner: Arc<RwLock<CacheInner<K, V>>>,
     /// Per-key init locks for single-flight `get_with`.
-    init_locks: Arc<AsyncMutex<HashMap<K, Arc<AsyncMutex<()>>>>>,
+    init_locks: Arc<InitLocks>,
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
@@ -161,6 +163,97 @@ where
     }
 }
 
+/// Single-flight init-lock registry, keyed by key hash instead of the key
+/// itself so it is compiled once for every `<K, V>` cache in the binary. A
+/// hash collision only makes two distinct keys share one init lock — they
+/// serialize their initializers, and the double-checked `get` inside
+/// `get_with_slow` keeps the result correct — so the key never needs to be
+/// stored or cloned here.
+struct InitLocks {
+    /// Shared across cache clones so a key hashes identically everywhere.
+    hasher: RandomState,
+    map: AsyncMutex<HashMap<u64, Arc<AsyncMutex<()>>>>,
+}
+
+impl InitLocks {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            map: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    async fn acquire(&self, hash: u64) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.map.lock().await;
+        locks
+            .entry(hash)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Drop a single-flight init lock once no other caller is using it, so the
+    /// registry can't grow without bound across distinct keys (it is otherwise
+    /// only reclaimed by `run_pending_tasks`, which several hot `get_with`
+    /// caches never call). `strong_count <= 2` means only this caller's clone
+    /// and the map entry remain; the `ptr_eq` guard avoids dropping a newer
+    /// lock a racing caller may have inserted.
+    async fn reclaim(&self, hash: u64, init_mutex: &Arc<AsyncMutex<()>>) {
+        let mut locks = self.map.lock().await;
+        if Arc::strong_count(init_mutex) <= 2
+            && let Some(existing) = locks.get(&hash)
+            && Arc::ptr_eq(existing, init_mutex)
+        {
+            locks.remove(&hash);
+        }
+    }
+
+    /// Best-effort synchronous reclaim for cancellation paths: `try_lock` so it
+    /// can run inside `Drop`. Contention here only defers cleanup to the next
+    /// reclaim on this hash or to `run_pending_tasks`.
+    fn reclaim_now(&self, hash: u64, init_mutex: &Arc<AsyncMutex<()>>) {
+        if let Some(mut locks) = self.map.try_lock()
+            && Arc::strong_count(init_mutex) <= 2
+            && let Some(existing) = locks.get(&hash)
+            && Arc::ptr_eq(existing, init_mutex)
+        {
+            locks.remove(&hash);
+        }
+    }
+
+    async fn retain_active(&self) {
+        let mut locks = self.map.lock().await;
+        locks.retain(|_, v| Arc::strong_count(v) > 1);
+    }
+}
+
+/// Reclaims a single-flight init lock if `get_with_slow` is cancelled mid-init
+/// (caller timeout/abort), so cancelled fills can't grow the registry until
+/// `run_pending_tasks`. The success path disarms it and runs the awaited
+/// (guaranteed) reclaim instead.
+struct InitLockCleanup<'a> {
+    registry: &'a InitLocks,
+    hash: u64,
+    lock: Option<Arc<AsyncMutex<()>>>,
+}
+
+impl InitLockCleanup<'_> {
+    fn disarm(&mut self) -> Arc<AsyncMutex<()>> {
+        self.lock.take().expect("init-lock cleanup disarmed twice")
+    }
+}
+
+impl Drop for InitLockCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            self.registry.reclaim_now(self.hash, &lock);
+        }
+    }
+}
+
 // -- Builder --
 
 pub struct PortableCacheBuilder<K, V> {
@@ -213,7 +306,7 @@ where
     pub fn build(self) -> PortableCache<K, V> {
         PortableCache {
             inner: Arc::new(RwLock::new(CacheInner::new())),
-            init_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            init_locks: Arc::new(InitLocks::new()),
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
@@ -523,84 +616,74 @@ where
     }
 
     /// Get or insert (single-flight). Takes key by value.
+    ///
+    /// The initializer is boxed only on cache miss — a hit returns without
+    /// allocating. The boxing keeps the slow path monomorphic per `<K, V>`
+    /// instead of per call-site future type. A racer that loses the
+    /// double-check inside [`get_with_slow`](Self::get_with_slow) pays one
+    /// spare box; deferring the box past the double-check would drag the
+    /// future type parameter back into the slow path, re-stamping it per
+    /// call site.
+    #[inline]
     pub async fn get_with<F>(&self, key: K, init: F) -> V
     where
-        F: std::future::Future<Output = V>,
+        F: std::future::Future<Output = V> + MaybeSend,
     {
         if let Some(v) = self.get(&key).await {
             return v;
         }
-
-        let init_mutex = {
-            let mut locks = self.init_locks.lock().await;
-            locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-
-        let value = {
-            let _init_guard = init_mutex.lock().await;
-            // Double-check after acquiring per-key lock.
-            if let Some(v) = self.get(&key).await {
-                v
-            } else {
-                self.insert_and_return(key.clone(), init.await).await
-            }
-        };
-
-        self.reclaim_init_lock(&key, &init_mutex).await;
-        value
+        self.get_with_slow(key, Box::pin(init)).await
     }
 
     /// Get or insert (single-flight). Takes key by reference — only allocates
-    /// the owned key on cache miss.
+    /// the owned key (and the boxed initializer) on cache miss.
+    #[inline]
     pub async fn get_with_by_ref<Q, F>(&self, key: &Q, init: F) -> V
     where
         K: Borrow<Q>,
         Q: ToOwned<Owned = K> + Hash + Eq + ?Sized,
-        F: std::future::Future<Output = V>,
+        F: std::future::Future<Output = V> + MaybeSend,
     {
         if let Some(v) = self.get(key).await {
             return v;
         }
+        self.get_with_slow(key.to_owned(), Box::pin(init)).await
+    }
 
-        let owned_key = key.to_owned();
-        let init_mutex = {
-            let mut locks = self.init_locks.lock().await;
-            locks
-                .entry(owned_key.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
+    /// Miss path shared by [`get_with`](Self::get_with) and
+    /// [`get_with_by_ref`](Self::get_with_by_ref): single-flight init under the
+    /// per-key lock, with a double-checked `get` so a collided or racing key
+    /// still resolves to the first inserted value.
+    async fn get_with_slow(&self, key: K, init: BoxFuture<'_, V>) -> V {
+        let hash = self.init_locks.hash_of(&key);
+        // The cleanup guard holds the sole long-lived Arc so its Drop sees an
+        // exact strong count if this future is cancelled at any await below.
+        let mut cleanup = InitLockCleanup {
+            registry: &self.init_locks,
+            hash,
+            lock: Some(self.init_locks.acquire(hash).await),
         };
 
         let value = {
-            let _init_guard = init_mutex.lock().await;
-            if let Some(v) = self.get(key).await {
+            let _init_guard = cleanup
+                .lock
+                .as_ref()
+                .expect("init-lock cleanup still armed")
+                .lock()
+                .await;
+            // Double-check after acquiring the per-key lock.
+            if let Some(v) = self.get(&key).await {
                 v
             } else {
-                self.insert_and_return(owned_key.clone(), init.await).await
+                let value = init.await;
+                self.insert_and_return(key, value).await
             }
         };
 
-        self.reclaim_init_lock(&owned_key, &init_mutex).await;
+        let init_mutex = cleanup.disarm();
+        drop(cleanup);
+        self.init_locks.reclaim(hash, &init_mutex).await;
         value
-    }
-
-    /// Drop a single-flight init lock once no other caller is using it, so
-    /// `init_locks` can't grow without bound across distinct keys (it is
-    /// otherwise only reclaimed by [`run_pending_tasks`], which several hot
-    /// `get_with` caches never call). `strong_count <= 2` means only this
-    /// caller's clone and the map entry remain; the `ptr_eq` guard avoids
-    /// dropping a newer lock a racing caller may have inserted.
-    async fn reclaim_init_lock(&self, key: &K, init_mutex: &Arc<AsyncMutex<()>>) {
-        let mut locks = self.init_locks.lock().await;
-        if Arc::strong_count(init_mutex) <= 2
-            && let Some(existing) = locks.get(key)
-            && Arc::ptr_eq(existing, init_mutex)
-        {
-            locks.remove(key);
-        }
     }
 
     /// Evict expired entries and clean up unused init locks.
@@ -618,8 +701,7 @@ where
         drop(guard);
 
         // Clean up init locks not actively held.
-        let mut locks = self.init_locks.lock().await;
-        locks.retain(|_, v| Arc::strong_count(v) > 1);
+        self.init_locks.retain_active().await;
     }
 }
 
@@ -1111,10 +1193,139 @@ mod tests {
         let _ = cache.get_with("key1".to_string(), async { 1 }).await;
         let _ = cache.get_with_by_ref("key2", async { 2 }).await;
 
-        let locks = cache.init_locks.lock().await;
+        let locks = cache.init_locks.map.lock().await;
         assert!(
             locks.is_empty(),
             "init locks must be reclaimed after get_with"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_get_with_reclaims_init_lock() {
+        // A get_with whose caller is aborted mid-init must not leave its
+        // per-key init lock behind: hot caches never call run_pending_tasks.
+        let cache = build_cache::<String, u32>();
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_with("stuck".to_string(), std::future::pending::<u32>())
+                    .await
+            }
+        });
+
+        // Poll (bounded) until the in-flight init registers its lock.
+        let mut registered = false;
+        for _ in 0..400 {
+            if !cache.init_locks.map.lock().await.is_empty() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(registered, "in-flight get_with never registered its lock");
+
+        task.abort();
+        let _ = task.await;
+
+        // Poll (bounded): the cleanup guard reclaims on cancellation, without
+        // any run_pending_tasks call.
+        let mut reclaimed = false;
+        for _ in 0..400 {
+            if cache.init_locks.map.lock().await.is_empty() {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(reclaimed, "cancelled get_with leaked its init lock");
+    }
+
+    #[tokio::test]
+    async fn init_locks_collision_shares_one_lock() {
+        // Two keys that hash to the same slot must share the lock (they
+        // serialize) and both resolve correctly through the double-checked get.
+        let registry = InitLocks::new();
+        let first = registry.acquire(42).await;
+        let second = registry.acquire(42).await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same hash must yield the same init lock"
+        );
+
+        // While another caller still holds a clone, reclaim must keep the entry.
+        registry.reclaim(42, &first).await;
+        assert!(
+            registry.map.lock().await.contains_key(&42),
+            "reclaim must not drop a lock another caller still holds"
+        );
+
+        // Once the other caller is done, the entry is removed.
+        drop(second);
+        registry.reclaim(42, &first).await;
+        assert!(
+            registry.map.lock().await.is_empty(),
+            "last reclaim must drop the registry entry"
+        );
+    }
+
+    /// Key whose hash is a constant, so any two instances collide in the
+    /// hash-keyed init-lock registry while remaining distinct map keys.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct CollidingKey(&'static str);
+
+    impl Hash for CollidingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            state.write_u64(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn colliding_keys_keep_distinct_values() {
+        let cache: PortableCache<CollidingKey, u32> =
+            PortableCache::builder().max_capacity(16).build();
+        let (a, b) = (CollidingKey("a"), CollidingKey("b"));
+        assert_eq!(
+            cache.init_locks.hash_of(&a),
+            cache.init_locks.hash_of(&b),
+            "test premise: both keys must share one init-lock slot"
+        );
+
+        // Rendezvous BEFORE get_with: colliding keys share one init lock, so
+        // their initializers serialize and must never wait on each other.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for (key, value) in [(a.clone(), 1u32), (b.clone(), 2u32)] {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache
+                    .get_with(key, async {
+                        tokio::task::yield_now().await;
+                        value
+                    })
+                    .await
+            }));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        assert_eq!(results, vec![1, 2], "each key must get its own init value");
+        assert_eq!(cache.get(&a).await, Some(1));
+        assert_eq!(cache.get(&b).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn get_with_distinct_keys_share_registry_correctly() {
+        // Same value type, distinct keys: each key keeps its own value even
+        // though the init-lock registry is keyed by hash rather than by key.
+        let cache = build_cache::<String, u32>();
+        let a = cache.get_with("a".to_string(), async { 1 }).await;
+        let b = cache.get_with("b".to_string(), async { 2 }).await;
+        assert_eq!((a, b), (1, 2));
+        assert_eq!(cache.get("a").await, Some(1));
+        assert_eq!(cache.get("b").await, Some(2));
     }
 }
