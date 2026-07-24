@@ -101,13 +101,6 @@ impl ProfilePictureSpec {
         self
     }
 
-    /// Set the existing picture ID for cache optimization.
-    /// The server may return an empty result if the picture hasn't changed.
-    pub fn with_existing_id(mut self, id: String) -> Self {
-        self.existing_id = Some(id);
-        self
-    }
-
     /// Override the default request timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

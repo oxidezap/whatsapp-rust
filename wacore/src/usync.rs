@@ -1,9 +1,6 @@
-use crate::iq::usync::{
-    device_list_query, parse_usync_response, project_device_list_response, project_lid_mapping,
-};
+use crate::iq::usync::{parse_usync_response, project_device_list_response};
 use anyhow::Result;
-use wacore_binary::Jid;
-use wacore_binary::{Node, NodeRef};
+use wacore_binary::{Jid, Node};
 
 /// A LID mapping learned from usync response
 #[derive(Debug, Clone)]
@@ -47,10 +44,6 @@ pub struct UserDeviceList {
     pub key_index_bytes: Option<Vec<u8>>,
 }
 
-pub fn build_get_user_devices_query(jids: &[Jid], sid: &str) -> Node {
-    device_list_query(jids, None).build_node(sid)
-}
-
 /// Parse usync response returning devices grouped by user with phash.
 /// This is the full-featured version that includes the participant hash.
 pub fn parse_get_user_devices_response_with_phash(resp_node: &Node) -> Result<Vec<UserDeviceList>> {
@@ -70,20 +63,6 @@ pub fn parse_get_user_devices_response(resp_node: &Node) -> Result<Vec<Jid>> {
                 .map(move |d| user_jid.with_device_hosting(d.device, d.is_hosted))
         })
         .collect())
-}
-
-/// Parse LID mappings from a usync `NodeRef` response (zero-copy path).
-pub fn parse_lid_mappings_from_response(resp_node: &NodeRef<'_>) -> Vec<UsyncLidMapping> {
-    parse_usync_response(resp_node).map_or_else(
-        |_| Vec::new(),
-        |response| {
-            response
-                .users
-                .iter()
-                .filter_map(project_lid_mapping)
-                .collect()
-        },
-    )
 }
 
 #[cfg(test)]

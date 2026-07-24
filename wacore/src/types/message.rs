@@ -119,10 +119,6 @@ pub struct MessageSource {
 }
 
 impl MessageSource {
-    pub fn is_incoming_broadcast(&self) -> bool {
-        (!self.is_from_me || self.broadcast_list_owner.is_some()) && self.chat.is_broadcast_list()
-    }
-
     /// Our own outgoing DM to a user or bot, echoed back to this device
     /// (`is_from_me` with a `recipient`). The server's offline queue only
     /// releases these on a `<receipt type="sender">`, so they must not be

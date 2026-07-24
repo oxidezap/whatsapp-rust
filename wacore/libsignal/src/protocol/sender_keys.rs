@@ -517,14 +517,6 @@ pub struct SenderKeyRecord {
 const RESERVED_ITERATION_FIELD: u32 = super::local_field::COUNTER_RESERVATION_FIELD;
 
 impl SenderKeyRecord {
-    /// Replaces the states wholesale, so the wire gate — which belongs to the
-    /// advance being replaced — resets with them.
-    pub fn set_states_for_testing(&mut self, states: std::collections::VecDeque<SenderKeyState>) {
-        self.states = states;
-        self.wire_gated = false;
-        self.reserved_iteration = 0;
-    }
-
     pub fn new_empty() -> Self {
         Self {
             states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),

@@ -1,6 +1,6 @@
 // Re-export everything from wacore::appstate_sync for backwards compatibility
 pub use wacore::appstate::Mutation;
-pub use wacore::appstate_sync::{AppStateProcessor, AppStateSyncDriver, AppStateSyncError};
+pub use wacore::appstate_sync::{AppStateProcessor, AppStateSyncError};
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]

@@ -59,48 +59,6 @@ impl<const KIND: u8> std::hash::Hash for SpecificServiceId<KIND> {
     }
 }
 
-impl<const KIND: u8> SpecificServiceId<KIND>
-where
-    ServiceId: From<Self>,
-    Self: TryFrom<ServiceId>,
-{
-    #[inline]
-    pub fn service_id_binary(&self) -> Vec<u8> {
-        ServiceId::from(*self).service_id_binary()
-    }
-
-    #[inline]
-    pub fn service_id_fixed_width_binary(&self) -> ServiceIdFixedWidthBinaryBytes {
-        ServiceId::from(*self).service_id_fixed_width_binary()
-    }
-
-    pub fn service_id_string(&self) -> String {
-        ServiceId::from(*self).service_id_string()
-    }
-
-    #[inline]
-    pub fn parse_from_service_id_binary(bytes: &[u8]) -> Option<Self> {
-        ServiceId::parse_from_service_id_binary(bytes)?
-            .try_into()
-            .ok()
-    }
-
-    #[inline]
-    pub fn parse_from_service_id_fixed_width_binary(
-        bytes: &ServiceIdFixedWidthBinaryBytes,
-    ) -> Option<Self> {
-        ServiceId::parse_from_service_id_fixed_width_binary(bytes)?
-            .try_into()
-            .ok()
-    }
-
-    pub fn parse_from_service_id_string(input: &str) -> Option<Self> {
-        ServiceId::parse_from_service_id_string(input)?
-            .try_into()
-            .ok()
-    }
-}
-
 impl<const KIND: u8> From<Uuid> for SpecificServiceId<KIND> {
     #[inline]
     fn from(value: Uuid) -> Self {
@@ -146,86 +104,11 @@ impl ServiceId {
     }
 
     #[inline]
-    pub fn service_id_binary(&self) -> Vec<u8> {
-        if let Self::Aci(aci) = self {
-            aci.0.as_bytes().to_vec()
-        } else {
-            self.service_id_fixed_width_binary().to_vec()
-        }
-    }
-
-    #[inline]
-    pub fn service_id_fixed_width_binary(&self) -> ServiceIdFixedWidthBinaryBytes {
-        let mut result = [0; 17];
-        result[0] = self.kind().into();
-        result[1..].copy_from_slice(self.raw_uuid().as_bytes());
-        result
-    }
-
-    pub fn service_id_string(&self) -> String {
-        if let Self::Aci(aci) = self {
-            aci.0.to_string()
-        } else {
-            format!("{}:{}", self.kind(), self.raw_uuid())
-        }
-    }
-
-    #[inline]
-    pub fn parse_from_service_id_binary(bytes: &[u8]) -> Option<Self> {
-        match bytes.len() {
-            16 => Some(Self::Aci(Uuid::from_slice(bytes).ok()?.into())),
-            17 => {
-                let result = Self::parse_from_service_id_fixed_width_binary(
-                    bytes.try_into().expect("already measured"),
-                )?;
-                if result.kind() == ServiceIdKind::Aci {
-                    None
-                } else {
-                    Some(result)
-                }
-            }
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn parse_from_service_id_fixed_width_binary(
-        bytes: &ServiceIdFixedWidthBinaryBytes,
-    ) -> Option<Self> {
-        let uuid = Uuid::from_slice(&bytes[1..]).ok()?;
-        match ServiceIdKind::try_from(bytes[0]).ok()? {
-            ServiceIdKind::Aci => Some(Self::Aci(uuid.into())),
-            ServiceIdKind::Pni => Some(Self::Pni(uuid.into())),
-        }
-    }
-
-    pub fn parse_from_service_id_string(input: &str) -> Option<Self> {
-        fn try_parse_hyphenated(input: &str) -> Option<Uuid> {
-            if input.len() != uuid::fmt::Hyphenated::LENGTH {
-                return None;
-            }
-            Uuid::try_parse(input).ok()
-        }
-
-        if let Some(uuid_string) = input.strip_prefix("PNI:") {
-            let uuid = try_parse_hyphenated(uuid_string)?;
-            Some(Self::Pni(uuid.into()))
-        } else {
-            let uuid = try_parse_hyphenated(input)?;
-            Some(Self::Aci(uuid.into()))
-        }
-    }
-
-    #[inline]
     pub fn raw_uuid(self) -> Uuid {
         match self {
             ServiceId::Aci(aci) => aci.into(),
             ServiceId::Pni(pni) => pni.into(),
         }
-    }
-
-    pub fn to_protocol_address(&self, device_id: DeviceId) -> ProtocolAddress {
-        ProtocolAddress::new(self.service_id_string(), device_id)
     }
 }
 

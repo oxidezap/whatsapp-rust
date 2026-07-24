@@ -247,10 +247,6 @@ impl GroupParticipantOptions {
         Self::new(phone_number)
     }
 
-    pub fn from_lid_and_phone(lid: Jid, phone_number: Jid) -> Self {
-        Self::new(lid).with_phone_number(phone_number)
-    }
-
     pub fn with_phone_number(mut self, phone_number: Jid) -> Self {
         self.phone_number = Some(phone_number);
         self
@@ -330,11 +326,6 @@ impl GroupCreateOptions {
 
     pub fn with_member_add_mode(mut self, mode: MemberAddMode) -> Self {
         self.member_add_mode = Some(mode);
-        self
-    }
-
-    pub fn with_membership_approval_mode(mut self, mode: MembershipApprovalMode) -> Self {
-        self.membership_approval_mode = Some(mode);
         self
     }
 

@@ -3,20 +3,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
-use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
 use crate::appstate::keys::ExpandedAppStateKeys;
-use crate::appstate::patch_decode::{
-    CollectionSyncError, PatchList, WAPatchName, parse_patch_list, parse_patch_list_ref,
-    parse_patch_lists, parse_patch_lists_ref,
-};
+use crate::appstate::patch_decode::{CollectionSyncError, PatchList};
 use crate::appstate::{
     collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
 use crate::store::traits::Backend;
-use wacore_binary::{Node, NodeRef};
 use waproto::whatsapp as wa;
 
 // Re-export Mutation from appstate for convenience
@@ -191,20 +186,9 @@ impl AppStateProcessor {
         Ok(())
     }
 
-    pub async fn decode_patch_list_ref(
-        &self,
-        stanza_root: &NodeRef<'_>,
-        download: &BlobDownloadFn<'_>,
-        validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
-        let pl = parse_patch_list_ref(stanza_root)?;
-        self.process_parsed_patch_list(pl, download, validate_macs)
-            .await
-    }
-
     /// Process an already-parsed single PatchList: download external blobs via
     /// `download`, then decode + apply. Lets a caller that parsed the response for
-    /// pre-download avoid re-parsing it. See [`decode_patch_list_ref`].
+    /// pre-download avoid re-parsing it.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list(
         &self,
@@ -216,44 +200,9 @@ impl AppStateProcessor {
         self.process_patch_list(pl, validate_macs).await
     }
 
-    pub async fn decode_patch_list(
-        &self,
-        stanza_root: &Node,
-        download: &BlobDownloadFn<'_>,
-        validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
-        let pl = parse_patch_list(stanza_root)?;
-        self.process_parsed_patch_list(pl, download, validate_macs)
-            .await
-    }
-
-    pub async fn decode_multi_patch_list_ref(
-        &self,
-        stanza_root: &NodeRef<'_>,
-        download: &BlobDownloadFn<'_>,
-        validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
-        let patch_lists = parse_patch_lists_ref(stanza_root)?;
-        self.process_patch_lists(patch_lists, download, validate_macs)
-            .await
-    }
-
-    /// Decode a multi-collection IQ response into per-collection results.
-    /// Each collection is parsed and processed independently.
-    pub async fn decode_multi_patch_list(
-        &self,
-        stanza_root: &Node,
-        download: &BlobDownloadFn<'_>,
-        validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
-        let patch_lists = parse_patch_lists(stanza_root)?;
-        self.process_patch_lists(patch_lists, download, validate_macs)
-            .await
-    }
-
     /// Process already-parsed patch lists, downloading any external blobs via
     /// `download`. Lets callers that already parsed the IQ response (e.g. to
-    /// pre-download blobs) avoid re-parsing it. See [`decode_multi_patch_list_ref`].
+    /// pre-download blobs) avoid re-parsing it.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
     pub async fn process_patch_lists(
         &self,
@@ -599,57 +548,6 @@ impl AppStateProcessor {
         download_external_blobs(pl, download)?;
         self.get_missing_key_ids(pl).await
     }
-
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_collection", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    pub async fn sync_collection<D>(
-        &self,
-        driver: &D,
-        name: WAPatchName,
-        validate_macs: bool,
-        download: &BlobDownloadFn<'_>,
-    ) -> Result<Vec<Mutation>>
-    where
-        D: AppStateSyncDriver + Sync,
-    {
-        let mut all = Vec::new();
-        // Bound re-fetches so a server that keeps returning a retryable collection
-        // (e.g. an empty-ltHash patch without a snapshot) can't loop forever.
-        const MAX_RETRIES: usize = 5;
-        let mut retries = 0;
-        loop {
-            let state = self.backend.get_version(name.as_str()).await?;
-            let node = driver.fetch_collection(name, state.version).await?;
-            let (mut muts, _new_state, list) = self
-                .decode_patch_list(&node, download, validate_macs)
-                .await?;
-            all.append(&mut muts);
-            // A retryable error (or conflict-with-more) left the version unadvanced;
-            // re-fetch (now requesting a snapshot, since the version is still 0)
-            // rather than reporting success. Mirrors the batched path's needs_refetch.
-            // Fatal / conflict-without-more fall through and end the loop.
-            if matches!(
-                list.error,
-                Some(CollectionSyncError::Retry { .. })
-                    | Some(CollectionSyncError::Conflict { has_more: true })
-            ) {
-                retries += 1;
-                if retries >= MAX_RETRIES {
-                    break;
-                }
-                continue;
-            }
-            if !list.has_more_patches {
-                break;
-            }
-        }
-        Ok(all)
-    }
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait AppStateSyncDriver {
-    async fn fetch_collection(&self, name: WAPatchName, after_version: u64) -> Result<Node>;
 }
 
 /// A snapshot is stale when the collection already holds a version at or beyond the
@@ -688,6 +586,7 @@ mod snapshot_guard_tests {
 #[cfg(test)]
 mod external_blob_tests {
     use super::*;
+    use crate::appstate::patch_decode::WAPatchName;
 
     fn pl_with_snapshot_ref(snapshot_ref: Option<wa::ExternalBlobReference>) -> PatchList {
         PatchList {
