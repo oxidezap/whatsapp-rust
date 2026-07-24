@@ -35,8 +35,8 @@ pub enum SendError {
     /// Connection/transport/IQ failure (embeds the shared base error).
     // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
     // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
-    #[error(transparent)]
-    Client(ClientError),
+    #[error("{0}")]
+    Client(#[source] ClientError),
     /// The client has no PN/LID identity yet (not paired / mid LID migration).
     #[error("client is not logged in")]
     NotLoggedIn,
@@ -48,9 +48,9 @@ pub enum SendError {
     #[error("invalid send request: {0}")]
     InvalidRequest(String),
     /// Catch-all for internal send failures (Signal encrypt, protobuf, group
-    /// resolution) that have no dedicated variant yet. Transparent so the
-    /// underlying error's `Display`/source chain is preserved.
-    #[error(transparent)]
+    /// resolution) that have no dedicated variant yet. `Display` forwards to
+    /// the inner error while `source()` still exposes it for downcast.
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

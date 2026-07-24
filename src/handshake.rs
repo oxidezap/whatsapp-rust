@@ -43,6 +43,23 @@ pub enum HandshakeError {
 }
 
 impl HandshakeError {
+    /// The handshake ran out of time, as opposed to being torn down.
+    ///
+    /// Matched exhaustively so a new variant has to be classified here rather
+    /// than defaulting to "not a timeout" unnoticed.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            HandshakeError::Timeout => true,
+            HandshakeError::Transport(_)
+            | HandshakeError::Core(_)
+            | HandshakeError::StreamClosed
+            | HandshakeError::Disconnected
+            | HandshakeError::UnexpectedEvent(_) => false,
+        }
+    }
+}
+
+impl HandshakeError {
     /// Transient errors that are expected during reconnect and will resolve
     /// on retry. These never invalidate the cached server static.
     pub fn is_transient(&self) -> bool {

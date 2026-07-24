@@ -103,6 +103,34 @@ pub enum IqError {
     InternalChannelClosed,
 }
 
+impl IqError {
+    /// The transport is gone rather than the request having been refused.
+    ///
+    /// Sole owner of that judgement for this type: callers that classify an
+    /// error chain read it here instead of restating the variant list.
+    pub fn is_transport_unavailable(&self) -> bool {
+        matches!(
+            self,
+            IqError::NotConnected | IqError::Disconnected(_) | IqError::InternalChannelClosed
+        )
+    }
+
+    /// The request went out and no answer came back in time.
+    ///
+    /// Matched exhaustively so a new variant has to be classified here rather
+    /// than defaulting to "not a timeout" unnoticed.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            IqError::Timeout => true,
+            IqError::NotConnected
+            | IqError::Disconnected(_)
+            | IqError::ServerError { .. }
+            | IqError::UnexpectedResponseType { .. }
+            | IqError::InternalChannelClosed => false,
+        }
+    }
+}
+
 /// Lightweight server error that can be embedded in `anyhow::Error` and
 /// downcast from any crate. Used as a shared type across crate boundaries
 /// when `wacore::request::IqError` isn't directly available (e.g., errors

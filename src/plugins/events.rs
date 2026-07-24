@@ -164,7 +164,7 @@ pub enum PluginEventRouteError {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PluginEventSubscribeError {
-    #[error(transparent)]
+    #[error("{0}")]
     Resource(#[from] PluginResourceError),
     #[error("at least one plugin event selector is required")]
     EmptySelectors,
@@ -184,7 +184,7 @@ pub enum PluginEventSubscribeError {
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PluginEventPublishError {
-    #[error(transparent)]
+    #[error("{0}")]
     Resource(#[from] PluginResourceError),
     #[error("plugin event schema version must be greater than zero")]
     InvalidSchemaVersion,

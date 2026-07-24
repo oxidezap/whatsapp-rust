@@ -40,10 +40,10 @@ pub use wacore::iq::groups::{
 #[non_exhaustive]
 pub enum GroupError {
     /// A `w:g2` IQ to the server failed (transport, timeout, server rejection).
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// A MEX (GraphQL) group-property mutation failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Mex(#[from] MexError),
     /// The request was malformed (e.g. empty invite code, batch over the limit,
     /// expired V4 invite, non-group JID where one is required).
@@ -57,7 +57,7 @@ pub enum GroupError {
     DescriptionConflict,
     /// Catch-all for internal failures (LID/PN resolution, the protocol-message
     /// send path behind `update_member_label`, cache plumbing).
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

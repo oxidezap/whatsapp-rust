@@ -27,20 +27,20 @@ use waproto::whatsapp as wa;
 #[non_exhaustive]
 pub enum NewsletterError {
     /// A MEX (GraphQL) query/mutation failed or returned malformed data.
-    #[error(transparent)]
+    #[error("{0}")]
     Mex(#[from] MexError),
     /// An IQ (message history, live updates) failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// Connection/transport failure sending a plaintext stanza (edit/revoke).
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
     /// The request was malformed (e.g. a non-newsletter JID, an empty target
     /// message id, or a missing element in the server response).
     #[error("invalid newsletter request: {0}")]
     InvalidRequest(String),
     /// Catch-all for internal failures with no dedicated variant.
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

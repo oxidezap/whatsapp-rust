@@ -13,10 +13,10 @@ pub enum PresenceError {
     #[error("cannot send presence without a push name set")]
     PushNameEmpty,
     /// Connection/transport failure sending the `<presence>` stanza.
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
     /// Catch-all for internal failures with no dedicated variant.
-    #[error(transparent)]
+    #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
 

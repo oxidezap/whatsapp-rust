@@ -133,6 +133,8 @@ pub use client::{ConnectError, ConnectStage, SignalMaintenanceError};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
+pub mod error;
+pub use error::{ErrorChainExt, ServerRejection, Sources};
 pub mod handlers;
 pub use handlers::chatstate::ChatStateEvent;
 pub mod handshake;

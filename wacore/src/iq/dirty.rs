@@ -22,6 +22,7 @@ pub enum DirtyType {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DirtyBitParseError {
     #[error("invalid timestamp '{value}': {source}")]
     InvalidTimestamp {

@@ -290,18 +290,18 @@ pub enum PluginResourceError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PluginMessagingError {
-    #[error(transparent)]
+    #[error("{0}")]
     Resource(#[from] PluginResourceError),
-    #[error(transparent)]
+    #[error("{0}")]
     Send(#[from] SendError),
 }
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PluginIqError {
-    #[error(transparent)]
+    #[error("{0}")]
     Resource(#[from] PluginResourceError),
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
 }
 
@@ -2585,7 +2585,7 @@ enum PluginCallbackError {
         "callback timed out after {timeout_seconds:.3} seconds and panicked while being cancelled"
     )]
     TimeoutCancellationPanic { timeout_seconds: f64 },
-    #[error(transparent)]
+    #[error("{0}")]
     Callback(#[from] anyhow::Error),
 }
 

@@ -6,17 +6,9 @@ const APP_STATE_KEY_SHARE_SEND_ATTEMPTS: u8 = 3;
 const APP_STATE_KEY_SHARE_SEND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn app_state_key_share_requires_reconnect(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::client::ClientError>()
-            .is_some_and(crate::client::ClientError::is_transport_unavailable)
-            || cause
-                .downcast_ref::<crate::request::IqError>()
-                .is_some_and(crate::request::IqError::is_transport_unavailable)
-            || cause
-                .downcast_ref::<crate::socket::error::EncryptSendError>()
-                .is_some_and(crate::socket::error::EncryptSendError::is_transport_unavailable)
-    })
+    // Annotated because `anyhow::Error` has two `AsRef<dyn Error>` impls.
+    let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+    crate::ErrorChainExt::is_transport_unavailable(cause)
 }
 
 impl Client {

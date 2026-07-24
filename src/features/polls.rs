@@ -17,7 +17,7 @@ pub use wacore::poll::PollVoteCiphertext;
 #[non_exhaustive]
 pub enum PollError {
     /// Sending the poll/vote stanza failed (embeds the send path error).
-    #[error(transparent)]
+    #[error("{0}")]
     Send(#[from] SendError),
     /// The poll definition is invalid (option count, duplicate names, bad
     /// quiz index, selectable count out of range).

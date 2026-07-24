@@ -111,6 +111,27 @@ impl IqError {
             _ => false,
         }
     }
+
+    /// The request went out and no answer came back in time.
+    ///
+    /// Matched exhaustively so a new variant has to be classified here rather
+    /// than defaulting to "not a timeout" unnoticed.
+    pub(crate) fn is_timeout(&self) -> bool {
+        match self {
+            IqError::Timeout => true,
+            IqError::NotConnected
+            | IqError::Socket(_)
+            | IqError::EncryptSend(_)
+            | IqError::ClientState(_)
+            | IqError::Disconnected(_)
+            | IqError::ServerError { .. }
+            | IqError::UnexpectedResponseType { .. }
+            | IqError::InternalChannelClosed
+            | IqError::DuplicateRequestId(_)
+            | IqError::EncodeError(_)
+            | IqError::ParseError(_) => false,
+        }
+    }
 }
 
 impl From<wacore::request::IqError> for IqError {

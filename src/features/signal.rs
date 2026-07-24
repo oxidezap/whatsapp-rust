@@ -22,7 +22,7 @@ use crate::client::Client;
 #[non_exhaustive]
 pub enum SignalError {
     /// A Signal protocol primitive (encrypt/decrypt/session) failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Protocol(#[from] SignalProtocolError),
     /// The requested operation is not valid for this input (e.g. a sender-key
     /// or message-secret envelope passed to the pairwise decrypt path).
@@ -32,7 +32,7 @@ pub enum SignalError {
     #[error("invalid signal input: {0}")]
     InvalidInput(String),
     /// Catch-all for internal failures (device resolution, cache flush).
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

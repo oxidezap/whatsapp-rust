@@ -29,6 +29,7 @@ use wacore_binary::NodeRef;
 
 /// Error type for chatstate parsing failures.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ChatstateParseError {
     /// Stanza has wrong tag (not `<chatstate>`)
     #[error("expected <chatstate>, got <{0}>")]
