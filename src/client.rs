@@ -664,6 +664,23 @@ pub enum SignalMaintenanceError {
     DrainShuttingDown,
 }
 
+impl ConnectError {
+    /// A step of the connect flow ran out of time.
+    ///
+    /// Matched exhaustively so a new variant has to be classified here rather
+    /// than defaulting to "not a timeout" unnoticed.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            ConnectError::Timeout { .. } => true,
+            ConnectError::Handshake(handshake) => handshake.is_timeout(),
+            ConnectError::AlreadyConnected
+            | ConnectError::NotActivated
+            | ConnectError::Version(_)
+            | ConnectError::Transport(_) => false,
+        }
+    }
+}
+
 impl ClientError {
     pub fn is_transport_unavailable(&self) -> bool {
         match self {

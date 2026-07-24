@@ -43,49 +43,76 @@ fn rust_sources() -> Vec<PathBuf> {
     out
 }
 
-/// Everything between the previous item and `lines[index]`: attributes and doc
-/// comments, however they are wrapped.
-fn preceding_attributes(lines: &[&str], index: usize) -> String {
-    let mut block = Vec::new();
-    for line in lines[..index].iter().rev() {
-        let trimmed = line.trim_end();
-        let ends_previous_item =
-            trimmed.is_empty() || trimmed.ends_with('}') || trimmed.ends_with(';');
-        if ends_previous_item {
-            break;
-        }
-        block.push(trimmed.trim_start());
-    }
-    block.join("\n")
-}
-
-/// The body of the enum declared at `lines[index]`, by brace balance.
-fn enum_body(lines: &[&str], index: usize) -> String {
-    let mut depth = 0usize;
-    let mut body = Vec::new();
-    for line in &lines[index..] {
-        depth += line.matches('{').count();
-        body.push(*line);
-        depth -= line.matches('}').count();
-        if depth == 0 && !body.is_empty() && body.len() > 1 {
-            break;
+/// Every `enum` in `text`, including those nested in inline modules.
+fn enums_of(text: &str) -> Vec<syn::ItemEnum> {
+    fn collect(items: &[syn::Item], out: &mut Vec<syn::ItemEnum>) {
+        for item in items {
+            match item {
+                syn::Item::Enum(item) => out.push(item.clone()),
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        collect(items, out);
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    body.join("\n")
+    // A parse failure must be loud: silently skipping a file would let an
+    // unchecked error enum through, which is the whole thing this guards.
+    let file = syn::parse_file(text).expect("parse Rust source");
+    let mut out = Vec::new();
+    collect(&file.items, &mut out);
+    out
 }
 
-/// A `thiserror` enum, identified by its variants rather than by its derive, so
-/// a multi-line `#[derive(..)]` cannot hide one.
-fn is_error_enum(lines: &[&str], index: usize) -> bool {
-    enum_body(lines, index).contains("#[error(")
+fn has_attribute(attrs: &[syn::Attribute], name: &str) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident(name))
 }
 
-/// `#[error(transparent)]` delegates `source()` to the *wrapped error's own*
+/// A `thiserror` enum, identified by its variants carrying `#[error(..)]`.
+fn is_error_enum(item: &syn::ItemEnum) -> bool {
+    item.variants
+        .iter()
+        .any(|variant| has_attribute(&variant.attrs, "error"))
+}
+
+/// Names of error enums in `text` that are `pub` and lack `#[non_exhaustive]`.
+fn error_enums_missing_non_exhaustive(text: &str) -> Vec<String> {
+    enums_of(text)
+        .iter()
+        .filter(|item| matches!(item.vis, syn::Visibility::Public(_)))
+        .filter(|item| is_error_enum(item))
+        .filter(|item| !has_attribute(&item.attrs, "non_exhaustive"))
+        .map(|item| item.ident.to_string())
+        .collect()
+}
+
+/// Names of variants in `text` annotated `#[error(transparent)]`.
+fn transparent_variants(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in enums_of(text) {
+        for variant in &item.variants {
+            for attr in &variant.attrs {
+                if attr.path().is_ident("error")
+                    && attr
+                        .parse_args::<syn::Ident>()
+                        .is_ok_and(|arg| arg == "transparent")
+                {
+                    out.push(format!("{}::{}", item.ident, variant.ident));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `#[error(transparent)]` delegates `source()` to the *wrapped error\'s own*
 /// source, so a wrapped leaf disappears from the chain entirely and can never
 /// be downcast. `#[error("{0}")]` renders identically and keeps it reachable.
 ///
 /// This is a blanket policy, deliberately wider than the reported symptom: it
-/// covers private enums too, because today's private error is tomorrow's public
+/// covers private enums too, because today\'s private error is tomorrow\'s public
 /// one and the attribute is invisible at the point where it hurts. Waiving it
 /// for a case where erasure is genuinely wanted is a decision to argue for in
 /// review, not to make silently.
@@ -94,10 +121,8 @@ fn surface_has_no_transparent_error_attribute() {
     let mut offenders = Vec::new();
     for file in rust_sources() {
         let text = std::fs::read_to_string(&file).expect("read source");
-        for (n, line) in text.lines().enumerate() {
-            if line.trim() == "#[error(transparent)]" {
-                offenders.push(format!("{}:{}", file.display(), n + 1));
-            }
+        for variant in transparent_variants(&text) {
+            offenders.push(format!("{} {}", file.display(), variant));
         }
     }
     assert!(
@@ -116,17 +141,8 @@ fn surface_error_enums_are_non_exhaustive() {
     let mut offenders = Vec::new();
     for file in rust_sources() {
         let text = std::fs::read_to_string(&file).expect("read source");
-        let lines: Vec<&str> = text.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
-            let Some(rest) = line.trim_start().strip_prefix("pub enum ") else {
-                continue;
-            };
-            if is_error_enum(&lines, n)
-                && !preceding_attributes(&lines, n).contains("non_exhaustive")
-            {
-                let name = rest.split(['{', ' ']).next().unwrap_or(rest);
-                offenders.push(format!("{}:{} {}", file.display(), n + 1, name));
-            }
+        for name in error_enums_missing_non_exhaustive(&text) {
+            offenders.push(format!("{} {}", file.display(), name));
         }
     }
     assert!(
@@ -135,6 +151,60 @@ fn surface_error_enums_are_non_exhaustive() {
          a breaking change. Found without it:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+// ── The scanner guards itself ───────────────────────────────────────────────
+//
+// Text scanning got both of these wrong: a blank line between the attribute and
+// the declaration hid `#[non_exhaustive]`, and an unbalanced brace in a doc
+// comment truncated the enum so it stopped looking like an error enum at all.
+// The second was fail-open, which is why this is parsed rather than scanned.
+
+#[test]
+fn scanner_sees_attributes_separated_by_a_blank_line() {
+    let source = "#[derive(Debug, thiserror::Error)]\n#[non_exhaustive]\n\npub enum E {\n    #[error(\"x\")]\n    V,\n}";
+    assert!(error_enums_missing_non_exhaustive(source).is_empty());
+}
+
+#[test]
+fn scanner_sees_through_unbalanced_braces_in_doc_comments() {
+    let source = "#[derive(Debug, thiserror::Error)]\npub enum E {\n    /// shape: { \"k\": v }}\n    #[error(\"x\")]\n    V,\n}";
+    assert_eq!(error_enums_missing_non_exhaustive(source), vec!["E"]);
+}
+
+#[test]
+fn scanner_sees_transparent_followed_by_other_text() {
+    let source =
+        "pub enum E {\n    #[error(transparent)] // legacy\n    V(#[from] std::fmt::Error),\n}";
+    assert_eq!(transparent_variants(source), vec!["E::V"]);
+}
+
+#[test]
+fn scanner_reads_a_declaration_whose_header_wraps() {
+    let source =
+        "#[derive(Debug, thiserror::Error)]\npub enum\n    E\n{\n    #[error(\"x\")]\n    V,\n}";
+    assert_eq!(error_enums_missing_non_exhaustive(source), vec!["E"]);
+}
+
+#[test]
+fn scanner_ignores_enums_that_are_not_errors() {
+    // Prose mentioning Error, and a variant named Error, must not be enough.
+    let source = "/// Errors are boxed here.\n#[derive(Debug)]\npub enum Outcome {\n    Value(u8),\n    Error(Box<u8>),\n}";
+    assert!(error_enums_missing_non_exhaustive(source).is_empty());
+}
+
+#[test]
+fn scanner_ignores_private_and_empty_enums_for_non_exhaustive() {
+    let private = "#[derive(Debug, thiserror::Error)]\nenum E {\n    #[error(\"x\")]\n    V,\n}";
+    assert!(error_enums_missing_non_exhaustive(private).is_empty());
+    let empty = "#[derive(Debug)]\npub enum E {}";
+    assert!(error_enums_missing_non_exhaustive(empty).is_empty());
+}
+
+#[test]
+fn scanner_finds_enums_nested_in_modules() {
+    let source = "mod inner {\n    #[derive(Debug, thiserror::Error)]\n    pub enum E {\n        #[error(\"x\")]\n        V,\n    }\n}";
+    assert_eq!(error_enums_missing_non_exhaustive(source), vec!["E"]);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

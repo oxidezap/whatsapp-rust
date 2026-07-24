@@ -114,6 +114,21 @@ impl IqError {
             IqError::NotConnected | IqError::Disconnected(_) | IqError::InternalChannelClosed
         )
     }
+
+    /// The request went out and no answer came back in time.
+    ///
+    /// Matched exhaustively so a new variant has to be classified here rather
+    /// than defaulting to "not a timeout" unnoticed.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            IqError::Timeout => true,
+            IqError::NotConnected
+            | IqError::Disconnected(_)
+            | IqError::ServerError { .. }
+            | IqError::UnexpectedResponseType { .. }
+            | IqError::InternalChannelClosed => false,
+        }
+    }
 }
 
 /// Lightweight server error that can be embedded in `anyhow::Error` and

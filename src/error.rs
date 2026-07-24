@@ -1,45 +1,11 @@
 //! Typed recovery over the error chain.
 //!
-//! Every public error in this crate is a `thiserror` enum whose wrapping
-//! variants keep the error they wrap reachable through
-//! [`std::error::Error::source`]. That makes the failure recoverable by type,
-//! but only if the caller is willing to write a chain walk and to know which
-//! concrete types can carry a given fact. Two types carry a server rejection
-//! ([`wacore::request::IqError`] and [`crate::request::IqError`]) and a third
-//! ([`wacore::request::ServerErrorCode`]) exists purely to move one across a
-//! crate boundary, so that walk is neither short nor obvious.
-//!
-//! [`ErrorChainExt`] is that walk, written once. It is an extension trait with
-//! a blanket impl over [`std::error::Error`], so a domain error added tomorrow
-//! answers these questions without implementing anything: the guarantee comes
-//! from the chain being lossless, not from per-enum bookkeeping.
-//!
-//! It is a read-only view over the existing errors. It defines no new error
-//! type, and the per-domain enums remain the return types.
-//!
-//! # Rendering
-//!
-//! A wrapping variant renders exactly what it wraps, so each error's own
-//! `Display` is unchanged. A caller that concatenates the whole chain will see
-//! consecutive nodes repeat the same sentence, which is the cosmetic price of
-//! keeping the wrapped error downcastable. Print the innermost cause, or
-//! collapse equal neighbours, rather than joining every node.
-//!
-//! # Scope
-//!
-//! Only questions the crate already answers internally are exposed. There is
-//! deliberately no "invalid input", "protocol violation" or "internal" query:
-//! each domain spells those as its own `InvalidRequest(String)`-style variant
-//! with no shared representation, so any such split would be invented here
-//! rather than recovered. [`crate::features::MexError::ExtensionError`] is
-//! likewise not reported as a server rejection: its `code` is a GraphQL
-//! extension code, a different space from the IQ `code` attribute, and merging
-//! the two would make the number meaningless.
-//!
-//! # Cost
-//!
-//! Nothing runs unless a caller asks, on an error value it already holds. The
-//! walk borrows; it allocates nothing and formats nothing.
+//! [`ErrorChainExt`] answers a few questions about any error without the caller
+//! knowing its concrete type, so it need not walk [`std::error::Error::source`]
+//! itself nor learn that three different types can carry a server rejection. It
+//! is a read-only view with a blanket impl: a domain error added later answers
+//! the same questions without implementing anything, and no new error type or
+//! parallel hierarchy exists.
 //!
 //! ```no_run
 //! use whatsapp_rust::ErrorChainExt;
@@ -53,17 +19,35 @@
 //! # }
 //! ```
 //!
-//! An `anyhow::Error` needs an annotation to reach the same methods, because
-//! it carries two `AsRef<dyn Error>` impls and both are covered here:
+//! From an `anyhow::Error`, annotate the cast: it carries two
+//! `AsRef<dyn Error>` impls and both are covered here.
 //!
 //! ```no_run
-//! use whatsapp_rust::ErrorChainExt;
-//!
+//! # use whatsapp_rust::ErrorChainExt;
 //! # fn demo(err: whatsapp_rust::anyhow::Error) {
 //! let cause: &(dyn std::error::Error + 'static) = err.as_ref();
 //! let _ = cause.server_rejection();
 //! # }
 //! ```
+//!
+//! # Scope
+//!
+//! Only questions the crate already answers internally are exposed. There is
+//! deliberately no "invalid input", "protocol violation" or "internal" query:
+//! each domain spells those as its own `InvalidRequest(String)`-style variant
+//! with no shared representation, so any such split would be invented here
+//! rather than recovered. [`crate::features::MexError::ExtensionError`] is
+//! likewise not reported as a server rejection: its `code` is a GraphQL
+//! extension code, a different space from the IQ `code` attribute, and merging
+//! the two would make the number meaningless.
+//!
+//! # Rendering
+//!
+//! A wrapping variant renders exactly what it wraps, so each error's own
+//! `Display` is unchanged. A caller that concatenates the whole chain will see
+//! consecutive nodes repeat the same sentence, which is the price of keeping
+//! the wrapped error downcastable. Print the innermost cause, or collapse equal
+//! neighbours, rather than joining every node.
 
 use std::error::Error as StdError;
 
@@ -139,19 +123,18 @@ pub trait ErrorChainExt {
     /// that never completed.
     fn is_timeout(&self) -> bool {
         self.sources().any(|cause| {
-            matches!(
-                cause.downcast_ref::<ClientIqError>(),
-                Some(ClientIqError::Timeout)
-            ) || matches!(
-                cause.downcast_ref::<CoreIqError>(),
-                Some(CoreIqError::Timeout)
-            ) || matches!(
-                cause.downcast_ref::<crate::client::ConnectError>(),
-                Some(crate::client::ConnectError::Timeout { .. })
-            ) || matches!(
-                cause.downcast_ref::<crate::handshake::HandshakeError>(),
-                Some(crate::handshake::HandshakeError::Timeout)
-            )
+            if let Some(iq) = cause.downcast_ref::<ClientIqError>() {
+                return iq.is_timeout();
+            }
+            if let Some(iq) = cause.downcast_ref::<CoreIqError>() {
+                return iq.is_timeout();
+            }
+            if let Some(connect) = cause.downcast_ref::<crate::client::ConnectError>() {
+                return connect.is_timeout();
+            }
+            cause
+                .downcast_ref::<crate::handshake::HandshakeError>()
+                .is_some_and(crate::handshake::HandshakeError::is_timeout)
         })
     }
 
