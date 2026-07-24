@@ -556,14 +556,60 @@ mod shutdown_tests {
     // notify() wakes every registered listener, not just the first one:
     // event_listener's notify takes a count, so a wrong count here would strand
     // all but one of the tasks waiting on shutdown.
+    //
+    // Resolution is the wrong observable for that: the sticky flag makes a
+    // re-polled waiter finish whether or not it was ever woken, so `block_on`
+    // alone still passes with notify(1). Count the wakeups instead, and poll
+    // each waiter to Pending first — registration happens on that first poll,
+    // so a still-lazy future is not yet listening when notify fires.
     #[test]
     fn notify_wakes_every_registered_listener() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWaker(AtomicUsize);
+        impl futures::task::ArcWake for CountingWaker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         let notifier = ShutdownNotifier::new();
         let signals: Vec<_> = (0..4).map(|_| notifier.subscribe()).collect();
-        let waiters: Vec<_> = signals.iter().map(wait_for_shutdown).collect();
-        let publisher_side = notifier.listen();
+        let mut waiters: Vec<_> = signals
+            .iter()
+            .map(|s| Box::pin(wait_for_shutdown(s).fuse()))
+            .collect();
+        let mut publisher_side = Box::pin(notifier.listen().fuse());
+
+        // One waker per subscriber, plus one for the publisher-side listener.
+        let wakers: Vec<_> = (0..signals.len() + 1)
+            .map(|_| Arc::new(CountingWaker(AtomicUsize::new(0))))
+            .collect();
+        for (fut, waker) in waiters.iter_mut().zip(&wakers) {
+            let waker = futures::task::waker_ref(waker);
+            let mut ctx = futures::task::Context::from_waker(&waker);
+            assert!(fut.as_mut().poll_unpin(&mut ctx).is_pending());
+        }
+        {
+            let waker = futures::task::waker_ref(wakers.last().expect("wakers is non-empty"));
+            let mut ctx = futures::task::Context::from_waker(&waker);
+            assert!(publisher_side.as_mut().poll_unpin(&mut ctx).is_pending());
+        }
+        assert!(
+            wakers.iter().all(|w| w.0.load(Ordering::Relaxed) == 0),
+            "no listener may be woken before notify()"
+        );
 
         notifier.notify();
+
+        for (i, waker) in wakers.iter().enumerate() {
+            assert!(
+                waker.0.load(Ordering::Relaxed) > 0,
+                "listener {i} of {} was never woken by notify()",
+                wakers.len()
+            );
+        }
 
         block_on(futures::future::join_all(waiters));
         block_on(publisher_side);

@@ -3681,17 +3681,12 @@ async fn ack_miss_path_does_not_heap_allocate() {
 
     let node = Arc::new(owned_ack_node("3EB0A9252A8F12B7E2"));
 
-    // Min-delta over many windows: sibling tests share the process-global
-    // counter, but their allocations are sporadic. A per-call String shows up
-    // in every window, so the minimum only reaches 0 when the path is clean.
-    let mut min_delta = u64::MAX;
-    for _ in 0..100 {
-        let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+    // A per-call String shows up in every window, so the minimum only reaches 0
+    // when the path is clean.
+    let min_delta = crate::test_alloc::min_allocs(0, || {
         let handled = client.handle_ack_response_arc(&node);
-        let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
         assert!(!handled, "no waiter is registered for this id");
-        min_delta = min_delta.min(after - before);
-    }
+    });
     assert_eq!(min_delta, 0, "ack miss path must not allocate");
 }
 

@@ -33,6 +33,36 @@ pub(crate) mod test_alloc {
 
     #[global_allocator]
     static GLOBAL: CountingAlloc = CountingAlloc;
+
+    /// Smallest allocation delta observed while running `op`, retrying until it
+    /// reaches `expected`.
+    ///
+    /// `ALLOCS` counts every allocation in the process, so a sibling test thread
+    /// allocating inside the window inflates that window's delta. A fixed
+    /// iteration count only hopes one of its windows lands quiet, which is a
+    /// flake under a loaded CI runner; retrying until the delta reaches
+    /// `expected` makes ambient traffic cost iterations instead of a false
+    /// failure. A real regression never reaches `expected`, so the caller's
+    /// assertion still fires — with the count actually observed.
+    pub(crate) fn min_allocs<T>(expected: u64, mut op: impl FnMut() -> T) -> u64 {
+        // Bounded so a genuine regression fails instead of spinning forever.
+        // The happy path exits on its first quiet window, so a budget this
+        // large is free unless something is actually wrong.
+        const BUDGET: u32 = 100_000;
+
+        let mut min = u64::MAX;
+        for _ in 0..BUDGET {
+            let before = ALLOCS.load(Ordering::Relaxed);
+            let value = std::hint::black_box(op());
+            let after = ALLOCS.load(Ordering::Relaxed);
+            drop(value);
+            min = min.min(after - before);
+            if min <= expected {
+                break;
+            }
+        }
+        min
+    }
 }
 
 pub use wacore::appstate::schemas;

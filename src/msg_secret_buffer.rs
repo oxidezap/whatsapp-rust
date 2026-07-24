@@ -582,17 +582,17 @@ mod tests {
         buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11))
             .await;
 
-        // Sibling tests share the process-wide counter, so take the minimum of
-        // repeated windows. The result Vec costs exactly one allocation; an
-        // owned lookup key would add one allocation per component every time.
-        let mut min_delta = u64::MAX;
-        for _ in 0..100 {
-            let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
-            let result = buf.lookup("g@g.us", "a@s.whatsapp.net", "M1");
-            std::hint::black_box(&result);
-            let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
-            min_delta = min_delta.min(after - before);
-        }
+        // A miss would also be allocation-free, which would read as a pass for
+        // the wrong reason.
+        assert!(
+            buf.lookup("g@g.us", "a@s.whatsapp.net", "M1").is_some(),
+            "the queued secret must be buffered before measuring"
+        );
+
+        // The result Vec costs exactly one allocation; an owned lookup key would
+        // add one allocation per component every time.
+        let min_delta =
+            crate::test_alloc::min_allocs(1, || buf.lookup("g@g.us", "a@s.whatsapp.net", "M1"));
         assert_eq!(min_delta, 1, "only the returned secret Vec may allocate");
 
         buf.wait_flushed().await;
@@ -603,14 +603,7 @@ mod tests {
     #[test]
     fn entry_clone_does_not_heap_allocate() {
         let entry = entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11);
-        let mut min_delta = u64::MAX;
-        for _ in 0..100 {
-            let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
-            let cloned = std::hint::black_box(&entry).clone();
-            std::hint::black_box(cloned);
-            let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
-            min_delta = min_delta.min(after - before);
-        }
+        let min_delta = crate::test_alloc::min_allocs(0, || std::hint::black_box(&entry).clone());
         assert_eq!(min_delta, 0, "an entry clone must not allocate");
     }
 
