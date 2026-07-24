@@ -582,7 +582,11 @@ where
     ///
     /// The initializer is boxed only on cache miss — a hit returns without
     /// allocating. The boxing keeps the slow path monomorphic per `<K, V>`
-    /// instead of per call-site future type.
+    /// instead of per call-site future type. A racer that loses the
+    /// double-check inside [`get_with_slow`](Self::get_with_slow) pays one
+    /// spare box; deferring the box past the double-check would drag the
+    /// future type parameter back into the slow path, re-stamping it per
+    /// call site.
     #[inline]
     pub async fn get_with<F>(&self, key: K, init: F) -> V
     where
