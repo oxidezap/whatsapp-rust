@@ -133,7 +133,7 @@ pub enum AppStateSyncError {
     KeyNotFound(String),
     #[error("store error")]
     Store(#[from] crate::store::error::StoreError),
-    #[error(transparent)]
+    #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
 

@@ -29,7 +29,7 @@ pub enum AppStateError {
     #[error("invalid app-state request: {0}")]
     InvalidRequest(String),
     /// Encoding, key lookup, or sending the app-state patch failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

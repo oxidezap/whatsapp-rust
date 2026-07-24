@@ -26,13 +26,13 @@ use wacore_binary::Jid;
 #[non_exhaustive]
 pub enum CommunityError {
     /// A `w:g2` IQ to the server failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// A MEX (GraphQL) metadata query/mutation failed or returned bad data.
-    #[error(transparent)]
+    #[error("{0}")]
     Mex(#[from] MexError),
     /// A delegated group operation failed (e.g. setting the community description).
-    #[error(transparent)]
+    #[error("{0}")]
     Group(#[from] GroupError),
     /// The request was malformed or the server response was missing required data.
     #[error("invalid community request: {0}")]

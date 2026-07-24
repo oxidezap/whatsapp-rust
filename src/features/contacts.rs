@@ -24,7 +24,7 @@ pub use wacore::stanza::business::VerifiedName;
 #[non_exhaustive]
 pub enum ContactError {
     /// The usync/profile IQ to the server failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// An input JID is not supported for this query (only PN and LID are).
     #[error("unsupported contact JID: {0}")]

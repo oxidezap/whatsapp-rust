@@ -569,9 +569,9 @@ pub enum ClientError {
     #[error("IQ request failed: {0}")]
     Iq(#[from] crate::request::IqError),
     /// Last-resort catch-all for internal failures threaded through `?` that do
-    /// not (yet) have a dedicated variant. Transparent so the underlying
-    /// error's `Display`/source chain is preserved.
-    #[error(transparent)]
+    /// not (yet) have a dedicated variant. `Display` forwards to the inner
+    /// error while `source()` still exposes it for downcast.
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 
@@ -625,7 +625,7 @@ pub enum ConnectError {
     #[error("failed to open transport")]
     Transport(#[source] anyhow::Error),
     /// The noise handshake failed after the transport was up.
-    #[error(transparent)]
+    #[error("{0}")]
     Handshake(#[from] handshake::HandshakeError),
 }
 
@@ -650,7 +650,7 @@ pub enum SignalMaintenanceError {
     #[error("IQ request failed: {0}")]
     Iq(#[from] crate::request::IqError),
     /// A Signal primitive failed (e.g. signing the new signed pre-key).
-    #[error(transparent)]
+    #[error("{0}")]
     Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
     /// The inbound drain batch could not be committed, so the Signal cache was
     /// left unflushed on purpose and the server redelivers those messages.

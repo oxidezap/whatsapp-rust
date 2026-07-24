@@ -47,6 +47,7 @@ const ENC_KEY_INFO: &[u8] = b"Pairing Information Encryption Key";
 const VERIFICATION_CODE_BYTES: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ShortcakeError {
     #[error("invalid primary public key: {0}")]
     InvalidPrimaryKey(CurveError),

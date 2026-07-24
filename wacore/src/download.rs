@@ -28,7 +28,7 @@ pub enum MediaDecryptionError {
     Decryption(#[source] AesCbcDecryptionError),
     #[error("HMAC initialization failed")]
     Mac(#[source] CryptoError),
-    #[error(transparent)]
+    #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
 

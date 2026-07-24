@@ -32,10 +32,10 @@ use wacore_binary::Jid;
 #[non_exhaustive]
 pub enum TcTokenError {
     /// The IQ requesting tokens from the server failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// A token store (persistence) operation failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Store(#[from] StoreError),
 }
 

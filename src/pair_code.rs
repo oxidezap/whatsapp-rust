@@ -66,7 +66,7 @@ pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PairError {
-    #[error(transparent)]
+    #[error("{0}")]
     PairCode(#[from] PairCodeError),
 
     /// The pair-code IQ was rejected by the server.
@@ -590,18 +590,22 @@ mod tests {
     }
 
     #[test]
-    fn pair_error_paircode_transparent_walks_to_curve_error() {
+    fn pair_error_paircode_walks_to_curve_error() {
         use wacore::libsignal::protocol::CurveError;
         // Wrap a wacore PairCodeError that itself carries a CurveError source.
-        // Because PairError::PairCode is `transparent`, walking source() once
-        // skips the transparent layer and lands directly on the CurveError.
         let pe: PairError =
             PairCodeError::EphemeralKeyAgreement(CurveError::NoKeyTypeIdentifier).into();
         assert_eq!(pe.to_string(), "ephemeral key agreement failed");
+        // Hop 1 is the PairCodeError itself: the wrapper no longer erases it.
         let src = std::error::Error::source(&pe).expect("source preserved");
-        let curve = src
+        let pce = src
+            .downcast_ref::<PairCodeError>()
+            .expect("downcasts to PairCodeError");
+        assert!(matches!(pce, PairCodeError::EphemeralKeyAgreement(_)));
+        let curve = std::error::Error::source(pce)
+            .expect("inner source preserved")
             .downcast_ref::<CurveError>()
-            .expect("downcasts to CurveError through transparent wrapper");
+            .expect("downcasts to CurveError");
         assert!(matches!(curve, CurveError::NoKeyTypeIdentifier));
     }
 

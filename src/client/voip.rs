@@ -36,7 +36,7 @@ impl Client {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CallError {
-    #[error(transparent)]
+    #[error("{0}")]
     Send(#[from] ClientError),
     #[error("call_id cannot be empty")]
     EmptyCallId,

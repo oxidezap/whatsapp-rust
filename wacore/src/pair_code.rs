@@ -517,6 +517,7 @@ impl PairCodeUtils {
 /// `whatsapp_rust::pair_code::PairError` and adds an IQ-failure variant for the
 /// transport layer.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PairCodeError {
     #[error("phone number is required")]
     PhoneNumberRequired,

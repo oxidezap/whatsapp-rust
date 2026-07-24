@@ -73,7 +73,7 @@ pub enum StanzaResponseError {
     UnsupportedStanzaClass,
     #[error("failed to encode stanza response")]
     Encoding(#[from] wacore_binary::error::BinaryError),
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
 }
 
@@ -155,7 +155,7 @@ pub enum RetryRequestError {
     MissingLocalIdentity,
     #[error("invalid message stanza")]
     InvalidStanza(#[source] anyhow::Error),
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
     #[error("failed to prepare retry request")]
     Internal(#[from] anyhow::Error),

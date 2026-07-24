@@ -16,14 +16,14 @@ use wacore_binary::Jid;
 #[non_exhaustive]
 pub enum BlockingError {
     /// The IQ to the server failed (transport, timeout, server rejection).
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// The target JID is not a user JID, or has no resolvable LID↔PN mapping
     /// (modern WA requires both sides for a block).
     #[error("invalid blocklist target: {0}")]
     InvalidJid(String),
     /// Catch-all for internal failures (e.g. LID/PN store lookup).
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

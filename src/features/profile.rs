@@ -19,16 +19,16 @@ pub use wacore::iq::contacts::SetProfilePictureResponse;
 #[non_exhaustive]
 pub enum ProfileError {
     /// An IQ to the server failed (status text / profile picture).
-    #[error(transparent)]
+    #[error("{0}")]
     Iq(#[from] IqError),
     /// Connection/transport failure sending a stanza (push-name presence).
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
     /// A provided argument is invalid (e.g. an empty push name).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     /// Catch-all for internal failures with no dedicated variant.
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

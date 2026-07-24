@@ -31,7 +31,7 @@ const MEDIA_REUPLOAD_CONCURRENCY: usize = 32;
 #[non_exhaustive]
 pub enum MediaReuploadError {
     /// Connection/transport failure sending the server-error receipt.
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
     /// The client is not logged in.
     #[error("client is not logged in")]
@@ -44,7 +44,7 @@ pub enum MediaReuploadError {
     #[error("media retry notification timed out")]
     Timeout,
     /// Catch-all for internal failures (receipt encryption, response parsing).
-    #[error(transparent)]
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 

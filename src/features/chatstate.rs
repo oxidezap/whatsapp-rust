@@ -12,7 +12,7 @@ use wacore_binary::builder::NodeBuilder;
 #[non_exhaustive]
 pub enum ChatStateError {
     /// Connection/transport failure sending the `<chatstate>` stanza.
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientError),
 }
 

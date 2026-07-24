@@ -89,7 +89,7 @@ pub enum BotBuilderError {
     /// Initializing the device row in the storage backend failed.
     #[error("failed to initialize the device store: {0}")]
     Store(#[from] StoreError),
-    #[error(transparent)]
+    #[error("{0}")]
     Client(#[from] ClientBuilderError),
 }
 
