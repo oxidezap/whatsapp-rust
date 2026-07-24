@@ -48,7 +48,7 @@ pub enum MessageEditError {
         source: JidError,
     },
     /// The target key carried neither `participant` nor `remote_jid`, and
-    /// `from_me` was not set, so no author can be derived from it.
+    /// `from_me` was not `Some(true)`, so no author can be derived from it.
     #[error("target message key missing participant and remote_jid")]
     MissingTargetSender,
 }
@@ -730,6 +730,40 @@ mod tests {
             .original_sender_jid(&my_jid)
             .expect_err("a target key with no sender must not resolve");
         assert!(matches!(err, MessageEditError::MissingTargetSender));
+    }
+
+    #[test]
+    fn original_sender_jid_reports_an_unparseable_remote_jid() {
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("not a jid".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_envelope(&msg).expect("recognised");
+        let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
+        let err = env
+            .original_sender_jid(&my_jid)
+            .expect_err("a malformed remote_jid must not resolve");
+        assert!(matches!(
+            err,
+            MessageEditError::InvalidTargetJid {
+                field: "remoteJid",
+                ..
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]

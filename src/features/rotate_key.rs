@@ -26,6 +26,17 @@ pub(crate) const SIGNED_PRE_KEY_RETENTION: usize = 3;
 /// per rotation and wrap back to 1 here.
 const MAX_SIGNED_PRE_KEY_ID: u32 = 16_777_215;
 
+/// Wraps a backend failure as [`SignalMaintenanceError::Storage`], keeping the
+/// typed cause in the `source()` chain under `context`.
+fn storage_err<E>(
+    context: impl std::fmt::Display + Send + Sync + 'static,
+) -> impl FnOnce(E) -> SignalMaintenanceError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    move |e| SignalMaintenanceError::Storage(anyhow::Error::new(e).context(context))
+}
+
 /// Whether the cadence has elapsed. `last == 0` means the field predates this
 /// feature; the baseline path handles that, so we never rotate on `0`.
 pub(crate) fn should_rotate_signed_pre_key(last_rotation_ms: i64, now_ms: i64) -> bool {
@@ -63,11 +74,10 @@ impl Client {
             self.persistence_manager
                 .process_command(DeviceCommand::SetSignedPreKeyRotationBaseline(now))
                 .await;
-            self.persistence_manager.flush().await.map_err(|e| {
-                SignalMaintenanceError::Storage(
-                    anyhow::Error::new(e).context("failed to flush rotation baseline"),
-                )
-            })?;
+            self.persistence_manager
+                .flush()
+                .await
+                .map_err(storage_err("failed to flush rotation baseline"))?;
             return Ok(());
         }
 
@@ -107,11 +117,11 @@ impl Client {
         // this id verbatim. A retry after an ambiguous failure then re-uploads
         // THIS exact key instead of minting a fresh one under the same id, so the
         // key the server may already have accepted is never overwritten/lost.
-        let (new_kp, signature) = match backend.load_signed_prekey(new_id).await.map_err(|e| {
-            SignalMaintenanceError::Storage(
-                anyhow::Error::new(e).context("failed to load staged signed pre-key"),
-            )
-        })? {
+        let (new_kp, signature) = match backend
+            .load_signed_prekey(new_id)
+            .await
+            .map_err(storage_err("failed to load staged signed pre-key"))?
+        {
             Some(bytes) => {
                 let s = waproto::codec::signed_pre_key_record_decode(&bytes).map_err(|e| {
                     SignalMaintenanceError::CorruptKey(format!("staged record decode: {e}"))
@@ -169,11 +179,7 @@ impl Client {
                         &waproto::codec::signed_pre_key_record_to_vec(&record),
                     )
                     .await
-                    .map_err(|e| {
-                        SignalMaintenanceError::Storage(
-                            anyhow::Error::new(e).context("failed to stage new signed pre-key"),
-                        )
-                    })?;
+                    .map_err(storage_err("failed to stage new signed pre-key"))?;
                 (kp, signature)
             }
         };
@@ -194,11 +200,7 @@ impl Client {
                 &waproto::codec::signed_pre_key_record_to_vec(&old_record),
             )
             .await
-            .map_err(|e| {
-                SignalMaintenanceError::Storage(
-                    anyhow::Error::new(e).context("failed to retain old signed pre-key"),
-                )
-            })?;
+            .map_err(storage_err("failed to retain old signed pre-key"))?;
 
         // WA Web reads 406 = bad key, 409 = server validation fail, >=500 =
         // transient; none advance local state or fail the automatic login path.
@@ -224,11 +226,12 @@ impl Client {
                     // staged. Every other code (rate limits, transient 5xx, …) is
                     // retryable, so keep the staged key for a plain retry.
                     if *code == 406 || *code == 409 {
-                        backend.remove_signed_prekey(new_id).await.map_err(|e| {
-                            SignalMaintenanceError::Storage(anyhow::Error::new(e).context(format!(
+                        backend
+                            .remove_signed_prekey(new_id)
+                            .await
+                            .map_err(storage_err(format!(
                                 "failed to drop rejected staged signed pre-key {new_id}"
-                            )))
-                        })?;
+                            )))?;
                         log::warn!(
                             "signed pre-key rotation rejected (code={code}, text='{text}'); \
                              discarded the rejected key, will remint on a later connect"
@@ -261,11 +264,10 @@ impl Client {
                 rotation_ms: now,
             })
             .await;
-        self.persistence_manager.flush().await.map_err(|e| {
-            SignalMaintenanceError::Storage(
-                anyhow::Error::new(e).context("failed to flush rotated signed pre-key"),
-            )
-        })?;
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(storage_err("failed to flush rotated signed pre-key"))?;
 
         // new_id now lives in the device field, so drop its redundant staged copy
         // before pruning to RETENTION total addressable keys (field + RETENTION-1
@@ -274,11 +276,10 @@ impl Client {
         if let Err(e) = backend.remove_signed_prekey(new_id).await {
             log::warn!("failed to drop staged signed pre-key {new_id}: {e}");
         }
-        let mut retained = backend.load_all_signed_prekeys().await.map_err(|e| {
-            SignalMaintenanceError::Storage(
-                anyhow::Error::new(e).context("failed to load retained signed pre-keys"),
-            )
-        })?;
+        let mut retained = backend
+            .load_all_signed_prekeys()
+            .await
+            .map_err(storage_err("failed to load retained signed pre-keys"))?;
         retained.sort_unstable_by_key(|(id, _)| std::cmp::Reverse(*id));
         for (id, _) in retained
             .into_iter()
