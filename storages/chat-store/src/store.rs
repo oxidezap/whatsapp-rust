@@ -1340,6 +1340,9 @@ fn apply_receipt(
         )
         .set(schema::messages::status.eq(status))
         .execute(conn)?;
+        // Zero rows covers both the real PN/LID miss and a replay against a
+        // row already at/past the target; the alt retry stays harmless for
+        // the latter (advance-only) and still heals a lagging split copy.
         if updated == 0 {
             missed.push(msg_id);
         }

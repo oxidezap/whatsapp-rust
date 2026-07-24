@@ -16,7 +16,7 @@
 //! `accountLid` column, and the chat-store needs no schema of its own.
 
 use diesel::prelude::*;
-use diesel::sql_types::{Bool, Integer, Text};
+use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use wacore_binary::{Jid, Server};
 
 use crate::schema;
@@ -145,6 +145,16 @@ struct DupMessage {
     status: i32,
     #[diesel(sql_type = Bool)]
     starred: bool,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    edited_at_ms: Option<i64>,
+    #[diesel(sql_type = Bool)]
+    revoked: bool,
+    #[diesel(sql_type = Nullable<Text>)]
+    text_content: Option<String>,
+    #[diesel(sql_type = Text)]
+    kind: String,
+    #[diesel(sql_type = Nullable<Binary>)]
+    proto: Option<Vec<u8>>,
 }
 
 /// Fold a peer's split PN/LID pair into one thread and return the surviving
@@ -190,11 +200,15 @@ pub(crate) fn merge_split_chat(
     }
 
     // Same message stored under both keys (fanout echo vs. history overlap):
-    // fold the source copy's advance-only columns into the surviving row —
-    // the destination row keeps its content (it may carry a newer edit or a
-    // tombstone the source copy predates).
+    // fold the source copy into the surviving row under the live-path rules —
+    // status/starred advance-only, a source tombstone wins (`apply_revoke`),
+    // a strictly newer source edit brings its content (`apply_edit`); short
+    // of those, the destination row keeps its content.
     let dups: Vec<DupMessage> = diesel::sql_query(
-        "SELECT m.msg_id AS id, m.status AS status, m.starred AS starred FROM messages m \
+        "SELECT m.msg_id AS id, m.status AS status, m.starred AS starred, \
+                m.edited_at_ms AS edited_at_ms, m.revoked AS revoked, \
+                m.text_content AS text_content, m.kind AS kind, m.proto AS proto \
+         FROM messages m \
          WHERE m.device_id = ? AND m.chat_jid = ? AND EXISTS \
          (SELECT 1 FROM messages d WHERE d.device_id = m.device_id \
           AND d.chat_jid = ? AND d.msg_id = m.msg_id)",
@@ -214,6 +228,28 @@ pub(crate) fn merge_split_chat(
             diesel::update(crate::store::message_row(device_id, dest, &dup.id))
                 .set(dsl::starred.eq(true))
                 .execute(conn)?;
+        }
+        if dup.revoked {
+            diesel::update(crate::store::message_row(device_id, dest, &dup.id))
+                .set((
+                    dsl::revoked.eq(true),
+                    dsl::text_content.eq(None::<String>),
+                    dsl::proto.eq(None::<Vec<u8>>),
+                ))
+                .execute(conn)?;
+        } else if let Some(edited) = dup.edited_at_ms {
+            diesel::update(
+                crate::store::message_row(device_id, dest, &dup.id)
+                    .filter(dsl::revoked.eq(false))
+                    .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.le(edited))),
+            )
+            .set((
+                dsl::text_content.eq(dup.text_content.as_deref()),
+                dsl::kind.eq(&dup.kind),
+                dsl::proto.eq(dup.proto.as_deref()),
+                dsl::edited_at_ms.eq(Some(edited)),
+            ))
+            .execute(conn)?;
         }
     }
     // UPDATE OR IGNORE: PK collisions (the dups above) stay behind and are

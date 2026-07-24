@@ -3003,3 +3003,94 @@ async fn lid_reaction_reaches_pn_keyed_message() {
     // No twin chat was opened for the reaction.
     assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 1);
 }
+
+/// An edit or revoke that reached only one side of a split survives the
+/// merge: the source copy's newer edit content and tombstone fold into the
+/// surviving row (same monotonic rules as the live path).
+#[tokio::test]
+async fn merge_folds_src_side_edit_and_revoke() {
+    let (store, chat_store) = test_store().await;
+
+    // No mapping: duplicate copies of both messages under each identity.
+    for chat in [PEER, PEER_LID] {
+        feed(
+            &chat_store,
+            [
+                message_event(
+                    wa::Message::text("typo"),
+                    incoming_info(chat, chat, "MSG-ED", 1_700_000_000),
+                ),
+                message_event(
+                    wa::Message::text("apaga"),
+                    incoming_info(chat, chat, "MSG-RV", 1_700_000_010),
+                ),
+            ],
+        )
+        .await;
+    }
+    // Edit and revoke land only on the LID side.
+    let edit = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-ED".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::from_box(Box::new(wa::Message::text("consertada"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-RV".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [
+            message_event(
+                edit,
+                incoming_info(PEER_LID, PEER_LID, "MSG-ED2", 1_700_000_050),
+            ),
+            message_event(
+                revoke,
+                incoming_info(PEER_LID, PEER_LID, "MSG-RV2", 1_700_000_060),
+            ),
+            // Newer activity on the PN side makes it the merge destination.
+            message_event(
+                wa::Message::text("mais nova"),
+                incoming_info(PEER, PEER, "MSG-NW", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, jid(PEER));
+    let edited = chat_store
+        .message(&jid(PEER), "MSG-ED")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.text.as_deref(), Some("consertada"));
+    assert!(edited.edited_at.is_some());
+    let revoked = chat_store
+        .message(&jid(PEER), "MSG-RV")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(revoked.revoked);
+    assert!(revoked.text.is_none());
+}
