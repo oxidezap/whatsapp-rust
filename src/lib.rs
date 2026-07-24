@@ -179,12 +179,12 @@ pub use features::{
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
     NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
     PictureType, PollError, PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError,
-    PresenceStatus, Profile, ProfileError, ProfilePicture, ReachoutTimelock, RetryReason,
-    RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind, SecretEncrypted,
-    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
-    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
-    SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo,
-    UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    PresenceStatus, PreviousDescription, Profile, ProfileError, ProfilePicture, ReachoutTimelock,
+    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind,
+    SecretEncrypted, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
+    SignalSessionMigration, StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting,
+    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
+    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
