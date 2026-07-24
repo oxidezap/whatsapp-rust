@@ -389,7 +389,7 @@ async fn handle_pair_success<'a>(
                 error!("Failed to send pair error node: {send_err}");
             }
 
-            let pair_error_event = crate::types::events::PairError::builder()
+            let pair_error_event = PairError::builder()
                 .id(jid)
                 .lid(lid)
                 .business_name(business_name)

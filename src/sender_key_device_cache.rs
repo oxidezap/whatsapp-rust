@@ -109,7 +109,7 @@ impl SenderKeyDeviceCache {
     /// Concurrent callers for the same key share the single init result.
     pub(crate) async fn get_or_init<F>(&self, group_jid: &str, init: F) -> Arc<SenderKeyDeviceMap>
     where
-        F: std::future::Future<Output = Arc<SenderKeyDeviceMap>> + wacore::sync_marker::MaybeSend,
+        F: Future<Output = Arc<SenderKeyDeviceMap>> + wacore::sync_marker::MaybeSend,
     {
         self.inner.get_with_by_ref(group_jid, init).await
     }
@@ -184,13 +184,11 @@ impl SenderKeyDeviceCache {
         self.inner
             .memory_stats(|k, v| {
                 k.capacity()
-                    + v.devices.capacity()
-                        * std::mem::size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>()
+                    + v.devices.capacity() * size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>()
                     + v.devices
                         .iter()
                         .map(|(user, by_device)| {
-                            user.len()
-                                + by_device.capacity() * std::mem::size_of::<(u16, AtomicBool)>()
+                            user.len() + by_device.capacity() * size_of::<(u16, AtomicBool)>()
                         })
                         .sum::<usize>()
             })

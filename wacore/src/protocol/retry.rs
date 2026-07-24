@@ -112,14 +112,14 @@ fn parse_registration_id(bytes: &[u8]) -> Option<u32> {
 /// Helper to extract registration ID from a node (4 bytes big-endian).
 ///
 /// Looks for a `<registration>` child node and parses its bytes content
-/// as a big-endian `u32`. See [`parse_registration_id`] for the parse rules.
+/// as a big-endian `u32`. See `parse_registration_id` for the parse rules.
 pub fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;
     parse_registration_id(get_bytes_content(registration_node)?)
 }
 
 /// `NodeRef` counterpart of [`extract_registration_id_from_node`]; shares the
-/// same parse rules via [`parse_registration_id`].
+/// same parse rules via `parse_registration_id`.
 pub fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;
     parse_registration_id(registration_node.content_bytes()?)

@@ -12,6 +12,10 @@
 //! Metric labels are strictly categorical (outcome, kind, namespace, ...); JIDs,
 //! phone numbers and message ids are never used as labels.
 
+// The rendered scrape is this example's output, not a diagnostic to route
+// through `log`.
+#![allow(clippy::print_stdout)]
+
 fn main() {
     // Install a Prometheus recorder. `install_recorder()` sets the global recorder
     // and returns a handle you can render from your own HTTP endpoint. Use

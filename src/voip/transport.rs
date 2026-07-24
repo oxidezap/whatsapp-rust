@@ -215,7 +215,7 @@ pub async fn connect_relay_media(
 /// `webrtc-data::DataChannel::client` does NOT commit the config's reliability for a `negotiated`
 /// channel (only the DCEP-accept path does), so we set it on the SCTP stream directly -- the same
 /// mapping `commit_reliability_params` applies for `PartialReliableRexmitUnordered` with 0 retransmits.
-async fn open_media_datachannel(assoc: &Arc<Association>) -> anyhow::Result<DataChannel> {
+async fn open_media_datachannel(assoc: &Arc<Association>) -> Result<DataChannel> {
     let stream = assoc
         .open_stream(0, PayloadProtocolIdentifier::Binary)
         .await

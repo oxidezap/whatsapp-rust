@@ -104,7 +104,7 @@ mod tests {
 
         async fn handle(
             &self,
-            _client: Arc<crate::client::Client>,
+            _client: Arc<Client>,
             _node: Arc<OwnedNodeRef>,
             _cancelled: &mut bool,
         ) -> bool {
@@ -157,7 +157,7 @@ mod tests {
             .expect("persistence manager should initialize");
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
         let http_client = Arc::new(MockHttpClient);
-        let (client, _rx) = crate::client::Client::new(
+        let (client, _rx) = Client::new(
             Arc::new(crate::runtime_impl::TokioRuntime),
             Arc::new(pm),
             transport,
@@ -190,7 +190,7 @@ mod tests {
             .expect("persistence manager should initialize");
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
         let http_client = Arc::new(MockHttpClient);
-        let (client, _rx) = crate::client::Client::new(
+        let (client, _rx) = Client::new(
             Arc::new(crate::runtime_impl::TokioRuntime),
             Arc::new(pm),
             transport,

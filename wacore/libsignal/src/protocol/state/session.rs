@@ -1241,14 +1241,14 @@ mod tests {
         let identity_keypair = KeyPair::generate(&mut csprng);
         let their_identity = IdentityKey::new(identity_keypair.public_key);
         let our_identity = IdentityKey::new(KeyPair::generate(&mut csprng).public_key);
-        let root_key = crate::protocol::ratchet::RootKey::new([0u8; 32]);
+        let root_key = RootKey::new([0u8; 32]);
 
         let mut state =
             SessionState::new(version, &our_identity, &their_identity, &root_key, base_key);
 
         // Add a sender chain to make it usable
         let sender_keypair = KeyPair::generate(&mut csprng);
-        let chain_key = crate::protocol::ratchet::ChainKey::new([1u8; 32], 0);
+        let chain_key = ChainKey::new([1u8; 32], 0);
         state.set_sender_chain(&sender_keypair, &chain_key);
 
         state
@@ -1330,10 +1330,10 @@ mod tests {
         let identity_keypair = KeyPair::generate(&mut csprng);
         let their_identity = IdentityKey::new(identity_keypair.public_key);
         let our_identity = IdentityKey::new(KeyPair::generate(&mut csprng).public_key);
-        let root_key = crate::protocol::ratchet::RootKey::new([0u8; 32]);
+        let root_key = RootKey::new([0u8; 32]);
         let base_key = KeyPair::generate(&mut csprng).public_key;
         let mut state = SessionState::new(3, &our_identity, &their_identity, &root_key, &base_key);
-        let chain_key = crate::protocol::ratchet::ChainKey::new([1u8; 32], 0);
+        let chain_key = ChainKey::new([1u8; 32], 0);
 
         let err = state
             .set_sender_chain_key(&chain_key)
@@ -1718,7 +1718,7 @@ mod tests {
 
         // Add a receiver chain
         let sender_key = KeyPair::generate(&mut rng()).public_key;
-        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        let chain_key = ChainKey::new([2u8; 32], 0);
         state.add_receiver_chain(&sender_key, &chain_key);
 
         // Add message keys with counters 0, 1, 2
@@ -1745,7 +1745,7 @@ mod tests {
         let mut state = create_test_session_state(3, &base_key);
 
         let sender_key = KeyPair::generate(&mut rng()).public_key;
-        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        let chain_key = ChainKey::new([2u8; 32], 0);
         state.add_receiver_chain(&sender_key, &chain_key);
 
         // Amortized eviction uses MESSAGE_KEY_PRUNE_THRESHOLD.
@@ -1785,7 +1785,7 @@ mod tests {
         let mut state = create_test_session_state(3, &base_key);
 
         let sender_key = KeyPair::generate(&mut rng()).public_key;
-        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        let chain_key = ChainKey::new([2u8; 32], 0);
         state.add_receiver_chain(&sender_key, &chain_key);
 
         // Enough inserts for two prunes: pushing counter 2051 prunes 0..=50,
@@ -1824,7 +1824,7 @@ mod tests {
 
         // Add a receiver chain
         let sender_keypair = KeyPair::generate(&mut rng());
-        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        let chain_key = ChainKey::new([2u8; 32], 0);
         state.add_receiver_chain(&sender_keypair.public_key, &chain_key);
 
         // Retrieve chain key using same public key
@@ -1845,7 +1845,7 @@ mod tests {
         let mut state = create_test_session_state(3, &base_key);
 
         let sender_keypair = KeyPair::generate(&mut rng());
-        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        let chain_key = ChainKey::new([2u8; 32], 0);
         state.add_receiver_chain(&sender_keypair.public_key, &chain_key);
 
         // Deserialize the same key from bytes and look up

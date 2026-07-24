@@ -107,7 +107,7 @@ impl Client {
         // are detached per copy, so a get-then-insert would let two
         // concurrent copies both pass the gate, and only the claim winner may
         // release the slot on send failure below.
-        let claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let claimed_clone = claimed.clone();
         self.pdo_requested
             .get_with(cache_key.clone(), async move {
@@ -422,12 +422,11 @@ impl Client {
             .event_bus
             .dispatch(wacore::types::events::Event::Messages(
                 wacore::types::events::MessageBatch::builder()
-                    .messages(std::sync::Arc::from([
-                        wacore::types::events::InboundMessage::builder()
-                            .message(Arc::from(message))
-                            .info(message_info)
-                            .build(),
-                    ]))
+                    .messages(Arc::from([wacore::types::events::InboundMessage::builder(
+                    )
+                    .message(Arc::from(message))
+                    .info(message_info)
+                    .build()]))
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
             ));

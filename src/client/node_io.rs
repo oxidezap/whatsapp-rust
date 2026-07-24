@@ -76,7 +76,7 @@ impl Client {
         // every lane and sender with no other signal — surface long waits
         // instead of hanging silently. The slow path keeps ONE acquire future
         // alive across warn ticks so the waiter never loses its queue position.
-        const PERMIT_WAIT_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+        const PERMIT_WAIT_WARN: Duration = Duration::from_secs(10);
         loop {
             let (generation, semaphore) = self.read_message_semaphore();
             let permit = match semaphore.try_acquire_arc() {
@@ -288,7 +288,7 @@ impl Client {
     )]
     pub(crate) fn decrypt_frame(
         &self,
-        noise_socket: &crate::socket::noise_socket::NoiseSocket,
+        noise_socket: &NoiseSocket,
         encrypted_frame: bytes::BytesMut,
     ) -> Option<wacore_binary::OwnedNodeRef> {
         let decrypted_payload = match noise_socket.decrypt_frame(encrypted_frame) {
@@ -425,7 +425,7 @@ impl Client {
                 // remaining drops to <=C and no batch request is in flight,
                 // schedule the next one.
                 let pending = total.saturating_sub(processed);
-                crate::client::offline_resume::on_offline_stanza_arrived(self, pending);
+                offline_resume::on_offline_stanza_arrived(self, pending);
 
                 if processed >= total {
                     let elapsed = match self.offline_sync_metrics.start_time.lock() {
@@ -1062,7 +1062,7 @@ impl Client {
                 // from business_name at pairing (src/pair.rs) while still needing the
                 // full sync, so the watchdog would wrongly stand down on a failed sync.
                 let critical_sync_done =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    Arc::new(AtomicBool::new(false));
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
                 let timeout_rt = client_clone.runtime.clone();
@@ -1318,9 +1318,7 @@ impl Client {
                 )
                 .maybe_error(ack_error.as_ref().map(|v| v.as_str().to_string()))
                 .build();
-            self.core
-                .event_bus
-                .dispatch(wacore::types::events::Event::ServerAck(ack));
+            self.core.event_bus.dispatch(Event::ServerAck(ack));
         }
 
         let id = ack_id.map(|v| v.as_str())?;
@@ -1526,14 +1524,12 @@ impl Client {
                 "Got {reason:?} connect failure, logging out: {}",
                 DisplayableNodeRef(node)
             );
-            self.core
-                .event_bus
-                .dispatch(wacore::types::events::Event::LoggedOut(
-                    crate::types::events::LoggedOut::builder()
-                        .on_connect(true)
-                        .reason(reason)
-                        .build(),
-                ));
+            self.core.event_bus.dispatch(Event::LoggedOut(
+                crate::types::events::LoggedOut::builder()
+                    .on_connect(true)
+                    .reason(reason)
+                    .build(),
+            ));
         } else if let ConnectFailureReason::TempBanned = reason {
             let ban_code = attrs.optional_u64("code").unwrap_or(0) as i32;
             let expire_secs = attrs.optional_u64("expire").unwrap_or(0);

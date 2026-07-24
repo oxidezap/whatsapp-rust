@@ -161,7 +161,7 @@ impl TryFrom<&[u8]> for PublicKey {
     }
 }
 
-impl subtle::ConstantTimeEq for PublicKey {
+impl ConstantTimeEq for PublicKey {
     /// A constant-time comparison as long as the two keys have a matching type.
     ///
     /// If the two keys have different types, the comparison short-circuits,
@@ -208,10 +208,7 @@ impl fmt::Debug for PublicKey {
 }
 
 impl serde::Serialize for PublicKey {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> core::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut bytes = [0u8; 33];
         bytes[0] = self.key_type().value();
         bytes[1..].copy_from_slice(self.public_key_bytes());
@@ -224,9 +221,7 @@ impl serde::Serialize for PublicKey {
 }
 
 impl<'de> serde::Deserialize<'de> for PublicKey {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> core::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             let s: String = serde::Deserialize::deserialize(deserializer)?;
             let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
@@ -321,8 +316,8 @@ impl From<&PublicKey> for PreparedVerifyingKey {
     }
 }
 
-impl std::fmt::Debug for PreparedVerifyingKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PreparedVerifyingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreparedVerifyingKey")
             .field("mont", &hex::encode(self.mont))
             .finish_non_exhaustive()
@@ -499,10 +494,7 @@ impl TryFrom<&[u8]> for PrivateKey {
 }
 
 impl serde::Serialize for PrivateKey {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> core::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let PrivateKeyData::DjbPrivateKey { key, .. } = &self.key;
         if serializer.is_human_readable() {
             serializer.serialize_str(&hex::encode(key))
@@ -513,9 +505,7 @@ impl serde::Serialize for PrivateKey {
 }
 
 impl<'de> serde::Deserialize<'de> for PrivateKey {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> core::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             let s: String = serde::Deserialize::deserialize(deserializer)?;
             let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
@@ -599,7 +589,7 @@ impl TryFrom<PrivateKey> for KeyPair {
 mod tests {
     use super::*;
 
-    fn rng() -> impl rand::CryptoRng {
+    fn rng() -> impl CryptoRng {
         rand::make_rng::<rand::rngs::StdRng>()
     }
 

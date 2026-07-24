@@ -29,12 +29,9 @@ fn verify_cert_step(
     }
     let signature = signature
         .ok_or_else(|| HandshakeError::CertVerification(format!("Missing {label} signature")))?;
-    let pk = wacore_libsignal::core::curve::PublicKey::from_djb_public_key_bytes(issuer_key)
-        .map_err(|_| {
-            HandshakeError::CertVerification(format!(
-                "Invalid {label} issuer key (not Djb/Curve25519)"
-            ))
-        })?;
+    let pk = PublicKey::from_djb_public_key_bytes(issuer_key).map_err(|_| {
+        HandshakeError::CertVerification(format!("Invalid {label} issuer key (not Djb/Curve25519)"))
+    })?;
     if pk.verify_signature(details, signature) {
         Ok(())
     } else {
@@ -749,8 +746,7 @@ mod tests {
         pattern: &str,
         prologue: &[u8],
     ) -> (Vec<u8>, NoiseHandshake, KeyPair, [u8; 32]) {
-        let msg =
-            wa::HandshakeMessage::decode_from_slice(client_hello_bytes).expect("decode hello");
+        let msg = HandshakeMessage::decode_from_slice(client_hello_bytes).expect("decode hello");
         let client_eph_pub_vec = msg.client_hello.into_option().unwrap().ephemeral.unwrap();
         let client_eph_pub: [u8; 32] = client_eph_pub_vec.try_into().unwrap();
 
@@ -779,7 +775,7 @@ mod tests {
             .encrypt(&responder.cert_chain_bytes)
             .expect("enc cert");
 
-        let server_hello = wa::HandshakeMessage {
+        let server_hello = HandshakeMessage {
             server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
                 ephemeral: Some(server_eph_pub.to_vec()),
                 r#static: Some(encrypted_static),
@@ -797,8 +793,7 @@ mod tests {
         server_eph: KeyPair,
         client_finish_bytes: &[u8],
     ) -> (NoiseCipher, NoiseCipher) {
-        let msg =
-            wa::HandshakeMessage::decode_from_slice(client_finish_bytes).expect("decode finish");
+        let msg = HandshakeMessage::decode_from_slice(client_finish_bytes).expect("decode finish");
         let cf = msg.client_finish.into_option().unwrap();
         let client_static = noise.decrypt(&cf.r#static.unwrap()).expect("dec s");
         let client_static_arr: [u8; 32] = client_static.try_into().unwrap();
@@ -823,8 +818,7 @@ mod tests {
         prologue: &[u8],
     ) -> Vec<u8> {
         // Run IK responder side per Noise § 7.5.
-        let msg =
-            wa::HandshakeMessage::decode_from_slice(client_hello_bytes).expect("decode hello");
+        let msg = HandshakeMessage::decode_from_slice(client_hello_bytes).expect("decode hello");
         let ch = msg.client_hello.into_option().unwrap();
         let client_eph_pub_vec = ch.ephemeral.unwrap();
         let client_eph_pub: [u8; 32] = client_eph_pub_vec.try_into().unwrap();
@@ -872,7 +866,7 @@ mod tests {
             .unwrap();
         let encrypted_cert = noise.encrypt(&responder.cert_chain_bytes).unwrap();
 
-        let server_hello = wa::HandshakeMessage {
+        let server_hello = HandshakeMessage {
             server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
                 ephemeral: Some(server_eph_pub.to_vec()),
                 r#static: None,
@@ -895,8 +889,7 @@ mod tests {
         // Pull the client's ephemeral out of the IK clientHello to seed an
         // XXfallback responder. We ignore the encrypted client static and
         // 0-RTT payload since the client will resend on the XXfallback path.
-        let msg =
-            wa::HandshakeMessage::decode_from_slice(client_hello_bytes).expect("decode hello");
+        let msg = HandshakeMessage::decode_from_slice(client_hello_bytes).expect("decode hello");
         let client_eph_pub_vec = msg.client_hello.into_option().unwrap().ephemeral.unwrap();
         let client_eph_pub: [u8; 32] = client_eph_pub_vec.try_into().unwrap();
 
@@ -925,7 +918,7 @@ mod tests {
 
         let encrypted_cert = noise.encrypt(&responder.cert_chain_bytes).unwrap();
 
-        let server_hello = wa::HandshakeMessage {
+        let server_hello = HandshakeMessage {
             server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
                 ephemeral: Some(server_eph_pub.to_vec()),
                 r#static: Some(encrypted_static),

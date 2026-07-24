@@ -59,7 +59,7 @@ pub(crate) type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 /// Using a named struct instead of a positional tuple so fields are
 /// accessed by name, reducing the risk of mix-ups when columns are added.
 #[derive(Queryable, Selectable)]
-#[diesel(table_name = crate::schema::device)]
+#[diesel(table_name = device)]
 #[allow(dead_code)]
 struct DeviceRow {
     id: i32,
@@ -515,7 +515,7 @@ impl SqliteStore {
                             MAX_RETRIES + 1
                         );
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -846,13 +846,13 @@ impl SqliteStore {
                 signed_pre_key_id: row.signed_pre_key_id as u32,
                 signed_pre_key_signature,
                 adv_secret_key,
-                account: account.map(std::sync::Arc::new),
+                account: account.map(Arc::new),
                 push_name: row.push_name,
                 app_version_primary: row.app_version_primary as u32,
                 app_version_secondary: row.app_version_secondary as u32,
                 app_version_tertiary: row.app_version_tertiary.try_into().unwrap_or(0u32),
                 app_version_last_fetched_ms: row.app_version_last_fetched_ms,
-                device_props: std::sync::Arc::new(wacore::store::device::DEVICE_PROPS.clone()),
+                device_props: Arc::new(wacore::store::device::DEVICE_PROPS.clone()),
                 client_profile: wacore::client_profile::ClientProfile::web(),
                 edge_routing_info: row.edge_routing_info,
                 props_hash: row.props_hash,
@@ -950,7 +950,7 @@ impl SqliteStore {
                         attempt + 1,
                         MAX_RETRIES + 1,
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -1096,7 +1096,7 @@ impl SqliteStore {
                         attempt + 1,
                         MAX_RETRIES + 1,
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -1615,11 +1615,11 @@ impl SignalStore for SqliteStore {
             .await
     }
 
-    async fn get_session(&self, address: &str) -> Result<Option<bytes::Bytes>> {
+    async fn get_session(&self, address: &str) -> Result<Option<Bytes>> {
         Ok(self
             .get_session_for_device(address, self.device_id)
             .await?
-            .map(bytes::Bytes::from))
+            .map(Bytes::from))
     }
 
     async fn has_session(&self, address: &str) -> Result<bool> {
@@ -1773,7 +1773,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -1844,7 +1844,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -1947,7 +1947,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -2056,7 +2056,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -2149,7 +2149,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -2293,7 +2293,7 @@ fn insert_pending_inbound_row(
     sender: &str,
     id: &str,
     message: &[u8],
-) -> diesel::QueryResult<usize> {
+) -> QueryResult<usize> {
     diesel::replace_into(pending_inbound_messages::table)
         .values((
             pending_inbound_messages::chat.eq(chat),
@@ -2312,7 +2312,7 @@ fn delete_pending_inbound_row(
     chat: &str,
     sender: &str,
     id: &str,
-) -> diesel::QueryResult<usize> {
+) -> QueryResult<usize> {
     diesel::delete(
         pending_inbound_messages::table
             .filter(pending_inbound_messages::chat.eq(chat))
@@ -2391,8 +2391,7 @@ impl ProtocolStore for SqliteStore {
                         ))
                         .do_update()
                         .set((
-                            sender_key_devices::has_key
-                                .eq(diesel::upsert::excluded(sender_key_devices::has_key)),
+                            sender_key_devices::has_key.eq(excluded(sender_key_devices::has_key)),
                             sender_key_devices::updated_at.eq(now),
                         ))
                         .execute(conn)?;
@@ -2542,9 +2541,9 @@ impl ProtocolStore for SqliteStore {
         // Share the batch across retry attempts via Arc so no retry re-clones
         // the Vec. `with_retry` invokes `make_op` once per attempt; we only
         // bump the Arc refcount.
-        let entries: std::sync::Arc<Vec<LidPnMappingEntry>> = std::sync::Arc::new(entries.to_vec());
+        let entries: Arc<Vec<LidPnMappingEntry>> = Arc::new(entries.to_vec());
         self.with_retry("put_lid_mappings", move || {
-            let entries = std::sync::Arc::clone(&entries);
+            let entries = Arc::clone(&entries);
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction::<_, DieselError, _>(|conn| {
                     for entry in entries.iter() {
@@ -2769,10 +2768,10 @@ impl ProtocolStore for SqliteStore {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let prepared = std::sync::Arc::new(prepared);
+        let prepared = Arc::new(prepared);
 
         self.with_retry("update_device_lists", move || {
-            let prepared = std::sync::Arc::clone(&prepared);
+            let prepared = Arc::clone(&prepared);
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction::<_, DieselError, _>(|conn| {
                     for row in prepared.iter() {
@@ -3369,10 +3368,7 @@ impl ProtocolStore for SqliteStore {
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
-    async fn store_pending_inbound_batch(
-        &self,
-        rows: &[wacore::store::traits::PendingInboundRow<'_>],
-    ) -> Result<()> {
+    async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -3410,10 +3406,7 @@ impl ProtocolStore for SqliteStore {
         .await
     }
 
-    async fn delete_pending_inbound_batch(
-        &self,
-        keys: &[wacore::store::traits::PendingInboundKey<'_>],
-    ) -> Result<()> {
+    async fn delete_pending_inbound_batch(&self, keys: &[PendingInboundKey<'_>]) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }

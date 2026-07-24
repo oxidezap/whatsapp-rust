@@ -54,7 +54,7 @@ impl NoiseCipher {
     /// Encrypts plaintext in-place within the provided buffer: on entry `buffer`
     /// holds the plaintext; on return it holds ciphertext + 16-byte tag.
     /// Preserves the buffer's allocated capacity across calls.
-    /// Accepts any [`NoiseBuffer`] (`Vec<u8>` or `bytes::BytesMut`).
+    /// Accepts any `NoiseBuffer` (`Vec<u8>` or `bytes::BytesMut`).
     pub fn encrypt_in_place_with_counter<B: NoiseBuffer>(
         &self,
         counter: u32,
@@ -68,7 +68,7 @@ impl NoiseCipher {
 
     /// Decrypts ciphertext (with 16-byte tag appended) in-place within the
     /// provided buffer. On return, `buffer` holds the plaintext (tag removed).
-    /// Accepts any [`NoiseBuffer`] (`Vec<u8>` or `bytes::BytesMut`).
+    /// Accepts any `NoiseBuffer` (`Vec<u8>` or `bytes::BytesMut`).
     /// Zero allocations with the default [`wacore_libsignal::crypto::RustCryptoProvider`].
     pub fn decrypt_in_place_with_counter<B: NoiseBuffer>(
         &self,

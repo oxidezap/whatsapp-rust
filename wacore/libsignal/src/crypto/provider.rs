@@ -223,7 +223,7 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
     /// In-place AES-256-GCM seal. On entry `buffer` holds the plaintext; on
     /// return it holds `ciphertext || tag` (length grown by 16).
     ///
-    /// Default impl delegates to the allocating [`aes_256_gcm_encrypt`] so
+    /// Default impl delegates to the allocating [`aes_256_gcm_encrypt`](Self::aes_256_gcm_encrypt) so
     /// existing providers keep working; override for zero-allocation variants.
     fn aes_256_gcm_encrypt_in_place(
         &self,
@@ -244,7 +244,7 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
     /// the buffer contents are indeterminate and the caller must treat the
     /// session as dead.
     ///
-    /// Default impl delegates to the allocating [`aes_256_gcm_decrypt`].
+    /// Default impl delegates to the allocating [`aes_256_gcm_decrypt`](Self::aes_256_gcm_decrypt).
     fn aes_256_gcm_decrypt_in_place(
         &self,
         key: &[u8; 32],

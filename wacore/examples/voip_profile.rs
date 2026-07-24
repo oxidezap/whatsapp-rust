@@ -8,6 +8,9 @@
 //!     --callgrind-out-file=cg.enc target/release/examples/voip_profile encode 30
 //!   callgrind_annotate cg.enc | head -60
 
+// A CLI driver: the usage line is its output, not a diagnostic.
+#![allow(clippy::print_stderr)]
+
 use std::hint::black_box;
 use wacore::voip::{MlowDecoder, MlowEncoder};
 

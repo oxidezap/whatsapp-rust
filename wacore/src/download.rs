@@ -389,7 +389,7 @@ impl DownloadUtils {
 
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
 
-        let mut hmac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&mac_key)
+        let mut hmac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key)
             .map_err(|_| anyhow!("Failed to init HMAC"))?;
         hmac.update(&iv);
 
@@ -470,7 +470,7 @@ impl DownloadUtils {
 
     /// Decrypt a media stream, returning the plaintext as a `Vec<u8>`.
     ///
-    /// This is a convenience wrapper around [`decrypt_stream_to_writer`] that
+    /// This is a convenience wrapper around [`decrypt_stream_to_writer`](Self::decrypt_stream_to_writer) that
     /// accumulates output in memory.
     pub fn decrypt_stream<R: std::io::Read>(
         reader: R,

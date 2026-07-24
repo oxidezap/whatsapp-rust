@@ -534,7 +534,7 @@ impl SendContextResolver for MockSendContextResolver {
         unimplemented!("resolve_group_info not needed for send.rs tests")
     }
 
-    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
+    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<CompactString> {
         self.phone_to_lid.get(phone_user).map(|s| s.as_str().into())
     }
 
@@ -1403,7 +1403,7 @@ mod group_retry {
             &mut is,
             &bundle,
             &mut rand::make_rng::<rand::rngs::StdRng>(),
-            crate::libsignal::protocol::UsePQRatchet::No,
+            UsePQRatchet::No,
         )
         .await
         .unwrap();
@@ -2070,16 +2070,14 @@ mod group_retry {
         }
     }
 
-    async fn build_peer_stanza(
-        account: Option<&wa::ADVSignedDeviceIdentity>,
-    ) -> wacore_binary::Node {
+    async fn build_peer_stanza(account: Option<&wa::ADVSignedDeviceIdentity>) -> Node {
         build_peer_stanza_with_options(account, PeerMessageOptions::default()).await
     }
 
     async fn build_peer_stanza_with_options(
         account: Option<&wa::ADVSignedDeviceIdentity>,
         options: PeerMessageOptions,
-    ) -> wacore_binary::Node {
+    ) -> Node {
         let (mut ss, mut is, jid) = setup_session().await;
         let addr = jid.to_protocol_address();
         prepare_peer_stanza_with_options(
@@ -3215,7 +3213,7 @@ mod mark_full_distribution_list {
         let mut sks = MemSenderKeyStore::default();
         sks.records.insert(name.clone(), record);
 
-        crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+        encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
             .await
             .expect("group encrypt");
 
@@ -3243,7 +3241,7 @@ mod mark_full_distribution_list {
         // Empty store: no local SenderKeyRecord for `name`.
         let mut sks = MemSenderKeyStore::default();
 
-        let err = crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+        let err = encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
             .await
             .expect_err("a missing sender key must error");
         assert!(
@@ -3570,7 +3568,7 @@ mod mark_full_distribution_list {
         .await
         .expect("prepare_group_stanza should succeed even when a device fails to encrypt");
 
-        let marked: std::collections::HashSet<String> = prepared
+        let marked: HashSet<String> = prepared
             .skdm_devices
             .iter()
             .map(|j| j.to_string())
@@ -3620,7 +3618,7 @@ mod mark_full_distribution_list {
             group_info: &GroupInfo,
             msg: &wa::Message,
             req: &str,
-        ) -> (wacore_binary::Node, bool) {
+        ) -> (Node, bool) {
             let (mut ss, mut is) = established_stores(a).await;
             let mut sks = MemSenderKeyStore::default();
             let mut pks = UnusedPreKeyStore;
@@ -3732,8 +3730,7 @@ mod mark_full_distribution_list {
             known: Default::default(),
         };
         let mut sks = MemSenderKeyStore::default();
-        let chain_name =
-            crate::types::jid::make_sender_key_name(&group, &own_jid.to_protocol_address());
+        let chain_name = make_sender_key_name(&group, &own_jid.to_protocol_address());
         let probe = ChainLockProbe {
             lock: sks.sender_key_lock(&chain_name).await,
             setup_lock: sks.session_setup_lock(&chain_name).await,
@@ -4070,23 +4067,18 @@ mod local_identity_change_on_send {
         }
     }
     #[derive(Default)]
-    struct MemSenderKeyStore(
-        HashMap<crate::libsignal::store::sender_key_name::SenderKeyName, SenderKeyRecord>,
-    );
+    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
     #[async_trait::async_trait]
     impl SenderKeyStore for MemSenderKeyStore {
         async fn store_sender_key(
             &mut self,
-            n: &crate::libsignal::store::sender_key_name::SenderKeyName,
+            n: &SenderKeyName,
             r: SenderKeyRecord,
         ) -> SigResult<()> {
             self.0.insert(n.clone(), r);
             Ok(())
         }
-        async fn load_sender_key(
-            &self,
-            n: &crate::libsignal::store::sender_key_name::SenderKeyName,
-        ) -> SigResult<Option<SenderKeyRecord>> {
+        async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
             Ok(self.0.get(n).cloned())
         }
     }

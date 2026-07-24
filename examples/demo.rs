@@ -1,6 +1,9 @@
 // See the matching note in lib.rs: instrumented large async fns need a deeper
 // recursion limit when the `tracing` + `tracing-pii` paths combine.
 #![recursion_limit = "512"]
+// Startup banner: the logger is not configured yet at this point, so stderr
+// is the only channel available.
+#![allow(clippy::print_stderr)]
 
 use log::{error, info};
 use whatsapp_rust::pair_code::PairCodeOptions;
@@ -130,7 +133,7 @@ fn main() {
                 // SIGINT (Ctrl+C) or SIGTERM (`docker stop`, k8s, systemd). Watching
                 // only Ctrl+C left `docker stop` to time out and SIGKILL the PID-1
                 // container, skipping the graceful flush below.
-                _ = whatsapp_rust::shutdown_signal() => {
+                _ = shutdown_signal() => {
                     info!("Received shutdown signal, shutting down...");
                     handle.shutdown().await;
                 }
@@ -165,7 +168,7 @@ async fn handle_text_ping(ctx: &MessageContext) {
     );
 
     let edit = wa::Message {
-        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
             text: Some(format!("{PONG_TEXT}\n`{duration}`")),
             ..Default::default()
         }),
@@ -227,7 +230,7 @@ fn build_media_pong(message: &wa::Message) -> Option<wa::Message> {
         && img.caption.as_deref() == Some(PING_TRIGGER)
     {
         return Some(wa::Message {
-            image_message: buffa::MessageField::some(wa::message::ImageMessage {
+            image_message: MessageField::some(wa::message::ImageMessage {
                 caption: Some(PONG_TEXT.to_string()),
                 ..img.clone()
             }),
@@ -238,7 +241,7 @@ fn build_media_pong(message: &wa::Message) -> Option<wa::Message> {
         && vid.caption.as_deref() == Some(PING_TRIGGER)
     {
         return Some(wa::Message {
-            video_message: buffa::MessageField::some(wa::message::VideoMessage {
+            video_message: MessageField::some(wa::message::VideoMessage {
                 caption: Some(PONG_TEXT.to_string()),
                 ..vid.clone()
             }),

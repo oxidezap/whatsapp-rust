@@ -22,7 +22,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 /// Polls a pinned future once with a no-op waker and asserts it has not resolved.
 fn assert_pending<F: Future + ?Sized>(mut fut: Pin<&mut F>, msg: &str) {
-    let waker = whatsapp_rust::futures::task::noop_waker();
+    let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending), "{msg}");
 }

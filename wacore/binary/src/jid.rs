@@ -317,7 +317,7 @@ impl PartialEq<&str> for Server {
 
 impl TryFrom<&str> for Server {
     type Error = JidError;
-    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
             "s.whatsapp.net" => Ok(Self::Pn),
             "lid" => Ok(Self::Lid),
@@ -1075,7 +1075,7 @@ impl fmt::Display for Jid {
     }
 }
 
-/// Privacy-aware [`Display`] wrapper for a [`Jid`], for use in tracing fields.
+/// Privacy-aware [`Display`](fmt::Display) wrapper for a [`Jid`], for use in tracing fields.
 ///
 /// Pseudonymous (LID) and non-personal (newsletter/bot/call, modern group ids)
 /// JIDs render in full, so the same peer/chat correlates across spans. JIDs whose

@@ -26,7 +26,7 @@ impl StanzaHandler for NotificationHandler {
     async fn handle(
         &self,
         client: Arc<Client>,
-        node: Arc<wacore_binary::OwnedNodeRef>,
+        node: Arc<OwnedNodeRef>,
         _cancelled: &mut bool,
     ) -> bool {
         handle_notification_impl(&client, node).await;
@@ -1209,7 +1209,7 @@ mod tests {
         // Seed a companion-device (device 1) Signal session: clear_device_record
         // runs even on the no-prior path, so this must be deleted afterward. Keyed
         // the same way delete_sessions_for_devices builds the address.
-        let mut companion = wacore_binary::Jid::new("5511666666666", wacore_binary::Server::Pn);
+        let mut companion = Jid::new("5511666666666", wacore_binary::Server::Pn);
         companion.device = 1;
         let companion_addr = companion.to_protocol_address();
         client

@@ -288,7 +288,7 @@ impl Instant {
     }
 
     /// Duration elapsed since this instant was captured. Returns
-    /// [`Duration::ZERO`] if the clock somehow reported a smaller value
+    /// [`Duration::ZERO`](std::time::Duration::ZERO) if the clock somehow reported a smaller value
     /// than at capture time — which a well-behaved monotonic provider
     /// must never do, but we saturate defensively.
     #[inline]
@@ -297,7 +297,7 @@ impl Instant {
         std::time::Duration::from_nanos(now.saturating_sub(self.0))
     }
 
-    /// Duration from `earlier` to `self`. Returns [`Duration::ZERO`] if
+    /// Duration from `earlier` to `self`. Returns [`Duration::ZERO`](std::time::Duration::ZERO) if
     /// `earlier` is after `self`.
     #[inline]
     pub fn saturating_duration_since(&self, earlier: Instant) -> std::time::Duration {

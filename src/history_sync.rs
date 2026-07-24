@@ -197,7 +197,7 @@ impl HistoryMsgSecretRecordVisitor for &mut HistorySecretSeedCollector {
     }
 
     fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
-        std::num::NonZeroUsize::new(std::mem::size_of::<MsgSecretEntry>())
+        std::num::NonZeroUsize::new(size_of::<MsgSecretEntry>())
     }
 }
 
@@ -575,7 +575,7 @@ impl Client {
 
     /// Store a tctoken candidate extracted during history sync streaming.
     async fn store_tc_token_candidate(&self, candidate: TcTokenCandidate) {
-        let jid: wacore_binary::Jid = match candidate.id.parse() {
+        let jid: Jid = match candidate.id.parse() {
             Ok(j) => j,
             Err(_) => return,
         };
@@ -890,7 +890,7 @@ mod tests {
             .await;
 
         let event = event_rx.try_recv().expect("HistorySync event dispatched");
-        let crate::types::events::Event::HistorySync(lazy) = &*event else {
+        let Event::HistorySync(lazy) = &*event else {
             panic!("expected HistorySync event, got {event:?}");
         };
 
@@ -1032,17 +1032,14 @@ mod tests {
         }
     }
 
-    async fn seeded_client(
-        name: &str,
-        policy: crate::cache_config::MsgSecretPolicy,
-    ) -> Arc<Client> {
+    async fn seeded_client(name: &str, policy: MsgSecretPolicy) -> Arc<Client> {
         let cfg = crate::cache_config::CacheConfig {
             msg_secret_policy: policy,
             ..Default::default()
         };
         let client = crate::test_utils::create_test_client_with_config(
             name,
-            std::sync::Arc::new(crate::test_utils::MockHttpClient),
+            Arc::new(crate::test_utils::MockHttpClient),
             cfg,
         )
         .await;
@@ -1232,7 +1229,7 @@ mod tests {
         };
         let client = crate::test_utils::create_test_client_with_config(
             "seed_flag_off",
-            std::sync::Arc::new(crate::test_utils::MockHttpClient),
+            Arc::new(crate::test_utils::MockHttpClient),
             cfg,
         )
         .await;

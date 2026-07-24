@@ -142,7 +142,7 @@ impl Client {
     }
 
     /// Awaits the persist + any device/session migrations. Hot paths should
-    /// prefer [`learn_lid_pn_mapping_fast`].
+    /// prefer `learn_lid_pn_mapping_fast`.
     ///
     /// Public so embedders can feed in pairs the library never observes
     /// itself — e.g. app-state `ContactAction` mutations, which carry
@@ -821,10 +821,7 @@ impl Client {
             migration_flags,
             usync_phones,
         } = self
-            .record_lid_pn_batch_in_memory(
-                mappings,
-                crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
-            )
+            .record_lid_pn_batch_in_memory(mappings, LearningSource::MigrationSyncLatest)
             .await;
         self.spawn_lid_usync_reconcile(usync_phones);
         if !entries.is_empty() {

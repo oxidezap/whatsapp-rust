@@ -14,10 +14,7 @@ fn clone_or_take_last<T: Clone>(value: &mut Option<T>, is_last: bool) -> Option<
 
 /// Sync is fire-and-forget (spawned), so this is not async -- it parses
 /// collection nodes synchronously and spawns the async sync task.
-pub(crate) fn handle_server_sync_notification(
-    client: &Arc<Client>,
-    nr: &wacore_binary::NodeRef<'_>,
-) {
+pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef<'_>) {
     use std::str::FromStr;
     use wacore::appstate::patch_decode::WAPatchName;
 

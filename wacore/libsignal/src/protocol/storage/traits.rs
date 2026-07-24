@@ -132,7 +132,7 @@ pub trait SignedPreKeyStore: ThreadSafe {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait SessionStore: ThreadSafe {
     /// Loads the session for `address` without removing it from the store.
-    /// Destructive cache checkouts belong in [`load_session_for_update`].
+    /// Destructive cache checkouts belong in `load_session_for_update`.
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
 
     /// Loads a mutation copy and optionally marks it as destructively checked out.

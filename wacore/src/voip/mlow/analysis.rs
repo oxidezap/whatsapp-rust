@@ -79,7 +79,7 @@ pub(crate) struct SmplEncoderState {
     /// bitrate controller and the voiced/unvoiced classifier read.
     vad: Option<super::smpl_vad::SmplVadState>,
     /// Voicing-classifier hysteresis + spectral-tilt background tracker (`VUV_Mode`), per stream.
-    vuv: super::smpl_signal_mode::VuvMode,
+    vuv: VuvMode,
     /// Last `SMPL_PITCH_LAG_MAX` HP samples of the previous packet, so the first internal frame's
     /// pitch search has real history instead of zeros.
     hp_pitch_hist: Vec<f32>,
@@ -232,7 +232,7 @@ pub(crate) fn smpl_analyze_frame_st(
     // Predictor mirror, fresh per 60 ms frame (mirrors encode_smpl_frame's fresh SmplLsfState),
     // threaded across the 3 internal frames so the voiced abs-vs-delta lag choice matches the
     // entropy encoder.
-    let mut lstate = super::smpl_decode::SmplLsfState::default();
+    let mut lstate = SmplLsfState::default();
 
     // Lazily build the persistent CELP encoder + perceptual model (their state carries across frames).
     es.celp.get_or_insert_with(|| {

@@ -130,10 +130,7 @@ fn build_read_receipt_node(
 /// string (`None` = plain delivered, which omits the attr). Single source of
 /// truth for both the receipt builder and the aggregation grouping key, so the
 /// two can't drift apart.
-fn delivery_receipt_type(
-    info: &crate::types::message::MessageInfo,
-    active: bool,
-) -> Option<&'static str> {
+fn delivery_receipt_type(info: &MessageInfo, active: bool) -> Option<&'static str> {
     let is_status = info.source.chat.is_status_broadcast();
     if info.category == MessageCategory::Peer {
         Some("peer_msg")
@@ -148,10 +145,7 @@ fn delivery_receipt_type(
 
 /// Receipt-level attrs shared by the single and aggregate delivery builders
 /// (everything except `id`/`t`/the `<list>` child).
-fn delivery_receipt_builder(
-    info: &crate::types::message::MessageInfo,
-    active: bool,
-) -> NodeBuilder {
+fn delivery_receipt_builder(info: &MessageInfo, active: bool) -> NodeBuilder {
     let is_status = info.source.chat.is_status_broadcast();
     // A peer-synced message takes `type="peer_msg"` and carries NO recipient
     // (WA Web `!l` guard), so the sender-receipt shape applies only off the
@@ -187,10 +181,7 @@ fn delivery_receipt_builder(
     builder
 }
 
-fn build_delivery_receipt_node(
-    info: &crate::types::message::MessageInfo,
-    active: bool,
-) -> wacore_binary::Node {
+fn build_delivery_receipt_node(info: &MessageInfo, active: bool) -> wacore_binary::Node {
     delivery_receipt_builder(info, active)
         .attr("id", &info.id)
         .build()
@@ -387,7 +378,7 @@ fn build_nack_node<S: NackSource + ?Sized>(
 }
 
 impl Client {
-    pub(crate) fn should_send_delivery_receipt(info: &crate::types::message::MessageInfo) -> bool {
+    pub(crate) fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return false;
         }
@@ -599,7 +590,7 @@ impl Client {
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
-    pub(crate) async fn send_delivery_receipt(&self, info: &crate::types::message::MessageInfo) {
+    pub(crate) async fn send_delivery_receipt(&self, info: &MessageInfo) {
         if !Self::should_send_delivery_receipt(info) {
             return;
         }

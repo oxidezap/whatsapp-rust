@@ -34,11 +34,7 @@ impl Client {
             RevokeType::Sender => {
                 // For sender revoke, participant is NOT set (from_me=true identifies it)
                 // This matches whatsmeow's BuildMessageKey behavior
-                (
-                    true,
-                    None,
-                    crate::types::message::EditAttribute::SenderRevoke,
-                )
+                (true, None, EditAttribute::SenderRevoke)
             }
             RevokeType::Admin { original_sender } => {
                 // Admin revoke requires group context
@@ -54,11 +50,7 @@ impl Client {
                     "Admin revoke: using participant {} for MessageKey",
                     participant_str
                 );
-                (
-                    false,
-                    Some(participant_str),
-                    crate::types::message::EditAttribute::AdminRevoke,
-                )
+                (false, Some(participant_str), EditAttribute::AdminRevoke)
             }
         };
 
@@ -163,7 +155,7 @@ impl Client {
             chat,
             &message,
             SendPipelineOptions {
-                edit: Some(crate::types::message::EditAttribute::PinInChat),
+                edit: Some(EditAttribute::PinInChat),
                 ..Default::default()
             },
         )

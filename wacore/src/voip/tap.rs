@@ -1,6 +1,6 @@
-//! Optional packet-capture tap over the [`RelayTransport`](super::transport::RelayTransport) seam,
+//! Optional packet-capture tap over the [`RelayTransport`] seam,
 //! for debugging a live call. It decorates a transport/factory to record every packet crossing the
-//! seam -- both directions -- into a pluggable [`PacketTap`] sink, WITHOUT touching the engine, the
+//! seam -- both directions -- into a pluggable `PacketTap` sink, WITHOUT touching the engine, the
 //! driver, or the codec (the seam is the only interposition point). The sink is any `PacketTap`
 //! impl: a file dump, a pcap writer, an in-memory buffer, a logger, a network forwarder. This is the
 //! "transport-decorator dump" the design notes left as a follow-up -- modular and consumer-driven,

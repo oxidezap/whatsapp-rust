@@ -1,6 +1,6 @@
 //! Poll vote encryption/decryption.
 //!
-//! Thin wrapper over [`secret_enc_addon`] specialised for the
+//! Thin wrapper over [`secret_enc_addon`](crate::secret_enc_addon) specialised for the
 //! `PollVoteMessage` proto and the `"Poll Vote"` use-case.
 
 use anyhow::{Result, anyhow, ensure};
@@ -36,7 +36,8 @@ pub fn compute_option_hash(option_name: &str) -> [u8; 32] {
 /// HKDF-SHA256: info = stanzaId || pollCreator || voter || "Poll Vote", no salt.
 ///
 /// Kept as a public API for backwards compatibility; new code should call
-/// [`secret_enc_addon::derive_use_case_secret`] with `ModificationType::PollVote`.
+/// [`secret_enc_addon::derive_use_case_secret`](crate::secret_enc_addon::derive_use_case_secret)
+/// with `ModificationType::PollVote`.
 pub fn derive_vote_encryption_key(
     message_secret: &[u8],
     stanza_id: &str,

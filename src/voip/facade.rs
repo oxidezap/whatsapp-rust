@@ -61,7 +61,7 @@ impl AudioEndpoints {
     }
 }
 
-/// Builder returned by [`Voip::accept`](super::super::client::voip::Voip::accept). Holds the offer
+/// Builder returned by [`Voip::accept`](crate::Voip::accept). Holds the offer
 /// and, once [`audio`](Self::audio) is called, the source/sink, then [`start`](Self::start) drives
 /// the call. Borrows the client so it can't outlive it.
 pub struct AcceptCall<'a> {
@@ -259,7 +259,7 @@ impl<'a> AcceptCall<'a> {
     }
 }
 
-/// Builder returned by [`Voip::call`](super::super::client::voip::Voip::call). Mirrors [`AcceptCall`]:
+/// Builder returned by [`Voip::call`](crate::Voip::call). Mirrors [`AcceptCall`]:
 /// holds the peer and, once [`audio`](Self::audio) is called, the source/sink, then [`start`](Self::start)
 /// generates the callKey, encrypts it per peer device, sends the `<offer>`, and registers the call.
 /// Borrows the client so it can't outlive it.
@@ -351,7 +351,7 @@ impl<'a> OutgoingCall<'a> {
     /// Generate the callKey, encrypt it per peer device, send the `<offer>`, register the outgoing
     /// call, and return a dormant [`CallHandle`]. The initiator's relay is NOT in the offer; it
     /// arrives in the server's `<ack type=offer>` reply, so the media engine attaches later via
-    /// [`attach_outgoing_relay`]. Everything here (device resolution, encrypt, offer build + send) is
+    /// `attach_outgoing_relay`. Everything here (device resolution, encrypt, offer build + send) is
     /// offline testable; the relay attach + media connect need a real server.
     #[cfg_attr(
         feature = "tracing",
@@ -1728,7 +1728,7 @@ impl CallHandle {
 
     /// Tear the call down: abort the media task (which closes the relay and the audio channels).
     /// Idempotent. Signaling `<terminate>` is a separate concern; send it via
-    /// [`Voip::terminate`](super::super::client::voip::Voip::terminate) if the peer must be told.
+    /// [`Voip::terminate`](crate::Voip::terminate) if the peer must be told.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -2341,13 +2341,13 @@ mod tests {
 
     /// A test client with a real NoiseSocket over a counting transport, so the offer send path
     /// (`send_node`) is exercised, plus the own LID set so `place_call` can derive call_creator.
-    async fn make_sending_client() -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn make_sending_client() -> (Arc<Client>, Arc<AtomicUsize>) {
         make_sending_client_with_failure_after(None).await
     }
 
     async fn make_sending_client_with_failure_after(
         failure_after: Option<usize>,
-    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (Arc<Client>, Arc<AtomicUsize>) {
         let backend = create_test_backend().await;
         make_sending_client_with_backend(backend, failure_after).await
     }
@@ -2355,7 +2355,7 @@ mod tests {
     async fn make_sending_client_with_backend(
         backend: Arc<dyn Backend>,
         failure_after: Option<usize>,
-    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (Arc<Client>, Arc<AtomicUsize>) {
         use wacore::handshake::NoiseCipher;
         let pm = PersistenceManager::new(backend).await.expect("pm");
         // Set our own LID so lid() resolves (the send-side participant id).
@@ -2886,7 +2886,7 @@ mod tests {
         let (client, _count) = make_sending_client().await;
         let (handle, _call_id) = place_dormant_outgoing(&client).await;
 
-        crate::voip::facade::drain_pending_outgoing_on_disconnect(&client);
+        drain_pending_outgoing_on_disconnect(&client);
 
         assert!(
             client.pending_outgoing_calls.lock().unwrap().is_empty(),
@@ -3635,9 +3635,9 @@ mod tests {
     /// returned relay sender is a keepalive: dropping it disconnects the relay and ends the call.
     async fn sending_handle() -> (
         Arc<Client>,
-        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<AtomicUsize>,
         CallHandle,
-        async_channel::Sender<wacore::voip::transport::RelayTransportEvent>,
+        async_channel::Sender<RelayTransportEvent>,
     ) {
         let (client, sent_count) = make_sending_client().await;
         let (relay_tx, relay_rx) = async_channel::unbounded();

@@ -272,7 +272,7 @@ impl Client {
     pub(crate) fn register_ack_waiter(
         &self,
         message_id: &str,
-    ) -> futures::channel::oneshot::Receiver<std::sync::Arc<wacore_binary::OwnedNodeRef>> {
+    ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
         let (tx, rx) = futures::channel::oneshot::channel();
         self.response_waiters_guard()
             .insert(message_id.to_string(), tx);

@@ -562,16 +562,16 @@ mod tests {
     #[test]
     fn xx_and_ik_share_same_first_frame_prologue() {
         // No edge routing: pure WA_CONN_HEADER.
-        let (xx_header, xx_used) = wacore::handshake::build_handshake_header(None);
-        let (ik_header, ik_used) = wacore::handshake::build_handshake_header(None);
+        let (xx_header, xx_used) = build_handshake_header(None);
+        let (ik_header, ik_used) = build_handshake_header(None);
         assert_eq!(xx_header, ik_header);
         assert_eq!(xx_used, ik_used);
         assert!(xx_header.starts_with(b"WA"));
 
         // With edge routing: pre-intro applied identically.
         let routing = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let (xx_h2, xx_used2) = wacore::handshake::build_handshake_header(Some(&routing));
-        let (ik_h2, ik_used2) = wacore::handshake::build_handshake_header(Some(&routing));
+        let (xx_h2, xx_used2) = build_handshake_header(Some(&routing));
+        let (ik_h2, ik_used2) = build_handshake_header(Some(&routing));
         assert_eq!(xx_h2, ik_h2);
         assert_eq!(xx_used2, ik_used2);
         assert!(xx_used2);

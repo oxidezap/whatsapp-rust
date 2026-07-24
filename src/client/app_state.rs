@@ -22,22 +22,20 @@ const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 /// The mutex is synchronous and never held across an await.
 pub(crate) struct SyncInFlight {
     entries: std::sync::Mutex<HashMap<WAPatchName, u64>>,
-    next_token: portable_atomic::AtomicU64,
+    next_token: AtomicU64,
 }
 
 impl SyncInFlight {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             entries: std::sync::Mutex::new(HashMap::new()),
-            next_token: portable_atomic::AtomicU64::new(0),
+            next_token: AtomicU64::new(0),
         })
     }
 
     /// Reserve `name`, or `None` when a sync for it is already in flight.
     pub(crate) fn try_begin(self: &Arc<Self>, name: WAPatchName) -> Option<SyncInFlightGuard> {
-        let token = self
-            .next_token
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if entries.contains_key(&name) {
             return None;
@@ -135,12 +133,12 @@ fn append_app_state_key_request_failure(
 }
 
 async fn collect_app_state_key_request_results<F, E>(
-    runtime: &dyn wacore::runtime::Runtime,
+    runtime: &dyn Runtime,
     mut requests: futures::stream::FuturesUnordered<F>,
     timeout: Duration,
 ) -> Result<AppStateKeyRequestDelivery, anyhow::Error>
 where
-    F: std::future::Future<Output = (u16, std::result::Result<(), E>)>,
+    F: Future<Output = (u16, std::result::Result<(), E>)>,
     E: std::fmt::Display,
 {
     use futures::StreamExt;
@@ -264,7 +262,7 @@ impl Client {
     async fn pre_download_external_blobs(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
-    ) -> std::collections::HashMap<String, Vec<u8>> {
+    ) -> HashMap<String, Vec<u8>> {
         use futures::StreamExt;
 
         // Kept only so a failed download logs the right message (snapshot vs patch).
@@ -278,7 +276,7 @@ impl Client {
         // recovered from the moved `ext` after the fetch. Dedup by directPath so
         // patches sharing a blob don't fetch it twice into the same map key.
         let mut jobs: Vec<(wa::ExternalBlobReference, BlobKind)> = Vec::new();
-        let mut seen_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_paths: HashSet<&str> = HashSet::new();
         for pl in patch_lists {
             if let Some(ext) = &pl.snapshot_ref
                 && let Some(path) = ext.direct_path.as_deref()
@@ -302,10 +300,10 @@ impl Client {
         }
 
         if jobs.is_empty() {
-            return std::collections::HashMap::new();
+            return HashMap::new();
         }
 
-        let mut pre_downloaded = std::collections::HashMap::with_capacity(jobs.len());
+        let mut pre_downloaded = HashMap::with_capacity(jobs.len());
         let results = futures::stream::iter(jobs.into_iter().map(|(ext, kind)| async move {
             let bytes = self.download(&ext).await;
             // directPath presence was checked when the job was built.
@@ -346,7 +344,7 @@ impl Client {
 
     pub(crate) fn start_sync_task_worker(
         self: &Arc<Self>,
-        receiver: async_channel::Receiver<crate::sync_task::MajorSyncTask>,
+        receiver: async_channel::Receiver<MajorSyncTask>,
     ) {
         const HISTORY_SYNC_CONCURRENCY: usize = 2;
 
@@ -359,7 +357,7 @@ impl Client {
                         break;
                     };
 
-                    if matches!(task, crate::sync_task::MajorSyncTask::HistorySync { .. }) {
+                    if matches!(task, MajorSyncTask::HistorySync { .. }) {
                         let permit = history_permits.acquire_arc().await;
                         let task_client = worker_client.clone();
                         worker_client
@@ -385,9 +383,9 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.appstate.sync_task", level = "debug", skip_all)
     )]
-    pub async fn process_sync_task(self: &Arc<Self>, task: crate::sync_task::MajorSyncTask) {
+    pub async fn process_sync_task(self: &Arc<Self>, task: MajorSyncTask) {
         match task {
-            crate::sync_task::MajorSyncTask::HistorySync {
+            MajorSyncTask::HistorySync {
                 message_id,
                 notification,
                 mut tracker,
@@ -395,7 +393,7 @@ impl Client {
                 self.process_history_sync_task_tracked(message_id, *notification, &mut tracker)
                     .await;
             }
-            crate::sync_task::MajorSyncTask::AppStateSync { name, full_sync } => {
+            MajorSyncTask::AppStateSync { name, full_sync } => {
                 if let Err(e) = self.process_app_state_sync_task(name, full_sync).await {
                     log::warn!("App state sync task for {name:?} failed: {e}");
                 }
@@ -404,7 +402,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> anyhow::Result<()> {
+    pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> Result<()> {
         // In-flight dedup: skip if this collection is already being synced.
         // Matches WA Web's WAWebSyncdCollectionsStateMachine which tracks in-flight syncs
         // and queues new requests to a pending set. The guard releases on every
@@ -417,7 +415,7 @@ impl Client {
         self.fetch_app_state_with_retry_inner(name).await
     }
 
-    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> anyhow::Result<()> {
+    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<()> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
         loop {
@@ -490,7 +488,7 @@ impl Client {
         &self,
         collections: Vec<WAPatchName>,
         key_wait_deadline: Option<wacore::time::Instant>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if collections.is_empty() {
             return Ok(());
         }
@@ -523,7 +521,7 @@ impl Client {
         &self,
         mut pending: Vec<WAPatchName>,
         key_wait_deadline: Option<wacore::time::Instant>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
@@ -540,7 +538,7 @@ impl Client {
 
             // Build multi-collection IQ, tracking which collections need a snapshot
             let mut collection_nodes = Vec::with_capacity(pending.len());
-            let mut was_snapshot = std::collections::HashSet::new();
+            let mut was_snapshot = HashSet::new();
             for &name in &pending {
                 let state = backend.get_version(name.as_str()).await?;
                 let want_snapshot = state.version == 0;
@@ -582,7 +580,7 @@ impl Client {
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -722,7 +720,7 @@ impl Client {
         &self,
         name: WAPatchName,
         full_sync: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if self.is_shutting_down() {
             debug!(target: "Client/AppState", "Skipping app state sync task {:?}: client is shutting down", name);
             return Ok(());
@@ -800,7 +798,7 @@ impl Client {
                 .pre_download_external_blobs(std::slice::from_ref(&pl))
                 .await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -940,7 +938,7 @@ impl Client {
         request: F,
     ) -> AppStateKeyRequestProgress
     where
-        F: std::future::Future<Output = AppStateKeyRequestSchedule>,
+        F: Future<Output = AppStateKeyRequestSchedule>,
     {
         futures::pin_mut!(request);
         loop {

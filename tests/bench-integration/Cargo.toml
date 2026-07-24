@@ -2,6 +2,7 @@
 name = "bench-integration"
 version = "0.0.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 [dependencies]

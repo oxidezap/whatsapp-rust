@@ -147,7 +147,7 @@ impl Client {
         // multiple missing keys one share at a time.
         if stored_count > 0 {
             self.initial_app_state_keys_received
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(true, Ordering::Relaxed);
             self.initial_keys_synced_notifier.notify(usize::MAX);
         }
     }
@@ -163,11 +163,9 @@ impl Client {
         #[cfg(test)]
         if self
             .app_state_key_share_prepare_test_failures
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |remaining| remaining.checked_sub(1),
-            )
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
             .is_ok()
         {
             anyhow::bail!("injected app-state key-share preparation failure");
@@ -247,12 +245,12 @@ impl Client {
                         let ready = commit_ready
                             && client
                                 .offline_sync_completed
-                                .load(std::sync::atomic::Ordering::Acquire)
+                                .load(Ordering::Acquire)
                             && !client.inbound_commit_batch.is_active()
                             && reconnect_after.is_none_or(|generation| {
                                 client
                                     .connection_generation
-                                    .load(std::sync::atomic::Ordering::Acquire)
+                                    .load(Ordering::Acquire)
                                     != generation
                             });
                         drop(client);
@@ -281,7 +279,7 @@ impl Client {
                     };
                     let send_generation = client
                         .connection_generation
-                        .load(std::sync::atomic::Ordering::Acquire);
+                        .load(Ordering::Acquire);
                     let Some(flush_guard) = client.outbound_flush.try_track() else {
                         reconnect_after = Some(send_generation);
                         drop(client);

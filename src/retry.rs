@@ -1288,7 +1288,7 @@ impl Client {
     async fn process_retry_key_bundle(
         &self,
         node: &NodeRef<'_>,
-        requester_jid: &wacore_binary::Jid,
+        requester_jid: &Jid,
         is_peer: bool,
         is_fbid_bot_retry: bool,
     ) -> Result<(), anyhow::Error> {
@@ -1610,9 +1610,9 @@ impl Client {
     pub(crate) async fn send_enc_rekey_retry_receipt(
         &self,
         stanza_id: &str,
-        peer_jid: &wacore_binary::Jid,
+        peer_jid: &Jid,
         call_id: &str,
-        call_creator: &wacore_binary::Jid,
+        call_creator: &Jid,
         retry_count: u8,
     ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -1984,11 +1984,7 @@ mod tests {
         let our_pn = Jid::pn("559999999999");
         let our_lid = Jid::lid("100000000000001");
 
-        fn build_retry_receipt(
-            info: &MessageInfo,
-            our_pn: &Jid,
-            our_lid: &Jid,
-        ) -> wacore_binary::Node {
+        fn build_retry_receipt(info: &MessageInfo, our_pn: &Jid, our_lid: &Jid) -> Node {
             // Mirror production routing: groups → chat JID, DMs → sender JID
             let receipt_to = if info.source.is_group {
                 &info.source.chat
@@ -2217,7 +2213,7 @@ mod tests {
             .get_optional_child("registration")
             .expect("<registration> child must exist");
         let reg_bytes = match &registration.content {
-            Some(wacore_binary::NodeContent::Bytes(b)) => b.clone(),
+            Some(NodeContent::Bytes(b)) => b.clone(),
             _ => panic!("registration must contain bytes"),
         };
         assert_eq!(

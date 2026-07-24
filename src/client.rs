@@ -206,7 +206,7 @@ type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
 /// Keyed by `Jid` to avoid per-message `to_string()` allocation.
 #[derive(Clone)]
 pub(crate) struct ChatLane {
-    pub enqueue_lock: Arc<async_lock::Mutex<()>>,
+    pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: async_channel::Sender<QueuedChatMessage>,
 }
 
@@ -224,7 +224,7 @@ impl ChatLane {
 
 pub(crate) struct QueuedChatMessage {
     pub node: Arc<wacore_binary::OwnedNodeRef>,
-    pub lane_liveness: Arc<async_lock::Mutex<()>>,
+    pub lane_liveness: Arc<Mutex<()>>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
@@ -616,7 +616,7 @@ pub enum ConnectError {
     #[error("{stage} timed out after {timeout:?}")]
     Timeout {
         stage: ConnectStage,
-        timeout: std::time::Duration,
+        timeout: Duration,
     },
     /// The app version could not be resolved.
     #[error("failed to resolve app version")]
@@ -626,7 +626,7 @@ pub enum ConnectError {
     Transport(#[source] anyhow::Error),
     /// The noise handshake failed after the transport was up.
     #[error(transparent)]
-    Handshake(#[from] crate::handshake::HandshakeError),
+    Handshake(#[from] handshake::HandshakeError),
 }
 
 /// Failures of the background Signal maintenance surface: signed pre-key
@@ -781,7 +781,7 @@ impl ResponseWaiterMap {
 /// protocol operation built on top of them.
 ///
 /// This is the low-level entry point. Build one with
-/// [`ClientBuilder`](crate::client::ClientBuilder), which
+/// [`ClientBuilder`], which
 /// takes the four platform dependencies (storage backend, transport factory,
 /// HTTP client, async runtime) and validates them at runtime. Most applications
 /// should use [`Bot`](crate::bot::Bot) instead and reach the client through
@@ -802,7 +802,7 @@ impl ResponseWaiterMap {
 /// # Events
 ///
 /// Everything the server reports (messages, receipts, pairing progress,
-/// connection state) is delivered as an [`Event`](wacore::types::events::Event)
+/// connection state) is delivered as an [`Event`]
 /// on the event bus. Register a handler with [`Client::subscribe`] (explicit
 /// [`EventInterest`](wacore::types::events::EventInterest) filter) or
 /// [`Client::subscribe_handler`].
@@ -914,7 +914,7 @@ pub struct Client {
     /// are processed concurrently across different chats.
     /// Keys are Signal protocol address strings (e.g., "user@s.whatsapp.net:0")
     /// to match the SignalProtocolStoreAdapter's internal locking.
-    pub(crate) session_locks: Cache<String, Arc<async_lock::Mutex<()>>>,
+    pub(crate) session_locks: Cache<String, Arc<Mutex<()>>>,
 
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
@@ -927,7 +927,7 @@ pub struct Client {
     pub(crate) lid_pn_cache: Arc<LidPnCache>,
     pub(crate) ab_props: Arc<wacore::store::ab_props::AbPropsCache>,
 
-    pub group_cache: async_lock::Mutex<Option<Arc<GroupCache>>>,
+    pub group_cache: Mutex<Option<Arc<GroupCache>>>,
 
     pub(crate) expected_disconnect: Arc<AtomicBool>,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
@@ -966,7 +966,7 @@ pub struct Client {
     /// base-key collision — sessions that diverged without either trigger
     /// stay stuck. This map throttles the fallback so a noisy peer can't
     /// loop us through prekey fetches.
-    pub(crate) session_recreate_history: Cache<wacore_binary::jid::Jid, wacore::time::Instant>,
+    pub(crate) session_recreate_history: Cache<Jid, wacore::time::Instant>,
 
     /// Per-chat outbound resend rate limiter: bounds the aggregate resend rate
     /// to a chat (the anti-abuse signal) so a PN to LID fan-out cannot storm into
@@ -993,7 +993,7 @@ pub struct Client {
 
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 
-    pub(crate) app_state_processor: async_lock::Mutex<Option<Arc<AppStateProcessor>>>,
+    pub(crate) app_state_processor: Mutex<Option<Arc<AppStateProcessor>>>,
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
@@ -1002,10 +1002,10 @@ pub struct Client {
     pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
 
     /// Prevents concurrent prekey upload operations (matches WA Web's dedup set in `handlePreKeyLow`).
-    pub(crate) prekey_upload_lock: Arc<async_lock::Mutex<()>>,
+    pub(crate) prekey_upload_lock: Arc<Mutex<()>>,
     /// Single-flights signed pre-key rotation so overlapping post-login tasks
     /// (from reconnect churn) can't run the rotate/upload/prune flow concurrently.
-    pub(crate) signed_pre_key_rotation_lock: Arc<async_lock::Mutex<()>>,
+    pub(crate) signed_pre_key_rotation_lock: Arc<Mutex<()>>,
     /// Notifier for when offline sync (ib offline stanza) is received.
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
     pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
@@ -1039,11 +1039,11 @@ pub struct Client {
         )>,
     >,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
-    pub(crate) presence_subscriptions: Arc<async_lock::Mutex<HashSet<Jid>>>,
+    pub(crate) presence_subscriptions: Arc<Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging
     pub(crate) offline_sync_metrics: Arc<OfflineSyncMetrics>,
     /// Drives the WA Web pull-batch loop for offline backlog delivery.
-    pub(crate) offline_batch: Arc<crate::client::offline_resume::OfflineBatchCoordinator>,
+    pub(crate) offline_batch: Arc<offline_resume::OfflineBatchCoordinator>,
     /// Notifier for when the noise socket is established (before login).
     /// Use this to wait for the socket to be ready for sending messages.
     pub(crate) socket_ready_notifier: Arc<event_listener::Event>,
@@ -1095,8 +1095,7 @@ pub struct Client {
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
     pub(crate) chatstate_handlers: Arc<RwLock<Vec<ChatStateHandler>>>,
 
-    pub(crate) pdo_pending_requests:
-        Cache<wacore::types::message::ChatMessageId, crate::pdo::PendingPdoRequest>,
+    pub(crate) pdo_pending_requests: Cache<ChatMessageId, crate::pdo::PendingPdoRequest>,
 
     /// Messages already covered by a placeholder-resend PDO request. Mirrors
     /// the session-lifetime set in
@@ -1104,7 +1103,7 @@ pub struct Client {
     /// request per message, no matter how many times the server redelivers
     /// the undecryptable original. Entries are dropped on send failure so a
     /// transient error does not block the next attempt.
-    pub(crate) pdo_requested: Cache<wacore::types::message::ChatMessageId, ()>,
+    pub(crate) pdo_requested: Cache<ChatMessageId, ()>,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.
@@ -1112,10 +1111,10 @@ pub struct Client {
     /// Device registry fused with its topology tracker: every write records
     /// the change by construction, so the group-devices memo below can never
     /// be left stale by a forgotten bump.
-    pub(crate) device_registry_cache: crate::client::device_topology::DeviceRegistryCache,
+    pub(crate) device_registry_cache: device_topology::DeviceRegistryCache,
     /// Shared topology tracker (generation + changed-users log). LidPnCache
     /// records mapping changes into it; the memo validates against it.
-    pub(crate) device_topology: Arc<crate::client::device_topology::DeviceTopology>,
+    pub(crate) device_topology: Arc<device_topology::DeviceTopology>,
     /// Whether the group-devices memo may be used: false when the registry
     /// or LID-PN caches are store-backed (a shared external store can be
     /// written by other processes, which the in-process topology tracker
@@ -1125,14 +1124,13 @@ pub struct Client {
     /// validated by GroupInfo identity + the device topology. Serves the
     /// per-send full-set resolution in `resolve_skdm_targets` so a warm
     /// repeat send skips the per-member cache fan-out.
-    pub(crate) group_devices_memo:
-        Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,
+    pub(crate) group_devices_memo: Cache<Jid, Arc<device_registry::GroupDevicesMemo>>,
 
     /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
     /// cold sends each re-ran the full per-member fan-out before any of them
     /// marked the devices warm; the loser now waits here and re-resolves,
     /// finding everything warm. Warm sends never touch it.
-    pub(crate) group_distribution_locks: Cache<Jid, Arc<async_lock::Mutex<()>>>,
+    pub(crate) group_distribution_locks: Cache<Jid, Arc<Mutex<()>>>,
 
     /// Last `(devices, sender-key-device map)` Arc pair whose `needs_skdm`
     /// was warm — empty, or only our own devices (which are never memoized
@@ -1186,7 +1184,7 @@ pub struct Client {
     /// across sleep/backoff) and re-checks the generation under it; teardown
     /// holds it around the settle. Lock order is always this-gate → processing
     /// permit / sessions lock, so no inversion.
-    pub(crate) signal_flush_lifecycle: async_lock::Mutex<()>,
+    pub(crate) signal_flush_lifecycle: Mutex<()>,
     /// Injected failures for the coalesced flush (consumed one per attempt),
     /// so tests can exercise the retry/backoff path deterministically.
     #[cfg(test)]
@@ -1228,16 +1226,15 @@ pub struct Client {
     /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
     /// arrives. Behind the `voip` feature; populated only by the media facade.
     #[cfg(feature = "voip-runtime")]
-    pub(crate) pending_outgoing_calls: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, crate::voip::facade::PendingOutgoing>>,
-    >,
+    pub(crate) pending_outgoing_calls:
+        Arc<std::sync::Mutex<HashMap<String, crate::voip::facade::PendingOutgoing>>>,
 }
 
 /// Builds a pong response node for a server-initiated ping.
 ///
 /// Matches WhatsApp Web (`WAWebCommsHandleStanza`): only includes `id`
 /// when the server ping carried one.
-fn build_pong(to: String, id: Option<&str>) -> wacore_binary::Node {
+fn build_pong(to: String, id: Option<&str>) -> Node {
     let mut builder = NodeBuilder::new("iq").attr("to", to).attr("type", "result");
     if let Some(id) = id {
         builder = builder.attr("id", id);

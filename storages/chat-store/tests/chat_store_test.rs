@@ -1348,8 +1348,8 @@ async fn clear_chat_reflects_surviving_starred_messages() {
     assert_eq!(chats[0].unread_count, 0);
 }
 
-fn range_up_to(ts_secs: i64) -> buffa::MessageField<wa::sync_action_value::SyncActionMessageRange> {
-    buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+fn range_up_to(ts_secs: i64) -> MessageField<wa::sync_action_value::SyncActionMessageRange> {
+    MessageField::some(wa::sync_action_value::SyncActionMessageRange {
         last_message_timestamp: Some(ts_secs),
         ..Default::default()
     })
@@ -1648,10 +1648,10 @@ async fn keyed_range_spares_unlisted_same_second_siblings() {
     }
 
     // The action enumerates only MSG-IN at the boundary.
-    let range = buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+    let range = MessageField::some(wa::sync_action_value::SyncActionMessageRange {
         last_message_timestamp: Some(1_700_000_000),
         messages: vec![wa::sync_action_value::SyncActionMessage {
-            key: buffa::MessageField::some(wa::MessageKey {
+            key: MessageField::some(wa::MessageKey {
                 id: Some("MSG-IN".into()),
                 remote_jid: Some(PEER.into()),
                 ..Default::default()
@@ -1977,10 +1977,10 @@ async fn keyed_mark_read_spares_unlisted_same_second_sibling() {
     )
     .await;
 
-    let range = buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+    let range = MessageField::some(wa::sync_action_value::SyncActionMessageRange {
         last_message_timestamp: Some(1_700_000_000),
         messages: vec![wa::sync_action_value::SyncActionMessage {
-            key: buffa::MessageField::some(wa::MessageKey {
+            key: MessageField::some(wa::MessageKey {
                 id: Some("MSG-KA".into()),
                 remote_jid: Some(PEER.into()),
                 ..Default::default()
@@ -2219,10 +2219,10 @@ async fn keyed_read_covers_a_message_that_materializes_later() {
 
     // The keyed mark-read arrives BEFORE the message it names (read on
     // another device, local drain lagging).
-    let range = buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+    let range = MessageField::some(wa::sync_action_value::SyncActionMessageRange {
         last_message_timestamp: Some(1_700_000_000),
         messages: vec![wa::sync_action_value::SyncActionMessage {
-            key: buffa::MessageField::some(wa::MessageKey {
+            key: MessageField::some(wa::MessageKey {
                 id: Some("MSG-FUT".into()),
                 remote_jid: Some(PEER.into()),
                 ..Default::default()

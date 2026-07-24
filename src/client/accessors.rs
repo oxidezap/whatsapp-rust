@@ -492,9 +492,7 @@ impl Client {
     /// `.lock().unwrap()` that would panic if a holder ever panicked. The critical
     /// section is a trivial map op, never held across an `.await`.
     #[inline]
-    pub(crate) fn response_waiters_guard(
-        &self,
-    ) -> std::sync::MutexGuard<'_, crate::client::ResponseWaiterMap> {
+    pub(crate) fn response_waiters_guard(&self) -> std::sync::MutexGuard<'_, ResponseWaiterMap> {
         self.response_waiters
             .lock()
             .unwrap_or_else(|p| p.into_inner())

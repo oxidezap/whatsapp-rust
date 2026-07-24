@@ -214,7 +214,7 @@ impl Client {
 /// duplicate (silent loss for hook consumers).
 struct ReinsertGuard<'a> {
     batcher: &'a InboundCommitBatcher,
-    items: Option<std::sync::Arc<[InboundMessage]>>,
+    items: Option<Arc<[InboundMessage]>>,
     commit_ticket: Option<InboundCommitTicket>,
 }
 
@@ -297,7 +297,7 @@ impl Client {
             // a Vec would add an alloc+dealloc per live message (measured
             // ~18ns and 2x the allocations of this step).
             return if self
-                .commit_inbound_batch(std::sync::Arc::from([item]), BatchOrigin::Live, None)
+                .commit_inbound_batch(Arc::from([item]), BatchOrigin::Live, None)
                 .await
             {
                 InboundCommitState::Durable
@@ -697,7 +697,7 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.commit_batch", level = "debug", skip_all, fields(count = items.len())))]
     pub(crate) async fn commit_inbound_batch(
         self: &Arc<Self>,
-        items: std::sync::Arc<[InboundMessage]>,
+        items: Arc<[InboundMessage]>,
         origin: BatchOrigin,
         commit_ticket: Option<InboundCommitTicket>,
     ) -> bool {
@@ -709,7 +709,7 @@ impl Client {
         }
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
-            items: is_drain.then(|| std::sync::Arc::clone(&items)),
+            items: is_drain.then(|| Arc::clone(&items)),
             commit_ticket,
         };
         #[cfg(test)]

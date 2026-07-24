@@ -39,7 +39,7 @@ pub enum MexError {
 /// MEX request: a persisted-query descriptor plus its typed variables.
 ///
 /// Variables are serialized straight to the wire in the IQ spec (no intermediate
-/// `serde_json::Value`). Build one with the [`mex_request!`] macro, which pulls
+/// `serde_json::Value`). Build one with the `mex_request!` macro, which pulls
 /// `NAME`/`DOC_ID` from a generated [`wacore::iq::mex_operations`] module so the
 /// op is named once.
 #[derive(Debug, Clone)]
@@ -53,7 +53,7 @@ pub struct MexRequest<V> {
 
 impl<V> MexRequest<V> {
     /// Pair a `(name, id)` from a generated op module with its variables.
-    /// Prefer the [`mex_request!`] macro, which names the op once.
+    /// Prefer the `mex_request!` macro, which names the op once.
     pub fn new(name: &'static str, id: &'static str, variables: V) -> Self {
         Self {
             doc: MexDoc { name, id },

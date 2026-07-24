@@ -453,7 +453,7 @@ mod tests {
             keys: HashMap::new(),
         };
 
-        let skdm = futures::executor::block_on(create_sender_key_distribution_message(
+        let skdm = block_on(create_sender_key_distribution_message(
             &name,
             &mut alice_store,
             &mut rng,
@@ -473,8 +473,7 @@ mod tests {
         )
         .expect("build skm");
 
-        let result =
-            futures::executor::block_on(group_decrypt(skm.serialized(), &mut alice_store, &name));
+        let result = block_on(group_decrypt(skm.serialized(), &mut alice_store, &name));
 
         match result {
             Err(SignalProtocolError::NoSenderKeyState(msg)) => {

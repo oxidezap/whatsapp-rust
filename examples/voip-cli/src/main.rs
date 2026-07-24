@@ -8,14 +8,17 @@
 //! and ffplay renders the peer's stream — the library only transports encoded AUs.
 //!
 //! Subcommands (all accept a trailing `--video`):
-//!   loopback [--video]  Mic → Opus → E2E-SRTP protect → unprotect → Opus → speaker.
-//!                       Exercises the whole media stack locally; NO WhatsApp connection.
-//!                       With --video: ffmpeg source → AU splitter → ffplay window instead.
-//!   listen [accept] [--video]  Connect, print incoming calls; reject (default) or accept.
-//!                       With --video an accepted call answers with video media too.
-//!   call <jid> [--video]  Place a call; with --video it is a video call from the start.
 //!
-//!   cargo run -p whatsapp-rust-voip-cli --release -- loopback
+//! ```text
+//! loopback [--video]  Mic → Opus → E2E-SRTP protect → unprotect → Opus → speaker.
+//!                     Exercises the whole media stack locally; NO WhatsApp connection.
+//!                     With --video: ffmpeg source → AU splitter → ffplay window instead.
+//! listen [accept] [--video]  Connect, print incoming calls; reject (default) or accept.
+//!                     With --video an accepted call answers with video media too.
+//! call <jid> [--video]  Place a call; with --video it is a video call from the start.
+//!
+//! cargo run -p whatsapp-rust-voip-cli --release -- loopback
+//! ```
 //!
 //! During a live call, single-key commands on stdin (terminal only): `v` toggles video
 //! (upgrade / accept a pending peer request / downgrade), `q` hangs up.
@@ -28,6 +31,9 @@
 //! speaker).start()` returns a `CallHandle` and the library owns the callKey decrypt, the relay
 //! socket, the sans-IO engine, and the task lifetime. This example only supplies the cpal audio
 //! device / ffmpeg pipes and reacts to engine events.
+
+// The usage line is this binary's output, not a diagnostic to route through `log`.
+#![allow(clippy::print_stderr)]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -1699,7 +1705,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
     tokio::select! {
         _ = bot.run() => {}
         // SIGINT or SIGTERM: react to `docker stop`/k8s, not just Ctrl+C.
-        _ = whatsapp_rust::shutdown_signal() => { info!("shutting down"); }
+        _ = shutdown_signal() => { info!("shutting down"); }
     }
     Ok(())
 }

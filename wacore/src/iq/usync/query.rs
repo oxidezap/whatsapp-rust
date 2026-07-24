@@ -2461,6 +2461,6 @@ mod tests {
 
     #[test]
     fn sparse_result_layout_stays_bounded() {
-        assert!(std::mem::size_of::<UsyncProtocolResult>() <= 96);
+        assert!(size_of::<UsyncProtocolResult>() <= 96);
     }
 }

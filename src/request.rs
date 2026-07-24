@@ -22,7 +22,7 @@ const IQ_TAG: &str = "iq";
 /// on wasm where the runtime is single-threaded.
 #[cfg(not(target_arch = "wasm32"))]
 type IqSendFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'a>>;
 #[cfg(target_arch = "wasm32")]
 type IqSendFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + 'a>>;
@@ -515,7 +515,7 @@ mod tests {
     // leaked entry suppresses keepalives for the life of the connection.
     #[test]
     fn waiter_guard_removes_pending_entry_on_drop() {
-        let waiters: Arc<Mutex<crate::client::ResponseWaiterMap>> =
+        let waiters: Arc<Mutex<ResponseWaiterMap>> =
             Arc::new(Mutex::new(ResponseWaiterMap::default()));
         let (tx, _rx) = futures::channel::oneshot::channel();
         let cleanup_generation = waiters
@@ -542,7 +542,7 @@ mod tests {
     // guard drops, so the guard's removal must be a harmless no-op.
     #[test]
     fn waiter_guard_drop_is_noop_when_already_resolved() {
-        let waiters: Arc<Mutex<crate::client::ResponseWaiterMap>> =
+        let waiters: Arc<Mutex<ResponseWaiterMap>> =
             Arc::new(Mutex::new(ResponseWaiterMap::default()));
         let (tx, _rx) = futures::channel::oneshot::channel();
         let cleanup_generation = waiters

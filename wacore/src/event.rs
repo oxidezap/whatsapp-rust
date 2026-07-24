@@ -1,6 +1,6 @@
 //! Event response encryption.
 //!
-//! Thin wrapper over [`secret_enc_addon`] specialised for the
+//! Thin wrapper over [`secret_enc_addon`](crate::secret_enc_addon) specialised for the
 //! `EventResponseMessage` proto and the `"Event Response"` use-case.
 
 use anyhow::{Result, ensure};

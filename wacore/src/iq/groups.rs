@@ -1690,7 +1690,7 @@ impl ParticipantChangeResponse {
     }
 }
 
-impl crate::protocol::ProtocolNode for ParticipantChangeResponse {
+impl ProtocolNode for ParticipantChangeResponse {
     fn tag(&self) -> &'static str {
         "participant"
     }

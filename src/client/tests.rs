@@ -502,7 +502,7 @@ async fn test_lid_pn_cache_timestamp_resolution() {
     );
 
     // Small delay to ensure different timestamp
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Add new mapping with newer timestamp
     client
@@ -626,9 +626,7 @@ async fn test_wait_for_offline_delivery_end_returns_immediately_when_flag_set() 
     .await;
 
     // Set the flag to true (simulating offline sync completed)
-    client
-        .offline_sync_completed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    client.offline_sync_completed.store(true, Ordering::Relaxed);
 
     // This should return immediately (not wait 10 seconds)
     let start = wacore::time::Instant::now();
@@ -672,7 +670,7 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
     // marks the sync complete on timeout.
     let start = wacore::time::Instant::now();
     client
-        .wait_for_offline_delivery_end_with_timeout(std::time::Duration::from_millis(50))
+        .wait_for_offline_delivery_end_with_timeout(Duration::from_millis(50))
         .await;
 
     let elapsed = start.elapsed();
@@ -695,7 +693,7 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
         if permits == 64 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     assert!(
@@ -704,9 +702,7 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
         elapsed
     );
     assert!(
-        client
-            .offline_sync_completed
-            .load(std::sync::atomic::Ordering::Relaxed),
+        client.offline_sync_completed.load(Ordering::Relaxed),
         "wait_for_offline_delivery_end should mark offline sync complete on timeout"
     );
     assert_eq!(
@@ -743,7 +739,7 @@ async fn test_wait_for_offline_delivery_end_returns_on_notify() {
 
     // Spawn a task that will notify after 50ms
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         client_clone.offline_sync_notifier.notify(usize::MAX);
     });
 
@@ -790,9 +786,7 @@ async fn test_offline_sync_flag_initially_false() {
 
     // The flag should be false initially
     assert!(
-        !client
-            .offline_sync_completed
-            .load(std::sync::atomic::Ordering::Relaxed),
+        !client.offline_sync_completed.load(Ordering::Relaxed),
         "offline_sync_completed should be false when Client is first created"
     );
 
@@ -837,7 +831,7 @@ async fn test_offline_sync_lifecycle() {
     });
 
     // Give the waiter time to start waiting
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Verify waiter hasn't completed yet
     assert!(
@@ -850,7 +844,7 @@ async fn test_offline_sync_lifecycle() {
     client.offline_sync_notifier.notify(usize::MAX);
 
     // 4. Waiter should complete
-    let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiter_handle)
+    let result = tokio::time::timeout(Duration::from_millis(100), waiter_handle)
         .await
         .expect("Waiter should complete after notify")
         .expect("Waiter task should not panic");
@@ -943,7 +937,7 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     });
 
     // Wait a bit - ensure_e2e_sessions should return immediately for empty list
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(
         ensure_handle.is_finished(),
         "ensure_e2e_sessions should return immediately for empty JID list"
@@ -960,7 +954,7 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     });
 
     // Give it a moment to start
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
     // It should still be waiting (offline sync not complete)
     assert!(
@@ -973,7 +967,7 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     client.offline_sync_notifier.notify(usize::MAX);
 
     // Now it should complete (might fail on session establishment, but that's ok)
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), ensure_handle).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), ensure_handle).await;
 
     assert!(
         result.is_ok(),
@@ -1065,7 +1059,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // Note: This will fail because we can't actually fetch prekeys in tests,
     // but the important thing is that it doesn't WAIT for offline sync
     let result = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
+        Duration::from_millis(500),
         client.establish_primary_phone_session_immediate(),
     )
     .await;
@@ -3022,7 +3016,7 @@ async fn test_custom_cache_config_is_respected() {
 
 #[tokio::test]
 async fn held_group_distribution_lane_survives_capacity_pressure() {
-    let config = crate::cache_config::CacheConfig {
+    let config = CacheConfig {
         group_distribution_locks_capacity: 1,
         ..Default::default()
     };
@@ -3064,14 +3058,14 @@ async fn active_chat_lane_survives_capacity_pressure() {
         let (queue_tx, queue_rx) = async_channel::unbounded();
         (
             ChatLane {
-                enqueue_lock: Arc::new(async_lock::Mutex::new(())),
+                enqueue_lock: Arc::new(Mutex::new(())),
                 queue_tx,
             },
             queue_rx,
         )
     }
 
-    let config = crate::cache_config::CacheConfig {
+    let config = CacheConfig {
         chat_lanes_capacity: 1,
         ..Default::default()
     };
@@ -3679,9 +3673,9 @@ async fn ack_miss_path_does_not_heap_allocate() {
     // in every window, so the minimum only reaches 0 when the path is clean.
     let mut min_delta = u64::MAX;
     for _ in 0..100 {
-        let before = crate::test_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+        let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
         let handled = client.handle_ack_response_arc(&node);
-        let after = crate::test_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+        let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
         assert!(!handled, "no waiter is registered for this id");
         min_delta = min_delta.min(after - before);
     }
@@ -3715,12 +3709,12 @@ async fn stats_snapshot_reflects_counters() {
 async fn memory_report_on_fresh_client() {
     // recent_messages is capacity-0 (disabled) by default; enable it so the
     // byte-attribution assertion below has a collection to land in.
-    let mut cache_config = crate::cache_config::CacheConfig::default();
+    let mut cache_config = CacheConfig::default();
     cache_config.recent_messages =
-        crate::cache_config::CacheEntryConfig::new(Some(std::time::Duration::from_secs(300)), 64);
+        crate::cache_config::CacheEntryConfig::new(Some(Duration::from_secs(300)), 64);
     let client = crate::test_utils::create_test_client_with_config(
         "memory_report",
-        std::sync::Arc::new(crate::test_utils::MockHttpClient),
+        Arc::new(MockHttpClient),
         cache_config,
     )
     .await;
@@ -3735,13 +3729,13 @@ async fn memory_report_on_fresh_client() {
     assert_eq!(report.response_waiters, 0);
 
     // Retained bytes must appear once something is cached.
-    let key = wacore::types::message::ChatMessageId::new(
+    let key = ChatMessageId::new(
         "559980000001@s.whatsapp.net".parse().unwrap(),
         "3EB0TESTMSGID".to_string(),
     );
     client
         .recent_messages
-        .insert(key, std::sync::Arc::new(vec![0u8; 2048]))
+        .insert(key, Arc::new(vec![0u8; 2048]))
         .await;
     let report = client.memory_report().await;
     assert_eq!(report.recent_messages.entries, 1);
@@ -3792,7 +3786,7 @@ async fn resource_report_composes_client_and_out_of_client_components() {
 
     // Install an alloc meter and charge a known allocation inside a poll scope;
     // the next report folds in its snapshot.
-    let meter = std::sync::Arc::new(AllocMeter::new());
+    let meter = Arc::new(AllocMeter::new());
     meter.on_poll_start();
     AllocMeter::on_alloc(4096);
     meter.on_poll_end();
@@ -3813,13 +3807,11 @@ async fn instrumented_runtime_reports_to_cpu_meter() {
     use wacore::runtime::Runtime as _;
     use wacore::stats::{CpuMeter, InstrumentedRuntime};
 
-    let meter = std::sync::Arc::new(CpuMeter::new());
-    let runtime = InstrumentedRuntime::new(
-        std::sync::Arc::new(crate::runtime_impl::TokioRuntime),
-        meter.clone(),
-    );
+    let meter = Arc::new(CpuMeter::new());
+    let runtime =
+        InstrumentedRuntime::new(Arc::new(crate::runtime_impl::TokioRuntime), meter.clone());
 
-    let (tx, rx) = futures::channel::oneshot::channel::<()>();
+    let (tx, rx) = oneshot::channel::<()>();
     runtime
         .spawn(Box::pin(async move {
             let _ = tx.send(());

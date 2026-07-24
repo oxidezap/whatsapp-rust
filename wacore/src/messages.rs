@@ -407,7 +407,7 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
 #[derive(Debug)]
 pub struct DetachedHistorySyncNotification {
     pub notification: wa::message::HistorySyncNotification,
-    pub inline_payload: Option<buffa::bytes::Bytes>,
+    pub inline_payload: Option<bytes::Bytes>,
 }
 
 impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotification {
@@ -415,7 +415,7 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
         let inline_payload = notification
             .initial_hist_bootstrap_inline_payload
             .take()
-            .map(buffa::bytes::Bytes::from);
+            .map(bytes::Bytes::from);
         Self {
             notification,
             inline_payload,
@@ -437,7 +437,7 @@ pub fn decode_plaintext_detached_history_sync(
     padding_version: u8,
 ) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
     let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
-    let source = buffa::bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
+    let source = bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
 
     // Mirror `unwrap_device_sent`: once a DSM carries an inner message, only
     // that message is dispatched. Inspecting just this generated-tag path
@@ -642,7 +642,7 @@ pub fn decode_plaintext_owned_view(
     padding_version: u8,
 ) -> Result<wa::MessageOwnedView> {
     let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
-    let plaintext = buffa::bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
+    let plaintext = bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
     wa::MessageOwnedView::decode(plaintext)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
@@ -1658,7 +1658,7 @@ mod parse_message_info_tests {
         // never produce 16; assert 16 is reachable over many samples.
         let mut saw_16 = false;
         for _ in 0..5_000 {
-            let p = super::MessageUtils::random_pad_len();
+            let p = MessageUtils::random_pad_len();
             assert!((1..=16).contains(&p), "pad len {p} out of 1..=16");
             saw_16 |= p == 16;
         }

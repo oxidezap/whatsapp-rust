@@ -256,10 +256,7 @@ mod tests {
 
     use wacore::libsignal::protocol::{ProtocolAddress, SessionRecord};
 
-    async fn backend_session(
-        client: &Arc<crate::client::Client>,
-        addr: &ProtocolAddress,
-    ) -> Option<bytes::Bytes> {
+    async fn backend_session(client: &Arc<Client>, addr: &ProtocolAddress) -> Option<bytes::Bytes> {
         client
             .persistence_manager
             .backend()
@@ -268,7 +265,7 @@ mod tests {
             .expect("backend read")
     }
 
-    fn dirty_session(client: &Arc<crate::client::Client>, user: &str) -> ProtocolAddress {
+    fn dirty_session(client: &Arc<Client>, user: &str) -> ProtocolAddress {
         let addr = ProtocolAddress::new(user.to_string(), 1.into());
         assert!(
             client
@@ -279,7 +276,7 @@ mod tests {
         addr
     }
 
-    async fn wait_for_backend_session(client: &Arc<crate::client::Client>, addr: &ProtocolAddress) {
+    async fn wait_for_backend_session(client: &Arc<Client>, addr: &ProtocolAddress) {
         let deadline = wacore::time::Instant::now() + Duration::from_secs(2);
         while backend_session(client, addr).await.is_none() {
             assert!(

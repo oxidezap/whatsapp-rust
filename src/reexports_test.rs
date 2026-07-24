@@ -4,6 +4,10 @@
 #![cfg(test)]
 // Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
+// The `whatsapp_rust::` prefixes ARE the assertion here — spelling a path the way
+// a downstream consumer would is the only thing this file checks. Shortening them
+// to the direct dependency would leave the test passing with the re-exports gone.
+#![allow(unused_qualifications)]
 
 use crate as whatsapp_rust;
 use whatsapp_rust::waproto::whatsapp as wa;

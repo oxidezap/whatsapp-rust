@@ -147,6 +147,90 @@ jobs:
           cargo test -p wacore --features voip --lib
           cargo test -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
 
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    env:
+      # Broken intra-doc links and malformed doc attributes are only surfaced by
+      # rustdoc, never by clippy or rustc, so they need their own gate.
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reclaim unused Android SDK space
+        run: |
+          df -h /
+          sudo rm -rf --one-file-system /usr/local/lib/android
+          df -h /
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      # The voip-cli member links cpal, which needs ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      # --all-features so the voip-gated docs are covered too. Default features
+      # alone would leave their links unchecked, and docs.rs builds with features
+      # on (hence the `cfg(docsrs)` in the workspace check-cfg).
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --all-features
+
+  feature-matrix:
+    name: Feature Matrix (each feature)
+    runs-on: ubuntu-latest
+    # Individual features are only ever exercised in the combinations the other
+    # jobs happen to build (default / --all-features), so a feature whose gates
+    # are wrong compiles fine there and breaks for a downstream consumer that
+    # picks it alone. Restricted to the published library crates; bin/test
+    # members carry no feature surface worth enumerating.
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reclaim unused Android SDK space
+        run: |
+          df -h /
+          sudo rm -rf --one-file-system /usr/local/lib/android
+          df -h /
+      # `simd` needs nightly, so the matrix runs on the pinned toolchain.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      # Cache the target dir too: sccache can't cache proc-macros, build scripts
+      # or bins (linker-output crate types), and those recompile every run.
+      # Swatinem restores them; sccache still fills in after a Cargo.lock change.
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      # --no-dev-deps: dev-dependencies enable features on the crate under test
+      # (wacore/test-util, for one), which would mask exactly the gaps this
+      # job looks for.
+      - name: Check each feature
+        run: >
+          cargo hack check --each-feature --no-dev-deps
+          -p whatsapp-rust -p wacore -p wacore-binary -p wacore-appstate
+          -p wacore-libsignal -p wacore-noise -p waproto
+
   test-stable:
     name: Test Stable (no-simd)
     runs-on: ubuntu-latest
@@ -157,7 +241,10 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned rather than `@stable`: this version is the workspace MSRV
+      # (`rust-version` in the root Cargo.toml). To raise the floor, bump both
+      # together — a floating `stable` would silently let the declared MSRV rot.
+      - uses: dtolnay/rust-toolchain@1.94.1
       - name: Install protoc
         uses: taiki-e/install-action@v2
         with:
@@ -183,3 +270,14 @@ jobs:
         run: cargo build -p wacore --no-default-features --verbose
       - name: Test wacore (stable, no SIMD)
         run: cargo test -p wacore --no-default-features --lib --verbose
+      # `rust-version` is published metadata for every member, but only the
+      # three crates above are exercised at that toolchain. This compiles the
+      # rest of the publishable set so the declared floor is a checked promise
+      # rather than an assertion. Check-only: the tests that matter here
+      # already ran above, and this is about the toolchain accepting the code.
+      - name: Check the remaining published crates at MSRV
+        run: >
+          cargo check --no-default-features --verbose
+          -p whatsapp-rust -p wacore-derive -p wacore-libsignal -p wacore-noise -p waproto
+          -p whatsapp-rust-ureq-http-client -p whatsapp-rust-chat-store
+          -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport

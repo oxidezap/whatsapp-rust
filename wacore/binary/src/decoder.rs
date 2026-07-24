@@ -552,7 +552,7 @@ mod tests {
     use super::*;
     use crate::node::{Attrs, Node};
 
-    type TestResult = crate::error::Result<()>;
+    type TestResult = Result<()>;
 
     #[test]
     fn test_decode_node() -> TestResult {
@@ -575,7 +575,7 @@ mod tests {
         assert!(decoded.attrs.is_empty());
         match &decoded.content {
             Some(content) => match &**content {
-                crate::node::NodeContentRef::String(s) => assert_eq!(s, "receipt"),
+                NodeContentRef::String(s) => assert_eq!(s, "receipt"),
                 _ => panic!("Expected string content"),
             },
             None => panic!("Expected content"),
@@ -605,7 +605,7 @@ mod tests {
         assert!(decoded.attrs.is_empty());
         match &decoded.content {
             Some(content) => match &**content {
-                crate::node::NodeContentRef::String(s) => assert_eq!(s, test_str),
+                NodeContentRef::String(s) => assert_eq!(s, test_str),
                 _ => panic!("Expected string content"),
             },
             None => panic!("Expected content"),

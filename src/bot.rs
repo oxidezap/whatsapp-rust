@@ -479,7 +479,7 @@ async fn run_metered<F: std::future::Future<Output = ()>>(
 /// ```
 ///
 /// Handlers registered through the builder (`on_message`, `on_event`, …)
-/// receive typed [`Event`](wacore::types::events::Event) payloads. Anything the
+/// receive typed [`Event`] payloads. Anything the
 /// builder does not expose is reachable on the underlying client via
 /// [`Bot::client`], which stays valid after the bot is started.
 pub struct Bot {
@@ -1268,14 +1268,12 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
     /// Boxed barrier: see [`Bot::run`]. Building the client wires every cache
     /// and background loop, so an unboxed await here would duplicate that
     /// whole construction graph into the consumer crate.
-    pub async fn build(self) -> std::result::Result<Bot, BotBuilderError> {
+    pub async fn build(self) -> Result<Bot, BotBuilderError> {
         self.build_boxed().await
     }
 
     #[inline(never)]
-    fn build_boxed(
-        self,
-    ) -> wacore::runtime::BoxFuture<'static, std::result::Result<Bot, BotBuilderError>> {
+    fn build_boxed(self) -> wacore::runtime::BoxFuture<'static, Result<Bot, BotBuilderError>> {
         Box::pin(self.build_graph())
     }
 
@@ -1283,7 +1281,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         feature = "tracing",
         tracing::instrument(name = "wa.bot.build", level = "debug", skip_all, err(Debug))
     )]
-    async fn build_graph(self) -> std::result::Result<Bot, BotBuilderError> {
+    async fn build_graph(self) -> Result<Bot, BotBuilderError> {
         // Destructure to extract required fields — typestate guarantees all are Some.
         let (Some(runtime), Some(backend), Some(transport_factory), Some(http_client)) = (
             self.runtime,
@@ -1460,7 +1458,7 @@ mod tests {
         fn install(
             &self,
             _context: crate::plugins::PluginContext,
-        ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+        ) -> wacore::runtime::BoxFuture<'_, Result<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new("installed")) })
         }
     }

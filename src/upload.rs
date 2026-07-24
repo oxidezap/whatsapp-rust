@@ -135,7 +135,7 @@ impl UploadCrypto {
 /// futures spawnable on native; on wasm the `HttpClient` futures are `?Send`
 /// (single-threaded runtime), so the bound is dropped there.
 #[cfg(not(target_arch = "wasm32"))]
-type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(target_arch = "wasm32")]
 type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
 
@@ -186,13 +186,13 @@ async fn upload_media_with_retry<GMC, GMCFut, IMC, IMCFut, EXR, EXRFut, SB, SBFu
 ) -> Result<UploadResponse>
 where
     GMC: FnMut(bool) -> GMCFut + MaybeSend,
-    GMCFut: std::future::Future<Output = Result<crate::mediaconn::MediaConn>> + MaybeSend,
+    GMCFut: Future<Output = Result<crate::mediaconn::MediaConn>> + MaybeSend,
     IMC: FnMut() -> IMCFut + MaybeSend,
-    IMCFut: std::future::Future<Output = ()> + MaybeSend,
+    IMCFut: Future<Output = ()> + MaybeSend,
     EXR: FnMut(HttpRequest) -> EXRFut + MaybeSend,
-    EXRFut: std::future::Future<Output = Result<HttpResponse>> + MaybeSend,
+    EXRFut: Future<Output = Result<HttpResponse>> + MaybeSend,
     SB: FnMut(HttpRequest, u64, u64) -> SBFut + MaybeSend,
-    SBFut: std::future::Future<Output = Result<HttpResponse>> + MaybeSend,
+    SBFut: Future<Output = Result<HttpResponse>> + MaybeSend,
 {
     upload_media_with_retry_dyn(
         crypto,
