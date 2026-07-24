@@ -12,6 +12,74 @@ const APP_STATE_KEY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// In-flight dedup registry for app-state collection syncs.
+///
+/// Reservations carry a per-begin token so a release can only ever remove the
+/// reservation it belongs to: a stale task finishing after a reconnect cleared
+/// the registry cannot evict the newer generation's reservation for the same
+/// collection. Releases run from the guard's `Drop`, so a cancelled sync
+/// (timeout, abort, teardown) can never strand a collection as "in flight".
+/// The mutex is synchronous and never held across an await.
+pub(crate) struct SyncInFlight {
+    entries: std::sync::Mutex<HashMap<WAPatchName, u64>>,
+    next_token: portable_atomic::AtomicU64,
+}
+
+impl SyncInFlight {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+            next_token: portable_atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Reserve `name`, or `None` when a sync for it is already in flight.
+    pub(crate) fn try_begin(self: &Arc<Self>, name: WAPatchName) -> Option<SyncInFlightGuard> {
+        let token = self
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.contains_key(&name) {
+            return None;
+        }
+        entries.insert(name, token);
+        Some(SyncInFlightGuard {
+            registry: Arc::clone(self),
+            name,
+            token,
+        })
+    }
+
+    /// Drop every reservation, releasing backing storage. Guards from before
+    /// the clear become no-ops thanks to the token check.
+    pub(crate) fn clear(&self) {
+        *self.entries.lock().unwrap_or_else(|p| p.into_inner()) = HashMap::new();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+pub(crate) struct SyncInFlightGuard {
+    registry: Arc<SyncInFlight>,
+    name: WAPatchName,
+    token: u64,
+}
+
+impl Drop for SyncInFlightGuard {
+    fn drop(&mut self) {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if entries.get(&self.name) == Some(&self.token) {
+            entries.remove(&self.name);
+        }
+    }
+}
+
 fn initial_app_state_key_retry(timeout: Duration) -> Duration {
     (timeout / 2)
         .max(Duration::from_millis(1))
@@ -339,21 +407,14 @@ impl Client {
     pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> anyhow::Result<()> {
         // In-flight dedup: skip if this collection is already being synced.
         // Matches WA Web's WAWebSyncdCollectionsStateMachine which tracks in-flight syncs
-        // and queues new requests to a pending set.
-        {
-            let mut syncing = self.app_state_syncing.lock().await;
-            if !syncing.insert(name) {
-                debug!(target: "Client/AppState", "Skipping sync for {:?}: already in flight", name);
-                return Ok(());
-            }
-        }
+        // and queues new requests to a pending set. The guard releases on every
+        // exit path, including cancellation.
+        let Some(_guard) = self.app_state_syncing.try_begin(name) else {
+            debug!(target: "Client/AppState", "Skipping sync for {:?}: already in flight", name);
+            return Ok(());
+        };
 
-        let result = self.fetch_app_state_with_retry_inner(name).await;
-
-        // Always remove from in-flight set when done
-        self.app_state_syncing.lock().await.remove(&name);
-
-        result
+        self.fetch_app_state_with_retry_inner(name).await
     }
 
     async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> anyhow::Result<()> {
@@ -434,40 +495,28 @@ impl Client {
             return Ok(());
         }
 
-        // In-flight dedup: filter out collections already being synced
-        let pending = {
-            let mut syncing = self.app_state_syncing.lock().await;
-            let mut filtered = Vec::with_capacity(collections.len());
-            for name in collections {
-                if syncing.insert(name) {
-                    filtered.push(name);
-                } else {
+        // In-flight dedup: filter out collections already being synced. The
+        // guards release on every exit path, including cancellation.
+        let mut guards = Vec::with_capacity(collections.len());
+        let mut pending = Vec::with_capacity(collections.len());
+        for name in collections {
+            match self.app_state_syncing.try_begin(name) {
+                Some(guard) => {
+                    guards.push(guard);
+                    pending.push(name);
+                }
+                None => {
                     debug!(target: "Client/AppState", "Skipping {:?} in batch: already in flight", name);
                 }
             }
-            filtered
-        };
+        }
 
         if pending.is_empty() {
             return Ok(());
         }
 
-        // Track all collections for cleanup
-        let all_collections: Vec<WAPatchName> = pending.clone();
-
-        let result = self
-            .sync_collections_batched_inner(pending, key_wait_deadline)
-            .await;
-
-        // Always clean up in-flight set
-        {
-            let mut syncing = self.app_state_syncing.lock().await;
-            for name in &all_collections {
-                syncing.remove(name);
-            }
-        }
-
-        result
+        self.sync_collections_batched_inner(pending, key_wait_deadline)
+            .await
     }
 
     async fn sync_collections_batched_inner(
@@ -1381,5 +1430,56 @@ mod tests {
             initial_app_state_key_retry(Duration::from_secs(180)),
             APP_STATE_KEY_PARTIAL_RETRY
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_in_flight_tests {
+    use super::*;
+
+    #[test]
+    fn second_begin_blocked_until_release() {
+        let registry = SyncInFlight::new();
+        let guard = registry
+            .try_begin(WAPatchName::Regular)
+            .expect("first begin must reserve");
+        assert!(
+            registry.try_begin(WAPatchName::Regular).is_none(),
+            "in-flight collection must dedup"
+        );
+        // Other collections are independent.
+        assert!(registry.try_begin(WAPatchName::CriticalBlock).is_some());
+
+        drop(guard);
+        assert!(
+            registry.try_begin(WAPatchName::Regular).is_some(),
+            "release (including cancellation drop) must free the slot"
+        );
+    }
+
+    #[test]
+    fn stale_guard_does_not_clobber_new_generation() {
+        let registry = SyncInFlight::new();
+        // Generation 1 reserves, then a reconnect clears the registry while
+        // the task is still in flight.
+        let stale = registry
+            .try_begin(WAPatchName::Regular)
+            .expect("gen-1 reserve");
+        registry.clear();
+
+        // Generation 2 reserves the same collection.
+        let fresh = registry
+            .try_begin(WAPatchName::Regular)
+            .expect("post-clear reserve");
+
+        // The stale task finishing must NOT evict generation 2's reservation.
+        drop(stale);
+        assert!(
+            registry.try_begin(WAPatchName::Regular).is_none(),
+            "stale release clobbered the new generation's reservation"
+        );
+
+        drop(fresh);
+        assert!(registry.try_begin(WAPatchName::Regular).is_some());
     }
 }

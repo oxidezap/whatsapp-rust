@@ -327,7 +327,7 @@ impl Client {
 
             app_state_processor: async_lock::Mutex::new(None),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
-            app_state_syncing: Arc::new(Mutex::new(HashSet::new())),
+            app_state_syncing: app_state::SyncInFlight::new(),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
             prekey_upload_lock: Arc::new(async_lock::Mutex::new(())),
@@ -1117,7 +1117,7 @@ impl Client {
         // Clear app state tracking maps to prevent unbounded growth across reconnections.
         // Replace with new collections to release backing storage.
         *self.app_state_key_requests.lock().await = HashMap::new();
-        *self.app_state_syncing.lock().await = HashSet::new();
+        self.app_state_syncing.clear();
 
         // Drop stale media connection (auth tokens become invalid on reconnect)
         *self.media_conn.write().await = None;
