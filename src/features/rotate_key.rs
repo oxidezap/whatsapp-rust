@@ -8,7 +8,7 @@
 use crate::client::{Client, SignalMaintenanceError};
 use crate::request::IqError;
 use wacore::iq::prekeys::RotateSignedPreKeySpec;
-use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
+use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey, SignalProtocolError};
 use wacore::libsignal::store::record_helpers::new_signed_pre_key_record;
 use wacore::store::commands::DeviceCommand;
 
@@ -153,10 +153,13 @@ impl Client {
                     .map_err(|e| SignalMaintenanceError::Signal(e.into()))?
                     .as_ref()
                     .try_into()
+                    // Not CorruptKey: nothing was read back from storage here, so
+                    // a wrong width means the signing backend broke its contract.
                     .map_err(|_| {
-                        SignalMaintenanceError::CorruptKey(
+                        SignalMaintenanceError::Signal(SignalProtocolError::InvalidState(
+                            "rotate_signed_pre_key",
                             "Ed25519 signature must be 64 bytes".to_string(),
-                        )
+                        ))
                     })?;
                 let record =
                     new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
