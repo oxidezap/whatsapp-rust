@@ -103,6 +103,7 @@ pub enum ClientBuilderError {
 /// Unlike [`crate::bot::BotBuilder`], this builder deliberately does not use
 /// typestate. FFI and embedded hosts can populate dependencies dynamically and
 /// receive a typed error without encoding Rust generic state in their wrapper.
+#[must_use = "call .build() to produce the Client; the builder does nothing on its own"]
 pub struct ClientBuilder {
     runtime: Option<Arc<dyn Runtime>>,
     persistence_manager: Option<Arc<PersistenceManager>>,

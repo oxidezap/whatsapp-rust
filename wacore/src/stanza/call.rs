@@ -1131,7 +1131,7 @@ mod tests {
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
         let media = call.media.expect("offer captures media");
 
-        // Our own device LID as get_lid() yields it: agent=1.
+        // Our own device LID as lid() yields it: agent=1.
         assert_eq!(
             media
                 .enc_for(Some(&wire_to))

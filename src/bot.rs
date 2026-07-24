@@ -391,6 +391,7 @@ impl EventHandler for CallbackBusAdapter {
 ///
 /// Dropping the handle aborts the bot task. Keep it alive for as long as the
 /// bot should run, and prefer [`BotHandle::shutdown`] to stop it.
+#[must_use = "dropping the handle aborts the bot; bind it and await it, or call .shutdown()"]
 pub struct BotHandle {
     client: Arc<Client>,
     done_rx: futures::channel::oneshot::Receiver<()>,
@@ -446,6 +447,41 @@ async fn run_metered<F: std::future::Future<Output = ()>>(
     }
 }
 
+/// A configured WhatsApp session with its event handlers already wired,
+/// ready to be started.
+///
+/// This is the high-level entry point and what most applications should use.
+/// Build one with [`Bot::builder`]: the typestate [`BotBuilder`] takes the
+/// storage backend (the only required dependency with the default cargo
+/// features), the pairing callbacks, and the message/event handlers, then
+/// hands back a `Bot`.
+///
+/// Starting it is a single call. [`Bot::run`] drives the session on the
+/// current task until logout or shutdown; [`Bot::spawn`] starts it on the
+/// runtime instead and returns a [`BotHandle`] you can await, shut down
+/// gracefully, or abort. Both consume the `Bot`, so handlers are registered
+/// at build time, not afterwards.
+///
+/// ```no_run
+/// # use whatsapp_rust::prelude::*;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let bot = Bot::builder()
+///     .with_backend(SqliteStore::new("whatsapp.db").await?)
+///     .on_message(|ctx| async move {
+///         let _ = ctx.reply("pong").await;
+///     })
+///     .build()
+///     .await?;
+///
+/// bot.run().await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Handlers registered through the builder (`on_message`, `on_event`, …)
+/// receive typed [`Event`](wacore::types::events::Event) payloads. Anything the
+/// builder does not expose is reachable on the underlying client via
+/// [`Bot::client`], which stays valid after the bot is started.
 pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
@@ -607,6 +643,7 @@ impl Bot {
 /// into compile-time errors. With the default cargo features, transport, HTTP
 /// client and runtime start [`Provided`] (Tokio WebSocket, ureq, Tokio), so
 /// only the backend is required.
+#[must_use = "call .build() to produce the Bot; the builder does nothing on its own"]
 pub struct BotBuilder<
     B = MissingBackend,
     T = MissingTransport,

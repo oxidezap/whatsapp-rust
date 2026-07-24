@@ -20,10 +20,7 @@ async fn test_set_profile_picture() -> anyhow::Result<()> {
     info!("Profile picture set successfully, id={}", response.id);
 
     // Verify the picture can be retrieved
-    let own_jid = client
-        .client
-        .get_pn()
-        .expect("should have PN after pairing");
+    let own_jid = client.client.pn().expect("should have PN after pairing");
     info!("Fetching profile picture for own JID: {}", own_jid);
     let pic = client
         .client
@@ -92,10 +89,7 @@ async fn test_set_profile_picture_then_update() -> anyhow::Result<()> {
     assert_ne!(resp1.id, resp2.id, "Picture IDs should differ after update");
 
     // Verify the updated picture is returned
-    let own_jid = client
-        .client
-        .get_pn()
-        .expect("should have PN after pairing");
+    let own_jid = client.client.pn().expect("should have PN after pairing");
     let pic = client
         .client
         .contacts()
@@ -134,10 +128,7 @@ async fn test_remove_profile_picture() -> anyhow::Result<()> {
     info!("Profile picture removed successfully");
 
     // Verify we receive a PictureUpdate event with removed=true
-    let own_jid = client
-        .client
-        .get_pn()
-        .expect("should have PN after pairing");
+    let own_jid = client.client.pn().expect("should have PN after pairing");
     let expected_jid = own_jid.to_non_ad();
     let event = client
         .wait_for_event(
@@ -176,10 +167,7 @@ async fn test_get_nonexistent_profile_picture() -> anyhow::Result<()> {
     let client = TestClient::connect("e2e_get_no_ppic").await?;
 
     // Query own picture without ever setting one — should return None
-    let own_jid = client
-        .client
-        .get_pn()
-        .expect("should have PN after pairing");
+    let own_jid = client.client.pn().expect("should have PN after pairing");
     let pic = client
         .client
         .contacts()
@@ -210,11 +198,7 @@ async fn test_get_contact_profile_picture() -> anyhow::Result<()> {
         .await?;
 
     // Client A fetches Client B's profile picture
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have PN")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have PN").to_non_ad();
     let pic = client_a
         .client
         .contacts()
@@ -249,10 +233,7 @@ async fn test_get_profile_picture_preview_and_full() -> anyhow::Result<()> {
         .wait_for_event(10, |e| matches!(e, Event::PictureUpdate(_)))
         .await?;
 
-    let own_jid = client
-        .client
-        .get_pn()
-        .expect("should have PN after pairing");
+    let own_jid = client.client.pn().expect("should have PN after pairing");
 
     // Fetch preview
     let preview = client

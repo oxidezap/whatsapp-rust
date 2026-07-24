@@ -31,7 +31,7 @@ async fn status_broadcast_send_is_wa_web_compliant() -> anyhow::Result<()> {
     let client_b = TestClient::connect("e2e_status_ok_b").await?;
     let recipient = client_b
         .client
-        .get_lid()
+        .lid()
         .expect("recipient should have a LID after connect");
 
     let sent_waiter = client_a.next_sent_message_waiter();

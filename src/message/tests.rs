@@ -5491,7 +5491,7 @@ fn test_undecryptable_event_has_no_pending_pdo_hint() {
     );
 }
 
-/// Seed `device.pn` so `send_nack` clears its `get_pn()` guard.
+/// Seed `device.pn` so `send_nack` clears its `pn()` guard.
 async fn seed_test_pn(client: &Arc<Client>) {
     use crate::store::commands::DeviceCommand;
     client

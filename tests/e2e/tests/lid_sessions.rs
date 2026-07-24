@@ -104,8 +104,8 @@ async fn test_sessions_stored_under_lid_not_pn() -> anyhow::Result<()> {
 
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
-    let lid_a = client_a.client.get_lid().expect("A should have LID");
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_a = client_a.client.lid().expect("A should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     // Roundtrip to establish sessions in both directions
     send_and_expect_text(
@@ -169,7 +169,7 @@ async fn test_multiple_sends_stay_lid_only() -> anyhow::Result<()> {
     let mut client_b = TestClient::connect("e2e_lid_multi_send_b").await?;
 
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     // Send 5 messages sequentially
     for i in 1..=5 {
@@ -216,7 +216,7 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
 
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     // First, establish a normal LID session via roundtrip
     send_and_expect_text(
@@ -324,7 +324,7 @@ async fn test_lid_session_survives_reconnect() -> anyhow::Result<()> {
 
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     // Establish sessions with a roundtrip
     send_and_expect_text(
@@ -401,11 +401,11 @@ async fn test_own_device_0_has_lid_session_after_login() -> anyhow::Result<()> {
 
     let own_pn = client
         .client
-        .get_pn()
+        .pn()
         .expect("Client should have PN after connect");
     let own_lid = client
         .client
-        .get_lid()
+        .lid()
         .expect("Client should have LID after connect");
 
     let backend = client.client.persistence_manager().backend();
@@ -507,7 +507,7 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
 
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     // Step 1: Establish sessions via roundtrip
     send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "Setup A->B", 30).await?;
@@ -626,7 +626,7 @@ async fn test_inbound_1x1_session_keyed_at_companion_device() -> anyhow::Result<
     let mut client_b = TestClient::connect("e2e_lid_dev_b").await?;
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "hi", 30).await?;
     send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
@@ -660,7 +660,7 @@ async fn test_pn_migration_is_durable_across_followup_messages() -> anyhow::Resu
     let mut client_b = TestClient::connect("e2e_lid_dur_b").await?;
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid().expect("B should have LID");
+    let lid_b = client_b.client.lid().expect("B should have LID");
 
     send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "setup", 30).await?;
     send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "setup reply", 30).await?;

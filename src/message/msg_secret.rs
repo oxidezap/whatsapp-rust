@@ -120,23 +120,21 @@ impl Client {
         }
 
         match info.source.addressing_mode {
-            Some(AddressingMode::Lid) => match self.get_lid() {
+            Some(AddressingMode::Lid) => match self.lid() {
                 Some(jid) => Some(jid),
-                None => self.get_pn(),
+                None => self.pn(),
             },
-            Some(AddressingMode::Pn) => match self.get_pn() {
+            Some(AddressingMode::Pn) => match self.pn() {
                 Some(jid) => Some(jid),
-                None => self.get_lid(),
+                None => self.lid(),
             },
-            None if info.source.sender.is_lid() || info.source.chat.is_lid() => {
-                match self.get_lid() {
-                    Some(jid) => Some(jid),
-                    None => self.get_pn(),
-                }
-            }
-            None => match self.get_pn() {
+            None if info.source.sender.is_lid() || info.source.chat.is_lid() => match self.lid() {
                 Some(jid) => Some(jid),
-                None => self.get_lid(),
+                None => self.pn(),
+            },
+            None => match self.pn() {
+                Some(jid) => Some(jid),
+                None => self.lid(),
             },
         }
     }
@@ -712,9 +710,9 @@ impl Client {
             return Some(ts.clone());
         }
         if info.source.sender.server == wacore_binary::Server::Bot {
-            self.get_lid()
+            self.lid()
         } else {
-            self.get_pn()
+            self.pn()
         }
     }
 
@@ -878,9 +876,9 @@ impl Client {
                 }
             };
             return if lid_mode {
-                self.get_lid().or_else(|| self.get_pn())
+                self.lid().or_else(|| self.pn())
             } else {
-                self.get_pn().or_else(|| self.get_lid())
+                self.pn().or_else(|| self.lid())
             }
             .map(|j| j.to_non_ad());
         }
@@ -891,9 +889,9 @@ impl Client {
     /// chat addressing): LID identities key the HKDF of LID-addressed addons.
     pub(crate) fn addon_self_jid(&self, reference: &Jid) -> Option<Jid> {
         if reference.is_lid() {
-            self.get_lid().or_else(|| self.get_pn())
+            self.lid().or_else(|| self.pn())
         } else {
-            self.get_pn().or_else(|| self.get_lid())
+            self.pn().or_else(|| self.lid())
         }
         .map(|j| j.to_non_ad())
     }

@@ -69,8 +69,8 @@ impl<'a> Comments<'a> {
         // WA Web comments are authored under the LID identity
         // (getMeLidUserOrThrow); fall back to PN only when no LID is known.
         let commenter = client
-            .get_lid()
-            .or_else(|| client.get_pn())
+            .lid()
+            .or_else(|| client.pn())
             .map(|j| j.to_non_ad())
             .ok_or(SendError::NotLoggedIn)?;
 

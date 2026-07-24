@@ -88,7 +88,7 @@ impl<'a> Events<'a> {
                 message_secret.len()
             )));
         }
-        let my_jid = self.client.get_pn().ok_or(SendError::NotLoggedIn)?;
+        let my_jid = self.client.pn().ok_or(SendError::NotLoggedIn)?;
         let my_base = my_jid.to_non_ad();
 
         let responder = self
@@ -142,7 +142,7 @@ impl<'a> Events<'a> {
         if !event_creator_jid.is_lid() {
             return own_pn.clone();
         }
-        match self.client.get_lid() {
+        match self.client.lid() {
             Some(lid) => lid.to_non_ad(),
             None => own_pn.clone(),
         }

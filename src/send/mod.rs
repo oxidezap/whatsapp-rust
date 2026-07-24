@@ -257,7 +257,17 @@ impl SendBranchOutput {
 }
 
 /// Options for [`Client::send_message_with_options`].
+///
+/// Start from [`SendOptions::default`] and chain the `with_*` setters; the
+/// struct is `#[non_exhaustive]` so new knobs can be added without breaking
+/// consumers.
+///
+/// ```
+/// # use whatsapp_rust::send::SendOptions;
+/// let options = SendOptions::default().with_message_id("3EB0ABCDEF");
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SendOptions {
     /// Override the auto-generated message ID.
     /// Useful for resending a failed message with the same ID or idempotency.
@@ -277,8 +287,51 @@ pub struct SendOptions {
     pub device_freshness: crate::cache::Freshness,
 }
 
+impl SendOptions {
+    /// See [`SendOptions::message_id`].
+    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
+        self.message_id = Some(message_id.into());
+        self
+    }
+
+    /// See [`SendOptions::extra_stanza_nodes`].
+    pub fn with_extra_stanza_nodes(mut self, nodes: Vec<Node>) -> Self {
+        self.extra_stanza_nodes = nodes;
+        self
+    }
+
+    /// See [`SendOptions::ephemeral_expiration`].
+    pub fn with_ephemeral_expiration(mut self, seconds: u32) -> Self {
+        self.ephemeral_expiration = Some(seconds);
+        self
+    }
+
+    /// See [`SendOptions::stanza_type_override`].
+    pub fn with_stanza_type_override(mut self, stanza_type: StanzaType) -> Self {
+        self.stanza_type_override = Some(stanza_type);
+        self
+    }
+
+    /// See [`SendOptions::group_metadata_freshness`].
+    pub fn with_group_metadata_freshness(mut self, freshness: crate::cache::Freshness) -> Self {
+        self.group_metadata_freshness = freshness;
+        self
+    }
+
+    /// See [`SendOptions::device_freshness`].
+    pub fn with_device_freshness(mut self, freshness: crate::cache::Freshness) -> Self {
+        self.device_freshness = freshness;
+        self
+    }
+}
+
 /// Options for [`Client::edit_message_with_options`].
+///
+/// Start from [`EditOptions::default`] and chain the `with_*` setters; the
+/// struct is `#[non_exhaustive]` so new knobs can be added without breaking
+/// consumers.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct EditOptions {
     /// Override the outer stanza id (default: a fresh id, like
     /// [`Client::edit_message`]). Pinning it to an **existing** message's id is
@@ -290,6 +343,14 @@ pub struct EditOptions {
     ///   client-dependent (the server may dedupe against the outer id), so treat
     ///   the visible outcome as non-guaranteed.
     pub stanza_id: Option<String>,
+}
+
+impl EditOptions {
+    /// See [`EditOptions::stanza_id`].
+    pub fn with_stanza_id(mut self, stanza_id: impl Into<String>) -> Self {
+        self.stanza_id = Some(stanza_id.into());
+        self
+    }
 }
 
 #[derive(Default)]
@@ -2461,9 +2522,9 @@ impl Client {
     /// `PreparedGroupStanza.sender_identity` directly instead of this.
     pub(crate) async fn dm_sender_identity_for(&self, to: &Jid) -> Option<Jid> {
         if to.server == wacore_binary::Server::Bot {
-            self.get_lid()
+            self.lid()
         } else {
-            self.get_pn()
+            self.pn()
         }
     }
 
