@@ -78,10 +78,7 @@ async fn test_dm_retry_recovers_after_session_deletion() -> anyhow::Result<()> {
         .send_message_with_options(
             jid_b.clone(),
             text_msg("retry-recover"),
-            SendOptions {
-                message_id: Some(message_id.clone()),
-                ..Default::default()
-            },
+            SendOptions::default().with_message_id(message_id.clone()),
         )
         .await?;
 

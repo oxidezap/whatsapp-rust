@@ -558,7 +558,7 @@ impl Client {
         media_key: &[u8],
     ) -> Result<(), anyhow::Error> {
         let own_jid = self
-            .get_pn()
+            .pn()
             .ok_or(crate::client::ClientError::NotLoggedIn)?
             .to_non_ad();
         let (ciphertext, iv) =

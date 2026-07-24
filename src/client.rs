@@ -777,6 +777,43 @@ impl ResponseWaiterMap {
     }
 }
 
+/// A single WhatsApp session: the connection, the Signal state, and every
+/// protocol operation built on top of them.
+///
+/// This is the low-level entry point. Build one with
+/// [`ClientBuilder`](crate::client::ClientBuilder), which
+/// takes the four platform dependencies (storage backend, transport factory,
+/// HTTP client, async runtime) and validates them at runtime. Most applications
+/// should use [`Bot`](crate::bot::Bot) instead and reach the client through
+/// [`Bot::client`](crate::bot::Bot::client); `Client` is what remains when you
+/// need to drive the lifecycle yourself, from an FFI host, or from a wrapper
+/// that cannot express typestate generics.
+///
+/// The client is always used behind an `Arc` (most methods take `self: &Arc<Self>`)
+/// and is cheap to clone and share across tasks.
+///
+/// # Lifecycle
+///
+/// [`Client::run`] owns the session: it connects, keeps the socket alive, and
+/// reconnects with backoff until [`Client::disconnect`] is called or the device
+/// is logged out. [`Client::connect`] performs a single connection attempt
+/// without the supervision loop, for hosts that manage retries themselves.
+///
+/// # Events
+///
+/// Everything the server reports (messages, receipts, pairing progress,
+/// connection state) is delivered as an [`Event`](wacore::types::events::Event)
+/// on the event bus. Register a handler with [`Client::subscribe`] (explicit
+/// [`EventInterest`](wacore::types::events::EventInterest) filter) or
+/// [`Client::subscribe_handler`].
+///
+/// # Sending
+///
+/// [`Client::send_message`] covers the common path;
+/// [`Client::send_message_with_options`] takes a [`SendOptions`](crate::send::SendOptions)
+/// for message-id pinning, ephemeral expiration, and cache freshness. Domain
+/// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
+/// and [`Client::presence`].
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) core: wacore::client::CoreClient,
@@ -960,7 +997,7 @@ pub struct Client {
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
-    pub(crate) app_state_syncing: Arc<Mutex<HashSet<WAPatchName>>>,
+    pub(crate) app_state_syncing: Arc<app_state::SyncInFlight>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
 

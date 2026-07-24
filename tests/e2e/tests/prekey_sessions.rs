@@ -41,7 +41,7 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
     let mut recipient = TestClient::connect("e2e_pkcol_recv").await?;
     let recipient_jid = recipient
         .client
-        .get_pn()
+        .pn()
         .expect("Recipient should have a JID")
         .to_non_ad();
     info!("Recipient JID: {recipient_jid}");

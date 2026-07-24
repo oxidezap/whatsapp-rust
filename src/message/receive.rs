@@ -148,7 +148,7 @@ impl Client {
 
         let own_jid = nr
             .get_optional_child("participants")
-            .and_then(|_| self.get_pn());
+            .and_then(|_| self.pn());
         let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
         all_enc_nodes.extend(message_enc_nodes_for_device(nr, own_jid.as_ref()));
 
