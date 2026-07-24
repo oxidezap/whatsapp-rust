@@ -2050,7 +2050,13 @@ mod tests {
         removed.wait();
         let shutdown_registration = Arc::clone(&registration);
         let shutdown = tokio::spawn(async move { shutdown_registration.shutdown().await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // `terminal` flips inside signal_shutdown_sync, right before it reaches for
+        // the `scopes` lock the blocked close callback is holding. Once it is set,
+        // shutdown provably cannot get past that lock until `release` is waited.
+        crate::test_utils::poll_until("shutdown to reach the scope registry", || {
+            registration.terminal.load(Ordering::Acquire)
+        })
+        .await;
         assert!(!shutdown.is_finished());
 
         release.wait();

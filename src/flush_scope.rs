@@ -120,6 +120,14 @@ impl FlushScope {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// Number of tasks parked inside [`Self::flush`]. `flush` registers its
+    /// listener before checking the counter, so a listener here means a flusher
+    /// really is waiting — what tests poll instead of sleeping.
+    #[cfg(test)]
+    pub fn flush_waiters(&self) -> usize {
+        self.idle.total_listeners()
+    }
+
     #[cfg(test)]
     pub fn track_rejections(&self) -> usize {
         self.track_rejections.load(Ordering::Relaxed)
@@ -297,7 +305,10 @@ mod tests {
                 .flush(&*flush_runtime, Duration::from_secs(5))
                 .await;
         });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        crate::test_utils::poll_until("the flusher to park on the scope", || {
+            scope.flush_waiters() >= 1
+        })
+        .await;
         assert!(
             !flush_task.is_finished(),
             "flush must wait while a tracked guard is alive"

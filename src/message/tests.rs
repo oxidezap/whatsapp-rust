@@ -3713,8 +3713,8 @@ async fn test_spawn_retry_receipt_basic_flow() {
     let info = Arc::new(info);
     client.spawn_retry_receipt(&info, RetryReason::UnknownError);
 
-    // Give the spawned task time to execute
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Let the spawned task run to completion
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
 
     // Verify count was incremented (the actual send will fail due to no connection, but count should update)
     let stored = client
@@ -3756,8 +3756,9 @@ async fn test_spawn_retry_receipt_respects_max_retries() {
     let info = Arc::new(info);
     client.spawn_retry_receipt(&info, RetryReason::UnknownError);
 
-    // Give the spawned task time to execute
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Draining the scope is what makes the negative assertion below meaningful:
+    // the task really ran, and chose not to increment.
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
 
     // Count should still be at max (not incremented)
     let stored = client
@@ -5007,7 +5008,7 @@ async fn test_undecryptable_fires_before_retry_task() {
         "retry task has not progressed yet",
     );
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
     assert_eq!(
         client
             .message_retry_counts
@@ -5102,8 +5103,13 @@ async fn test_pdo_armed_for_status_broadcast() {
 
     assert_eq!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-    client.run_pdo_request(&info).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // `run_pdo_request` is fully awaited, so its return value is the outcome:
+    // `false` means the request was built and the (offline) send failed, while a
+    // skipped request returns `true` without ever reaching the transport.
+    assert!(
+        !client.run_pdo_request(&info).await,
+        "status@broadcast must arm a PDO request, not skip it",
+    );
 }
 
 /// Broadcast lists share the same code path; locks the guard for both.
@@ -5119,8 +5125,13 @@ async fn test_pdo_armed_for_any_broadcast_chat() {
 
     assert_eq!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-    client.run_pdo_request(&info).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // `run_pdo_request` is fully awaited, so its return value is the outcome:
+    // `false` means the request was built and the (offline) send failed, while a
+    // skipped request returns `true` without ever reaching the transport.
+    assert!(
+        !client.run_pdo_request(&info).await,
+        "broadcast lists must arm a PDO request, not skip it",
+    );
 }
 
 #[tokio::test]
@@ -5135,8 +5146,13 @@ async fn test_pdo_armed_for_one_on_one() {
 
     assert_ne!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-    client.run_pdo_request(&info).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // `run_pdo_request` is fully awaited, so its return value is the outcome:
+    // `false` means the request was built and the (offline) send failed, while a
+    // skipped request returns `true` without ever reaching the transport.
+    assert!(
+        !client.run_pdo_request(&info).await,
+        "one-on-one chats must arm a PDO request, not skip it",
+    );
 }
 
 /// fromMe messages fanned out to a linked device can still fail decrypt
@@ -5151,8 +5167,13 @@ async fn test_pdo_armed_for_from_me() {
     info.source.is_from_me = true;
     let info = Arc::new(info);
 
-    client.run_pdo_request(&info).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // `run_pdo_request` is fully awaited, so its return value is the outcome:
+    // `false` means the request was built and the (offline) send failed, while a
+    // skipped request returns `true` without ever reaching the transport.
+    assert!(
+        !client.run_pdo_request(&info).await,
+        "fromMe fanouts must arm a PDO request, not skip it",
+    );
 }
 
 /// Stops offline-sync / reconnect tails from flooding the phone with
@@ -5170,8 +5191,12 @@ async fn test_pdo_skipped_for_ancient_messages() {
 
     let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
 
-    client.run_pdo_request(&info).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Fully awaited, and the age gate returns before any send, so the pending map
+    // is already settled when this returns.
+    assert!(
+        client.run_pdo_request(&info).await,
+        "an over-age message must be skipped, not attempted",
+    );
 
     assert!(
         client.pdo_pending_requests.get(&cache_key).await.is_none(),
@@ -5196,8 +5221,12 @@ async fn test_pdo_rejects_just_past_14d_boundary() {
 
     let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
 
-    client.run_pdo_request(&info).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Fully awaited, and the age gate returns before any send, so the pending map
+    // is already settled when this returns.
+    assert!(
+        client.run_pdo_request(&info).await,
+        "an over-age message must be skipped, not attempted",
+    );
 
     assert!(
         client.pdo_pending_requests.get(&cache_key).await.is_none(),
