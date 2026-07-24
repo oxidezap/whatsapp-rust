@@ -30,7 +30,7 @@ use crate::cache_store::TypedCache;
 use crate::handshake;
 use crate::lid_pn_cache::LidPnCache;
 use crate::pair;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use futures::FutureExt;
 #[cfg(test)]
 use std::borrow::Cow;
@@ -564,8 +564,6 @@ pub enum ClientError {
     Socket(#[from] SocketError),
     #[error("encrypt/send error: {0}")]
     EncryptSend(#[from] EncryptSendError),
-    #[error("client is already connected")]
-    AlreadyConnected,
     #[error("client is not logged in")]
     NotLoggedIn,
     #[error("IQ request failed: {0}")]
@@ -575,6 +573,95 @@ pub enum ClientError {
     /// error's `Display`/source chain is preserved.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+/// The step of the connect flow a [`ConnectError::Timeout`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectStage {
+    /// Resolving the app version advertised to the server.
+    VersionFetch,
+    /// Opening the underlying transport.
+    Transport,
+    /// Waiting for the noise socket, which is ready before login.
+    Socket,
+    /// Waiting for login plus the critical app state sync to finish.
+    Ready,
+}
+
+impl std::fmt::Display for ConnectStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = match self {
+            ConnectStage::VersionFetch => "version fetch",
+            ConnectStage::Transport => "transport connect",
+            ConnectStage::Socket => "socket wait",
+            ConnectStage::Ready => "connection wait",
+        };
+        f.write_str(stage)
+    }
+}
+
+/// Failure modes of [`Client::connect`] and of the readiness waiters
+/// ([`Client::wait_for_socket`], [`Client::wait_for_connected`]).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ConnectError {
+    /// A connection is already up, or another attempt is already in flight.
+    #[error("client is already connected")]
+    AlreadyConnected,
+    /// Construction never completed, so the attempt was rejected before any I/O.
+    #[error("client construction did not activate")]
+    NotActivated,
+    /// A step of the connect flow ran out of time.
+    #[error("{stage} timed out after {timeout:?}")]
+    Timeout {
+        stage: ConnectStage,
+        timeout: std::time::Duration,
+    },
+    /// The app version could not be resolved.
+    #[error("failed to resolve app version")]
+    Version(#[source] anyhow::Error),
+    /// The transport factory could not open a connection.
+    #[error("failed to open transport")]
+    Transport(#[source] anyhow::Error),
+    /// The noise handshake failed after the transport was up.
+    #[error(transparent)]
+    Handshake(#[from] crate::handshake::HandshakeError),
+}
+
+/// Failures of the background Signal maintenance surface: signed pre-key
+/// rotation ([`Client::rotate_signed_pre_key`]) and cache durability
+/// ([`Client::flush_pending_signal_state`]).
+///
+/// The split that matters to a caller is corruption versus everything else:
+/// [`Self::CorruptKey`] will keep failing until the stored material is
+/// replaced, while storage, IQ and drain failures are worth retrying.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SignalMaintenanceError {
+    /// Key material is unusable: bad encoding, or a missing/wrong-sized field.
+    /// Almost always a staged record that a retry would read back identically.
+    #[error("corrupt signed pre-key material: {0}")]
+    CorruptKey(String),
+    /// The storage backend failed a read, write or flush.
+    #[error("signal storage failure: {0}")]
+    Storage(#[source] anyhow::Error),
+    /// The rotation IQ was rejected by the server or never reached it.
+    #[error("IQ request failed: {0}")]
+    Iq(#[from] crate::request::IqError),
+    /// A Signal primitive failed (e.g. signing the new signed pre-key).
+    #[error(transparent)]
+    Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
+    /// The inbound drain batch could not be committed, so the Signal cache was
+    /// left unflushed on purpose and the server redelivers those messages.
+    #[error(
+        "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
+    )]
+    DrainCommitFailed,
+    /// The client is going away while an inbound drain is active; flushing
+    /// there would persist ratchet advances whose messages have no durable row.
+    #[error("client dropping while inbound drain is active; skipping Signal flush")]
+    DrainShuttingDown,
 }
 
 impl ClientError {

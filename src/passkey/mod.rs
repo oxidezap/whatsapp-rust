@@ -91,6 +91,7 @@ pub struct Assertion {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PasskeyError {
     #[error("no passkey registered for this account on the authenticator")]
     NoCredential,

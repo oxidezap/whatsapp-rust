@@ -465,9 +465,10 @@ impl Client {
 
             if let Err(connect_err) = self.connect().await {
                 wacore::telemetry::connect("fail");
-                let is_transient = connect_err
-                    .downcast_ref::<crate::handshake::HandshakeError>()
-                    .is_some_and(|e| e.is_transient());
+                let is_transient = matches!(
+                    &connect_err,
+                    ConnectError::Handshake(e) if e.is_transient()
+                );
                 if is_transient {
                     debug!("Transient connect failure, will retry: {connect_err:#}");
                 } else {
@@ -570,20 +571,18 @@ impl Client {
     /// Boxed barrier: see [`crate::bot::Bot::run`]. Coroutines are LocalCopy
     /// across crates, so consumers awaiting the connect graph directly would
     /// re-codegen it; the box makes them poll through a vtable instead.
-    pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+    pub async fn connect(self: &Arc<Self>) -> Result<(), ConnectError> {
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
         {
-            return Err(anyhow!("client construction did not activate"));
+            return Err(ConnectError::NotActivated);
         }
         self.connect_boxed().await
     }
 
     #[inline(never)]
-    fn connect_boxed(
-        self: &Arc<Self>,
-    ) -> wacore::runtime::BoxFuture<'_, Result<(), anyhow::Error>> {
+    fn connect_boxed(self: &Arc<Self>) -> wacore::runtime::BoxFuture<'_, Result<(), ConnectError>> {
         Box::pin(self.connect_graph())
     }
 
@@ -602,12 +601,12 @@ impl Client {
             err(level = "warn", Debug)
         )
     )]
-    async fn connect_graph(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+    async fn connect_graph(self: &Arc<Self>) -> Result<(), ConnectError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 
         if self.is_connecting.swap(true, Ordering::SeqCst) {
-            return Err(ClientError::AlreadyConnected.into());
+            return Err(ConnectError::AlreadyConnected);
         }
 
         let _guard = scopeguard::guard((), |_| {
@@ -615,7 +614,7 @@ impl Client {
         });
 
         if self.is_connected() {
-            return Err(ClientError::AlreadyConnected.into());
+            return Err(ConnectError::AlreadyConnected);
         }
         let _t = wacore::telemetry::timer(wacore::telemetry::CONNECT_DURATION);
 
@@ -669,11 +668,17 @@ impl Client {
         let (version_result, transport_result) = futures::join!(version_future, transport_future);
 
         version_result
-            .map_err(|_| anyhow!("Version fetch timed out after {TRANSPORT_CONNECT_TIMEOUT:?}"))?
-            .map_err(|e| anyhow!("Failed to resolve app version: {}", e))?;
-        let (transport, mut transport_events) = transport_result.map_err(|_| {
-            anyhow!("Transport connect timed out after {TRANSPORT_CONNECT_TIMEOUT:?}")
-        })??;
+            .map_err(|_| ConnectError::Timeout {
+                stage: ConnectStage::VersionFetch,
+                timeout: TRANSPORT_CONNECT_TIMEOUT,
+            })?
+            .map_err(ConnectError::Version)?;
+        let (transport, mut transport_events) = transport_result
+            .map_err(|_| ConnectError::Timeout {
+                stage: ConnectStage::Transport,
+                timeout: TRANSPORT_CONNECT_TIMEOUT,
+            })?
+            .map_err(ConnectError::Transport)?;
         debug!("Version fetch and transport connection established.");
 
         let noise_socket = match handshake::do_handshake(
@@ -716,11 +721,15 @@ impl Client {
 
     /// Deregister this companion device and disconnect.
     /// Does NOT wipe stored keys. Delete the storage backend to fully clear credentials.
+    ///
+    /// Infallible on purpose: the deregistration IQ is best-effort (it cannot be
+    /// sent at all while offline), and the local teardown runs either way, so a
+    /// caller has nothing to branch on. A failed IQ is logged at warn.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.logout", level = "info", skip_all, err(Debug))
+        tracing::instrument(name = "wa.conn.logout", level = "info", skip_all)
     )]
-    pub async fn logout(self: &Arc<Self>) -> Result<()> {
+    pub async fn logout(self: &Arc<Self>) {
         use wacore::iq::devices::RemoveCompanionDeviceSpec;
 
         self.enable_auto_reconnect.store(false, Ordering::Relaxed);
@@ -740,8 +749,6 @@ impl Client {
         ));
 
         self.disconnect().await;
-
-        Ok(())
     }
 
     #[cfg_attr(
@@ -1137,7 +1144,7 @@ impl Client {
     /// such as requesting a pair code during initial pairing.
     ///
     /// If the socket is already connected, returns immediately.
-    pub async fn wait_for_socket(&self, timeout: std::time::Duration) -> Result<(), anyhow::Error> {
+    pub async fn wait_for_socket(&self, timeout: std::time::Duration) -> Result<(), ConnectError> {
         // Fast path: already connected
         if self.is_connected() {
             return Ok(());
@@ -1152,7 +1159,10 @@ impl Client {
 
         rt_timeout(&*self.runtime, timeout, notified)
             .await
-            .map_err(|_| anyhow::anyhow!("Timeout waiting for socket"))
+            .map_err(|_| ConnectError::Timeout {
+                stage: ConnectStage::Socket,
+                timeout,
+            })
     }
 
     /// Waits for the client to establish a connection and complete login.
@@ -1165,7 +1175,7 @@ impl Client {
     pub async fn wait_for_connected(
         &self,
         timeout: std::time::Duration,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ConnectError> {
         // Fast path: fully ready (connected + logged in + critical sync done).
         if self.is_fully_ready() {
             return Ok(());
@@ -1180,7 +1190,10 @@ impl Client {
 
         rt_timeout(&*self.runtime, timeout, notified)
             .await
-            .map_err(|_| anyhow::anyhow!("Timeout waiting for connection"))
+            .map_err(|_| ConnectError::Timeout {
+                stage: ConnectStage::Ready,
+                timeout,
+            })
     }
 
     pub fn is_connected(&self) -> bool {
@@ -1195,5 +1208,111 @@ impl Client {
 
     pub fn is_logged_in(&self) -> bool {
         self.is_logged_in.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn wait_for_socket_resolves_immediately_once_connected() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_connected_for_test(true);
+
+        client
+            .wait_for_socket(Duration::from_millis(50))
+            .await
+            .expect("an already connected client must not wait");
+    }
+
+    #[tokio::test]
+    async fn wait_for_socket_times_out_at_the_socket_stage() {
+        let client = crate::test_utils::create_test_client().await;
+
+        let timeout = Duration::from_millis(50);
+        let error = client
+            .wait_for_socket(timeout)
+            .await
+            .expect_err("a disconnected client must time out");
+        assert!(matches!(
+            error,
+            ConnectError::Timeout {
+                stage: ConnectStage::Socket,
+                timeout: waited,
+            } if waited == timeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_for_connected_resolves_immediately_once_fully_ready() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.is_ready.store(true, Ordering::Relaxed);
+
+        client
+            .wait_for_connected(Duration::from_millis(50))
+            .await
+            .expect("a fully ready client must not wait");
+    }
+
+    #[tokio::test]
+    async fn wait_for_connected_times_out_at_the_ready_stage() {
+        let client = crate::test_utils::create_test_client().await;
+        // Connected but never logged in: readiness, not the socket, is missing.
+        client.set_connected_for_test(true);
+
+        let timeout = Duration::from_millis(50);
+        let error = client
+            .wait_for_connected(timeout)
+            .await
+            .expect_err("a client that never logged in must time out");
+        assert!(matches!(
+            error,
+            ConnectError::Timeout {
+                stage: ConnectStage::Ready,
+                timeout: waited,
+            } if waited == timeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn logout_tears_down_an_offline_client_without_sending_the_iq() {
+        let client = crate::test_utils::create_test_client().await;
+
+        tokio::time::timeout(Duration::from_secs(5), client.logout())
+            .await
+            .expect("logout must not block on an offline client");
+
+        assert!(!client.enable_auto_reconnect.load(Ordering::Relaxed));
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn logout_still_tears_down_when_the_deregistration_iq_fails() {
+        let client = crate::test_utils::create_test_client().await;
+        // Flagged connected with no socket behind it, so the IQ cannot be sent.
+        client.set_connected_for_test(true);
+
+        tokio::time::timeout(Duration::from_secs(5), client.logout())
+            .await
+            .expect("a failed deregistration IQ must not block logout");
+
+        assert!(!client.enable_auto_reconnect.load(Ordering::Relaxed));
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_an_already_connected_client() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_connected_for_test(true);
+
+        let error = client
+            .connect()
+            .await
+            .expect_err("connecting twice must be refused");
+        assert!(matches!(error, ConnectError::AlreadyConnected));
     }
 }
