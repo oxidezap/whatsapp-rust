@@ -119,7 +119,7 @@ impl Client {
                     .to_string(),
             )
         } else {
-            if self.get_pn().is_none() {
+            if self.pn().is_none() {
                 return Err(crate::send::SendError::NotLoggedIn);
             }
             None
@@ -213,7 +213,7 @@ impl Client {
                 .map_err(SendError::from_anyhow)?
                 .to_non_ad()
         } else {
-            self.get_pn().ok_or(SendError::NotLoggedIn)?.to_non_ad()
+            self.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad()
         };
         let participant = if to.is_group() {
             Some(self_jid.to_string())

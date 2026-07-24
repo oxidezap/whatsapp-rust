@@ -77,7 +77,7 @@ async fn test_durable_resume_position_always_covers_spent_counters() -> anyhow::
     let client_a = TestClient::connect("e2e_sig_durable_a").await?;
     let client_b = TestClient::connect("e2e_sig_durable_b").await?;
     let jid_b = client_b.jid().await;
-    let lid_b = client_b.client.get_lid();
+    let lid_b = client_b.client.lid();
 
     // The first send raises the lease, so its flush is synchronous: the
     // durable resume position must already be past counter 0 the moment
@@ -364,7 +364,7 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
 
     // LID sessions: the active sessions used by encrypt_for_devices
     let mut lid_sessions = Vec::new();
-    if let Some(lid) = client_b.client.get_lid() {
+    if let Some(lid) = client_b.client.lid() {
         lid_sessions = scan_sessions(&*backend, &lid.user, "lid").await?;
         for (addr, pending) in &lid_sessions {
             info!("LID session {addr}: pending_pre_key={pending}");
@@ -447,7 +447,7 @@ async fn test_session_persistence() -> anyhow::Result<()> {
     // PN→LID mapping was resolved before encryption.
     let mut post_send = scan_sessions(&*backend, &jid_b.user, "c.us").await?;
     if post_send.is_empty()
-        && let Some(lid_b) = client_b.client.get_lid()
+        && let Some(lid_b) = client_b.client.lid()
     {
         post_send = scan_sessions(&*backend, &lid_b.user, "lid").await?;
     }
@@ -602,7 +602,7 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
         // A 1:1 message is LID-addressed on the wire (compliant), so B sees A's LID
         // as the sender (with the PN carried in sender_pn). Accept either identity.
         let sender_user = info.source.sender.user.as_str();
-        let a_lid = client_a.client.get_lid();
+        let a_lid = client_a.client.lid();
         assert!(
             sender_user == jid_a.user.as_str()
                 || a_lid
@@ -640,7 +640,7 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
         assert!(!info.source.is_group);
         // LID-addressed 1:1 → A sees B's LID as the sender; accept PN or LID.
         let sender_user = info.source.sender.user.as_str();
-        let b_lid = client_b.client.get_lid();
+        let b_lid = client_b.client.lid();
         assert!(
             sender_user == jid_b.user.as_str()
                 || b_lid

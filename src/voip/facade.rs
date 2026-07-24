@@ -215,10 +215,7 @@ impl<'a> AcceptCall<'a> {
 
         // Our own device LID: used both to pick the callKey enc for THIS device (a multi-device
         // offer lists one per `<destination><to jid>`) and as the send-side SRTP participant id.
-        let own_lid = self
-            .client
-            .get_lid()
-            .ok_or(CallError::Media("no own LID"))?;
+        let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let enc = media
             .enc_for(Some(&own_lid))
             .ok_or(CallError::Media("offer carried no callKey for this device"))?;
@@ -379,10 +376,7 @@ impl<'a> OutgoingCall<'a> {
         let call_id = gen_call_id();
 
         // Our own LID is the send-side SRTP participant id; required for E2E key derivation.
-        let own_lid = self
-            .client
-            .get_lid()
-            .ok_or(CallError::Media("no own LID"))?;
+        let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
 
         // The media keys (SFrame/SRTP) derive from the peer's LID, so a PN callee must be resolved to
         // its LID first; without a known LID we would derive non-matching keys, so reject. The offer
@@ -2364,7 +2358,7 @@ mod tests {
     ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
         use wacore::handshake::NoiseCipher;
         let pm = PersistenceManager::new(backend).await.expect("pm");
-        // Set our own LID so get_lid() resolves (the send-side participant id).
+        // Set our own LID so lid() resolves (the send-side participant id).
         pm.process_command(crate::store::commands::DeviceCommand::SetLid(Some(
             Jid::new("111111111111111", Server::Lid),
         )))
@@ -2431,7 +2425,7 @@ mod tests {
         let device = peer_lid();
         seed_peer_session(&client, &device).await;
 
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
@@ -2555,7 +2549,7 @@ mod tests {
         client
             .signal_flush_test_block
             .store(true, Ordering::Release);
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let _handle = place_call(
@@ -2588,7 +2582,7 @@ mod tests {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(&client, &device).await;
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
 
         let handle = place_call(
@@ -2657,7 +2651,7 @@ mod tests {
             .await
             .unwrap();
 
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
@@ -2711,7 +2705,7 @@ mod tests {
         seed_peer_session(&client, &good0).await;
         seed_peer_session(&client, &good1).await;
 
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -2784,7 +2778,7 @@ mod tests {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         // No session seeded for the device, so its encrypt errors and it is skipped.
         let device = peer_lid();
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
@@ -2833,7 +2827,7 @@ mod tests {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(client, &device).await;
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let call_id = "00abcdef0123456789abcdef0123beef".to_string();
@@ -3362,7 +3356,7 @@ mod tests {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(&client, &device).await;
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let call_id = "00abcdef0123456789abcdef0123dead".to_string();
@@ -3530,7 +3524,7 @@ mod tests {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(&client, &device).await;
-        let own_lid = client.get_lid().expect("own lid");
+        let own_lid = client.lid().expect("own lid");
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let call_id = "00abcdef0123456789abcdef0123feed".to_string();

@@ -82,8 +82,8 @@ impl Client {
         // CAG is our LID identity regardless of the parent author's namespace;
         // mirror the comment path (WA Web authors CAG addons under LID).
         let reactor = self
-            .get_lid()
-            .or_else(|| self.get_pn())
+            .lid()
+            .or_else(|| self.pn())
             .map(|j| j.to_non_ad())
             .ok_or(SendError::NotLoggedIn)?;
 

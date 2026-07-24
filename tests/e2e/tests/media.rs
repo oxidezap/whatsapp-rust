@@ -387,11 +387,7 @@ async fn test_send_image_message() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_send_img_a").await?;
     let mut client_b = TestClient::connect("e2e_send_img_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     // A uploads an image
     let original = b"Image bytes sent from A to B".to_vec();
@@ -450,11 +446,7 @@ async fn test_send_video_message() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_send_vid_a").await?;
     let mut client_b = TestClient::connect("e2e_send_vid_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     let original = vec![0xBB; 64];
     let upload = client_a
@@ -496,11 +488,7 @@ async fn test_send_document_message() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_send_doc_a").await?;
     let mut client_b = TestClient::connect("e2e_send_doc_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     let original = b"Important document content".to_vec();
     let upload = client_a
@@ -544,11 +532,7 @@ async fn test_send_audio_message() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_send_aud_a").await?;
     let mut client_b = TestClient::connect("e2e_send_aud_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     let original = vec![0xCC; 64];
     let upload = client_a
@@ -589,11 +573,7 @@ async fn test_send_ptt_voice_message() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_send_ptt_a").await?;
     let mut client_b = TestClient::connect("e2e_send_ptt_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     let original = vec![0xDD; 64];
     let upload = client_a
@@ -637,16 +617,8 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_bidir_img_a").await?;
     let mut client_b = TestClient::connect("e2e_bidir_img_b").await?;
 
-    let jid_a = client_a
-        .client
-        .get_pn()
-        .expect("A should have JID")
-        .to_non_ad();
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_a = client_a.client.pn().expect("A should have JID").to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     // A -> B: send image
     let data_a = b"Image from A to B".to_vec();
@@ -708,11 +680,7 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_multi_media_a").await?;
     let mut client_b = TestClient::connect("e2e_multi_media_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     // Send image
     let img_data = b"image data for multi-type test".to_vec();
@@ -865,11 +833,7 @@ async fn test_send_image_no_caption() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_img_nocap_a").await?;
     let mut client_b = TestClient::connect("e2e_img_nocap_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     let original = b"Image without caption".to_vec();
     let upload = client_a

@@ -367,6 +367,19 @@ impl<'a> Groups<'a> {
         Self { client }
     }
 
+    /// Query the cached, send-oriented view of a group.
+    ///
+    /// Returns the slim [`GroupInfo`] the encryption path needs: participant
+    /// JIDs, the group's addressing mode, the LID/PN mapping, and whether it is
+    /// a community announcement group. A cached entry is returned as-is, so a
+    /// repeated call is free. Only a cache miss goes to the network, and it
+    /// sends the persisted participant phash, so an unchanged group costs a
+    /// `not-modified` answer instead of a full metadata download.
+    ///
+    /// This is the right call for routing and encrypting a message. For the
+    /// user-facing fields (subject, description, admin roles, group settings)
+    /// use [`Groups::get_metadata`], and to control staleness explicitly use
+    /// [`Groups::query_info_with_freshness`].
     pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, GroupError> {
         self.query_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
             .await
@@ -609,6 +622,19 @@ impl<'a> Groups<'a> {
         Ok(result)
     }
 
+    /// Fetch the complete, user-facing metadata of a group.
+    ///
+    /// Returns an owned [`GroupMetadata`]: subject, description, creator,
+    /// per-participant admin roles, and ephemeral and membership settings. In a
+    /// LID-addressed group, participant phone numbers the server left out are
+    /// backfilled from known LID/PN mappings on a best-effort basis; a
+    /// participant with no known mapping keeps `phone_number: None`. The query
+    /// always hits the network (no phash is sent, so the server never answers
+    /// `not-modified`) and the result does not populate the group cache.
+    ///
+    /// This is the right call for displaying or auditing a group. When you only
+    /// need the participant list to send a message, prefer the cached
+    /// [`Groups::query_info`].
     pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
@@ -944,10 +970,7 @@ impl<'a> Groups<'a> {
         Ok(self
             .client
             .execute(AcceptGroupInviteV4Iq::new(
-                group_jid.clone(),
-                code.to_string(),
-                expiration,
-                admin_jid.clone(),
+                group_jid, code, expiration, admin_jid,
             ))
             .await?)
     }
@@ -1137,7 +1160,7 @@ impl<'a> Groups<'a> {
                 wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
             )));
         }
-        let raw = self.client.execute(BatchGetGroupInfoIq::new(jids)).await?;
+        let raw = self.client.execute(BatchGetGroupInfoIq::new(&jids)).await?;
         Ok(raw
             .into_iter()
             .map(|r| match r {
@@ -1164,13 +1187,13 @@ impl<'a> Groups<'a> {
                 wacore::iq::groups::BATCH_PROFILE_PICTURES_LIMIT,
             )));
         }
-        let groups = group_jids
+        let groups: Vec<(Jid, PictureType)> = group_jids
             .into_iter()
             .map(|jid| (jid, picture_type))
             .collect();
         Ok(self
             .client
-            .execute(GetGroupProfilePicturesIq::with_type(groups))
+            .execute(GetGroupProfilePicturesIq::with_type(&groups))
             .await?)
     }
 
