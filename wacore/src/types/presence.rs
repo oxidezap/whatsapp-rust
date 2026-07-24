@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,7 +23,7 @@ pub enum ChatPresenceMedia {
     Audio,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(from = "String")]
 #[non_exhaustive]
 pub enum ReceiptType {
@@ -100,6 +100,59 @@ impl ReceiptType {
             Self::Other(s) => s,
         }
     }
+
+    /// Variant name as it appears in the serde form (`"ReadSelf"`, not the
+    /// wire `"read-self"`). Exposed so consumers that observe the serialized
+    /// event shape can name a variant without round-tripping through a
+    /// serializer or duplicating the list of this `#[non_exhaustive]` enum.
+    /// The [`Serialize`] impl is built on it, so the two cannot drift.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Delivered => "Delivered",
+            Self::Sent => "Sent",
+            Self::Sender => "Sender",
+            Self::Retry => "Retry",
+            Self::EncRekeyRetry => "EncRekeyRetry",
+            Self::Read => "Read",
+            Self::ReadSelf => "ReadSelf",
+            Self::Played => "Played",
+            Self::PlayedSelf => "PlayedSelf",
+            Self::ServerError => "ServerError",
+            Self::Inactive => "Inactive",
+            Self::PeerMsg => "PeerMsg",
+            Self::HistorySync => "HistorySync",
+            Self::Other(_) => "Other",
+        }
+    }
+}
+
+impl Serialize for ReceiptType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Indices follow declaration order so the output stays byte-identical
+        // to the derive this replaced.
+        let index = match self {
+            Self::Delivered => 0,
+            Self::Sent => 1,
+            Self::Sender => 2,
+            Self::Retry => 3,
+            Self::EncRekeyRetry => 4,
+            Self::Read => 5,
+            Self::ReadSelf => 6,
+            Self::Played => 7,
+            Self::PlayedSelf => 8,
+            Self::ServerError => 9,
+            Self::Inactive => 10,
+            Self::PeerMsg => 11,
+            Self::HistorySync => 12,
+            Self::Other(_) => 13,
+        };
+        match self {
+            Self::Other(inner) => {
+                serializer.serialize_newtype_variant("ReceiptType", index, "Other", inner)
+            }
+            _ => serializer.serialize_unit_variant("ReceiptType", index, self.variant_name()),
+        }
+    }
 }
 
 impl From<String> for ReceiptType {
@@ -162,5 +215,71 @@ mod tests {
         }
         let other = ReceiptType::Other("custom-type".to_string());
         assert_eq!(other.as_wire_str(), "custom-type");
+    }
+
+    /// Every unit variant paired with the exact JSON the previous
+    /// `#[derive(Serialize)]` produced.
+    const UNIT_VARIANTS: [(ReceiptType, &str); 13] = [
+        (ReceiptType::Delivered, "Delivered"),
+        (ReceiptType::Sent, "Sent"),
+        (ReceiptType::Sender, "Sender"),
+        (ReceiptType::Retry, "Retry"),
+        (ReceiptType::EncRekeyRetry, "EncRekeyRetry"),
+        (ReceiptType::Read, "Read"),
+        (ReceiptType::ReadSelf, "ReadSelf"),
+        (ReceiptType::Played, "Played"),
+        (ReceiptType::PlayedSelf, "PlayedSelf"),
+        (ReceiptType::ServerError, "ServerError"),
+        (ReceiptType::Inactive, "Inactive"),
+        (ReceiptType::PeerMsg, "PeerMsg"),
+        (ReceiptType::HistorySync, "HistorySync"),
+    ];
+
+    #[test]
+    fn unit_variants_serialize_to_their_variant_name() {
+        for (variant, expected) in &UNIT_VARIANTS {
+            assert_eq!(
+                variant.variant_name(),
+                *expected,
+                "name drift for {variant:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(variant).expect("serialization is infallible"),
+                serde_json::Value::String((*expected).to_string()),
+                "serialized form drift for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_serializes_as_a_newtype_variant() {
+        let other = ReceiptType::Other("custom-type".to_string());
+        assert_eq!(other.variant_name(), "Other");
+        assert_eq!(
+            serde_json::to_value(&other).expect("serialization is infallible"),
+            serde_json::json!({ "Other": "custom-type" })
+        );
+
+        // An empty payload still nests under the variant name rather than
+        // collapsing to a bare string.
+        let empty = ReceiptType::Other(String::new());
+        assert_eq!(
+            serde_json::to_value(&empty).expect("serialization is infallible"),
+            serde_json::json!({ "Other": "" })
+        );
+    }
+
+    #[test]
+    fn variant_name_does_not_leak_the_wire_form() {
+        // The two mappings differ on purpose; guard against one being wired
+        // to the other.
+        assert_eq!(ReceiptType::ReadSelf.variant_name(), "ReadSelf");
+        assert_eq!(ReceiptType::ReadSelf.as_wire_str(), "read-self");
+        assert_eq!(ReceiptType::Delivered.variant_name(), "Delivered");
+        assert_eq!(ReceiptType::Delivered.as_wire_str(), "delivery");
+        assert_eq!(
+            ReceiptType::Other("custom-type".to_string()).variant_name(),
+            "Other"
+        );
     }
 }
