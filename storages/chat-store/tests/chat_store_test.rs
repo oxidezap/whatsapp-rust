@@ -3183,3 +3183,376 @@ async fn merge_keeps_strictly_newer_edit_across_sides() {
     assert_eq!(ce2.text.as_deref(), Some("lid mais nova"));
     assert_eq!(ce2.edited_at.map(|t| t.timestamp()), Some(1_700_000_080));
 }
+
+// ── Companion-device (device-suffixed) identities (issue #1095) ─────────────
+
+/// A peer's linked device as the binary decoder yields it: `user:48@lid`,
+/// carrying the LID domain-type byte in `agent`.
+fn companion(user: &str, device: u16) -> Jid {
+    Jid {
+        user: user.into(),
+        server: wacore_binary::Server::Lid,
+        agent: 1,
+        device,
+        integrator: 0,
+    }
+}
+
+fn peer_receipt(source: Jid, ids: Vec<&str>, ty: ReceiptType, ts: i64) -> Event {
+    Event::Receipt(
+        Receipt::builder()
+            .source(MessageSource {
+                chat: source.clone(),
+                sender: source,
+                ..Default::default()
+            })
+            .message_ids(ids.into_iter().map(String::from).collect())
+            .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+            .r#type(ty)
+            .offline(false)
+            .build(),
+    )
+}
+
+/// A fresh LID-only thread has no counterpart to fall back to, so the direct
+/// match has to succeed on the normalized key.
+#[tokio::test]
+async fn companion_device_receipt_advances_status() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid("10203040506070@lid");
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-AD-1",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    feed(
+        &chat_store,
+        [peer_receipt(
+            companion("10203040506070", 48),
+            vec!["OUT-AD-1"],
+            ReceiptType::Delivered,
+            1_700_000_200,
+        )],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&chat, "OUT-AD-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Delivered);
+    // The receipt keyed no thread of its own.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, chat);
+}
+
+/// Multi-device emits the read once, from whichever device read first. The
+/// primary never re-sends it, so a companion read has to land.
+#[tokio::test]
+async fn companion_read_advances_past_primary_delivered() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid("10203040506070@lid");
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-AD-2",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    feed(
+        &chat_store,
+        [
+            peer_receipt(
+                chat.clone(),
+                vec!["OUT-AD-2"],
+                ReceiptType::Delivered,
+                1_700_000_200,
+            ),
+            peer_receipt(
+                companion("10203040506070", 48),
+                vec!["OUT-AD-2"],
+                ReceiptType::Read,
+                1_700_000_300,
+            ),
+        ],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&chat, "OUT-AD-2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+}
+
+/// Device-suffixed *and* addressed by the identity the rows are not keyed
+/// under: normalization has to happen before the alternate-key retry, or the
+/// mapping is never consulted.
+#[tokio::test]
+async fn companion_receipt_resolves_across_pn_lid_mapping() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-AD-3",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    add_lid_mapping(&store).await;
+
+    feed(
+        &chat_store,
+        [peer_receipt(
+            companion("111000011112222", 12),
+            vec!["OUT-AD-3"],
+            ReceiptType::Read,
+            1_700_000_200,
+        )],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-AD-3")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, jid(PEER));
+}
+
+/// A self receipt carrying a device must recount the real thread instead of
+/// materializing a twin of it.
+#[tokio::test]
+async fn companion_read_self_recounts_the_real_chat() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid("10203040506070@lid");
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(
+                "10203040506070@lid",
+                "10203040506070@lid",
+                "IN-AD-1",
+                1_700_000_000,
+            ),
+        )],
+    )
+    .await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].unread_count, 1);
+
+    feed(
+        &chat_store,
+        [peer_receipt(
+            companion("10203040506070", 48),
+            vec!["IN-AD-1"],
+            ReceiptType::ReadSelf,
+            1_700_000_100,
+        )],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1, "no phantom chat: {chats:?}");
+    assert_eq!(chats[0].jid, chat);
+    assert_eq!(chats[0].unread_count, 0);
+}
+
+/// Messages keep the device on `sender` by design, so the push name of a peer
+/// texting from WhatsApp Web has to be filed under the bare identity anyway.
+#[tokio::test]
+async fn companion_sender_push_name_lands_on_the_bare_contact() {
+    let (_store, chat_store) = test_store().await;
+    let bare = jid("10203040506070@lid");
+    let device = companion("10203040506070", 48);
+
+    let mut info = MessageInfo {
+        source: MessageSource {
+            chat: bare.clone(),
+            sender: device.clone(),
+            is_from_me: false,
+            ..Default::default()
+        },
+        id: "IN-AD-2".to_string(),
+        timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        ..Default::default()
+    };
+    info.push_name = "Alice Example".into();
+    feed(&chat_store, [message_event(wa::Message::text("oi"), info)]).await;
+
+    let contact = chat_store.contact(&bare).await.unwrap().unwrap();
+    assert_eq!(contact.push_name.as_deref(), Some("Alice Example"));
+    // And a caller holding the message's `sender` finds the same row.
+    let via_device = chat_store.contact(&device).await.unwrap().unwrap();
+    assert_eq!(via_device.jid, bare);
+}
+
+/// One read-by row per participant, not per device: a member reading on their
+/// phone and on Web emits one receipt each.
+#[tokio::test]
+async fn group_receipts_from_two_devices_keep_one_row_per_participant() {
+    let (_store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+
+    chat_store
+        .record_outgoing(
+            &group,
+            "OUT-G-AD",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    for (device, ty, ts) in [
+        (0u16, ReceiptType::Delivered, 1_700_000_200),
+        (48u16, ReceiptType::Read, 1_700_000_300),
+    ] {
+        feed(
+            &chat_store,
+            [Event::Receipt(
+                Receipt::builder()
+                    .source(MessageSource {
+                        chat: group.clone(),
+                        sender: companion("111000011112222", device),
+                        ..Default::default()
+                    })
+                    .message_ids(vec!["OUT-G-AD".to_string()])
+                    .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                    .r#type(ty)
+                    .offline(false)
+                    .build(),
+            )],
+        )
+        .await;
+    }
+
+    let receipts = chat_store.receipts(&group, "OUT-G-AD").await.unwrap();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(receipts[0].user_jid, jid("111000011112222@lid"));
+    assert_eq!(receipts[0].status, MessageStatus::Read);
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct JidRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    jid: String,
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct ReceiptKeyRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    user_jid: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    receipt_type: i32,
+}
+
+/// The heal migration, replayed over rows the pre-fix writers left behind.
+/// Migrations run at open, so the artifacts are seeded afterwards and the
+/// statements re-applied — they are idempotent by construction.
+#[tokio::test]
+async fn migration_folds_device_suffixed_rows() {
+    let (store, _chat_store) = test_store().await;
+
+    store
+        .shared()
+        .run(|conn| {
+            let seed = [
+                // Phantom chat from a read-self, plus the real thread.
+                "INSERT INTO chats (device_id, jid) VALUES (1, '10203040506070:48@lid')",
+                "INSERT INTO chats (device_id, jid) VALUES (1, '10203040506070@lid')",
+                // A device-keyed chat that somehow owns messages is left alone.
+                "INSERT INTO chats (device_id, jid) VALUES (1, '20304050607080:7@lid')",
+                "INSERT INTO messages (device_id, chat_jid, msg_id, sender_jid, timestamp_ms, kind) \
+                 VALUES (1, '20304050607080:7@lid', 'M-1', '', 1, 'text')",
+                // Contact reachable only under the device key…
+                "INSERT INTO contacts (device_id, jid, push_name) VALUES (1, '30405060708090:5@lid', 'Bob')",
+                // …and one whose bare row already exists and must win.
+                "INSERT INTO contacts (device_id, jid, push_name) VALUES (1, '10203040506070:48@lid', 'stale')",
+                "INSERT INTO contacts (device_id, jid, push_name) VALUES (1, '10203040506070@lid', 'Alice')",
+                // Same participant split across phone and Web: Read wins.
+                "INSERT INTO message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms) \
+                 VALUES (1, '120363000000000001@g.us', 'G-1', '111000011112222@lid', 3, 10)",
+                "INSERT INTO message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms) \
+                 VALUES (1, '120363000000000001@g.us', 'G-1', '111000011112222:48@lid', 4, 20)",
+                // Two device rows and no bare row: the highest still survives.
+                "INSERT INTO message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms) \
+                 VALUES (1, '120363000000000001@g.us', 'G-1', '222000011112222:3@lid', 4, 30)",
+                "INSERT INTO message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type, ts_ms) \
+                 VALUES (1, '120363000000000001@g.us', 'G-1', '222000011112222:9@lid', 3, 40)",
+            ];
+            for stmt in seed {
+                diesel::sql_query(stmt)
+                    .execute(conn)
+                    .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            }
+            // Run the file the way the migration harness does, statements and
+            // comments included.
+            diesel::connection::SimpleConnection::batch_execute(
+                conn,
+                include_str!("../migrations/2026-07-24-000000_bare_identity_keys/up.sql"),
+            )
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (chats, contacts, receipts) = store
+        .shared()
+        .run(|conn| {
+            let chats: Vec<JidRow> =
+                diesel::sql_query("SELECT jid FROM chats WHERE device_id = 1 ORDER BY jid")
+                    .load(conn)
+                    .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            let contacts: Vec<JidRow> = diesel::sql_query(
+                "SELECT jid || '=' || push_name AS jid FROM contacts WHERE device_id = 1 ORDER BY jid",
+            )
+            .load(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            let receipts: Vec<ReceiptKeyRow> = diesel::sql_query(
+                "SELECT user_jid, receipt_type FROM message_receipts WHERE device_id = 1 ORDER BY user_jid",
+            )
+            .load(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            Ok((chats, contacts, receipts))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        chats.iter().map(|r| r.jid.as_str()).collect::<Vec<_>>(),
+        ["10203040506070@lid", "20304050607080:7@lid"]
+    );
+    assert_eq!(
+        contacts.iter().map(|r| r.jid.as_str()).collect::<Vec<_>>(),
+        ["10203040506070@lid=Alice", "30405060708090@lid=Bob"]
+    );
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.user_jid.as_str(), r.receipt_type))
+            .collect::<Vec<_>>(),
+        [("111000011112222@lid", 4), ("222000011112222@lid", 4)]
+    );
+}

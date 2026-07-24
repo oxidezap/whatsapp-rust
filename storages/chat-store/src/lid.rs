@@ -24,10 +24,15 @@ use crate::store::ChangeSet;
 
 /// Bare 1:1 user chat key — the only namespace with a PN/LID alias. Hosted
 /// and interop namespaces alias differently and are left alone.
+///
+/// A device-suffixed input normalizes rather than being rejected: a peer's
+/// companion device addresses traffic as `user:48@lid`, and every row of that
+/// thread is keyed by the bare identity, so the device must not decide
+/// whether a chat resolves.
 fn user_chat(chat: &str) -> Option<Jid> {
     let jid: Jid = chat.parse().ok()?;
-    (jid.device == 0 && jid.integrator == 0 && matches!(jid.server, Server::Pn | Server::Lid))
-        .then_some(jid)
+    (jid.integrator == 0 && matches!(jid.server, Server::Pn | Server::Lid))
+        .then(|| jid.into_non_ad())
 }
 
 #[derive(QueryableByName)]
@@ -47,6 +52,16 @@ pub(crate) fn counterpart_chat_key(
     let Some(jid) = user_chat(chat) else {
         return Ok(None);
     };
+    counterpart_of(conn, device_id, &jid)
+}
+
+/// [`counterpart_chat_key`] for an already-normalized key, so callers that
+/// need the normalized form themselves don't parse twice.
+fn counterpart_of(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &Jid,
+) -> QueryResult<Option<String>> {
     let (sql, server) = if jid.is_lid() {
         (
             "SELECT phone_number AS user FROM lid_pn_mapping \
@@ -79,8 +94,11 @@ pub(crate) fn chat_key_candidates(
     device_id: i32,
     chat: &str,
 ) -> QueryResult<Vec<String>> {
-    let mut keys = vec![chat.to_string()];
-    if let Some(alt) = counterpart_chat_key(conn, device_id, chat)? {
+    let Some(jid) = user_chat(chat) else {
+        return Ok(vec![chat.to_string()]);
+    };
+    let mut keys = vec![jid.to_string()];
+    if let Some(alt) = counterpart_of(conn, device_id, &jid)? {
         keys.push(alt);
     }
     Ok(keys)
@@ -90,15 +108,21 @@ pub(crate) fn chat_key_candidates(
 /// `selectChatForOneOnOneMessage` parity: an existing thread keeps its key
 /// whichever identity addressed it; a brand-new chat with a known LID is
 /// keyed by the LID. Rows split across both keys (the state receipts dropped
-/// under the wrong identity leave behind) are merged before routing.
+/// under the wrong identity leave behind) are merged before routing. A
+/// device-suffixed input is normalized even when no counterpart is known, so
+/// a companion device can never materialize a thread of its own.
 pub(crate) fn route_chat_key(
     conn: &mut SqliteConnection,
     device_id: i32,
     wire_chat: &str,
     cs: &mut ChangeSet,
 ) -> QueryResult<String> {
-    let Some(alt) = counterpart_chat_key(conn, device_id, wire_chat)? else {
+    let Some(jid) = user_chat(wire_chat) else {
         return Ok(wire_chat.to_string());
+    };
+    let key = jid.to_string();
+    let Some(alt) = counterpart_of(conn, device_id, &jid)? else {
+        return Ok(key);
     };
     let existing: Vec<String> = {
         use schema::chats::dsl;
@@ -106,19 +130,16 @@ pub(crate) fn route_chat_key(
             .filter(
                 dsl::device_id
                     .eq(device_id)
-                    .and(dsl::jid.eq_any([wire_chat, alt.as_str()])),
+                    .and(dsl::jid.eq_any([key.as_str(), alt.as_str()])),
             )
             .select(dsl::jid)
             .load(conn)?
     };
-    match (
-        existing.iter().any(|j| j == wire_chat),
-        existing.contains(&alt),
-    ) {
-        (true, true) => merge_split_chat(conn, device_id, wire_chat, &alt, cs),
-        (true, false) => Ok(wire_chat.to_string()),
+    match (existing.contains(&key), existing.contains(&alt)) {
+        (true, true) => merge_split_chat(conn, device_id, &key, &alt, cs),
+        (true, false) => Ok(key),
         (false, true) => Ok(alt),
-        (false, false) => Ok(lid_side(wire_chat, &alt).to_string()),
+        (false, false) => Ok(lid_side(&key, &alt).to_string()),
     }
 }
 

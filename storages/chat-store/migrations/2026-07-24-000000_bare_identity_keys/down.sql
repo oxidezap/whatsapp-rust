@@ -1,0 +1,3 @@
+-- Irreversible: the device that keyed each folded row is not recorded
+-- anywhere, and the rows it produced were unreachable artifacts. Nothing to
+-- restore.
