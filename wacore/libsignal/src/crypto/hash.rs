@@ -45,11 +45,6 @@ impl CryptographicMac {
         }
     }
 
-    pub fn update_and_get(&mut self, input: &[u8]) -> &mut Self {
-        self.update(input);
-        self
-    }
-
     pub fn finalize(&mut self) -> Vec<u8> {
         match self {
             Self::HmacSha1(sha1) => sha1.finalize_reset().into_bytes().to_vec(),

@@ -57,11 +57,6 @@ impl AliceSignalProtocolParameters {
         self.their_one_time_pre_key = Some(ec_public);
     }
 
-    pub fn with_their_one_time_pre_key(mut self, ec_public: PublicKey) -> Self {
-        self.set_their_one_time_pre_key(ec_public);
-        self
-    }
-
     #[inline]
     pub fn our_identity_key_pair(&self) -> &IdentityKeyPair {
         &self.our_identity_key_pair

@@ -1,7 +1,7 @@
 pub mod record_helpers;
 pub mod sender_key_name;
 
-use crate::protocol::{IdentityKeyStore, ProtocolAddress, SessionRecord};
+use crate::protocol::{ProtocolAddress, SessionRecord};
 use async_trait::async_trait;
 use std::error::Error;
 use waproto::whatsapp::{PreKeyRecordStructure, SignedPreKeyRecordStructure};
@@ -55,14 +55,4 @@ pub trait SessionStore: Send + Sync {
     async fn contains_session(&self, address: &ProtocolAddress) -> Result<bool, StoreError>;
     async fn delete_session(&self, address: &ProtocolAddress) -> Result<(), StoreError>;
     async fn delete_all_sessions(&self, name: &str) -> Result<(), StoreError>;
-}
-
-pub trait SignalProtocolStore:
-    IdentityKeyStore + PreKeyStore + SignedPreKeyStore + SessionStore
-{
-}
-
-impl<T: IdentityKeyStore + PreKeyStore + SignedPreKeyStore + SessionStore> SignalProtocolStore
-    for T
-{
 }

@@ -171,7 +171,6 @@ pub struct Aes256GcmEncryption {
 }
 
 impl Aes256GcmEncryption {
-    pub const TAG_SIZE: usize = TAG_SIZE;
     pub const NONCE_SIZE: usize = NONCE_SIZE;
 
     pub fn new(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<Self> {
@@ -200,7 +199,6 @@ pub struct Aes256GcmDecryption {
 }
 
 impl Aes256GcmDecryption {
-    pub const TAG_SIZE: usize = TAG_SIZE;
     pub const NONCE_SIZE: usize = NONCE_SIZE;
 
     pub fn new(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<Self> {

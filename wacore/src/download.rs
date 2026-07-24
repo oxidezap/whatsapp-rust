@@ -1,6 +1,6 @@
 use crate::libsignal::crypto::{
     DecryptionError as AesCbcDecryptionError, Error as CryptoError, aes_256_cbc_decrypt_in_place,
-    aes_256_cbc_decrypt_into, hmac_sha256_two_part,
+    hmac_sha256_two_part,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
@@ -504,13 +504,6 @@ impl DownloadUtils {
             .try_into()
             .map_err(|_| anyhow!("HKDF output has unexpected length for MAC key"))?;
         Ok((iv, cipher_key, mac_key))
-    }
-
-    pub fn decrypt_cbc(cipher_key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        aes_256_cbc_decrypt_into(ciphertext, cipher_key, iv, &mut output)
-            .map_err(anyhow::Error::new)?;
-        Ok(output)
     }
 
     pub fn verify_and_decrypt(

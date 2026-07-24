@@ -1184,45 +1184,6 @@ pub struct DecryptionErrorMessage {
 }
 
 impl DecryptionErrorMessage {
-    #[allow(clippy::disallowed_methods)]
-    pub fn for_original(
-        original_bytes: &[u8],
-        original_type: CiphertextMessageType,
-        original_timestamp: Timestamp,
-        original_sender_device_id: u32,
-    ) -> Result<Self> {
-        let ratchet_key = match original_type {
-            CiphertextMessageType::Whisper => {
-                Some(*SignalMessage::try_from(original_bytes)?.sender_ratchet_key())
-            }
-            CiphertextMessageType::PreKey => Some(
-                *PreKeySignalMessage::try_from(original_bytes)?
-                    .message()
-                    .sender_ratchet_key(),
-            ),
-            CiphertextMessageType::SenderKey => None,
-            CiphertextMessageType::Plaintext => {
-                return Err(SignalProtocolError::InvalidArgument(
-                    "cannot create a DecryptionErrorMessage for plaintext content; it is not encrypted".to_string()
-                ));
-            }
-        };
-
-        let proto_message = DecryptionErrorMessageProto {
-            timestamp: Some(original_timestamp.epoch_millis()),
-            ratchet_key: ratchet_key.map(|k| k.serialize().into()),
-            device_id: Some(original_sender_device_id),
-        };
-        let serialized = proto_message.encode_to_vec();
-
-        Ok(Self {
-            ratchet_key,
-            timestamp: original_timestamp,
-            device_id: original_sender_device_id,
-            serialized: serialized.into_boxed_slice(),
-        })
-    }
-
     #[inline]
     pub fn timestamp(&self) -> Timestamp {
         self.timestamp

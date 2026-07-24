@@ -93,18 +93,6 @@ fn unix_now() -> i64 {
     crate::time::now_secs()
 }
 
-/// Check if a tcToken has expired using default constants.
-///
-/// For AB-prop-aware expiration, use [`is_tc_token_expired_with`].
-pub fn is_tc_token_expired(token_timestamp: i64) -> bool {
-    is_tc_token_expired_at(
-        token_timestamp,
-        unix_now(),
-        TC_TOKEN_BUCKET_DURATION,
-        TC_TOKEN_NUM_BUCKETS,
-    )
-}
-
 /// Check if a tcToken has expired using configurable receiver-side timing.
 pub fn is_tc_token_expired_with(token_timestamp: i64, config: &TcTokenConfig) -> bool {
     let cfg = config.clamped();
@@ -146,13 +134,6 @@ fn expiration_cutoff_at(now: i64, bucket_duration: i64, num_buckets: i64) -> i64
     let current_bucket = bucket_index(now, bucket_duration);
     let expired_bucket = current_bucket - (num_buckets - 1);
     expired_bucket * bucket_duration
-}
-
-/// Check if we should issue a new tcToken to a contact (default constants).
-///
-/// For AB-prop-aware check, use [`should_send_new_tc_token_with`].
-pub fn should_send_new_tc_token(sender_timestamp: Option<i64>) -> bool {
-    should_send_new_tc_token_at(sender_timestamp, unix_now(), TC_TOKEN_BUCKET_DURATION)
 }
 
 /// Check if we should issue a new tcToken using configurable sender bucket duration.

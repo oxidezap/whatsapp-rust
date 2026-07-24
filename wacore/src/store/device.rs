@@ -419,10 +419,6 @@ impl Device {
         }
     }
 
-    pub fn is_ready_for_presence(&self) -> bool {
-        self.pn.is_some() && !self.push_name.is_empty()
-    }
-
     /// Mirrors WA Web `WAWebUserPrefsMultiDevice.isRegistered()`:
     /// `!!(m() && getMaybeMeDevicePn())`.
     pub fn is_registered(&self) -> bool {

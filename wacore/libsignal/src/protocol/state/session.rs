@@ -439,10 +439,6 @@ impl SessionState {
         Ok(ChainKey::new(chain_key_bytes, index))
     }
 
-    pub fn get_sender_chain_key_bytes(&self) -> Result<Vec<u8>, InvalidSessionError> {
-        Ok(self.get_sender_chain_key()?.key().to_vec())
-    }
-
     pub fn set_sender_chain_key(
         &mut self,
         next_chain_key: &ChainKey,
@@ -1218,37 +1214,6 @@ impl SessionRecord {
             .session_version()?)
     }
 
-    pub fn local_identity_key_bytes(&self) -> Result<Vec<u8>, SignalProtocolError> {
-        Ok(self
-            .session_state()
-            .ok_or_else(|| {
-                SignalProtocolError::InvalidState(
-                    "local_identity_key_bytes",
-                    "No current session".into(),
-                )
-            })?
-            .local_identity_key_bytes()?)
-    }
-
-    pub fn remote_identity_key_bytes(&self) -> Result<Option<Vec<u8>>, SignalProtocolError> {
-        Ok(self
-            .session_state()
-            .ok_or_else(|| {
-                SignalProtocolError::InvalidState(
-                    "remote_identity_key_bytes",
-                    "No current session".into(),
-                )
-            })?
-            .remote_identity_key_bytes()?)
-    }
-
-    pub fn has_usable_sender_chain(&self) -> Result<bool, SignalProtocolError> {
-        match &self.current_session {
-            Some(session) => Ok(session.has_usable_sender_chain()?),
-            None => Ok(false),
-        }
-    }
-
     pub fn alice_base_key(&self) -> Result<&[u8], SignalProtocolError> {
         Ok(self
             .session_state()
@@ -1256,44 +1221,6 @@ impl SessionRecord {
                 SignalProtocolError::InvalidState("alice_base_key", "No current session".into())
             })?
             .alice_base_key())
-    }
-
-    pub fn get_receiver_chain_key_bytes(
-        &self,
-        sender: &PublicKey,
-    ) -> Result<Option<Box<[u8]>>, SignalProtocolError> {
-        Ok(self
-            .session_state()
-            .ok_or_else(|| {
-                SignalProtocolError::InvalidState(
-                    "get_receiver_chain_key",
-                    "No current session".into(),
-                )
-            })?
-            .get_receiver_chain_key(sender)?
-            .map(|chain| chain.key()[..].into()))
-    }
-
-    pub fn get_sender_chain_key_bytes(&self) -> Result<Vec<u8>, SignalProtocolError> {
-        Ok(self
-            .session_state()
-            .ok_or_else(|| {
-                SignalProtocolError::InvalidState(
-                    "get_sender_chain_key_bytes",
-                    "No current session".into(),
-                )
-            })?
-            .get_sender_chain_key_bytes()?)
-    }
-
-    pub fn current_ratchet_key_matches(
-        &self,
-        key: &PublicKey,
-    ) -> Result<bool, SignalProtocolError> {
-        match &self.current_session {
-            Some(session) => Ok(&session.sender_ratchet_key()? == key),
-            None => Ok(false),
-        }
     }
 }
 

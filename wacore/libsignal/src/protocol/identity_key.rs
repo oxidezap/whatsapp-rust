@@ -14,10 +14,6 @@ use crate::protocol::{
     KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::IdentityKeyPairStructure,
 };
 
-// Used for domain separation between alternate-identity signatures and other key-to-key signatures.
-const ALTERNATE_IDENTITY_SIGNATURE_PREFIX_1: &[u8] = &[0xFF; 32];
-const ALTERNATE_IDENTITY_SIGNATURE_PREFIX_2: &[u8] = b"Signal_PNI_Signature";
-
 /// A public key that represents the identity of a user.
 ///
 /// Wrapper for [`PublicKey`].
@@ -61,21 +57,6 @@ impl IdentityKey {
     pub fn decode(value: &[u8]) -> Result<Self> {
         let pk = PublicKey::try_from(value)?;
         Ok(Self { public_key: pk })
-    }
-
-    /// Given a trusted identity `self`, verify that `other` represents an alternate identity for
-    /// this user.
-    ///
-    /// `signature` must be calculated from [`IdentityKeyPair::sign_alternate_identity`].
-    pub fn verify_alternate_identity(&self, other: &IdentityKey, signature: &[u8]) -> Result<bool> {
-        Ok(self.public_key.verify_signature_for_multipart_message(
-            &[
-                ALTERNATE_IDENTITY_SIGNATURE_PREFIX_1,
-                ALTERNATE_IDENTITY_SIGNATURE_PREFIX_2,
-                &other.serialize(),
-            ],
-            signature,
-        ))
     }
 }
 
@@ -144,22 +125,6 @@ impl IdentityKeyPair {
 
         let result = structure.encode_to_vec();
         result.into_boxed_slice()
-    }
-
-    /// Generate a signature claiming that `other` represents the same user as `self`.
-    pub fn sign_alternate_identity<R: Rng + CryptoRng>(
-        &self,
-        other: &IdentityKey,
-        rng: &mut R,
-    ) -> Result<[u8; 64]> {
-        Ok(self.private_key.calculate_signature_for_multipart_message(
-            &[
-                ALTERNATE_IDENTITY_SIGNATURE_PREFIX_1,
-                ALTERNATE_IDENTITY_SIGNATURE_PREFIX_2,
-                &other.serialize(),
-            ],
-            rng,
-        )?)
     }
 }
 

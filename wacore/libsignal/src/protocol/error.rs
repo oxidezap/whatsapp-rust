@@ -103,16 +103,6 @@ pub enum SignalProtocolError {
     SealedSenderSelfSend,
 }
 
-impl SignalProtocolError {
-    /// Convenience factory for [`SignalProtocolError::ApplicationCallbackError`].
-    #[inline]
-    pub fn for_application_callback<E: std::error::Error + Send + Sync + UnwindSafe + 'static>(
-        method: &'static str,
-    ) -> impl FnOnce(E) -> Self {
-        move |error| Self::ApplicationCallbackError(method, Box::new(error))
-    }
-}
-
 impl From<CurveError> for SignalProtocolError {
     fn from(e: CurveError) -> Self {
         match e {

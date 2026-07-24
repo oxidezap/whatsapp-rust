@@ -152,16 +152,6 @@ impl Default for PairCodeOptions {
     }
 }
 
-impl PairCodeOptions {
-    /// Convenience constructor with the phone number preset and other fields defaulted.
-    pub fn for_phone(phone_number: impl Into<String>) -> Self {
-        Self {
-            phone_number: phone_number.into(),
-            ..Self::default()
-        }
-    }
-}
-
 /// State machine for pair code authentication flow.
 #[derive(Default)]
 pub enum PairCodeState {

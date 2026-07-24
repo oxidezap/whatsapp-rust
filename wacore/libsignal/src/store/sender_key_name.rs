@@ -1,5 +1,3 @@
-use crate::protocol::ProtocolAddress;
-
 /// Identifies a sender key by group + sender address.
 ///
 /// Stores a single `"{group_id}:{sender_id}"` buffer with an offset,
@@ -52,21 +50,5 @@ impl SenderKeyName {
     #[inline]
     pub fn cache_key(&self) -> &str {
         &self.buf
-    }
-
-    /// Construct from a group JID and a protocol address.
-    /// Uses `ProtocolAddress::as_str()` to avoid allocating the sender string.
-    pub fn from_jid(group_jid: &impl std::fmt::Display, sender: &ProtocolAddress) -> Self {
-        Self::from_parts(&group_jid.to_string(), sender.as_str())
-    }
-
-    pub fn to_protocol_address(&self) -> ProtocolAddress {
-        let group = self.group_id();
-        let sender = self.sender_id();
-        let mut name = String::with_capacity(group.len() + 1 + sender.len());
-        name.push_str(group);
-        name.push('\n');
-        name.push_str(sender);
-        ProtocolAddress::new(name, 0.into())
     }
 }
