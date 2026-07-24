@@ -165,6 +165,7 @@ struct GroupBranchRequest<'a> {
     extra_stanza_nodes: &'a [Node],
     group_metadata_freshness: crate::cache::Freshness,
     device_freshness: crate::cache::Freshness,
+    borrowed_message_id: bool,
 }
 
 struct DmBranchRequest<'a> {
@@ -175,6 +176,7 @@ struct DmBranchRequest<'a> {
     extra_stanza_nodes: Vec<Node>,
     is_status_addon: bool,
     device_freshness: crate::cache::Freshness,
+    borrowed_message_id: bool,
 }
 
 enum GroupDeviceSnapshot {
@@ -275,6 +277,21 @@ pub struct SendOptions {
     pub device_freshness: crate::cache::Freshness,
 }
 
+/// Options for [`Client::edit_message_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct EditOptions {
+    /// Override the outer stanza id (default: a fresh id, like
+    /// [`Client::edit_message`]). Pinning it to an **existing** message's id is
+    /// a best-effort, side-effect-aware operation:
+    /// - No id-keyed local state is bound to the borrowed id — the edit does not
+    ///   persist an outbound message secret or a retry-cache entry under it, so
+    ///   the original message's secret and retry content are left intact.
+    /// - Whether the wire-level collision is honored is server- and
+    ///   client-dependent (the server may dedupe against the outer id), so treat
+    ///   the visible outcome as non-guaranteed.
+    pub stanza_id: Option<String>,
+}
+
 #[derive(Default)]
 pub(crate) struct SendPipelineOptions {
     pub(crate) request_id: Option<String>,
@@ -285,6 +302,12 @@ pub(crate) struct SendPipelineOptions {
     pub(crate) stanza_type: Option<StanzaType>,
     pub(crate) group_metadata_freshness: crate::cache::Freshness,
     pub(crate) device_freshness: crate::cache::Freshness,
+    /// The outer stanza id is borrowed from another message (caller-forced
+    /// `request_id`), so id-keyed state must NOT be bound to it: skip
+    /// `add_recent_message` (retry cache) and `persist_outbound_msg_secret`.
+    /// Without this, the borrowed id clobbers the original message's retry
+    /// content and outbound secret.
+    pub(crate) borrowed_message_id: bool,
 }
 
 /// Result of a successfully sent message.
@@ -1549,6 +1572,7 @@ impl Client {
             stanza_type: stanza_type_override,
             group_metadata_freshness,
             device_freshness,
+            borrowed_message_id,
         } = options;
         validate_extra_stanza_nodes(&extra_stanza_nodes)?;
         if request_id_override.as_ref().is_some_and(String::is_empty) {
@@ -1627,6 +1651,7 @@ impl Client {
                 extra_stanza_nodes: &extra_stanza_nodes,
                 group_metadata_freshness,
                 device_freshness,
+                borrowed_message_id,
             }))
             .await?
         } else {
@@ -1638,6 +1663,7 @@ impl Client {
                 extra_stanza_nodes,
                 is_status_addon,
                 device_freshness,
+                borrowed_message_id,
             }))
             .await?
         };
@@ -1651,7 +1677,12 @@ impl Client {
         // rather than transmit an advance we couldn't save.
         self.persist_signal_state_pre_wire().await?;
 
-        let ack = if let Some(phash) = dm_phash
+        // A borrowed id must not register a phash ack-waiter: the waiter map is
+        // keyed by outer stanza id, so it would overwrite the original send's
+        // waiter (either ack could resolve the wrong send, and the older timeout
+        // could remove the replacement). The edit's own ack is best-effort.
+        let ack = if !borrowed_message_id
+            && let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
                 .attrs()
                 .optional_string("id")
@@ -1679,7 +1710,10 @@ impl Client {
             }
             return Err(e.into());
         }
-        if let Some(secret) = outbound_msg_secret.as_ref() {
+        // Skip when the stanza id is borrowed from another message: binding the
+        // outbound secret under the borrowed id would overwrite the original
+        // message's secret (breaking later reactions/poll votes on it).
+        if !borrowed_message_id && let Some(secret) = outbound_msg_secret.as_ref() {
             let sender = match outbound_group_sender_identity {
                 Some(s) => Some(s),
                 None => self.dm_sender_identity_for(&tc_issue_target).await,
@@ -1788,6 +1822,7 @@ impl Client {
             extra_stanza_nodes,
             group_metadata_freshness,
             device_freshness,
+            borrowed_message_id,
         } = request;
         // Every arm of the prepare match below assigns these three.
         let outbound_msg_secret: Option<[u8; 32]>;
@@ -1819,9 +1854,13 @@ impl Client {
                 .message_context_info
                 .is_unset()
                 .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
-            // Store serialized message bytes for retry (lightweight)
-            self.add_recent_message(&to, &request_id, message, shared_content.clone())
-                .await;
+            // Store serialized message bytes for retry (lightweight). Skip when
+            // the id is borrowed: it would replace the original message's
+            // retry-cache entry, so a retry receipt for it returns this edit.
+            if !borrowed_message_id {
+                self.add_recent_message(&to, &request_id, message, shared_content.clone())
+                    .await;
+            }
 
             let device_store_arc = self.persistence_manager.get_device_arc().await;
             let to_str = to.to_string();
@@ -2161,6 +2200,7 @@ impl Client {
             extra_stanza_nodes,
             is_status_addon,
             device_freshness,
+            borrowed_message_id,
         } = request;
         let mut should_issue_tc_token_after_send = false;
         let prepared = {
@@ -2173,18 +2213,22 @@ impl Client {
                 .is_unset()
                 .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
             // Status reaction retries arrive with `from=status@broadcast`;
-            // cache under the broadcast chat so take_recent_message hits.
-            if is_status_addon {
-                self.add_recent_message(
-                    &Jid::status_broadcast(),
-                    &request_id,
-                    message,
-                    shared_content.clone(),
-                )
-                .await;
-            } else {
-                self.add_recent_message(&to, &request_id, message, shared_content.clone())
+            // cache under the broadcast chat so take_recent_message hits. Skip
+            // for a borrowed id: it would replace the original message's
+            // retry-cache entry (a retry receipt for it would return this edit).
+            if !borrowed_message_id {
+                if is_status_addon {
+                    self.add_recent_message(
+                        &Jid::status_broadcast(),
+                        &request_id,
+                        message,
+                        shared_content.clone(),
+                    )
                     .await;
+                } else {
+                    self.add_recent_message(&to, &request_id, message, shared_content.clone())
+                        .await;
+                }
             }
 
             let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -2687,6 +2731,56 @@ mod tests {
         assert!(
             matches!(err, SendError::NotLoggedIn),
             "expected SendError::NotLoggedIn, got: {err:?}"
+        );
+    }
+
+    // Edit path resolves the sender before the wire, so a logged-out DM edit
+    // must surface the typed NotLoggedIn (not the Internal catch-all).
+    #[tokio::test]
+    async fn edit_message_logged_out_dm_returns_not_logged_in() {
+        let client = crate::test_utils::create_test_client().await;
+        let to: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let err = client
+            .edit_message(
+                to,
+                "ORIG_ID",
+                wa::Message {
+                    conversation: Some("x".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("logged-out DM edit must error");
+        assert!(
+            matches!(err, SendError::NotLoggedIn),
+            "expected SendError::NotLoggedIn, got: {err:?}"
+        );
+    }
+
+    // An empty EditOptions::stanza_id must land in request_id and be rejected as
+    // InvalidRequest — doubles as a guard that stanza_id actually reaches the id.
+    #[tokio::test]
+    async fn edit_message_with_empty_stanza_id_returns_invalid_request() {
+        let client = crate::test_utils::create_test_client().await;
+        seed_pn(&client, "222222222222@s.whatsapp.net").await;
+        let to: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let err = client
+            .edit_message_with_options(
+                to,
+                "ORIG_ID",
+                wa::Message {
+                    conversation: Some("x".into()),
+                    ..Default::default()
+                },
+                EditOptions {
+                    stanza_id: Some(String::new()),
+                },
+            )
+            .await
+            .expect_err("empty stanza_id must error");
+        assert!(
+            matches!(err, SendError::InvalidRequest(_)),
+            "expected SendError::InvalidRequest, got: {err:?}"
         );
     }
 

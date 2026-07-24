@@ -64,16 +64,49 @@ impl Client {
         original_id: impl Into<String>,
         new_content: wa::Message,
     ) -> Result<String, crate::send::SendError> {
-        self.edit_message_inner(to.into(), original_id.into(), new_content)
+        self.edit_message_inner(to.into(), original_id.into(), new_content, None)
             .await
     }
 
+    /// Edits a message you own (`original_id`) with caller-supplied
+    /// [`crate::send::EditOptions`]. The edit-path counterpart of
+    /// [`crate::send::SendOptions::message_id`] (which overrides the stanza id
+    /// for plain sends): `stanza_id` lets callers control the outer stanza id —
+    /// for example to collide it with an existing message so clients re-render
+    /// that slot.
+    ///
+    /// When `stanza_id` is set, no id-keyed local state is bound to the borrowed
+    /// id (the edit skips outbound-secret and retry-cache persistence, leaving
+    /// the original message's state intact), and whether the collision is
+    /// honored is server/client dependent — treat it as best-effort. See
+    /// [`crate::send::EditOptions::stanza_id`].
+    pub async fn edit_message_with_options(
+        &self,
+        to: impl Into<Jid>,
+        original_id: impl Into<String>,
+        new_content: wa::Message,
+        options: crate::send::EditOptions,
+    ) -> Result<String, crate::send::SendError> {
+        self.edit_message_inner(
+            to.into(),
+            original_id.into(),
+            new_content,
+            options.stanza_id,
+        )
+        .await
+    }
+
+    /// Shared edit-send flow for [`Self::edit_message`] and
+    /// [`Self::edit_message_with_options`]. `request_id` overrides the outer
+    /// stanza id when `Some`; when `None` a fresh one is generated (the default,
+    /// safe behavior — see below).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     async fn edit_message_inner(
         &self,
         to: Jid,
         original_id: String,
         new_content: wa::Message,
+        request_id: Option<String>,
     ) -> Result<String, crate::send::SendError> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
         // returns LID for LID-addressing groups and PN otherwise.
@@ -100,16 +133,22 @@ impl Client {
             wacore::time::now_millis(),
         );
 
-        // Use a new stanza ID instead of reusing the original message ID.
-        // The original message ID is already embedded in protocolMessage.key.id
-        // inside the encrypted payload. Reusing it as the outer stanza ID causes
-        // the server to deduplicate against the original message and silently
-        // drop the edit.
+        // Default (`request_id = None`) uses a fresh stanza ID instead of
+        // reusing the original message ID: the original ID is already embedded
+        // in protocolMessage.key.id inside the encrypted payload, and reusing it
+        // as the outer stanza ID makes the server deduplicate against the
+        // original message and silently drop the edit. Callers that intentionally
+        // want to pin the outer stanza id pass it via `request_id`; that id is
+        // borrowed from another message, so id-keyed state (retry cache, outbound
+        // secret) must not be bound to it.
+        let borrowed_message_id = request_id.is_some();
         self.send_message_impl(
             to,
             &edit_container_message,
             crate::send::SendPipelineOptions {
                 edit: Some(crate::types::message::EditAttribute::MessageEdit),
+                request_id,
+                borrowed_message_id,
                 ..Default::default()
             },
         )

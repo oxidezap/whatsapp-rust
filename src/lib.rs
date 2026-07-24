@@ -139,7 +139,7 @@ pub mod runtime_impl;
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
-pub use send::{PinDuration, RevokeType, SendError, SendOptions, SendResult};
+pub use send::{EditOptions, PinDuration, RevokeType, SendError, SendOptions, SendResult};
 pub use wacore::send::StanzaType;
 pub mod media;
 pub mod session;
@@ -215,7 +215,7 @@ pub mod prelude {
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;
-    pub use crate::send::{SendError, SendOptions, SendResult};
+    pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
