@@ -9,6 +9,7 @@ use crate::features::groups::GroupMetadata;
 use crate::features::groups::GroupParticipant;
 use crate::features::groups::GroupParticipantOptions;
 use crate::features::groups::ParticipantChangeResponse;
+use crate::features::groups::PreviousDescription;
 use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
 use log::warn;
@@ -176,7 +177,9 @@ impl<'a> Community<'a> {
         {
             self.client
                 .groups()
-                .set_description(&metadata.id, Some(desc), None)
+                // The group was just created, so nothing can have set a
+                // description ahead of us.
+                .set_description(&metadata.id, Some(desc), PreviousDescription::Absent)
                 .await?;
             metadata.description = Some(desc_text);
         }

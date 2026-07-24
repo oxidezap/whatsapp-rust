@@ -49,7 +49,7 @@ pub use groups::{
     GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture, GroupSubject, Groups,
     GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
     MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType,
+    ParticipantType, PictureType, PreviousDescription,
 };
 
 pub use labels::Labels;
