@@ -1,5 +1,5 @@
 //! The portable async driver: one loop that drives a [`CallEngine`] over an injected
-//! [`Runtime`](crate::runtime::Runtime) and [`RelayTransport`](super::transport::RelayTransport).
+//! [`Runtime`] and [`RelayTransport`].
 //! It owns no concrete socket, clock, or executor; native injects the Tokio runtime + the webrtc-rs
 //! DataChannel, the WASM bridge injects its single-threaded runtime + a `node:dgram` transport. The
 //! esp32 control plane does not use this (it has no relay/media).

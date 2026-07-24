@@ -1250,7 +1250,7 @@ mod tests {
             .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
             .unwrap();
 
-        let pre_keys: Vec<(u32, crate::libsignal::protocol::PublicKey)> = (1..=num_prekeys)
+        let pre_keys: Vec<(u32, PublicKey)> = (1..=num_prekeys)
             .map(|id| {
                 let kp = KeyPair::generate(&mut rng);
                 (id, kp.public_key)
@@ -1275,7 +1275,7 @@ mod tests {
         assert!(used);
 
         let iq = spec.build_iq();
-        let iq_node = wacore_binary::builder::NodeBuilder::new("iq")
+        let iq_node = NodeBuilder::new("iq")
             .attr("id", request_id)
             .attr("xmlns", iq.namespace)
             .attr("type", iq.query_type.as_str())

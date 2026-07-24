@@ -46,10 +46,7 @@ impl SenderKeyStore for CachedSenderKeyStore<'_> {
             .get_sender_key(name, self.backend)
             .await
             .map_err(|error| {
-                crate::libsignal::protocol::SignalProtocolError::BackendError(
-                    "durability chaos store",
-                    error.into(),
-                )
+                SignalProtocolError::BackendError("durability chaos store", error.into())
             })?
             .map(|record| (*record).clone()))
     }
@@ -129,7 +126,7 @@ struct ChaosHarness {
 }
 
 impl ChaosHarness {
-    async fn new(seed: u64) -> anyhow::Result<Self> {
+    async fn new(seed: u64) -> Result<Self> {
         let mut harness = Self {
             backend: InMemoryBackend::new(),
             cache: SignalStoreCache::with_max_entries_and_incarnation(32, incarnation(seed, 0)),
@@ -161,7 +158,7 @@ impl ChaosHarness {
         Ok(harness)
     }
 
-    async fn apply(&mut self, action: Action) -> anyhow::Result<()> {
+    async fn apply(&mut self, action: Action) -> Result<()> {
         match action {
             Action::DmSend { fail_gate } => {
                 self.dm_send(fail_gate).await?;
@@ -190,7 +187,7 @@ impl ChaosHarness {
         self.assert_invariants().await
     }
 
-    async fn dm_send(&mut self, fail_gate: bool) -> anyhow::Result<bool> {
+    async fn dm_send(&mut self, fail_gate: bool) -> Result<bool> {
         let (record, checkout) = self
             .cache
             .checkout_session(&self.dm_address, &self.backend)
@@ -232,7 +229,7 @@ impl ChaosHarness {
         Ok(published)
     }
 
-    async fn dm_cancel(&mut self) -> anyhow::Result<()> {
+    async fn dm_cancel(&mut self) -> Result<()> {
         let (record, checkout) = self
             .cache
             .checkout_session(&self.dm_address, &self.backend)
@@ -264,7 +261,7 @@ impl ChaosHarness {
         record: SessionRecord,
         checkout: SessionCheckoutKey,
         had_session: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         match self.cache.restore_session_from_checkout(
             &self.dm_address,
             record,
@@ -289,7 +286,7 @@ impl ChaosHarness {
         }
     }
 
-    async fn group_send(&mut self, fail_gate: bool) -> anyhow::Result<bool> {
+    async fn group_send(&mut self, fail_gate: bool) -> Result<bool> {
         let record = if let Some(record) = self
             .cache
             .get_sender_key(&self.group_name, &self.backend)
@@ -340,7 +337,7 @@ impl ChaosHarness {
         Ok(published)
     }
 
-    async fn sync_group_distribution(&mut self) -> anyhow::Result<()> {
+    async fn sync_group_distribution(&mut self) -> Result<()> {
         let distribution = {
             let mut sender = CachedSenderKeyStore {
                 cache: &self.cache,
@@ -363,7 +360,7 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn deliver_group(&mut self, newest: bool) -> anyhow::Result<bool> {
+    async fn deliver_group(&mut self, newest: bool) -> Result<bool> {
         let Some(message) = (if newest {
             self.pending_group.pop_back()
         } else {
@@ -406,7 +403,7 @@ impl ChaosHarness {
         Ok(true)
     }
 
-    async fn recover_group(&mut self) -> anyhow::Result<()> {
+    async fn recover_group(&mut self) -> Result<()> {
         if self.pending_group.is_empty() {
             ensure!(
                 self.group_send(false).await?,
@@ -423,7 +420,7 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn release_wire_gate(&self, failure: FlushFailure) -> anyhow::Result<bool> {
+    async fn release_wire_gate(&self, failure: FlushFailure) -> Result<bool> {
         if !self.cache.needs_pre_wire_flush().await {
             return Ok(true);
         }
@@ -478,7 +475,7 @@ impl ChaosHarness {
         }
     }
 
-    async fn fail_pending_flush(&self) -> anyhow::Result<()> {
+    async fn fail_pending_flush(&self) -> Result<()> {
         let session_pending = !self
             .cache
             .lock_sessions()
@@ -506,7 +503,7 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn flush_successfully(&self) -> anyhow::Result<()> {
+    async fn flush_successfully(&self) -> Result<()> {
         self.cache.flush(&self.backend).await?;
         ensure!(
             !self.cache.needs_pre_wire_flush().await,
@@ -515,7 +512,7 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn clean_reload(&self) -> anyhow::Result<()> {
+    async fn clean_reload(&self) -> Result<()> {
         let dm_before = self
             .cache
             .peek_session(&self.dm_address, &self.backend)
@@ -560,7 +557,7 @@ impl ChaosHarness {
         );
     }
 
-    async fn lossy_clear(&mut self) -> anyhow::Result<()> {
+    async fn lossy_clear(&mut self) -> Result<()> {
         let (record, checkout) = self
             .cache
             .checkout_session(&self.dm_address, &self.backend)
@@ -596,7 +593,7 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn checkout_during_flush(&self) -> anyhow::Result<()> {
+    async fn checkout_during_flush(&self) -> Result<()> {
         let (record, checkout) = self
             .cache
             .checkout_session(&self.dm_address, &self.backend)
@@ -623,7 +620,7 @@ impl ChaosHarness {
         Ok(())
     }
 
-    async fn assert_invariants(&self) -> anyhow::Result<()> {
+    async fn assert_invariants(&self) -> Result<()> {
         let sessions = self.cache.lock_sessions().await;
         ensure!(
             sessions
@@ -691,7 +688,7 @@ fn fresh_session(rng: &mut rand::rngs::StdRng) -> SessionRecord {
     SessionRecord::new(state)
 }
 
-fn dm_chain_index(record: &SessionRecord) -> anyhow::Result<u32> {
+fn dm_chain_index(record: &SessionRecord) -> Result<u32> {
     Ok(record
         .session_state()
         .context("DM session state missing")?
@@ -700,7 +697,7 @@ fn dm_chain_index(record: &SessionRecord) -> anyhow::Result<u32> {
         .index())
 }
 
-fn group_position(record: &SenderKeyRecord) -> anyhow::Result<(u32, u32)> {
+fn group_position(record: &SenderKeyRecord) -> Result<(u32, u32)> {
     let state = record
         .sender_key_state()
         .map_err(|_| anyhow::anyhow!("group sender-key state missing"))?;
@@ -713,7 +710,7 @@ fn group_position(record: &SenderKeyRecord) -> anyhow::Result<(u32, u32)> {
     ))
 }
 
-fn group_key_fingerprint(record: &SenderKeyRecord) -> anyhow::Result<KeyIvFingerprint> {
+fn group_key_fingerprint(record: &SenderKeyRecord) -> Result<KeyIvFingerprint> {
     let message_key = record
         .sender_key_state()
         .map_err(|_| anyhow::anyhow!("group sender-key state missing"))?
@@ -770,7 +767,7 @@ fn env_usize(name: &str, default: usize) -> usize {
     parsed
 }
 
-async fn run_seed(seed: u64, steps: usize) -> anyhow::Result<()> {
+async fn run_seed(seed: u64, steps: usize) -> Result<()> {
     let mut harness = tokio::time::timeout(Duration::from_secs(5), ChaosHarness::new(seed))
         .await
         .context("chaos setup timed out")??;

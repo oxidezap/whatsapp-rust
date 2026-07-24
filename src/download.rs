@@ -177,13 +177,11 @@ async fn download_media_with_retry<
 ) -> Result<Vec<u8>>
 where
     PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
-    PrepareRequestsFut:
-        std::future::Future<Output = Result<Vec<wacore::download::DownloadRequest>>>,
+    PrepareRequestsFut: Future<Output = Result<Vec<wacore::download::DownloadRequest>>>,
     InvalidateMediaConn: FnMut() -> InvalidateMediaConnFut,
-    InvalidateMediaConnFut: std::future::Future<Output = ()>,
+    InvalidateMediaConnFut: Future<Output = ()>,
     ExecuteRequest: FnMut(wacore::download::DownloadRequest) -> ExecuteRequestFut,
-    ExecuteRequestFut:
-        std::future::Future<Output = std::result::Result<Vec<u8>, DownloadRequestError>>,
+    ExecuteRequestFut: Future<Output = std::result::Result<Vec<u8>, DownloadRequestError>>,
 {
     let mut force_refresh = false;
     let mut last_err: Option<anyhow::Error> = None;
@@ -243,13 +241,11 @@ async fn download_to_writer_with_retry<
 where
     W: Write + Seek + Send + 'static,
     PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
-    PrepareRequestsFut:
-        std::future::Future<Output = Result<Vec<wacore::download::DownloadRequest>>>,
+    PrepareRequestsFut: Future<Output = Result<Vec<wacore::download::DownloadRequest>>>,
     InvalidateMediaConn: FnMut() -> InvalidateMediaConnFut,
-    InvalidateMediaConnFut: std::future::Future<Output = ()>,
+    InvalidateMediaConnFut: Future<Output = ()>,
     ExecuteRequest: FnMut(wacore::download::DownloadRequest, W) -> ExecuteRequestFut,
-    ExecuteRequestFut:
-        std::future::Future<Output = Result<(W, std::result::Result<(), DownloadRequestError>)>>,
+    ExecuteRequestFut: Future<Output = Result<(W, std::result::Result<(), DownloadRequestError>)>>,
 {
     let mut force_refresh = false;
     let mut last_err: Option<anyhow::Error> = None;
@@ -677,7 +673,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(&err, wacore::download::MediaDecryptionError::InvalidMac),
+            matches!(&err, MediaDecryptionError::InvalidMac),
             "Expected InvalidMac, got: {}",
             err
         );

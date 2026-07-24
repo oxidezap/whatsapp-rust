@@ -572,11 +572,7 @@ mod tests {
     }
 
     /// Encode an ADVSignedDeviceIdentity without the account_signature_key field.
-    fn trimmed_device_identity(
-        account: &crate::libsignal::protocol::KeyPair,
-        device: &crate::libsignal::protocol::KeyPair,
-        details: &[u8],
-    ) -> Vec<u8> {
+    fn trimmed_device_identity(account: &KeyPair, device: &KeyPair, details: &[u8]) -> Vec<u8> {
         use buffa::Message;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = device.public_key.public_key_bytes();

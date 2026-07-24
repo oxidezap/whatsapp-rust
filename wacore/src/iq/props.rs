@@ -94,7 +94,7 @@ pub struct AbProp {
     pub config_expo_key: Option<u32>,
 }
 
-impl crate::protocol::ProtocolNode for AbProp {
+impl ProtocolNode for AbProp {
     fn tag(&self) -> &'static str {
         "prop"
     }
@@ -146,7 +146,7 @@ pub struct SamplingProp {
     pub sampling_weight: i32,
 }
 
-impl crate::protocol::ProtocolNode for SamplingProp {
+impl ProtocolNode for SamplingProp {
     fn tag(&self) -> &'static str {
         "prop"
     }
@@ -196,7 +196,7 @@ pub enum AbPropConfig {
     Sampling(SamplingProp),
 }
 
-impl crate::protocol::ProtocolNode for AbPropConfig {
+impl ProtocolNode for AbPropConfig {
     fn tag(&self) -> &'static str {
         "prop"
     }
@@ -255,7 +255,7 @@ pub struct PropsResponse {
     pub experiment_props: Vec<(u32, CompactString)>,
 }
 
-impl crate::protocol::ProtocolNode for PropsResponse {
+impl ProtocolNode for PropsResponse {
     fn tag(&self) -> &'static str {
         "props"
     }

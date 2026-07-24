@@ -1091,7 +1091,7 @@ impl buffa::DefaultInstance for DecryptionErrorMessageProto {
     }
 }
 
-impl buffa::Message for DecryptionErrorMessageProto {
+impl Message for DecryptionErrorMessageProto {
     fn compute_size(&self, _cache: &mut buffa::SizeCache) -> u32 {
         let mut size = 0u32;
         if let Some(ref v) = self.ratchet_key {
@@ -1124,7 +1124,7 @@ impl buffa::Message for DecryptionErrorMessageProto {
     fn merge_field(
         &mut self,
         tag: buffa::encoding::Tag,
-        buf: &mut impl buffa::bytes::Buf,
+        buf: &mut impl bytes::Buf,
         ctx: buffa::DecodeContext<'_>,
     ) -> core::result::Result<(), buffa::DecodeError> {
         use buffa::encoding::WireType;

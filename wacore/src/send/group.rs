@@ -86,7 +86,7 @@ pub struct GroupStanzaRequest<'a> {
     pub force_distribution: bool,
     pub distribution_targets: Option<Vec<Jid>>,
     pub distribution_policy: SenderKeyDistributionPolicy,
-    pub phash_devices: Option<&'a super::ResolvedGroupDevices>,
+    pub phash_devices: Option<&'a ResolvedGroupDevices>,
     pub edit: Option<&'a crate::types::message::EditAttribute>,
     pub extra_nodes: &'a [Node],
     pub pre_encoded: Option<&'a [u8]>,

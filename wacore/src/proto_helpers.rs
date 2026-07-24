@@ -125,7 +125,7 @@ impl MessageBuilderExt for wa::Message {
 pub trait MessageExt {
     /// Recursively unwraps ephemeral/view-once/document_with_caption/edited wrappers to get the core message.
     fn get_base_message(&self) -> &wa::Message;
-    /// Consuming version of [`get_base_message`]. Moves the innermost message out of
+    /// Consuming version of [`get_base_message`](Self::get_base_message). Moves the innermost message out of
     /// wrapper types (device_sent, ephemeral, view_once, etc.) without cloning.
     fn into_base_message(self) -> wa::Message;
     fn is_ephemeral(&self) -> bool;

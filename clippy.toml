@@ -27,3 +27,8 @@ disallowed-types = [
     { path = "std::sync::atomic::AtomicU64", reason = "use portable_atomic::AtomicU64 (no native 64-bit atomics on 32-bit targets like Xtensa/ESP32)" },
     { path = "std::sync::atomic::AtomicI64", reason = "use portable_atomic::AtomicI64 (no native 64-bit atomics on 32-bit targets like Xtensa/ESP32)" },
 ]
+
+# The print lints (`print_stdout`/`print_stderr`, workspace-level) target the
+# library: diagnostics belong in `log`. Test bodies use prints as inspection
+# output under `--nocapture`, which is legitimate.
+allow-print-in-tests = true

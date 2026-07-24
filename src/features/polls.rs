@@ -210,7 +210,7 @@ impl<'a> Polls<'a> {
     /// the LID migration still open. Mirrors WA Web `WAWebAddonEncryption`.
     pub async fn decrypt_vote(
         &self,
-        ciphertext: poll::PollVoteCiphertext<'_>,
+        ciphertext: PollVoteCiphertext<'_>,
         message_secret: &[u8],
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
@@ -271,7 +271,7 @@ impl<'a> Polls<'a> {
     pub async fn aggregate_votes(
         &self,
         poll_options: &[String],
-        votes: &[(&Jid, poll::PollVoteCiphertext<'_>)],
+        votes: &[(&Jid, PollVoteCiphertext<'_>)],
         message_secret: &[u8],
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
@@ -585,7 +585,7 @@ mod tests {
         let out = client
             .polls()
             .decrypt_vote(
-                poll::PollVoteCiphertext {
+                PollVoteCiphertext {
                     enc_payload: &enc,
                     enc_iv: &iv,
                 },
@@ -619,7 +619,7 @@ mod tests {
         let res = client
             .polls()
             .decrypt_vote(
-                poll::PollVoteCiphertext {
+                PollVoteCiphertext {
                     enc_payload: &enc,
                     enc_iv: &iv,
                 },
@@ -663,9 +663,9 @@ mod tests {
         .unwrap();
 
         let voter_lid_jid = Jid::lid(voter_lid);
-        let votes: Vec<(&Jid, poll::PollVoteCiphertext)> = vec![(
+        let votes: Vec<(&Jid, PollVoteCiphertext)> = vec![(
             &voter_lid_jid,
-            poll::PollVoteCiphertext {
+            PollVoteCiphertext {
                 enc_payload: &enc,
                 enc_iv: &iv,
             },
@@ -726,17 +726,17 @@ mod tests {
 
         let voter_pn_jid = Jid::pn(voter_pn);
         let voter_lid_jid = Jid::lid(voter_lid);
-        let votes: Vec<(&Jid, poll::PollVoteCiphertext)> = vec![
+        let votes: Vec<(&Jid, PollVoteCiphertext)> = vec![
             (
                 &voter_pn_jid,
-                poll::PollVoteCiphertext {
+                PollVoteCiphertext {
                     enc_payload: &enc_pn,
                     enc_iv: &iv_pn,
                 },
             ),
             (
                 &voter_lid_jid,
-                poll::PollVoteCiphertext {
+                PollVoteCiphertext {
                     enc_payload: &enc_lid,
                     enc_iv: &iv_lid,
                 },
@@ -797,17 +797,17 @@ mod tests {
 
         let voter_pn_jid = Jid::pn(voter_pn);
         let voter_lid_jid = Jid::lid(voter_lid);
-        let votes: Vec<(&Jid, poll::PollVoteCiphertext)> = vec![
+        let votes: Vec<(&Jid, PollVoteCiphertext)> = vec![
             (
                 &voter_pn_jid,
-                poll::PollVoteCiphertext {
+                PollVoteCiphertext {
                     enc_payload: &enc_pn,
                     enc_iv: &iv_pn,
                 },
             ),
             (
                 &voter_lid_jid,
-                poll::PollVoteCiphertext {
+                PollVoteCiphertext {
                     enc_payload: &enc_clear,
                     enc_iv: &iv_clear,
                 },

@@ -594,7 +594,7 @@ pub struct DeviceListSpec {
     /// `<user jid="..."><devices device_hash="2:.." ts="N"/></user>` so the server
     /// returns only CHANGED users (WA Web `syncDeviceList`). Users the server omits
     /// from the response are UNCHANGED and their cached devices must be preserved.
-    pub hashes: std::collections::HashMap<Jid, (String, i64)>,
+    pub hashes: HashMap<Jid, (String, i64)>,
 }
 
 impl DeviceListSpec {
@@ -602,7 +602,7 @@ impl DeviceListSpec {
         Self {
             jids,
             sid: sid.into(),
-            hashes: std::collections::HashMap::new(),
+            hashes: HashMap::new(),
         }
     }
 
@@ -611,7 +611,7 @@ impl DeviceListSpec {
     pub fn with_hashes(
         jids: Vec<Jid>,
         sid: impl Into<String>,
-        hashes: std::collections::HashMap<Jid, (String, i64)>,
+        hashes: HashMap<Jid, (String, i64)>,
     ) -> Self {
         Self {
             jids,
@@ -1421,7 +1421,7 @@ mod tests {
         let spec = DeviceListSpec {
             jids: vec![jid.clone()],
             sid: "test-sid".to_string(),
-            hashes: std::collections::HashMap::new(),
+            hashes: HashMap::new(),
         };
 
         let DeviceListSpec { jids, sid, hashes } = spec;
@@ -1433,7 +1433,7 @@ mod tests {
     #[test]
     fn test_device_list_spec_build_iq_with_device_hash() {
         let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
-        let mut hashes = std::collections::HashMap::new();
+        let mut hashes = HashMap::new();
         hashes.insert(jid.clone(), ("2:cachedhash".to_string(), 1_700_000_000i64));
         let spec = DeviceListSpec::with_hashes(vec![jid], "sid-h", hashes);
         let iq = spec.build_iq();
@@ -1477,8 +1477,7 @@ mod tests {
         let best_effort = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-best-effort");
         let complete = DeviceListSpec::new(vec![a.clone(), b.clone()], "sid-complete")
             .require_complete_response();
-        let incremental =
-            DeviceListSpec::with_hashes(vec![a, b], "sid-omit", std::collections::HashMap::new());
+        let incremental = DeviceListSpec::with_hashes(vec![a, b], "sid-omit", HashMap::new());
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
@@ -1563,11 +1562,7 @@ mod tests {
             DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-best-effort");
         let complete = DeviceListSpec::new(vec![jid1.clone(), jid2.clone()], "test-sid-complete")
             .require_complete_response();
-        let incremental = DeviceListSpec::with_hashes(
-            vec![jid1, jid2],
-            "test-sid",
-            std::collections::HashMap::new(),
-        );
+        let incremental = DeviceListSpec::with_hashes(vec![jid1, jid2], "test-sid", HashMap::new());
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")

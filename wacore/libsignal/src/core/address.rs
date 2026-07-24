@@ -44,7 +44,7 @@ pub struct SpecificServiceId<const RAW_KIND: u8>(Uuid);
 impl<const KIND: u8> SpecificServiceId<KIND> {
     #[inline]
     pub const fn from_uuid_bytes(bytes: [u8; 16]) -> Self {
-        Self::from_uuid(uuid::Uuid::from_bytes(bytes))
+        Self::from_uuid(Uuid::from_bytes(bytes))
     }
 
     #[inline]
@@ -53,8 +53,8 @@ impl<const KIND: u8> SpecificServiceId<KIND> {
     }
 }
 
-impl<const KIND: u8> std::hash::Hash for SpecificServiceId<KIND> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<const KIND: u8> Hash for SpecificServiceId<KIND> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         state.write(self.0.as_bytes());
     }
 }

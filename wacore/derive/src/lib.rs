@@ -40,7 +40,7 @@ use syn::{Data, DeriveInput, Fields, parse_macro_input};
 /// - `#[attr(name = "attrname", default = "value")]` - Attribute with default value.
 ///   For `Option<String>` fields, a default always yields `Some(default)`.
 /// - `#[attr(name = "attrname", jid)]` - Marks a Jid field as a JID attribute (required).
-/// - `#[attr(name = "attrname", jid, optional)]` - Marks an Option<Jid> field as optional.
+/// - `#[attr(name = "attrname", jid, optional)]` - Marks an `Option<Jid>` field as optional.
 /// - `#[attr(name = "attrname", string_enum)]` - Marks a field whose type derives `WireEnum` in unit-string mode (uses `as_str()`/`TryFrom`).
 /// - `#[attr(name = "attrname", u64)]` - Marks a u64 numeric attribute.
 /// - `#[attr(name = "attrname", u32)]` - Marks a u32 numeric attribute.
@@ -672,7 +672,7 @@ enum VariantWire {
 
 struct VariantInfo {
     ident: syn::Ident,
-    fields: syn::Fields,
+    fields: Fields,
     wire: Option<VariantWire>,
     aliases: Vec<String>,
     is_default: bool,
@@ -799,7 +799,7 @@ fn expand_wire_enum_unit(
                 .to_compile_error();
             }
             match &info.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
                 _ => {
                     return syn::Error::new_spanned(
                         &info.ident,
@@ -821,7 +821,7 @@ fn expand_wire_enum_unit(
             }
             continue;
         }
-        if !matches!(info.fields, syn::Fields::Unit) {
+        if !matches!(info.fields, Fields::Unit) {
             return syn::Error::new_spanned(
                 &info.ident,
                 "unit-string WireEnum only supports unit variants (use #[wire_fallback] for a catch-all)",
@@ -1127,7 +1127,7 @@ fn expand_wire_enum_int(
                 .to_compile_error();
             }
             match &info.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
                 _ => {
                     return syn::Error::new_spanned(
                         &info.ident,
@@ -1139,7 +1139,7 @@ fn expand_wire_enum_int(
             fallback = Some(info);
             continue;
         }
-        if !matches!(info.fields, syn::Fields::Unit) {
+        if !matches!(info.fields, Fields::Unit) {
             return syn::Error::new_spanned(
                 &info.ident,
                 "int-mode WireEnum variants must be unit variants (except the #[wire_fallback])",
@@ -1309,7 +1309,7 @@ fn expand_wire_enum_tagged(
             // Must be { tag: String }
             let ok = matches!(
                 &info.fields,
-                syn::Fields::Named(n)
+                Fields::Named(n)
                     if n.named.len() == 1
                         && n.named
                             .first()
@@ -1370,9 +1370,9 @@ fn expand_wire_enum_tagged(
         }
         for info in &infos {
             let fields = match &info.fields {
-                syn::Fields::Named(fields) => &fields.named,
-                syn::Fields::Unnamed(fields) => &fields.unnamed,
-                syn::Fields::Unit => continue,
+                Fields::Named(fields) => &fields.named,
+                Fields::Unnamed(fields) => &fields.unnamed,
+                Fields::Unit => continue,
             };
             if let Some(field) = fields
                 .iter()
@@ -1401,9 +1401,9 @@ fn expand_wire_enum_tagged(
                     unreachable!()
                 };
                 match &info.fields {
-                    syn::Fields::Unit => quote! { #name::#id => #s },
-                    syn::Fields::Named(_) => quote! { #name::#id { .. } => #s },
-                    syn::Fields::Unnamed(_) => quote! { #name::#id(..) => #s },
+                    Fields::Unit => quote! { #name::#id => #s },
+                    Fields::Named(_) => quote! { #name::#id { .. } => #s },
+                    Fields::Unnamed(_) => quote! { #name::#id(..) => #s },
                 }
             }
         })
@@ -1433,8 +1433,8 @@ fn expand_wire_enum_tagged(
                     .iter()
                     .map(|alias| quote! { #[serde(alias = #alias)] });
                 let fields = match &info.fields {
-                    syn::Fields::Unit => quote! {},
-                    syn::Fields::Named(fields) => {
+                    Fields::Unit => quote! {},
+                    Fields::Named(fields) => {
                         let declarations = fields.named.iter().map(|field| {
                             let field_id = field.ident.as_ref().unwrap();
                             let ty = &field.ty;
@@ -1442,7 +1442,7 @@ fn expand_wire_enum_tagged(
                         });
                         quote! { { #(#declarations),* } }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let declarations = fields.unnamed.iter().map(|field| {
                             let ty = &field.ty;
                             quote! { &'__wire #ty }
@@ -1470,8 +1470,8 @@ fn expand_wire_enum_tagged(
                     .iter()
                     .map(|alias| quote! { #[serde(alias = #alias)] });
                 let fields = match &info.fields {
-                    syn::Fields::Unit => quote! {},
-                    syn::Fields::Named(fields) => {
+                    Fields::Unit => quote! {},
+                    Fields::Named(fields) => {
                         let declarations = fields.named.iter().map(|field| {
                             let field_id = field.ident.as_ref().unwrap();
                             let ty = &field.ty;
@@ -1479,7 +1479,7 @@ fn expand_wire_enum_tagged(
                         });
                         quote! { { #(#declarations),* } }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let declarations = fields.unnamed.iter().map(|field| {
                             let ty = &field.ty;
                             quote! { #ty }
@@ -1500,10 +1500,10 @@ fn expand_wire_enum_tagged(
             .map(|info| {
                 let id = &info.ident;
                 match &info.fields {
-                    syn::Fields::Unit => {
+                    Fields::Unit => {
                         quote! { #name::#id => #borrowed_ident::#id }
                     }
-                    syn::Fields::Named(fields) => {
+                    Fields::Named(fields) => {
                         let bindings = fields
                             .named
                             .iter()
@@ -1514,7 +1514,7 @@ fn expand_wire_enum_tagged(
                                 #borrowed_ident::#id { #(#values),* }
                         }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let bindings: Vec<_> = (0..fields.unnamed.len())
                             .map(|index| quote::format_ident!("__field_{index}"))
                             .collect();
@@ -1533,8 +1533,8 @@ fn expand_wire_enum_tagged(
             .map(|info| {
                 let id = &info.ident;
                 match &info.fields {
-                    syn::Fields::Unit => quote! { #owned_ident::#id => #name::#id },
-                    syn::Fields::Named(fields) => {
+                    Fields::Unit => quote! { #owned_ident::#id => #name::#id },
+                    Fields::Named(fields) => {
                         let bindings = fields
                             .named
                             .iter()
@@ -1545,7 +1545,7 @@ fn expand_wire_enum_tagged(
                                 #name::#id { #(#values),* }
                         }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let bindings: Vec<_> = (0..fields.unnamed.len())
                             .map(|index| quote::format_ident!("__field_{index}"))
                             .collect();
@@ -1606,8 +1606,8 @@ fn expand_wire_enum_tagged(
                     quote! { #name::#id { tag: _ } => {} }
                 } else {
                     match &info.fields {
-                        syn::Fields::Unit => quote! { #name::#id => {} },
-                        syn::Fields::Named(named) => {
+                        Fields::Unit => quote! { #name::#id => {} },
+                        Fields::Named(named) => {
                             let bindings: Vec<proc_macro2::TokenStream> = named
                                 .named
                                 .iter()
@@ -1650,7 +1650,7 @@ fn expand_wire_enum_tagged(
                                 }
                             }
                         }
-                        syn::Fields::Unnamed(_) => quote! {
+                        Fields::Unnamed(_) => quote! {
                             compile_error!("tagged WireEnum tuple variants require #[wire(content = \"...\")]");
                         },
                     }

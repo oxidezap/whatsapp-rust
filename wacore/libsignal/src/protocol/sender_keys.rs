@@ -41,7 +41,7 @@ pub struct SenderMessageKey {
 impl SenderMessageKey {
     pub fn new(iteration: u32, seed: [u8; 32]) -> Self {
         let mut derived = [0u8; 48];
-        hkdf::Hkdf::<sha2::Sha256>::new(None, &seed)
+        hkdf::Hkdf::<Sha256>::new(None, &seed)
             .expand(b"WhisperGroup", &mut derived)
             .expect("valid output length");
         Self {
@@ -827,9 +827,8 @@ impl SenderKeyRecord {
             .iter()
             .map(|s| {
                 s.state.compute_size(&mut cache) as usize
-                    + s.message_keys.len() * std::mem::size_of::<StoredMessageKey>()
-                    + s.sender_chain
-                        .map_or(0, |_| std::mem::size_of::<SenderChainKey>())
+                    + s.message_keys.len() * size_of::<StoredMessageKey>()
+                    + s.sender_chain.map_or(0, |_| size_of::<SenderChainKey>())
             })
             .sum()
     }
@@ -982,7 +981,7 @@ mod tests {
     #[test]
     fn signing_key_memo_warms_on_first_use_and_survives_clone() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let signing = crate::core::curve::KeyPair::generate(&mut rng);
+        let signing = KeyPair::generate(&mut rng);
         let chain_key = [7u8; 32];
         let state = SenderKeyState::new(
             3,

@@ -115,7 +115,7 @@ pub fn collect_simple_message_ids(
 /// `whatsapp-rust` crate), which is authoritative and intentionally diverges
 /// here (it also sends `<receipt context="status">` for status broadcasts,
 /// which this copy still skips). The self-fanout rule is shared via
-/// [`MessageSource::is_self_fanout`].
+/// [`MessageSource::is_self_fanout`](crate::types::message::MessageSource::is_self_fanout).
 pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
     if info.id.is_empty()
         || info.source.chat.user == STATUS_BROADCAST_USER

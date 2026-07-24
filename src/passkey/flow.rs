@@ -7,8 +7,8 @@
 //! companion finally sends its rotated ADV secret encrypted under that key. Linking
 //! then completes through the ordinary `pair-success` path.
 //!
-//! The handshake state machine ([`ShortcakeSession`]) drives against a
-//! [`ShortcakeIo`] seam rather than the concrete [`Client`], so the full IQ
+//! The handshake state machine (`ShortcakeSession`) drives against a
+//! `ShortcakeIo` seam rather than the concrete [`Client`], so the full IQ
 //! sequence is unit-testable with a scripted stand-in.
 
 use crate::client::Client;
@@ -1051,7 +1051,7 @@ mod tests {
         let pn: Jid = "15551230000:1@s.whatsapp.net".parse().unwrap();
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetId(Some(pn)))
+            .process_command(DeviceCommand::SetId(Some(pn)))
             .await;
         drive_passkey_request(&client, "{}".to_string()).await;
         assert!(

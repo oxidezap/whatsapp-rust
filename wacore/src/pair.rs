@@ -696,9 +696,9 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account_kp = KeyPair::generate(&mut rng);
         let account_type = if is_hosted {
-            wa::ADVEncryptionType::HOSTED
+            ADVEncryptionType::HOSTED
         } else {
-            wa::ADVEncryptionType::E2EE
+            ADVEncryptionType::E2EE
         };
         let inner = wa::ADVDeviceIdentity {
             raw_id: Some(1),

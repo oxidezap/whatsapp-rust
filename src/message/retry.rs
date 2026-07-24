@@ -72,14 +72,14 @@ impl Client {
             wacore::types::message::ChatMessageId::new(info.source.chat.clone(), info.id.clone());
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
-        let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fresh_clone = fresh.clone();
         self.undecryptable_dispatched
             .get_with(dedup_key, async move {
-                fresh_clone.store(true, std::sync::atomic::Ordering::Release);
+                fresh_clone.store(true, Ordering::Release);
             })
             .await;
-        let was_fresh = fresh.load(std::sync::atomic::Ordering::Acquire);
+        let was_fresh = fresh.load(Ordering::Acquire);
         if was_fresh {
             wacore::telemetry::recv("undecryptable");
             self.core.event_bus.dispatch(Event::UndecryptableMessage(

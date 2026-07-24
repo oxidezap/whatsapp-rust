@@ -109,7 +109,7 @@ struct BenchRuntime;
 impl Runtime for BenchRuntime {
     fn spawn(
         &self,
-        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        mut future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     ) -> AbortHandle {
         // Nested `futures::executor::block_on` panics, so drive the task with
         // a noop-waker poll loop. Encrypt tasks are CPU-bound and complete
@@ -129,18 +129,18 @@ impl Runtime for BenchRuntime {
     fn sleep(
         &self,
         _duration: std::time::Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
         unimplemented!("BenchRuntime::sleep is not used by the bench")
     }
 
     fn spawn_blocking(
         &self,
         _f: Box<dyn FnOnce() + Send + 'static>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
         unimplemented!("BenchRuntime::spawn_blocking is not used by the bench")
     }
 
-    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
         None
     }
 }

@@ -166,10 +166,7 @@ pub trait SignalStore: Send + Sync {
     /// Default implementation falls back to individual `put_identity` calls.
     /// Addresses are `Arc<str>` so callers (the flush path) pass shared keys
     /// without allocating a `String` per entry.
-    async fn put_identities_batch(
-        &self,
-        identities: &[(std::sync::Arc<str>, [u8; 32])],
-    ) -> Result<()> {
+    async fn put_identities_batch(&self, identities: &[(Arc<str>, [u8; 32])]) -> Result<()> {
         for (address, key) in identities {
             self.put_identity(address, *key).await?;
         }
@@ -192,7 +189,7 @@ pub trait SignalStore: Send + Sync {
 
     /// Store multiple encrypted sessions in a single batch operation.
     /// Default implementation falls back to individual `put_session` calls.
-    async fn put_sessions_batch(&self, sessions: &[(std::sync::Arc<str>, Bytes)]) -> Result<()> {
+    async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
         for (address, session) in sessions {
             self.put_session(address, session).await?;
         }
@@ -280,10 +277,7 @@ pub trait SignalStore: Send + Sync {
 
     /// Store multiple sender keys in a single batch operation.
     /// Default implementation falls back to individual `put_sender_key` calls.
-    async fn put_sender_keys_batch(
-        &self,
-        sender_keys: &[(std::sync::Arc<str>, Bytes)],
-    ) -> Result<()> {
+    async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
         for (address, record) in sender_keys {
             self.put_sender_key(address, record).await?;
         }
@@ -326,7 +320,7 @@ pub trait AppSyncStore: Send + Sync {
     /// Get a mutation MAC by index.
     async fn get_mutation_mac(&self, name: &str, index_mac: &[u8]) -> Result<Option<Vec<u8>>>;
 
-    /// Batch variant of [`get_mutation_mac`]: fetch many previous-MAC values in a
+    /// Batch variant of [`get_mutation_mac`](Self::get_mutation_mac): fetch many previous-MAC values in a
     /// single backend round-trip. The default delegates to per-item lookups;
     /// backends with a set-membership query (SQL `IN (...)`) should override to
     /// avoid an N+1 (one DB round-trip per mutation in appstate sync).
@@ -709,7 +703,7 @@ pub trait DeviceStore: Send + Sync {
     /// Best-effort process-local memory this backend attributes to the session
     /// (e.g. a SQLite page cache — often the single largest per-session chunk,
     /// living entirely outside the `Client`). Defaults to an all-`None`
-    /// [`StorageResourceReport`] ("not reported"); backends that can introspect
+    /// [`StorageResourceReport`](crate::stats::StorageResourceReport) ("not reported"); backends that can introspect
     /// their memory override it, and remote/store-backed backends report
     /// `memory_bytes: Some(0)` (their data isn't process memory).
     ///

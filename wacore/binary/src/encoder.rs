@@ -947,7 +947,7 @@ mod tests {
     use crate::node::Attrs;
     use std::io::Cursor;
 
-    type TestResult = crate::error::Result<()>;
+    type TestResult = Result<()>;
 
     #[test]
     fn test_encode_node() -> TestResult {

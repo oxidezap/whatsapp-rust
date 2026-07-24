@@ -338,12 +338,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
     let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
 
     let outcome = client
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &sender_jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     assert!(
@@ -412,12 +407,7 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
     ];
 
     let outcome = client
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &sender_jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     assert!(
@@ -503,12 +493,7 @@ async fn test_empty_session_record_treated_as_session_not_found() {
 
     let outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &sender_jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     // Should behave identically to SessionNotFound: failure, no dupe, event dispatched.
@@ -861,12 +846,7 @@ async fn submit_and_check_session(
     });
     let outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            peer_jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, peer_jid, DecryptFailMode::Show)
         .await;
     let backend = client.persistence_manager.backend();
     let still = client
@@ -1004,12 +984,7 @@ async fn migration_plaintext_failure_nacks_without_signal_retry() {
 
     let outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &alice_lid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &alice_lid, DecryptFailMode::Show)
         .await;
 
     assert!(
@@ -1138,12 +1113,7 @@ async fn test_badmac_preserves_session() {
 
     let outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &alice.jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &alice.jid, DecryptFailMode::Show)
         .await;
     assert!(!outcome.decrypted, "tampered MAC must not decrypt");
     assert!(
@@ -1302,12 +1272,7 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
     });
     let _outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &alice.jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &alice.jid, DecryptFailMode::Show)
         .await;
     // Confirm the BadMac branch executed (parse-error path would skip
     // both retry caches; another arm would record a different reason).
@@ -2166,7 +2131,7 @@ async fn test_second_message_with_only_skmsg_decrypts() {
     // Create message with ONLY skmsg (simulating second message after session established)
     let skmsg_ciphertext = {
         let mut device_guard = device_arc.write().await;
-        let sender_key_msg = wacore::libsignal::protocol::group_encrypt(
+        let sender_key_msg = group_encrypt(
             &mut *device_guard,
             &sender_key_name,
             b"ping",
@@ -2271,12 +2236,7 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
     // Call process_session_enc_batch
     // This should handle any errors gracefully without panicking
     let outcome = client
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &sender_jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     log::info!(
@@ -2360,12 +2320,7 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
     // Process the batch
     // Should handle all errors gracefully without stopping at first error
     let outcome = client
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &sender_jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
         .await;
 
     log::info!(
@@ -2435,12 +2390,7 @@ async fn test_untrusted_identity_in_group_context() {
     // Process the message
     // Should handle errors gracefully in group context
     let outcome = client
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &sender_phone,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &sender_phone, DecryptFailMode::Show)
         .await;
 
     log::info!(
@@ -3066,7 +3016,7 @@ async fn test_pn_message_uses_lid_for_session_lookup_when_mapping_known() {
     );
 
     // Test scenario: Parse a PN-addressed DM message (with sender_lid attribute)
-    let dm_node_with_sender_lid = wacore_binary::builder::NodeBuilder::new("message")
+    let dm_node_with_sender_lid = NodeBuilder::new("message")
         .attr("from", Jid::pn(phone).to_string())
         .attr("sender_lid", Jid::lid(lid).to_string())
         .attr("id", "test_dm_with_lid")
@@ -3197,7 +3147,7 @@ async fn test_pn_message_uses_cached_lid_without_sender_lid_attribute() {
     client.lid_pn_cache.add(&entry).await;
 
     // Parse a PN-addressed DM message WITHOUT sender_lid attribute
-    let dm_node_without_sender_lid = wacore_binary::builder::NodeBuilder::new("message")
+    let dm_node_without_sender_lid = NodeBuilder::new("message")
         .attr("from", Jid::pn(phone).to_string())
         // Note: No sender_lid attribute!
         .attr("id", "test_dm_no_lid")
@@ -3303,7 +3253,7 @@ async fn test_pn_message_uses_pn_when_no_lid_mapping() {
     // Don't populate the cache - simulate first-time contact
 
     // Parse a PN-addressed DM message without sender_lid
-    let dm_node = wacore_binary::builder::NodeBuilder::new("message")
+    let dm_node = NodeBuilder::new("message")
         .attr("from", Jid::pn(phone).to_string())
         .attr("id", "test_dm_no_mapping")
         .attr("t", "1765494882")
@@ -6785,11 +6735,7 @@ async fn decrypt_failure_emits_transport_ack() {
     });
 
     client
-        .handle_decrypt_failure(
-            &info,
-            RetryReason::BadMac,
-            crate::types::events::DecryptFailMode::Hide,
-        )
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide)
         .await;
 
     // retry + ack are detached spawns; poll the wire until the ack appears.
@@ -6838,11 +6784,7 @@ async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
     });
 
     client
-        .handle_decrypt_failure(
-            &info,
-            RetryReason::BadMac,
-            crate::types::events::DecryptFailMode::Hide,
-        )
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide)
         .await;
 
     let mut found = None;
@@ -6904,11 +6846,7 @@ async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
     });
 
     client
-        .handle_decrypt_failure(
-            &info,
-            RetryReason::BadMac,
-            crate::types::events::DecryptFailMode::Hide,
-        )
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Hide)
         .await;
 
     // Positive: the message IS cleared, via the bot-invoke-response bare
@@ -6956,11 +6894,7 @@ async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
     });
     transport.fail_next_sends(1);
     client
-        .handle_decrypt_failure(
-            &info,
-            RetryReason::BadMac,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
         .await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while transport.failed_sends() == 0 {
@@ -6994,11 +6928,7 @@ async fn decrypt_failure_sends_retry_before_ack() {
     // BadMac (not NoSession) so the retry receipt carries no keys and needs
     // no device account in this harness.
     client
-        .handle_decrypt_failure(
-            &info,
-            RetryReason::BadMac,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
         .await;
 
     let find = |tag: &str, retry: bool| -> Option<usize> {
@@ -7055,11 +6985,7 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
     });
 
     client
-        .handle_decrypt_failure(
-            &info,
-            RetryReason::BadMac,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
         .await;
 
     // status failures are acked from the flushed task (not just the detached
@@ -7117,11 +7043,9 @@ async fn process_session_ct(
                 group_payloads: vec![],
                 bot_payloads: vec![],
                 max_sender_retry_count: 0,
-                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+                decrypt_fail_mode: DecryptFailMode::Show,
             },
-            client
-                .connection_generation
-                .load(std::sync::atomic::Ordering::Acquire),
+            client.connection_generation.load(Ordering::Acquire),
         )
         .await;
 }
@@ -7222,11 +7146,9 @@ async fn process_group_classified_with_payloads(
                 group_payloads,
                 bot_payloads,
                 max_sender_retry_count: 0,
-                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+                decrypt_fail_mode: DecryptFailMode::Show,
             },
-            client
-                .connection_generation
-                .load(std::sync::atomic::Ordering::Acquire),
+            client.connection_generation.load(Ordering::Acquire),
         )
         .await;
 }
@@ -7942,11 +7864,7 @@ async fn error_message_ack_is_not_counted_as_positive_confirmation() {
         ..Default::default()
     });
 
-    client.spawn_nack(
-        &info,
-        wacore::protocol::nack::NackReason::ParsingError,
-        None,
-    );
+    client.spawn_nack(&info, NackReason::ParsingError, None);
 
     let mut nack_code = None;
     for _ in 0..80 {
@@ -8519,7 +8437,7 @@ async fn custom_handler_only_skips_fallback_ack() {
             &self,
             _client: Arc<Client>,
             _enc_node: &wacore_binary::Node,
-            _info: &crate::types::message::MessageInfo,
+            _info: &MessageInfo,
         ) -> anyhow::Result<()> {
             *self.calls.lock().await += 1;
             Ok(())
@@ -8533,7 +8451,7 @@ async fn custom_handler_only_skips_fallback_ack() {
     });
     // custom_enc_handlers is set-once (immutable after build); capturing_client
     // builds via Client::new and leaves it unset, so set it here.
-    let mut handlers = std::collections::HashMap::new();
+    let mut handlers = HashMap::new();
     handlers.insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
     // set() returns Err(map) on the already-set path; the map isn't Debug, so
     // assert via is_ok() rather than expect().
@@ -8960,9 +8878,7 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
         "an uncertain transport failure must not retry on the same Noise connection"
     );
 
-    client
-        .connection_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
     client.offline_sync_notifier.notify(usize::MAX);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while transport.sent_count() == sent_before {
@@ -8998,7 +8914,7 @@ async fn app_state_key_share_preparation_failure_is_retried() {
     let sent_before = transport.sent_count();
     client
         .app_state_key_share_prepare_test_failures
-        .store(1, std::sync::atomic::Ordering::Release);
+        .store(1, Ordering::Release);
     client.schedule_app_state_sync_key_share(
         requester,
         wa::message::AppStateSyncKeyRequest {
@@ -9019,7 +8935,7 @@ async fn app_state_key_share_preparation_failure_is_retried() {
     assert_eq!(
         client
             .app_state_key_share_prepare_test_failures
-            .load(std::sync::atomic::Ordering::Acquire),
+            .load(Ordering::Acquire),
         0
     );
 }
@@ -9062,9 +8978,7 @@ async fn app_state_key_share_survives_a_closed_flush_scope() {
     .expect("key-share job should observe the closed scope");
     assert_eq!(transport.sent_count(), sent_before);
 
-    client
-        .connection_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
     client.outbound_flush.reopen();
     client.offline_sync_notifier.notify(usize::MAX);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -9526,7 +9440,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
     };
     let client = crate::test_utils::create_test_client_with_config(
         "resolver_edit",
-        Arc::new(crate::test_utils::MockHttpClient),
+        Arc::new(MockHttpClient),
         cfg,
     )
     .await;
@@ -10817,7 +10731,7 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     };
     let client = crate::test_utils::create_test_client_with_config(
         "botonly_capture",
-        Arc::new(crate::test_utils::MockHttpClient),
+        Arc::new(MockHttpClient),
         cfg,
     )
     .await;
@@ -11913,12 +11827,7 @@ async fn bench_feed(
     });
     let outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            peer,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, peer, DecryptFailMode::Show)
         .await;
     outcome.decrypted && !outcome.undecryptable
 }
@@ -12122,12 +12031,7 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
 
     let outcome = client
         .clone()
-        .process_session_enc_batch(
-            payloads,
-            &info,
-            &alice.jid,
-            crate::types::events::DecryptFailMode::Show,
-        )
+        .process_session_enc_batch(payloads, &info, &alice.jid, DecryptFailMode::Show)
         .await;
     assert!(
         !outcome.decrypted,

@@ -3,6 +3,7 @@
 name = "whatsapp-rust"
 version = "0.6.0"
 edition = "2024"
+rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
@@ -46,6 +47,12 @@ default-members = [
     "waproto",
 ]
 
+# Minimum supported Rust version. Floor is the stable release CI's
+# "Test Stable (no-simd)" job pins; raise both together (that job's
+# `toolchain:` and this value) when a dependency or language feature needs it.
+[workspace.package]
+rust-version = "1.94"
+
 [workspace.lints.clippy]
 # Force the wacore::time abstraction so WASM/deterministic-test builds don't
 # regress. Exceptions carry `#[allow(clippy::disallowed_methods)]` inline.
@@ -53,9 +60,18 @@ disallowed_methods = "deny"
 # Ban std 64-bit atomic types: absent on 32-bit targets (Xtensa/ESP32). Use
 # portable_atomic. Host-only test/bench counters carry an inline allow.
 disallowed_types = "deny"
+# Leftover debugging aids must never reach a release: `dbg!` writes to stderr
+# unconditionally and `todo!` panics at runtime.
+dbg_macro = "deny"
+todo = "deny"
+# The library routes diagnostics through `log`; a stray print bypasses the
+# consumer's logger. Tests and build scripts are exempt (see clippy.toml).
+print_stdout = "warn"
+print_stderr = "warn"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+unused_qualifications = "warn"
 
 [workspace.dependencies]
 # Shared dependencies

@@ -319,7 +319,7 @@ impl IdentityKeyStore for IdentityAdapter {
 /// Decode the cache's raw 32-byte DJB public key bytes; empty/absent = no
 /// identity (mirrors the previous inline match in `get_identity`).
 fn parse_cached_identity(
-    data: Option<std::sync::Arc<[u8]>>,
+    data: Option<Arc<[u8]>>,
 ) -> Result<Option<IdentityKey>, SignalProtocolError> {
     match data {
         Some(data) if !data.is_empty() => {
@@ -430,21 +430,18 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
             .cache
             .get_sender_key(sender_key_name, &*device.backend)
             .await
-            .map(|opt| opt.map(std::sync::Arc::unwrap_or_clone))
+            .map(|opt| opt.map(Arc::unwrap_or_clone))
             .map_err(signal_err("backend"))
     }
 
-    async fn sender_key_lock(
-        &self,
-        sender_key_name: &SenderKeyName,
-    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+    async fn sender_key_lock(&self, sender_key_name: &SenderKeyName) -> Arc<async_lock::Mutex<()>> {
         self.0.cache.sender_key_lock(sender_key_name).await
     }
 
     async fn session_setup_lock(
         &self,
         sender_key_name: &SenderKeyName,
-    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+    ) -> Arc<async_lock::Mutex<()>> {
         self.0.cache.session_setup_lock(sender_key_name).await
     }
 }
@@ -476,12 +473,7 @@ mod tests {
 
         let addr = ProtocolAddress::new("bob".to_string(), 1.into());
         // The real path stores the promoted session before buffering the prekey.
-        cache
-            .put_session(
-                &addr,
-                wacore::libsignal::protocol::SessionRecord::new_fresh(),
-            )
-            .await;
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
         adapter
             .pre_key_store
             .buffer_consumed_prekey(PREKEY_ID.into(), &addr)

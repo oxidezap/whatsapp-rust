@@ -55,7 +55,7 @@ mod tests {
     impl EncHandler for MockEncHandler {
         async fn handle(
             &self,
-            _client: Arc<crate::client::Client>,
+            _client: Arc<Client>,
             enc_node: &Node,
             _info: &MessageInfo,
         ) -> Result<()> {

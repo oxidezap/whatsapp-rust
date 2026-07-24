@@ -754,13 +754,15 @@ impl CallEngine {
     }
 
     /// Bring the video plane up (from-start call, or an accepted upgrade) with OUTBOUND allowed.
-    /// Idempotent; also ungates a previously send-gated plane. See [`enable_video_gated`].
+    /// Idempotent; also ungates a previously send-gated plane. See
+    /// [`enable_video_gated`](Self::enable_video_gated).
     pub fn enable_video(&mut self) -> bool {
         self.enable_video_inner(false)
     }
 
     /// Bring the video plane up but hold OUTBOUND video off the wire (the initiator of an upgrade,
-    /// before the peer accepts). Inbound still decodes. [`enable_video`] later ungates it.
+    /// before the peer accepts). Inbound still decodes. [`enable_video`](Self::enable_video) later
+    /// ungates it.
     pub fn enable_video_gated(&mut self) -> bool {
         self.enable_video_inner(true)
     }
@@ -1583,9 +1585,9 @@ mod tests {
         // SSRC is the deterministic E2E derivation over our self LID.
         assert_eq!(
             cfg.ssrc,
-            crate::voip::ssrc::derive_wasm_participant_ssrc(
+            ssrc::derive_wasm_participant_ssrc(
                 "CID",
-                &crate::voip::ssrc::format_e2e_srtp_participant_id(SELF_LID),
+                &ssrc::format_e2e_srtp_participant_id(SELF_LID),
                 0
             )
         );
@@ -1647,9 +1649,9 @@ mod tests {
         assert!(cfg.enable_media && cfg.enable_sframe);
         assert_eq!(
             cfg.ssrc,
-            crate::voip::ssrc::derive_wasm_participant_ssrc(
+            ssrc::derive_wasm_participant_ssrc(
                 "CID",
-                &crate::voip::ssrc::format_e2e_srtp_participant_id(SELF_LID),
+                &ssrc::format_e2e_srtp_participant_id(SELF_LID),
                 0
             )
         );
@@ -2509,7 +2511,7 @@ mod tests {
             rr.extend_from_slice(&reported.to_be_bytes());
             rr.extend_from_slice(&[0; 20]);
         }
-        rr.extend_from_slice(&[0x81, crate::voip::rtcp::RTCP_PT_PSFB, 0, 2]);
+        rr.extend_from_slice(&[0x81, RTCP_PT_PSFB, 0, 2]);
         rr.extend_from_slice(&peer_ssrc.to_be_bytes());
         rr.extend_from_slice(&video_ssrc.to_be_bytes());
         let peer_keys = derive_srtcp_keys(&call_key, PEER_LID).unwrap();
@@ -2530,11 +2532,11 @@ mod tests {
                 reports_audio: true,
                 reports_video: true,
                 ..
-            }) if packet_types == &[RTCP_PT_RR, crate::voip::rtcp::RTCP_PT_PSFB]
+            }) if packet_types == &[RTCP_PT_RR, RTCP_PT_PSFB]
                 && *sender_ssrc == peer_ssrc
                 && referenced_ssrcs.contains(&audio_ssrc)
                 && referenced_ssrcs.contains(&video_ssrc)
-                && feedback.iter().any(|item| item.packet_type == crate::voip::rtcp::RTCP_PT_PSFB
+                && feedback.iter().any(|item| item.packet_type == RTCP_PT_PSFB
                     && item.fmt == 1
                     && item.media_ssrc == video_ssrc
                     && item.fci.is_empty())
@@ -2815,7 +2817,7 @@ mod tests {
 
     /// A mirrored peer engine's video plane (its self LID = our peer LID), used to craft real
     /// inbound video packets for demux tests.
-    fn peer_video_pipe() -> crate::voip::session::VideoPipeline {
+    fn peer_video_pipe() -> VideoPipeline {
         use crate::voip::session::{VideoPipeline, VideoPipelineParams};
         let call_key: Vec<u8> = (0u8..32).collect();
         VideoPipeline::new(&VideoPipelineParams {
@@ -3156,19 +3158,18 @@ mod tests {
 
         let call_key: Vec<u8> = (0u8..32).collect();
         let answering = "222222222222222:2@lid";
-        let mut answerer =
-            crate::voip::session::VideoPipeline::new(&crate::voip::session::VideoPipelineParams {
-                call_key: &call_key,
-                self_lid: answering,
-                peer_lid: SELF_LID,
-                ssrc: ssrc::derive_video_participant_ssrc(
-                    "CID",
-                    &ssrc::format_e2e_srtp_participant_id(answering),
-                ),
-                ts_stride: VIDEO_TS_STRIDE_15FPS,
-                warp_mi_tag_len: WARP_MI_TAG_LEN,
-            })
-            .unwrap();
+        let mut answerer = VideoPipeline::new(&VideoPipelineParams {
+            call_key: &call_key,
+            self_lid: answering,
+            peer_lid: SELF_LID,
+            ssrc: ssrc::derive_video_participant_ssrc(
+                "CID",
+                &ssrc::format_e2e_srtp_participant_id(answering),
+            ),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
 
         let au = video_au(120);
         for p in answerer.protect_video(&au) {
@@ -3204,19 +3205,18 @@ mod tests {
         assert!(eng.enable_video(), "upgrade after rekey");
 
         let call_key: Vec<u8> = (0u8..32).collect();
-        let mut answerer =
-            crate::voip::session::VideoPipeline::new(&crate::voip::session::VideoPipelineParams {
-                call_key: &call_key,
-                self_lid: answering,
-                peer_lid: SELF_LID,
-                ssrc: ssrc::derive_video_participant_ssrc(
-                    "CID",
-                    &ssrc::format_e2e_srtp_participant_id(answering),
-                ),
-                ts_stride: VIDEO_TS_STRIDE_15FPS,
-                warp_mi_tag_len: WARP_MI_TAG_LEN,
-            })
-            .unwrap();
+        let mut answerer = VideoPipeline::new(&VideoPipelineParams {
+            call_key: &call_key,
+            self_lid: answering,
+            peer_lid: SELF_LID,
+            ssrc: ssrc::derive_video_participant_ssrc(
+                "CID",
+                &ssrc::format_e2e_srtp_participant_id(answering),
+            ),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
         let au = video_au(80);
         for p in answerer.protect_video(&au) {
             eng.handle_input(1, Input::RelayPacket(&p));

@@ -174,7 +174,7 @@ impl PersistenceManager {
     /// flush before exiting on shutdown.
     ///
     /// Caller must keep the returned [`AbortHandle`] — dropping it aborts
-    /// the task. [`ShutdownSignal`] is sticky (see [`ShutdownNotifier`]):
+    /// the task. [`ShutdownSignal`] is sticky (see [`ShutdownNotifier`](wacore::runtime::ShutdownNotifier)):
     /// a notify that races the task's first [`listen()`](event_listener::Event::listen)
     /// is observed via the flag on the first iteration, so no data is stranded.
     pub fn run_background_saver(

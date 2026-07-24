@@ -12,12 +12,10 @@ use whatsapp_rust::waproto::whatsapp as wa;
 fn message_literals_build_from_reexports_only() {
     // Explicit MessageField path, as a consumer would write it.
     let explicit = wa::Message {
-        extended_text_message: whatsapp_rust::buffa::MessageField::some(
-            wa::message::ExtendedTextMessage {
-                text: Some("hi".into()),
-                ..Default::default()
-            },
-        ),
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some("hi".into()),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     // The From<T> route: no MessageField naming at all.
@@ -47,7 +45,7 @@ impl whatsapp_rust::InboundDurabilityHook for NoopHook {
         &self,
         _client: std::sync::Arc<whatsapp_rust::Client>,
         _batch: &[whatsapp_rust::types::events::InboundMessage],
-    ) -> whatsapp_rust::anyhow::Result<()> {
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -80,8 +78,7 @@ fn retry_admission_is_object_safe_and_constructible() {
 
 #[test]
 fn bytes_and_chrono_reexports_are_usable() {
-    let b = whatsapp_rust::bytes::Bytes::from_static(b"frame");
+    let b = bytes::Bytes::from_static(b"frame");
     assert_eq!(b.len(), 5);
-    let _ts: whatsapp_rust::chrono::DateTime<whatsapp_rust::chrono::Utc> =
-        whatsapp_rust::wacore::time::now_utc();
+    let _ts: chrono::DateTime<chrono::Utc> = wacore::time::now_utc();
 }

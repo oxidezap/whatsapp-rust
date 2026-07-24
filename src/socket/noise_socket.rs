@@ -43,7 +43,7 @@ impl NoiseSocket {
     }
 
     /// Like [`Self::new`], recording sent frames into `stats` (the main WA
-    /// session socket passes the client's [`SessionStats`]; VoIP relay
+    /// session socket passes the client's [`SessionStats`](wacore::stats::SessionStats); VoIP relay
     /// sockets and tests pass `None`).
     pub fn with_stats(
         runtime: Arc<dyn Runtime>,
@@ -286,7 +286,7 @@ mod tests {
 
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl crate::transport::Transport for CapturingTransport {
+        impl Transport for CapturingTransport {
             async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
                 let mut data = data.to_vec();
                 data.drain(..3); // strip the 3-byte frame length prefix
@@ -348,20 +348,18 @@ mod tests {
         struct RecordingTransport {
             recorded_order: Arc<Mutex<Vec<u8>>>,
             read_key: NoiseCipher,
-            counter: std::sync::atomic::AtomicU32,
+            counter: AtomicU32,
         }
 
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl crate::transport::Transport for RecordingTransport {
+        impl Transport for RecordingTransport {
             async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
                 if data.len() > 16 {
                     let mut data = data.to_vec();
                     // Strip the 3-byte frame header, then decrypt in place
                     data.drain(..3);
-                    let counter = self
-                        .counter
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let counter = self.counter.fetch_add(1, Ordering::SeqCst);
 
                     if self
                         .read_key
@@ -388,7 +386,7 @@ mod tests {
         let transport = Arc::new(RecordingTransport {
             recorded_order: recorded_order.clone(),
             read_key: NoiseCipher::new(&key).expect("32-byte key should be valid"),
-            counter: std::sync::atomic::AtomicU32::new(0),
+            counter: AtomicU32::new(0),
         });
 
         let socket = Arc::new(NoiseSocket::new(
@@ -437,7 +435,7 @@ mod tests {
 
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl crate::transport::Transport for SizeRecordingTransport {
+        impl Transport for SizeRecordingTransport {
             async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
                 self.last_size.store(data.len(), Ordering::SeqCst);
                 Ok(())
@@ -531,7 +529,7 @@ mod tests {
 
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl crate::transport::Transport for NoOpTransport {
+        impl Transport for NoOpTransport {
             async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
                 Ok(())
             }

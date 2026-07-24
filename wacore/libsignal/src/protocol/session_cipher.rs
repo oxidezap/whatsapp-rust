@@ -1607,15 +1607,9 @@ mod tests {
         // Peer sessions cap at WA Web's `signalFutureMessagesMax` (2000); the
         // self ceiling stays wider but bounded (previously unbounded).
         assert_eq!(forward_jump_limit(false), 2_000);
-        assert_eq!(
-            forward_jump_limit(false),
-            crate::protocol::consts::MAX_FORWARD_JUMPS
-        );
+        assert_eq!(forward_jump_limit(false), MAX_FORWARD_JUMPS);
         assert_eq!(forward_jump_limit(true), 25_000);
-        assert_eq!(
-            forward_jump_limit(true),
-            crate::protocol::consts::MAX_FORWARD_JUMPS_SELF
-        );
+        assert_eq!(forward_jump_limit(true), consts::MAX_FORWARD_JUMPS_SELF);
         assert!(forward_jump_limit(true) > forward_jump_limit(false));
     }
 
@@ -1648,21 +1642,18 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl SessionStore for DestructiveSessionStore {
-        async fn load_session(
-            &self,
-            _address: &ProtocolAddress,
-        ) -> error::Result<Option<SessionRecord>> {
+        async fn load_session(&self, _address: &ProtocolAddress) -> Result<Option<SessionRecord>> {
             Ok(self.0.lock().expect("test store lock poisoned").clone())
         }
 
         fn try_load_session_for_update(
             &self,
             _address: &ProtocolAddress,
-        ) -> Option<error::Result<(Option<SessionRecord>, Option<SessionCheckoutKey>)>> {
+        ) -> Option<Result<(Option<SessionRecord>, Option<SessionCheckoutKey>)>> {
             Some(Ok((self.take(), Some(Self::CHECKOUT))))
         }
 
-        async fn has_session(&self, _address: &ProtocolAddress) -> error::Result<bool> {
+        async fn has_session(&self, _address: &ProtocolAddress) -> Result<bool> {
             Ok(self.0.lock().expect("test store lock poisoned").is_some())
         }
 
@@ -1670,7 +1661,7 @@ mod tests {
             &mut self,
             _address: &ProtocolAddress,
             record: SessionRecord,
-        ) -> error::Result<()> {
+        ) -> Result<()> {
             self.replace(record);
             Ok(())
         }
@@ -1693,20 +1684,17 @@ mod tests {
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl SessionStore for MemSessionStore {
-        async fn load_session(
-            &self,
-            address: &ProtocolAddress,
-        ) -> error::Result<Option<SessionRecord>> {
+        async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>> {
             Ok(self.0.get(address.as_str()).cloned())
         }
-        async fn has_session(&self, address: &ProtocolAddress) -> error::Result<bool> {
+        async fn has_session(&self, address: &ProtocolAddress) -> Result<bool> {
             Ok(self.0.contains_key(address.as_str()))
         }
         async fn store_session(
             &mut self,
             address: &ProtocolAddress,
             record: SessionRecord,
-        ) -> error::Result<()> {
+        ) -> Result<()> {
             self.0.insert(address.as_str().to_string(), record);
             Ok(())
         }
@@ -1747,11 +1735,11 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl IdentityKeyStore for PendingIdentityStore {
-        async fn get_identity_key_pair(&self) -> error::Result<IdentityKeyPair> {
+        async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair> {
             self.inner.get_identity_key_pair().await
         }
 
-        async fn get_local_registration_id(&self) -> error::Result<u32> {
+        async fn get_local_registration_id(&self) -> Result<u32> {
             self.inner.get_local_registration_id().await
         }
 
@@ -1759,7 +1747,7 @@ mod tests {
             &mut self,
             address: &ProtocolAddress,
             identity: &IdentityKey,
-        ) -> error::Result<IdentityChange> {
+        ) -> Result<IdentityChange> {
             if matches!(self.call, PendingIdentityCall::Save) {
                 self.wait_forever().await
             } else {
@@ -1772,7 +1760,7 @@ mod tests {
             address: &ProtocolAddress,
             identity: &IdentityKey,
             direction: Direction,
-        ) -> error::Result<bool> {
+        ) -> Result<bool> {
             if matches!(self.call, PendingIdentityCall::Trust) {
                 self.wait_forever().await
             } else {
@@ -1782,10 +1770,7 @@ mod tests {
             }
         }
 
-        async fn get_identity(
-            &self,
-            address: &ProtocolAddress,
-        ) -> error::Result<Option<IdentityKey>> {
+        async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
             self.inner.get_identity(address).await
         }
     }
@@ -1800,17 +1785,17 @@ mod tests {
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl IdentityKeyStore for MemIdentityStore {
-        async fn get_identity_key_pair(&self) -> error::Result<IdentityKeyPair> {
+        async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair> {
             Ok(self.pair.clone())
         }
-        async fn get_local_registration_id(&self) -> error::Result<u32> {
+        async fn get_local_registration_id(&self) -> Result<u32> {
             Ok(self.reg_id)
         }
         async fn save_identity(
             &mut self,
             address: &ProtocolAddress,
             identity: &IdentityKey,
-        ) -> error::Result<IdentityChange> {
+        ) -> Result<IdentityChange> {
             let changed = self
                 .known
                 .get(address.as_str())
@@ -1823,13 +1808,10 @@ mod tests {
             _address: &ProtocolAddress,
             _identity: &IdentityKey,
             _direction: Direction,
-        ) -> error::Result<bool> {
+        ) -> Result<bool> {
             Ok(true)
         }
-        async fn get_identity(
-            &self,
-            address: &ProtocolAddress,
-        ) -> error::Result<Option<IdentityKey>> {
+        async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
             Ok(self.known.get(address.as_str()).copied())
         }
     }
@@ -1842,17 +1824,17 @@ mod tests {
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl PreKeyStore for MemPreKeyStore {
-        async fn get_pre_key(&self, id: PreKeyId) -> error::Result<PreKeyRecord> {
+        async fn get_pre_key(&self, id: PreKeyId) -> Result<PreKeyRecord> {
             self.0
                 .get(&id)
                 .cloned()
                 .ok_or(SignalProtocolError::InvalidPreKeyId)
         }
-        async fn save_pre_key(&mut self, id: PreKeyId, record: &PreKeyRecord) -> error::Result<()> {
+        async fn save_pre_key(&mut self, id: PreKeyId, record: &PreKeyRecord) -> Result<()> {
             self.0.insert(id, record.clone());
             Ok(())
         }
-        async fn remove_pre_key(&mut self, id: PreKeyId) -> error::Result<()> {
+        async fn remove_pre_key(&mut self, id: PreKeyId) -> Result<()> {
             self.0.remove(&id);
             Ok(())
         }
@@ -1866,10 +1848,7 @@ mod tests {
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl SignedPreKeyStore for MemSignedPreKeyStore {
-        async fn get_signed_pre_key(
-            &self,
-            id: SignedPreKeyId,
-        ) -> error::Result<SignedPreKeyRecord> {
+        async fn get_signed_pre_key(&self, id: SignedPreKeyId) -> Result<SignedPreKeyRecord> {
             self.0
                 .get(&id)
                 .cloned()
@@ -1879,7 +1858,7 @@ mod tests {
             &mut self,
             id: SignedPreKeyId,
             record: &SignedPreKeyRecord,
-        ) -> error::Result<()> {
+        ) -> Result<()> {
             self.0.insert(id, record.clone());
             Ok(())
         }

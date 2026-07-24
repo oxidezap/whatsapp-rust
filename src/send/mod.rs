@@ -161,7 +161,7 @@ struct GroupBranchRequest<'a> {
     message: &'a wa::Message,
     request_id: String,
     force_key_distribution: bool,
-    edit: Option<crate::types::message::EditAttribute>,
+    edit: Option<EditAttribute>,
     extra_stanza_nodes: &'a [Node],
     group_metadata_freshness: crate::cache::Freshness,
     device_freshness: crate::cache::Freshness,
@@ -172,7 +172,7 @@ struct DmBranchRequest<'a> {
     to: Jid,
     message: &'a wa::Message,
     request_id: String,
-    edit: Option<crate::types::message::EditAttribute>,
+    edit: Option<EditAttribute>,
     extra_stanza_nodes: Vec<Node>,
     is_status_addon: bool,
     device_freshness: crate::cache::Freshness,
@@ -208,7 +208,7 @@ impl AsRef<wacore::send::ResolvedGroupDevices> for GroupDeviceSnapshot {
 )]
 fn box_send_branch<F>(future: F) -> std::pin::Pin<Box<F>>
 where
-    F: std::future::Future,
+    F: Future,
 {
     Box::pin(future)
 }
@@ -297,7 +297,7 @@ pub(crate) struct SendPipelineOptions {
     pub(crate) request_id: Option<String>,
     pub(crate) peer: bool,
     pub(crate) force_key_distribution: bool,
-    pub(crate) edit: Option<crate::types::message::EditAttribute>,
+    pub(crate) edit: Option<EditAttribute>,
     pub(crate) extra_stanza_nodes: Vec<Node>,
     pub(crate) stanza_type: Option<StanzaType>,
     pub(crate) group_metadata_freshness: crate::cache::Freshness,
@@ -722,7 +722,9 @@ impl Client {
     ///
     /// Builds a forward-ready copy of `message` (sets `is_forwarded`, bumps the
     /// forwarding score, strips the reply/quote chain, and drops the source
-    /// `message_secret`) via [`MessageExt::prepare_for_forward`], then sends it.
+    /// `message_secret`) via
+    /// [`MessageExt::prepare_for_forward`](wacore::proto_helpers::MessageExt::prepare_for_forward),
+    /// then sends it.
     /// `message` may be a received body or a wrapper (ephemeral/view-once); the
     /// inner content is unwrapped before forwarding. Existing media is relayed
     /// from the same CDN blob rather than re-uploaded.
@@ -787,9 +789,9 @@ impl Client {
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         self.stats.record_message_sent();
         wacore::telemetry::send(match to.server {
-            wacore_binary::Server::Group => "group",
-            wacore_binary::Server::Broadcast => "status",
-            wacore_binary::Server::Newsletter => "newsletter",
+            Server::Group => "group",
+            Server::Broadcast => "status",
+            Server::Newsletter => "newsletter",
             _ => "dm",
         });
         if let Some(exp) = options.ephemeral_expiration
@@ -1248,7 +1250,7 @@ impl Client {
             Some(self.skdm_device_map(group_jid).await)
         };
 
-        let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
+        let is_lid_mode = group_info.addressing_mode == AddressingMode::Lid;
         let jids_to_resolve: Vec<Jid> = group_info
             .participants
             .iter()
@@ -1550,9 +1552,9 @@ impl Client {
     /// (already in <participants>) uses device JIDs with <enc> children.
     async fn ensure_status_participants(
         &self,
-        stanza: wacore_binary::Node,
+        stanza: Node,
         group_info: &wacore::client::context::GroupInfo,
-    ) -> Result<wacore_binary::Node, anyhow::Error> {
+    ) -> Result<Node, anyhow::Error> {
         Ok(wacore::send::ensure_status_participants(stanza, group_info))
     }
 
@@ -1843,7 +1845,7 @@ impl Client {
             let own_jid = device_snapshot
                 .pn
                 .as_ref()
-                .ok_or(crate::client::ClientError::NotLoggedIn)?;
+                .ok_or(ClientError::NotLoggedIn)?;
             let own_lid = device_snapshot
                 .lid
                 .as_ref()
@@ -1866,8 +1868,8 @@ impl Client {
             let to_str = to.to_string();
 
             let (own_sending_jid, _) = match group_info.addressing_mode {
-                crate::types::message::AddressingMode::Lid => (own_lid.clone(), "lid"),
-                crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
+                AddressingMode::Lid => (own_lid.clone(), "lid"),
+                AddressingMode::Pn => (own_jid.clone(), "pn"),
             };
 
             // Memo identity must be the CACHED Arc: ensure_self_in_group clones
@@ -2235,7 +2237,7 @@ impl Client {
             let own_jid = device_snapshot
                 .pn
                 .as_ref()
-                .ok_or(crate::client::ClientError::NotLoggedIn)?;
+                .ok_or(ClientError::NotLoggedIn)?;
 
             // PN→LID mapping (WA Web: ManagePhoneNumberMappingJob)
             if to.is_pn() && self.lid_pn_cache.get_current_lid(&to.user).await.is_none() {
@@ -2460,7 +2462,7 @@ impl Client {
     /// `messageSecret` should be persisted. Group sends should use
     /// `PreparedGroupStanza.sender_identity` directly instead of this.
     pub(crate) async fn dm_sender_identity_for(&self, to: &Jid) -> Option<Jid> {
-        if to.server == wacore_binary::Server::Bot {
+        if to.server == Server::Bot {
             self.get_lid()
         } else {
             self.get_pn()
@@ -2587,18 +2589,17 @@ mod tests {
 
         // Self already a member (the common case): the shared Arc passes through
         // untouched, with no deep clone of the participant list.
-        let with_self = std::sync::Arc::new(GroupInfo::new(
+        let with_self = Arc::new(GroupInfo::new(
             vec![other.to_non_ad(), own.to_non_ad()],
             AddressingMode::Pn,
         ));
         let out = ensure_self_in_group(with_self.clone(), &own);
-        assert!(std::sync::Arc::ptr_eq(&with_self, &out));
+        assert!(Arc::ptr_eq(&with_self, &out));
 
         // Self missing: a fresh GroupInfo is built with self appended.
-        let without_self =
-            std::sync::Arc::new(GroupInfo::new(vec![other.to_non_ad()], AddressingMode::Pn));
+        let without_self = Arc::new(GroupInfo::new(vec![other.to_non_ad()], AddressingMode::Pn));
         let out = ensure_self_in_group(without_self.clone(), &own);
-        assert!(!std::sync::Arc::ptr_eq(&without_self, &out));
+        assert!(!Arc::ptr_eq(&without_self, &out));
         assert_eq!(out.participants.len(), 2);
         assert!(out.participants.iter().any(|p| p.is_same_user_as(&own)));
     }
@@ -2668,11 +2669,11 @@ mod tests {
         let own_lid: Jid = "100000000000001@lid".parse().unwrap();
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetId(Some(own_pn)))
+            .process_command(DeviceCommand::SetId(Some(own_pn)))
             .await;
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(own_lid)))
+            .process_command(DeviceCommand::SetLid(Some(own_lid)))
             .await;
 
         let status = Jid::status_broadcast();
@@ -2682,7 +2683,7 @@ mod tests {
             .get(&status)
             .await
             .expect("cached distribution lock");
-        let lock_refs = std::sync::Arc::strong_count(&lock);
+        let lock_refs = Arc::strong_count(&lock);
         let mut task = tokio::spawn({
             let client = client.clone();
             async move {
@@ -2879,15 +2880,11 @@ mod tests {
         let message_id = "3EB0ABC123".to_string();
 
         let (from_me, participant, edit_attr) = match RevokeType::Sender {
-            RevokeType::Sender => (
-                true,
-                None,
-                crate::types::message::EditAttribute::SenderRevoke,
-            ),
+            RevokeType::Sender => (true, None, EditAttribute::SenderRevoke),
             RevokeType::Admin { original_sender } => (
                 false,
                 Some(original_sender.to_non_ad_string()),
-                crate::types::message::EditAttribute::AdminRevoke,
+                EditAttribute::AdminRevoke,
             ),
         };
 
@@ -2919,15 +2916,11 @@ mod tests {
             original_sender: original_sender.clone(),
         };
         let (from_me, participant, edit_attr) = match revoke_type {
-            RevokeType::Sender => (
-                true,
-                None,
-                crate::types::message::EditAttribute::SenderRevoke,
-            ),
+            RevokeType::Sender => (true, None, EditAttribute::SenderRevoke),
             RevokeType::Admin { original_sender } => (
                 false,
                 Some(original_sender.to_non_ad_string()),
-                crate::types::message::EditAttribute::AdminRevoke,
+                EditAttribute::AdminRevoke,
             ),
         };
 
@@ -3490,9 +3483,7 @@ mod tests {
         let own_lid = Jid::from_str("888000888000888:1@lid").unwrap();
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
-                own_lid.clone(),
-            )))
+            .process_command(DeviceCommand::SetLid(Some(own_lid.clone())))
             .await;
 
         let group = "120363000000000009@g.us";
@@ -3545,9 +3536,7 @@ mod tests {
         let own_lid = Jid::from_str("888000888000888:1@lid").unwrap();
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
-                own_lid.clone(),
-            )))
+            .process_command(DeviceCommand::SetLid(Some(own_lid.clone())))
             .await;
 
         let group = "120363000000000010@g.us";
@@ -4741,7 +4730,7 @@ mod tests {
                 SendPipelineOptions {
                     request_id: Some(request_id.to_string()),
                     peer: true,
-                    stanza_type: Some(wacore::send::StanzaType::Poll),
+                    stanza_type: Some(StanzaType::Poll),
                     ..Default::default()
                 },
             )
@@ -4757,7 +4746,7 @@ mod tests {
             .expect("sent node waiter should resolve");
         assert_eq!(
             node.attrs().optional_string("type").unwrap().as_ref(),
-            wacore::send::StanzaType::Poll.as_wire()
+            StanzaType::Poll.as_wire()
         );
     }
 
@@ -5430,7 +5419,7 @@ mod tests {
         // PreparedDmStanza/PreparedGroupStanza now carry this exact array
         // through to send_message_impl which calls persist_outbound_msg_secret.
         let prepared = wacore::send::PreparedDmStanza {
-            node: wacore_binary::builder::NodeBuilder::new("message").build(),
+            node: NodeBuilder::new("message").build(),
             phash: None,
             message_secret: Some(result.message_secret),
         };
@@ -5446,7 +5435,7 @@ mod jid_into_convention {
     /// method must accept BOTH an owned `Jid` (move, zero copy) and a `&Jid`
     /// (one clone via `From<&Jid>`). Never executed; compilation is the test.
     #[allow(dead_code)]
-    async fn both_call_styles_compile(client: &crate::client::Client, jid: Jid) {
+    async fn both_call_styles_compile(client: &Client, jid: Jid) {
         let msg = wa::Message::default();
         let _ = client.send_message(&jid, msg.clone()).await;
         let _ = client
@@ -5511,20 +5500,17 @@ mod future_size_tests {
         let msg = waproto::whatsapp::Message::default();
 
         let f = client.send_message(jid.clone(), msg.clone());
-        assert!(std::mem::size_of_val(&f) <= 192, "send_message future grew");
+        assert!(size_of_val(&f) <= 192, "send_message future grew");
         drop(f);
         let f = client.send_text(jid.clone(), "x");
-        assert!(std::mem::size_of_val(&f) <= 192, "send_text future grew");
+        assert!(size_of_val(&f) <= 192, "send_text future grew");
         drop(f);
         let f = client.forward_message(jid.clone(), &msg);
-        assert!(
-            std::mem::size_of_val(&f) <= 192,
-            "forward_message future grew"
-        );
+        assert!(size_of_val(&f) <= 192, "forward_message future grew");
         drop(f);
         let f = client.send_message_with_options(jid, msg, Default::default());
         assert!(
-            std::mem::size_of_val(&f) <= 192,
+            size_of_val(&f) <= 192,
             "send_message_with_options future grew"
         );
         drop(f);

@@ -51,14 +51,14 @@ impl AsRef<str> for NodeStr<'_> {
     }
 }
 
-impl std::fmt::Debug for NodeStr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&**self, f)
+impl fmt::Debug for NodeStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl std::fmt::Display for NodeStr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NodeStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self)
     }
 }
@@ -1015,8 +1015,8 @@ impl serde::Serialize for OwnedNodeRef {
     }
 }
 
-impl std::fmt::Debug for OwnedNodeRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OwnedNodeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.get().fmt(f)
     }
 }

@@ -485,7 +485,7 @@ pub struct OfferParams<'a> {
 }
 
 /// `<call to=peer><offer call-id call-creator>…</offer></call>` with the mandatory
-/// child order: privacy → audio(8k) → audio(16k) → [video] → net → capability →
+/// child order: privacy → audio(8k) → audio(16k) → \[video\] → net → capability →
 /// destination|enc → encopt → device-identity.
 pub fn build_offer(p: &OfferParams<'_>) -> Node {
     let mut children: Vec<Node> = Vec::new();
@@ -578,8 +578,8 @@ pub struct AcceptParams<'a> {
     pub peer_abtest_bucket_id_list: Option<&'a str>,
 }
 
-/// `<accept>`: audio → [video] → [te priority=2] → net medium=2 → encopt → [metadata] →
-/// [capability] → [rte] → [voip_settings].
+/// `<accept>`: audio → \[video\] → \[te priority=2\] → net medium=2 → encopt → \[metadata\] →
+/// \[capability\] → \[rte\] → \[voip_settings\].
 pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     let mut children: Vec<Node> = p.audio_rates.iter().map(|rate| audio_opus(rate)).collect();
     if p.video {
@@ -682,7 +682,7 @@ fn capability_node(blob: &[u8]) -> Node {
         .build()
 }
 
-/// `<preaccept>`: audio → [video] → encopt → capability. `id` is the random call-wrapper id. A video
+/// `<preaccept>`: audio → \[video\] → encopt → capability. `id` is the random call-wrapper id. A video
 /// callee advertises the `<video>` decoder here; the default capability stays the `0xbb`
 /// [`CAPABILITY_OFFER`] blob (the `0xfa` variant is the caller's offer).
 pub fn build_preaccept(
@@ -970,7 +970,7 @@ mod tests {
             .attr("call-id", "CALL-ID-0001")
     }
 
-    fn as_ref<'a>(n: &'a wacore_binary::Node) -> NodeRef<'a> {
+    fn as_ref<'a>(n: &'a Node) -> NodeRef<'a> {
         n.as_node_ref()
     }
 

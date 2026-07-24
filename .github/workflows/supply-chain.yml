@@ -1,0 +1,87 @@
+permissions:
+  contents: read
+name: Supply Chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+  # RUSTSEC advisories land against a lockfile that has not changed, so the
+  # audit needs a clock of its own rather than only PR triggers.
+  schedule:
+    - cron: '0 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # No build here: cargo-deny resolves the graph from Cargo.lock, so it
+      # needs neither protoc nor ALSA nor a warm target dir.
+      - name: Run cargo-deny
+        run: cargo deny --all-features check
+
+  semver-checks:
+    name: Semver Checks (informational)
+    runs-on: ubuntu-latest
+    # Advisory only. The workspace is pre-1.0 and intentionally breaks API
+    # between minors; this job exists to make the break visible in the summary,
+    # not to block the PR.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      - name: Check API against the last published release
+        id: semver
+        run: |
+          set -o pipefail
+          cargo semver-checks check-release \
+            -p wacore -p wacore-binary -p waproto 2>&1 | tee semver.log
+      - name: Publish report to the job summary
+        if: always()
+        run: |
+          {
+            echo '## cargo-semver-checks (informational)'
+            echo
+            if [ "${{ steps.semver.outcome }}" = "success" ]; then
+              echo 'No breaking changes detected against the last published release.'
+            else
+              echo 'Breaking changes detected. This does not block the PR — bump the'
+              echo 'minor version if the break is intended.'
+            fi
+            echo
+            echo '<details><summary>Full output</summary>'
+            echo
+            echo '```'
+            cat semver.log
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -75,7 +75,8 @@ impl Client {
 
     /// Set a privacy setting.
     ///
-    /// Use [`PrivacyCategory::is_valid_value`] to check valid combinations.
+    /// Use [`PrivacyCategory::is_valid_value`](wacore::iq::privacy::PrivacyCategory::is_valid_value)
+    /// to check valid combinations.
     ///
     /// # Example
     /// ```ignore
@@ -127,7 +128,7 @@ impl Client {
     /// default use [`Client::set_default_disappearing_mode`].
     pub async fn set_chat_disappearing_timer(
         &self,
-        chat: wacore_binary::Jid,
+        chat: Jid,
         duration: u32,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         // 1:1 only: groups use Groups::set_ephemeral (a separate IQ). Sending the
@@ -146,7 +147,7 @@ impl Client {
     /// Get business profile for a WhatsApp Business account.
     pub async fn get_business_profile(
         &self,
-        jid: &wacore_binary::Jid,
+        jid: &Jid,
     ) -> Result<Option<wacore::iq::business::BusinessProfile>, crate::request::IqError> {
         use wacore::iq::business::BusinessProfileSpec;
         self.execute(BusinessProfileSpec::new(jid)).await

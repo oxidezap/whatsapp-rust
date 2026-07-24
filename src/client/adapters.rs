@@ -26,7 +26,7 @@ impl Client {
     /// Build a [`SignalProtocolStoreAdapter`] from a pre-fetched device arc.
     pub(crate) fn signal_adapter_from(
         &self,
-        device_store: Arc<async_lock::RwLock<crate::store::Device>>,
+        device_store: Arc<RwLock<crate::store::Device>>,
     ) -> crate::store::signal_adapter::SignalProtocolStoreAdapter {
         crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
             device_store,
@@ -35,14 +35,9 @@ impl Client {
     }
 
     /// Get the per-address session mutex from the lock cache.
-    pub(crate) async fn session_lock_for(
-        &self,
-        signal_addr_str: &str,
-    ) -> Arc<async_lock::Mutex<()>> {
+    pub(crate) async fn session_lock_for(&self, signal_addr_str: &str) -> Arc<Mutex<()>> {
         self.session_locks
-            .get_with_by_ref(signal_addr_str, async {
-                Arc::new(async_lock::Mutex::new(()))
-            })
+            .get_with_by_ref(signal_addr_str, async { Arc::new(Mutex::new(())) })
             .await
     }
 
@@ -52,16 +47,14 @@ impl Client {
         group: &Jid,
     ) -> async_lock::MutexGuardArc<()> {
         self.group_distribution_locks
-            .get_with_by_ref(group, async { Arc::new(async_lock::Mutex::new(())) })
+            .get_with_by_ref(group, async { Arc::new(Mutex::new(())) })
             .await
             .lock_arc()
             .await
     }
 
     /// Get the active noise socket, or error if not connected.
-    pub(crate) async fn get_noise_socket(
-        &self,
-    ) -> Result<Arc<crate::socket::noise_socket::NoiseSocket>, ClientError> {
+    pub(crate) async fn get_noise_socket(&self) -> Result<Arc<NoiseSocket>, ClientError> {
         self.noise_socket
             .lock()
             .await
@@ -186,10 +179,7 @@ impl Client {
         if self.signal_cache.needs_pre_wire_flush().await {
             return self.flush_signal_cache_batch_safe().await;
         }
-        self.schedule_signal_flush(
-            self.connection_generation
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
+        self.schedule_signal_flush(self.connection_generation.load(Ordering::Acquire));
         Ok(())
     }
 

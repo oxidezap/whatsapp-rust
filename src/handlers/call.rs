@@ -590,7 +590,7 @@ mod tests {
     fn register_native_opus_call(
         client: &Client,
         ring_devices: Vec<Jid>,
-    ) -> async_channel::Receiver<wacore::voip::CallEvent> {
+    ) -> async_channel::Receiver<CallEvent> {
         use wacore::voip::{AudioFormat, CallEvent};
 
         let registry = client.call_registry();

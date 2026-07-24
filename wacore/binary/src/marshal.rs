@@ -74,7 +74,7 @@ pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     // so a plan/encode traversal divergence must fail the marshal instead of
     // shipping corrupt bytes. Two integer compares per stanza.
     if written != payload.len() || !plan.hints.fully_consumed() {
-        return Err(crate::error::BinaryError::PlanMismatch);
+        return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
 }
@@ -122,7 +122,7 @@ pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let written = encoder.bytes_written();
     // Same invariant enforcement as marshal_exact.
     if written != payload.len() || !plan.hints.fully_consumed() {
-        return Err(crate::error::BinaryError::PlanMismatch);
+        return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
 }
@@ -263,7 +263,7 @@ mod tests {
     use crate::jid::Jid;
     use crate::node::{Attrs, NodeContent, NodeValue};
 
-    type TestResult = crate::error::Result<()>;
+    type TestResult = Result<()>;
 
     fn fixture_node() -> Node {
         let mut attrs = Attrs::with_capacity(4);

@@ -191,7 +191,8 @@ impl SessionStats {
     }
 
     /// The dead-socket watchdog anchor: the first send since the last receive
-    /// (0 when unarmed). Evaluate [`is_dead_socket`] against this, not the last
+    /// (0 when unarmed). Evaluate
+    /// [`is_dead_socket`](crate::protocol::keepalive::is_dead_socket) against this, not the last
     /// send, so continued outgoing traffic can't hide a half-open socket.
     #[inline]
     pub fn first_send_since_recv_ms(&self) -> u64 {
@@ -241,7 +242,7 @@ impl<T: HeapSize> HeapSize for Arc<T> {
     /// in practice, so attributing the full size to each holder's client is
     /// the useful semantics.
     fn heap_bytes(&self) -> usize {
-        core::mem::size_of::<T>() + T::heap_bytes(self)
+        size_of::<T>() + T::heap_bytes(self)
     }
 }
 
@@ -775,7 +776,7 @@ mod tests {
         // The CAS gate holds the anchor put across further sends; a sleep makes an
         // "unconditional store" regression observable without the assert depending
         // on the clock actually ticking (it stays == armed either way).
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(2));
         stats.record_frame_sent(10);
         stats.record_frame_sent(10);
         assert_eq!(

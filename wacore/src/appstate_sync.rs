@@ -483,7 +483,7 @@ impl AppStateProcessor {
         // the inbound patch path: one batched query instead of a
         // spawn_blocking + single-row SELECT per mutation.
         let need_db_lookup = collect_unique_index_macs(&mutations);
-        let db_prev: std::collections::HashMap<IndexMac, Vec<u8>> = self
+        let db_prev: HashMap<IndexMac, Vec<u8>> = self
             .backend
             .get_mutation_macs(collection_name, &need_db_lookup)
             .await?;
@@ -535,7 +535,7 @@ impl AppStateProcessor {
 
     /// Inline the patch list's external blobs, then report which referenced decode keys
     /// are absent. Inlining first is load-bearing: the SNAPSHOT's `key_id` lives inside
-    /// its external blob, so [`get_missing_key_ids`] alone (called before download)
+    /// its external blob, so [`get_missing_key_ids`](Self::get_missing_key_ids) alone (called before download)
     /// can't see it and would miss the snapshot's key — letting processing later abort
     /// with `KeyNotFound`. Used by the sync paths to request missing keys up front.
     /// Idempotent: `download_external_blobs` no-ops once the blobs are inlined, and the

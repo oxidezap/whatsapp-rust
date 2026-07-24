@@ -34,7 +34,7 @@ impl wacore::stats::HeapSize for GroupDevicesMemo {
         // The Weak keeps only the GroupInfo allocation header alive; the memo
         // does not retain its payload.
         self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-            + self.members.capacity() * std::mem::size_of::<wacore_binary::CompactString>()
+            + self.members.capacity() * size_of::<wacore_binary::CompactString>()
             + self.devices.heap_bytes()
     }
 }
@@ -316,7 +316,7 @@ impl Client {
     /// probe (one `lid_pn_cache` lookup per member instead of two, on every
     /// group send). Other namespaces keep the two-probe fallback.
     async fn resolve_lookup_keys_for_jid(&self, jid: &Jid) -> UserLookupKeys {
-        if jid.server == wacore_binary::Server::Lid {
+        if jid.server == Server::Lid {
             if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
                 return UserLookupKeys::LidWithPn {
                     lid: jid.user.as_str().into(),
@@ -327,7 +327,7 @@ impl Client {
                 user: jid.user.as_str().into(),
             };
         }
-        if jid.server == wacore_binary::Server::Pn {
+        if jid.server == Server::Pn {
             if let Some(lid) = self.lid_pn_cache.get_current_lid(&jid.user).await {
                 return UserLookupKeys::PnWithLid {
                     lid,
@@ -353,7 +353,7 @@ impl Client {
     }
 
     /// WA Web: `isFromKnownDevice(author)` — local check only, no network.
-    pub(crate) async fn is_from_known_device(&self, sender: &wacore_binary::Jid) -> bool {
+    pub(crate) async fn is_from_known_device(&self, sender: &Jid) -> bool {
         let device_id = sender.device as u32;
         self.has_device(&sender.user, device_id).await
     }
@@ -1142,7 +1142,7 @@ mod tests {
         let pn = "5511999990000";
         let lid = "100000000000001";
         client
-            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
             .await
             .expect("mapping should persist");
         setup_device_record(&client, pn, &[0, 7]).await;
@@ -1341,11 +1341,7 @@ mod tests {
         // recompute even though the group never saw the LID.
         setup_device_record(&client, pn, &[0, 7]).await;
         client
-            .add_lid_pn_mapping(
-                "100000000000077",
-                pn,
-                crate::lid_pn_cache::LearningSource::Usync,
-            )
+            .add_lid_pn_mapping("100000000000077", pn, LearningSource::Usync)
             .await
             .expect("mapping");
         let fresh = client
@@ -1416,7 +1412,7 @@ mod tests {
         // Mapping known BEFORE the memo: the canonical record lives under the
         // LID, while the group only references the member by PN.
         client
-            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
             .await
             .expect("mapping");
         client
@@ -1514,11 +1510,7 @@ mod tests {
 
         let before = current_gen(&client);
         client
-            .add_lid_pn_mapping(
-                "100000000000042",
-                "5511999990004",
-                crate::lid_pn_cache::LearningSource::Usync,
-            )
+            .add_lid_pn_mapping("100000000000042", "5511999990004", LearningSource::Usync)
             .await
             .expect("mapping should persist");
         assert!(
@@ -1752,7 +1744,7 @@ mod tests {
         wacore::stanza::devices::DeviceElement {
             jid: Jid {
                 user: "15551234567".into(),
-                server: wacore_binary::Server::Pn,
+                server: Server::Pn,
                 device: device_id,
                 ..Default::default()
             },

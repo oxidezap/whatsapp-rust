@@ -150,7 +150,7 @@ impl MessageKeys {
                     .expect("valid output length");
             }
             Some(salt) => {
-                hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), input_key_material)
+                hkdf::Hkdf::<Sha256>::new(Some(salt), input_key_material)
                     .expand(b"WhisperMessageKeys", &mut okm)
                     .expect("valid output length");
             }
@@ -209,7 +209,7 @@ impl ChainKey {
         self.index
     }
 
-    pub fn next_chain_key(&self) -> crate::protocol::Result<Self> {
+    pub fn next_chain_key(&self) -> Result<Self> {
         Ok(Self {
             key: self.calculate_base_material(Self::CHAIN_KEY_SEED),
             index: self.index.checked_add(1).ok_or_else(|| {
@@ -230,7 +230,7 @@ impl ChainKey {
 
     /// Compute both message keys and next chain key in one call, reusing HMAC key setup.
     #[inline]
-    pub fn step_with_message_keys(&self) -> crate::protocol::Result<(MessageKeyGenerator, Self)> {
+    pub fn step_with_message_keys(&self) -> Result<(MessageKeyGenerator, Self)> {
         let mut hmac = HmacReset::<Sha256>::new_from_slice(&self.key)
             .expect("HMAC-SHA256 should accept any size key");
 
@@ -280,7 +280,7 @@ impl RootKey {
     ) -> Result<(RootKey, ChainKey)> {
         let shared_secret = our_ratchet_key.calculate_agreement(their_ratchet_key)?;
         let mut derived_secret_bytes = [0; 64];
-        hkdf::Hkdf::<sha2::Sha256>::new(Some(&self.key), &shared_secret)
+        hkdf::Hkdf::<Sha256>::new(Some(&self.key), &shared_secret)
             .expand(b"WhisperRatchet", &mut derived_secret_bytes)
             .expect("valid output length");
 
@@ -322,7 +322,7 @@ mod tests {
             let keys = MessageKeys::derive_keys(ikm, None, i as u32);
 
             let mut okm = [0u8; 80];
-            hkdf::Hkdf::<sha2::Sha256>::new(None, ikm)
+            hkdf::Hkdf::<Sha256>::new(None, ikm)
                 .expand(b"WhisperMessageKeys", &mut okm)
                 .expect("valid output length");
 

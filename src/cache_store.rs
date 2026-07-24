@@ -1,5 +1,5 @@
 //! Typed cache wrapper that dispatches to either the in-process
-//! [`Cache`](crate::cache::Cache) or a custom [`CacheStore`] backend (e.g., Redis).
+//! [`Cache`] or a custom [`CacheStore`] backend (e.g., Redis).
 //!
 //! [`TypedCache`] presents the same interface regardless of the backing store.
 //! Keys are serialised via [`Display`]; values are serialised with `serde_json`

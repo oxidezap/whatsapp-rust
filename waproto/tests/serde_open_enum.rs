@@ -34,7 +34,7 @@ fn open_field_serializes_like_a_closed_enum() {
 #[test]
 fn open_field_serializes_unknown_as_raw_integer() {
     let mutation = wa::SyncdMutation {
-        operation: Some(waproto::buffa::EnumValue::Unknown(7)),
+        operation: Some(buffa::EnumValue::Unknown(7)),
         ..Default::default()
     };
     let json = serde_json::to_value(mutation).unwrap();

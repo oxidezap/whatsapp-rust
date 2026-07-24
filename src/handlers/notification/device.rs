@@ -9,10 +9,7 @@ use wacore::types::events::{DeviceListUpdate, DeviceNotificationInfo};
 use wacore_binary::NodeRef;
 use wacore_binary::{Jid, JidExt};
 
-pub(crate) async fn handle_encrypt_notification(
-    client: &Arc<Client>,
-    nr: &wacore_binary::NodeRef<'_>,
-) {
+pub(crate) async fn handle_encrypt_notification(client: &Arc<Client>, nr: &NodeRef<'_>) {
     if nr.get_optional_child("identity").is_some() {
         handle_identity_change(client, nr).await;
     } else if nr
@@ -30,10 +27,7 @@ pub(crate) async fn handle_encrypt_notification(
     }
 }
 
-pub(crate) async fn handle_account_sync_notification(
-    client: &Arc<Client>,
-    nr: &wacore_binary::NodeRef<'_>,
-) {
+pub(crate) async fn handle_account_sync_notification(client: &Arc<Client>, nr: &NodeRef<'_>) {
     if let Some(new_push_name) = nr.attrs().optional_string("pushname") {
         client
             .clone()
@@ -617,7 +611,7 @@ pub(crate) async fn handle_account_sync_devices(
             .iter()
             .map(|d| {
                 DeviceInfo::new(d.jid.device as u32, d.key_index)
-                    .with_hosting(wacore_binary::JidExt::is_hosted(&d.jid))
+                    .with_hosting(JidExt::is_hosted(&d.jid))
             })
             .collect(),
         timestamp,

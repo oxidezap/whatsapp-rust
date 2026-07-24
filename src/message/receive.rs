@@ -27,7 +27,7 @@ async fn decrypt_session_message(
     signal_address: &wacore::libsignal::protocol::ProtocolAddress,
     adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
     rng: &mut rand::rngs::StdRng,
-) -> std::result::Result<DecryptionResult, SignalProtocolError> {
+) -> Result<DecryptionResult, SignalProtocolError> {
     match message {
         ParsedSessionMessage::Retained(message) => {
             message_decrypt(
@@ -64,9 +64,7 @@ impl Client {
     /// spawn generation.
     #[cfg(test)]
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
-        let generation = self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
+        let generation = self.connection_generation.load(Ordering::Acquire);
         self.handle_incoming_message_scoped(node, generation).await
     }
 
@@ -87,11 +85,7 @@ impl Client {
         // unavailable-only acks, PDO scheduling), so a stale stanza must be
         // dropped BEFORE it — this pairs with the post-permit re-check, which
         // covers a bump landing between here and the decrypt.
-        if self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != lane_generation
-        {
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
             log::debug!(
                 "Connection torn down before classification; leaving the stanza for redelivery"
             );
@@ -409,11 +403,7 @@ impl Client {
         // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
         // sender with "No sender key state".
         let _global_permit = self.acquire_message_processing_permit().await;
-        if self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != lane_generation
-        {
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
             // Teardown bumped the generation while this stanza waited for the
             // permit; its cache settle must be the LAST Signal-cache activity
             // of the connection. Decrypting now would advance ratchets with
@@ -1750,7 +1740,7 @@ impl Client {
 
     pub(crate) async fn parse_message_info(
         &self,
-        node: &wacore_binary::NodeRef<'_>,
+        node: &NodeRef<'_>,
     ) -> Result<MessageInfo, anyhow::Error> {
         // Per-message path: borrow pn/lid from the snapshot, no lock, no clones.
         let device_snapshot = self.persistence_manager.get_device_snapshot();

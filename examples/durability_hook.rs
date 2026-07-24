@@ -98,7 +98,7 @@ impl InboundDurabilityHook for InboxArchiver {
     async fn on_messages(
         &self,
         _client: Arc<Client>,
-        batch: &[whatsapp_rust::types::events::InboundMessage],
+        batch: &[InboundMessage],
     ) -> anyhow::Result<()> {
         // Live traffic arrives one message at a time; an offline drain hands
         // over a whole batch. Either way the commit below is a single append +

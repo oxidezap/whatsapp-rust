@@ -401,7 +401,7 @@ impl LifecycleRegistration {
             CONSTRUCTION_REJECTED => return false,
             _ => {}
         }
-        wacore::runtime::wait_for_shutdown(&activated).await;
+        wait_for_shutdown(&activated).await;
         self.construction_state.load(Ordering::Acquire) == CONSTRUCTION_ACTIVE
             && !self.terminal.load(Ordering::Acquire)
     }
@@ -563,7 +563,7 @@ impl LifecycleRegistration {
         if self.shutdown_complete.load(Ordering::Acquire) {
             return;
         }
-        wacore::runtime::wait_for_shutdown(&completed).await;
+        wait_for_shutdown(&completed).await;
     }
 
     pub(super) fn request_shutdown(self: &Arc<Self>) {
@@ -1464,7 +1464,7 @@ mod tests {
         let cleanup = tokio::spawn(async move {
             cleanup_client.cleanup_connection_state().await;
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
             .await
             .expect("transport cleanup started")
             .expect("transport remained alive");
@@ -1474,7 +1474,7 @@ mod tests {
         assert_eq!(lifecycle.events(), vec!["install", "ready:9"]);
 
         release_tx.send(()).await.expect("release cleanup");
-        tokio::time::timeout(std::time::Duration::from_secs(2), cleanup)
+        tokio::time::timeout(Duration::from_secs(2), cleanup)
             .await
             .expect("cleanup completed")
             .expect("cleanup did not panic");
@@ -1519,7 +1519,7 @@ mod tests {
         let disconnect = tokio::spawn(async move {
             disconnect_client.disconnect().await;
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
             .await
             .expect("disconnect reached cancellable transport I/O")
             .expect("transport remained alive");
@@ -1527,7 +1527,7 @@ mod tests {
 
         disconnect.abort();
         let _ = disconnect.await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while lifecycle.shutdowns.load(Ordering::SeqCst) != 1 {
                 tokio::task::yield_now().await;
             }
@@ -1624,14 +1624,14 @@ mod tests {
         let cleanup_task = tokio::spawn(async move {
             cleanup_client.cleanup_connection_state().await;
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while !scope.is_cancelled() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("scope cancellation");
-        tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_task)
+        tokio::time::timeout(Duration::from_secs(2), cleanup_task)
             .await
             .expect("cleanup completed while callback was blocked")
             .expect("cleanup task did not panic");
@@ -1681,7 +1681,7 @@ mod tests {
         );
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            Duration::from_secs(2),
             client.dispatch_connected(GENERATION),
         )
         .await
@@ -1766,7 +1766,7 @@ mod tests {
         let registration = Arc::new(LifecycleRegistration::new_with_timeout(
             lifecycle.clone(),
             Arc::new(TokioRuntime),
-            std::time::Duration::from_millis(20),
+            Duration::from_millis(20),
         ));
         const GENERATION: u64 = 19;
         assert!(registration.begin_scope_if_current(GENERATION, || true));
@@ -1788,12 +1788,12 @@ mod tests {
         registration.close_scope(GENERATION);
         assert_eq!(scope.state(), ConnectionScopeState::Closed);
         assert!(
-            !tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+            !tokio::time::timeout(Duration::from_secs(1), ready)
                 .await
                 .expect("ready callback was bounded")
                 .expect("ready task did not panic")
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), registration.shutdown())
+        tokio::time::timeout(Duration::from_secs(1), registration.shutdown())
             .await
             .expect("lifecycle shutdown completed");
 
@@ -1971,7 +1971,7 @@ mod tests {
             .send(())
             .await
             .expect("release shutdown callback");
-        tokio::time::timeout(std::time::Duration::from_secs(2), registration.shutdown())
+        tokio::time::timeout(Duration::from_secs(2), registration.shutdown())
             .await
             .expect("later shutdown waiter observed completion");
 
@@ -1991,7 +1991,7 @@ mod tests {
 
         assert!(registration.ready(GENERATION).await);
         registration.close_scope(GENERATION);
-        tokio::time::timeout(std::time::Duration::from_secs(2), registration.shutdown())
+        tokio::time::timeout(Duration::from_secs(2), registration.shutdown())
             .await
             .expect("callback driver recovered from synchronous panics");
 
@@ -2050,7 +2050,7 @@ mod tests {
         removed.wait();
         let shutdown_registration = Arc::clone(&registration);
         let shutdown = tokio::spawn(async move { shutdown_registration.shutdown().await });
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!shutdown.is_finished());
 
         release.wait();
@@ -2108,7 +2108,7 @@ mod tests {
         assert_eq!(scope.state(), ConnectionScopeState::Cancelled);
 
         release_tx.send(()).await.expect("release cleanup");
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while scope.state() != ConnectionScopeState::Closed {
                 tokio::task::yield_now().await;
             }
@@ -2192,7 +2192,7 @@ mod tests {
                 .begin_scope_if_current(24, || { generation.load(Ordering::SeqCst) == 24 })
         );
         assert!(registration.scope_for(24).is_none());
-        tokio::time::timeout(std::time::Duration::from_secs(2), registration.shutdown())
+        tokio::time::timeout(Duration::from_secs(2), registration.shutdown())
             .await
             .expect("shutdown did not wait for a rejected scope");
         assert_eq!(lifecycle.shutdowns.load(Ordering::SeqCst), 1);
@@ -2322,7 +2322,7 @@ mod tests {
         let shutdown = tokio::spawn(async move {
             shutdown_registration.shutdown().await;
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while !scope.is_cancelled() {
                 tokio::task::yield_now().await;
             }

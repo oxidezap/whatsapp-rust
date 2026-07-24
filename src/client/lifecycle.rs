@@ -218,7 +218,7 @@ impl Client {
 
         let (tx, rx) = async_channel::bounded(32);
 
-        let device_topology = crate::client::device_topology::DeviceTopology::new();
+        let device_topology = device_topology::DeviceTopology::new();
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -282,7 +282,7 @@ impl Client {
                 cache_config.cache_stores.lid_pn_cache.clone(),
             )),
             ab_props: Arc::new(wacore::store::ab_props::AbPropsCache::new()),
-            group_cache: async_lock::Mutex::new(None),
+            group_cache: Mutex::new(None),
 
             expected_disconnect: Arc::new(AtomicBool::new(false)),
             intentional_reconnect: AtomicBool::new(false),
@@ -316,22 +316,22 @@ impl Client {
                 processed_messages: AtomicUsize::new(0),
                 start_time: std::sync::Mutex::new(None),
             }),
-            offline_batch: Arc::new(crate::client::offline_resume::OfflineBatchCoordinator::new()),
+            offline_batch: Arc::new(offline_resume::OfflineBatchCoordinator::new()),
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
-            connected_at_ms: Arc::new(portable_atomic::AtomicI64::new(0)),
+            connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
 
             needs_initial_full_sync: Arc::new(AtomicBool::new(false)),
 
-            app_state_processor: async_lock::Mutex::new(None),
+            app_state_processor: Mutex::new(None),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
             app_state_syncing: Arc::new(Mutex::new(HashSet::new())),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
-            prekey_upload_lock: Arc::new(async_lock::Mutex::new(())),
-            signed_pre_key_rotation_lock: Arc::new(async_lock::Mutex::new(())),
+            prekey_upload_lock: Arc::new(Mutex::new(())),
+            signed_pre_key_rotation_lock: Arc::new(Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
@@ -340,7 +340,7 @@ impl Client {
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
-            presence_subscriptions: Arc::new(async_lock::Mutex::new(HashSet::new())),
+            presence_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
@@ -350,7 +350,7 @@ impl Client {
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
             signal_flush_state: AtomicU64::new(0),
-            signal_flush_lifecycle: async_lock::Mutex::new(()),
+            signal_flush_lifecycle: Mutex::new(()),
             #[cfg(test)]
             signal_flush_test_failures: AtomicU32::new(0),
             #[cfg(test)]
@@ -365,7 +365,7 @@ impl Client {
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
-            device_registry_cache: crate::client::device_topology::DeviceRegistryCache::new(
+            device_registry_cache: device_topology::DeviceRegistryCache::new(
                 cache_config.device_registry_cache.build_typed_ttl(
                     cache_config.cache_stores.device_registry_cache.clone(),
                     "device_registry",
@@ -398,11 +398,9 @@ impl Client {
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicUsize::new(0),
             #[cfg(feature = "voip-runtime")]
-            call_registry: std::sync::Arc::new(wacore::voip::CallRegistry::new()),
+            call_registry: Arc::new(wacore::voip::CallRegistry::new()),
             #[cfg(feature = "voip-runtime")]
-            pending_outgoing_calls: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let arc = Arc::new(this);
@@ -466,7 +464,7 @@ impl Client {
             if let Err(connect_err) = self.connect().await {
                 wacore::telemetry::connect("fail");
                 let is_transient = connect_err
-                    .downcast_ref::<crate::handshake::HandshakeError>()
+                    .downcast_ref::<handshake::HandshakeError>()
                     .is_some_and(|e| e.is_transient());
                 if is_transient {
                     debug!("Transient connect failure, will retry: {connect_err:#}");
@@ -486,11 +484,11 @@ impl Client {
                 // reason distinguishes a routine server recycle from a real failure so
                 // consumers don't have to.
                 let unexpected_disconnect = match loop_result {
-                    Ok(super::node_io::ReadLoopExit::Expected) => {
+                    Ok(node_io::ReadLoopExit::Expected) => {
                         debug!("Message loop exited gracefully (expected disconnect).");
                         None
                     }
-                    Ok(super::node_io::ReadLoopExit::ServerRecycle(reason)) => {
+                    Ok(node_io::ReadLoopExit::ServerRecycle(reason)) => {
                         if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
                             debug!("Message loop exited during expected disconnect.");
                             None
@@ -773,7 +771,7 @@ impl Client {
         // may not be durable yet (receipting an SKDM whose sender key only
         // lives in the cache would lose it to a crash with no redelivery).
         if self
-            .flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
+            .flush_inbound_commits_bounded(Duration::from_secs(5))
             .await
         {
             self.flush_offline_receipts();
@@ -781,7 +779,7 @@ impl Client {
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
         self.outbound_flush
-            .flush(&*self.runtime, std::time::Duration::from_secs(5))
+            .flush(&*self.runtime, Duration::from_secs(5))
             .await;
         self.notify_connection_shutdown();
 
@@ -806,7 +804,7 @@ impl Client {
         self.shutdown_lifecycle().await;
     }
 
-    /// Backoff step used by [`reconnect()`] to create an offline window.
+    /// Backoff step used by [`reconnect()`](Self::reconnect) to create an offline window.
     ///
     /// `fibonacci_backoff(RECONNECT_BACKOFF_STEP)` determines the delay before
     /// the run loop re-connects.  This must be longer than the mock server's
@@ -817,10 +815,10 @@ impl Client {
 
     /// Drop the current connection and trigger the auto-reconnect loop.
     ///
-    /// Unlike [`disconnect`], this does **not** stop the run loop. The client
+    /// Unlike [`disconnect`](Self::disconnect), this does **not** stop the run loop. The client
     /// will reconnect automatically using the same persisted identity/store,
     /// just as it would after a network interruption. Use
-    /// [`wait_for_connected`] to wait for the new connection to be ready.
+    /// [`wait_for_connected`](Self::wait_for_connected) to wait for the new connection to be ready.
     ///
     /// This is useful for:
     /// - Handling network changes (e.g., Wi-Fi → cellular)
@@ -845,14 +843,14 @@ impl Client {
 
         // Same durable-before-receipts gate as disconnect().
         if self
-            .flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
+            .flush_inbound_commits_bounded(Duration::from_secs(2))
             .await
         {
             self.flush_offline_receipts();
         }
         self.outbound_flush.close();
         self.outbound_flush
-            .flush(&*self.runtime, std::time::Duration::from_secs(2))
+            .flush(&*self.runtime, Duration::from_secs(2))
             .await;
         self.notify_connection_shutdown();
 
@@ -863,7 +861,7 @@ impl Client {
 
     /// Drop the current connection and reconnect immediately with no delay.
     ///
-    /// Unlike [`reconnect`], which introduces a deliberate offline window,
+    /// Unlike [`reconnect`](Self::reconnect), which introduces a deliberate offline window,
     /// this method sets the `expected_disconnect` flag so the run loop
     /// skips the backoff delay and reconnects as fast as possible.
     #[cfg_attr(
@@ -880,14 +878,14 @@ impl Client {
 
         // Same durable-before-receipts gate as disconnect().
         if self
-            .flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
+            .flush_inbound_commits_bounded(Duration::from_secs(2))
             .await
         {
             self.flush_offline_receipts();
         }
         self.outbound_flush.close();
         self.outbound_flush
-            .flush(&*self.runtime, std::time::Duration::from_secs(2))
+            .flush(&*self.runtime, Duration::from_secs(2))
             .await;
         self.notify_connection_shutdown();
 
@@ -1045,7 +1043,7 @@ impl Client {
         let flush_gate = self.signal_flush_lifecycle.lock().await;
         if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
             client
-                .teardown_inbound_commits_bounded(std::time::Duration::from_secs(5))
+                .teardown_inbound_commits_bounded(Duration::from_secs(5))
                 .await;
         } else {
             // Same class of bug as the complete_offline_sync twin: a silent
@@ -1137,7 +1135,7 @@ impl Client {
     /// such as requesting a pair code during initial pairing.
     ///
     /// If the socket is already connected, returns immediately.
-    pub async fn wait_for_socket(&self, timeout: std::time::Duration) -> Result<(), anyhow::Error> {
+    pub async fn wait_for_socket(&self, timeout: Duration) -> Result<(), anyhow::Error> {
         // Fast path: already connected
         if self.is_connected() {
             return Ok(());
@@ -1162,10 +1160,7 @@ impl Client {
     /// and authentication is complete.
     ///
     /// If the client is already connected and logged in, returns immediately.
-    pub async fn wait_for_connected(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn wait_for_connected(&self, timeout: Duration) -> Result<(), anyhow::Error> {
         // Fast path: fully ready (connected + logged in + critical sync done).
         if self.is_fully_ready() {
             return Ok(());

@@ -67,7 +67,7 @@ where
 /// type-erased (`dyn`) so the encrypt/session functions compile to a single
 /// instantiation rather than one per concrete adapter set.
 pub struct SignalStores<'a> {
-    pub sender_key_store: &'a mut (dyn crate::libsignal::protocol::SenderKeyStore + Send + Sync),
+    pub sender_key_store: &'a mut (dyn SenderKeyStore + Send + Sync),
     pub session_store: &'a mut (dyn CloneableSessionStore + Send + Sync),
     pub identity_store: &'a mut (dyn CloneableIdentityStore + Send + Sync),
     pub prekey_store: &'a mut (dyn crate::libsignal::protocol::PreKeyStore + Send + Sync),
@@ -338,7 +338,7 @@ fn encrypted_device_to_participant_node(
 
 /// Per-device Signal sessions are independent (different ratchet state per
 /// recipient), so this fans the encrypt loop out across tokio tasks bounded
-/// by [`ENCRYPT_FANOUT_CONCURRENCY`]. Each task clones the store handles
+/// by `ENCRYPT_FANOUT_CONCURRENCY`. Each task clones the store handles
 /// (Arc bumps under the hood); the shared cache provides interior mutability.
 ///
 /// Composition of [`ensure_sessions_for_devices`] (network: prekey fetch +

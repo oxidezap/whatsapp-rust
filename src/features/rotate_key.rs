@@ -78,7 +78,7 @@ impl Client {
 
     /// Stage a fresh signed pre-key durably, upload it, and only on server
     /// acceptance promote it locally: retain the outgoing key, advance the
-    /// current key + cadence, and prune to [`SIGNED_PRE_KEY_RETENTION`].
+    /// current key + cadence, and prune to `SIGNED_PRE_KEY_RETENTION`.
     ///
     /// Both the new candidate and the outgoing key are written to the backend
     /// table *before* upload (the candidate reused verbatim on retry), so every

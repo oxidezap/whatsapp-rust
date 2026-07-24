@@ -693,7 +693,7 @@ impl SignalStoreCache {
     // === Sessions (object cache — serialize only during flush) ===
 
     /// Takes ownership of the cached session, leaving a `CheckedOut` marker.
-    /// Callers must return the record with [`put_session`] after use.
+    /// Callers must return the record with [`put_session`](Self::put_session) after use.
     pub async fn get_session(
         &self,
         address: &ProtocolAddress,
@@ -1720,7 +1720,7 @@ mod sender_key_lock_tests {
         assert_eq!(cache.try_has_session(&addr), Some(true));
         cache.flush(&backend).await.unwrap();
         assert!(
-            crate::store::traits::SignalStore::get_session(&backend, addr.as_str())
+            SignalStore::get_session(&backend, addr.as_str())
                 .await
                 .unwrap()
                 .is_some(),
@@ -1789,7 +1789,7 @@ mod sender_key_lock_tests {
 
         cache.flush(&backend).await.unwrap();
         assert!(
-            crate::store::traits::SignalStore::get_session(&backend, addr.as_str())
+            SignalStore::get_session(&backend, addr.as_str())
                 .await
                 .unwrap()
                 .is_some(),

@@ -13,10 +13,13 @@ pub use buffa;
 pub mod whatsapp {
     // disallowed_methods: the generated impls call the buffa trait methods on
     // nested messages; that IS the pinned instantiation.
+    // unused_qualifications: the generator emits fully-qualified paths on
+    // purpose so the output cannot collide with names in the including scope.
     #![allow(
         non_camel_case_types,
         non_snake_case,
         unreachable_patterns,
+        unused_qualifications,
         clippy::derivable_impls,
         clippy::match_single_binding,
         clippy::needless_else,

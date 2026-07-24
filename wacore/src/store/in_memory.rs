@@ -1002,7 +1002,7 @@ impl DeviceStore for InMemoryBackend {
 mod tests {
     use super::*;
 
-    fn is_backend<T: crate::store::traits::Backend>() {}
+    fn is_backend<T: Backend>() {}
 
     #[test]
     fn in_memory_backend_implements_backend() {

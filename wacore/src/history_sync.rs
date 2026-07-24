@@ -386,7 +386,7 @@ where
     }
 
     fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
-        std::num::NonZeroUsize::new(std::mem::size_of::<HistoryMsgSecretRecord>())
+        std::num::NonZeroUsize::new(size_of::<HistoryMsgSecretRecord>())
     }
 }
 
@@ -3236,7 +3236,7 @@ mod tests {
             }
 
             fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
-                std::num::NonZeroUsize::new(std::mem::size_of::<u64>())
+                std::num::NonZeroUsize::new(size_of::<u64>())
             }
         }
 

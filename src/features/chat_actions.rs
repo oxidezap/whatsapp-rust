@@ -816,7 +816,7 @@ impl Client {
     }
 
     /// Send any app-state (syncd) `Set` action, driven by a generated
-    /// [`Schema`](wacore::appstate::schemas::Schema) from
+    /// [`Schema`] from
     /// [`wacore::appstate::schemas`]. The collection, action version, and index
     /// shape come from the registry; the caller only fills the typed
     /// [`SyncActionValue`](wa::SyncActionValue) (its action sub-field, plus a

@@ -3628,7 +3628,7 @@ mod tests {
         type Output = ();
 
         fn poll(
-            self: std::pin::Pin<&mut Self>,
+            self: Pin<&mut Self>,
             _context: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Self::Output> {
             std::task::Poll::Pending
@@ -4761,7 +4761,7 @@ mod tests {
         type Output = anyhow::Result<()>;
 
         fn poll(
-            self: std::pin::Pin<&mut Self>,
+            self: Pin<&mut Self>,
             _context: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Self::Output> {
             std::task::Poll::Pending
@@ -5147,21 +5147,11 @@ mod tests {
             .await
             .expect("event subscription plugin");
         let client = build.into_client();
-        assert!(
-            client
-                .core
-                .event_bus
-                .has_handler_for(wacore::types::events::EventKind::Connected)
-        );
+        assert!(client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(client.raw_node_forwarding_enabled());
 
         client.disconnect().await;
-        assert!(
-            !client
-                .core
-                .event_bus
-                .has_handler_for(wacore::types::events::EventKind::Connected)
-        );
+        assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(!client.raw_node_forwarding_enabled());
     }
 

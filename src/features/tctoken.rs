@@ -67,7 +67,7 @@ impl<'a> TcToken<'a> {
 
     /// Prune expired tc tokens from the store.
     ///
-    /// Cutoffs are AB-prop-aware via [`Client::tc_token_config()`] — the server
+    /// Cutoffs are AB-prop-aware via `Client::tc_token_config()` — the server
     /// may override the default 28-day window (e.g. 26 buckets = 182 days). The
     /// received token and the sender bucket expire on independent windows, so a
     /// row is dropped only when both are stale.

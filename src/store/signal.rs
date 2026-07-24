@@ -342,7 +342,7 @@ impl SignedPreKeyStore for Device {
         signed_prekey_id: u32,
     ) -> Result<Option<SignedPreKeyRecordStructure>, StoreError> {
         if signed_prekey_id == self.signed_pre_key_id {
-            let record = wacore::libsignal::store::record_helpers::new_signed_pre_key_record(
+            let record = record_helpers::new_signed_pre_key_record(
                 self.signed_pre_key_id,
                 &self.signed_pre_key,
                 self.signed_pre_key_signature,
@@ -675,7 +675,7 @@ mod tests {
         let kp = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
             rand::rngs::StdRng,
         >());
-        let record = wacore::libsignal::store::record_helpers::new_signed_pre_key_record(
+        let record = record_helpers::new_signed_pre_key_record(
             old_id,
             &kp,
             [9u8; 64],

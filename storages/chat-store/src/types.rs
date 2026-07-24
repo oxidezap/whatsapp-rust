@@ -138,7 +138,7 @@ pub struct ChatEntry {
     pub last_message_at: Option<DateTime<Utc>>,
     pub last_message_preview: Option<String>,
     /// Content class of the latest message, so a media preview can render as
-    /// "[photo]"/"[voice note]" in whatever way (and language) the frontend
+    /// "\[photo\]"/"\[voice note\]" in whatever way (and language) the frontend
     /// chooses — the store never bakes in presentation strings.
     pub last_message_kind: Option<MessageKind>,
     /// `-1` means "manually marked unread" (WA Web convention).

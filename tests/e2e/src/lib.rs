@@ -2,6 +2,9 @@
 // `send_and_expect_text()` future past the default layout-query depth. Matches the
 // `512` already used in `src/lib.rs` / `examples/demo.rs`.
 #![recursion_limit = "512"]
+// Harness diagnostics. This lives in a lib target rather than under
+// `#[cfg(test)]`, so clippy's allow-print-in-tests does not reach it.
+#![allow(clippy::print_stderr)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -125,7 +128,7 @@ async fn collect_connect_diagnostics(
 ) -> String {
     async fn session_status(
         client: &whatsapp_rust::client::Client,
-        jid: Option<whatsapp_rust::Jid>,
+        jid: Option<Jid>,
     ) -> &'static str {
         match jid {
             Some(jid) => match client.signal().validate_session(&jid).await {
