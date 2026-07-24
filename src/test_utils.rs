@@ -34,7 +34,10 @@ pub async fn poll_until(what: &str, mut cond: impl FnMut() -> bool) {
     // time (and would otherwise burn a core for the whole deadline).
     const YIELDS: u32 = 64;
 
-    let started = wacore::time::Instant::now();
+    // Tokio's clock, not the wall clock: the timed step below is a tokio sleep, so
+    // measuring the deadline on the same clock keeps the two in agreement even
+    // under `tokio::time::pause()`.
+    let started = tokio::time::Instant::now();
     let mut spins = 0u32;
     loop {
         if cond() {

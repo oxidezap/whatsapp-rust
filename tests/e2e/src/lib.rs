@@ -501,7 +501,10 @@ impl TestClient {
                 return Ok(());
             }
 
-            if tokio::time::Instant::now() >= deadline {
+            // Re-sample the flag: the teardown runs on another task and can flip it
+            // between the check above and the deadline expiring, and a disconnect
+            // that lands in that window is a success, not a timeout.
+            if tokio::time::Instant::now() >= deadline && self.client.is_connected() {
                 return Err(anyhow::anyhow!(
                     "Timed out after {timeout_secs}s waiting for the client to go offline"
                 ));
