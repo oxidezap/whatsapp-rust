@@ -11,7 +11,7 @@
 //! - No UndecryptableMessage events during normal messaging
 //! - Multiple sequential sends don't regress to PN sessions
 
-use e2e_tests::{TestClient, send_and_expect_text};
+use e2e_tests::{TestClient, peer_session_addr, scan_sessions, send_and_expect_text};
 use log::info;
 use wacore::store::traits::SignalStore;
 use wacore::types::events::Event;
@@ -28,32 +28,6 @@ fn mask_addr(addr: &str) -> String {
     } else {
         addr.to_string()
     }
-}
-
-/// Backend session-store key for a peer's `(user, server, device)`, matching the
-/// `<user>[:dev]@<server>.0` protocol-address form the Signal store keys on.
-fn peer_session_addr(user: &str, server: &str, device: u16) -> String {
-    if device == 0 {
-        format!("{user}@{server}.0")
-    } else {
-        format!("{user}:{device}@{server}.0")
-    }
-}
-
-/// Scan backend for sessions matching a user across device IDs 0..=99.
-async fn scan_sessions(
-    backend: &dyn SignalStore,
-    user: &str,
-    server: &str,
-) -> anyhow::Result<Vec<String>> {
-    let mut results = Vec::new();
-    for device_id in 0..=99u16 {
-        let addr = peer_session_addr(user, server, device_id);
-        if backend.get_session(&addr).await?.is_some() {
-            results.push(addr);
-        }
-    }
-    Ok(results)
 }
 
 /// Assert that ALL sessions for a user are under LID, NONE under PN.
@@ -87,7 +61,7 @@ async fn assert_lid_only_sessions(
         lid_sessions.len(),
         lid_sessions
             .first()
-            .map(|s| mask_addr(s))
+            .map(|(addr, _)| mask_addr(addr))
             .unwrap_or_default()
     );
 }

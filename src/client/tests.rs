@@ -830,8 +830,10 @@ async fn test_offline_sync_lifecycle() {
         true // Return that we completed
     });
 
-    // Give the waiter time to start waiting
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // A registered listener proves the waiter reached its await point, so the
+    // "still waiting" assertion below cannot pass just because the spawned task
+    // never got scheduled.
+    crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
 
     // Verify waiter hasn't completed yet
     assert!(
@@ -936,12 +938,13 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
         client_clone.ensure_e2e_sessions(&[]).await
     });
 
-    // Wait a bit - ensure_e2e_sessions should return immediately for empty list
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(
-        ensure_handle.is_finished(),
-        "ensure_e2e_sessions should return immediately for empty JID list"
-    );
+    // An empty list must not wait for offline sync: the flag is still false, so a
+    // waiting call would hang until DEFAULT_OFFLINE_SYNC_TIMEOUT.
+    tokio::time::timeout(Duration::from_secs(5), ensure_handle)
+        .await
+        .expect("ensure_e2e_sessions should return immediately for empty JID list")
+        .expect("ensure_e2e_sessions task should not panic")
+        .expect("empty JID list should succeed");
 
     // Now test with actual JIDs - it should wait for offline sync
     let client_clone = client.clone();
@@ -953,8 +956,10 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
         start.elapsed()
     });
 
-    // Give it a moment to start
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Registration is what makes the assertion below scheduler-independent: it
+    // pins down that `ensure_e2e_sessions` is blocked on offline sync rather than
+    // simply not started yet.
+    crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
 
     // It should still be waiting (offline sync not complete)
     assert!(
@@ -3276,7 +3281,12 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
         disconnect_client.disconnect().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // disconnect() closes the scope and then parks in `outbound_flush.flush`; the
+    // parked flusher is what proves it got that far and is stuck there.
+    crate::test_utils::poll_until("disconnect to park on the outbound flush", || {
+        client.outbound_flush.flush_waiters() >= 1
+    })
+    .await;
     assert!(
         !client.connection_shutdown_signal().is_fired(),
         "connection cleanup must not fire while outbound flush is blocked"
@@ -3477,7 +3487,10 @@ async fn flush_waits_for_queued_delivery_receipts() {
             .flush(&*flush_client.runtime, Duration::from_secs(5))
             .await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    crate::test_utils::poll_until("the flusher to park on the outbound scope", || {
+        client.outbound_flush.flush_waiters() >= 1
+    })
+    .await;
     assert!(
         !flush_task.is_finished(),
         "flush must wait while receipts are queued or in flight"
@@ -3668,17 +3681,12 @@ async fn ack_miss_path_does_not_heap_allocate() {
 
     let node = Arc::new(owned_ack_node("3EB0A9252A8F12B7E2"));
 
-    // Min-delta over many windows: sibling tests share the process-global
-    // counter, but their allocations are sporadic. A per-call String shows up
-    // in every window, so the minimum only reaches 0 when the path is clean.
-    let mut min_delta = u64::MAX;
-    for _ in 0..100 {
-        let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+    // A per-call String shows up in every window, so the minimum only reaches 0
+    // when the path is clean.
+    let min_delta = crate::test_alloc::min_allocs(0, || {
         let handled = client.handle_ack_response_arc(&node);
-        let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
         assert!(!handled, "no waiter is registered for this id");
-        min_delta = min_delta.min(after - before);
-    }
+    });
     assert_eq!(min_delta, 0, "ack miss path must not allocate");
 }
 

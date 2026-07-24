@@ -14,7 +14,7 @@ async fn test_offline_message_delivery_on_reconnect() -> anyhow::Result<()> {
     // Triggers auto-reconnect
     client_b.client.reconnect().await;
     info!("Client B connection dropped, will auto-reconnect");
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     let text = "Hello from offline queue!";
     let msg_id = client_a
@@ -44,7 +44,7 @@ async fn test_offline_message_ordering() -> anyhow::Result<()> {
     let jid_b = client_b.jid().await;
 
     client_b.client.reconnect().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     let messages = vec!["first", "second", "third"];
     for text in &messages {
@@ -117,7 +117,6 @@ async fn test_server_accepts_messages_for_offline_recipient() -> anyhow::Result<
     let jid_b = client_b.jid().await;
 
     client_b.disconnect().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let mut msg_ids = Vec::new();
     for i in 1..=5 {

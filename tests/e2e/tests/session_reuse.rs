@@ -1,41 +1,8 @@
 //! Signal session management e2e tests.
 
-use e2e_tests::{TestClient, send_and_expect_text};
+use e2e_tests::{TestClient, scan_sessions, send_and_expect_text};
 use log::info;
 use wacore::libsignal::protocol::SessionRecord;
-
-/// Scan backend for sessions matching a user across device IDs 0..=99.
-/// Returns Vec<(address, has_pending_pre_key)> for all found sessions.
-///
-/// The range must cover the peer's real companion device (a paired client is a
-/// non-zero device, e.g. 33), not just low ids — otherwise the only session found
-/// is the phantom device-0 one, whose pending_pre_key never clears (device 0 never
-/// completes the X3DH handshake).
-async fn scan_sessions(
-    backend: &dyn wacore::store::traits::SignalStore,
-    user: &str,
-    server: &str,
-) -> anyhow::Result<Vec<(String, bool)>> {
-    let mut results = Vec::new();
-    for device_id in 0..=99u16 {
-        let addr = if device_id == 0 {
-            format!("{user}@{server}.0")
-        } else {
-            format!("{user}:{device_id}@{server}.0")
-        };
-        if let Some(data) = backend.get_session(&addr).await? {
-            let record = SessionRecord::deserialize(&data)?;
-            if let Some(state) = record.session_state() {
-                let has_pending = state
-                    .unacknowledged_pre_key_message_items()
-                    .map_err(|e| anyhow::anyhow!("invalid session state: {e}"))?
-                    .is_some();
-                results.push((addr, has_pending));
-            }
-        }
-    }
-    Ok(results)
-}
 
 /// Read the sender-chain counter of the first established session for `user`
 /// straight from the backend (no cache, no settle) — the durable outbound

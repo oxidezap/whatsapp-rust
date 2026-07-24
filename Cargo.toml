@@ -251,6 +251,8 @@ aes = { workspace = true }
 async-trait = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
 env_logger = { workspace = true }
+# `total_listeners()` (how tests observe that a waiter parked) is std-gated.
+event-listener = { workspace = true, features = ["std"] }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }

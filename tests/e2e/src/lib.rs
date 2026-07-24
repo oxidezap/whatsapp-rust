@@ -486,6 +486,34 @@ impl TestClient {
 
     // ── Connection lifecycle ────────────────────────────────────────────────
 
+    /// Wait until the current connection is torn down.
+    ///
+    /// `reconnect()` / `reconnect_immediately()` only ask the transport to
+    /// close; the client is still bookkeeping-connected until the run loop
+    /// finishes `cleanup_connection_state`. Offline tests must observe that
+    /// transition before acting, and polling it is bounded and self-reporting
+    /// where a fixed sleep is neither.
+    pub async fn wait_for_disconnected(&self, timeout_secs: u64) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            if !self.client.is_connected() {
+                return Ok(());
+            }
+
+            // Re-sample the flag: the teardown runs on another task and can flip it
+            // between the check above and the deadline expiring, and a disconnect
+            // that lands in that window is a success, not a timeout.
+            if tokio::time::Instant::now() >= deadline && self.client.is_connected() {
+                return Err(anyhow::anyhow!(
+                    "Timed out after {timeout_secs}s waiting for the client to go offline"
+                ));
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+        }
+    }
+
     /// Reconnect and wait for the Connected event.
     pub async fn reconnect_and_wait(&mut self) -> anyhow::Result<()> {
         // Drain any buffered Connected events from prior connections
@@ -518,6 +546,57 @@ impl TestClient {
 }
 
 // ── Free-standing test helpers ──────────────────────────────────────────────
+
+/// True when `node` has a direct child with the given tag.
+pub fn has_child(node: &Node, tag: &str) -> bool {
+    node.children()
+        .map(|children| children.iter().any(|child| child.tag == tag))
+        .unwrap_or(false)
+}
+
+/// Backend session-store key for a peer's `(user, server, device)`, matching the
+/// `<user>[:dev]@<server>.0` protocol-address form the Signal store keys on.
+pub fn peer_session_addr(user: &str, server: &str, device: u16) -> String {
+    if device == 0 {
+        format!("{user}@{server}.0")
+    } else {
+        format!("{user}:{device}@{server}.0")
+    }
+}
+
+/// Scan the backend for sessions matching `user` across device IDs 0..=99,
+/// returning `(address, has_pending_pre_key)` for each one found.
+///
+/// The range must cover the peer's real companion device (a paired client is a
+/// non-zero device, e.g. 33), not just low ids — otherwise the only session
+/// found is the phantom device-0 one, whose pending_pre_key never clears
+/// (device 0 never completes the X3DH handshake).
+///
+/// A record that deserializes without a current state is still reported (with
+/// `has_pending_pre_key = false`), so absence in the result means "no session
+/// stored", which is what the LID-only assertions rely on.
+pub async fn scan_sessions(
+    backend: &dyn wacore::store::traits::SignalStore,
+    user: &str,
+    server: &str,
+) -> anyhow::Result<Vec<(String, bool)>> {
+    let mut results = Vec::new();
+    for device_id in 0..=99u16 {
+        let addr = peer_session_addr(user, server, device_id);
+        if let Some(data) = backend.get_session(&addr).await? {
+            let record = wacore::libsignal::protocol::SessionRecord::deserialize(&data)?;
+            let has_pending = match record.session_state() {
+                Some(state) => state
+                    .unacknowledged_pre_key_message_items()
+                    .map_err(|e| anyhow::anyhow!("invalid session state: {e}"))?
+                    .is_some(),
+                None => false,
+            };
+            results.push((addr, has_pending));
+        }
+    }
+    Ok(results)
+}
 
 /// Build a simple text message.
 pub fn text_msg(text: &str) -> wa::Message {

@@ -204,3 +204,389 @@ fn parse_collection_error(
         _ => CollectionSyncError::Retry { code, text },
     })
 }
+
+#[cfg(test)]
+// Fixtures encode protos the pinned `waproto::codec` wrappers don't cover; the
+// binary-size reason for pinning them doesn't apply to test code.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+    use buffa::Message;
+    use wacore_binary::builder::NodeBuilder;
+
+    /// Length-delimited field 1 announcing 5 bytes but carrying 1, so every
+    /// protobuf decoder in the tests below fails deterministically.
+    const TRUNCATED_PROTOBUF: [u8; 3] = [0x0A, 0x05, 0x01];
+
+    fn patch_bytes(version: u64) -> Vec<u8> {
+        waproto::codec::syncd_patch_to_vec(&wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion {
+                version: Some(version),
+            }),
+            snapshot_mac: Some(vec![0xAB; 32]),
+            ..Default::default()
+        })
+    }
+
+    fn snapshot_ref_bytes(direct_path: &str) -> Vec<u8> {
+        wa::ExternalBlobReference {
+            direct_path: Some(direct_path.to_string()),
+            file_size_bytes: Some(4096),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// `<collection>` carrying a snapshot ref and two patches.
+    fn full_collection() -> Node {
+        NodeBuilder::new("collection")
+            .attr("name", "regular")
+            .attr("has_more_patches", "true")
+            .children([
+                NodeBuilder::new("snapshot")
+                    .bytes(snapshot_ref_bytes("/appstate/snapshot.enc"))
+                    .build(),
+                NodeBuilder::new("patches")
+                    .children([
+                        NodeBuilder::new("patch").bytes(patch_bytes(1)).build(),
+                        NodeBuilder::new("patch").bytes(patch_bytes(2)).build(),
+                    ])
+                    .build(),
+            ])
+            .build()
+    }
+
+    fn sync_node(collections: impl IntoIterator<Item = Node>) -> Node {
+        NodeBuilder::new("sync").children(collections).build()
+    }
+
+    fn iq_with(collections: impl IntoIterator<Item = Node>) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([sync_node(collections)])
+            .build()
+    }
+
+    #[test]
+    fn patch_name_roundtrips_every_wire_string() {
+        for name in [
+            WAPatchName::CriticalBlock,
+            WAPatchName::CriticalUnblockLow,
+            WAPatchName::RegularLow,
+            WAPatchName::RegularHigh,
+            WAPatchName::Regular,
+        ] {
+            assert_eq!(WAPatchName::from_str(name.as_str()), Ok(name));
+        }
+        assert_eq!(
+            WAPatchName::from_str("something_new"),
+            Ok(WAPatchName::Unknown)
+        );
+    }
+
+    #[test]
+    fn parse_patch_list_reads_name_patches_and_snapshot_ref() {
+        let list = parse_patch_list(&iq_with([full_collection()])).expect("well-formed collection");
+
+        assert_eq!(list.name, WAPatchName::Regular);
+        assert!(list.has_more_patches);
+        assert!(list.error.is_none());
+        // Inline snapshots are never sent; only the external reference is parsed.
+        assert!(list.snapshot.is_none());
+        assert_eq!(
+            list.snapshot_ref
+                .as_ref()
+                .and_then(|r| r.direct_path.as_deref()),
+            Some("/appstate/snapshot.enc")
+        );
+
+        let versions: Vec<Option<u64>> = list
+            .patches
+            .iter()
+            .map(|p| p.version.as_option().and_then(|v| v.version))
+            .collect();
+        assert_eq!(versions, vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn parse_patch_list_ref_matches_owned_path() {
+        let node = iq_with([full_collection()]);
+        let list = parse_patch_list_ref(&node.as_node_ref()).expect("well-formed collection");
+
+        assert_eq!(list.name, WAPatchName::Regular);
+        assert_eq!(list.patches.len(), 2);
+    }
+
+    #[test]
+    fn parse_patch_list_defaults_missing_optional_fields() {
+        let collection = NodeBuilder::new("collection")
+            .attr("name", "critical_block")
+            .build();
+        let list = parse_patch_list(&iq_with([collection])).expect("name alone is enough");
+
+        assert_eq!(list.name, WAPatchName::CriticalBlock);
+        assert!(!list.has_more_patches);
+        assert!(list.patches.is_empty());
+        assert!(list.snapshot_ref.is_none());
+        assert!(list.error.is_none());
+    }
+
+    #[test]
+    fn parse_patch_list_maps_unknown_collection_name() {
+        let collection = NodeBuilder::new("collection")
+            .attr("name", "collection_from_the_future")
+            .build();
+        let list = parse_patch_list(&iq_with([collection])).expect("unknown names are tolerated");
+
+        assert_eq!(list.name, WAPatchName::Unknown);
+    }
+
+    #[test]
+    fn parse_patch_list_rejects_missing_sync_collection_path() {
+        let err = parse_patch_list(&NodeBuilder::new("iq").build())
+            .expect_err("no sync/collection to descend into");
+        assert!(err.to_string().contains("missing sync/collection"));
+
+        let err = parse_patch_list(&iq_with([]))
+            .expect_err("a sync node without collections is still unusable here");
+        assert!(err.to_string().contains("missing sync/collection"));
+    }
+
+    #[test]
+    fn parse_single_collection_rejects_missing_name() {
+        let collection = NodeBuilder::new("collection")
+            .attr("has_more_patches", "true")
+            .build();
+        let err = parse_patch_list(&iq_with([collection]))
+            .expect_err("a nameless collection cannot be routed anywhere");
+        assert!(
+            err.to_string()
+                .contains("collection missing 'name' attribute")
+        );
+    }
+
+    #[test]
+    fn parse_single_collection_rejects_undecodable_patch() {
+        let collection = NodeBuilder::new("collection")
+            .attr("name", "regular")
+            .children([NodeBuilder::new("patches")
+                .children([
+                    NodeBuilder::new("patch").bytes(patch_bytes(1)).build(),
+                    NodeBuilder::new("patch")
+                        .bytes(TRUNCATED_PROTOBUF.to_vec())
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let err = parse_patch_list(&iq_with([collection]))
+            .expect_err("a garbled patch must not be silently dropped");
+        assert!(err.to_string().contains("failed to unmarshal patch"));
+    }
+
+    #[test]
+    fn parse_single_collection_skips_unusable_snapshot_nodes() {
+        // Unlike patches, a snapshot that fails to decode is tolerated: the
+        // caller falls back to applying patches from the current version.
+        let collection = NodeBuilder::new("collection")
+            .attr("name", "regular")
+            .children([NodeBuilder::new("snapshot")
+                .bytes(TRUNCATED_PROTOBUF.to_vec())
+                .build()])
+            .build();
+        let list = parse_patch_list(&iq_with([collection])).expect("snapshot errors are tolerated");
+        assert!(list.snapshot_ref.is_none());
+
+        // A snapshot carrying a string instead of bytes is likewise ignored.
+        let collection = NodeBuilder::new("collection")
+            .attr("name", "regular")
+            .children([NodeBuilder::new("snapshot")
+                .string_content("not-bytes")
+                .build()])
+            .build();
+        let list = parse_patch_list(&iq_with([collection])).expect("snapshot errors are tolerated");
+        assert!(list.snapshot_ref.is_none());
+    }
+
+    #[test]
+    fn parse_patch_lists_accepts_both_iq_and_bare_sync_roots() {
+        let collections = || {
+            [
+                full_collection(),
+                NodeBuilder::new("collection")
+                    .attr("name", "regular_high")
+                    .build(),
+            ]
+        };
+
+        for root in [iq_with(collections()), sync_node(collections())] {
+            let lists = parse_patch_lists(&root).expect("well-formed sync node");
+            let names: Vec<WAPatchName> = lists.iter().map(|l| l.name).collect();
+            assert_eq!(names, vec![WAPatchName::Regular, WAPatchName::RegularHigh]);
+        }
+    }
+
+    #[test]
+    fn parse_patch_lists_ref_matches_owned_path() {
+        let node = sync_node([full_collection()]);
+        let lists = parse_patch_lists_ref(&node.as_node_ref()).expect("well-formed sync node");
+        assert_eq!(lists.len(), 1);
+    }
+
+    #[test]
+    fn parse_patch_lists_ignores_non_collection_children() {
+        let root = NodeBuilder::new("sync")
+            .children([NodeBuilder::new("unexpected").build(), full_collection()])
+            .build();
+        let lists = parse_patch_lists(&root).expect("unknown siblings are skipped");
+        assert_eq!(lists.len(), 1);
+    }
+
+    #[test]
+    fn parse_patch_lists_rejects_missing_sync_node() {
+        let err = parse_patch_lists(&NodeBuilder::new("iq").build())
+            .expect_err("no sync node to read collections from");
+        assert!(err.to_string().contains("missing sync node in response"));
+    }
+
+    #[test]
+    fn parse_patch_lists_returns_empty_for_childless_sync() {
+        let lists = parse_patch_lists(&NodeBuilder::new("sync").build())
+            .expect("an empty sync node is not an error");
+        assert!(lists.is_empty());
+    }
+
+    #[test]
+    fn parse_patch_lists_propagates_a_single_bad_collection() {
+        let root = sync_node([
+            full_collection(),
+            NodeBuilder::new("collection").build(), // no name
+        ]);
+        let err = parse_patch_lists(&root).expect_err("one bad collection fails the batch");
+        assert!(
+            err.to_string()
+                .contains("collection missing 'name' attribute")
+        );
+    }
+
+    fn error_collection(error_child: Option<Node>) -> Node {
+        let mut children = Vec::new();
+        children.extend(error_child);
+        NodeBuilder::new("collection")
+            .attr("name", "regular")
+            .attr("type", "error")
+            .attr("has_more_patches", "true")
+            .children(children)
+            .build()
+    }
+
+    fn parse_error(collection: Node) -> Option<CollectionSyncError> {
+        parse_patch_list(&iq_with([collection]))
+            .expect("an error collection still parses")
+            .error
+    }
+
+    #[test]
+    fn collection_error_409_becomes_conflict_carrying_has_more() {
+        let error = parse_error(error_collection(Some(
+            NodeBuilder::new("error").attr("code", "409").build(),
+        )));
+        assert!(matches!(
+            error,
+            Some(CollectionSyncError::Conflict { has_more: true })
+        ));
+    }
+
+    #[test]
+    fn collection_errors_400_and_404_are_fatal() {
+        for code in ["400", "404"] {
+            let error = parse_error(error_collection(Some(
+                NodeBuilder::new("error")
+                    .attr("code", code)
+                    .attr("text", "bad request")
+                    .build(),
+            )));
+            let Some(CollectionSyncError::Fatal { code: got, text }) = error else {
+                panic!("expected a fatal error for code {code}, got {error:?}");
+            };
+            assert_eq!(got.to_string(), code);
+            assert_eq!(text, "bad request");
+        }
+    }
+
+    #[test]
+    fn other_collection_errors_are_retryable() {
+        let error = parse_error(error_collection(Some(
+            NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal")
+                .build(),
+        )));
+        assert!(matches!(
+            error,
+            Some(CollectionSyncError::Retry { code: 500, .. })
+        ));
+    }
+
+    #[test]
+    fn unparseable_error_codes_fall_back_to_retry() {
+        // Missing child, missing code and a non-numeric code all land on the
+        // same conservative "retry with code 0" answer.
+        let cases = [
+            (None, "missing <error> child"),
+            (Some(NodeBuilder::new("error").build()), ""),
+            (
+                Some(
+                    NodeBuilder::new("error")
+                        .attr("code", "not-a-number")
+                        .build(),
+                ),
+                "",
+            ),
+        ];
+
+        for (child, expected_text) in cases {
+            let error = parse_error(error_collection(child));
+            let Some(CollectionSyncError::Retry { code, text }) = error else {
+                panic!("expected a retryable error, got {error:?}");
+            };
+            assert_eq!(code, 0);
+            assert_eq!(text, expected_text);
+        }
+    }
+
+    #[test]
+    fn non_error_collection_type_yields_no_error() {
+        let collection = NodeBuilder::new("collection")
+            .attr("name", "regular")
+            .attr("type", "result")
+            .children([NodeBuilder::new("error").attr("code", "500").build()])
+            .build();
+        // The `<error>` child only counts when the collection is typed as one.
+        assert!(parse_error(collection).is_none());
+    }
+
+    #[test]
+    fn collection_sync_error_display_names_each_variant() {
+        assert_eq!(
+            CollectionSyncError::Conflict { has_more: false }.to_string(),
+            "conflict (has_more=false)"
+        );
+        assert_eq!(
+            CollectionSyncError::Fatal {
+                code: 404,
+                text: "not found".to_string(),
+            }
+            .to_string(),
+            "fatal error 404: not found"
+        );
+        assert_eq!(
+            CollectionSyncError::Retry {
+                code: 503,
+                text: "try later".to_string(),
+            }
+            .to_string(),
+            "retryable error 503: try later"
+        );
+    }
+}

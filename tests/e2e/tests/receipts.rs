@@ -107,7 +107,7 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
 
     client_b.client.reconnect().await;
     info!("B disconnected (will auto-reconnect)");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
 
     let msg_id = client_a
         .client
@@ -187,7 +187,7 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
 
     client_a.client.reconnect().await;
     info!("A disconnected (will auto-reconnect)");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client_a.wait_for_disconnected(5).await?;
 
     client_b
         .client
@@ -225,7 +225,7 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
     let jid_b = client_b.jid().await;
 
     client_b.client.reconnect().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client_b.wait_for_disconnected(5).await?;
     info!("B offline");
 
     let msg_id = client_a
@@ -236,7 +236,7 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
     info!("A sent to offline B: {msg_id}");
 
     client_a.client.reconnect().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client_a.wait_for_disconnected(5).await?;
     info!("A offline");
 
     // B reconnects, receives message, sends delivery receipt (queued since A is offline)
@@ -271,8 +271,10 @@ async fn test_no_delivery_receipt_for_fully_offline() -> anyhow::Result<()> {
 
     let jid_b = client_b.jid().await;
 
+    // Nothing reconnects B afterwards, so the assert_no_event window below is
+    // what actually establishes "never came back" — disconnect() only has to get
+    // B off the socket, and it logs a WARN if its own wait times out.
     client_b.disconnect().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
     info!("B fully disconnected");
 
     let msg_id = client_a

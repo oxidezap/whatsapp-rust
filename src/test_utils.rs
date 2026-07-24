@@ -15,13 +15,71 @@ pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
 }
 
 pub async fn wait_for_lock_waiter(lock: &Arc<async_lock::Mutex<()>>, baseline: usize) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while Arc::strong_count(lock) <= baseline {
-            tokio::task::yield_now().await;
-        }
+    poll_until("a task to reach the contested lock", || {
+        Arc::strong_count(lock) > baseline
     })
-    .await
-    .expect("task must reach the contested lock");
+    .await;
+}
+
+/// Polls `cond` until it holds, panicking once a bounded deadline passes.
+///
+/// A fixed sleep can only be wrong: long enough to be reliable makes the suite
+/// slow, short enough to be fast makes it flaky on a loaded CI runner. Polling
+/// the real condition is both fast on the happy path and stable under load.
+pub async fn poll_until(what: &str, mut cond: impl FnMut() -> bool) {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    const STEP: std::time::Duration = std::time::Duration::from_millis(2);
+    // Most waits here are satisfied by letting a sibling task run once, so yield
+    // first and only fall back to a timed step for waits that need real elapsed
+    // time (and would otherwise burn a core for the whole deadline).
+    const YIELDS: u32 = 64;
+
+    // Tokio's clock, not the wall clock: the timed step below is a tokio sleep, so
+    // measuring the deadline on the same clock keeps the two in agreement even
+    // under `tokio::time::pause()`.
+    let started = tokio::time::Instant::now();
+    let mut spins = 0u32;
+    loop {
+        if cond() {
+            return;
+        }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "timed out after {DEADLINE:?} waiting for {what}",
+        );
+        if spins < YIELDS {
+            spins += 1;
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(STEP).await;
+        }
+    }
+}
+
+/// Waits until every task tracked by the client's outbound flush scope has run.
+///
+/// Retry receipts, PDO fallbacks and transport acks are all spawned there, and
+/// the guard is taken synchronously by the spawn, so a drained scope proves the
+/// spawned side effect completed — including the cases where it must
+/// deliberately do nothing.
+pub async fn wait_for_outbound_tasks(client: &Arc<Client>) {
+    poll_until("the outbound flush scope to drain", || {
+        client.outbound_flush.pending() == 0
+    })
+    .await;
+}
+
+/// Waits until at least `count` tasks are parked on `notifier`.
+///
+/// Every waiter in this codebase registers its listener before re-checking the
+/// condition it waits on, so a registered listener is proof the task reached its
+/// await point — the observable a "still waiting" assertion needs instead of a
+/// sleep long enough to hope the scheduler got there.
+pub async fn wait_for_notifier_listeners(notifier: &event_listener::Event, count: usize) {
+    poll_until(&format!("{count} task(s) parked on the notifier"), || {
+        notifier.total_listeners() >= count
+    })
+    .await;
 }
 
 use crate::http::{HttpClient, HttpRequest, HttpResponse};

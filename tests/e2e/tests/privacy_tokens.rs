@@ -1,5 +1,5 @@
 use e2e_tests::{
-    TestClient, restricted_push_name, scenario_push_name, send_and_expect_text, text_msg,
+    TestClient, has_child, restricted_push_name, scenario_push_name, send_and_expect_text, text_msg,
 };
 use log::info;
 use std::sync::Arc;
@@ -8,12 +8,6 @@ use wacore::types::events::Event;
 use wacore_binary::OwnedNodeRef;
 use wacore_binary::node::Node;
 use whatsapp_rust::{NodeFilter, SendOptions};
-
-fn has_child(node: &Node, tag: &str) -> bool {
-    node.children()
-        .map(|children| children.iter().any(|child| child.tag == tag))
-        .unwrap_or(false)
-}
 
 fn has_descendant(node: &Node, tag: &str) -> bool {
     node.children().is_some_and(|children| {

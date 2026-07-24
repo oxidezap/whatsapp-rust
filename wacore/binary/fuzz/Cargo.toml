@@ -26,6 +26,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "parse_jid"
+path = "fuzz_targets/parse_jid.rs"
+test = false
+doc = false
+bench = false
+
 # libFuzzer needs debug info and benefits from optimization; mirror the
 # defaults `cargo fuzz init` generates.
 [profile.release]
