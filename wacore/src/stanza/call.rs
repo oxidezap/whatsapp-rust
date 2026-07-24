@@ -844,7 +844,7 @@ pub struct VideoStateParams<'a> {
     pub id: &'a str,
     pub call_creator: &'a Jid,
     pub state: VideoState,
-    /// `dec` attr: codecs we can decode (`"H264"` on the upgrade request, `"H264,AV1"` on accept).
+    /// `dec` attr: codecs we can decode (`"H264"` on request/enabled, `"H264,AV1"` on accept).
     pub dec: Option<&'a str>,
     pub device_orientation: Option<u8>,
 }

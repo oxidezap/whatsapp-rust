@@ -3838,6 +3838,58 @@ mod tests {
     }
 
     #[test]
+    fn test_set_group_description_without_prev_omits_the_attr() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let desc = GroupDescription::new("First description").unwrap();
+        let iq = SetGroupDescriptionIq::new(&jid, Some(desc), None).build_iq();
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected nodes content");
+        };
+        let desc_node = &nodes[0];
+        assert_eq!(desc_node.attrs().optional_string("id").unwrap().len(), 8);
+        assert!(
+            desc_node.attrs().optional_string("prev").is_none(),
+            "a group with no description must not carry a prev token"
+        );
+        assert!(desc_node.get_children_by_tag("body").next().is_some());
+    }
+
+    #[test]
+    fn test_set_group_description_delete_without_prev_omits_the_attr() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = SetGroupDescriptionIq::new(&jid, None, None).build_iq();
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected nodes content");
+        };
+        let desc_node = &nodes[0];
+        assert_eq!(
+            desc_node.attrs().optional_string("delete").as_deref(),
+            Some("true")
+        );
+        assert!(desc_node.attrs().optional_string("prev").is_none());
+    }
+
+    #[test]
+    fn test_set_group_description_ids_are_distinct_per_request() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let desc = GroupDescription::new("Description").unwrap();
+        let first = SetGroupDescriptionIq::new(&jid, Some(desc.clone()), Some("AABBCCDD"));
+        let second = SetGroupDescriptionIq::new(&jid, Some(desc), Some("AABBCCDD"));
+
+        assert_ne!(
+            first.id, second.id,
+            "each update must mint a new description id"
+        );
+        assert_ne!(
+            first.id,
+            first.prev.clone().unwrap(),
+            "the new id must not reuse the token it replaces"
+        );
+    }
+
+    #[test]
     fn test_leave_group_iq() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
         let spec = LeaveGroupIq::new(&jid);

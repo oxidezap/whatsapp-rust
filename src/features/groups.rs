@@ -1,6 +1,7 @@
 use crate::client::Client;
 use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -48,11 +49,61 @@ pub enum GroupError {
     /// expired V4 invite, non-group JID where one is required).
     #[error("invalid group request: {0}")]
     InvalidRequest(String),
+    /// The server refused a description update because the `prev` token no
+    /// longer matches the group's current description: another device changed
+    /// it first. Distinct from a permission refusal, so a caller can re-read
+    /// the description and retry instead of giving up.
+    #[error("the group description changed since it was read")]
+    DescriptionConflict,
     /// Catch-all for internal failures (LID/PN resolution, the protocol-message
     /// send path behind `update_member_label`, cache plumbing).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
+
+/// The description a [`Groups::set_description`] call expects to replace.
+///
+/// The server takes the `prev` attribute as an optimistic-concurrency token: it
+/// applies the update only when the token matches the group's current
+/// description id, and answers `409 conflict` otherwise. A group with no
+/// description expects no token at all.
+///
+/// The default is [`PreviousDescription::Resolve`] because it is the only
+/// variant that is correct without knowing anything about the group. Note that
+/// it is also the only one that costs a round trip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreviousDescription<'a> {
+    /// Read the group's current description id from the server before sending.
+    /// The right choice when the caller holds no fresh metadata.
+    #[default]
+    Resolve,
+    /// The group carries no description yet (a freshly created group), so no
+    /// token is sent.
+    Absent,
+    /// A description id the caller already holds, typically
+    /// [`GroupMetadata::description_id`] from a recent [`Groups::get_metadata`].
+    Id(&'a str),
+}
+
+/// Turns a held [`GroupMetadata::description_id`] into a token.
+///
+/// `None` means "that metadata says the group has no description", so it maps
+/// to [`PreviousDescription::Absent`] and not to a fresh read. Metadata stale
+/// enough to have missed a description added since is therefore answered with
+/// [`GroupError::DescriptionConflict`]; pass [`PreviousDescription::Resolve`]
+/// when the age of the metadata is unknown.
+impl<'a> From<Option<&'a str>> for PreviousDescription<'a> {
+    fn from(description_id: Option<&'a str>) -> Self {
+        match description_id {
+            Some(id) => Self::Id(id),
+            None => Self::Absent,
+        }
+    }
+}
+
+/// `<error code="409" text="conflict"/>` on a `w:g2` set: the request lost an
+/// optimistic-concurrency check.
+const CONFLICT_STATUS_CODE: u16 = 409;
 
 /// Typed `update` payload for the `update_group_property` mex mutation. The
 /// generated mirror types this op's `update` as a `String`, but it is a one-of
@@ -706,21 +757,66 @@ impl<'a> Groups<'a> {
             .await?)
     }
 
-    /// Sets or deletes a group's description.
+    /// Set or delete a group's description.
     ///
-    /// `prev` is the current description ID (from group metadata) used for
-    /// conflict detection. Pass `None` if unknown.
+    /// Pass `None` as the description to delete it. `prev` names the
+    /// description this update replaces; the server accepts the change only
+    /// when that token matches the group's current description, so a group that
+    /// already has one cannot be updated without it. With
+    /// [`PreviousDescription::Resolve`] the token is read from the server first,
+    /// which costs one extra query but is always current; a caller holding
+    /// fresh [`GroupMetadata::description_id`] can pass it directly instead.
+    ///
+    /// Returns [`GroupError::DescriptionConflict`] when the group's description
+    /// changed between the read and this update.
     pub async fn set_description(
         &self,
         jid: impl Into<Jid>,
         description: Option<GroupDescription>,
-        prev: Option<&str>,
+        prev: PreviousDescription<'_>,
     ) -> Result<(), GroupError> {
         let jid = &jid.into();
-        Ok(self
-            .client
-            .execute(SetGroupDescriptionIq::new(jid, description, prev))
-            .await?)
+        let prev: Option<Cow<'_, str>> = match prev {
+            PreviousDescription::Absent => None,
+            PreviousDescription::Id(id) => Some(Cow::Borrowed(id)),
+            // Resolution runs first so a failed read never sends an update
+            // carrying a token the server would reject or, worse, accept
+            // against a description the caller never saw.
+            PreviousDescription::Resolve => self.query_description_id(jid).await?.map(Cow::Owned),
+        };
+
+        self.client
+            .execute(SetGroupDescriptionIq::new(
+                jid,
+                description,
+                prev.as_deref(),
+            ))
+            .await
+            .map_err(|err| match err {
+                IqError::ServerError {
+                    code: CONFLICT_STATUS_CODE,
+                    ..
+                } => GroupError::DescriptionConflict,
+                other => other.into(),
+            })
+    }
+
+    /// Read just the group's current description id from the server.
+    ///
+    /// Deliberately not served from the group cache: that snapshot is the slim
+    /// send-path view, and its refresh is conditional on the participant phash,
+    /// so it can be current for participants while the description behind it
+    /// has already moved. For the same reason the query carries no phash, which
+    /// makes the server answer with the whole group; on a large community that
+    /// is a full participant list downloaded for one attribute. The protocol
+    /// offers no narrower read, so the cost is the price of a correct token.
+    async fn query_description_id(&self, jid: &Jid) -> Result<Option<String>, GroupError> {
+        match self.client.execute(GroupQueryIq::new(jid)).await? {
+            GroupInfoOutcome::Full(group) => Ok(group.description_id),
+            GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
+                "group query returned not-modified without a phash".into(),
+            )),
+        }
     }
 
     pub async fn leave(&self, jid: impl Into<Jid>) -> Result<(), GroupError> {
@@ -1798,6 +1894,495 @@ mod tests {
                     "limit_sharing_trigger": "CHAT_SETTING"
                 }
             })
+        );
+    }
+
+    /// Fictitious group used by the description round-trip tests.
+    fn description_test_group() -> Jid {
+        "120363000000000001@g.us"
+            .parse()
+            .expect("test group JID should be valid")
+    }
+
+    /// `<iq type="result">` carrying a `<group>` with (optionally) a current
+    /// description, i.e. what the server answers a metadata query with.
+    fn group_result_with_description(
+        request_id: &str,
+        group: &Jid,
+        description_id: Option<&str>,
+    ) -> wacore_binary::Node {
+        use wacore_binary::builder::NodeBuilder;
+
+        let mut group_node = NodeBuilder::new("group")
+            .attr("id", group.to_string())
+            .attr("subject", "Test Group");
+        if let Some(description_id) = description_id {
+            group_node = group_node.children([NodeBuilder::new("description")
+                .attr("id", description_id)
+                .children([NodeBuilder::new("body")
+                    .string_content("current description")
+                    .build()])
+                .build()]);
+        }
+
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id)
+            .attr("from", group)
+            .children([group_node.build()])
+            .build()
+    }
+
+    fn iq_error(request_id: &str, group: &Jid, code: &str, text: &str) -> wacore_binary::Node {
+        use wacore_binary::builder::NodeBuilder;
+
+        NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("id", request_id)
+            .attr("from", group)
+            .children([NodeBuilder::new("error")
+                .attr("code", code)
+                .attr("text", text)
+                .build()])
+            .build()
+    }
+
+    fn iq_result(request_id: &str, group: &Jid) -> wacore_binary::Node {
+        use wacore_binary::builder::NodeBuilder;
+
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id)
+            .attr("from", group)
+            .build()
+    }
+
+    /// A group that already has a description can only be updated by naming the
+    /// id it replaces, so the update must carry both a fresh `id` and the
+    /// current one as `prev`.
+    #[tokio::test]
+    async fn set_description_sends_the_current_description_id_as_prev() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(
+                        group,
+                        Some(GroupDescription::new("new description").unwrap()),
+                        PreviousDescription::Resolve,
+                    )
+                    .await
+            })
+        };
+
+        let query = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let query = query.get();
+        assert_eq!(query.tag.as_ref(), "iq");
+        assert_eq!(
+            query.attrs().optional_string("type").as_deref(),
+            Some("get")
+        );
+        assert!(
+            query.get_optional_child("query").is_some(),
+            "the resolution step must be a group metadata query"
+        );
+        let query_id = query
+            .attrs()
+            .optional_string("id")
+            .expect("query carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &query_id,
+            &group_result_with_description(&query_id, &group, Some("D1D2D3D4")),
+        )
+        .await;
+
+        let set = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let set = set.get();
+        assert_eq!(set.attrs().optional_string("type").as_deref(), Some("set"));
+        let description = set
+            .get_optional_child("description")
+            .expect("the update carries a <description>");
+        let id = description
+            .attrs()
+            .optional_string("id")
+            .expect("a new id is minted");
+        assert_eq!(id.len(), 8);
+        assert_ne!(id, "D1D2D3D4", "the new id must not reuse prev");
+        assert_eq!(
+            description.attrs().optional_string("prev").as_deref(),
+            Some("D1D2D3D4"),
+            "the update must name the description it replaces"
+        );
+        let body = description
+            .get_optional_child("body")
+            .expect("a set carries a <body>");
+        assert_eq!(body.content_as_string().as_deref(), Some("new description"));
+
+        let set_id = set
+            .attrs()
+            .optional_string("id")
+            .expect("the update carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &set_id, &iq_result(&set_id, &group)).await;
+        update
+            .await
+            .expect("the update task should not panic")
+            .expect("the update should succeed");
+    }
+
+    /// Deleting a description is the same optimistic-concurrency check, so the
+    /// `delete` marker travels with the token it replaces.
+    #[tokio::test]
+    async fn delete_description_sends_prev_alongside_the_delete_marker() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(group, None, PreviousDescription::Resolve)
+                    .await
+            })
+        };
+
+        let query = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let query_id = query
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("query carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &query_id,
+            &group_result_with_description(&query_id, &group, Some("AABBCCDD")),
+        )
+        .await;
+
+        let set = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let set = set.get();
+        let description = set
+            .get_optional_child("description")
+            .expect("the delete carries a <description>");
+        assert_eq!(
+            description.attrs().optional_string("delete").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            description.attrs().optional_string("prev").as_deref(),
+            Some("AABBCCDD")
+        );
+        assert!(
+            description.get_optional_child("body").is_none(),
+            "a delete carries no body"
+        );
+
+        let set_id = set
+            .attrs()
+            .optional_string("id")
+            .expect("the delete carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &set_id, &iq_result(&set_id, &group)).await;
+        update
+            .await
+            .expect("the delete task should not panic")
+            .expect("the delete should succeed");
+    }
+
+    /// The path that already worked: a group with no description expects no
+    /// token, and sending one would be rejected.
+    #[tokio::test]
+    async fn set_description_on_a_group_without_one_omits_prev() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(
+                        group,
+                        Some(GroupDescription::new("first description").unwrap()),
+                        PreviousDescription::Resolve,
+                    )
+                    .await
+            })
+        };
+
+        let query = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let query_id = query
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("query carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &query_id,
+            &group_result_with_description(&query_id, &group, None),
+        )
+        .await;
+
+        let set = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let set = set.get();
+        let description = set
+            .get_optional_child("description")
+            .expect("the update carries a <description>");
+        assert!(
+            description.attrs().optional_string("prev").is_none(),
+            "a group with no description must not carry a prev token"
+        );
+        assert!(description.attrs().optional_string("id").is_some());
+
+        let set_id = set
+            .attrs()
+            .optional_string("id")
+            .expect("the update carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &set_id, &iq_result(&set_id, &group)).await;
+        update
+            .await
+            .expect("the update task should not panic")
+            .expect("the update should succeed");
+    }
+
+    /// A caller that already holds the id (the community create path holds
+    /// "none") skips the resolution query entirely.
+    #[tokio::test]
+    async fn set_description_with_a_known_token_skips_the_resolution_query() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(
+                        group,
+                        Some(GroupDescription::new("known token").unwrap()),
+                        PreviousDescription::Id("KNOWNID1"),
+                    )
+                    .await
+            })
+        };
+
+        let set = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let set = set.get();
+        assert_eq!(
+            set.attrs().optional_string("type").as_deref(),
+            Some("set"),
+            "the first stanza must be the update itself, not a query"
+        );
+        let description = set
+            .get_optional_child("description")
+            .expect("the update carries a <description>");
+        assert_eq!(
+            description.attrs().optional_string("prev").as_deref(),
+            Some("KNOWNID1")
+        );
+
+        let set_id = set
+            .attrs()
+            .optional_string("id")
+            .expect("the update carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &set_id, &iq_result(&set_id, &group)).await;
+        update
+            .await
+            .expect("the update task should not panic")
+            .expect("the update should succeed");
+        assert_eq!(transport.sent_count(), 1);
+    }
+
+    /// If the resolution query fails there is no token to send, and guessing
+    /// one (or omitting it) would either be rejected or silently overwrite a
+    /// description the caller never read.
+    #[tokio::test]
+    async fn a_failed_resolution_sends_no_update() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(
+                        group,
+                        Some(GroupDescription::new("new description").unwrap()),
+                        PreviousDescription::Resolve,
+                    )
+                    .await
+            })
+        };
+
+        let query = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let query_id = query
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("query carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &query_id,
+            &iq_error(&query_id, &group, "403", "forbidden"),
+        )
+        .await;
+
+        let error = update
+            .await
+            .expect("the update task should not panic")
+            .expect_err("a failed resolution must fail the update");
+        assert!(
+            matches!(
+                error,
+                GroupError::Iq(IqError::ServerError { code: 403, .. })
+            ),
+            "the resolution failure must surface as-is, got {error:?}"
+        );
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "no update may be sent once resolution failed"
+        );
+    }
+
+    /// Another device changing the description between the read and the update
+    /// is exactly what the token guards against; the server's `409 conflict`
+    /// must stay distinguishable from a permission refusal.
+    #[tokio::test]
+    async fn a_concurrent_change_surfaces_as_a_description_conflict() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(
+                        group,
+                        Some(GroupDescription::new("new description").unwrap()),
+                        PreviousDescription::Resolve,
+                    )
+                    .await
+            })
+        };
+
+        let query = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let query_id = query
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("query carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &query_id,
+            &group_result_with_description(&query_id, &group, Some("STALE001")),
+        )
+        .await;
+
+        let set = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let set_id = set
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("the update carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &set_id,
+            &iq_error(&set_id, &group, "409", "conflict"),
+        )
+        .await;
+
+        let error = update
+            .await
+            .expect("the update task should not panic")
+            .expect_err("a conflict must fail the update");
+        assert!(
+            matches!(error, GroupError::DescriptionConflict),
+            "a 409 on a description update is a conflict, got {error:?}"
+        );
+    }
+
+    /// A refusal that is not a conflict keeps its server code, so a caller can
+    /// still tell "no permission" from "someone else changed it".
+    #[tokio::test]
+    async fn a_forbidden_update_is_not_reported_as_a_conflict() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let update = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .set_description(
+                        group,
+                        Some(GroupDescription::new("new description").unwrap()),
+                        PreviousDescription::Id("KNOWNID1"),
+                    )
+                    .await
+            })
+        };
+
+        let set = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let set_id = set
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("the update carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &set_id,
+            &iq_error(&set_id, &group, "403", "forbidden"),
+        )
+        .await;
+
+        let error = update
+            .await
+            .expect("the update task should not panic")
+            .expect_err("a forbidden update must fail");
+        assert!(
+            matches!(
+                error,
+                GroupError::Iq(IqError::ServerError { code: 403, .. })
+            ),
+            "a non-conflict refusal must keep its code, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn previous_description_from_optional_id() {
+        assert_eq!(
+            PreviousDescription::from(Some("ABCD1234")),
+            PreviousDescription::Id("ABCD1234")
+        );
+        assert_eq!(
+            PreviousDescription::from(None),
+            PreviousDescription::Absent,
+            "a group with no description resolves to no token, not to a query"
         );
     }
 }
