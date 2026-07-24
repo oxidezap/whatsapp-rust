@@ -99,12 +99,18 @@ fuzz_target!(|data: &[u8]| {
             // `to_ad_string` gets no check at all: it always emits
             // `user.agent:device`, which the parser does not always read back as an
             // agent, so it is not round-trippable even for clean users.
-            if !jid.user.is_empty()
-                && !jid.user.contains(['.', ':'])
-                && let Ok(bare) = jid.to_non_ad_string().parse::<Jid>()
-            {
+            if !jid.user.is_empty() && !jid.user.contains(['.', ':']) {
+                let bare = jid.to_non_ad_string();
+                let reparsed = bare.parse::<Jid>().unwrap_or_else(|e| {
+                    panic!("to_non_ad_string produced unparseable {bare:?}: {e}")
+                });
                 assert_eq!(
-                    (&bare.user, bare.server, bare.agent, bare.device),
+                    (
+                        &reparsed.user,
+                        reparsed.server,
+                        reparsed.agent,
+                        reparsed.device
+                    ),
                     (&jid.user, jid.server, 0, 0),
                     "to_non_ad_string lost identity for {jid:?}"
                 );
