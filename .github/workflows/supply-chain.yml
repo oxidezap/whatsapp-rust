@@ -63,13 +63,20 @@ jobs:
           cache-targets: "true"
       - name: Check API against the last published release
         id: semver
+        env:
+          # Plain output: the progress spinner's escape codes are most of the
+          # log's bytes and render as noise once captured to a file.
+          CARGO_TERM_COLOR: never
         run: |
           set -o pipefail
-          cargo semver-checks check-release \
+          cargo semver-checks check-release --color never \
             -p wacore -p wacore-binary -p waproto 2>&1 | tee semver.log
       - name: Publish report to the job summary
         if: always()
         run: |
+          # The step summary is capped at 1 MiB and a full run comfortably
+          # exceeds it, so only the tail — where the verdict and the offending
+          # items are — goes here. The whole log is attached as an artifact.
           {
             echo '## cargo-semver-checks (informational)'
             echo
@@ -80,11 +87,17 @@ jobs:
               echo 'minor version if the break is intended.'
             fi
             echo
-            echo '<details><summary>Full output</summary>'
+            echo '<details><summary>Output (tail; full log in the semver-checks-log artifact)</summary>'
             echo
             echo '```'
-            cat semver.log
+            tail -c 200000 semver.log
             echo '```'
             echo
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the full semver-checks log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semver-checks-log
+          path: semver.log

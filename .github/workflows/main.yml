@@ -262,3 +262,14 @@ jobs:
         run: cargo build -p wacore --no-default-features --verbose
       - name: Test wacore (stable, no SIMD)
         run: cargo test -p wacore --no-default-features --lib --verbose
+      # `rust-version` is published metadata for every member, but only the
+      # three crates above are exercised at that toolchain. This compiles the
+      # rest of the publishable set so the declared floor is a checked promise
+      # rather than an assertion. Check-only: the tests that matter here
+      # already ran above, and this is about the toolchain accepting the code.
+      - name: Check the remaining published crates at MSRV
+        run: >
+          cargo check --no-default-features --verbose
+          -p whatsapp-rust -p wacore-derive -p wacore-libsignal -p wacore-noise -p waproto
+          -p whatsapp-rust-ureq-http-client -p whatsapp-rust-chat-store
+          -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
