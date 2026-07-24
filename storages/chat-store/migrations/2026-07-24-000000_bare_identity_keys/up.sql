@@ -20,7 +20,10 @@ DELETE FROM chats
         AND messages.chat_jid = chats.jid);
 
 -- Contacts. An existing bare row wins (a live path wrote it with the same or
--- newer data); otherwise the device-keyed names carry over to it.
+-- newer data); otherwise the device-keyed names carry over to it. Two devices
+-- of the same peer can disagree, so the newest row is inserted first and the
+-- rest lose to it — OR IGNORE resolves in SELECT order, which makes the pick
+-- deterministic instead of scan-dependent.
 INSERT OR IGNORE INTO contacts (device_id, jid, push_name, full_name, first_name, business_name)
 SELECT device_id,
        substr(jid, 1, instr(jid, ':') - 1) || substr(jid, instr(jid, '@')),
@@ -29,9 +32,11 @@ SELECT device_id,
        first_name,
        business_name
   FROM contacts
- WHERE jid LIKE '%:%@%';
+ WHERE jid LIKE '%:%@%'
+ ORDER BY rowid DESC;
 
-DELETE FROM contacts WHERE jid LIKE '%:%@%';
+DELETE FROM contacts
+ WHERE jid LIKE '%:%@%';
 
 -- Read-by rows. Highest receipt type per participant wins, the live path's
 -- monotonic rule: drop every row a sibling of the same bare identity beats,
@@ -61,4 +66,5 @@ UPDATE OR IGNORE message_receipts
                   || substr(user_jid, instr(user_jid, '@'))
  WHERE user_jid LIKE '%:%@%';
 
-DELETE FROM message_receipts WHERE user_jid LIKE '%:%@%';
+DELETE FROM message_receipts
+ WHERE user_jid LIKE '%:%@%';
