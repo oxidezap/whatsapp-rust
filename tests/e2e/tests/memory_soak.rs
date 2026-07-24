@@ -327,8 +327,8 @@ async fn test_heavy_dm_soak() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("soak2_dm_a").await?;
     let mut client_b = TestClient::connect("soak2_dm_b").await?;
 
-    let jid_a = client_a.client.get_pn().expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
+    let jid_a = client_a.client.pn().expect("A JID").to_non_ad();
+    let jid_b = client_b.client.pn().expect("B JID").to_non_ad();
 
     // Warm-up
     for i in 0..5 {
@@ -389,8 +389,8 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
     let mut client_b = TestClient::connect("soak2_grp_b").await?;
     let mut client_c = TestClient::connect("soak2_grp_c").await?;
 
-    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
-    let jid_c = client_c.client.get_pn().expect("C JID").to_non_ad();
+    let jid_b = client_b.client.pn().expect("B JID").to_non_ad();
+    let jid_c = client_c.client.pn().expect("C JID").to_non_ad();
 
     // Create group 1: A + B + C
     let g1 = client_a
@@ -533,9 +533,9 @@ async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
     let mut client_b = TestClient::connect("soak2_mix_b").await?;
     let mut client_c = TestClient::connect("soak2_mix_c").await?;
 
-    let jid_a = client_a.client.get_pn().expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
-    let jid_c = client_c.client.get_pn().expect("C JID").to_non_ad();
+    let jid_a = client_a.client.pn().expect("A JID").to_non_ad();
+    let jid_b = client_b.client.pn().expect("B JID").to_non_ad();
+    let jid_c = client_c.client.pn().expect("C JID").to_non_ad();
 
     // Create group
     let group_jid = client_a
@@ -679,7 +679,7 @@ async fn test_many_peers_soak() -> anyhow::Result<()> {
     let mut peer_jids: Vec<Jid> = Vec::new();
     for i in 0..num_peers {
         let peer = TestClient::connect(&format!("soak2_peers_p{i}")).await?;
-        let jid = peer.client.get_pn().expect("peer JID").to_non_ad();
+        let jid = peer.client.pn().expect("peer JID").to_non_ad();
         peer_jids.push(jid);
         peers.push(peer);
     }
@@ -747,8 +747,8 @@ async fn test_heavy_reconnect_soak() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("soak2_recon_a").await?;
     let mut client_b = TestClient::connect("soak2_recon_b").await?;
 
-    let jid_a = client_a.client.get_pn().expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
+    let jid_a = client_a.client.pn().expect("A JID").to_non_ad();
+    let jid_b = client_b.client.pn().expect("B JID").to_non_ad();
 
     let mut snaps: Vec<Snapshot> = Vec::new();
     snaps.push(snapshot("A-recon", 0, &client_a.client).await);

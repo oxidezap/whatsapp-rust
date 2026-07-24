@@ -221,6 +221,7 @@ jobs:
         run: >
           cargo hack check --each-feature --no-dev-deps
           -p whatsapp-rust -p wacore -p wacore-binary -p wacore-appstate
+          -p wacore-libsignal -p wacore-noise -p waproto
 
   test-stable:
     name: Test Stable (no-simd)

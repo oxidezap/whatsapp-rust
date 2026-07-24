@@ -186,7 +186,7 @@ impl Client {
         let response_waiters = self.response_waiters_guard().len();
         let presence_subscriptions = self.presence_subscriptions.lock().await.len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
-        let app_state_syncing = self.app_state_syncing.lock().await.len();
+        let app_state_syncing = self.app_state_syncing.len();
         let chatstate_handlers = self.chatstate_handlers.read().await.len();
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
@@ -325,18 +325,21 @@ impl Client {
     // itself is an Arc refcount bump (no lock against writers). Callers that
     // only need a borrow can hold `persistence_manager().get_device_snapshot()`
     // and read fields directly.
-    pub fn get_push_name(&self) -> String {
+    /// This device's push name (the display name peers see).
+    pub fn push_name(&self) -> String {
         self.persistence_manager
             .get_device_snapshot()
             .push_name
             .clone()
     }
 
-    pub fn get_pn(&self) -> Option<Jid> {
+    /// This device's phone-number JID, or `None` before pairing completes.
+    pub fn pn(&self) -> Option<Jid> {
         self.persistence_manager.get_device_snapshot().pn.clone()
     }
 
-    pub fn get_lid(&self) -> Option<Jid> {
+    /// This device's LID JID, or `None` before pairing completes.
+    pub fn lid(&self) -> Option<Jid> {
         self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
@@ -369,7 +372,7 @@ impl Client {
     }
 
     pub(crate) fn require_pn(&self) -> Result<Jid> {
-        self.get_pn().ok_or(ClientError::NotLoggedIn.into())
+        self.pn().ok_or(ClientError::NotLoggedIn.into())
     }
 
     /// Resolve our own JID for a group, respecting its addressing mode.

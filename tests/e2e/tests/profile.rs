@@ -40,7 +40,7 @@ async fn test_set_push_name() -> anyhow::Result<()> {
     // The push name mutation requires encryption keys from the critical_block sync.
     client.wait_for_app_state_sync().await?;
 
-    let old_name = client.client.get_push_name();
+    let old_name = client.client.push_name();
     info!("Current push name: '{}'", old_name);
 
     let new_name = "TestBot 🤖";
@@ -48,7 +48,7 @@ async fn test_set_push_name() -> anyhow::Result<()> {
     client.client.profile().set_push_name(new_name).await?;
 
     // Verify it was updated locally
-    let updated_name = client.client.get_push_name();
+    let updated_name = client.client.push_name();
     assert_eq!(
         updated_name, new_name,
         "Push name should be updated locally"
@@ -60,7 +60,7 @@ async fn test_set_push_name() -> anyhow::Result<()> {
     info!("Setting push name again to '{}'...", second_name);
     client.client.profile().set_push_name(second_name).await?;
 
-    let final_name = client.client.get_push_name();
+    let final_name = client.client.push_name();
     assert_eq!(
         final_name, second_name,
         "Push name should be updated to second value"
@@ -166,7 +166,7 @@ async fn test_set_push_name_special_characters() -> anyhow::Result<()> {
     let name_emoji = "Bot 🤖🦀";
     info!("Setting push name with emoji: '{}'...", name_emoji);
     client.client.profile().set_push_name(name_emoji).await?;
-    let result = client.client.get_push_name();
+    let result = client.client.push_name();
     assert_eq!(result, name_emoji, "Push name should support emoji");
     info!("Emoji push name set successfully");
 
@@ -174,7 +174,7 @@ async fn test_set_push_name_special_characters() -> anyhow::Result<()> {
     let name_russian = "Тест";
     info!("Setting push name with Russian: '{}'...", name_russian);
     client.client.profile().set_push_name(name_russian).await?;
-    let result = client.client.get_push_name();
+    let result = client.client.push_name();
     assert_eq!(result, name_russian, "Push name should support Cyrillic");
     info!("Russian push name set successfully");
 
@@ -182,7 +182,7 @@ async fn test_set_push_name_special_characters() -> anyhow::Result<()> {
     let name_mixed = "Test™ User©";
     info!("Setting push name with special chars: '{}'...", name_mixed);
     client.client.profile().set_push_name(name_mixed).await?;
-    let result = client.client.get_push_name();
+    let result = client.client.push_name();
     assert_eq!(
         result, name_mixed,
         "Push name should support special characters"
@@ -206,7 +206,7 @@ async fn test_set_push_name_long() -> anyhow::Result<()> {
     let long_name = "A".repeat(25);
     info!("Setting push name with {} characters...", long_name.len());
     client.client.profile().set_push_name(&long_name).await?;
-    let result = client.client.get_push_name();
+    let result = client.client.push_name();
     assert_eq!(result, long_name, "Push name should support 25 characters");
     info!("Long push name set successfully");
 
@@ -233,7 +233,7 @@ async fn test_set_push_name_whitespace_only() -> anyhow::Result<()> {
         .profile()
         .set_push_name(whitespace_name)
         .await?;
-    let result = client.client.get_push_name();
+    let result = client.client.push_name();
     assert_eq!(
         result, whitespace_name,
         "Whitespace-only push name should be accepted (only empty is rejected)"
@@ -264,7 +264,7 @@ async fn test_status_text_notification_received() -> anyhow::Result<()> {
 
     let jid_a = client_a
         .client
-        .get_pn()
+        .pn()
         .expect("Client A should have a JID")
         .to_non_ad();
 
@@ -304,7 +304,7 @@ async fn test_set_push_name_persists_across_operations() -> anyhow::Result<()> {
     let push_name = "PersistBot";
     info!("Setting push name to '{}'...", push_name);
     client.client.profile().set_push_name(push_name).await?;
-    let result = client.client.get_push_name();
+    let result = client.client.push_name();
     assert_eq!(result, push_name);
     info!("Push name set successfully");
 
@@ -318,7 +318,7 @@ async fn test_set_push_name_persists_across_operations() -> anyhow::Result<()> {
     info!("Status text set successfully");
 
     // Verify push name is still correct
-    let after_status = client.client.get_push_name();
+    let after_status = client.client.push_name();
     assert_eq!(
         after_status, push_name,
         "Push name should persist after setting status text"

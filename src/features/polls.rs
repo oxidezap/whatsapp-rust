@@ -126,7 +126,7 @@ impl<'a> Polls<'a> {
         option_names: &[String],
     ) -> Result<SendResult, PollError> {
         let chat_jid = &chat_jid.into();
-        let my_jid = self.client.get_pn().ok_or(PollError::NotLoggedIn)?;
+        let my_jid = self.client.pn().ok_or(PollError::NotLoggedIn)?;
         let my_base = my_jid.to_non_ad();
 
         let voter_jid = self
@@ -193,7 +193,7 @@ impl<'a> Polls<'a> {
         if !poll_creator_jid.is_lid() {
             return own_pn.clone();
         }
-        match self.client.get_lid() {
+        match self.client.lid() {
             Some(lid) => lid.to_non_ad(),
             None => {
                 log::warn!(
@@ -536,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn voter_falls_back_to_pn_when_own_lid_unknown() {
         let client: Arc<Client> = create_test_client().await;
-        // No SetLid, so get_lid() is None.
+        // No SetLid, so lid() is None.
         let own_pn = Jid::pn("5511999999999");
         let creator = Jid::lid("111000111000111");
 

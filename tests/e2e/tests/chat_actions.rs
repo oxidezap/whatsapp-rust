@@ -17,11 +17,7 @@ async fn test_archive_chat() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_archive_a").await?;
     let client_b = TestClient::connect("e2e_archive_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -44,11 +40,7 @@ async fn test_unarchive_chat() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_unarchive_a").await?;
     let client_b = TestClient::connect("e2e_unarchive_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -81,11 +73,7 @@ async fn test_pin_chat() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_pin_a").await?;
     let client_b = TestClient::connect("e2e_pin_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -104,11 +92,7 @@ async fn test_unpin_chat() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_unpin_a").await?;
     let client_b = TestClient::connect("e2e_unpin_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -132,11 +116,7 @@ async fn test_mute_chat_indefinite() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_mute_indef_a").await?;
     let client_b = TestClient::connect("e2e_mute_indef_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -155,11 +135,7 @@ async fn test_mute_chat_with_expiry() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_mute_expiry_a").await?;
     let client_b = TestClient::connect("e2e_mute_expiry_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -185,11 +161,7 @@ async fn test_unmute_chat() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_unmute_a").await?;
     let client_b = TestClient::connect("e2e_unmute_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -214,11 +186,7 @@ async fn test_star_message() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_star_a").await?;
     let client_b = TestClient::connect("e2e_star_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -256,11 +224,7 @@ async fn test_unstar_message() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_unstar_a").await?;
     let client_b = TestClient::connect("e2e_unstar_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -305,11 +269,7 @@ async fn test_multiple_chat_actions() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_multi_actions_a").await?;
     let client_b = TestClient::connect("e2e_multi_actions_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -355,11 +315,7 @@ async fn test_mark_chat_as_read() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_mark_read_a").await?;
     let client_b = TestClient::connect("e2e_mark_read_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -389,11 +345,7 @@ async fn test_delete_chat() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_delete_chat_a").await?;
     let client_b = TestClient::connect("e2e_delete_chat_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 
@@ -416,11 +368,7 @@ async fn test_delete_message_for_me() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_del_msg_me_a").await?;
     let client_b = TestClient::connect("e2e_del_msg_me_b").await?;
 
-    let jid_b = client_b
-        .client
-        .get_pn()
-        .expect("B should have JID")
-        .to_non_ad();
+    let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_a.wait_for_app_state_sync().await?;
 

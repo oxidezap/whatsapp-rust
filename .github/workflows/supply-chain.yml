@@ -15,6 +15,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep in sync with PROTOC_VERSION in main.yml — env is per-workflow, so the
+  # value cannot be shared across files without a repo-level Actions variable.
+  PROTOC_VERSION: '3.25.3'
 
 jobs:
   cargo-deny:
@@ -49,7 +52,7 @@ jobs:
       - name: Install protoc
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@3.25.3
+          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@v2
         with:

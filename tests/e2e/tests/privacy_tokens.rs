@@ -55,10 +55,7 @@ async fn send_message_and_expect_463_with_id(
         .send_message_with_options(
             recipient_jid.clone(),
             text_msg(text),
-            SendOptions {
-                message_id: Some(msg_id.clone()),
-                ..Default::default()
-            },
+            SendOptions::default().with_message_id(msg_id.clone()),
         )
         .await?
         .message_id;
@@ -126,7 +123,7 @@ async fn test_issue_tokens_api_delivers_notification_and_updates_index() -> anyh
 
     let jid_b_lid = client_b
         .client
-        .get_lid()
+        .lid()
         .expect("B should have LID after connect");
     let issued = client_a
         .client
@@ -239,8 +236,8 @@ async fn test_tc_token_notification_reaches_all_connected_devices() -> anyhow::R
     let mut client_b1 = TestClient::connect_as("e2e_tctok_multi_b1", &shared_b_name).await?;
     let client_b2 = TestClient::connect_as("e2e_tctok_multi_b2", &shared_b_name).await?;
 
-    let phone_b1 = client_b1.client.get_pn().expect("B1 should have JID");
-    let phone_b2 = client_b2.client.get_pn().expect("B2 should have JID");
+    let phone_b1 = client_b1.client.pn().expect("B1 should have JID");
+    let phone_b2 = client_b2.client.pn().expect("B2 should have JID");
     assert_eq!(
         phone_b1.user, phone_b2.user,
         "B devices should share a phone"
@@ -398,7 +395,7 @@ async fn test_only_nct_send_ab_without_salt_still_receives_463() -> anyhow::Resu
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     let msg_id = format!("E2ECSNEG1{}", uuid::Uuid::new_v4().simple());
     let sent_msg_id = msg_id.clone();
@@ -416,7 +413,7 @@ async fn test_only_nct_send_ab_without_salt_still_receives_463() -> anyhow::Resu
         .map_err(|_| anyhow::anyhow!("Timed out waiting for sent message node"))?
         .map_err(|_| anyhow::anyhow!("sent message waiter was canceled"))?;
     // A 1:1 `to` carries the recipient's BARE LID (device-stripped); the device is
-    // addressed per-recipient in the enc fan-out, never on `to`. `get_lid()` returns
+    // addressed per-recipient in the enc fan-out, never on `to`. `lid()` returns
     // the account's own device-suffixed LID (e.g. `:33`, matching the real WA
     // `<success lid="…:33@lid">`), so compare against the non-AD form.
     assert_eq!(
@@ -461,7 +458,7 @@ async fn test_send_and_syncd_ab_without_delivery_still_receives_463() -> anyhow:
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     let msg_id = format!("E2ECSNEG2{}", uuid::Uuid::new_v4().simple());
     let sent_msg_id = msg_id.clone();
@@ -479,7 +476,7 @@ async fn test_send_and_syncd_ab_without_delivery_still_receives_463() -> anyhow:
         .map_err(|_| anyhow::anyhow!("Timed out waiting for sent message node"))?
         .map_err(|_| anyhow::anyhow!("sent message waiter was canceled"))?;
     // A 1:1 `to` carries the recipient's BARE LID (device-stripped); the device is
-    // addressed per-recipient in the enc fan-out, never on `to`. `get_lid()` returns
+    // addressed per-recipient in the enc fan-out, never on `to`. `lid()` returns
     // the account's own device-suffixed LID (e.g. `:33`, matching the real WA
     // `<success lid="…:33@lid">`), so compare against the non-AD form.
     assert_eq!(
@@ -525,7 +522,7 @@ async fn test_history_sync_nct_salt_enables_cstoken_first_contact() -> anyhow::R
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -533,10 +530,8 @@ async fn test_history_sync_nct_salt_enables_cstoken_first_contact() -> anyhow::R
         .send_message_with_options(
             jid_a_lid,
             text_msg("history-sync cstoken first contact"),
-            SendOptions {
-                message_id: Some(format!("E2ECSHIST{}", uuid::Uuid::new_v4().simple())),
-                ..Default::default()
-            },
+            SendOptions::default()
+                .with_message_id(format!("E2ECSHIST{}", uuid::Uuid::new_v4().simple())),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -591,7 +586,7 @@ async fn test_cstoken_only_first_contact_succeeds_when_tctoken_disabled() -> any
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -599,10 +594,8 @@ async fn test_cstoken_only_first_contact_succeeds_when_tctoken_disabled() -> any
         .send_message_with_options(
             jid_a_lid,
             text_msg("cstoken-only first contact"),
-            SendOptions {
-                message_id: Some(format!("E2ECSONLY{}", uuid::Uuid::new_v4().simple())),
-                ..Default::default()
-            },
+            SendOptions::default()
+                .with_message_id(format!("E2ECSONLY{}", uuid::Uuid::new_v4().simple())),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -651,7 +644,7 @@ async fn test_syncd_nct_salt_enables_cstoken_first_contact() -> anyhow::Result<(
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -659,10 +652,8 @@ async fn test_syncd_nct_salt_enables_cstoken_first_contact() -> anyhow::Result<(
         .send_message_with_options(
             jid_a_lid,
             text_msg("syncd cstoken first contact"),
-            SendOptions {
-                message_id: Some(format!("E2ECSSYN{}", uuid::Uuid::new_v4().simple())),
-                ..Default::default()
-            },
+            SendOptions::default()
+                .with_message_id(format!("E2ECSSYN{}", uuid::Uuid::new_v4().simple())),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -708,7 +699,7 @@ async fn test_clearing_nct_salt_locally_makes_first_contact_fail_again() -> anyh
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     client_b
         .client
@@ -737,7 +728,7 @@ async fn test_clearing_nct_salt_locally_makes_first_contact_fail_again() -> anyh
     let mut client_c = TestClient::connect_as("e2e_cstok_remove_c", &restricted_name_c).await?;
     let jid_c_lid = client_c
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     send_first_message_and_expect_463(
         &client_b,
@@ -789,10 +780,8 @@ async fn test_tctoken_only_reply_succeeds_when_cstoken_disabled() -> anyhow::Res
         .send_message_with_options(
             jid_a.clone(),
             text_msg("tctoken-only reply"),
-            SendOptions {
-                message_id: Some(format!("E2ETCONLY{}", uuid::Uuid::new_v4().simple())),
-                ..Default::default()
-            },
+            SendOptions::default()
+                .with_message_id(format!("E2ETCONLY{}", uuid::Uuid::new_v4().simple())),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -846,7 +835,7 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
 
     let jid_a_lid = client_a
         .client
-        .get_lid()
+        .lid()
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -854,10 +843,8 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
         .send_message_with_options(
             jid_a_lid,
             text_msg("reconnect cstoken first contact"),
-            SendOptions {
-                message_id: Some(format!("E2ECSRECON{}", uuid::Uuid::new_v4().simple())),
-                ..Default::default()
-            },
+            SendOptions::default()
+                .with_message_id(format!("E2ECSRECON{}", uuid::Uuid::new_v4().simple())),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -928,10 +915,7 @@ async fn test_pn_target_first_contact_uses_cstoken_after_lid_resolution() -> any
         .send_message_with_options(
             jid_a_pn.clone(),
             text_msg("pn-target cstoken first contact"),
-            SendOptions {
-                message_id: Some(msg_id),
-                ..Default::default()
-            },
+            SendOptions::default().with_message_id(msg_id),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)

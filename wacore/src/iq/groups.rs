@@ -2968,12 +2968,12 @@ pub struct AcceptGroupInviteV4Iq {
 }
 
 impl AcceptGroupInviteV4Iq {
-    pub fn new(group_jid: Jid, code: String, expiration: i64, admin_jid: Jid) -> Self {
+    pub fn new(group_jid: &Jid, code: &str, expiration: i64, admin_jid: &Jid) -> Self {
         Self {
-            group_jid,
-            code,
+            group_jid: group_jid.clone(),
+            code: code.to_string(),
             expiration,
-            admin_jid,
+            admin_jid: admin_jid.clone(),
         }
     }
 }
@@ -3335,8 +3335,10 @@ pub struct BatchGetGroupInfoIq {
 }
 
 impl BatchGetGroupInfoIq {
-    pub fn new(group_jids: Vec<Jid>) -> Self {
-        Self { group_jids }
+    pub fn new(group_jids: &[Jid]) -> Self {
+        Self {
+            group_jids: group_jids.to_vec(),
+        }
     }
 }
 
@@ -3434,17 +3436,19 @@ pub struct GetGroupProfilePicturesIq {
 }
 
 impl GetGroupProfilePicturesIq {
-    pub fn new(group_jids: Vec<Jid>) -> Self {
+    pub fn new(group_jids: &[Jid]) -> Self {
         Self {
             groups: group_jids
-                .into_iter()
-                .map(|jid| (jid, PictureType::Preview))
+                .iter()
+                .map(|jid| (jid.clone(), PictureType::Preview))
                 .collect(),
         }
     }
 
-    pub fn with_type(groups: Vec<(Jid, PictureType)>) -> Self {
-        Self { groups }
+    pub fn with_type(groups: &[(Jid, PictureType)]) -> Self {
+        Self {
+            groups: groups.to_vec(),
+        }
     }
 }
 
@@ -5273,12 +5277,7 @@ mod tests {
         let code = "A1B2C3D4".to_string();
         let expiration: i64 = 1_700_000_123;
 
-        let spec = AcceptGroupInviteV4Iq::new(
-            group_jid.clone(),
-            code.clone(),
-            expiration,
-            admin_jid.clone(),
-        );
+        let spec = AcceptGroupInviteV4Iq::new(&group_jid, &code, expiration, &admin_jid);
         let iq = spec.build_iq();
 
         assert_eq!(iq.to, group_jid);

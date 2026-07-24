@@ -383,10 +383,7 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
             .send_message_with_options(
                 jid_b.clone(),
                 text_msg(&text),
-                SendOptions {
-                    message_id: Some(id.clone()),
-                    ..Default::default()
-                },
+                SendOptions::default().with_message_id(id.clone()),
             )
             .await?
             .message_id;
