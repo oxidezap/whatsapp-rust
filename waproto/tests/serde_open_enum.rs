@@ -57,10 +57,7 @@ fn open_field_deserializes_from_lowercased_proto_name() {
 fn open_field_deserializes_unknown_integer() {
     let mutation: wa::SyncdMutation =
         serde_json::from_value(serde_json::json!({"operation": 7})).unwrap();
-    assert_eq!(
-        mutation.operation,
-        Some(waproto::buffa::EnumValue::Unknown(7))
-    );
+    assert_eq!(mutation.operation, Some(buffa::EnumValue::Unknown(7)));
 
     let absent: wa::SyncdMutation = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(absent.operation, None);

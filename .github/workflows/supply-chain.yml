@@ -90,7 +90,12 @@ jobs:
             echo '<details><summary>Output (tail; full log in the semver-checks-log artifact)</summary>'
             echo
             echo '```'
-            tail -c 200000 semver.log
+            if [ -f semver.log ]; then
+              tail -c 200000 semver.log
+            else
+              # Checkout, toolchain or tool install failed before the run.
+              echo 'cargo-semver-checks did not run; see the failed setup step above.'
+            fi
             echo '```'
             echo
             echo '</details>'

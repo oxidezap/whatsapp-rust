@@ -203,7 +203,7 @@ impl AsRef<wacore::send::ResolvedGroupDevices> for GroupDeviceSnapshot {
         name = "wa.send.branch_box",
         level = "debug",
         skip_all,
-        fields(future_bytes = std::mem::size_of::<F>())
+        fields(future_bytes = size_of::<F>())
     )
 )]
 fn box_send_branch<F>(future: F) -> std::pin::Pin<Box<F>>

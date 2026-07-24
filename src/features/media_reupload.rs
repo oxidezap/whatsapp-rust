@@ -157,8 +157,10 @@ impl<'a> MediaReupload<'a> {
     ///
     /// Each request registers its own notification waiter and awaits it
     /// independently, so a bulk recovery — e.g. many expired-URL media after a
-    /// long offline period — is bounded by roughly one `MEDIA_RETRY_TIMEOUT`
-    /// instead of the serial sum of per-item waits. Results are returned in the
+    /// long offline period — runs `MEDIA_REUPLOAD_CONCURRENCY` at a time instead
+    /// of paying the serial sum of per-item waits. A batch larger than that runs
+    /// in waves, so the worst case is `ceil(len / MEDIA_REUPLOAD_CONCURRENCY)`
+    /// `MEDIA_RETRY_TIMEOUT` windows. Results are returned in the
     /// same order as `reqs`; each entry carries that item's success or error
     /// (one item failing never aborts the others).
     ///
