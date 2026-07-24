@@ -211,9 +211,46 @@ impl InitLocks {
         }
     }
 
+    /// Best-effort synchronous reclaim for cancellation paths: `try_lock` so it
+    /// can run inside `Drop`. Contention here only defers cleanup to the next
+    /// reclaim on this hash or to `run_pending_tasks`.
+    fn reclaim_now(&self, hash: u64, init_mutex: &Arc<AsyncMutex<()>>) {
+        if let Some(mut locks) = self.map.try_lock()
+            && Arc::strong_count(init_mutex) <= 2
+            && let Some(existing) = locks.get(&hash)
+            && Arc::ptr_eq(existing, init_mutex)
+        {
+            locks.remove(&hash);
+        }
+    }
+
     async fn retain_active(&self) {
         let mut locks = self.map.lock().await;
         locks.retain(|_, v| Arc::strong_count(v) > 1);
+    }
+}
+
+/// Reclaims a single-flight init lock if `get_with_slow` is cancelled mid-init
+/// (caller timeout/abort), so cancelled fills can't grow the registry until
+/// `run_pending_tasks`. The success path disarms it and runs the awaited
+/// (guaranteed) reclaim instead.
+struct InitLockCleanup<'a> {
+    registry: &'a InitLocks,
+    hash: u64,
+    lock: Option<Arc<AsyncMutex<()>>>,
+}
+
+impl InitLockCleanup<'_> {
+    fn disarm(&mut self) -> Arc<AsyncMutex<()>> {
+        self.lock.take().expect("init-lock cleanup disarmed twice")
+    }
+}
+
+impl Drop for InitLockCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            self.registry.reclaim_now(self.hash, &lock);
+        }
     }
 }
 
@@ -619,10 +656,21 @@ where
     /// still resolves to the first inserted value.
     async fn get_with_slow(&self, key: K, init: BoxFuture<'_, V>) -> V {
         let hash = self.init_locks.hash_of(&key);
-        let init_mutex = self.init_locks.acquire(hash).await;
+        // The cleanup guard holds the sole long-lived Arc so its Drop sees an
+        // exact strong count if this future is cancelled at any await below.
+        let mut cleanup = InitLockCleanup {
+            registry: &self.init_locks,
+            hash,
+            lock: Some(self.init_locks.acquire(hash).await),
+        };
 
         let value = {
-            let _init_guard = init_mutex.lock().await;
+            let _init_guard = cleanup
+                .lock
+                .as_ref()
+                .expect("init-lock cleanup still armed")
+                .lock()
+                .await;
             // Double-check after acquiring the per-key lock.
             if let Some(v) = self.get(&key).await {
                 v
@@ -632,6 +680,8 @@ where
             }
         };
 
+        let init_mutex = cleanup.disarm();
+        drop(cleanup);
         self.init_locks.reclaim(hash, &init_mutex).await;
         value
     }
@@ -1151,6 +1201,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_get_with_reclaims_init_lock() {
+        // A get_with whose caller is aborted mid-init must not leave its
+        // per-key init lock behind: hot caches never call run_pending_tasks.
+        let cache = build_cache::<String, u32>();
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_with("stuck".to_string(), std::future::pending::<u32>())
+                    .await
+            }
+        });
+
+        // Poll (bounded) until the in-flight init registers its lock.
+        let mut registered = false;
+        for _ in 0..400 {
+            if !cache.init_locks.map.lock().await.is_empty() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(registered, "in-flight get_with never registered its lock");
+
+        task.abort();
+        let _ = task.await;
+
+        // Poll (bounded): the cleanup guard reclaims on cancellation, without
+        // any run_pending_tasks call.
+        let mut reclaimed = false;
+        for _ in 0..400 {
+            if cache.init_locks.map.lock().await.is_empty() {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(reclaimed, "cancelled get_with leaked its init lock");
+    }
+
+    #[tokio::test]
     async fn init_locks_collision_shares_one_lock() {
         // Two keys that hash to the same slot must share the lock (they
         // serialize) and both resolve correctly through the double-checked get.
@@ -1176,6 +1267,54 @@ mod tests {
             registry.map.lock().await.is_empty(),
             "last reclaim must drop the registry entry"
         );
+    }
+
+    /// Key whose hash is a constant, so any two instances collide in the
+    /// hash-keyed init-lock registry while remaining distinct map keys.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct CollidingKey(&'static str);
+
+    impl Hash for CollidingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            state.write_u64(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn colliding_keys_keep_distinct_values() {
+        let cache: PortableCache<CollidingKey, u32> =
+            PortableCache::builder().max_capacity(16).build();
+        let (a, b) = (CollidingKey("a"), CollidingKey("b"));
+        assert_eq!(
+            cache.init_locks.hash_of(&a),
+            cache.init_locks.hash_of(&b),
+            "test premise: both keys must share one init-lock slot"
+        );
+
+        // Rendezvous BEFORE get_with: colliding keys share one init lock, so
+        // their initializers serialize and must never wait on each other.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for (key, value) in [(a.clone(), 1u32), (b.clone(), 2u32)] {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache
+                    .get_with(key, async {
+                        tokio::task::yield_now().await;
+                        value
+                    })
+                    .await
+            }));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        assert_eq!(results, vec![1, 2], "each key must get its own init value");
+        assert_eq!(cache.get(&a).await, Some(1));
+        assert_eq!(cache.get(&b).await, Some(2));
     }
 
     #[tokio::test]
