@@ -138,7 +138,7 @@ impl NoiseSocket {
             enc_buf.clear();
             enc_buf.extend_from_slice(&plaintext);
             if let Err(e) = write_key.encrypt_in_place_with_counter(counter, enc_buf) {
-                return Err(EncryptSendError::crypto(anyhow::anyhow!(e.to_string())));
+                return Err(EncryptSendError::crypto(e));
             }
 
             if let Err(e) = wacore::framing::encode_frame_into(enc_buf, None, out_buf) {
@@ -156,7 +156,7 @@ impl NoiseSocket {
             let ciphertext = match encrypt_result {
                 Ok(c) => c,
                 Err(e) => {
-                    return Err(EncryptSendError::crypto(anyhow::anyhow!(e.to_string())));
+                    return Err(EncryptSendError::crypto(e));
                 }
             };
 

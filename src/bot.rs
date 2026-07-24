@@ -479,7 +479,7 @@ async fn run_metered<F: std::future::Future<Output = ()>>(
 /// ```
 ///
 /// Handlers registered through the builder (`on_message`, `on_event`, …)
-/// receive typed [`Event`](wacore::types::events::Event) payloads. Anything the
+/// receive typed [`Event`] payloads. Anything the
 /// builder does not expose is reachable on the underlying client via
 /// [`Bot::client`], which stays valid after the bot is started.
 pub struct Bot {

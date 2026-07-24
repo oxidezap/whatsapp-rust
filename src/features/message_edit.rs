@@ -28,7 +28,30 @@ use log::warn;
 use wacore::message_edit::{self, MessageEditContext};
 use wacore::secret_enc_addon::ModificationType;
 use wacore_binary::Jid;
+use wacore_binary::jid::JidError;
 use waproto::whatsapp as wa;
+
+/// Failures of the target-key sender resolvers ([`EncryptedEdit::original_sender_jid`],
+/// [`SecretEncrypted::original_sender_jid`], [`SecretEncrypted::original_sender_for_dispatch`]).
+///
+/// Both variants mean the peer sent a target message key we cannot attribute,
+/// so retrying the same envelope yields the same result.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MessageEditError {
+    /// A JID carried by the target message key did not parse.
+    #[error("invalid {field} in target message key")]
+    InvalidTargetJid {
+        /// Wire name of the offending target-key field.
+        field: &'static str,
+        #[source]
+        source: JidError,
+    },
+    /// The target key carried neither `participant` nor `remote_jid`, and
+    /// `from_me` was not `Some(true)`, so no author can be derived from it.
+    #[error("target message key missing participant and remote_jid")]
+    MissingTargetSender,
+}
 
 /// Decrypt a `secret_encrypted_message` MESSAGE_EDIT envelope.
 ///
@@ -167,7 +190,7 @@ impl<'a> EncryptedEdit<'a> {
     /// 1. `participant` if present (always set in groups).
     /// 2. `my_jid` if `from_me == Some(true)`.
     /// 3. `remote_jid` otherwise.
-    pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid> {
+    pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid, MessageEditError> {
         resolve_target_sender(self.target_message_key, my_jid)
     }
 
@@ -202,11 +225,14 @@ fn edit_author_from_envelope(is_from_me: bool, envelope_sender: &Jid, my_jid: &J
 
 /// Resolve the original sender JID from a `secret_encrypted_message`'s target
 /// key (see [`EncryptedEdit::original_sender_jid`] for the rationale).
-fn resolve_target_sender(target: &wa::MessageKey, my_jid: &Jid) -> Result<Jid> {
+fn resolve_target_sender(target: &wa::MessageKey, my_jid: &Jid) -> Result<Jid, MessageEditError> {
     if let Some(p) = target.participant.as_deref() {
         return p
             .parse::<Jid>()
-            .map_err(|e| anyhow!("invalid participant jid in target key: {e}"));
+            .map_err(|source| MessageEditError::InvalidTargetJid {
+                field: "participant",
+                source,
+            });
     }
     if target.from_me == Some(true) {
         return Ok(my_jid.to_non_ad());
@@ -214,9 +240,12 @@ fn resolve_target_sender(target: &wa::MessageKey, my_jid: &Jid) -> Result<Jid> {
     let raw = target
         .remote_jid
         .as_deref()
-        .ok_or_else(|| anyhow!("target message key missing participant and remote_jid"))?;
+        .ok_or(MessageEditError::MissingTargetSender)?;
     raw.parse::<Jid>()
-        .map_err(|e| anyhow!("invalid remote_jid in target key: {e}"))
+        .map_err(|source| MessageEditError::InvalidTargetJid {
+            field: "remoteJid",
+            source,
+        })
 }
 
 /// Which `secret_encrypted_message` use case an envelope carries.
@@ -287,7 +316,7 @@ impl<'a> SecretEncrypted<'a> {
     /// MESSAGE_EDIT prefer [`Self::original_sender_for_dispatch`] on the receive
     /// path. Authoritative for poll/event kinds (whose target key carries the
     /// real author).
-    pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid> {
+    pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid, MessageEditError> {
         resolve_target_sender(self.target_message_key, my_jid)
     }
 
@@ -306,7 +335,7 @@ impl<'a> SecretEncrypted<'a> {
         is_from_me: bool,
         envelope_sender: &Jid,
         my_jid: &Jid,
-    ) -> Result<Jid> {
+    ) -> Result<Jid, MessageEditError> {
         match self.kind {
             SecretEncKind::MessageEdit => Ok(edit_author_from_envelope(
                 is_from_me,
@@ -636,6 +665,95 @@ mod tests {
             env.original_sender_jid(&my_jid).unwrap().to_string(),
             "5511999@s.whatsapp.net"
         );
+    }
+
+    #[test]
+    fn original_sender_jid_reports_an_unparseable_participant() {
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("g@g.us".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: Some("not a jid".to_string()),
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_envelope(&msg).expect("recognised");
+        let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
+        let err = env
+            .original_sender_jid(&my_jid)
+            .expect_err("a malformed participant must not resolve");
+        assert!(matches!(
+            err,
+            MessageEditError::InvalidTargetJid {
+                field: "participant",
+                ..
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn original_sender_jid_reports_a_target_key_without_any_sender() {
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: None,
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_envelope(&msg).expect("recognised");
+        let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
+        let err = env
+            .original_sender_jid(&my_jid)
+            .expect_err("a target key with no sender must not resolve");
+        assert!(matches!(err, MessageEditError::MissingTargetSender));
+    }
+
+    #[test]
+    fn original_sender_jid_reports_an_unparseable_remote_jid() {
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("not a jid".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_envelope(&msg).expect("recognised");
+        let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
+        let err = env
+            .original_sender_jid(&my_jid)
+            .expect_err("a malformed remote_jid must not resolve");
+        assert!(matches!(
+            err,
+            MessageEditError::InvalidTargetJid {
+                field: "remoteJid",
+                ..
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]

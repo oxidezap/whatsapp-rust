@@ -5,10 +5,10 @@
 //! retains the old ones so prekey messages already in flight against a
 //! previous signed pre-key still decrypt.
 
-use crate::client::Client;
+use crate::client::{Client, SignalMaintenanceError};
 use crate::request::IqError;
 use wacore::iq::prekeys::RotateSignedPreKeySpec;
-use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
+use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey, SignalProtocolError};
 use wacore::libsignal::store::record_helpers::new_signed_pre_key_record;
 use wacore::store::commands::DeviceCommand;
 
@@ -25,6 +25,17 @@ pub(crate) const SIGNED_PRE_KEY_RETENTION: usize = 3;
 /// 24-bit ceiling, matching the one-time prekey id border. Ids advance by one
 /// per rotation and wrap back to 1 here.
 const MAX_SIGNED_PRE_KEY_ID: u32 = 16_777_215;
+
+/// Wraps a backend failure as [`SignalMaintenanceError::Storage`], keeping the
+/// typed cause in the `source()` chain under `context`.
+fn storage_err<E>(
+    context: impl std::fmt::Display + Send + Sync + 'static,
+) -> impl FnOnce(E) -> SignalMaintenanceError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    move |e| SignalMaintenanceError::Storage(anyhow::Error::new(e).context(context))
+}
 
 /// Whether the cadence has elapsed. `last == 0` means the field predates this
 /// feature; the baseline path handles that, so we never rotate on `0`.
@@ -45,7 +56,7 @@ pub(crate) fn next_signed_pre_key_id(current: u32) -> u32 {
 impl Client {
     /// Rotate the signed pre-key if the cadence has elapsed. Seeds the cadence
     /// baseline (without rotating) for devices upgraded in with the field at 0.
-    pub(crate) async fn maybe_rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn maybe_rotate_signed_pre_key(&self) -> Result<(), SignalMaintenanceError> {
         // Single-flight: a concurrent rotation (e.g. an older post-login task
         // racing a newer one across reconnect churn) already covers this cadence,
         // so skip rather than run the rotate/upload/prune flow twice.
@@ -66,7 +77,7 @@ impl Client {
             self.persistence_manager
                 .flush()
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to flush rotation baseline: {e:?}"))?;
+                .map_err(storage_err("failed to flush rotation baseline"))?;
             return Ok(());
         }
 
@@ -89,12 +100,12 @@ impl Client {
     /// just leaves the current key in place to retry — never advancing the
     /// cadence or pruning the key the server still hands out. Calls are
     /// serialized with the automatic rotation path.
-    pub async fn rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
+    pub async fn rotate_signed_pre_key(&self) -> Result<(), SignalMaintenanceError> {
         let _guard = self.signed_pre_key_rotation_lock.lock().await;
         self.rotate_signed_pre_key_inner().await
     }
 
-    async fn rotate_signed_pre_key_inner(&self) -> Result<(), anyhow::Error> {
+    async fn rotate_signed_pre_key_inner(&self) -> Result<(), SignalMaintenanceError> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let now = wacore::time::now_millis();
         let backend = self.persistence_manager.backend();
@@ -109,25 +120,35 @@ impl Client {
         let (new_kp, signature) = match backend
             .load_signed_prekey(new_id)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to load staged signed pre-key: {e}"))?
+            .map_err(storage_err("failed to load staged signed pre-key"))?
         {
             Some(bytes) => {
-                let s = waproto::codec::signed_pre_key_record_decode(&bytes)
-                    .map_err(|e| anyhow::anyhow!("staged signed pre-key decode: {e}"))?;
-                let public = PublicKey::from_djb_public_key_bytes(
-                    s.public_key
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("staged signed pre-key missing public"))?,
-                )?;
-                let private =
-                    PrivateKey::deserialize(s.private_key.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("staged signed pre-key missing private")
-                    })?)?;
+                let s = waproto::codec::signed_pre_key_record_decode(&bytes).map_err(|e| {
+                    SignalMaintenanceError::CorruptKey(format!("staged record decode: {e}"))
+                })?;
+                let public = PublicKey::from_djb_public_key_bytes(s.public_key.as_deref().ok_or(
+                    SignalMaintenanceError::CorruptKey("staged record missing public".to_string()),
+                )?)
+                .map_err(|e| {
+                    SignalMaintenanceError::CorruptKey(format!("staged record public key: {e}"))
+                })?;
+                let private = PrivateKey::deserialize(s.private_key.as_deref().ok_or(
+                    SignalMaintenanceError::CorruptKey("staged record missing private".to_string()),
+                )?)
+                .map_err(|e| {
+                    SignalMaintenanceError::CorruptKey(format!("staged record private key: {e}"))
+                })?;
                 let signature: [u8; 64] = s
                     .signature
-                    .ok_or_else(|| anyhow::anyhow!("staged signed pre-key missing signature"))?
+                    .ok_or(SignalMaintenanceError::CorruptKey(
+                        "staged record missing signature".to_string(),
+                    ))?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("staged signature must be 64 bytes"))?;
+                    .map_err(|_| {
+                        SignalMaintenanceError::CorruptKey(
+                            "staged signature must be 64 bytes".to_string(),
+                        )
+                    })?;
                 (KeyPair::new(public, private), signature)
             }
             None => {
@@ -138,10 +159,18 @@ impl Client {
                 let signature: [u8; 64] = snapshot
                     .identity_key
                     .private_key
-                    .calculate_signature(&kp.public_key.serialize(), &mut rng)?
+                    .calculate_signature(&kp.public_key.serialize(), &mut rng)
+                    .map_err(|e| SignalMaintenanceError::Signal(e.into()))?
                     .as_ref()
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("Ed25519 signature must be 64 bytes"))?;
+                    // Not CorruptKey: nothing was read back from storage here, so
+                    // a wrong width means the signing backend broke its contract.
+                    .map_err(|_| {
+                        SignalMaintenanceError::Signal(SignalProtocolError::InvalidState(
+                            "rotate_signed_pre_key",
+                            "Ed25519 signature must be 64 bytes".to_string(),
+                        ))
+                    })?;
                 let record =
                     new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
                 backend
@@ -150,7 +179,7 @@ impl Client {
                         &waproto::codec::signed_pre_key_record_to_vec(&record),
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("failed to stage new signed pre-key: {e}"))?;
+                    .map_err(storage_err("failed to stage new signed pre-key"))?;
                 (kp, signature)
             }
         };
@@ -171,7 +200,7 @@ impl Client {
                 &waproto::codec::signed_pre_key_record_to_vec(&old_record),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("failed to retain old signed pre-key: {e}"))?;
+            .map_err(storage_err("failed to retain old signed pre-key"))?;
 
         // WA Web reads 406 = bad key, 409 = server validation fail, >=500 =
         // transient; none advance local state or fail the automatic login path.
@@ -197,11 +226,12 @@ impl Client {
                     // staged. Every other code (rate limits, transient 5xx, …) is
                     // retryable, so keep the staged key for a plain retry.
                     if *code == 406 || *code == 409 {
-                        backend.remove_signed_prekey(new_id).await.map_err(|e| {
-                            anyhow::anyhow!(
-                                "failed to drop rejected staged signed pre-key {new_id}: {e}"
-                            )
-                        })?;
+                        backend
+                            .remove_signed_prekey(new_id)
+                            .await
+                            .map_err(storage_err(format!(
+                                "failed to drop rejected staged signed pre-key {new_id}"
+                            )))?;
                         log::warn!(
                             "signed pre-key rotation rejected (code={code}, text='{text}'); \
                              discarded the rejected key, will remint on a later connect"
@@ -237,7 +267,7 @@ impl Client {
         self.persistence_manager
             .flush()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to flush rotated signed pre-key: {e:?}"))?;
+            .map_err(storage_err("failed to flush rotated signed pre-key"))?;
 
         // new_id now lives in the device field, so drop its redundant staged copy
         // before pruning to RETENTION total addressable keys (field + RETENTION-1
@@ -249,7 +279,7 @@ impl Client {
         let mut retained = backend
             .load_all_signed_prekeys()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to load retained signed pre-keys: {e}"))?;
+            .map_err(storage_err("failed to load retained signed pre-keys"))?;
         retained.sort_unstable_by_key(|(id, _)| std::cmp::Reverse(*id));
         for (id, _) in retained
             .into_iter()
@@ -346,11 +376,10 @@ mod tests {
         .await
         .expect("automatic rotation must not recursively acquire its held lock")
         .expect_err("the disconnected test client must fail at upload");
-        assert!(
-            error
-                .downcast_ref::<IqError>()
-                .is_some_and(|error| matches!(error, IqError::NotConnected))
-        );
+        assert!(matches!(
+            error,
+            SignalMaintenanceError::Iq(IqError::NotConnected)
+        ));
         assert!(
             client
                 .persistence_manager
@@ -371,10 +400,30 @@ mod tests {
             .rotate_signed_pre_key()
             .await
             .expect_err("manual rotation must report a failed upload");
-        assert!(
-            error
-                .downcast_ref::<IqError>()
-                .is_some_and(|error| matches!(error, IqError::NotConnected))
-        );
+        assert!(matches!(
+            error,
+            SignalMaintenanceError::Iq(IqError::NotConnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rotation_reports_an_unusable_staged_key_as_corrupt() {
+        let client = crate::test_utils::create_test_client().await;
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let staged_id = next_signed_pre_key_id(snapshot.signed_pre_key_id);
+        // A record that decodes but carries no key material: rereading it would
+        // yield the same bytes, so it is a corruption, not a storage failure.
+        client
+            .persistence_manager
+            .backend()
+            .store_signed_prekey(staged_id, &[])
+            .await
+            .expect("stage an empty signed pre-key record");
+
+        let error = client
+            .rotate_signed_pre_key()
+            .await
+            .expect_err("an unusable staged key must abort the rotation");
+        assert!(matches!(error, SignalMaintenanceError::CorruptKey(_)));
     }
 }

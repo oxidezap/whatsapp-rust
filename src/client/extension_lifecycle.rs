@@ -2369,7 +2369,7 @@ mod tests {
             }))
             .detach();
 
-        client.logout().await.expect("client logout");
+        client.logout().await;
 
         assert_eq!(
             lifecycle.events(),

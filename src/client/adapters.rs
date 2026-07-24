@@ -83,7 +83,7 @@ impl Client {
     /// permit — re-entering it would deadlock.
     ///
     /// [`InboundDurabilityHook`]: crate::types::durability_hook::InboundDurabilityHook
-    pub async fn flush_pending_signal_state(&self) -> Result<(), anyhow::Error> {
+    pub async fn flush_pending_signal_state(&self) -> Result<(), SignalMaintenanceError> {
         self.flush_signal_cache_batch_safe().await
     }
 
@@ -123,7 +123,7 @@ impl Client {
     ///
     /// Must NOT be called while holding the processing permit (it acquires
     /// it); permit-holding paths commit via the batcher directly.
-    pub(crate) async fn flush_signal_cache_batch_safe(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn flush_signal_cache_batch_safe(&self) -> Result<(), SignalMaintenanceError> {
         // Under the permit the commit ALWAYS flushes the Signal cache (an empty
         // batch still flushes — see flush_inbound_commits_under_permit), so a
         // successful call is proof the out-of-band advance is persisted; no
@@ -137,9 +137,7 @@ impl Client {
             {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!(
-                    "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
-                ))
+                Err(SignalMaintenanceError::DrainCommitFailed)
             };
         } else if drain_active {
             // Drain active but no live client to route the permit-held flush
@@ -149,11 +147,11 @@ impl Client {
             // flush here would persist them rowless — the exact loss this
             // batch-safe path exists to prevent. Leaving the cache unflushed
             // makes the server redeliver.
-            return Err(anyhow::anyhow!(
-                "client dropping while inbound drain is active; skipping Signal flush"
-            ));
+            return Err(SignalMaintenanceError::DrainShuttingDown);
         }
-        self.flush_signal_cache().await
+        self.flush_signal_cache()
+            .await
+            .map_err(SignalMaintenanceError::Storage)
     }
 
     /// Pre-wire durability gate for the send path. Flushes synchronously only
@@ -177,7 +175,10 @@ impl Client {
     /// statement about what this send REQUIRES, not a promise it never flushes.
     pub(crate) async fn persist_signal_state_pre_wire(&self) -> Result<(), anyhow::Error> {
         if self.signal_cache.needs_pre_wire_flush().await {
-            return self.flush_signal_cache_batch_safe().await;
+            return self
+                .flush_signal_cache_batch_safe()
+                .await
+                .map_err(Into::into);
         }
         self.schedule_signal_flush(self.connection_generation.load(Ordering::Acquire));
         Ok(())
@@ -196,7 +197,7 @@ impl Client {
     }
 }
 
-fn log_signal_flush_error(context: &str, id: Option<&str>, e: &anyhow::Error) {
+fn log_signal_flush_error(context: &str, id: Option<&str>, e: &SignalMaintenanceError) {
     if let Some(id) = id {
         log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
     } else {
@@ -234,5 +235,34 @@ mod tests {
                 .any(|cause| cause.contains("put_sessions_batch failing (test hook)")),
             "typed backend cause missing from {chain:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn flush_pending_signal_state_settles_a_healthy_backend() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        let peer = Jid::new("12025550112", Server::Pn).with_device(1);
+        crate::test_utils::seed_peer_session(&client, &peer).await;
+
+        client
+            .flush_pending_signal_state()
+            .await
+            .expect("a healthy backend must settle");
+    }
+
+    #[tokio::test]
+    async fn flush_pending_signal_state_reports_a_backend_failure_as_storage() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        let peer = Jid::new("12025550113", Server::Pn).with_device(1);
+        crate::test_utils::seed_peer_session(&client, &peer).await;
+        backend.set_fail_session_writes(true);
+
+        let error = client
+            .flush_pending_signal_state()
+            .await
+            .expect_err("injected backend failure must propagate");
+        assert!(matches!(error, SignalMaintenanceError::Storage(_)));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

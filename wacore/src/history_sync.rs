@@ -2125,7 +2125,7 @@ mod tests {
 
     /// Encode a HistorySync proto and zlib-compress it.
     fn encode_and_compress(hs: &wa::HistorySync) -> Vec<u8> {
-        let proto_bytes = hs.encode_to_vec();
+        let proto_bytes = waproto::codec::history_sync_to_vec(hs);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&proto_bytes).unwrap();
         encoder.finish().unwrap()
@@ -4103,7 +4103,9 @@ mod tests {
         // encoder without finish(): a valid prefix with no terminator, so the
         // inflater exhausts input cleanly right at the field boundary.
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&hs.encode_to_vec()).unwrap();
+        encoder
+            .write_all(&waproto::codec::history_sync_to_vec(&hs))
+            .unwrap();
         encoder.flush().unwrap();
         let truncated = encoder.get_ref().clone();
 
@@ -4206,7 +4208,7 @@ mod tests {
     #[test]
     fn extraction_reports_exact_decompressed_size() {
         let hs = parity_fixture("5511000000000");
-        let raw_len = hs.encode_to_vec().len();
+        let raw_len = waproto::codec::history_sync_to_vec(&hs).len();
         let compressed = encode_and_compress(&hs);
         let result = process_history_sync(compressed, None, false).unwrap();
         assert_eq!(result.decompressed_size, raw_len);

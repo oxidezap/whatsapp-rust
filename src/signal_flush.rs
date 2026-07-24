@@ -230,7 +230,9 @@ impl Client {
                 anyhow::bail!("injected coalesced-flush failure");
             }
         }
-        self.flush_signal_cache_batch_safe().await
+        self.flush_signal_cache_batch_safe()
+            .await
+            .map_err(Into::into)
     }
 
     #[cfg(test)]
