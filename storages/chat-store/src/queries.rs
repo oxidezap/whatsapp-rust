@@ -309,7 +309,9 @@ impl ChatStore {
     pub async fn contact(&self, jid: &Jid) -> Result<Option<ContactEntry>> {
         use schema::contacts::dsl;
         let device_id = self.device_id();
-        let jid_str = jid.to_string();
+        // Bare key, matching how the writers file contacts: a caller holding a
+        // message's `sender` has the device on it.
+        let jid_str = jid.to_non_ad_string();
         let row: Option<ContactRow> = self
             .db()
             .run(move |conn| {

@@ -807,7 +807,7 @@ fn client_weak(client: &Client) -> std::sync::Weak<Client> {
 }
 
 /// Time to wait for the server's `<ack type=offer>` carrying the relay before giving up.
-const OFFER_ACK_RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
 const MIC_CHANNEL_CAPACITY: usize = 3;
@@ -2151,7 +2151,7 @@ mod tests {
             if !sent.lock().unwrap().is_empty() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             !sent.lock().unwrap().is_empty(),
@@ -2165,7 +2165,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("wait_ended must resolve after the relay disconnects");
         assert_eq!(
@@ -2220,7 +2220,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("wait_ended must resolve after the relay disconnects");
 
@@ -2369,7 +2369,7 @@ mod tests {
         .expect("replacement spawn_call");
 
         // The replacement aborted the stale task; its wait_ended must still resolve.
-        tokio::time::timeout(std::time::Duration::from_secs(2), stale.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), stale.wait_ended())
             .await
             .expect("stale handle wait_ended must resolve, not hang");
     }
@@ -2409,9 +2409,9 @@ mod tests {
         };
         // Let the waiter register its listener and pass the still-present phase check, so it is truly
         // parked on `listener.await` (the path the guard must cover), not the early return.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         handle.hangup().await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("wait_ended must resolve after hangup aborts the task")
             .expect("waiter task");
@@ -2606,7 +2606,7 @@ mod tests {
             "the relay-attach material must be parked pending the relay"
         );
 
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("offer must be sent")
             .expect("waiter");
@@ -2740,7 +2740,7 @@ mod tests {
         .await
         .expect("place encoded call");
 
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("offer must be sent")
             .expect("waiter");
@@ -2812,7 +2812,7 @@ mod tests {
         .await
         .expect("place_call");
 
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("offer must be sent")
             .expect("waiter");
@@ -2871,7 +2871,7 @@ mod tests {
             "the offer for the surviving devices must be sent"
         );
 
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("offer must be sent")
             .expect("waiter");
@@ -3015,7 +3015,7 @@ mod tests {
             0,
             "hangup must deregister the dormant call"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("dormant hangup must resolve wait_ended (no engine task to notify it)");
     }
@@ -3033,7 +3033,7 @@ mod tests {
             client.pending_outgoing_calls.lock().unwrap().is_empty(),
             "disconnect must drain dormant outgoing calls"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("disconnect must resolve a dormant call's wait_ended");
     }
@@ -3106,7 +3106,7 @@ mod tests {
             if client.call_registry().active_count() == 1 {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
             client.call_registry().active_count(),
@@ -3124,7 +3124,7 @@ mod tests {
             0,
             "the spawned task must not resurrect a stale entry after cleanup"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("an aborted-before-poll task must still notify ended via the drop-guard");
     }
@@ -3233,17 +3233,17 @@ mod tests {
             }
         });
         // Let attach_engine reach the gated connect before hanging up.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         handle.hangup().await;
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect(
                 "hangup in the connect window must wake wait_ended without the dial completing",
             );
 
-        let res = tokio::time::timeout(std::time::Duration::from_secs(2), attach)
+        let res = tokio::time::timeout(Duration::from_secs(2), attach)
             .await
             .expect("attach_engine must return once hangup aborts the dial")
             .expect("attach task");
@@ -3310,18 +3310,18 @@ mod tests {
             }
         });
         // Let attach_engine park in the gated connect.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         // A disconnect clears the task-less registry entry, whose on_terminal hook wakes `ended`.
         client.call_registry().abort_all();
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), ended.wait())
+        tokio::time::timeout(Duration::from_secs(2), ended.wait())
             .await
             .expect(
                 "a disconnect in the connect window must wake `ended` without the dial completing",
             );
 
-        let res = tokio::time::timeout(std::time::Duration::from_secs(2), attach)
+        let res = tokio::time::timeout(Duration::from_secs(2), attach)
             .await
             .expect("attach_engine must return once the disconnect aborts the dial")
             .expect("attach task");
@@ -3380,16 +3380,16 @@ mod tests {
                 .await
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         // The peer terminal-stanza path (no pending entry; entry has no media task yet).
         terminate_call(&client, "CID-FACADE");
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), ended.wait())
+        tokio::time::timeout(Duration::from_secs(2), ended.wait())
             .await
             .expect("a peer terminate in the connect window must wake `ended`");
 
-        let res = tokio::time::timeout(std::time::Duration::from_secs(2), attach)
+        let res = tokio::time::timeout(Duration::from_secs(2), attach)
             .await
             .expect("attach_engine must return once the terminate aborts the dial")
             .expect("attach task");
@@ -3555,7 +3555,7 @@ mod tests {
             0,
             "a setup error in attach_outgoing_relay must reap the registry generation"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("a setup error must resolve the handle's wait_ended, not hang it");
     }
@@ -3578,7 +3578,7 @@ mod tests {
             matches!(res, Ok(true)),
             "a superseded attach returns Ok(true)"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("a superseded attach must resolve the handle's wait_ended, not hang it");
     }
@@ -3624,7 +3624,7 @@ mod tests {
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(
             !client
@@ -3875,7 +3875,7 @@ mod tests {
         let (vsrc, vsink) = video_endpoints();
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         handle.start_video(vsrc, vsink).await.expect("start_video");
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("upgrade request must be sent")
             .expect("waiter");
@@ -3993,7 +3993,7 @@ mod tests {
             2,
             "accept_video sends UpgradeAccept then Enabled"
         );
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("accept must be sent")
             .expect("waiter");
@@ -4188,7 +4188,7 @@ mod tests {
 
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         handle.stop_video().await.expect("stop_video");
-        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("downgrade must be sent")
             .expect("waiter");
@@ -4288,7 +4288,7 @@ mod tests {
         );
 
         src_tx.send(vec![1, 2, 3]).await.expect("feed source");
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), in_rx.recv())
+        let got = tokio::time::timeout(Duration::from_secs(2), in_rx.recv())
             .await
             .expect("AU must be forwarded")
             .expect("channel open");
@@ -4300,7 +4300,7 @@ mod tests {
         ended.notify();
         tokio::task::yield_now().await;
         src_tx.send(vec![9, 9, 9]).await.expect("source still open");
-        let after = tokio::time::timeout(std::time::Duration::from_millis(300), in_rx.recv()).await;
+        let after = tokio::time::timeout(Duration::from_millis(300), in_rx.recv()).await;
         assert!(
             after.is_err(),
             "an AU sent after ended must not be forwarded (feed stopped)"

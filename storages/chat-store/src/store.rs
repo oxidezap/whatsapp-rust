@@ -3,6 +3,7 @@
 //! (one transaction per drained batch), so event order is preserved and fan-in
 //! bursts don't pay per-event commit costs.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1255,7 +1256,11 @@ fn apply_receipt(
     receipt: &wacore::types::events::Receipt,
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
-    let chat = receipt.source.chat.to_string();
+    // Receipts are the one event that carries the peer's wire identity
+    // verbatim: the parser keeps the device on `chat` because the retry
+    // pipeline and the receipt echo need the full JID, so a companion device
+    // acking a DM arrives as `user:48@lid`. Rows are keyed bare.
+    let chat = receipt.source.chat.to_non_ad_string();
     let ts_ms = receipt.timestamp.timestamp_millis();
 
     let status = match receipt.r#type {
@@ -1326,7 +1331,9 @@ fn apply_receipt(
         _ => return Ok(()),
     };
 
-    let user = receipt.source.sender.to_string();
+    // One read-by row per participant, not per device: a member reading on
+    // their phone and on Web emits one receipt each.
+    let user = receipt.source.sender.to_non_ad_string();
     let mut missed: Vec<&String> = Vec::new();
     for msg_id in &receipt.message_ids {
         // Peer receipts only ever advance the delivery state of our own
@@ -1909,6 +1916,20 @@ pub(crate) fn merge_chat_metadata(
     Ok(())
 }
 
+/// Contacts are keyed by the peer's bare identity, the canonical form
+/// [`ChatStore::contact`] looks up. Message senders keep their device by
+/// design (a peer texting from WhatsApp Web is `user:48@lid`), so writing the
+/// sender verbatim would file the name under a key nothing ever reads.
+fn contact_key(jid: &str) -> Cow<'_, str> {
+    match jid.parse::<Jid>() {
+        // Bare already renders identically; only pay the allocation otherwise.
+        Ok(parsed) if parsed.device != 0 || parsed.agent != 0 => {
+            Cow::Owned(parsed.to_non_ad_string())
+        }
+        _ => Cow::Borrowed(jid),
+    }
+}
+
 fn upsert_contact_push_name(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1916,10 +1937,11 @@ fn upsert_contact_push_name(
     push_name: &str,
 ) -> QueryResult<()> {
     use schema::contacts::dsl;
+    let jid = contact_key(jid);
     diesel::insert_into(dsl::contacts)
         .values((
             dsl::device_id.eq(device_id),
-            dsl::jid.eq(jid),
+            dsl::jid.eq(&jid),
             dsl::push_name.eq(push_name),
         ))
         .on_conflict((dsl::device_id, dsl::jid))
@@ -1936,10 +1958,11 @@ fn upsert_contact_business_name(
     business_name: &str,
 ) -> QueryResult<()> {
     use schema::contacts::dsl;
+    let jid = contact_key(jid);
     diesel::insert_into(dsl::contacts)
         .values((
             dsl::device_id.eq(device_id),
-            dsl::jid.eq(jid),
+            dsl::jid.eq(&jid),
             dsl::business_name.eq(business_name),
         ))
         .on_conflict((dsl::device_id, dsl::jid))
@@ -1957,10 +1980,11 @@ fn upsert_contact_names(
     first_name: Option<&str>,
 ) -> QueryResult<()> {
     use schema::contacts::dsl;
+    let jid = contact_key(jid);
     diesel::insert_into(dsl::contacts)
         .values((
             dsl::device_id.eq(device_id),
-            dsl::jid.eq(jid),
+            dsl::jid.eq(&jid),
             dsl::full_name.eq(full_name),
             dsl::first_name.eq(first_name),
         ))
