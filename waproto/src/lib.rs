@@ -157,6 +157,17 @@ pub mod codec {
         whatsapp::HistorySync::decode_from_slice(bytes)
     }
 
+    /// Append the encoded `HistorySync` to `out`. Infallible into a `Vec`.
+    #[inline(never)]
+    pub fn history_sync_encode_into(msg: &whatsapp::HistorySync, out: &mut Vec<u8>) {
+        msg.encode(out);
+    }
+
+    #[inline(never)]
+    pub fn history_sync_to_vec(msg: &whatsapp::HistorySync) -> Vec<u8> {
+        msg.encode_to_vec()
+    }
+
     /// History-sync streaming decodes individual `HistorySyncMsg`/`Conversation`
     /// records; pinning them here keeps their nested `WebMessageInfo`/`Message`
     /// decode tree from being re-instantiated in the calling crate.
