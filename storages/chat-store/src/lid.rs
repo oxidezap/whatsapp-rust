@@ -55,8 +55,11 @@ pub(crate) fn counterpart_chat_key(
         )
     } else {
         (
+            // The lid tiebreak keeps routing stable when updated_at ties —
+            // flapping between counterpart keys would re-split the thread.
             "SELECT lid AS user FROM lid_pn_mapping \
-             WHERE phone_number = ? AND device_id = ? ORDER BY updated_at DESC LIMIT 1",
+             WHERE phone_number = ? AND device_id = ? \
+             ORDER BY updated_at DESC, lid DESC LIMIT 1",
             Server::Lid,
         )
     };
@@ -239,8 +242,8 @@ pub(crate) fn merge_split_chat(
             diesel::update(
                 crate::store::message_row(device_id, dest, &dup.id)
                     .filter(dsl::revoked.eq(false))
-                    // Strictly newer: on a timestamp tie the destination keeps
-                    // its content (the copies carry the same edit anyway).
+                    // Strictly newer: a tie may be two competing edits, and
+                    // keeping the destination's copy is the deterministic pick.
                     .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.lt(edited))),
             )
             .set((
