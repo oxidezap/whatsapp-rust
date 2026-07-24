@@ -311,6 +311,207 @@ pub async fn blocking<T: 'static>(_rt: &dyn Runtime, f: impl FnOnce() -> T + 'st
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+mod abort_handle_tests {
+    use super::AbortHandle;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn counting_handle() -> (AbortHandle, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = {
+            let calls = Arc::clone(&calls);
+            AbortHandle::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        (handle, calls)
+    }
+
+    #[test]
+    fn abort_runs_the_callback_exactly_once() {
+        let (handle, calls) = counting_handle();
+
+        handle.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The callback is FnOnce, so a second abort (and the Drop that follows)
+        // must be a no-op rather than a double cancellation.
+        handle.abort();
+        drop(handle);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_aborts_an_unaborted_handle() {
+        let (handle, calls) = counting_handle();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(handle);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detach_disarms_the_abort_on_drop() {
+        let (handle, calls) = counting_handle();
+
+        handle.detach();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a detached handle must leave the task running"
+        );
+    }
+
+    #[test]
+    fn noop_handle_is_inert() {
+        let handle = AbortHandle::noop();
+        handle.abort();
+        drop(handle);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tokio_runtime_tests {
+    use super::{AbortHandle, Elapsed, Runtime, timeout};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    /// Bound for every await below: a test that hangs should fail, not stall CI.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct TokioTestRuntime;
+
+    #[async_trait::async_trait]
+    impl Runtime for TokioTestRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            let handle = tokio::spawn(future);
+            AbortHandle::new(move || handle.abort())
+        }
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    /// Fires its channel when dropped, so a test can observe that a spawned
+    /// future was cancelled without racing a sleep against the abort.
+    struct DropSignal(Option<futures::channel::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// Spawn a task that parks forever, returning its handle plus a receiver
+    /// that resolves once the task's future has been dropped. The signal is
+    /// built before the future so it fires even if the task is cancelled
+    /// before its first poll.
+    async fn spawn_parked_task() -> (AbortHandle, futures::channel::oneshot::Receiver<()>) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let dropped_on_cancel = DropSignal(Some(tx));
+        let handle = TokioTestRuntime.spawn(Box::pin(async move {
+            let _dropped_on_cancel = dropped_on_cancel;
+            std::future::pending::<()>().await;
+        }));
+        // Let the task reach its park point so the abort below exercises the
+        // cancel-a-running-task path rather than cancel-before-first-poll.
+        tokio::task::yield_now().await;
+        (handle, rx)
+    }
+
+    async fn expect_cancelled(rx: futures::channel::oneshot::Receiver<()>) {
+        tokio::time::timeout(TEST_TIMEOUT, rx)
+            .await
+            .expect("timed out waiting for the spawned task to be cancelled")
+            .expect("the task's drop signal was lost");
+    }
+
+    #[tokio::test]
+    async fn abort_cancels_a_spawned_task() {
+        let (handle, rx) = spawn_parked_task().await;
+        handle.abort();
+        expect_cancelled(rx).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_cancels_a_spawned_task() {
+        let (handle, rx) = spawn_parked_task().await;
+        drop(handle);
+        expect_cancelled(rx).await;
+    }
+
+    #[tokio::test]
+    async fn detached_task_survives_its_handle() {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        TokioTestRuntime
+            .spawn(Box::pin(async move {
+                let _ = tx.send(7u32);
+            }))
+            .detach();
+
+        let value = tokio::time::timeout(TEST_TIMEOUT, rx)
+            .await
+            .expect("timed out waiting for the detached task")
+            .expect("the detached task was cancelled");
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_the_value_when_the_future_wins() {
+        // A generous budget against an immediately-ready future: the only way
+        // this fails is if timeout drops the result.
+        let result = timeout(&TokioTestRuntime, Duration::from_secs(30), async { 42u32 }).await;
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn timeout_elapses_when_the_future_never_completes() {
+        // `pending()` can never win the race, so the deadline is deterministic
+        // and can be short.
+        let result = timeout(
+            &TokioTestRuntime,
+            Duration::from_millis(5),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_eq!(result, Err(Elapsed));
+        assert_eq!(Elapsed.to_string(), "operation timed out");
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_wait_out_the_duration_on_success() {
+        // The sleep must be dropped as soon as the future resolves; a timeout
+        // that awaited both would take a minute here.
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let result = timeout(&TokioTestRuntime, Duration::from_secs(60), async { "ok" }).await;
+            assert_eq!(result, Ok("ok"));
+        })
+        .await
+        .expect("timeout() must return as soon as the inner future completes");
+    }
+
+    #[tokio::test]
+    async fn blocking_ferries_the_closure_result_back() {
+        let value = super::blocking(&TokioTestRuntime, || 6 * 7).await;
+        assert_eq!(value, 42);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod shutdown_tests {
     use super::{ShutdownNotifier, ShutdownSignal, wait_for_shutdown};
     use futures::FutureExt;
@@ -350,6 +551,71 @@ mod shutdown_tests {
 
         notifier.notify();
         block_on(fut);
+    }
+
+    // notify() wakes every registered listener, not just the first one:
+    // event_listener's notify takes a count, so a wrong count here would strand
+    // all but one of the tasks waiting on shutdown.
+    #[test]
+    fn notify_wakes_every_registered_listener() {
+        let notifier = ShutdownNotifier::new();
+        let signals: Vec<_> = (0..4).map(|_| notifier.subscribe()).collect();
+        let waiters: Vec<_> = signals.iter().map(wait_for_shutdown).collect();
+        let publisher_side = notifier.listen();
+
+        notifier.notify();
+
+        block_on(futures::future::join_all(waiters));
+        block_on(publisher_side);
+        assert!(signals.iter().all(|s| s.is_fired()));
+    }
+
+    // Repeated notifies are harmless, and a subscriber that arrives after the
+    // last one still sees the sticky flag.
+    #[test]
+    fn notify_is_idempotent_for_late_subscribers() {
+        let notifier = ShutdownNotifier::new();
+        let early = notifier.subscribe();
+        notifier.notify();
+        notifier.notify();
+
+        let late = notifier.subscribe();
+        assert!(early.is_fired());
+        assert!(late.is_fired());
+        block_on(futures::future::join(
+            wait_for_shutdown(&early),
+            wait_for_shutdown(&late),
+        ));
+    }
+
+    // Clones share the notifier's inner state, so one notify covers all of them.
+    #[test]
+    fn cloned_signals_observe_the_same_notify() {
+        let notifier = ShutdownNotifier::new();
+        let signal = notifier.subscribe();
+        let clone = signal.clone();
+
+        assert!(!signal.is_fired());
+        assert!(!clone.is_fired());
+
+        notifier.notify();
+
+        assert!(signal.is_fired());
+        assert!(clone.is_fired());
+        block_on(wait_for_shutdown(&clone));
+    }
+
+    // A fresh notifier must not look fired, and its listeners must stay pending
+    // until someone notifies.
+    #[test]
+    fn unfired_notifier_leaves_listeners_pending() {
+        let notifier = ShutdownNotifier::default();
+        let signal = notifier.subscribe();
+        assert!(!signal.is_fired());
+
+        let mut fut = Box::pin(wait_for_shutdown(&signal).fuse());
+        let mut ctx = futures::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(fut.as_mut().poll_unpin(&mut ctx).is_pending());
     }
 
     // never() must never resolve. Poll once manually and assert Pending.

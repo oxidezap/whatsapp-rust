@@ -520,6 +520,140 @@ mod tests {
         assert_eq!(result.settings[8].value, PrivacyValue::Off);
     }
 
+    // --- Malformed response tests ---
+    //
+    // Every field below is server-controlled, so each rejection branch needs a
+    // test: accepting a half-filled `<category>` would surface a privacy setting
+    // the server never actually reported.
+
+    #[test]
+    fn test_privacy_settings_parse_response_rejects_missing_privacy_child() {
+        let spec = PrivacySettingsSpec::new();
+        let response = NodeBuilder::new("iq").attr("type", "result").build();
+
+        let err = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a response without <privacy> must be a hard error");
+        assert!(err.to_string().contains("<privacy> child not found"));
+    }
+
+    #[test]
+    fn test_privacy_settings_parse_response_rejects_category_without_name() {
+        let spec = PrivacySettingsSpec::new();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("privacy")
+                .children([NodeBuilder::new("category").attr("value", "all").build()])
+                .build()])
+            .build();
+
+        let err = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a nameless category cannot be mapped to a setting");
+        assert!(err.to_string().contains("missing name in category"));
+    }
+
+    #[test]
+    fn test_privacy_settings_parse_response_rejects_category_without_value() {
+        let spec = PrivacySettingsSpec::new();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("privacy")
+                .children([NodeBuilder::new("category").attr("name", "last").build()])
+                .build()])
+            .build();
+
+        let err = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a valueless category cannot be mapped to a setting");
+        assert!(err.to_string().contains("missing value in category"));
+    }
+
+    #[test]
+    fn test_privacy_settings_parse_response_fails_on_first_bad_category() {
+        // A good category ahead of a bad one must not mask the failure.
+        let spec = PrivacySettingsSpec::new();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("privacy")
+                .children([
+                    NodeBuilder::new("category")
+                        .attr("name", "last")
+                        .attr("value", "all")
+                        .build(),
+                    NodeBuilder::new("category").attr("name", "status").build(),
+                ])
+                .build()])
+            .build();
+
+        let err = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("one malformed category fails the whole response");
+        assert!(err.to_string().contains("missing value in category"));
+    }
+
+    #[test]
+    fn test_privacy_settings_parse_response_tolerates_empty_and_unknown() {
+        let spec = PrivacySettingsSpec::new();
+
+        // An empty <privacy> is a valid (if unusual) answer, not an error.
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("privacy").build()])
+            .build();
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert!(result.settings.is_empty());
+
+        // Unknown names/values fall through to the WireEnum fallbacks so a new
+        // server-side category does not break the whole fetch.
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("privacy")
+                .children([
+                    NodeBuilder::new("unexpected").build(),
+                    NodeBuilder::new("category")
+                        .attr("name", "brand_new")
+                        .attr("value", "brand_new_value")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(result.settings.len(), 1);
+        assert_eq!(
+            result.settings[0].category,
+            PrivacyCategory::Other("brand_new".to_string())
+        );
+        assert_eq!(
+            result.settings[0].value,
+            PrivacyValue::Other("brand_new_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_privacy_parse_response_tolerates_missing_nodes() {
+        // The SET response only mines an optional dhash, so a bare <iq> or an
+        // empty <privacy> must yield None rather than an error.
+        let spec = SetPrivacySettingSpec::new(PrivacyCategory::Last, PrivacyValue::All);
+
+        for response in [
+            NodeBuilder::new("iq").attr("type", "result").build(),
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("privacy").build()])
+                .build(),
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("privacy")
+                    .children([NodeBuilder::new("category").build()])
+                    .build()])
+                .build(),
+        ] {
+            let result = spec.parse_response(&response.as_node_ref()).unwrap();
+            assert!(result.dhash.is_none());
+        }
+    }
+
     #[test]
     fn test_privacy_settings_response_get() {
         let response = PrivacySettingsResponse {
