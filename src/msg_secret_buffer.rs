@@ -102,7 +102,20 @@ impl Drop for QueuedEntries<'_> {
             "message-secret queue dropped mid-backpressure; force-buffered {count} entr{} past the high-water mark",
             if count == 1 { "y" } else { "ies" }
         );
-        self.buffer.schedule_drain();
+        // Mirror schedule_or_flush: a sealed buffer must not leave entries to
+        // the detached drain, so run a full flush; the terminal disconnect
+        // flush also sweeps these, since producers are torn down before it.
+        if self.buffer.sealed.load(Ordering::Acquire) {
+            let buffer = Arc::clone(self.buffer);
+            self.buffer
+                .runtime
+                .spawn(Box::pin(async move {
+                    buffer.flush().await;
+                }))
+                .detach();
+        } else {
+            self.buffer.schedule_drain();
+        }
     }
 }
 
@@ -495,6 +508,44 @@ mod tests {
                 .expect("entry must reach the backend after the drain");
             assert_eq!(stored, vec![byte; 32]);
         }
+    }
+
+    /// The disconnect sequence seals, then runs the terminal flush; a producer
+    /// dropped in between (teardown cancels lane workers first) must leave its
+    /// blocked entry where that terminal flush can still sweep it.
+    #[tokio::test]
+    async fn dropped_producer_after_seal_survives_terminal_flush() {
+        use futures::FutureExt;
+
+        let buf = buffer_with_pending_limit(1).await;
+
+        assert!(
+            buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11))
+                .now_or_never()
+                .is_none()
+        );
+        // Producer parked in the capacity wait, still holding M2. Box::pin so
+        // `drop` drops the future itself, not just a borrowed pin.
+        let mut fut = Box::pin(buf.queue_one(entry("g@g.us", "b@s.whatsapp.net", "M2", 0x22)));
+        assert!(futures::poll!(fut.as_mut()).is_pending());
+
+        buf.seal();
+        drop(fut);
+        assert_eq!(
+            buf.pending_len(),
+            2,
+            "post-seal cancellation must still force-buffer the entry"
+        );
+
+        // Terminal flush, as disconnect() runs it right after seal().
+        buf.flush().await;
+        let stored = buf
+            .backend
+            .get_msg_secret("g@g.us", "b@s.whatsapp.net", "M2")
+            .await
+            .unwrap()
+            .expect("sealed-and-cancelled entry must reach the backend");
+        assert_eq!(stored, vec![0x22; 32]);
     }
 
     /// The point of the buffer: a queued secret is readable BEFORE any flush
