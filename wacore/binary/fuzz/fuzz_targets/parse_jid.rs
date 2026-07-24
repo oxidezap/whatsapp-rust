@@ -89,16 +89,11 @@ fuzz_target!(|data: &[u8]| {
             let _ = jid.device_key();
             assert!(jid.display_eq(&jid.to_string()));
 
-            // The non-AD form drops the agent and device by definition, so it must
-            // re-parse to the same identity with both cleared — but only while the
-            // user part is separator-free. The parse fallback can leave `.` or `:`
-            // inside `user` (`"0.1:@s.whatsapp.net"` parses to user `"0.1"`), and
-            // rendering that back as `user@server` invites the parser to read those
-            // separators as an agent/device on the way in.
-            //
-            // `to_ad_string` gets no check at all: it always emits
-            // `user.agent:device`, which the parser does not always read back as an
-            // agent, so it is not round-trippable even for clean users.
+            // The non-AD form drops agent and device by definition, so it must
+            // re-parse to the same identity with both cleared. Users holding a `.`
+            // or `:` are excluded: rendering them back invites the parser to read
+            // those separators as an agent/device. `to_ad_string` is checked only
+            // for panics, since it is not round-trippable at all.
             if !jid.user.is_empty() && !jid.user.contains(['.', ':']) {
                 let bare = jid.to_non_ad_string();
                 let reparsed = bare.parse::<Jid>().unwrap_or_else(|e| {

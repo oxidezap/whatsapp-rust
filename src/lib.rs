@@ -7,9 +7,9 @@
 // `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
 #![recursion_limit = "512"]
 
-// Process-wide allocation counter shared by empirical unit-test guards. Tests
-// use minimum deltas across repeated windows so allocations from sibling test
-// threads cannot create false passes.
+// Process-wide allocation counter shared by empirical unit-test guards. It sees
+// every thread, so measurements go through `min_allocs`, which retries until a
+// window lands quiet rather than trusting any single one.
 #[cfg(test)]
 #[allow(clippy::disallowed_types)]
 pub(crate) mod test_alloc {

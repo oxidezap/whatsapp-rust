@@ -422,14 +422,20 @@ mod tokio_runtime_tests {
     /// before its first poll.
     async fn spawn_parked_task() -> (AbortHandle, futures::channel::oneshot::Receiver<()>) {
         let (tx, rx) = futures::channel::oneshot::channel();
+        let (started_tx, started_rx) = futures::channel::oneshot::channel();
         let dropped_on_cancel = DropSignal(Some(tx));
         let handle = TokioTestRuntime.spawn(Box::pin(async move {
             let _dropped_on_cancel = dropped_on_cancel;
+            let _ = started_tx.send(());
             std::future::pending::<()>().await;
         }));
-        // Let the task reach its park point so the abort below exercises the
-        // cancel-a-running-task path rather than cancel-before-first-poll.
-        tokio::task::yield_now().await;
+        // Wait for the task to report its first poll: a yield only requeues the
+        // current task, so without this the abort could land before the spawned
+        // future ever ran and the cancel-a-running-task path would go untested.
+        tokio::time::timeout(TEST_TIMEOUT, started_rx)
+            .await
+            .expect("timed out waiting for the spawned task to start")
+            .expect("the spawned task was cancelled before it started");
         (handle, rx)
     }
 
@@ -506,7 +512,12 @@ mod tokio_runtime_tests {
 
     #[tokio::test]
     async fn blocking_ferries_the_closure_result_back() {
-        let value = super::blocking(&TokioTestRuntime, || 6 * 7).await;
+        // Bounded so a `blocking` that never hands the result back fails here
+        // instead of hanging the job.
+        let value =
+            tokio::time::timeout(TEST_TIMEOUT, super::blocking(&TokioTestRuntime, || 6 * 7))
+                .await
+                .expect("timed out waiting for the blocking closure");
         assert_eq!(value, 42);
     }
 }
