@@ -82,7 +82,9 @@ let event = client_b.wait_for_event(30, |e| matches!(e, Event::Messages(_))).awa
 ```
 
 Full disconnects need nothing: `TestClient::disconnect()` awaits the run task, so
-the client is already offline when it returns.
+the client is normally already offline when it returns. It caps that wait at 5s
+and warns instead of failing, so a test that depends on the client being offline
+afterwards should still assert it rather than assume it.
 
 ```rust
 client_b.disconnect().await;

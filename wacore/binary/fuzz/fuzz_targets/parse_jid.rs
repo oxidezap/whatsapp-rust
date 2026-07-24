@@ -71,15 +71,37 @@ fn build_jid(data: &[u8]) -> Jid {
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
-        let _ = parse_jid_fast(text);
-        let _ = parse_jid_ref(text);
+        // `parse_jid_ref` layers server validation over `parse_jid_fast`, so it may
+        // only ever reject more — never accept text the scanner turned down, and
+        // never disagree about the parts it keeps.
+        let fast = parse_jid_fast(text);
+        if let Some(r) = parse_jid_ref(text) {
+            let parts = fast.expect("parse_jid_ref accepted text parse_jid_fast rejected");
+            assert_eq!(
+                (r.user.as_ref(), r.agent, r.device, r.integrator),
+                (parts.user, parts.agent, parts.device, parts.integrator),
+                "the two parse paths disagree on {text:?}"
+            );
+        }
 
         if let Ok(jid) = text.parse::<Jid>() {
-            let _ = jid.to_string();
             let _ = jid.to_ad_string();
-            let _ = jid.to_non_ad_string();
             let _ = jid.device_key();
             assert!(jid.display_eq(&jid.to_string()));
+
+            // The non-AD form drops the agent and device by definition, so it must
+            // re-parse to the same identity with both cleared. `to_ad_string` gets
+            // no such check: it always emits `user.agent:device`, which the parser
+            // does not always read back as an agent, so it is not round-trippable.
+            if !jid.user.is_empty()
+                && let Ok(bare) = jid.to_non_ad_string().parse::<Jid>()
+            {
+                assert_eq!(
+                    (&bare.user, bare.server, bare.agent, bare.device),
+                    (&jid.user, jid.server, 0, 0),
+                    "to_non_ad_string lost identity for {jid:?}"
+                );
+            }
         }
     }
 

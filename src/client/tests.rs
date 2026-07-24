@@ -830,7 +830,9 @@ async fn test_offline_sync_lifecycle() {
         true // Return that we completed
     });
 
-    // Wait until the waiter is actually parked on the notifier
+    // A registered listener proves the waiter reached its await point, so the
+    // "still waiting" assertion below cannot pass just because the spawned task
+    // never got scheduled.
     crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
 
     // Verify waiter hasn't completed yet
@@ -954,7 +956,9 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
         start.elapsed()
     });
 
-    // Wait until it is parked on the offline-sync notifier
+    // Registration is what makes the assertion below scheduler-independent: it
+    // pins down that `ensure_e2e_sessions` is blocked on offline sync rather than
+    // simply not started yet.
     crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
 
     // It should still be waiting (offline sync not complete)
