@@ -289,36 +289,42 @@ pub struct SendOptions {
 
 impl SendOptions {
     /// See [`SendOptions::message_id`].
+    #[must_use]
     pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
         self.message_id = Some(message_id.into());
         self
     }
 
     /// See [`SendOptions::extra_stanza_nodes`].
+    #[must_use]
     pub fn with_extra_stanza_nodes(mut self, nodes: Vec<Node>) -> Self {
         self.extra_stanza_nodes = nodes;
         self
     }
 
     /// See [`SendOptions::ephemeral_expiration`].
+    #[must_use]
     pub fn with_ephemeral_expiration(mut self, seconds: u32) -> Self {
         self.ephemeral_expiration = Some(seconds);
         self
     }
 
     /// See [`SendOptions::stanza_type_override`].
+    #[must_use]
     pub fn with_stanza_type_override(mut self, stanza_type: StanzaType) -> Self {
         self.stanza_type_override = Some(stanza_type);
         self
     }
 
     /// See [`SendOptions::group_metadata_freshness`].
+    #[must_use]
     pub fn with_group_metadata_freshness(mut self, freshness: crate::cache::Freshness) -> Self {
         self.group_metadata_freshness = freshness;
         self
     }
 
     /// See [`SendOptions::device_freshness`].
+    #[must_use]
     pub fn with_device_freshness(mut self, freshness: crate::cache::Freshness) -> Self {
         self.device_freshness = freshness;
         self
@@ -347,6 +353,7 @@ pub struct EditOptions {
 
 impl EditOptions {
     /// See [`EditOptions::stanza_id`].
+    #[must_use]
     pub fn with_stanza_id(mut self, stanza_id: impl Into<String>) -> Self {
         self.stanza_id = Some(stanza_id.into());
         self
