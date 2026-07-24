@@ -36,6 +36,15 @@ pub enum SignalError {
     Internal(#[from] anyhow::Error),
 }
 
+impl From<crate::client::SignalMaintenanceError> for SignalError {
+    fn from(err: crate::client::SignalMaintenanceError) -> Self {
+        match err {
+            crate::client::SignalMaintenanceError::Signal(e) => SignalError::Protocol(e),
+            other => SignalError::Internal(other.into()),
+        }
+    }
+}
+
 /// Read-only information from a currently open pairwise session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalSessionInfo {

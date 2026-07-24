@@ -99,6 +99,7 @@ pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError, RawNode
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use client::{ConnectError, ConnectStage, SignalMaintenanceError};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
@@ -173,16 +174,17 @@ pub use features::{
     InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    MessageRetransmission, Mex, MexError, MexErrorExtensions, MexRequest, MexResponse, NackReason,
-    Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
-    NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
-    ParticipantChangeResponse, ParticipantType, PictureType, PollError, Presence, PresenceError,
-    PresenceStatus, Profile, ProfileError, ProfilePicture, ReachoutTimelock, RetryReason,
-    RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind, SecretEncrypted,
-    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
-    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
-    SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo,
-    UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexRequest,
+    MexResponse, NackReason, Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType,
+    NewsletterMetadata, NewsletterReactionCount, NewsletterRole, NewsletterState,
+    NewsletterVerification, ParticipantChangeResponse, ParticipantType, PictureType, PollError,
+    Presence, PresenceError, PresenceStatus, Profile, ProfileError, ProfilePicture,
+    ReachoutTimelock, RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome,
+    SecretEncKind, SecretEncrypted, SetProfilePictureResponse, Signal, SignalError,
+    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError, Status,
+    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
+    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key,
+    message_range,
 };
 
 pub mod bot;
@@ -203,6 +205,7 @@ pub mod prelude {
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+    pub use crate::client::{ConnectError, ConnectStage};
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub use crate::plugins::{

@@ -58,7 +58,7 @@ pub use media_reupload::{
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
 };
 
-pub use message_edit::{EncryptedEdit, SecretEncKind, SecretEncrypted};
+pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEncrypted};
 
 pub use mex::{
     Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse, ReachoutTimelock,

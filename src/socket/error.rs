@@ -34,6 +34,7 @@ pub enum EncryptSendErrorKind {
 
 #[derive(Debug, thiserror::Error)]
 #[error("{kind}")]
+#[non_exhaustive]
 pub struct EncryptSendError {
     pub kind: EncryptSendErrorKind,
     #[source]
@@ -106,6 +107,25 @@ mod tests {
             .downcast_ref::<CryptoProviderError>()
             .expect("downcasts to CryptoProviderError");
         assert!(matches!(cpe, CryptoProviderError::AuthFailed));
+    }
+
+    #[test]
+    fn crypto_preserves_the_noise_error_type() {
+        let err = EncryptSendError::crypto(NoiseError::Encrypt(CryptoProviderError::BackendFailed));
+        assert!(matches!(err.kind, EncryptSendErrorKind::Crypto));
+        let src = std::error::Error::source(&err).expect("source preserved");
+        let ne = src
+            .downcast_ref::<NoiseError>()
+            .expect("downcasts to NoiseError");
+        assert!(matches!(ne, NoiseError::Encrypt(_)));
+    }
+
+    #[test]
+    fn crypto_from_an_untyped_source_still_carries_its_message() {
+        let err = EncryptSendError::crypto(anyhow::anyhow!("some opaque failure"));
+        let src = std::error::Error::source(&err).expect("source preserved");
+        assert!(src.downcast_ref::<NoiseError>().is_none());
+        assert_eq!(src.to_string(), "some opaque failure");
     }
 
     #[test]
