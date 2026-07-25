@@ -541,7 +541,7 @@ mod tests {
             let low_rate = (frame[0] >> 2) & 1 != 0;
             let mut dec = crate::voip::mlow::rangecoder::RangeDecoder::new(&frame[1..]);
             for f in 0..3 {
-                let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f);
+                let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f, true);
                 let pulses = decode_smpl_pulses(&mut dec, cc, 320, 4, 1, config as i32, lsf.stage1);
                 let voiced = lsf.stage1 == 1;
                 let mut params = CelpDecParams {

@@ -84,5 +84,8 @@ PY
 }
 
 emit 120 8 "$testdata/mlow_120ms_frames.json" "$testdata/ref_120ms_expected.raw"
+# 60 ms with DTX off: the encoder emits VoA=00 frames (TOC 0x10) for the silent stretches of
+# synth_mic.raw, which is the only in-repo coverage of the DTX-off decode path.
+emit 60 110 "$testdata/mlow_dtx_off_frames.json" "$testdata/ref_dtx_off_expected.raw"
 
 echo "==> done; re-run: cargo test -p wacore --features voip-mlow --lib"

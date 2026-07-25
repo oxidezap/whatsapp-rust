@@ -121,13 +121,16 @@ impl MlowDecoder {
             );
             return vec![0.0; out_len];
         }
-        // Inactive / SID (DTX/CNG) frames carry no decodable voice and are silenced without opening the
-        // range coder, so their geometry can never desync. Handle them before the operating-point guard:
-        // otherwise an inactive off-point frame (e.g. the 10ms startup silence a real peer emits before
-        // speech) would trip the loud "dropped" canary instead of being the benign silence it is. A full
-        // 60ms slot keeps the playout cadence regardless of the frame's nominal duration.
-        if toc.sid || !toc.active {
-            log::debug!("mlow: DTX/SID TOC 0x{:02x} -> 60ms silence", frame[0]);
+        // A SID (DTX/CNG) frame carries comfort noise rather than coded voice and is silenced without
+        // opening the range coder, so its geometry can never desync. Handle it before the
+        // operating-point guard so an off-point SID is the benign silence it is rather than tripping
+        // the "dropped" canary. A full 60ms slot keeps the playout cadence regardless of the frame's
+        // nominal duration.
+        //
+        // A frame that is merely coded inactive is NOT silence: with DTX off the encoder keeps sending
+        // background noise this way, and the reference decodes it. It goes through the normal path.
+        if toc.sid {
+            log::debug!("mlow: SID TOC 0x{:02x} -> 60ms silence", frame[0]);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
@@ -158,10 +161,18 @@ impl MlowDecoder {
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let frames = frames.expect("the guard above rejected every unsupported duration");
-        self.decode_active_frame(frame, frames * SMPL_INTF_LEN, frames)
+        self.decode_active_frame(frame, frames * SMPL_INTF_LEN, frames, toc.active)
     }
 
-    fn decode_active_frame(&mut self, frame: &[u8], out_len: usize, frames: usize) -> Vec<f32> {
+    /// `coded_as_active_voice` gates two symbols that a frame coded inactive never puts on the wire;
+    /// reading them would consume symbols that were never written and desync everything after.
+    fn decode_active_frame(
+        &mut self,
+        frame: &[u8],
+        out_len: usize,
+        frames: usize,
+        coded_as_active_voice: bool,
+    ) -> Vec<f32> {
         let config = (frame[0] >> 2) as usize & 1;
         let tbl = load_smpl_tables();
         let synth_t = load_smpl_synth_tables();
@@ -178,13 +189,20 @@ impl MlowDecoder {
         let mut packet_lags: Vec<f32> = Vec::with_capacity(frames * 8);
         let mut avg_norm_br = 0.0f32;
         for f in 0..frames {
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut self.state.lstate, config, f);
+            let lsf = decode_smpl_lsf(
+                &mut dec,
+                tbl,
+                &mut self.state.lstate,
+                config,
+                f,
+                coded_as_active_voice,
+            );
             let pulses = decode_smpl_pulses(
                 &mut dec,
                 cc,
                 SMPL_INTF_LEN as i32,
                 4,
-                1,
+                i32::from(coded_as_active_voice),
                 config as i32,
                 lsf.stage1,
             );
@@ -322,7 +340,7 @@ pub(crate) fn diag_decode_params() -> Vec<DiagParam> {
         let config = (frame[0] >> 2) as usize & 1;
         let mut dec = RangeDecoder::new(&frame[1..]);
         for f in 0..3 {
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f);
+            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f, true);
             let pulses = decode_smpl_pulses(
                 &mut dec,
                 cc,
@@ -434,6 +452,57 @@ mod tests {
             "10 ms runs a geometry the synthesis does not implement"
         );
         assert!(!dec.had_error(), "the drop must not open the range decoder");
+    }
+
+    /// A `VoA=00` packet is a normal frame carrying background noise, not a SID: the reference
+    /// decodes it, and with DTX off a peer sends nothing else during a pause. Silencing it drops
+    /// ~12% of a real stream on the floor while the call merely sounds quiet.
+    #[test]
+    fn dtx_off_frames_decode_to_audio() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_dtx_off_frames.json"))
+                .expect("mlow_dtx_off_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/ref_dtx_off_expected.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        let mut spans = Vec::new();
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            let start = out.len();
+            out.extend_from_slice(&dec.decode(&frame));
+            // The frames this covers: not SID, VoA=0, hang-over clear, i.e. coded_as_active_voice
+            // == 0. `0x12` shares VoA=0 but sets the hang-over bit, which makes it active and
+            // already decoded, so it must not be counted here.
+            if frame[0] & 0xC2 == 0 {
+                spans.push((start, out.len()));
+            }
+        }
+        assert!(
+            !spans.is_empty(),
+            "fixture lost its DTX-off frames: this path is no longer covered"
+        );
+        assert_eq!(out.len(), refp.len());
+
+        let energy = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+        let (mut e_ref, mut e_ours, mut n) = (0.0, 0.0, 0usize);
+        for (s, e) in &spans {
+            e_ref += energy(&refp[*s..*e]);
+            e_ours += energy(&out[*s..*e]);
+            n += e - s;
+        }
+        let (rms_ref, rms_ours) = ((e_ref / n as f64).sqrt(), (e_ours / n as f64).sqrt());
+        assert!(
+            rms_ref > 0.01,
+            "the reference itself has no audio here; the fixture is wrong"
+        );
+        assert!(
+            rms_ours > rms_ref * 0.5,
+            "DTX-off frames decoded to {rms_ours:.5} rms against the reference's {rms_ref:.5}"
+        );
     }
 
     /// The two halves of a cross-check vector come out of one harness run and mean nothing apart:
@@ -686,13 +755,12 @@ mod tests {
         );
     }
 
-    // An inactive / DTX frame (TOC 0x00: vad=false so active=false, 16kHz, low_rate=0, 10ms) is the
-    // benign startup/comfort silence a real peer emits, not a desync hazard: inactive frames are
-    // silenced without opening the range coder regardless of geometry. It must take the quiet DTX/SID
-    // path (a full 60ms silence slot, range coder untouched) and must NOT count as an out-of-operating
-    // -point drop, which is reserved for active frames that would have lost decodable audio.
+    // A SID frame (TOC 0x80, the DTX/CNG marker) is comfort noise, not a desync hazard: it is
+    // silenced without opening the range coder regardless of geometry. It must take the quiet path (a
+    // full 60ms silence slot, range coder untouched) and must NOT count as an out-of-operating-point
+    // drop, which is reserved for frames that would have lost decodable audio.
     #[test]
-    fn inactive_off_point_frame_is_silenced_not_dropped() {
+    fn sid_frame_is_silenced_not_dropped() {
         let frames: Vec<String> =
             serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
         let real = hex::decode(&frames[0]).unwrap();
@@ -703,8 +771,8 @@ mod tests {
             "a real low_rate=0 frame must decode to audio"
         );
 
-        // TOC 0x00 -> inactive: silenced via the DTX/SID path, not the operating-point drop.
-        let inactive = dec.decode(&[0x00, 0xAA, 0xBB, 0xCC]);
+        // TOC 0x80 -> SID: silenced via the comfort-noise path, not the operating-point drop.
+        let inactive = dec.decode(&[0x80, 0xAA, 0xBB, 0xCC]);
         assert_eq!(
             inactive.len(),
             960,
@@ -716,11 +784,11 @@ mod tests {
         );
         assert_eq!(
             dec.dropped_unsupported, 0,
-            "an inactive frame is the DTX/silence path, not an operating-point drop"
+            "a SID frame is the comfort-noise path, not an operating-point drop"
         );
         assert!(
             !dec.had_error(),
-            "the inactive path must not open the range decoder"
+            "the SID path must not open the range decoder"
         );
 
         // Contrast: an active off-point frame (0x60 = vad=true, 32 kHz) IS counted, proving the drop

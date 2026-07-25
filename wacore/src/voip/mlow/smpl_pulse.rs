@@ -230,7 +230,7 @@ mod tests {
             let frame = hex::decode(rec["frame"].as_str().unwrap()).unwrap();
             let mut st = SmplLsfState::default();
             let mut dec = RangeDecoder::new(&frame[1..]);
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut st, 0, 0);
+            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut st, 0, 0, true);
             let pr = decode_smpl_pulses(&mut dec, cc, 320, 4, 1, 0, lsf.stage1);
 
             let want_subfr: Vec<i32> = rec["subfr"]
