@@ -62,9 +62,7 @@ const PLAYOUT_DRAIN: usize = 320;
 #[cfg(feature = "voip-mlow")]
 const OPUS_FRAME_SAMPS_60MS: usize = 960;
 /// ~150ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
-/// of lagging. Both this and the prime target scale with the packet the peer actually sends, via
-/// [`playout_bounds`] -- a peer on 120ms packets needs a proportionally larger cushion, and capping
-/// it at this figure would trim the very cushion the prebuffer just asked for.
+/// of lagging. The floor for [`playout_bounds`], which scales it to the peer's packet.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_CAP: usize = 2400;
 /// Prebuffer target: prime playout until the jitter buffer holds two 60ms peer frames, so the
@@ -470,9 +468,8 @@ struct PcmAudioState {
     /// Consecutive playout ticks spent priming; bounds the wait so a partial buffer (the peer sent one
     /// frame then went DTX) is flushed after `MAX_PRIME_TICKS` instead of being held silent forever.
     priming_ticks: u32,
-    /// Samples in the peer's most recent packet. The prebuffer and latency ceiling scale with it
-    /// (see `playout_bounds`), since a peer on 120ms packets needs a proportionally larger cushion
-    /// than one on 60ms. Starts at the 60ms default until the first packet says otherwise.
+    /// Samples in the peer's most recent packet, the input to [`playout_bounds`]. Starts at the
+    /// 60ms default until the first decode reports otherwise.
     packet_samps: usize,
 }
 
@@ -687,8 +684,6 @@ impl CallEngine {
                     jitter: VecDeque::new(),
                     priming: true,
                     priming_ticks: 0,
-                    // The 60ms frame this decoder emitted before multi-frame packets existed; the
-                    // first decode replaces it with what the peer really sends.
                     packet_samps: OPUS_FRAME_SAMPS_60MS,
                 }),
                 playout_deadline: NEVER,
@@ -1199,8 +1194,7 @@ impl CallEngine {
         #[cfg(feature = "voip-mlow")]
         {
             let decoded = pcm.decoder.decode(&encoded);
-            // Record what the peer is actually sending, so the prebuffer and the latency ceiling
-            // size themselves to it rather than to the 60ms frame they were written for.
+            // Feeds `playout_bounds`; an empty decode carries no duration to learn from.
             if !decoded.is_empty() {
                 pcm.packet_samps = decoded.len();
             }
