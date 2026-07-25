@@ -152,7 +152,15 @@ pub(crate) struct MsgSecretWriteBuffer {
     /// later writer always carries values at least as new as any earlier
     /// in-flight write, and a stale upsert can never land after a fresh one.
     write_lock: async_lock::Mutex<()>,
-    drain_in_flight: AtomicBool,
+    /// Wake signal for the drain worker. Capacity one: the token means "there
+    /// is work", so a burst collapses into a single wakeup and a full channel
+    /// is success, not backpressure.
+    wake_tx: async_channel::Sender<()>,
+    wake_rx: async_channel::Receiver<()>,
+    /// Guards the one-time worker start. The worker is not permanent by
+    /// ownership: it holds a Weak, and the Sender above lives here, so dropping
+    /// the buffer closes the channel and ends the worker.
+    worker_started: AtomicBool,
     backend: Arc<dyn crate::store::traits::Backend>,
     runtime: Arc<dyn wacore::runtime::Runtime>,
     /// Batches written so far; test observability for the coalescing claim.
@@ -179,13 +187,16 @@ impl MsgSecretWriteBuffer {
             pending_limit > 0,
             "pending message-secret limit must be positive"
         );
+        let (wake_tx, wake_rx) = async_channel::bounded(1);
         Arc::new(Self {
             pending: Mutex::new(HashMap::with_hasher(RandomState::new())),
             pending_limit,
             capacity_available: event_listener::Event::new(),
             sealed: AtomicBool::new(false),
             write_lock: async_lock::Mutex::new(()),
-            drain_in_flight: AtomicBool::new(false),
+            wake_tx,
+            wake_rx,
+            worker_started: AtomicBool::new(false),
             backend,
             runtime,
             flushed_batches: AtomicU64::new(0),
@@ -300,6 +311,9 @@ impl MsgSecretWriteBuffer {
     /// `disconnect()` right before its final flush.
     pub(crate) fn seal(&self) {
         self.sealed.store(true, Ordering::Release);
+        // From here every queue writes inline, so the worker has nothing left
+        // to do; closing releases it without waiting for a wakeup.
+        self.wake_tx.close();
     }
 
     /// Buffered-first read. Returns `(secret, message_ts)` like
@@ -315,36 +329,40 @@ impl MsgSecretWriteBuffer {
             .map(|e| (e.secret.to_vec(), e.message_ts))
     }
 
+    /// Signal the drain worker, starting it on first use.
+    ///
+    /// This used to spawn a task that died as soon as the map emptied, which
+    /// under a steady stream is one task per message: a capture arrives after
+    /// the previous one has already been written. A single worker woken by a
+    /// channel keeps the same write-behind semantics without that per-message
+    /// task.
     fn schedule_drain(self: &Arc<Self>) {
-        if self.drain_in_flight.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let buffer = Arc::clone(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                buffer.drain_loop().await;
-            }))
-            .detach();
+        self.start_worker();
+        // Full means a wakeup is already pending, which is exactly what this
+        // call wanted; closed means the worker is gone with the buffer.
+        let _ = self.wake_tx.try_send(());
     }
 
-    async fn drain_loop(self: Arc<Self>) {
-        loop {
-            if self.flush_pending_once().await {
-                continue;
-            }
-            self.drain_in_flight.store(false, Ordering::Release);
-            // An insert may have raced the flag clear; reclaim the drain
-            // only if work exists and nobody else took it.
-            let has_work = !self
-                .pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty();
-            if has_work && !self.drain_in_flight.swap(true, Ordering::AcqRel) {
-                continue;
-            }
+    fn start_worker(self: &Arc<Self>) {
+        if self.worker_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Weak so a live worker never keeps the buffer (and through it the
+        // backend) alive. The Sender lives in the buffer, so a dropped buffer
+        // closes the channel and the worker returns; there is no permanent task
+        // to abort at teardown.
+        let weak = Arc::downgrade(self);
+        let wake_rx = self.wake_rx.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                while wake_rx.recv().await.is_ok() {
+                    let Some(buffer) = weak.upgrade() else {
+                        break;
+                    };
+                    buffer.flush().await;
+                }
+            }))
+            .detach();
     }
 
     /// Write one snapshot of the pending map. Returns whether anything was
@@ -718,6 +736,37 @@ mod tests {
                 .await
                 .expect("backend read");
             assert_eq!(stored.as_deref(), Some(&[i; 32][..]), "entry M{i}");
+        }
+    }
+
+    /// Captures spread over separate scheduler turns must all be written. The
+    /// drain used to be a task per insert, so nothing depended on the worker
+    /// outliving one batch; now a single worker serves every later capture, and
+    /// a worker that exited early would strand these silently.
+    #[tokio::test]
+    async fn captures_across_turns_all_reach_the_backend() {
+        let buf = buffer().await;
+        for i in 0..8u8 {
+            buf.queue(vec![entry(
+                "g@g.us",
+                "a@s.whatsapp.net",
+                &format!("T{i}"),
+                i,
+            )])
+            .await;
+            // Let the worker drain and park before the next capture, which is
+            // the steady-state shape this path sees under load.
+            buf.wait_flushed().await;
+            tokio::task::yield_now().await;
+        }
+
+        for i in 0..8u8 {
+            let stored = buf
+                .backend
+                .get_msg_secret("g@g.us", "a@s.whatsapp.net", &format!("T{i}"))
+                .await
+                .expect("backend read");
+            assert_eq!(stored.as_deref(), Some(&[i; 32][..]), "entry T{i}");
         }
     }
 
