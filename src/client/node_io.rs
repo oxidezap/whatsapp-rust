@@ -201,35 +201,7 @@ impl Client {
                                 while let Some(encrypted_frame) = frame_decoder.decode_frame() {
                                     // Decrypt the frame synchronously (required for noise counter ordering)
                                     if let Some(node) = self.decrypt_frame(&noise_socket, encrypted_frame) {
-                                        // Determine processing mode for this node:
-                                        // - Critical nodes (success/failure/stream:error): inline, required for state
-                                        // - Message nodes: inline, preserves arrival order for per-chat queues
-                                        //   (MessageHandler just enqueues + ACKs, heavy crypto runs in workers)
-                                        // - Acks/receipts: inline when unobserved; retry work detaches itself
-                                        // - ib (in-band): inline, ensures offline sync tracking (expected count)
-                                        //   is set up before offline messages are processed
-                                        // - Everything else: spawned concurrently for parallelism
-                                        let process_inline = match node.tag() {
-                                            "success" | "failure" | "stream:error" | "message" | "ib" => true,
-                                            // Preserve concurrent callback behavior when an app
-                                            // observes these events or every raw node.
-                                            "receipt" => {
-                                                !self.synchronous_ack
-                                                    && !self.raw_node_forwarding_enabled()
-                                                    && !self.core.event_bus.has_handler_for(
-                                                        wacore::types::events::EventKind::Receipt,
-                                                    )
-                                            }
-                                            "ack" => {
-                                                !self.raw_node_forwarding_enabled()
-                                                    && !self.core.event_bus.has_handler_for(
-                                                        wacore::types::events::EventKind::ServerAck,
-                                                    )
-                                            }
-                                            _ => false,
-                                        };
-
-                                        if process_inline {
+                                        if self.processes_inline(node.get()) {
                                             self.process_decrypted_node(node).await;
                                         } else {
                                             let client = self.clone();
@@ -570,6 +542,38 @@ impl Client {
 
         if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
+        }
+    }
+
+    /// Whether a decrypted node must be processed on the read loop instead of a
+    /// spawned task:
+    /// - success/failure/stream:error carry connection state the rest depends on
+    /// - message and status@broadcast only enqueue here, and the per-chat queue
+    ///   is what preserves arrival order (heavy crypto runs in the lane worker);
+    ///   a spawned enqueue could put a group message ahead of the pkmsg that
+    ///   establishes its session
+    /// - ib sets up offline-sync tracking before the offline batch arrives
+    /// - acks and receipts, only while nothing observes them concurrently
+    pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        match node.tag.as_ref() {
+            "success" | "failure" | "stream:error" | "message" | "ib" => true,
+            "status" => is_status_broadcast_stanza(node),
+            "receipt" => {
+                !self.synchronous_ack
+                    && !self.raw_node_forwarding_enabled()
+                    && !self
+                        .core
+                        .event_bus
+                        .has_handler_for(wacore::types::events::EventKind::Receipt)
+            }
+            "ack" => {
+                !self.raw_node_forwarding_enabled()
+                    && !self
+                        .core
+                        .event_bus
+                        .has_handler_for(wacore::types::events::EventKind::ServerAck)
+            }
+            _ => false,
         }
     }
 

@@ -12276,6 +12276,10 @@ async fn unrecognized_stanza_is_nacked() {
             .is_some_and(|v| v.as_str() == "100000000000001@lid")
     );
     assert!(nack.get_attr("type").is_some_and(|v| v.as_str() == "media"));
+    assert!(
+        !extra_frame_appears(&transport, 1).await,
+        "the nack is the whole answer; no plain ack may follow it"
+    );
 }
 
 /// The nack needs `id` + `from` to be routable, exactly like WA Web's
@@ -12296,6 +12300,20 @@ async fn unrecognized_stanza_without_id_is_not_nacked() {
     assert!(
         !extra_frame_appears(&transport, 0).await,
         "a stanza with no id cannot be nacked"
+    );
+
+    // The other half of the guard: addressable means id AND from.
+    let no_from = NodeBuilder::new("totally_unknown_stanza")
+        .attr("id", "UNKNOWN-2")
+        .build();
+
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&no_from))
+        .await;
+
+    assert!(
+        !extra_frame_appears(&transport, 0).await,
+        "a stanza with no from cannot be nacked either"
     );
 }
 

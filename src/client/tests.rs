@@ -3852,3 +3852,41 @@ async fn instrumented_runtime_reports_to_cpu_meter() {
         "blocking work is metered too"
     );
 }
+
+/// A status@broadcast stanza feeds the same per-chat queue a `<message>` does,
+/// so it has to be enqueued from the read loop: a spawned enqueue could land a
+/// group message ahead of the pkmsg that establishes its session. A newsletter
+/// `<status>` has no such queue and stays on the concurrent path.
+#[tokio::test]
+async fn status_broadcast_stanzas_are_dispatched_inline() {
+    use wacore_binary::builder::NodeBuilder;
+
+    let client = create_offline_sync_test_client().await;
+
+    let status = NodeBuilder::new("status")
+        .attr("from", "status@broadcast")
+        .attr("id", "INLINE-1")
+        .build();
+    assert!(
+        client.processes_inline(&status.as_node_ref()),
+        "a status@broadcast stanza must keep the read loop's arrival order"
+    );
+
+    let message = NodeBuilder::new("message")
+        .attr("from", "status@broadcast")
+        .attr("id", "INLINE-2")
+        .build();
+    assert!(
+        client.processes_inline(&message.as_node_ref()),
+        "the pre-existing <message> form is unchanged"
+    );
+
+    let newsletter_status = NodeBuilder::new("status")
+        .attr("from", "120363298765432100@newsletter")
+        .attr("id", "INLINE-3")
+        .build();
+    assert!(
+        !client.processes_inline(&newsletter_status.as_node_ref()),
+        "a newsletter <status> has no per-chat queue to order"
+    );
+}
