@@ -170,6 +170,11 @@ pub enum CallAction {
     Reject {
         call_id: String,
         call_creator: Jid,
+        /// Why the device rejected. `busy` means THAT DEVICE cannot take the call (already in one,
+        /// or a companion that does not do voice) - it is not the callee declining, and the peer's
+        /// other devices keep ringing. Absent means an explicit decline by the user.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Terminate {
         call_id: String,
@@ -195,10 +200,7 @@ pub enum CallAction {
         transport_message_type: Option<String>,
     },
     /// Per-relay RTT probe from the peer; the client replies with a relaylatency ack.
-    RelayLatency {
-        call_id: String,
-        call_creator: Jid,
-    },
+    RelayLatency { call_id: String, call_creator: Jid },
     /// In-call `<video state=N>` signaling: the audio→video upgrade / video→audio downgrade
     /// handshake. Serde-renamed to the wire tag (`video`), like the other variants.
     #[serde(rename = "video")]

@@ -319,10 +319,15 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             }
         }
         "reject" => {
+            // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
+            // actually declining; dropping it made both look identical and ended calls the peer's
+            // other devices were still answering.
+            let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
                 call_id,
                 call_creator,
+                reason,
             }
         }
         "video" => {
@@ -444,6 +449,11 @@ pub const TERMINATE_REASON_ACCEPTED_ELSEWHERE: &str = "accepted_elsewhere";
 pub const TERMINATE_REASON_REJECTED_ELSEWHERE: &str = "rejected_elsewhere";
 pub const TERMINATE_REASON_TIMEOUT: &str = "timeout";
 pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
+
+/// `<reject reason>` wire token for a device that cannot take the call - already in a call, or a
+/// companion that does not do voice at all. It is a statement about ONE DEVICE, not the callee's
+/// decision: the peer's remaining devices go on ringing and may still answer.
+pub const REJECT_REASON_BUSY: &str = "busy";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {
@@ -1418,6 +1428,47 @@ mod tests {
                 assert_eq!(audio_duration, Some(3670));
             }
             other => panic!("expected Terminate, got {other:?}"),
+        }
+    }
+
+    /// A `<reject>` from a device that cannot take the call carries `reason="busy"`. Dropping it
+    /// made a busy companion indistinguishable from the callee declining, which ended calls the
+    /// peer's other devices were still answering.
+    #[test]
+    fn reject_preserves_a_busy_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", REJECT_REASON_BUSY)
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_BUSY));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The failure case for the above: an explicit decline carries no `reason`, and must not be
+    /// confused with a busy device.
+    #[test]
+    fn reject_without_a_reason_parses_as_none() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => assert_eq!(reason, None),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 

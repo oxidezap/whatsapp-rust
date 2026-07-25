@@ -386,6 +386,7 @@ mod tests {
         call.action = CallAction::Reject {
             call_id: String::new(),
             call_creator: caller(),
+            reason: None,
         };
         assert!(client.voip().reject(&call).await.is_err());
     }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use log::{debug, warn};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::call::{
-    TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
+    REJECT_REASON_BUSY, TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
     VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
 };
@@ -198,11 +198,15 @@ impl StanzaHandler for CallHandler {
                             client.core.event_bus.dispatch(outcome);
                         }
                     }
+                    // A `busy` reject speaks for the responding DEVICE only, not the callee, so it
+                    // must not tear the call down while the peer's other devices are still ringing.
+                    // If every device is busy the call still ends, via the server's
+                    // `<terminate reason="timeout">` handled above.
                     #[cfg(feature = "voip-runtime")]
-                    if matches!(
-                        &call.action,
-                        CallAction::Reject { .. } | CallAction::Terminate { .. }
-                    ) {
+                    if matches!(&call.action, CallAction::Terminate { .. })
+                        || matches!(&call.action, CallAction::Reject { .. }
+                            if !reject_is_device_busy(&call.action))
+                    {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
                     #[cfg(feature = "voip-runtime")]
@@ -422,10 +426,27 @@ async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow:
 /// duplicate accept/reject can't re-dismiss. No-op for any other action, or a call we aren't the
 /// caller of (inbound call, single-device callee, or one already dismissed). A `Terminate` needs no
 /// handling here: the call ends, its registry entry (and the device set with it) goes away.
+/// Whether a `<reject>` says the DEVICE is unavailable rather than that the callee declined.
+///
+/// `busy` is a per-device statement (already in a call, or a companion with no voice support); the
+/// callee's other devices go on ringing and may still answer. Any other reason - including none -
+/// is the callee's own decision and ends the call.
+#[cfg(feature = "voip-runtime")]
+fn reject_is_device_busy(action: &CallAction) -> bool {
+    matches!(
+        action,
+        CallAction::Reject { reason, .. } if reason.as_deref() == Some(REJECT_REASON_BUSY)
+    )
+}
+
 #[cfg(feature = "voip-runtime")]
 async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     let reason = match &call.action {
         CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
+        // A `busy` device has not decided anything for the callee, so its siblings must keep
+        // ringing. Returning BEFORE take_dismiss_targets matters: that take is one-shot, and
+        // consuming the rung set here would leave a later genuine accept with nothing to dismiss.
+        CallAction::Reject { .. } if reject_is_device_busy(&call.action) => return,
         CallAction::Reject { .. } => TERMINATE_REASON_REJECTED_ELSEWHERE,
         _ => return,
     };
@@ -1522,6 +1543,99 @@ mod tests {
                 .take_dismiss_targets("CALL-ID-0001")
                 .is_none(),
             "the rung device set must be consumed one-shot"
+        );
+    }
+
+    // A `busy` reject is ONE DEVICE saying it cannot take the call, not the callee declining. It
+    // must neither tear the call down nor dismiss the siblings, or the primary phone's <preaccept>
+    // (observed landing 190ms later) arrives at a call we already ended. Critically the one-shot
+    // rung set must SURVIVE, so a later genuine accept still has siblings to dismiss.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn busy_reject_keeps_the_call_and_the_rung_set() {
+        let client = make_client().await;
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let (busy_device, other) = (peer.with_device(1), peer.with_device(2));
+
+        let mut session =
+            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        session.ring_devices = vec![busy_device.clone(), other.clone()];
+        client.call_registry().insert(session);
+
+        let reject = NodeBuilder::new("call")
+            .attr("from", busy_device.clone())
+            .attr("id", "STANZA-BUSY")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", creator.clone())
+                .attr("call-id", "CALL-ID-0001")
+                .attr("count", "0")
+                .attr("reason", "busy")
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&reject), &mut cancelled)
+                .await
+        );
+
+        assert!(
+            client
+                .call_registry()
+                .generation_of("CALL-ID-0001")
+                .is_some(),
+            "a busy device must not end the call for the others"
+        );
+        assert!(
+            client
+                .call_registry()
+                .take_dismiss_targets("CALL-ID-0001")
+                .is_some(),
+            "the one-shot rung set must survive a busy reject, or a later genuine accept has \
+             nothing to dismiss and the sibling rings until the call times out"
+        );
+    }
+
+    // The failure case for the above: a reject WITHOUT `reason="busy"` is the callee declining, and
+    // must still tear the call down exactly as before.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn reject_without_busy_still_ends_the_call() {
+        let client = make_client().await;
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let declining = peer.with_device(1);
+
+        let session =
+            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        client.call_registry().insert(session);
+
+        let reject = NodeBuilder::new("call")
+            .attr("from", declining)
+            .attr("id", "STANZA-DECLINE")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", creator.clone())
+                .attr("call-id", "CALL-ID-0001")
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&reject), &mut cancelled)
+                .await
+        );
+
+        assert!(
+            client
+                .call_registry()
+                .generation_of("CALL-ID-0001")
+                .is_none(),
+            "an explicit decline must still end the call"
         );
     }
 
