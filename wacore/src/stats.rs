@@ -122,8 +122,9 @@ impl SessionStats {
         let anchor = self.first_send_since_recv_ms.load(Ordering::Relaxed);
         if anchor == 0 || anchor <= last_recv {
             // The plain load above gates the clock read; the arm itself re-checks
-            // under a CAS so two senders racing to arm keep the earlier deadline
-            // instead of the later store winning.
+            // under a CAS, so once an anchor is set a later send cannot overwrite
+            // it. Two senders that both see it unarmed still resolve by whichever
+            // CAS lands first, which the serial sender task makes unreachable.
             let now = Self::now_ms();
             let _ = self.first_send_since_recv_ms.fetch_update(
                 Ordering::Relaxed,
