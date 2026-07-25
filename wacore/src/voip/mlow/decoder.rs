@@ -48,6 +48,10 @@ pub struct MlowDecoder {
     /// frame would desync the range coder if decoded, so it is dropped (treated as a lost frame). The
     /// count drives a once + every-100th `warn` naming the offending dimension.
     dropped_unsupported: u32,
+    /// Samples the last packet DECLARED, from its TOC, which is not always what `decode` returned:
+    /// a SID, a drop or a standard-Opus escape emits a fixed slot regardless of duration. Consumers
+    /// sizing a jitter cushion need the declared value, since that is what sets arrival cadence.
+    last_packet_samps: usize,
 }
 
 impl Default for MlowDecoder {
@@ -63,6 +67,7 @@ impl MlowDecoder {
             redundancy: 0,
             had_error: false,
             dropped_unsupported: 0,
+            last_packet_samps: OPUS_FRAME_SAMPS,
         }
     }
 
@@ -72,6 +77,12 @@ impl MlowDecoder {
     #[cfg(test)]
     pub(crate) fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Samples in the most recent packet as its TOC declared them, independent of what `decode`
+    /// emitted for it. Starts at a 60 ms packet.
+    pub fn last_packet_samps(&self) -> usize {
+        self.last_packet_samps
     }
 
     /// Set the negotiated RED redundancy level (0 = bare frames, the common case).
@@ -113,6 +124,9 @@ impl MlowDecoder {
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let toc = parse_mlow_toc(frame[0]);
+        if toc.frame_ms > 0 && toc.sample_rate > 0 {
+            self.last_packet_samps = (toc.sample_rate / 1000 * toc.frame_ms) as usize;
+        }
         if toc.std_opus {
             let out_len = (16000 / 1000 * toc.frame_ms) as usize;
             log::debug!(
@@ -452,6 +466,30 @@ mod tests {
             "10 ms runs a geometry the synthesis does not implement"
         );
         assert!(!dec.had_error(), "the drop must not open the range decoder");
+    }
+
+    /// The playout cushion is sized from the peer's packet duration, and a SID must not shrink it:
+    /// a DTX transition returns a fixed 60 ms silence slot regardless of the duration the packet
+    /// declares, so reading the cushion off the OUTPUT length would drop buffered speech that had
+    /// not been played yet. The declared duration is the one that governs arrival cadence.
+    #[test]
+    fn declared_duration_survives_a_dtx_transition() {
+        let mut dec = MlowDecoder::new();
+        let _ = dec.decode(&[0x58, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        assert_eq!(dec.last_packet_samps(), 6 * SMPL_INTF_LEN);
+
+        // A SID that still declares 120 ms (0x98 = SID | 120 ms) emits a 60 ms silence slot.
+        let sid = dec.decode(&[0x98, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(sid.len(), OPUS_FRAME_SAMPS, "SID is a fixed silence slot");
+        assert_eq!(
+            dec.last_packet_samps(),
+            6 * SMPL_INTF_LEN,
+            "the peer is still on 120 ms packets; the cushion must not shrink"
+        );
+
+        // A peer that genuinely moves to 60 ms is learned.
+        let _ = dec.decode(&[0x50, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(dec.last_packet_samps(), 3 * SMPL_INTF_LEN);
     }
 
     /// A `VoA=00` packet is a normal frame carrying background noise, not a SID: the reference

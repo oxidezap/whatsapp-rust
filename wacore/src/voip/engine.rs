@@ -1194,10 +1194,10 @@ impl CallEngine {
         #[cfg(feature = "voip-mlow")]
         {
             let decoded = pcm.decoder.decode(&encoded);
-            // Feeds `playout_bounds`; an empty decode carries no duration to learn from.
-            if !decoded.is_empty() {
-                pcm.packet_samps = decoded.len();
-            }
+            // The DECLARED duration, not the decoded length: a SID emits a fixed silence slot, so
+            // reading it off the output would shrink the cushion at a DTX transition and discard
+            // buffered speech that has not been played yet.
+            pcm.packet_samps = pcm.decoder.last_packet_samps();
             for s in decoded {
                 pcm.jitter
                     .push_back((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
