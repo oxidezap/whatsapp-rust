@@ -14,7 +14,7 @@ Before adding or changing protocol logic, check it against what the official cli
 This repo already vendors parts of it — `wacore/src/iq/mex_operations.rs` is copied verbatim from `generated/mex/operations.rs`, and the protobuf and app-state work came from the same place. Refreshing a vendored file is a `cp`.
 
 ```sh
-git clone https://github.com/oxidezap/whatspec   # locally: ~/projects/wa-forge
+git clone https://github.com/oxidezap/whatspec
 cd whatspec
 
 ./scripts/regen.sh                      # offline: rebuild generated/ from pinned bundles and verify it
@@ -43,8 +43,9 @@ Each has a JSON Schema under `generated/schema/`.
 
 ### Queries that work
 
+Run these from the checkout's `generated/` directory:
+
 ```sh
-cd ~/projects/wa-forge/generated
 
 # Which group requests does WA Web build?
 jq -r '.stanzas[] | select(.namespace=="w:g2") | .exportedFunction' iq/index.json
