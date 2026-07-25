@@ -11,6 +11,11 @@ on:
 
 jobs:
   copilot-setup-steps:
+    # Fork PRs get no secrets, so they can't pull the private mock-server image.
+    # Without this the job template fails to prepare (empty
+    # `credentials.password`) the first time an external contributor edits this
+    # file — the same failure codspeed.yml hit. Same condition as e2e.yml.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

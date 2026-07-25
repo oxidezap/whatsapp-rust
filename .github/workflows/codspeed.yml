@@ -91,6 +91,11 @@ jobs:
   # separate job so the unit-bench job above stays fast and mock-server-free.
   integration-benchmarks:
     name: Run CodSpeed integration benchmarks
+    # Fork PRs get no secrets, so they can't pull the private mock-server image.
+    # `credentials.password` rejects the empty string while the job template is
+    # being prepared, so the job fails before any step runs and a step-level
+    # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -101,7 +106,12 @@ jobs:
       id-token: write # for OpenID Connect authentication with CodSpeed
     services:
       mock-server:
-        image: ghcr.io/whiskeysockets-devtools/bartender:latest
+        # Pinned by digest, not `:latest`: send_and_receive measures a live
+        # round-trip and the mock server is the other end of it, so a tag moving
+        # under us shifts the instruction counts with no code change and
+        # pollutes the CodSpeed baseline. Same freeze rationale as the malloc
+        # thresholds above. Keep in sync with e2e.yml.
+        image: ghcr.io/whiskeysockets-devtools/bartender@sha256:975e9ce5143b56b527deea1afb5aed9423461671c546fc521473a25d1ffe26fa
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.BARTENDER_GHCR_TOKEN }}
