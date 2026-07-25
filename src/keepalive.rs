@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use wacore::iq::spec::IqSpec;
 use wacore::protocol::keepalive::{
-    KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE, is_dead_socket,
-    ms_since,
+    KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE,
+    is_dead_socket_at, ms_since, ms_since_at,
 };
 
 #[derive(Debug, PartialEq)]
@@ -211,8 +211,9 @@ impl Client {
                     // connection died immediately after.
                     let first_send = self.stats.first_send_since_recv_ms();
                     let last_recv = self.stats.last_data_received_ms();
-                    if is_dead_socket(first_send, last_recv) {
-                        let elapsed = ms_since(first_send).unwrap_or(0);
+                    let now = wacore::protocol::keepalive::now_ms();
+                    if is_dead_socket_at(first_send, last_recv, now) {
+                        let elapsed = ms_since_at(first_send, now).unwrap_or(0);
                         warn!(
                             target: "Client/Keepalive",
                             "No data received for {:.1}s after send (dead socket), forcing reconnect.",

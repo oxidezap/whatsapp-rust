@@ -320,11 +320,14 @@ pub(crate) async fn create_iq_test_client() -> (
     )
     .await;
 
-    let noise_socket = crate::socket::NoiseSocket::new(
+    // Wired to the client's stats like the real socket is, so per-frame
+    // bookkeeping is part of what tests observe.
+    let noise_socket = crate::socket::NoiseSocket::with_stats(
         Arc::new(TokioRuntime),
         transport.clone() as Arc<dyn crate::transport::Transport>,
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
+        Some(client.stats.clone()),
     );
     *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);

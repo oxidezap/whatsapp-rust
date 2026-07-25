@@ -3711,6 +3711,91 @@ async fn stats_snapshot_reflects_counters() {
     assert_eq!(snap.resends_throttled, 0);
 }
 
+/// A clock read leaves the module on wasm32/embedded, so the wire path owes a
+/// budget: only the send that arms the dead-socket anchor may date itself, and
+/// only one stamp may be spent per received transport event.
+#[test]
+fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
+    use wacore::time::clock_reads;
+
+    let stats = wacore::stats::SessionStats::new();
+
+    let arming = clock_reads::snapshot();
+    stats.record_frame_sent(10);
+    assert_eq!(
+        clock_reads::since(arming).wall,
+        1,
+        "the send that arms the anchor dates it"
+    );
+
+    let armed = clock_reads::snapshot();
+    for _ in 0..16 {
+        stats.record_frame_sent(10);
+    }
+    assert_eq!(
+        clock_reads::since(armed).wall,
+        0,
+        "sends under an already-armed anchor have nothing to date"
+    );
+
+    let recv = clock_reads::snapshot();
+    stats.mark_recv_activity();
+    stats.record_recv_batch(100, 1);
+    assert_eq!(
+        clock_reads::since(recv).wall,
+        1,
+        "a single-frame batch is stamped once, at arrival"
+    );
+
+    let long_batch = clock_reads::snapshot();
+    stats.mark_recv_activity();
+    stats.record_recv_batch(100, 4);
+    assert_eq!(
+        clock_reads::since(long_batch).wall,
+        2,
+        "a long batch re-stamps on completion so a slow drain is not read as silence"
+    );
+
+    let rearm = clock_reads::snapshot();
+    stats.record_frame_sent(10);
+    assert_eq!(
+        clock_reads::since(rearm).wall,
+        1,
+        "the receive cancelled the anchor, so this send arms it again"
+    );
+}
+
+/// Handling a received stanza must not ask for the time: the read loop already
+/// stamped arrival, and nothing downstream of it dates anything.
+#[tokio::test]
+async fn received_stanza_handling_reads_no_clock() {
+    use wacore::time::clock_reads;
+
+    let client = crate::test_utils::create_test_client().await;
+    let receipt = || {
+        to_owned_node(
+            &NodeBuilder::new("receipt")
+                .attr("id", "3EB0AABBCCDDEEFF001122")
+                .attr("from", "5511900000001@s.whatsapp.net")
+                .attr("t", "1780000000")
+                .build(),
+        )
+    };
+
+    client.process_decrypted_node(receipt()).await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+
+    let base = clock_reads::snapshot();
+    client.process_decrypted_node(receipt()).await;
+    let reads = clock_reads::since(base);
+
+    assert_eq!(reads.wall, 0, "receipt handling reads no wall clock");
+    assert_eq!(
+        reads.monotonic, 0,
+        "receipt handling reads no monotonic clock"
+    );
+}
+
 /// memory_report must be callable on a fresh client and internally
 /// consistent: empty collections report zero entries and zero bytes.
 #[tokio::test]

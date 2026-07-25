@@ -9,6 +9,11 @@
 //! Cost model:
 //! - [`SessionStats`] is always on: one relaxed `fetch_add` per wire frame,
 //!   on a path that already does AEAD crypto plus a transport write.
+//! - Clock reads: zero per frame sent while the dead-socket anchor is armed,
+//!   one on the send that arms it, one per received transport event. On
+//!   wasm32/embedded every read leaves the module, so a new timestamp field
+//!   here buys a read on the client's hottest path and needs a reader to
+//!   justify it.
 //! - [`HeapSize`] / memory reports only run when called; unused report code
 //!   is dropped by fat LTO.
 //! - [`TaskInstrument`] is resolved once at client build: unset leaves the
@@ -44,16 +49,22 @@ pub struct SessionStats {
     /// shedding events; the durability hook is the at-least-once escape hatch.
     events_dropped: AtomicU64,
     reconnects: AtomicU64,
-    /// Timestamp (ms since UNIX epoch) of the last sent WebSocket frame.
-    /// WA Web: `callStanza` → `deadSocketTimer.onOrBefore(deadSocketTime)`.
-    last_data_sent_ms: AtomicU64,
     /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
+    ///
+    /// Kept exact: two decisions measure elapsed time from it, the idle-ping
+    /// gate (15 s) and the dead-socket check (20 s). Sampling it would need a
+    /// refresh trigger, and the only one the core has is the keepalive tick,
+    /// which is coarser (15-30 s) than the gate it feeds.
     last_data_received_ms: AtomicU64,
     /// Dead-socket watchdog anchor (WA Web `deadSocketTimer.onOrBefore`): the first
     /// send since the last receive, so continued traffic can't push the deadline out.
     /// Treated as stale (and re-armed) once `<= last_data_received_ms`, so a send that
     /// raced past a receive-reset can't leave a pre-receive value stuck here.
+    ///
+    /// The only send-side timestamp: a `last_data_sent_ms` companion cost a
+    /// clock read per frame written and had no reader, since the watchdog
+    /// anchors on the first unanswered send and never on the most recent one.
     first_send_since_recv_ms: AtomicU64,
 }
 
@@ -83,7 +94,6 @@ pub struct StatsSnapshot {
     /// Outbound resends dropped by the per-chat rate limiter. Surfaces storm
     /// chats.
     pub resends_throttled: u64,
-    pub last_data_sent_ms: u64,
     pub last_data_received_ms: u64,
 }
 
@@ -102,19 +112,17 @@ impl SessionStats {
         self.bytes_sent
             .fetch_add(wire_bytes as u64, Ordering::Relaxed);
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
-        let now = Self::now_ms();
-        self.last_data_sent_ms.store(now, Ordering::Relaxed);
         // Arm the dead-socket deadline on the FIRST send after a receive (WA Web
         // `onOrBefore` keeps the earliest deadline; later sends must not push it out).
-        // Re-arm when the anchor is unset OR stale — a receive landed after it was
-        // armed (`anchor <= last_received`). Guarding only on `== 0` would let a send
-        // that captured `now` before a concurrent receive-reset write a pre-receive
-        // timestamp that then sticks forever (its arm raced past the reset), silently
-        // disabling detection; the stale check re-arms it on the next send instead.
+        // Re-arm when the anchor is unset OR stale, i.e. a receive landed after it was
+        // armed: guarding only on `== 0` would let a send whose arm raced past a
+        // receive-reset leave a pre-receive timestamp stuck there forever, silently
+        // disabling detection.
         let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
         let anchor = self.first_send_since_recv_ms.load(Ordering::Relaxed);
         if anchor == 0 || anchor <= last_recv {
-            self.first_send_since_recv_ms.store(now, Ordering::Relaxed);
+            self.first_send_since_recv_ms
+                .store(Self::now_ms(), Ordering::Relaxed);
         }
     }
 
@@ -180,14 +188,8 @@ impl SessionStats {
     /// watchdog never reads a previous connection's values. Traffic counters
     /// are cumulative and survive.
     pub fn reset_connection_activity(&self) {
-        self.last_data_sent_ms.store(0, Ordering::Relaxed);
         self.last_data_received_ms.store(0, Ordering::Relaxed);
         self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn last_data_sent_ms(&self) -> u64 {
-        self.last_data_sent_ms.load(Ordering::Relaxed)
     }
 
     /// The dead-socket watchdog anchor: the first send since the last receive
@@ -219,7 +221,6 @@ impl SessionStats {
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,
-            last_data_sent_ms: self.last_data_sent_ms.load(Ordering::Relaxed),
             last_data_received_ms: self.last_data_received_ms.load(Ordering::Relaxed),
         }
     }
@@ -740,6 +741,7 @@ mod tests {
         let stats = SessionStats::new();
         stats.record_frame_sent(100);
         stats.record_frame_sent(50);
+        assert!(stats.first_send_since_recv_ms() > 0);
         stats.record_recv_batch(300, 2);
         stats.record_message_sent();
         stats.record_message_received();
@@ -756,7 +758,6 @@ mod tests {
         assert_eq!(snap.messages_received, 1);
         assert_eq!(snap.reconnects, 1);
         assert_eq!(snap.events_dropped, 2);
-        assert!(snap.last_data_sent_ms > 0);
         assert!(snap.last_data_received_ms > 0);
     }
 
@@ -845,7 +846,7 @@ mod tests {
         stats.reset_connection_activity();
 
         let snap = stats.snapshot();
-        assert_eq!(snap.last_data_sent_ms, 0);
+        assert_eq!(stats.first_send_since_recv_ms(), 0);
         assert_eq!(snap.last_data_received_ms, 0);
         assert_eq!(snap.bytes_sent, 10);
         assert_eq!(snap.bytes_received, 20);

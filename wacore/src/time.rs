@@ -20,6 +20,71 @@
 
 use std::sync::OnceLock;
 
+/// Test-only clock-read accounting, so a budget over the hot path can be
+/// asserted instead of estimated.
+///
+/// Counting sits at the abstraction boundary, not inside a provider:
+/// [`set_time_provider`] is a `OnceLock` that the process's first `now_millis()`
+/// fills with the default, so a suite sharing one process cannot install an
+/// instrumented provider per test. Counting here also covers the defaults.
+#[cfg(feature = "test-util")]
+pub mod clock_reads {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static WALL: Cell<u64> = const { Cell::new(0) };
+        static MONOTONIC: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reads counted on one thread.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Reads {
+        /// Reads of the wall clock ([`super::now_millis`] and everything built
+        /// on it).
+        pub wall: u64,
+        /// Reads of the monotonic clock ([`super::Instant::now`],
+        /// [`super::Instant::elapsed`]).
+        pub monotonic: u64,
+    }
+
+    impl Reads {
+        pub fn total(&self) -> u64 {
+            self.wall + self.monotonic
+        }
+    }
+
+    #[inline]
+    pub(super) fn bump_wall() {
+        WALL.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    #[inline]
+    pub(super) fn bump_monotonic() {
+        MONOTONIC.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    /// Counters for the calling thread.
+    ///
+    /// Per thread, not process-wide, so a measurement stays exact while the
+    /// rest of the suite runs in parallel. Work handed to a blocking pool (the
+    /// storage backend) is counted on that thread and stays invisible here.
+    pub fn snapshot() -> Reads {
+        Reads {
+            wall: WALL.with(Cell::get),
+            monotonic: MONOTONIC.with(Cell::get),
+        }
+    }
+
+    /// Reads made on this thread since `base`.
+    pub fn since(base: Reads) -> Reads {
+        let now = snapshot();
+        Reads {
+            wall: now.wall.saturating_sub(base.wall),
+            monotonic: now.monotonic.saturating_sub(base.monotonic),
+        }
+    }
+}
+
 /// Wall-clock provider. Returns the current Unix time. May move backwards
 /// across calls when the system clock is adjusted.
 pub trait TimeProvider: Send + Sync + 'static {
@@ -84,6 +149,8 @@ pub fn set_time_provider(provider: impl TimeProvider) -> Result<(), &'static str
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn now_millis() -> i64 {
+    #[cfg(feature = "test-util")]
+    clock_reads::bump_wall();
     TIME_PROVIDER
         .get_or_init(default_time_provider)
         .now_millis()
@@ -95,6 +162,8 @@ pub fn now_millis() -> i64 {
 #[cfg(target_arch = "wasm32")]
 #[inline]
 pub fn now_millis() -> i64 {
+    #[cfg(feature = "test-util")]
+    clock_reads::bump_wall();
     match TIME_PROVIDER.get() {
         Some(provider) => provider.now_millis(),
         None => UnsetWasmTimeProvider.now_millis(),
@@ -251,6 +320,8 @@ pub fn set_monotonic_provider(provider: impl MonotonicProvider) -> Result<(), &'
 
 #[inline]
 fn now_nanos() -> u64 {
+    #[cfg(feature = "test-util")]
+    clock_reads::bump_monotonic();
     MONOTONIC_PROVIDER
         .get_or_init(default_monotonic_provider)
         .now_nanos()

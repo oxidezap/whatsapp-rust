@@ -32,9 +32,13 @@ chokepoints:
   transport write — post-noise wire bytes (frame header + AEAD tag included).
 - **Received**: the read loop (`node_io.rs`) per `DataReceived` batch.
 
-It also owns the `last_data_sent_ms`/`last_data_received_ms` activity
-timestamps the keepalive dead-socket watchdog reads (they were loose fields on
-`Client` before). Message-level counters piggyback on the existing
+It also owns the activity timestamps the keepalive dead-socket watchdog reads:
+`last_data_received_ms` (one clock read per received transport event) and
+`first_send_since_recv_ms` (read only on the send that arms the anchor). There
+is deliberately no "last send" timestamp: nothing in the core reads one, and it
+cost a clock read on every frame written, which is the client's hottest path
+and a call out of the module on wasm32/embedded. `frames_sent` answers "is it
+still sending?" for free. Message-level counters piggyback on the existing
 `telemetry::send`/`recv` chokepoints; reconnect attempts are counted in the
 run loop. VoIP relay sockets pass `None` and are not counted — this is the
 main WA session socket only.

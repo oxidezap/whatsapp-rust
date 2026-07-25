@@ -5593,3 +5593,171 @@ mod future_size_tests {
         drop(f);
     }
 }
+
+#[cfg(test)]
+mod clock_budget_tests {
+    use super::*;
+    use crate::store::commands::DeviceCommand;
+    use std::sync::Arc;
+    use wacore::time::clock_reads;
+
+    const OWN_PN: &str = "15551234001";
+    const PEER_PN: &str = "5511900000001";
+    const PEER_LID: &str = "100000000000079";
+
+    /// Budget for one steady-state DM send, in clock reads. On wasm32 and
+    /// embedded targets every read leaves the module, so this is a real cost of
+    /// the send path and not just an instruction count.
+    const SEND_WALL_READS: u64 = 4;
+    const SEND_MONOTONIC_READS: u64 = 2;
+
+    async fn seed_devices(client: &Arc<Client>, user: &str) {
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: user.into(),
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed device list");
+    }
+
+    /// Registry, LID mapping and Signal sessions already seeded, so a send
+    /// queries nothing over the wire.
+    async fn cold_send_client() -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+        Jid,
+    ) {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(
+                format!("{OWN_PN}@s.whatsapp.net").parse().expect("own pn"),
+            )))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "100000000000001@lid".parse().expect("own lid"),
+            )))
+            .await;
+
+        let peer = Jid::pn(PEER_PN);
+        seed_devices(&client, PEER_PN).await;
+        seed_devices(&client, OWN_PN).await;
+        seed_devices(&client, PEER_LID).await;
+        client
+            .add_lid_pn_mapping(
+                PEER_LID,
+                PEER_PN,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("lid mapping");
+        crate::test_utils::seed_peer_session(&client, &peer).await;
+        crate::test_utils::seed_peer_session(
+            &client,
+            &format!("{PEER_LID}@lid").parse().expect("lid jid"),
+        )
+        .await;
+
+        (client, transport, peer)
+    }
+
+    /// [`cold_send_client`] plus a first send, which drains the once-per-peer
+    /// privacy-token issuance so the next send is steady state.
+    async fn warm_send_client() -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+        Jid,
+    ) {
+        let (client, transport, peer) = cold_send_client().await;
+        client.send_text(peer.clone(), "warm").await.expect("warm");
+        // The privacy token is issued off the send path, so wait for its frame
+        // rather than let it land inside the measured window.
+        crate::test_utils::poll_until("the privacy token to be issued", || {
+            transport.sent_count() >= 2
+        })
+        .await;
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        (client, transport, peer)
+    }
+
+    /// Paused time so the unanswered IQs this harness leaves behind do not cost
+    /// their real timeouts.
+    #[tokio::test(start_paused = true)]
+    async fn dm_send_stays_within_its_clock_budget() {
+        let (client, transport, peer) = warm_send_client().await;
+        let frames_before = transport.sent_count();
+
+        let base = clock_reads::snapshot();
+        client.send_text(peer, "hello").await.expect("send");
+        let reads = clock_reads::since(base);
+
+        assert_eq!(
+            transport.sent_count() - frames_before,
+            1,
+            "the budget only describes a send that writes exactly one frame"
+        );
+        assert!(
+            reads.total() > 0,
+            "a zero count means the flow did not run, not that it got free"
+        );
+        assert!(
+            reads.wall <= SEND_WALL_READS,
+            "wall-clock reads per DM send rose to {} (budget {SEND_WALL_READS})",
+            reads.wall
+        );
+        assert!(
+            reads.monotonic <= SEND_MONOTONIC_READS,
+            "monotonic reads per DM send rose to {} (budget {SEND_MONOTONIC_READS})",
+            reads.monotonic
+        );
+
+        client.disconnect().await;
+    }
+
+    /// The wire timestamp is the one thing the budget must never buy: the
+    /// privacy-token IQ a first send emits still carries the real second.
+    #[tokio::test(start_paused = true)]
+    async fn wire_timestamp_keeps_real_time() {
+        let (client, transport, peer) = cold_send_client().await;
+
+        let before = wacore::time::now_secs();
+        client.send_text(peer, "hello").await.expect("send");
+        crate::test_utils::poll_until("the privacy token to be issued", || {
+            transport.sent_count() >= 2
+        })
+        .await;
+        let after = wacore::time::now_secs();
+
+        let mut seen = None;
+        for index in 0..transport.sent_count() {
+            let node = crate::test_utils::decode_sent_iq(&transport, index).await;
+            let node = node.get();
+            if node.attrs().optional_string("xmlns").as_deref() != Some("privacy") {
+                continue;
+            }
+            let token = node
+                .get_optional_child("tokens")
+                .and_then(|t| t.get_optional_child("token"))
+                .expect("the privacy IQ carries a <token>");
+            seen = token
+                .attrs()
+                .optional_string("t")
+                .and_then(|t| t.parse::<i64>().ok());
+            break;
+        }
+
+        let stamped = seen.expect("a first send issues a privacy token");
+        assert!(
+            (before..=after).contains(&stamped),
+            "wire timestamp {stamped} outside [{before}, {after}]"
+        );
+
+        client.disconnect().await;
+    }
+}

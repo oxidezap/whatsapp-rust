@@ -365,12 +365,14 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let now = self.entry_time();
-
         // Fast path (no TTI): read lock only, no write needed.
         if self.tti.is_none() {
             let guard = self.inner.read().await;
             let entry = guard.map.get(key)?;
+            // Read the clock after the lookup: a miss has no timestamp to
+            // compare, and lookups that miss are a large share of the calls
+            // (every negative registry probe, every warm-up).
+            let now = self.entry_time();
             if self.is_expired(entry, now) {
                 let owned_key = Self::find_key(&guard, key)?;
                 drop(guard);
@@ -388,6 +390,7 @@ where
         // TTI path: write lock to update last_accessed_at.
         let mut guard = self.inner.write().await;
         let entry = guard.map.get_mut(key)?;
+        let now = self.entry_time();
         if self.is_expired(entry, now) {
             let owned_key = Self::find_key(&guard, key)?;
             guard.remove_key(&owned_key);
@@ -491,10 +494,11 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let now = self.entry_time();
         let mut guard = self.inner.write().await;
         let owned_key = Self::find_key(&guard, key)?;
         let entry = guard.remove_key(&owned_key)?;
+        // Nothing to date until an entry is actually in hand.
+        let now = self.entry_time();
         if self.is_expired(&entry, now) {
             None
         } else {
@@ -943,6 +947,78 @@ mod tests {
         cache.insert("a".into(), 1).await;
         assert!(cache.get("a").await.is_none());
         assert_eq!(cache.entry_count(), 0);
+    }
+
+    /// Expiry decided against a supplied instant, so the boundary (exactly at
+    /// the deadline, which counts as expired) is pinned without depending on
+    /// wall-clock timing.
+    #[test]
+    fn expiry_boundary_is_exact_under_a_controlled_clock() {
+        let ttl = Duration::from_secs(60);
+        let tti = Duration::from_secs(10);
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_live(ttl)
+            .time_to_idle(tti)
+            .build();
+
+        let inserted = Instant::ZERO + Duration::from_secs(1_000);
+        let entry = CacheEntry {
+            value: 1,
+            inserted_at: inserted,
+            last_accessed_at: inserted,
+            seq: 0,
+        };
+
+        assert!(!cache.is_expired(&entry, inserted + tti - Duration::from_nanos(1)));
+        assert!(cache.is_expired(&entry, inserted + tti), "TTI is inclusive");
+
+        let idle_free: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_live(ttl)
+            .build();
+        assert!(!idle_free.is_expired(&entry, inserted + ttl - Duration::from_nanos(1)));
+        assert!(
+            idle_free.is_expired(&entry, inserted + ttl),
+            "TTL is inclusive"
+        );
+    }
+
+    /// A lookup that finds nothing has no timestamp to compare, so it must not
+    /// pay for one. Every negative registry probe goes through here.
+    #[tokio::test]
+    async fn a_miss_does_not_read_the_clock() {
+        use wacore::time::clock_reads;
+
+        for cache in [
+            PortableCache::<String, u32>::builder()
+                .max_capacity(100)
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+            PortableCache::<String, u32>::builder()
+                .max_capacity(100)
+                .time_to_idle(Duration::from_secs(60))
+                .build(),
+        ] {
+            cache.insert("present".into(), 1).await;
+
+            let base = clock_reads::snapshot();
+            assert!(cache.get("absent").await.is_none());
+            assert!(cache.remove("absent").await.is_none());
+            assert_eq!(
+                clock_reads::since(base).monotonic,
+                0,
+                "a miss must not read the monotonic clock"
+            );
+
+            let hit = clock_reads::snapshot();
+            assert_eq!(cache.get("present").await, Some(1));
+            assert_eq!(
+                clock_reads::since(hit).monotonic,
+                1,
+                "a hit reads once, to decide expiry"
+            );
+        }
     }
 
     #[tokio::test]
