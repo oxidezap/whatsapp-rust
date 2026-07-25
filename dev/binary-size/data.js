@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785001989476,
+  "lastUpdate": 1785002122224,
   "repoUrl": "https://github.com/oxidezap/whatsapp-rust",
   "entries": {
     "whatsapp-rust binary size": [
@@ -23534,6 +23534,130 @@ window.BENCHMARK_DATA = {
           {
             "name": ".text other deps",
             "value": 1981820,
+            "unit": "bytes"
+          },
+          {
+            "name": "llvm-lines wacore",
+            "value": 490836,
+            "unit": "lines"
+          },
+          {
+            "name": "llvm-lines wacore copies",
+            "value": 16324,
+            "unit": "copies"
+          },
+          {
+            "name": "llvm-lines whatsapp-rust lib",
+            "value": 703972,
+            "unit": "lines"
+          },
+          {
+            "name": "llvm-lines whatsapp-rust lib copies",
+            "value": 22173,
+            "unit": "copies"
+          },
+          {
+            "name": "deps crates (Cargo.lock)",
+            "value": 471,
+            "unit": "crates"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "82057278+Bot-Dev-RPA@users.noreply.github.com",
+            "name": "Sumit Kumar",
+            "username": "Bot-Dev-RPA"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "97c2cab5c7f86826b82dc2ba03abdd1242994875",
+          "message": "fix(voip): race the relay's advertised and web-client ports for media (#1104)",
+          "timestamp": "2026-07-25T14:49:21-03:00",
+          "tree_id": "a9866ab62b6b9fb6d8d4a1e6a6ddf65221e77daf",
+          "url": "https://github.com/oxidezap/whatsapp-rust/commit/97c2cab5c7f86826b82dc2ba03abdd1242994875"
+        },
+        "date": 1785002120147,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bin size (stripped)",
+            "value": 10415928,
+            "unit": "bytes"
+          },
+          {
+            "name": "bin .text",
+            "value": 8369462,
+            "unit": "bytes"
+          },
+          {
+            "name": "bin allocated (text+data+bss)",
+            "value": 10413046,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust",
+            "value": 1859714,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore",
+            "value": 662984,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_binary",
+            "value": 91568,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_libsignal",
+            "value": 165775,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_appstate",
+            "value": 22898,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_noise",
+            "value": 22121,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text waproto",
+            "value": 1825432,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust_sqlite_storage",
+            "value": 527123,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust_tokio_transport",
+            "value": 40866,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust_ureq_http_client",
+            "value": 10651,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text std",
+            "value": 1117927,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text other deps",
+            "value": 1982132,
             "unit": "bytes"
           },
           {
