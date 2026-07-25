@@ -1,187 +1,52 @@
-# Type-Safe Protocol Node Architecture
+# Protocol node architecture
 
-All protocol stanza builders use the declarative, type-safe pattern defined in `wacore/src/iq/`. This architecture provides compile-time safety, validation, and clear separation between request building and response parsing.
+Stanza builders and parsers live in `wacore/src/iq/`. Read this before adding a request type; the canonical worked examples are `wacore/src/iq/groups.rs` (rich: newtypes, nested children, enums) and `wacore/src/iq/blocklist.rs` (small).
 
-## Core Traits
+## The two traits
 
-### `ProtocolNode` (`wacore/src/protocol.rs`)
+- `ProtocolNode` (`wacore/src/protocol/mod.rs`) maps a struct to a node.
+- `IqSpec` (`wacore/src/iq/spec.rs`) pairs a request with its typed response.
 
-Maps Rust structs to WhatsApp protocol nodes:
+Both carry doc comments on every method; read the source rather than a copy here.
 
-```rust
-pub trait ProtocolNode: Sized {
-    fn tag(&self) -> &'static str;
-    fn into_node(self) -> Node;
-    fn try_from_node(node: &Node) -> Result<Self>;
-}
-```
+Non-obvious parts:
 
-### `IqSpec` (`wacore/src/iq/spec.rs`)
+- **`try_from_node_ref(&NodeRef<'_>)` is the canonical parse path**, not the owned `try_from_node`. The owned form is a defaulted convenience that borrows and delegates. Implement and call the ref form.
+- **`IqSpec` has an optional encode fast path** that writes the `<iq>` stanza straight into a pre-sized buffer and skips the `Node` intermediate. Returning `false` falls back to `build_iq()` + marshal, so it is safe to leave unimplemented — but do not add a second hand-rolled encoder next to it.
+- **Constructors take `&Jid`**, never `Jid`, so callers are not forced to clone.
 
-Pairs IQ requests with their typed responses:
+## Derive macros
 
-```rust
-pub trait IqSpec {
-    type Response;
-    fn build_iq(&self) -> InfoQuery<'static>;
-    fn parse_response(&self, response: &Node) -> Result<Self::Response>;
-}
-```
+`wacore` re-exports exactly three, from `wacore-derive`:
 
-## Derive Macros (Recommended)
+| Derive | For |
+| --- | --- |
+| `EmptyNode` | Nodes that are only a tag |
+| `ProtocolNode` | Nodes with attributes and children |
+| `WireEnum` | Every protocol enum |
 
-Use the derive macros from `wacore-derive` (re-exported via `wacore`):
+`StringEnum` is **not** a derive — it is an internal attribute kind inside the `ProtocolNode` derive. Protocol enums use `WireEnum`.
 
-```rust
-use wacore::{ProtocolNode, EmptyNode, StringEnum};
+### `WireEnum` modes
 
-// Empty node (tag only)
-#[derive(EmptyNode)]
-#[protocol(tag = "participants")]
-pub struct ParticipantsRequest;
+The `#[wire = ...]` attribute is the single source of truth for a variant's wire value. Do not also derive serde or add `#[serde(rename_all)]` on these types — the derive owns both directions.
 
-// Node with string attributes
-#[derive(ProtocolNode)]
-#[protocol(tag = "query")]
-pub struct QueryRequest {
-    #[attr(name = "request", default = "interactive")]
-    pub request_type: String,
-}
+- **unit-string** (default) — `#[wire = "block"]` per variant.
+- **int** — `#[wire(kind = "int")]` on the enum, `#[wire = 3]` per variant.
+- **tagged with payload** — `#[wire(tag = "type")]` on the enum. Fields accept `#[wire_alias = "..."]` and `#[wire(skip)]`; `#[wire_fallback]` marks the catch-all variant, `#[wire_default]` the default.
 
-// Enum with string representations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
-pub enum BlocklistAction {
-    #[str = "block"]
-    Block,
-    #[str = "unblock"]
-    Unblock,
-}
-```
+Tagged mode generates a sibling `<Name>Tag` enum. **Parsers must dispatch through `<Name>Tag::try_from(node.tag.as_ref())`** instead of matching string literals, so renaming a wire tag stays a single-attribute change. The generator is `wacore/derive/src/lib.rs`.
 
-**Available derive macros:**
-- `EmptyNode` - For nodes with only a tag (no attributes)
-- `ProtocolNode` - For nodes with string attributes
-- `StringEnum` - For enums with string representations (generates `as_str()`, `Display`, `TryFrom<&str>`, `Default`)
+The declarative `define_empty_node!` / `define_simple_node!` macros in `wacore/src/protocol/mod.rs` predate the derives. Do not reach for them in new code.
 
-For enums where the default should not be the first variant, use `#[string_default]`.
+## Parsing helpers
 
-### Legacy Declarative Macros
+`wacore/src/iq/node.rs` holds crate-internal helpers: `required_child`, `optional_child`, `required_attr`, `optional_attr`, `collect_children`, `extract_content_bytes`, `extract_content_uint`. They exist so error messages about missing tags and attributes stay uniform — prefer them over open-coding `get_optional_child` with a bespoke `anyhow!`.
 
-Prefer derive macros for new code. Declarative macros in `wacore/src/protocol.rs` (`define_empty_node!`, `define_simple_node!`) are also available but considered legacy.
+## Validated newtypes
 
-## Implementation Pattern
+Protocol limits belong in the type, not in a check at the call site. `GroupSubject` in `wacore/src/iq/groups.rs` is the pattern. The limits themselves (`GROUP_SUBJECT_MAX_LENGTH`, `GROUP_DESCRIPTION_MAX_LENGTH`, `GROUP_SIZE_LIMIT`) come from WhatsApp Web's A/B props registry — confirm one against the registry before changing it, in one command; see `wa_web_reference.md`.
 
-1. Define request struct with `ProtocolNode` (or derive macro)
-2. Define response struct with `ProtocolNode`
-3. Create `IqSpec` implementation pairing them
-4. Use `client.execute(Spec::new(&jid)).await?` in feature code
+## File layout
 
-See `wacore/src/iq/groups.rs` and `wacore/src/iq/blocklist.rs` for complete examples.
-
-## IQ Executor
-
-Use `Client::execute()` for simplified IQ request/response handling:
-
-```rust
-// Single call replaces manual build + send + parse
-let response = client.execute(GroupQueryIq::new(&jid)).await?;
-```
-
-**API Design Note**: IqSpec constructors should take `&Jid` (not `Jid`) to avoid forcing callers to clone.
-
-## Node Parsing Helpers
-
-Use helpers from `wacore/src/iq/node.rs`:
-
-```rust
-use crate::iq::node::{required_child, required_attr, optional_attr, optional_jid};
-
-fn try_from_node(node: &Node) -> Result<Self> {
-    let id = required_attr(node, "id")?;
-    let name = optional_attr(node, "name");
-    let jid = optional_jid(node, "jid")?;
-    let child = required_child(node, "group")?;
-}
-```
-
-## Validated Newtypes
-
-Use newtypes to enforce protocol constraints at compile time. See `GroupSubject` in `wacore/src/iq/groups.rs` for examples.
-
-Constants from WhatsApp Web A/B props:
-- `GROUP_SUBJECT_MAX_LENGTH`: 100 characters
-- `GROUP_DESCRIPTION_MAX_LENGTH`: 2048 characters
-- `GROUP_SIZE_LIMIT`: 257 participants
-
-## File Organization
-
-```text
-wacore/src/iq/
-├── mod.rs          # Re-exports
-├── spec.rs         # IqSpec trait definition
-├── node.rs         # Helper functions
-├── groups.rs       # Group types + IqSpec impls
-└── blocklist.rs    # Blocklist types + IqSpec impls
-```
-
-Each feature file contains: constants, enums (`StringEnum`), request/response structs (`ProtocolNode`), `IqSpec` impls, and unit tests.
-
-## Noise Handshake Patterns
-
-Three Noise patterns coexist, mirroring WA Web's `WAWebOpenChatSocket`:
-
-| Pattern        | When                                                          | State machine               | Cost                              |
-| -------------- | ------------------------------------------------------------- | --------------------------- | --------------------------------- |
-| **XX**         | First connect / pairing / forced fallback                     | `XxHandshakeState`          | 1.5 RTT                           |
-| **IK**         | Reconnect with valid cached `serverStaticPub`                 | `IkHandshakeState`          | 1 RTT, ships 0-RTT login payload  |
-| **XXfallback** | Server rejects in-flight IK (reply has `static != null`)      | `XxFallbackHandshakeState`  | 1 RTT (reuses already-sent eph.)  |
-
-### Selection (`src/handshake.rs::select_pattern`)
-
-```text
-ik_failures >= 1  ───────────────────────────────────────► XX
-no cached server_cert_chain ─────────────────────────────► XX
-leaf.not_after < now OR intermediate.not_after < now ────► XX
-otherwise ──────────────────────────────────────────────► IK with leaf.key
-```
-
-The counter `Client.ik_handshake_failures: AtomicU32` is per-process and
-not persisted (matches WA Web's `K = 0` reset on process start).
-
-### Invalidation policy
-
-| Error                                              | `ik_handshake_failures` | `server_cert_chain`                              |
-| -------------------------------------------------- | ----------------------- | ------------------------------------------------ |
-| Transient (timeout, disconnect, transport)         | unchanged               | unchanged                                        |
-| Crypto-fatal during IK (cert MAC, decrypt, proto)  | `+= 1`                  | cleared via `DeviceCommand::ClearServerCertChain`|
-| XX or XX-fallback failure                          | unchanged               | unchanged (XX never reads the cache)             |
-| Any successful handshake                           | reset to `0`            | repopulated (XX, XX-fallback) or kept (IK Continue)|
-
-Distinguishing transient from crypto-fatal is via `HandshakeError::is_transient()`
-and `HandshakeError::is_crypto_fatal()`. Getting the classification wrong leads
-to either oscillating back to XX needlessly or looping on a stale cache.
-
-### Persisted state (`Device.server_cert_chain`)
-
-`CachedServerCertChain { intermediate, leaf }` with each cert reduced to
-`{ key: [u8; 32], not_before: i64, not_after: i64 }`. Mirrors the
-storage layout WA Web uses in `PrefsInfoStore.js:setCertificateChain` —
-only those fields end up on disk.
-
-`verify_server_cert` checks structural shape, the issuer-serial pin, the
-chain link, and that `leaf.key` matches the decrypted Noise static.
-Ed25519 signature verification against `WA_CERT_PUB_KEY` is intentionally
-skipped (would break the e2e mock server). Same posture as whatsmeow.
-
-### Logs (matching WA Web's `[socket]` lines)
-
-```text
-[socket] doFullHandshake: openChatSocket send hello
-[socket] resumeNoiseHandshake started
-[socket] resumeNoiseHandshake send hello
-[socket] resumeNoiseHandshake rcv hello
-[socket] resumeNoiseHandshake deriving secrets
-[socket] resumeNoiseHandshake failed: serverStaticCiphertext not null —
-  doFallbackHandshake continuing handshake with given server hello
-[socket] continueFullHandshakeCore client finish and deriving secrets
-```
+One file per feature under `wacore/src/iq/`, each holding its constants, enums, request/response structs, `IqSpec` impls, and unit tests. `mod.rs` re-exports, `spec.rs` and `node.rs` are shared infrastructure.

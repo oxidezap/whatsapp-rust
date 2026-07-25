@@ -1,50 +1,58 @@
 # WhatsApp-Rust
 
-Rust implementation of the WhatsApp protocol, inspired by **whatsmeow** (Go), **Baileys** (TypeScript), and real **WhatsApp Web** behavior. Covers QR pairing, E2E encrypted messaging (1-on-1 + group), media upload/download, and connection management.
+Rust implementation of the WhatsApp protocol: QR pairing, E2E encrypted messaging (1-on-1 + group), media, VoIP, connection management.
 
-## Crate Structure
+Ground truth for protocol behavior is WhatsApp Web itself: query the structured [whatspec](https://github.com/oxidezap/whatspec) IR first, drop to the raw bundle in `docs/captured-js/` when it can't answer, and treat **whatsmeow** (Go) and **Baileys** (TypeScript) as second opinions. See `agent_docs/wa_web_reference.md`.
 
-- **wacore** — Platform-agnostic core: binary protocol, crypto, IQ types, state traits. No Tokio dependency.
-- **waproto** — Protobuf definitions (`whatsapp.proto`) compiled via prost. No feature logic here.
-- **whatsapp-rust** — Main client: Tokio runtime, SQLite persistence (Diesel), high-level API.
+## Crates
 
-## Build & Verify
+- **wacore** — platform-agnostic core: binary protocol, crypto, IQ types, state traits. Also builds for wasm32 and ESP32, so no Tokio here.
+- **waproto** — prost-generated protobufs from `whatsapp.proto`. No feature logic.
+- **whatsapp-rust** — Tokio runtime, SQLite persistence (Diesel), high-level API.
+
+## Build & verify
 
 ```bash
 cargo fmt --all
-cargo clippy --all --tests
-cargo test --all
-cargo test -p e2e-tests          # requires mock server running
+cargo test -p <touched crate> --lib                     # fast local loop
+cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
 ```
 
-## Rust Style
+Workspace clippy takes minutes — pushing and letting CI parallelize the matrix is usually faster. E2E tests (`cargo test -p e2e-tests`) need the mock server running; see `agent_docs/e2e_testing.md`.
 
-- **Collapsible if**: Always use let-chains (`if let Some(x) = foo && let Some(y) = x.bar { ... }`) instead of nested `if let` blocks. Clippy's `collapsible_if` lint will reject the nested form.
-- **No real PII in tests**: Use fictitious phone numbers and JIDs in test code. Never commit real user numbers.
+## Gotchas
 
-## Critical Conventions
+Things that look correct and are not:
 
-- **State**: Never modify Device state directly (not even in tests — a write-lock mutation bypasses the cached snapshot). Use `DeviceCommand` + `PersistenceManager::process_command()` (or `modify_device` internally). Read via `get_device_snapshot()` — it returns a cached `Arc<Device>` (sync, refcount-cheap, safe to call per message); borrow fields from the held snapshot instead of cloning them. `get_device_arc()` is only for store adapters that need `&mut Device` trait access.
-- **Async**: All I/O uses Tokio. Wrap blocking I/O (`ureq`) and heavy CPU work in `tokio::task::spawn_blocking`.
-- **Concurrency**: `session_locks` serializes per-sender Signal encrypt/decrypt. `message_enqueue_locks` serializes per-chat incoming message processing. Outgoing sends are not per-chat locked (matches WA Web).
-- **Errors**: `thiserror` for typed errors, `anyhow` for multi-failure functions. No `.unwrap()` outside tests.
-- **Protocol**: Cross-reference **whatsmeow**, **Baileys**, and captured WhatsApp Web JS (`docs/captured-js/`) to verify implementations.
-- **IQ Requests**: Use `client.execute(Spec::new(&jid)).await?` pattern. IqSpec constructors take `&Jid` not `Jid`.
-- **New features**: Expose via `src/features/mod.rs`, re-export in `src/lib.rs`.
-- **Event payloads**: Seal each payload struct with `#[non_exhaustive]` + `#[derive(bon::Builder)]` so fields can be added without breaking consumers; construct via the generated builder (`Type::builder()…build()`), not a struct literal. Model a maybe-absent field as `Option<T>` (gets a `maybe_*` setter), never an empty-string/zero sentinel. Every event payload is sealed this way (unit-marker events too, as empty sealed structs built via `X::builder().build()`); see the `Event` doc in `wacore/src/types/events.rs` for the full stability policy.
-- **Wire-tagged enums**: Every protocol enum uses `#[derive(WireEnum)]`. The `#[wire = "..."]` (or `#[wire = NUM]` for int mode) attribute is the SINGLE source of truth for each variant's wire value. Do NOT also derive `serde::Serialize`/`Deserialize` or add `#[serde(rename_all)]` — the derive owns both. Three modes: unit-string (default), tagged-with-payload (`#[wire(tag = "type")]` on the enum, optional `#[wire_alias = "..."]` and `#[wire(skip)]` on fields, `#[wire_fallback]` for catch-all), and int (`#[wire(kind = "int")]`). In tagged mode the derive auto-generates a sibling `<Name>Tag` enum; parsers must dispatch via `<Name>Tag::try_from(node.tag.as_ref())` instead of matching string literals, so renaming a wire tag stays a single-attribute change.
+- **Device state.** Never mutate `Device` directly, not even in tests — a write-lock mutation bypasses the cached snapshot. Mutate through `DeviceCommand` + `PersistenceManager::process_command()`; read through `get_device_snapshot()`, which returns a cached `Arc<Device>` (sync, refcount-cheap, safe per message) — hold it and borrow fields instead of cloning them. `get_device_arc()` exists only for store adapters that need `&mut Device` trait access.
+- **Locks.** `session_locks` serializes Signal encrypt/decrypt per protocol address; `chat_lanes` (`ChatLane::enqueue_lock` in `src/client.rs`) serializes *incoming* processing per chat. Outgoing sends are deliberately not per-chat locked — WA Web doesn't lock them either.
+- **Wire-tagged enums.** Every protocol enum derives `WireEnum`, and its `#[wire = ...]` attribute is the single source of truth for the wire value. Do not also derive `serde::Serialize`/`Deserialize` or add `#[serde(rename_all)]` — the derive owns both. In tagged mode it generates a sibling `<Name>Tag`; parsers must dispatch on `<Name>Tag::try_from(node.tag.as_ref())` rather than string literals, so renaming a tag stays a one-attribute change. Modes and attributes: `agent_docs/protocol_architecture.md`.
+- **Event payloads are a frozen API.** Sealed with `#[non_exhaustive]` + `#[derive(bon::Builder)]` and constructed via `Type::builder()…build()`; a maybe-absent field is `Option<T>`, never an empty-string or zero sentinel. The full stability policy is the `Event` doc comment in `wacore/src/types/events.rs`.
+- **Blocking work** — `ureq`, heavy CPU — belongs in `tokio::task::spawn_blocking`; it shares a runtime with the read loop.
+- **let-chains**, never nested `if let`. Clippy's `collapsible_if` is denied in CI.
+- **No real PII in tests**, including vectors derived from production captures. Regenerate them from fictitious JIDs and numbers.
+- **Errors**: `thiserror` for typed errors, `anyhow` where several failure kinds meet. No `.unwrap()` outside tests.
 
-## Detailed Docs
+## Adding a feature
 
-Read these when working on the relevant area:
+Find the wire format before designing anything — see `agent_docs/feature_implementation.md`. IQ requests go through `client.execute(Spec::new(&jid)).await?`, and `IqSpec` constructors take `&Jid` so callers need not clone. Public surface is `pub use` in `src/features/*.rs`, re-exported from `src/features/mod.rs` and `src/lib.rs`.
 
-- `agent_docs/protocol_architecture.md` — ProtocolNode, IqSpec, derive macros, node parsing
-- `agent_docs/feature_implementation.md` — Step-by-step feature implementation flow
-- `agent_docs/e2e_testing.md` — E2E test patterns, file organization, event-driven waiting
-- `agent_docs/debugging.md` — evcxr REPL, binary protocol debugging
-- `agent_docs/binary_size_ci.md` — size-tracking CI: metrics, budgets, baseline semantics
-- `agent_docs/observability.md` — per-session stats (I/O, memory report, TaskInstrument/CPU), design rules
-- `agent_docs/plugin_architecture.md` — native plugin host, lifecycle/capability invariants, future foreign adapter seam
-- `agent_docs/signal_durability.md` — Signal counter leases, pre-wire gates, crash recovery, review checklist
+Comments carry the *why* of a decision, at the single point where it is made. Repeating a rationale at call sites is how it goes stale.
 
-When adding comments to the code, dont be so verbose, also only explain why, not what
+## Detailed docs
+
+Read the one that covers what you are touching:
+
+| Doc | Read it when |
+| --- | --- |
+| `agent_docs/wa_web_reference.md` | Confirming any protocol behavior, limit, enum value, or stanza shape against real WA Web |
+| `agent_docs/protocol_architecture.md` | Building or parsing stanzas: `ProtocolNode`, `IqSpec`, derive macros, node helpers |
+| `agent_docs/noise_handshake.md` | Connection setup: XX/IK/fallback selection, server cert cache, failure classification |
+| `agent_docs/feature_implementation.md` | Starting a feature and needing its wire format from captured WA Web JS |
+| `agent_docs/signal_durability.md` | Any code that reads, mutates, persists, or sends Signal state |
+| `agent_docs/e2e_testing.md` | Writing or fixing tests under `tests/e2e/` |
+| `agent_docs/observability.md` | Adding a cache, counter, or anything reported by `memory_report()` / `stats()` |
+| `agent_docs/plugin_architecture.md` | Touching the `plugins` / `client-lifecycle` feature surface |
+| `agent_docs/voip_audio_codecs.md` | VoIP media: codec profiles, negotiation, encoded audio API |
+| `agent_docs/binary_size_ci.md` | A size gate failed, or a change adds dependencies or generic instantiations |
+| `agent_docs/debugging.md` | Decoding raw binary-protocol bytes by hand |

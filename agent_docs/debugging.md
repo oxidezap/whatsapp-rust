@@ -62,4 +62,4 @@ WhatsApp binary protocol uses nibble encoding for numeric strings. Each byte con
 // Encode: "100000000000001" -> "100000000000001f"
 ```
 
-See `wacore/binary/src/nibble.rs` for the implementation.
+The implementation is split across `wacore/binary/src/encoder.rs` and `decoder.rs`. The full token dictionaries WhatsApp Web uses are in whatspec's `generated/tokens/index.json` (see `wa_web_reference.md`) when a byte doesn't decode to what you expect.

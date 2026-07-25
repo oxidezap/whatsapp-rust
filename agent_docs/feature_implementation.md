@@ -1,59 +1,43 @@
-# Feature Implementation Guide
+# Finding a feature's wire format
 
-When adding a new feature, follow this flow that mirrors WhatsApp Web behavior while staying aligned with the project's architecture.
+The wire format is the ground truth, and it is discovered, not designed. Everything else — layering, ergonomics, tests — follows from it. This doc covers reading the raw bundle; conventions live in `AGENTS.md`, stanza mechanics in `protocol_architecture.md`.
 
-## Step-by-Step
+**Try the structured IR first.** `wa_web_reference.md` covers whatspec, which already extracts stanza shapes, enums, protocol limits, and notification dispatch into queryable JSON. Come back here when it can't answer — when the question is about control flow, ordering, or *when* a request is sent rather than what it contains.
 
-1. **Identify the wire format first**
-   - Capture or locate the WhatsApp Web request/response for the feature
-   - Extract the exact stanza structure: tags, attributes, and children
-   - Treat this as the ground truth for what must be sent and parsed
+## Where to look
 
-2. **Map the feature to the right layer**
-   - **wacore**: protocol logic, state traits, cryptographic helpers, data models (platform-agnostic)
-   - **whatsapp-rust**: runtime orchestration, storage integration, user-facing API
-   - **waproto**: protobuf structures only (no feature logic)
+`docs/captured-js/` is a local, untracked dump of WhatsApp Web (~3200 files under `WA/Smax/` alone). It is the highest-fidelity source available; whatsmeow and Baileys are second opinions when it is ambiguous.
 
-3. **Build minimal primitives before high-level APIs**
-   - Start with the smallest IQ/message builder that can successfully round-trip
-   - Parse and validate the response path before adding options or convenience
+Navigation that actually works:
 
-4. **Keep state changes behind the PersistenceManager**
-   - Use `DeviceCommand` + `PersistenceManager::process_command()` for mutations
-   - Use `get_device_snapshot()` for read access — sync, returns a cached `Arc<Device>` (refcount bump, no Device clone, no lock); hold it and borrow fields rather than cloning them
+- **`WA/Smax/Out*.js`** — outgoing request builders. `OutGroupsAddParticipantsRequest.js` is the shape of the stanza the client sends.
+- **`WA/Smax/In*.js`** — incoming response parsers, usually split into a success file and several error files per operation. The error files are where the server's failure taxonomy is written down.
+- Filenames repeat with a `__<hash>` suffix across bundle versions. Read the unsuffixed one; diff against a suffixed one only if you suspect the behavior changed between captures.
+- **`exports-map.json`** and **`dep-graph.json`** resolve a symbol to its module and find callers, which is faster than grepping 3000 files.
+- **`metadata.json`** lists GK gates — useful when a code path looks dead and is really feature-flagged.
 
-5. **Confirm concurrency requirements**
-   - Network I/O stays async
-   - Blocking or heavy CPU work goes into `tokio::task::spawn_blocking`
-   - Use `Client::chat_locks` to serialize per-chat operations when needed
+Patterns worth grepping across the dump: `xmlns:` for namespaces, `action:` for action attributes, `smax("tag", { attrs })` for node construction.
 
-6. **Add ergonomic API last**
-   - Once the protocol is stable, add Rust builders, enums, and result types
-   - Expose via `src/features/mod.rs` and re-export in `src/lib.rs`
+## Reading evidence honestly
 
-7. **Test and verify**
-   - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test --all`
-   - Use logging to compare with WhatsApp Web traffic where applicable
+Reading the JS gives you a hypothesis. If a capture yields an algorithm — a hash, a key derivation, a constant — run it against real captured data and report the hit rate against chance before building on it. "6 of 113 matched, 0.012 expected by chance" is evidence; "the code says md5" is a reading.
 
-## Protocol Architecture
+## Which crate
 
-For implementing `ProtocolNode`, `IqSpec`, derive macros, and node parsing patterns, read `agent_docs/protocol_architecture.md`.
+- **wacore** — protocol logic, state traits, crypto helpers, data models. Platform-agnostic: it also builds for wasm32 and ESP32.
+- **whatsapp-rust** — runtime orchestration, storage, user-facing API.
+- **waproto** — protobuf structures only.
 
-## Reverse Engineering Reference
+If a feature seems to need Tokio inside `wacore`, the split is wrong: the runtime-dependent half belongs in `whatsapp-rust`.
 
-The `docs/captured-js/` directory contains captured WhatsApp Web JavaScript. Use these to verify protocol implementations:
+## Order of construction
 
-**Key patterns to look for:**
-- `xmlns: "namespace"` - IQ namespaces
-- `action: "value"` - Action attributes
-- `smax("tag", { attrs })` - Node construction
-- Module names like `WASmaxOutBlocklists*` - Outgoing request builders
-- Module names like `WASmaxInBlocklists*` - Incoming response parsers
+Build the smallest builder that round-trips against the real server, and parse the response path before adding options or convenience. An ergonomic API built on an unverified stanza shape has to be rebuilt. Logging the client's own traffic next to a WA Web capture is the cheapest confirmation you get.
 
-## Quick Structure Guide
+## Map
 
-- **Protocol entry points**: `src/send.rs`, `src/message.rs`, `src/socket/`, `src/handshake.rs`
-- **Feature modules**: `src/features/`
-- **State + storage**: `src/store/` + `PersistenceManager`
-- **Core protocol & crypto**: `wacore/`
-- **Protobufs**: `waproto/`
+- Protocol entry points: `src/send.rs`, `src/message.rs`, `src/socket/`, `src/handshake.rs`
+- Feature modules: `src/features/`
+- State and storage: `src/store/` + `PersistenceManager`
+- Core protocol and crypto: `wacore/`
+- Protobufs: `waproto/`
