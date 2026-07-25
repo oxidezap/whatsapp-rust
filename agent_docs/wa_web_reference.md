@@ -9,7 +9,7 @@ Before adding or changing protocol logic, check it against what the official cli
 
 ## whatspec
 
-[`oxidezap/whatspec`](https://github.com/oxidezap/whatspec) parses the WhatsApp Web JS bundle with an `oxc` AST and emits a language-neutral IR: IQ stanzas, protobuf schemas, GraphQL persisted operations, app-state actions, feature flags, wire enums, notification dispatch, binary-protocol token dictionaries. The IR is the contract; the committed Rust modules are a reference consumer.
+[`oxidezap/whatspec`](https://github.com/oxidezap/whatspec) parses the WhatsApp Web JS bundle with an `oxc` AST and emits a language-neutral IR: IQ stanzas, protobuf schemas, GraphQL persisted operations, app-state actions, feature flags, wire enums, notification dispatch, binary-protocol token dictionaries. The IR is a derived model of the contract — a static reading of minified code, not the contract itself — and the committed Rust modules are one consumer of that model. Treat it as high-quality evidence, not as a specification; the limits are spelled out below.
 
 This repo already vendors parts of it — `wacore/src/iq/mex_operations.rs` is copied verbatim from `generated/mex/operations.rs`, and the protobuf and app-state work came from the same place. Refreshing a vendored file is a `cp`.
 

@@ -21,7 +21,7 @@ Timeouts that hold up in practice: 10-15s for event waits in online flows (event
 
 Each `TestClient` owns an isolated `InMemoryBackend`; the mock server is shared. Libtest runs tests inside a binary in parallel, so nothing may depend on test order — and file boundaries are organization, not synchronization.
 
-`unique_push_name()` gives server-side account isolation. In a multi-device test, create one unique name and pass it only to the clients that must share an account.
+`unique_push_name()` gives server-side account isolation — it appends a fresh UUID, so two clients built from the same prefix still land on different accounts. Sharing an account is therefore explicit: build one name and hand it to each device with `connect_as(prefix, &name)`, which pairs them to the same phone number under different device IDs.
 
 CI pins the mock-server image by digest, so an unchanged client commit always runs against the same protocol peer; bump it deliberately, together with the matching server change. Local runs need `CHATSTATE_TTL_SECS=3` on the mock — `chatstate_ttl.rs` depends on the same shortened expiry CI uses.
 
