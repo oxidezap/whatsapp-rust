@@ -330,12 +330,9 @@ pub fn merge_relay_data(base: RelayData, patch: RelayData) -> RelayData {
     }
 }
 
-/// The port a web client's relay media rides on. WA Web dials every relay candidate here regardless
-/// of the port the `<te2>` advertised, keeping the advertised one only as `originalPort`
-/// (`WAWebVoipSctpConnectionManager`: `TRUE_WEB_CLIENT_RELAY_PORT`, next to `FAUX_WEB_CLIENT_RELAY_PORT`
-/// = 3478). Relays that answer here are the ones that route a web client's media in BOTH directions:
-/// an endpoint on 3478 completes the handshake and accepts our uplink, but never forwards the peer's
-/// stream back (issue #1098).
+/// The port a web client's relay media rides on. Only relays answering here route a web client's
+/// media in both directions; one on 3478 completes the handshake and carries our uplink but never
+/// forwards the peer's stream back (issue #1098).
 pub const WEB_CLIENT_RELAY_PORT: u16 = 3480;
 
 /// FNA relays (is_fna=1, auth_token_id=0) are inbound-only; not for outbound relaylatency.
@@ -359,11 +356,8 @@ pub fn get_outbound_relay_endpoints(relay_data: &RelayData) -> Vec<RelayEndpoint
 
 /// The relay endpoint to connect the MEDIA transport to.
 ///
-/// Prefer an endpoint on [`WEB_CLIENT_RELAY_PORT`]: those are the ones that route a web client's
-/// media in BOTH directions. An endpoint on 3478 completes the handshake and happily carries our
-/// uplink -- the peer hears us -- but the relay never forwards the peer's stream back, so the call
-/// is silently one-way (issue #1098). This mirrors WA Web, which dials every candidate on 3480 and
-/// therefore only ever reaches the relays answering there.
+/// Prefer an endpoint on [`WEB_CLIENT_RELAY_PORT`], or the call goes silently one-way: the other
+/// endpoints connect and carry our uplink without ever delivering the peer's media.
 ///
 /// Below that: `auth_token_id` only gates relaylatency probes, so an offer that carries every
 /// endpoint with `auth_token_id=0` has no relaylatency candidate yet must still connect for media.
@@ -638,9 +632,8 @@ mod tests {
         assert_eq!(selected.relay_name, "real");
     }
 
-    /// A `<relay>` shaped like the ones WhatsApp actually hands an outgoing 1:1 call: three relays,
-    /// each with one IPv4 and one IPv6 address, and only the "true web client" one listening on
-    /// [`WEB_CLIENT_RELAY_PORT`]. Captured from a live call (issue #1098).
+    /// Captured from a live outgoing call: the mix that matters is one endpoint on
+    /// [`WEB_CLIENT_RELAY_PORT`] against lower-RTT ones on 3478.
     fn live_outgoing_relay() -> RelayData {
         let ep = |name: &str, id: u32, fna: bool, token_id: u32, auth: u32, ip: &str, port: u16| {
             RelayEndpoint {
@@ -686,12 +679,8 @@ mod tests {
         }
     }
 
-    /// The regression this whole module exists for: dialing a relay that does not listen on the web
-    /// client port gets an allocate-success and carries our uplink, but the relay never forwards the
-    /// peer's media back, so the call is one-way silent. WA Web pins every relay connection to 3480
-    /// (`WAWebVoipSctpConnectionManager`: `TRUE_WEB_CLIENT_RELAY_PORT`), which in practice selects the
-    /// only endpoint that answers there. Verified live: 3478 endpoints connect but never receive RTP;
-    /// the 3480 endpoint receives immediately.
+    /// Selecting by tier alone picks the lowest-RTT non-FNA endpoint, which is the one-way silent
+    /// case from issue #1098.
     #[test]
     fn media_relay_prefers_the_web_client_port_endpoint() {
         let rd = live_outgoing_relay();
