@@ -6,6 +6,14 @@
 # to reproduce them, including the two non-obvious setup steps, lives in
 # `scripts/mlow-vectors/mlow_frames.c`.
 #
+# The committed fixtures were produced with this exact oracle:
+#
+#   https://github.com/edgardmessias/opus_mlow at 84b076e0809412df22e8a0d26f944610c4a3e40f
+#
+# Byte-for-byte reproduction is only claimed against that revision. A different checkout can
+# change the output because the ORACLE changed, which is not the same thing as a decoder change,
+# so the script prints the revision it actually built against and warns when it differs.
+#
 # Requires a built `smpl` reference (the WhatsApp MLow fork of libopus):
 #
 #   cd "$MLOW_REFERENCE" && ./autogen.sh && ./configure --disable-shared --disable-doc \
@@ -35,6 +43,17 @@ if [[ ! -f "$ref/.libs/libopus.a" ]]; then
   echo "error: $ref/.libs/libopus.a not found; build the reference first (see the header of this script)" >&2
   exit 1
 fi
+
+# Recorded so a regeneration says which oracle produced it; see the header.
+expected_rev="84b076e0809412df22e8a0d26f944610c4a3e40f"
+actual_rev="$(git -C "$ref" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ "$actual_rev" == "unknown" ]]; then
+  echo "warning: $ref is not a git checkout; cannot confirm the oracle revision" >&2
+elif [[ "$actual_rev" != "$expected_rev" ]]; then
+  echo "warning: oracle is $actual_rev, fixtures were generated with $expected_rev" >&2
+  echo "         differences below may come from the reference, not from this repository" >&2
+fi
+echo "==> oracle: $ref @ $actual_rev"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

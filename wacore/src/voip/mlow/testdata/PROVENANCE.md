@@ -92,8 +92,13 @@ MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh
 
 The harness it builds lives in `scripts/mlow-vectors/mlow_frames.c`: it encodes `synth_mic.raw` at
 the requested duration through the `smpl` C reference and decodes each packet back, emitting both
-halves of the vector in one pass. Verified to reproduce the committed files byte for byte, so a
-regeneration that changes them is a real change and not tool drift.
+halves of the vector in one pass.
+
+The committed bytes were produced against one specific oracle —
+`github.com/edgardmessias/opus_mlow` at `84b076e0809412df22e8a0d26f944610c4a3e40f`. Reproduction is
+byte for byte **against that revision**, which is what makes a changed fixture a real change rather
+than tool drift; against a different checkout the reference itself may have moved, so the script
+prints the revision it built with and warns when it does not match.
 
 Both halves must be regenerated together — `decoder.rs::multi_frame_fixture_halves_stay_in_step`
 fails if the PCM length stops matching the frame count, and asserts every frame is still TOC `0x58`

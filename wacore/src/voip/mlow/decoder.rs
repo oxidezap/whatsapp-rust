@@ -447,7 +447,14 @@ mod tests {
                 .expect("mlow_120ms_frames.json");
         let pcm_bytes = include_bytes!("testdata/ref_120ms_expected.raw").len();
 
-        assert!(!frames.is_empty(), "fixture is empty");
+        // An absolute count, not just "non-empty": a regeneration that ends early produces a
+        // shorter vector whose PCM length still matches its own frame count, so a relative check
+        // would accept it and the coverage loss would be invisible.
+        assert_eq!(
+            frames.len(),
+            8,
+            "fixture no longer holds the 8 packets it was generated with; a short regeneration              silently reduces coverage"
+        );
         for (i, f) in frames.iter().enumerate() {
             let toc = hex::decode(f).expect("hex frame")[0];
             assert_eq!(

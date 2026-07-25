@@ -93,8 +93,16 @@ int main(int argc, char **argv) {
     }
 
     int emitted = 0;
+    int short_read = 0;
     for (int n = 0; want < 0 || n < want; n++) {
         if (fread(pcm, sizeof(opus_int16), (size_t)samps, f) != (size_t)samps) {
+            // A partial frame at EOF, or a read error. Either way this run cannot produce the
+            // vector that was asked for, and callers overwrite committed fixtures with whatever
+            // comes out of it -- so remember it and fail below rather than emit a short vector.
+            short_read = 1;
+            if (ferror(f)) {
+                perror("read input");
+            }
             break;
         }
         opus_int32 len = opus_encode(enc, pcm, samps, packet, sizeof(packet));
@@ -121,10 +129,25 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "emitted %d packet(s) of %d ms\n", emitted, frame_ms);
+
+    // Exiting 0 with fewer packets than requested would let a regeneration quietly replace a
+    // fixture with a smaller one: the relative length checks downstream stay satisfied, so the
+    // coverage loss is invisible. A short count is a failure, not a partial success.
+    int ok = 1;
+    if (emitted == 0) {
+        fprintf(stderr, "error: no packets emitted\n");
+        ok = 0;
+    } else if (want >= 0 && emitted != want) {
+        fprintf(stderr,
+                "error: asked for %d packet(s) but the input only yielded %d%s\n",
+                want, emitted, short_read ? " (short read)" : "");
+        ok = 0;
+    }
+
     free(pcm);
     free(out);
     opus_encoder_destroy(enc);
     opus_decoder_destroy(dec);
     fclose(f);
-    return emitted > 0 ? 0 : 1;
+    return ok ? 0 : 1;
 }
