@@ -5,12 +5,15 @@
 //! run an SCTP association over it, and open the pre-negotiated id=0 DataChannel that carries
 //! STUN/RTP/RTCP as binary messages.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bytes::Bytes;
+use log::debug;
 use tokio::net::UdpSocket;
 use webrtc_data::data_channel::{Config as DcConfig, DataChannel};
 use webrtc_data::message::message_channel_open::ChannelType;
@@ -24,6 +27,7 @@ use webrtc_util_011::Conn as Conn011;
 
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::voip::engine::TxIdSource;
+use wacore::voip::relay_parse::WEB_CLIENT_RELAY_PORT;
 use wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
@@ -308,6 +312,23 @@ impl RelayMediaChannelFactory {
     }
 }
 
+/// The relay addresses to dial concurrently for `advertised`.
+///
+/// Which of the two media ports a relay serves is NOT derivable from the offer, and it varies per
+/// relay host AND per session: a host may advertise 3478 and answer only on
+/// [`WEB_CLIENT_RELAY_PORT`], or advertise and honour the same port. So either choice alone
+/// black-holes for some relays, costing a full `RELAY_CONNECT_TIMEOUT` and failing the call.
+///
+/// The advertised port comes first so a relay that honours it is dialled on the port it asked for.
+/// Never yields a duplicate, which would double-dial the same endpoint for nothing.
+fn dial_candidates(advertised: SocketAddr) -> Vec<SocketAddr> {
+    let mut out = vec![advertised];
+    if advertised.port() != WEB_CLIENT_RELAY_PORT {
+        out.push(SocketAddr::new(advertised.ip(), WEB_CLIENT_RELAY_PORT));
+    }
+    out
+}
+
 #[async_trait]
 impl RelayTransportFactory for RelayMediaChannelFactory {
     async fn connect(
@@ -316,21 +337,64 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
+        // Race every candidate port (see `dial_candidates`) and keep whichever completes the
+        // handshake. `select_ok` discards the losers' errors and drops their futures, aborting those
+        // dials. Cost when the advertised port is the right one is a second UDP socket for the
+        // duration of the handshake; trying serially would instead add a full RELAY_CONNECT_TIMEOUT
+        // to every call on the other relay family.
+        let dialed = dial_candidates(self.addr);
+        // Whichever candidate wins is the only record of whether this relay honoured the port it
+        // advertised, and `select_ok` yields just the winner's output - so carry the address through
+        // rather than reconstruct it. Also tags each error with its address: `select_ok` propagates
+        // only the LAST error, which without this would name no endpoint at all.
+        let candidates: Vec<
+            Pin<Box<dyn Future<Output = Result<(SocketAddr, RelayMediaChannel)>> + Send>>,
+        > = dialed
+            .iter()
+            .map(|&addr| {
+                let runtime = self.runtime.clone();
+                Box::pin(async move {
+                    match connect_relay_media(addr, runtime).await {
+                        Ok(chan) => Ok((addr, chan)),
+                        Err(e) => Err(anyhow!("{addr}: {e}")),
+                    }
+                }) as Pin<Box<dyn Future<Output = _> + Send>>
+            })
+            .collect();
+        let tried = dialed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         // Bound the UDP+DTLS+SCTP+DataChannel handshake: a relay whose UDP is reachable but whose
         // DTLS/SCTP wedges (black-holed endpoint) would otherwise park the caller forever with no
         // failure surfaced. Matches the old connect_and_allocate's 12s timeout.
-        let chan = Arc::new(
-            wacore::runtime::timeout(
-                &*self.runtime,
-                RELAY_CONNECT_TIMEOUT,
-                connect_relay_media(self.addr, self.runtime.clone()),
+        let (winner, chan) = wacore::runtime::timeout(
+            &*self.runtime,
+            RELAY_CONNECT_TIMEOUT,
+            futures::future::select_ok(candidates),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} \
+                 (DTLS/SCTP didn't complete); tried {tried}"
             )
-                .await
-                .map_err(|_| {
-                    anyhow!("relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} (DTLS/SCTP didn't complete)")
-                })?
-                .map_err(|e| anyhow!("relay connect: {e}"))?,
+        })?
+        .map_err(|e| anyhow!("relay connect: {e}; tried {tried}"))?
+        .0;
+        // The advertised port and the port that answered diverge per host and per session, so this
+        // is the only place that fact is observable in production.
+        debug!(
+            "voip: relay media connected on {winner} (advertised {}){}",
+            self.addr,
+            if winner == self.addr {
+                ""
+            } else {
+                " - relay did NOT serve its advertised port"
+            }
         );
+        let chan = Arc::new(chan);
         let (tx, rx) = async_channel::bounded(RELAY_EVENT_CAP);
         let _ = tx.try_send(RelayTransportEvent::Connected);
         // Pump over a clone of just the DataChannel, not the channel that owns the handle: the task
@@ -449,6 +513,28 @@ mod tests {
 
     // Reads become PacketReceived events; a drained stream (Ok(0)) becomes Disconnected(Closed) and
     // ends the pump. Unbounded channel so the EOF send never blocks.
+    /// A relay that advertises 3478 must still be tried on the web client port, since which of the
+    /// two a host actually serves is not visible in the offer.
+    #[test]
+    fn dial_candidates_adds_the_web_client_port() {
+        let advertised: SocketAddr = "57.144.43.57:3478".parse().unwrap();
+        assert_eq!(
+            dial_candidates(advertised),
+            vec![
+                advertised,
+                "57.144.43.57:3480".parse::<SocketAddr>().unwrap()
+            ],
+            "the advertised port is dialled first, with 3480 raced alongside it"
+        );
+    }
+
+    /// The failure case: an endpoint already on the web client port must not be dialled twice.
+    #[test]
+    fn dial_candidates_does_not_duplicate_the_web_client_port() {
+        let advertised: SocketAddr = "170.78.54.98:3480".parse().unwrap();
+        assert_eq!(dial_candidates(advertised), vec![advertised]);
+    }
+
     #[tokio::test]
     async fn pump_maps_reads_then_eof_to_disconnect() {
         let reader = ScriptedReader::new([Ok(vec![1, 2, 3]), Ok(vec![4, 5])]);
