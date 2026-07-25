@@ -105,6 +105,21 @@ async fn test_ack_behavior_for_incoming_stanzas() {
         "should_ack must return TRUE for status@broadcast <message> (fallback for drop paths)."
     );
 
+    // The server may deliver a status update as a top-level <status> stanza
+    // instead of <message from="status@broadcast">. It expects the same
+    // transport ack back (it demands it as <stream:error><ack class="status"/>
+    // and recycles the stream until it arrives).
+    let mut status_stanza_attrs = Attrs::new();
+    status_stanza_attrs.insert("from".to_string(), "status@broadcast".to_string());
+    status_stanza_attrs.insert("id".to_string(), "STATUS-STANZA-1".to_string());
+    status_stanza_attrs.insert("participant".to_string(), "200725430796339@lid".to_string());
+    status_stanza_attrs.insert("type".to_string(), "media".to_string());
+    let status_stanza = Node::new("status", status_stanza_attrs, None);
+    assert!(
+        client.should_ack(&status_stanza.as_node_ref()),
+        "should_ack must return TRUE for a top-level <status> stanza."
+    );
+
     info!(
         "✅ test_ack_behavior_for_incoming_stanzas passed: Client correctly differentiates which stanzas to acknowledge."
     );

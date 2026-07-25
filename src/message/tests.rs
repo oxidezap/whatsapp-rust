@@ -12073,3 +12073,233 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
     // NACK path, which never bumps the retry caches.
     await_retry_receipt(&client, &info, 1, RetryReason::InvalidKeyId).await;
 }
+
+/// Production regression: the server delivers E2EE status updates as a
+/// top-level `<status>` stanza (WA Web `handleMessagingStanza` rewrites the tag
+/// to `message` under the `status_e2ee_recv_over_status_stanza` abprop). With
+/// the tag unhandled the client never acks, so the server redelivers the same
+/// id on every reconnect and then closes the stream with
+/// `<stream:error><ack class="status"/></stream:error>`.
+#[tokio::test]
+async fn status_stanza_gets_transport_ack() {
+    let (client, transport) = capturing_client("status_stanza_ack").await;
+
+    let status = NodeBuilder::new("status")
+        .attr("from", "status@broadcast")
+        .attr("type", "media")
+        .attr("id", "ACSTATUSSTANZA1")
+        .attr("participant", "200725430796339@lid")
+        .attr("t", "1784819907")
+        .children([NodeBuilder::new("enc")
+            .attr("v", "2")
+            .attr("type", "skmsg")
+            .bytes(vec![1, 2, 3])
+            .build()])
+        .build();
+
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&status))
+        .await;
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(frame) = transport.sent().first().cloned() {
+                return frame;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a <status> stanza must be acknowledged on the wire");
+
+    let bytes = decode_frame(0, &frame).expect("ack frame should decrypt");
+    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("ack frame should decode");
+    assert_eq!(ack.tag.as_ref(), "ack");
+    assert!(
+        ack.get_attr("class")
+            .is_some_and(|v| v.as_str() == "status"),
+        "WA Web acks a status stanza with class=\"status\" (the class the server \
+         demands back in <stream:error><ack class=\"status\"/>), got {:?}",
+        ack.get_attr("class").map(|v| v.as_str().to_string())
+    );
+    assert!(
+        ack.get_attr("id")
+            .is_some_and(|v| v.as_str() == "ACSTATUSSTANZA1")
+    );
+    assert!(
+        ack.get_attr("to")
+            .is_some_and(|v| v.as_str() == "status@broadcast")
+    );
+    assert!(
+        ack.get_attr("participant")
+            .is_some_and(|v| v.as_str() == "200725430796339@lid")
+    );
+    assert!(
+        ack.get_attr("type").is_some_and(|v| v.as_str() == "media"),
+        "the stanza type is echoed back, matching WA Web sendAck"
+    );
+    assert!(
+        ack.get_attr("from")
+            .is_some_and(|v| v.as_str() == "5511000000001@s.whatsapp.net"),
+        "WA Web sendAck always carries the own device JID for message-class acks"
+    );
+}
+
+/// A `<status>` stanza must reach the message pipeline (WA Web retags it to
+/// `message`), not just get acked: otherwise every E2EE status update is
+/// silently dropped.
+#[tokio::test]
+async fn status_stanza_is_routed_to_the_message_pipeline() {
+    let (client, _transport) = capturing_client("status_stanza_routing").await;
+
+    let status = NodeBuilder::new("status")
+        .attr("from", "status@broadcast")
+        .attr("type", "media")
+        .attr("id", "ACSTATUSSTANZA2")
+        .attr("participant", "200725430796339@lid")
+        .attr("t", "1784819907")
+        .children([NodeBuilder::new("enc")
+            .attr("v", "2")
+            .attr("type", "skmsg")
+            .bytes(vec![1, 2, 3])
+            .build()])
+        .build();
+
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&status))
+        .await;
+
+    let status_jid: Jid = "status@broadcast".parse().expect("status jid should parse");
+    assert!(
+        client.chat_lanes.get(&status_jid).await.is_some(),
+        "a <status> stanza must be enqueued on the status@broadcast chat lane"
+    );
+}
+
+/// WA Web nacks every stanza it does not recognize
+/// (`createNackFromStanza(NackReason.UnrecognizedStanza)`); staying silent is
+/// what let an unhandled `<status>` stanza sit in the offline queue for days,
+/// with the server recycling the stream every ~50 min to demand its ack.
+#[tokio::test]
+async fn unrecognized_stanza_is_nacked() {
+    let (client, transport) = capturing_client("unrecognized_stanza_nack").await;
+
+    let unknown = NodeBuilder::new("totally_unknown_stanza")
+        .attr("from", "status@broadcast")
+        .attr("id", "UNKNOWN-1")
+        .attr("participant", "200725430796339@lid")
+        .attr("type", "media")
+        .build();
+
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&unknown))
+        .await;
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(frame) = transport.sent().first().cloned() {
+                return frame;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("an unrecognized stanza must be nacked so the server stops retrying");
+
+    let bytes = decode_frame(0, &frame).expect("nack frame should decrypt");
+    let nack =
+        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("nack frame should decode");
+    assert_eq!(nack.tag.as_ref(), "ack");
+    assert!(
+        nack.get_attr("class")
+            .is_some_and(|v| v.as_str() == "totally_unknown_stanza"),
+        "WA Web echoes the original tag as the nack class"
+    );
+    assert!(
+        nack.get_attr("error").is_some_and(|v| v.as_str() == "488"),
+        "UnrecognizedStanza is error 488"
+    );
+    assert!(
+        nack.get_attr("id")
+            .is_some_and(|v| v.as_str() == "UNKNOWN-1")
+    );
+    assert!(
+        nack.get_attr("to")
+            .is_some_and(|v| v.as_str() == "status@broadcast")
+    );
+    assert!(
+        nack.get_attr("participant")
+            .is_some_and(|v| v.as_str() == "200725430796339@lid")
+    );
+    assert!(nack.get_attr("type").is_some_and(|v| v.as_str() == "media"));
+}
+
+/// The nack needs `id` + `from` to be routable, exactly like WA Web's
+/// `createNackFromStanza` guard; without them it must stay silent instead of
+/// putting a malformed ack on the wire.
+#[tokio::test]
+async fn unrecognized_stanza_without_id_is_not_nacked() {
+    let (client, transport) = capturing_client("unrecognized_stanza_no_id").await;
+
+    let unknown = NodeBuilder::new("totally_unknown_stanza")
+        .attr("from", "s.whatsapp.net")
+        .build();
+
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&unknown))
+        .await;
+
+    // Give any spawned send a chance to reach the transport before asserting.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        transport.sent_count(),
+        0,
+        "a stanza with no id cannot be nacked"
+    );
+}
+
+/// A `<status>` from a newsletter is not the status@broadcast shape, so it
+/// keeps the router path; unhandled, it must be nacked exactly once — never a
+/// plain ack alongside the nack.
+#[tokio::test]
+async fn newsletter_status_stanza_is_nacked_once() {
+    let (client, transport) = capturing_client("newsletter_status_nack").await;
+
+    let status = NodeBuilder::new("status")
+        .attr("from", "120363298765432100@newsletter")
+        .attr("id", "NL-STATUS-1")
+        .attr("type", "media")
+        .build();
+
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&status))
+        .await;
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(frame) = transport.sent().first().cloned() {
+                return frame;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("an unhandled newsletter <status> must be nacked");
+
+    let bytes = decode_frame(0, &frame).expect("nack frame should decrypt");
+    let nack =
+        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("nack frame should decode");
+    assert_eq!(nack.tag.as_ref(), "ack");
+    assert!(nack.get_attr("error").is_some_and(|v| v.as_str() == "488"));
+
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        transport.sent_count(),
+        1,
+        "the nack replaces the ack; the server must not get both"
+    );
+}

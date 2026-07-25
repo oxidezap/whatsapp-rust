@@ -36,6 +36,31 @@ impl ReadLoopError {
     }
 }
 
+/// Test the `from` attribute against a JID predicate without materializing an
+/// owned `Jid`: an already-parsed attribute is borrowed as-is and a string one
+/// is parsed in place, so neither branch allocates. This runs once per inbound
+/// stanza, so `ValueRef::to_jid`'s owned `Jid` would be pure churn.
+#[inline]
+fn from_jid_matches(
+    node: &wacore_binary::NodeRef<'_>,
+    pred: impl Fn(&wacore_binary::jid::JidRef<'_>) -> bool,
+) -> bool {
+    match node.get_attr("from") {
+        Some(wacore_binary::node::ValueRef::Jid(jid)) => pred(jid),
+        Some(wacore_binary::node::ValueRef::String(s)) => {
+            wacore_binary::jid::parse_jid_ref(s.as_ref()).is_some_and(|jid| pred(&jid))
+        }
+        None => false,
+    }
+}
+
+/// A top-level `<status from="status@broadcast">` stanza: the wire shape the
+/// server uses for E2EE status updates once `status_e2ee_recv_over_status_stanza`
+/// is on, carrying the same payload as `<message from="status@broadcast">`.
+fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
+    from_jid_matches(node, |jid| jid.is_status_broadcast())
+}
+
 impl Client {
     /// Read the current semaphore generation and Arc atomically under the mutex.
     pub(crate) fn read_message_semaphore(&self) -> (u64, Arc<async_lock::Semaphore>) {
@@ -517,6 +542,17 @@ impl Client {
                 )
                 .await;
             }
+            // WA Web `handleMessagingStanza` retags a non-newsletter `<status>`
+            // to `message` and runs the normal pipeline; the stanza only differs
+            // in tag. Anything else (newsletter status) keeps the router path.
+            "status" if is_status_broadcast_stanza(nr) => {
+                crate::handlers::message::MessageHandler::handle_inline(
+                    self.clone(),
+                    node,
+                    &mut cancelled,
+                )
+                .await;
+            }
             _ => {
                 let handled = self
                     .stanza_router
@@ -527,6 +563,9 @@ impl Client {
                         "Received unknown top-level node: {}",
                         DisplayableNodeRef(node.get())
                     );
+                    // The nack IS this stanza's acknowledgement, so drop the
+                    // deferred plain ack the gate may have armed.
+                    cancelled |= self.nack_unrecognized_stanza(node.get());
                 }
             }
         }
@@ -534,6 +573,26 @@ impl Client {
         if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }
+    }
+
+    /// Tell the server we cannot handle this stanza, so it drops it from the
+    /// offline queue instead of redelivering it forever. WA Web ends
+    /// `handleLoggedInStanza` with `createNackFromStanza(UnrecognizedStanza)`
+    /// for exactly this reason; staying silent is what let an unhandled
+    /// `<status>` stanza recycle the stream every ~50 minutes for days.
+    ///
+    /// Like WA Web, a stanza without `id`/`from` is skipped: the nack would
+    /// have nothing to address. Returns whether a nack was queued.
+    fn nack_unrecognized_stanza(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
+        if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
+            return false;
+        }
+        self.spawn_stanza_nack(
+            node,
+            wacore::protocol::nack::NackReason::UnrecognizedStanza,
+            None,
+        );
+        true
     }
 
     /// Per WA Web (`Handle/MsgSendReceipt.js`), only newsletter `<message>`
@@ -553,14 +612,13 @@ impl Client {
         if node.get_attr("id").is_none() {
             return false;
         }
-        let Some(from) = node.get_attr("from") else {
+        if node.get_attr("from").is_none() {
             return false;
-        };
+        }
         match tag {
             "receipt" | "notification" | "call" => true,
-            "message" => from
-                .to_jid()
-                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
+            "message" => from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast()),
+            "status" => is_status_broadcast_stanza(node),
             _ => false,
         }
     }
@@ -1466,7 +1524,9 @@ impl Client {
                             .map(|v| v.as_str().to_string())
                             .unwrap_or_default();
                         warn!(
-                            "Stream error carrying <ack> (class={class:?}, id={id}): server-driven stream rotation, not an ack rejection; reconnect follows on stream end"
+                            "Stream error carrying <ack> (class={class:?}, id={id}): the server is \
+                             still owed a transport ack for that stanza and recycles the stream \
+                             until it arrives; reconnect follows on stream end"
                         );
                     } else {
                         warn!("Unknown stream error: {}", DisplayableNodeRef(node));
