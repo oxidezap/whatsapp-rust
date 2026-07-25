@@ -1,6 +1,6 @@
 //! Outgoing message pipeline.
 //!
-//! Cost model, clock reads: one per send operation, sampled as [`SendInstant`]
+//! Cost model, clock reads: one per send operation, sampled as `SendInstant`
 //! and carried to every stamp. A new timestamp here should take that instant
 //! rather than read again, or the path silently accumulates reads the way it
 //! had accumulated four.
