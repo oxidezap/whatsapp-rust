@@ -436,6 +436,33 @@ mod tests {
         assert!(!dec.had_error(), "the drop must not open the range decoder");
     }
 
+    /// The two halves of a cross-check vector come out of one harness run and mean nothing apart:
+    /// refreshing only one leaves the comparison reading mismatched data, which surfaces as a
+    /// correlation number that moved rather than as an obvious error. Pin what ties them, and pin
+    /// that the fixture still exercises the multi-frame path it was added for.
+    #[test]
+    fn multi_frame_fixture_halves_stay_in_step() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_120ms_frames.json"))
+                .expect("mlow_120ms_frames.json");
+        let pcm_bytes = include_bytes!("testdata/ref_120ms_expected.raw").len();
+
+        assert!(!frames.is_empty(), "fixture is empty");
+        for (i, f) in frames.iter().enumerate() {
+            let toc = hex::decode(f).expect("hex frame")[0];
+            assert_eq!(
+                toc, 0x58,
+                "frame {i} is TOC {toc:#04x}, not the 120 ms packet this fixture exists to cover"
+            );
+        }
+        assert_eq!(
+            pcm_bytes,
+            frames.len() * 6 * SMPL_INTF_LEN * 2,
+            "reference PCM does not match the frame count; regenerate both halves together with \
+             scripts/regenerate-mlow-vectors.sh"
+        );
+    }
+
     /// The content check: decode a stream of real 120 ms packets and compare against the reference
     /// decoder's own output for the same bytes. Geometry alone is not enough, since running the loop
     /// the wrong number of times would still produce plausibly-shaped audio while consuming the

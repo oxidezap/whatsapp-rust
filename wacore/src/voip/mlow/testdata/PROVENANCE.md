@@ -79,17 +79,32 @@ exact wire bytes (config-1 `0x10` and config-2 `0x12` frames included). The trip
 committed stream still carries `0x10`, `0x12`, and `0x50` TOCs so the per-config decode branches stay
 covered; regenerating it requires the external encoder above on `synth_mic.raw`.
 
-## Multi-frame (120 ms) packets
+## Multi-frame (120 ms) packets — regenerable in one command
 
 | fixture | consumer / test | oracle recipe |
 | --- | --- | --- |
-| `mlow_120ms_frames.json` | `decoder.rs::multi_frame_decode_matches_the_reference` | `smpl` C reference encoding `synth_mic.raw` at 120 ms, hex frames |
-| `ref_120ms_expected.raw` | same test | the same C reference decoding those frames; s16le @ 16 kHz |
+| `mlow_120ms_frames.json` | `decoder.rs::multi_frame_decode_matches_the_reference` | `scripts/regenerate-mlow-vectors.sh` |
+| `ref_120ms_expected.raw` | same test | same run of the same script |
 
-Also not Rust-reproducible: this crate's encoder only emits 60 ms packets. Both files come from one
-run of a harness linked against the `smpl` C reference, which encodes `synth_mic.raw` in 1920-sample
-(120 ms) frames and decodes each packet back, emitting `<hex payload> <hex s16le pcm>` per line. The
-encoder needs `smpl_CreateCodec()` before the first `opus_encode` (it fails
-`SMPL_ENC_NO_GLOBAL_DATA` otherwise), `OPUS_SET_USING_SMPL(1)`, and a `max_data_bytes` the CBR pad
-can satisfy. Every frame is TOC `0x58`, which the test asserts so the fixture cannot silently drift
-off the multi-frame path.
+```sh
+MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh
+```
+
+The harness it builds lives in `scripts/mlow-vectors/mlow_frames.c`: it encodes `synth_mic.raw` at
+the requested duration through the `smpl` C reference and decodes each packet back, emitting both
+halves of the vector in one pass. Verified to reproduce the committed files byte for byte, so a
+regeneration that changes them is a real change and not tool drift.
+
+Both halves must be regenerated together — `decoder.rs::multi_frame_fixture_halves_stay_in_step`
+fails if the PCM length stops matching the frame count, and asserts every frame is still TOC `0x58`
+so the fixture cannot quietly drift off the multi-frame path.
+
+## What is still not reproducible, and why
+
+The fixtures above the multi-frame section predate the harness and were produced by tools that no
+longer exist here. The harness reproduces their SHAPE — run at 60 ms with DTX off it emits the same
+TOC mix as `inbound_capture_frames.json` (13x `0x10`, 2x `0x12`, 95x `0x50`) — but not their exact
+bytes: packet sizes bracket the committed ones without landing on them, so the original run used an
+encoder configuration (or reference build) that was not recorded. Regenerating them would therefore
+REPLACE those vectors rather than reproduce them, which is a deliberate decision to make with the
+correlation thresholds in hand, not a mechanical refresh.

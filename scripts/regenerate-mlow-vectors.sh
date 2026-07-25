@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Regenerate the MLow decoder cross-check fixtures from the `smpl` C reference.
+#
+# Consumers never run this — the fixtures are committed and the tests read them directly. It
+# exists so the vectors stop being a documented recipe with a missing binary: everything needed
+# to reproduce them, including the two non-obvious setup steps, lives in
+# `scripts/mlow-vectors/mlow_frames.c`.
+#
+# Requires a built `smpl` reference (the WhatsApp MLow fork of libopus):
+#
+#   cd "$MLOW_REFERENCE" && ./autogen.sh && ./configure --disable-shared --disable-doc \
+#     --disable-extra-programs && make -j"$(nproc)"
+#
+# Then:
+#
+#   MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh
+#
+# Regenerating changes committed fixtures. Re-run the decoder suite afterwards and treat any
+# correlation change as a finding, not as a number to paper over:
+#
+#   cargo test -p wacore --features voip-mlow --lib
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+testdata="$repo_root/wacore/src/voip/mlow/testdata"
+harness_src="$repo_root/scripts/mlow-vectors/mlow_frames.c"
+
+ref="${MLOW_REFERENCE:-}"
+if [[ -z "$ref" ]]; then
+  echo "error: set MLOW_REFERENCE to the built smpl/opus reference checkout" >&2
+  exit 1
+fi
+if [[ ! -f "$ref/.libs/libopus.a" ]]; then
+  echo "error: $ref/.libs/libopus.a not found; build the reference first (see the header of this script)" >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+echo "==> building the harness against $ref"
+cc -O2 \
+  -I "$ref/include" -I "$ref/src" -I "$ref/celt" -I "$ref" \
+  -o "$work/mlow_frames" "$harness_src" "$ref/.libs/libopus.a" -lm
+
+# One packet per line: "<hex payload> <hex s16le pcm>". Split into the frames fixture and the
+# reference PCM the decoder test compares against.
+emit() {
+  local frame_ms="$1" packets="$2" frames_json="$3" pcm_raw="$4"
+  echo "==> ${frame_ms}ms x ${packets} -> $(basename "$frames_json"), $(basename "$pcm_raw")"
+  "$work/mlow_frames" "$testdata/synth_mic.raw" "$frame_ms" "$packets" > "$work/vectors.txt"
+  python3 - "$work/vectors.txt" "$frames_json" "$pcm_raw" <<'PY'
+import json, sys
+src, frames_path, pcm_path = sys.argv[1:4]
+frames, pcm = [], bytearray()
+for line in open(src):
+    payload, samples = line.split()
+    frames.append(payload)
+    pcm += bytes.fromhex(samples)
+json.dump(frames, open(frames_path, "w"), indent=1)
+open(pcm_path, "wb").write(pcm)
+print(f"   {len(frames)} frames, {len(pcm)//2} samples, TOCs: {sorted({f[:2] for f in frames})}")
+PY
+}
+
+emit 120 8 "$testdata/mlow_120ms_frames.json" "$testdata/ref_120ms_expected.raw"
+
+echo "==> done; re-run: cargo test -p wacore --features voip-mlow --lib"
