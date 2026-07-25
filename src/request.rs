@@ -190,8 +190,9 @@ impl Client {
     /// second (see [`RequestUtils::generate_message_id_at`]).
     pub(crate) fn generate_message_id_at(&self, unix_secs: u64) -> String {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        self.get_request_utils()
-            .generate_message_id_at(device_snapshot.pn.as_ref(), unix_secs)
+        // Associated function on purpose: building a RequestUtils here cloned
+        // the unique id per message, and the derivation never reads it.
+        RequestUtils::message_id_at(device_snapshot.pn.as_ref(), unix_secs)
     }
 
     fn get_request_utils(&self) -> RequestUtils {
