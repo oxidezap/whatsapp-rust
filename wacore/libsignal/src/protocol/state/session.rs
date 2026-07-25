@@ -444,19 +444,27 @@ impl SessionState {
         next_chain_key: &ChainKey,
     ) -> Result<(), InvalidSessionError> {
         use bytes::Bytes;
-        let chain_key = session_structure::chain::ChainKey {
-            index: Some(next_chain_key.index()),
-            key: Some(Bytes::copy_from_slice(next_chain_key.key())),
-        };
-
-        let mut new_chain = self
+        let chain = self
             .session
             .sender_chain
-            .take()
+            .as_option_mut()
             .ok_or(InvalidSessionError("missing sender chain"))?;
-        new_chain.chain_key = MessageField::some(chain_key);
 
-        self.session.sender_chain = MessageField::some(new_chain);
+        // Overwrite the boxed ChainKey in place. Ratchet advance runs once per
+        // sent message, so allocating a fresh Box for a two-field struct was
+        // per-message churn for no state change beyond these two fields.
+        match chain.chain_key.as_option_mut() {
+            Some(existing) => {
+                existing.index = Some(next_chain_key.index());
+                existing.key = Some(Bytes::copy_from_slice(next_chain_key.key()));
+            }
+            None => {
+                chain.chain_key = MessageField::some(session_structure::chain::ChainKey {
+                    index: Some(next_chain_key.index()),
+                    key: Some(Bytes::copy_from_slice(next_chain_key.key())),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -585,11 +593,21 @@ impl SessionState {
             .expect("called set_receiver_chain_key for a non-existent chain");
 
         use bytes::Bytes;
-        self.session.receiver_chains[chain_idx].chain_key =
-            MessageField::some(session_structure::chain::ChainKey {
-                index: Some(chain_key.index()),
-                key: Some(Bytes::copy_from_slice(chain_key.key())),
-            });
+        // Same in-place update as the sender chain: this runs once per received
+        // message, and the box only ever holds these two fields.
+        let target = &mut self.session.receiver_chains[chain_idx].chain_key;
+        match target.as_option_mut() {
+            Some(existing) => {
+                existing.index = Some(chain_key.index());
+                existing.key = Some(Bytes::copy_from_slice(chain_key.key()));
+            }
+            None => {
+                *target = MessageField::some(session_structure::chain::ChainKey {
+                    index: Some(chain_key.index()),
+                    key: Some(Bytes::copy_from_slice(chain_key.key())),
+                });
+            }
+        }
 
         Ok(())
     }
