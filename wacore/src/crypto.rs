@@ -25,12 +25,10 @@ pub fn md5_digest(input: &[u8]) -> [u8; 16] {
 const CONTACT_NOTIFICATION_HASH_SUFFIX: &[u8] = b"WA_ADD_NOTIF";
 
 /// The contact identifier carried by `<notification type="devices">
-/// <update hash="..."/></notification>`: the first 3 bytes of
-/// `md5(user + "WA_ADD_NOTIF")`, base64-encoded on the wire (4 chars).
+/// <update hash="..."/></notification>`, base64-encoded on the wire.
 ///
-/// `user` is the bare user part of the contact's JID (WA Web hashes
-/// `createWid(contact.id).user`, which is LID-namespaced for migrated
-/// contacts). Fed incrementally so no concatenation buffer is allocated.
+/// `user` is the bare user part of the contact's JID, LID-namespaced for
+/// migrated contacts. Fed incrementally to avoid a concatenation buffer.
 pub fn contact_notification_hash(user: &str) -> [u8; 3] {
     let mut context = md5::Context::new();
     context.consume(user.as_bytes());
@@ -96,16 +94,16 @@ pub fn calculate_curve_signature(
 mod tests {
     use super::*;
 
-    /// Vectors captured from a live `<notification type="devices">
-    /// <update hash="..."/>` stream, cross-checked against the LIDs seen in the
-    /// same session.
+    /// The construction was confirmed against a live `<notification
+    /// type="devices"><update hash="..."/>` stream before these fictitious
+    /// vectors were derived from it.
     #[test]
     fn contact_notification_hash_matches_wire_vectors() {
         use base64::Engine as _;
         for (user, wire) in [
-            ("196314885312593", "TNcq"),
-            ("171588355903730", "XYZ6"),
-            ("202018165633152", "dcjp"),
+            ("100000000000001", "s7oK"),
+            ("100000000000002", "P2DY"),
+            ("100000000000003", "4ZhY"),
         ] {
             let encoded =
                 base64::engine::general_purpose::STANDARD.encode(contact_notification_hash(user));
@@ -120,7 +118,7 @@ mod tests {
 
     #[test]
     fn malformed_contact_hashes_are_rejected() {
-        for wire in ["", "TNc", "TNcqX", "TNcq==", "!!!!", "TNcqTNcq"] {
+        for wire in ["", "s7o", "s7oKX", "s7oK==", "!!!!", "s7oKs7oK"] {
             assert_eq!(
                 parse_contact_notification_hash(wire),
                 None,

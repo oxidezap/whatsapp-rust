@@ -36,10 +36,8 @@ impl ReadLoopError {
     }
 }
 
-/// Test the `from` attribute against a JID predicate without materializing an
-/// owned `Jid`: an already-parsed attribute is borrowed as-is and a string one
-/// is parsed in place, so neither branch allocates. This runs once per inbound
-/// stanza, so `ValueRef::to_jid`'s owned `Jid` would be pure churn.
+/// Runs once per inbound stanza, so it borrows instead of taking
+/// `ValueRef::to_jid`'s owned `Jid`.
 #[inline]
 fn from_jid_matches(
     node: &wacore_binary::NodeRef<'_>,
@@ -575,14 +573,10 @@ impl Client {
         }
     }
 
-    /// Tell the server we cannot handle this stanza, so it drops it from the
-    /// offline queue instead of redelivering it forever. WA Web ends
-    /// `handleLoggedInStanza` with `createNackFromStanza(UnrecognizedStanza)`
-    /// for exactly this reason; staying silent is what let an unhandled
-    /// `<status>` stanza recycle the stream every ~50 minutes for days.
-    ///
-    /// Like WA Web, a stanza without `id`/`from` is skipped: the nack would
-    /// have nothing to address. Returns whether a nack was queued.
+    /// Answering nothing leaves the stanza in the offline queue forever, which
+    /// is how an unhandled `<status>` recycled the stream every ~50 minutes for
+    /// days. An unaddressable stanza (no `id`/`from`) is the one case where
+    /// silence is all we can offer. Returns whether a nack was queued.
     fn nack_unrecognized_stanza(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;

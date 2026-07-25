@@ -3162,7 +3162,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
 
         let client = create_test_client().await;
-        let own_lid = "236395184570386";
+        let own_lid = "100000000000042";
         setup_device_record(&client, own_lid, &[0, 58, 65]).await;
 
         let node = NodeBuilder::new("notification")
@@ -3170,7 +3170,7 @@ mod tests {
             .attr("type", "devices")
             .attr("id", "NOTIF-UPDATE-HASH")
             .attr("t", "1784584925")
-            .children([NodeBuilder::new("update").attr("hash", "FseO").build()])
+            .children([NodeBuilder::new("update").attr("hash", "kcEm").build()])
             .build();
 
         crate::handlers::notification::handle_devices_notification(&client, &node.as_node_ref())
@@ -3195,16 +3195,16 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
 
         let client = create_test_client().await;
-        let contact_lid = "196314885312593"; // hashes to "TNcq"
+        let contact_lid = "100000000000001"; // hashes to "s7oK"
         setup_lid_pn(&client, contact_lid, "5511999990000").await;
         setup_device_record(&client, contact_lid, &[0, 12]).await;
 
         let node = NodeBuilder::new("notification")
-            .attr("from", "236395184570386@lid")
+            .attr("from", "100000000000042@lid")
             .attr("type", "devices")
             .attr("id", "NOTIF-UPDATE-HASH-2")
             .attr("t", "1784584925")
-            .children([NodeBuilder::new("update").attr("hash", "TNcq").build()])
+            .children([NodeBuilder::new("update").attr("hash", "s7oK").build()])
             .build();
 
         crate::handlers::notification::handle_devices_notification(&client, &node.as_node_ref())
@@ -3228,10 +3228,10 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
 
         let client = create_test_client().await;
-        setup_lid_pn(&client, "196314885312593", "5511999990000").await;
+        setup_lid_pn(&client, "100000000000001", "5511999990000").await;
 
         let node = NodeBuilder::new("notification")
-            .attr("from", "236395184570386@lid")
+            .attr("from", "100000000000042@lid")
             .attr("type", "devices")
             .attr("id", "NOTIF-UPDATE-HASH-3")
             .attr("t", "1784584925")

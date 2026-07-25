@@ -12074,6 +12074,26 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
     await_retry_receipt(&client, &info, 1, RetryReason::InvalidKeyId).await;
 }
 
+/// Wait for the transport to hold more than `expected` frames, returning
+/// whether that ever happened. A negative assertion needs a real deadline: a
+/// spawned send that parks on a lock or a channel outlives any fixed number of
+/// cooperative yields.
+async fn extra_frame_appears(
+    transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+    expected: usize,
+) -> bool {
+    tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        loop {
+            if transport.sent_count() > expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 /// Production regression: the server delivers E2EE status updates as a
 /// top-level `<status>` stanza (WA Web `handleMessagingStanza` rewrites the tag
 /// to `message` under the `status_e2ee_recv_over_status_stanza` abprop). With
@@ -12088,8 +12108,8 @@ async fn status_stanza_gets_transport_ack() {
         .attr("from", "status@broadcast")
         .attr("type", "media")
         .attr("id", "ACSTATUSSTANZA1")
-        .attr("participant", "200725430796339@lid")
-        .attr("t", "1784819907")
+        .attr("participant", "100000000000001@lid")
+        .attr("t", wacore::time::now_secs().to_string())
         .children([NodeBuilder::new("enc")
             .attr("v", "2")
             .attr("type", "skmsg")
@@ -12132,7 +12152,7 @@ async fn status_stanza_gets_transport_ack() {
     );
     assert!(
         ack.get_attr("participant")
-            .is_some_and(|v| v.as_str() == "200725430796339@lid")
+            .is_some_and(|v| v.as_str() == "100000000000001@lid")
     );
     assert!(
         ack.get_attr("type").is_some_and(|v| v.as_str() == "media"),
@@ -12156,8 +12176,8 @@ async fn status_stanza_is_routed_to_the_message_pipeline() {
         .attr("from", "status@broadcast")
         .attr("type", "media")
         .attr("id", "ACSTATUSSTANZA2")
-        .attr("participant", "200725430796339@lid")
-        .attr("t", "1784819907")
+        .attr("participant", "100000000000001@lid")
+        .attr("t", wacore::time::now_secs().to_string())
         .children([NodeBuilder::new("enc")
             .attr("v", "2")
             .attr("type", "skmsg")
@@ -12165,15 +12185,39 @@ async fn status_stanza_is_routed_to_the_message_pipeline() {
             .build()])
         .build();
 
+    let recorder = Arc::new(EventRecorder::default());
+    client
+        .core
+        .event_bus
+        .subscribe_handler(recorder.clone())
+        .detach();
+
     client
         .process_node(crate::test_utils::node_to_owned_ref(&status))
         .await;
 
-    let status_jid: Jid = "status@broadcast".parse().expect("status jid should parse");
+    // The undecryptable event only fires once the lane worker has dequeued the
+    // stanza and run it through decryption, so it proves the whole path, not
+    // just that a lane was created.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(event) = recorder.undecryptable().first().cloned() {
+                return event;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the status pipeline must reach decryption");
+
+    let Event::UndecryptableMessage(undecryptable) = &*event else {
+        unreachable!("filtered above")
+    };
     assert!(
-        client.chat_lanes.get(&status_jid).await.is_some(),
-        "a <status> stanza must be enqueued on the status@broadcast chat lane"
+        undecryptable.info.source.chat.is_status_broadcast(),
+        "the message must keep its status@broadcast routing"
     );
+    assert_eq!(undecryptable.info.id, "ACSTATUSSTANZA2");
 }
 
 /// WA Web nacks every stanza it does not recognize
@@ -12187,7 +12231,7 @@ async fn unrecognized_stanza_is_nacked() {
     let unknown = NodeBuilder::new("totally_unknown_stanza")
         .attr("from", "status@broadcast")
         .attr("id", "UNKNOWN-1")
-        .attr("participant", "200725430796339@lid")
+        .attr("participant", "100000000000001@lid")
         .attr("type", "media")
         .build();
 
@@ -12229,7 +12273,7 @@ async fn unrecognized_stanza_is_nacked() {
     );
     assert!(
         nack.get_attr("participant")
-            .is_some_and(|v| v.as_str() == "200725430796339@lid")
+            .is_some_and(|v| v.as_str() == "100000000000001@lid")
     );
     assert!(nack.get_attr("type").is_some_and(|v| v.as_str() == "media"));
 }
@@ -12249,13 +12293,8 @@ async fn unrecognized_stanza_without_id_is_not_nacked() {
         .process_node(crate::test_utils::node_to_owned_ref(&unknown))
         .await;
 
-    // Give any spawned send a chance to reach the transport before asserting.
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        transport.sent_count(),
-        0,
+    assert!(
+        !extra_frame_appears(&transport, 0).await,
         "a stanza with no id cannot be nacked"
     );
 }
@@ -12294,12 +12333,8 @@ async fn newsletter_status_stanza_is_nacked_once() {
     assert_eq!(nack.tag.as_ref(), "ack");
     assert!(nack.get_attr("error").is_some_and(|v| v.as_str() == "488"));
 
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        transport.sent_count(),
-        1,
+    assert!(
+        !extra_frame_appears(&transport, 1).await,
         "the nack replaces the ack; the server must not get both"
     );
 }

@@ -404,10 +404,8 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
 
 /// Refresh the device list of the contact a hash-only `<update>` names.
 ///
-/// The wire hash is `base64(md5(user + "WA_ADD_NOTIF")[..3])`; the LID-PN cache
-/// keeps the reverse index. An unresolvable hash is a contact we never learned
-/// a mapping for — nothing to refresh, which is also what WA Web does when
-/// `getContactRecordByHash` misses ("missing side contact hash").
+/// An unresolvable hash is a contact we never learned a mapping for, so there
+/// is nothing to refresh; WA Web equally gives up when its own lookup misses.
 async fn sync_hashed_contact(client: &Arc<Client>, wire_hash: Option<&str>) {
     let Some(hash) = wire_hash.and_then(wacore::crypto::parse_contact_notification_hash) else {
         debug!("Device update with unusable contact hash {wire_hash:?}");

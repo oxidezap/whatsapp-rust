@@ -274,14 +274,20 @@ impl LidPnCache {
             .insert(shared.lid.clone(), Arc::clone(&shared))
             .await;
 
-        for identifier in [&shared.lid, &shared.phone_number] {
-            self.contact_hash_to_lid
-                .insert(contact_hash_key(identifier), Arc::clone(&shared.lid))
-                .await;
-        }
+        self.contact_hash_to_lid
+            .insert(contact_hash_key(&shared.lid), Arc::clone(&shared.lid))
+            .await;
 
         // Update PN -> Entry map (only if newer or equal timestamp)
         if should_update_pn {
+            // The PN side follows the same arbitration: a losing older entry
+            // must not point this number's hash back at a superseded LID.
+            self.contact_hash_to_lid
+                .insert(
+                    contact_hash_key(&shared.phone_number),
+                    Arc::clone(&shared.lid),
+                )
+                .await;
             self.pn_to_entry
                 .insert(shared.phone_number.clone(), shared)
                 .await;
@@ -475,6 +481,24 @@ mod tests {
             cache.get_current_lid("559980000001").await.as_deref(),
             Some("100000087654321")
         );
+
+        // The number's contact hash follows the same winner, or a device
+        // update naming that number would refresh the superseded LID.
+        let phone_hash = wacore::crypto::contact_notification_hash("559980000001");
+        assert_eq!(
+            cache.lid_for_contact_hash(phone_hash).await.as_deref(),
+            Some("100000087654321")
+        );
+        // Each LID still resolves to itself: the loser is a real contact too.
+        for lid in ["100000087654321", "100000012345678"] {
+            assert_eq!(
+                cache
+                    .lid_for_contact_hash(wacore::crypto::contact_notification_hash(lid))
+                    .await
+                    .as_deref(),
+                Some(lid)
+            );
+        }
     }
 
     #[tokio::test]
