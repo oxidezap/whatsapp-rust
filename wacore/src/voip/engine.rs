@@ -57,7 +57,14 @@ const PLAYOUT_MS: Millis = 20;
 /// 20ms @ 16kHz: samples drained to the speaker per playout tick.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_DRAIN: usize = 320;
-/// ~150ms latency ceiling; a burst past this resyncs (drops oldest) instead of lagging.
+/// 60ms @ 16kHz: the peer packet size the playout constants were written for, and the assumption
+/// used until the first decode reports what the peer actually sends.
+#[cfg(feature = "voip-mlow")]
+const OPUS_FRAME_SAMPS_60MS: usize = 960;
+/// ~150ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
+/// of lagging. Both this and the prime target scale with the packet the peer actually sends, via
+/// [`playout_bounds`] -- a peer on 120ms packets needs a proportionally larger cushion, and capping
+/// it at this figure would trim the very cushion the prebuffer just asked for.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_CAP: usize = 2400;
 /// Prebuffer target: prime playout until the jitter buffer holds two 60ms peer frames, so the
@@ -67,6 +74,19 @@ const PLAYOUT_CAP: usize = 2400;
 /// arrival underruns. The cushion has to be one frame above what the per-cycle drain consumes.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_TARGET: usize = 1920;
+
+/// Prime target and latency ceiling for a peer sending `packet_samps`-sample packets.
+///
+/// The constants above assume a 60ms peer frame, which held while the decoder only produced those.
+/// A 120ms packet is a full [`PLAYOUT_TARGET`] on its own, so priming would end on the first one
+/// with no cushion at all, and two in flight would exceed [`PLAYOUT_CAP`] and be trimmed on arrival.
+/// Keep the same shape instead: prime to two packets so the steady-state buffer never drains below
+/// one, and let the ceiling hold that cushion plus a drain slice.
+#[cfg(feature = "voip-mlow")]
+fn playout_bounds(packet_samps: usize) -> (usize, usize) {
+    let target = PLAYOUT_TARGET.max(packet_samps.saturating_mul(2));
+    (target, PLAYOUT_CAP.max(target + PLAYOUT_DRAIN))
+}
 /// Bound on how long playout primes before flushing a partial buffer: if the peer sends one frame
 /// then goes DTX the jitter buffer never reaches `PLAYOUT_TARGET`, so after this many 20ms ticks
 /// (~200ms) drain whatever is queued instead of holding it (silent) forever. Comfortably above the
@@ -450,6 +470,10 @@ struct PcmAudioState {
     /// Consecutive playout ticks spent priming; bounds the wait so a partial buffer (the peer sent one
     /// frame then went DTX) is flushed after `MAX_PRIME_TICKS` instead of being held silent forever.
     priming_ticks: u32,
+    /// Samples in the peer's most recent packet. The prebuffer and latency ceiling scale with it
+    /// (see `playout_bounds`), since a peer on 120ms packets needs a proportionally larger cushion
+    /// than one on 60ms. Starts at the 60ms default until the first packet says otherwise.
+    packet_samps: usize,
 }
 
 /// The video half of the media plane. No jitter buffer or playout tick: an AU is handed to the
@@ -663,6 +687,9 @@ impl CallEngine {
                     jitter: VecDeque::new(),
                     priming: true,
                     priming_ticks: 0,
+                    // The 60ms frame this decoder emitted before multi-frame packets existed; the
+                    // first decode replaces it with what the peer really sends.
+                    packet_samps: OPUS_FRAME_SAMPS_60MS,
                 }),
                 playout_deadline: NEVER,
             })
@@ -933,8 +960,12 @@ impl CallEngine {
         {
             #[cfg(feature = "voip-mlow")]
             if let Some(pcm) = m.pcm.as_mut() {
-                let frame =
-                    drain_playout(&mut pcm.jitter, &mut pcm.priming, &mut pcm.priming_ticks);
+                let frame = drain_playout(
+                    &mut pcm.jitter,
+                    &mut pcm.priming,
+                    &mut pcm.priming_ticks,
+                    pcm.packet_samps,
+                );
                 m.playout_deadline = next_tick(m.playout_deadline, now, PLAYOUT_MS);
                 self.outbox.push_back(Output::Playout(frame));
             }
@@ -1166,17 +1197,28 @@ impl CallEngine {
         pcm.decoder
             .set_redundancy(i32::from(header.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED));
         #[cfg(feature = "voip-mlow")]
-        for s in pcm.decoder.decode(&encoded) {
-            pcm.jitter
-                .push_back((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+        {
+            let decoded = pcm.decoder.decode(&encoded);
+            // Record what the peer is actually sending, so the prebuffer and the latency ceiling
+            // size themselves to it rather than to the 60ms frame they were written for.
+            if !decoded.is_empty() {
+                pcm.packet_samps = decoded.len();
+            }
+            for s in decoded {
+                pcm.jitter
+                    .push_back((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+            }
         }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
         // tick). Drop oldest past the same ceiling the drain path uses.
         #[cfg(feature = "voip-mlow")]
-        if pcm.jitter.len() > PLAYOUT_CAP {
-            let drop_n = pcm.jitter.len() - PLAYOUT_CAP;
-            pcm.jitter.drain(..drop_n);
+        {
+            let cap = playout_bounds(pcm.packet_samps).1;
+            if pcm.jitter.len() > cap {
+                let drop_n = pcm.jitter.len() - cap;
+                pcm.jitter.drain(..drop_n);
+            }
         }
     }
 
@@ -1301,13 +1343,15 @@ fn drain_playout(
     jitter: &mut VecDeque<i16>,
     priming: &mut bool,
     priming_ticks: &mut u32,
+    packet_samps: usize,
 ) -> Vec<i16> {
-    if jitter.len() > PLAYOUT_CAP {
-        let drop_n = jitter.len() - PLAYOUT_CAP;
+    let (target, cap) = playout_bounds(packet_samps);
+    if jitter.len() > cap {
+        let drop_n = jitter.len() - cap;
         jitter.drain(..drop_n);
     }
     if *priming {
-        let reached_target = jitter.len() >= PLAYOUT_TARGET;
+        let reached_target = jitter.len() >= target;
         // Bounded wait: a partial buffer that never reaches the target (peer DTX after one frame) is
         // flushed rather than held silent forever / replayed stale when a much later packet arrives.
         let timed_out = *priming_ticks >= MAX_PRIME_TICKS && !jitter.is_empty();
@@ -1707,20 +1751,63 @@ mod tests {
         // One frame is below PLAYOUT_TARGET (two frames): playout holds silence without draining.
         feed_frame(&mut buf);
         assert!(
-            drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                .iter()
-                .all(|&s| s == 0),
+            drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS
+            )
+            .iter()
+            .all(|&s| s == 0),
             "below the prebuffer target playout primes with silence"
         );
         assert_eq!(buf.len(), 960, "priming must not consume the buffer");
         // The second frame reaches the target; playout now produces real audio.
         feed_frame(&mut buf);
         assert!(
-            drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                .iter()
-                .any(|&s| s != 0),
+            drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS
+            )
+            .iter()
+            .any(|&s| s != 0),
             "at the prebuffer target playout starts real audio"
         );
+    }
+
+    /// A peer sending 120 ms packets (WhatsApp Desktop) delivers 1920 samples at a time. The
+    /// prebuffer and the latency ceiling were both sized around a 60 ms peer frame, so with the
+    /// larger packet the cushion collapses to zero (one packet already meets the target) and, worse,
+    /// two in flight exceed the cap and get trimmed — dropping audio on every arrival. Both have to
+    /// scale with the packet the peer actually sends.
+    #[test]
+    fn playout_scales_its_cushion_to_the_peer_packet() {
+        const P: usize = 1920; // 120 ms @ 16 kHz
+        let feed_120 =
+            |b: &mut VecDeque<i16>| b.extend((0..P as i32).map(|i| (i % 200) as i16 - 99));
+
+        // One packet must NOT end priming: draining it takes its own 120 ms, so the buffer would be
+        // empty again exactly when the next one is due, leaving nothing for a late arrival.
+        let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
+        feed_120(&mut buf);
+        let first = drain_playout(&mut buf, &mut priming, &mut ticks, P);
+        assert!(
+            first.iter().all(|&s| s == 0),
+            "a single 120ms packet is a zero cushion; playout must keep priming"
+        );
+
+        // Two in flight must survive: the ceiling has to hold the cushion it just asked for.
+        feed_120(&mut buf);
+        let before = buf.len();
+        let _ = drain_playout(&mut buf, &mut priming, &mut ticks, P);
+        assert!(
+            buf.len() + PLAYOUT_DRAIN >= before,
+            "the latency ceiling trimmed the 120ms cushion: {before} -> {} samples",
+            buf.len()
+        );
+        assert!(!priming, "two packets is the cushion; playout must start");
     }
 
     #[test]
@@ -1770,9 +1857,14 @@ mod tests {
         let real: Vec<bool> = (0..ticks)
             .map(|t| {
                 feed(&mut buf, t);
-                drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                    .iter()
-                    .any(|&s| s != 0)
+                drain_playout(
+                    &mut buf,
+                    &mut priming,
+                    &mut priming_ticks,
+                    OPUS_FRAME_SAMPS_60MS,
+                )
+                .iter()
+                .any(|&s| s != 0)
             })
             .collect();
         assert_eq!(
@@ -2732,7 +2824,12 @@ mod tests {
             if arrivals.contains(&t) {
                 feed_frame(&mut buf);
             }
-            let _ = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+            let _ = drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            );
             max_occupancy = max_occupancy.max(buf.len());
         }
         assert!(
@@ -2745,9 +2842,14 @@ mod tests {
             if t % 3 == 0 {
                 feed_frame(&mut buf);
             }
-            if drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                .iter()
-                .any(|&s| s != 0)
+            if drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            )
+            .iter()
+            .any(|&s| s != 0)
             {
                 recovered = true;
             }
@@ -2769,7 +2871,12 @@ mod tests {
         feed_frame(&mut buf); // one 60ms frame (960) < PLAYOUT_TARGET (1920), then nothing (DTX)
         // Up to MAX_PRIME_TICKS the partial buffer is held: silence, no drain.
         for _ in 0..MAX_PRIME_TICKS {
-            let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+            let f = drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            );
             assert!(f.iter().all(|&s| s == 0), "still priming -> silence");
             assert_eq!(
                 buf.len(),
@@ -2778,7 +2885,12 @@ mod tests {
             );
         }
         // The next tick hits the bound and flushes the held frame as real audio.
-        let flushed = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+        let flushed = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut priming_ticks,
+            OPUS_FRAME_SAMPS_60MS,
+        );
         assert!(
             flushed.iter().any(|&s| s != 0),
             "the partial buffer must flush to real audio after the bounded wait"
@@ -2798,12 +2910,22 @@ mod tests {
         let mut priming = true;
         let mut priming_ticks = 0u32;
         for _ in 0..(MAX_PRIME_TICKS * 2) {
-            let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+            let f = drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            );
             assert!(f.iter().all(|&s| s == 0), "empty buffer -> silence");
         }
         // First frame arrives: must NOT flush instantly -- the counter didn't age while empty.
         feed_frame(&mut buf);
-        let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+        let f = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut priming_ticks,
+            OPUS_FRAME_SAMPS_60MS,
+        );
         assert!(
             f.iter().all(|&s| s == 0),
             "one frame is below the target -> still priming, no instant flush"
@@ -2811,7 +2933,12 @@ mod tests {
         assert_eq!(buf.len(), 960, "the first frame is held for the cushion");
         // The second frame reaches the target -> real audio drains.
         feed_frame(&mut buf);
-        let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+        let f = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut priming_ticks,
+            OPUS_FRAME_SAMPS_60MS,
+        );
         assert!(
             f.iter().any(|&s| s != 0),
             "at the target playout starts real audio"

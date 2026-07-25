@@ -100,6 +100,11 @@ byte for byte **against that revision**, which is what makes a changed fixture a
 than tool drift; against a different checkout the reference itself may have moved, so the script
 prints the revision it built with and warns when it does not match.
 
+The committed vector is an intentional 8-packet prefix, not the whole input: `synth_mic.raw` chunked
+into 120 ms frames would yield ~55 packets, which is far more than the decode path needs and 7x the
+bytes. A regeneration that produces more is the script defaulting to the whole file — pass the
+packet count, as the script does.
+
 Both halves must be regenerated together — `decoder.rs::multi_frame_fixture_halves_stay_in_step`
 fails if the PCM length stops matching the frame count, and asserts every frame is still TOC `0x58`
 so the fixture cannot quietly drift off the multi-frame path.
