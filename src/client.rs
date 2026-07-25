@@ -1334,8 +1334,7 @@ fn encode_ack_bytes(
         None
     };
 
-    // WA Web `sendAck` always stamps the own device JID, and it covers both the
-    // `message` and the `status` stanza class.
+    // WA Web stamps the own device JID for both classes.
     let own_device_pn = if tag == "message" || tag == "status" {
         Some(own_device_pn.ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?)
     } else {

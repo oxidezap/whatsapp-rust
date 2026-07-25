@@ -3151,12 +3151,8 @@ mod tests {
         );
     }
 
-    /// A `<notification type="devices"><update hash="..."/></notification>`
-    /// names a *contact* by hash (WA Web `getContactRecordByHash` →
-    /// `syncDeviceListJob` for that contact); the notification's `from` is our
-    /// own account and its device list is untouched. Wiping our own registry
-    /// here loses every companion device and makes the next message from one of
-    /// them look like an unknown device.
+    /// The hash names a contact; the notification's `from` is our own account,
+    /// whose companion list must survive.
     #[tokio::test]
     async fn hash_only_device_update_keeps_the_notified_users_registry() {
         use wacore_binary::builder::NodeBuilder;
@@ -3187,9 +3183,7 @@ mod tests {
         );
     }
 
-    /// The `hash` resolves to a contact via the LID-PN index, and that contact
-    /// (not the notification's `from`) is the one whose device list must be
-    /// refreshed — WA Web `getContactRecordByHash` → `syncDeviceListJob`.
+    /// The hashed contact, not the notification's `from`, is the one refreshed.
     #[tokio::test]
     async fn hash_only_device_update_refreshes_the_hashed_contact() {
         use wacore_binary::builder::NodeBuilder;
@@ -3221,8 +3215,7 @@ mod tests {
         );
     }
 
-    /// A hash no contact matches must not touch anything: WA Web logs
-    /// "missing side contact hash" and moves on.
+    /// A hash no contact matches must not touch anything.
     #[tokio::test]
     async fn unresolvable_contact_hash_syncs_nothing() {
         use wacore_binary::builder::NodeBuilder;

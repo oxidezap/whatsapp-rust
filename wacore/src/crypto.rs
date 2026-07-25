@@ -25,10 +25,8 @@ pub fn md5_digest(input: &[u8]) -> [u8; 16] {
 const CONTACT_NOTIFICATION_HASH_SUFFIX: &[u8] = b"WA_ADD_NOTIF";
 
 /// The contact identifier carried by `<notification type="devices">
-/// <update hash="..."/></notification>`, base64-encoded on the wire.
-///
-/// `user` is the bare user part of the contact's JID, LID-namespaced for
-/// migrated contacts. Fed incrementally to avoid a concatenation buffer.
+/// <update hash="..."/></notification>`, base64-encoded on the wire. `user` is
+/// the contact's bare user part. Fed incrementally to avoid a concat buffer.
 pub fn contact_notification_hash(user: &str) -> [u8; 3] {
     let mut context = md5::Context::new();
     context.consume(user.as_bytes());
@@ -37,9 +35,9 @@ pub fn contact_notification_hash(user: &str) -> [u8; 3] {
     [digest[0], digest[1], digest[2]]
 }
 
-/// Decode the wire form of [`contact_notification_hash`] (4 base64 chars) back
-/// into its 3 bytes. Returns `None` for anything that is not exactly one
-/// base64 group, so a malformed attribute can never alias a real contact.
+/// Decode the wire form of [`contact_notification_hash`]. Rejects anything that
+/// is not exactly one base64 group, so a malformed attribute cannot alias a
+/// real contact.
 pub fn parse_contact_notification_hash(wire: &str) -> Option<[u8; 3]> {
     use base64::Engine as _;
 
@@ -94,9 +92,7 @@ pub fn calculate_curve_signature(
 mod tests {
     use super::*;
 
-    /// The construction was confirmed against a live `<notification
-    /// type="devices"><update hash="..."/>` stream before these fictitious
-    /// vectors were derived from it.
+    /// Confirmed against a live stream, then re-derived from fictitious LIDs.
     #[test]
     fn contact_notification_hash_matches_wire_vectors() {
         use base64::Engine as _;

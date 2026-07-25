@@ -30,8 +30,7 @@ pub use wacore::types::{LearningSource, LidPnEntry};
 const NS_LID: &str = "lid_pn_by_lid";
 const NS_PN: &str = "lid_pn_by_pn";
 
-/// Pack the 3-byte contact hash into an integer key: no allocation, and the
-/// key stays `Display` for the store-backed cache path.
+/// An integer key allocates nothing and stays `Display` for the store path.
 #[inline]
 fn pack_contact_hash(hash: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, hash[0], hash[1], hash[2]])
@@ -68,16 +67,12 @@ pub struct LidPnCache {
     /// record both identifiers. Recording lives here, at the write
     /// chokepoint, so callers cannot forget it.
     topology: std::sync::OnceLock<Arc<crate::client::device_topology::DeviceTopology>>,
-    /// Contact hash -> LID. Reverse index for the contact named by
-    /// `<notification type="devices"><update hash="..."/></notification>`,
-    /// whose 3-byte hash is the only identifier the server sends. Both the LID
-    /// and the PN of a pair are indexed (WA Web hashes the contact's stored id,
-    /// LID-namespaced only for migrated contacts) and both point at the LID, so
-    /// either wire form resolves the same contact. Always in-process: it is
-    /// derived state that every process rebuilds from its own warm-up.
-    /// A 3-byte hash collides for ~1 pair in a few thousand contacts; like WA
-    /// Web's single-record lookup, the newest write wins and the loser simply
-    /// misses one refresh.
+    /// Contact hash -> LID, for the `<devices>` `<update hash>` notification
+    /// whose 3-byte hash is the only identifier it carries. Both sides of a pair
+    /// are indexed because the hashed id is LID-namespaced only for migrated
+    /// contacts, and both resolve to the LID. Always in-process: derived state
+    /// each process rebuilds from its own warm-up. A 3-byte hash collides for
+    /// ~1 pair in a few thousand contacts, where the newest write wins.
     contact_hash_to_lid: TypedCache<u32, Arc<str>>,
     /// PN -> the LID this process durably persisted for it. Lets the learn hot
     /// path skip a re-persist without swallowing the first live persist of a
@@ -280,8 +275,8 @@ impl LidPnCache {
 
         // Update PN -> Entry map (only if newer or equal timestamp)
         if should_update_pn {
-            // The PN side follows the same arbitration: a losing older entry
-            // must not point this number's hash back at a superseded LID.
+            // A losing older entry must not point this number's hash at a
+            // superseded LID.
             self.contact_hash_to_lid
                 .insert(
                     contact_hash_key(&shared.phone_number),

@@ -36,8 +36,8 @@ impl ReadLoopError {
     }
 }
 
-/// Runs once per inbound stanza, so it borrows instead of taking
-/// `ValueRef::to_jid`'s owned `Jid`.
+/// Borrows instead of taking `ValueRef::to_jid`'s owned `Jid`: this runs once
+/// per inbound stanza.
 #[inline]
 fn from_jid_matches(
     node: &wacore_binary::NodeRef<'_>,
@@ -52,9 +52,8 @@ fn from_jid_matches(
     }
 }
 
-/// A top-level `<status from="status@broadcast">` stanza: the wire shape the
-/// server uses for E2EE status updates once `status_e2ee_recv_over_status_stanza`
-/// is on, carrying the same payload as `<message from="status@broadcast">`.
+/// The wire shape the server uses for E2EE status updates, carrying the same
+/// payload as `<message from="status@broadcast">`.
 fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
 }
@@ -512,9 +511,8 @@ impl Client {
                 )
                 .await;
             }
-            // WA Web `handleMessagingStanza` retags a non-newsletter `<status>`
-            // to `message` and runs the normal pipeline; the stanza only differs
-            // in tag. Anything else (newsletter status) keeps the router path.
+            // Differs from a `<message>` only in tag, so WA Web retags it and
+            // runs the same pipeline.
             "status" if is_status_broadcast_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
@@ -533,8 +531,7 @@ impl Client {
                         "Received unknown top-level node: {}",
                         DisplayableNodeRef(node.get())
                     );
-                    // The nack IS this stanza's acknowledgement, so drop the
-                    // deferred plain ack the gate may have armed.
+                    // The nack is this stanza's acknowledgement.
                     cancelled |= self.nack_unrecognized_stanza(node.get());
                 }
             }
@@ -545,15 +542,12 @@ impl Client {
         }
     }
 
-    /// Whether a decrypted node must be processed on the read loop instead of a
-    /// spawned task:
-    /// - success/failure/stream:error carry connection state the rest depends on
-    /// - message and status@broadcast only enqueue here, and the per-chat queue
-    ///   is what preserves arrival order (heavy crypto runs in the lane worker);
-    ///   a spawned enqueue could put a group message ahead of the pkmsg that
-    ///   establishes its session
-    /// - ib sets up offline-sync tracking before the offline batch arrives
-    /// - acks and receipts, only while nothing observes them concurrently
+    /// Whether a decrypted node must stay on the read loop instead of moving to
+    /// a spawned task. success/failure/stream:error carry connection state the
+    /// rest depends on, and `ib` sets up offline-sync tracking before the batch
+    /// arrives. message and status@broadcast only enqueue here, and a spawned
+    /// enqueue could put a group message ahead of the pkmsg that establishes its
+    /// session. Acks and receipts qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         match node.tag.as_ref() {
             "success" | "failure" | "stream:error" | "message" | "ib" => true,
@@ -578,9 +572,8 @@ impl Client {
     }
 
     /// Answering nothing leaves the stanza in the offline queue forever, which
-    /// is how an unhandled `<status>` recycled the stream every ~50 minutes for
-    /// days. An unaddressable stanza (no `id`/`from`) is the one case where
-    /// silence is all we can offer. Returns whether a nack was queued.
+    /// is how an unhandled `<status>` kept recycling the stream. Returns whether
+    /// a nack was queued; one without `id`/`from` would have nothing to address.
     fn nack_unrecognized_stanza(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;

@@ -12074,10 +12074,8 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
     await_retry_receipt(&client, &info, 1, RetryReason::InvalidKeyId).await;
 }
 
-/// Wait for the transport to hold more than `expected` frames, returning
-/// whether that ever happened. A negative assertion needs a real deadline: a
-/// spawned send that parks on a lock or a channel outlives any fixed number of
-/// cooperative yields.
+/// Whether the transport ever holds more than `expected` frames. A negative
+/// assertion needs a deadline, not a fixed number of cooperative yields.
 async fn extra_frame_appears(
     transport: &Arc<crate::transport::mock::CapturingMockTransport>,
     expected: usize,
@@ -12196,9 +12194,8 @@ async fn status_stanza_is_routed_to_the_message_pipeline() {
         .process_node(crate::test_utils::node_to_owned_ref(&status))
         .await;
 
-    // The undecryptable event only fires once the lane worker has dequeued the
-    // stanza and run it through decryption, so it proves the whole path, not
-    // just that a lane was created.
+    // The event only fires once the lane worker has dequeued the stanza and run
+    // it through decryption, so it covers the whole path.
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(event) = recorder.undecryptable().first().cloned() {

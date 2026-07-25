@@ -155,11 +155,13 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 let messages = attrs.optional_u64("message").unwrap_or(0) as i32;
                 let notifications = attrs.optional_u64("notification").unwrap_or(0) as i32;
                 let receipts = attrs.optional_u64("receipt").unwrap_or(0) as i32;
+                let calls = attrs.optional_u64("call").unwrap_or(0) as i32;
+                let statuses = attrs.optional_u64("status").unwrap_or(0) as i32;
 
                 debug!(
                     target: "Client/OfflineSync",
-                    "Offline preview: {} total ({} messages, {} notifications, {} receipts, {} app data changes)",
-                    total, messages, notifications, receipts, app_data_changes,
+                    "Offline preview: {} total ({} messages, {} statuses, {} notifications, {} receipts, {} calls, {} app data changes)",
+                    total, messages, statuses, notifications, receipts, calls, app_data_changes,
                 );
 
                 client.core.event_bus.dispatch(Event::OfflineSyncPreview(
@@ -169,6 +171,8 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         .messages(messages)
                         .notifications(notifications)
                         .receipts(receipts)
+                        .calls(calls)
+                        .statuses(statuses)
                         .build(),
                 ));
 

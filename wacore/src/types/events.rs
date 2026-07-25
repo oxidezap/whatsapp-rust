@@ -1350,6 +1350,7 @@ pub struct Disconnected {
     pub reason: crate::net::DisconnectReason,
 }
 
+/// `total` is authoritative; the per-kind counts need not sum to it.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct OfflineSyncPreview {
@@ -1358,6 +1359,8 @@ pub struct OfflineSyncPreview {
     pub messages: i32,
     pub notifications: i32,
     pub receipts: i32,
+    pub calls: i32,
+    pub statuses: i32,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
