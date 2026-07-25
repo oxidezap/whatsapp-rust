@@ -1058,6 +1058,16 @@ pub struct Client {
             crate::flush_scope::FlushGuard,
         )>,
     >,
+    /// Feed of the persistent transport-ack worker, mirroring
+    /// [`Self::delivery_receipt_queue`]. Deferred acks used to be one spawned
+    /// task each; the queue also gives them FIFO order, which the spawns did
+    /// not guarantee.
+    pub(crate) transport_ack_queue: std::sync::OnceLock<
+        async_channel::Sender<(
+            Arc<wacore_binary::OwnedNodeRef>,
+            crate::flush_scope::FlushGuard,
+        )>,
+    >,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
     pub(crate) presence_subscriptions: Arc<Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging

@@ -614,9 +614,12 @@ impl Client {
         }
     }
 
-    /// Possibly send a deferred ack: either immediately or via spawned task.
-    /// Handlers can cancel by setting `cancelled` to true.
-    /// Uses Arc<OwnedNodeRef> to avoid cloning when spawning the async task.
+    /// Possibly send a deferred ack: either immediately or through the ack
+    /// worker. Handlers can cancel by setting `cancelled` to true.
+    /// Uses Arc<OwnedNodeRef> so queueing does not clone the node.
+    ///
+    /// The deferred path feeds one persistent worker rather than spawning a
+    /// task per ack, which also makes acks leave in arrival order.
     async fn maybe_deferred_ack(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
         if self.synchronous_ack {
             if let Err(e) = self.send_ack_for(node.get()).await
@@ -624,18 +627,50 @@ impl Client {
             {
                 warn!("Failed to send ack: {e:?}");
             }
-        } else {
-            let this = self.clone();
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = this.send_ack_for(node.get()).await
+            return;
+        }
+        // A closed scope means disconnect is already running; the spawned task
+        // it replaces would have failed on an unavailable transport anyway.
+        let Some(guard) = self.outbound_flush.try_track() else {
+            return;
+        };
+        let tx = self
+            .transport_ack_queue
+            .get_or_init(|| self.start_transport_ack_worker());
+        // Only fails once the worker is gone (client teardown).
+        let _ = tx.try_send((node, guard));
+    }
+
+    /// Worker shared by every deferred ack. Holds a `Weak`, so a dropped
+    /// `Client` closes the channel and ends the task instead of keeping the
+    /// client alive.
+    fn start_transport_ack_worker(
+        self: &Arc<Self>,
+    ) -> async_channel::Sender<(
+        Arc<wacore_binary::OwnedNodeRef>,
+        crate::flush_scope::FlushGuard,
+    )> {
+        let (tx, rx) = async_channel::unbounded::<(
+            Arc<wacore_binary::OwnedNodeRef>,
+            crate::flush_scope::FlushGuard,
+        )>();
+        let client = Arc::downgrade(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                while let Ok((node, guard)) = rx.recv().await {
+                    let Some(client) = client.upgrade() else {
+                        break;
+                    };
+                    if let Err(e) = client.send_ack_for(node.get()).await
                         && !e.is_transport_unavailable()
                     {
                         warn!("Failed to send ack: {e:?}");
                     }
-                }))
-                .detach();
-        }
+                    drop(guard);
+                }
+            }))
+            .detach();
+        tx
     }
 
     #[inline]
