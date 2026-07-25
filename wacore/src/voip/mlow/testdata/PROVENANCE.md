@@ -78,3 +78,18 @@ the reference decoder, one record per frame, compared byte-for-byte by the Rust 
 exact wire bytes (config-1 `0x10` and config-2 `0x12` frames included). The tripwire test asserts the
 committed stream still carries `0x10`, `0x12`, and `0x50` TOCs so the per-config decode branches stay
 covered; regenerating it requires the external encoder above on `synth_mic.raw`.
+
+## Multi-frame (120 ms) packets
+
+| fixture | consumer / test | oracle recipe |
+| --- | --- | --- |
+| `mlow_120ms_frames.json` | `decoder.rs::multi_frame_decode_matches_the_reference` | `smpl` C reference encoding `synth_mic.raw` at 120 ms, hex frames |
+| `ref_120ms_expected.raw` | same test | the same C reference decoding those frames; s16le @ 16 kHz |
+
+Also not Rust-reproducible: this crate's encoder only emits 60 ms packets. Both files come from one
+run of a harness linked against the `smpl` C reference, which encodes `synth_mic.raw` in 1920-sample
+(120 ms) frames and decodes each packet back, emitting `<hex payload> <hex s16le pcm>` per line. The
+encoder needs `smpl_CreateCodec()` before the first `opus_encode` (it fails
+`SMPL_ENC_NO_GLOBAL_DATA` otherwise), `OPUS_SET_USING_SMPL(1)`, and a `max_data_bytes` the CBR pad
+can satisfy. Every frame is TOC `0x58`, which the test asserts so the fixture cannot silently drift
+off the multi-frame path.
