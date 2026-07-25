@@ -33,8 +33,9 @@ chokepoints:
 - **Received**: the read loop (`node_io.rs`) per `DataReceived` batch.
 
 It also owns the activity timestamps the keepalive dead-socket watchdog reads:
-`last_data_received_ms` (one clock read per received transport event) and
-`first_send_since_recv_ms` (read only on the send that arms the anchor). There
+`last_data_received_ms` (one clock read per received transport event, plus one
+more when that event carries several frames, so a slow drain is not read as
+silence) and `first_send_since_recv_ms` (read only on the send that arms). There
 is deliberately no "last send" timestamp: nothing in the core reads one, and it
 cost a clock read on every frame written, which is the client's hottest path
 and a call out of the module on wasm32/embedded. `frames_sent` answers "is it

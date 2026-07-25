@@ -23,7 +23,7 @@ pub fn ms_since(timestamp_ms: u64) -> Option<u64> {
     ms_since_at(timestamp_ms, now_ms())
 }
 
-/// [`ms_since`] against a caller-supplied `now`.
+/// Same as [`ms_since`], but against a caller-supplied `now`.
 ///
 /// The dead-socket branch of the keepalive tick evaluates this and
 /// [`is_dead_socket_at`] against one instant instead of reading the clock per
@@ -53,8 +53,8 @@ pub fn is_dead_socket(armed_ms: u64, last_received_ms: u64) -> bool {
     is_dead_socket_at(armed_ms, last_received_ms, now_ms())
 }
 
-/// [`is_dead_socket`] against a caller-supplied `now`, so the decision is
-/// testable without depending on the platform clock.
+/// Same as [`is_dead_socket`], but against a caller-supplied `now`, so the
+/// decision is testable without depending on the platform clock.
 pub fn is_dead_socket_at(armed_ms: u64, last_received_ms: u64, now_ms: u64) -> bool {
     // Timer not armed (never sent since the last receive).
     if armed_ms == 0 {

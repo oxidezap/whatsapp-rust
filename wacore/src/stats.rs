@@ -10,10 +10,10 @@
 //! - [`SessionStats`] is always on: one relaxed `fetch_add` per wire frame,
 //!   on a path that already does AEAD crypto plus a transport write.
 //! - Clock reads: zero per frame sent while the dead-socket anchor is armed,
-//!   one on the send that arms it, one per received transport event. On
-//!   wasm32/embedded every read leaves the module, so a new timestamp field
-//!   here buys a read on the client's hottest path and needs a reader to
-//!   justify it.
+//!   one on the send that arms it, one per received transport event, plus one
+//!   more when that event carries several frames. On wasm32/embedded every read
+//!   leaves the module, so a new timestamp field here buys a read on the
+//!   client's hottest path and needs a reader to justify it.
 //! - [`HeapSize`] / memory reports only run when called; unused report code
 //!   is dropped by fat LTO.
 //! - [`TaskInstrument`] is resolved once at client build: unset leaves the
@@ -121,8 +121,15 @@ impl SessionStats {
         let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
         let anchor = self.first_send_since_recv_ms.load(Ordering::Relaxed);
         if anchor == 0 || anchor <= last_recv {
-            self.first_send_since_recv_ms
-                .store(Self::now_ms(), Ordering::Relaxed);
+            // The plain load above gates the clock read; the arm itself re-checks
+            // under a CAS so two senders racing to arm keep the earlier deadline
+            // instead of the later store winning.
+            let now = Self::now_ms();
+            let _ = self.first_send_since_recv_ms.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| (current == 0 || current <= last_recv).then_some(now),
+            );
         }
     }
 
