@@ -3150,4 +3150,100 @@ mod tests {
                 .is_empty()
         );
     }
+
+    /// A `<notification type="devices"><update hash="..."/></notification>`
+    /// names a *contact* by hash (WA Web `getContactRecordByHash` →
+    /// `syncDeviceListJob` for that contact); the notification's `from` is our
+    /// own account and its device list is untouched. Wiping our own registry
+    /// here loses every companion device and makes the next message from one of
+    /// them look like an unknown device.
+    #[tokio::test]
+    async fn hash_only_device_update_keeps_the_notified_users_registry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let client = create_test_client().await;
+        let own_lid = "236395184570386";
+        setup_device_record(&client, own_lid, &[0, 58, 65]).await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("from", format!("{own_lid}@lid"))
+            .attr("type", "devices")
+            .attr("id", "NOTIF-UPDATE-HASH")
+            .attr("t", "1784584925")
+            .children([NodeBuilder::new("update").attr("hash", "FseO").build()])
+            .build();
+
+        crate::handlers::notification::handle_devices_notification(&client, &node.as_node_ref())
+            .await;
+
+        let record = client
+            .device_registry_cache
+            .get(own_lid)
+            .await
+            .expect("a hash-only <update> must not drop the device registry");
+        assert!(
+            record.devices.iter().any(|d| d.device_id == 65),
+            "companion devices must survive a hash-only <update>"
+        );
+    }
+
+    /// The `hash` resolves to a contact via the LID-PN index, and that contact
+    /// (not the notification's `from`) is the one whose device list must be
+    /// refreshed — WA Web `getContactRecordByHash` → `syncDeviceListJob`.
+    #[tokio::test]
+    async fn hash_only_device_update_refreshes_the_hashed_contact() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let client = create_test_client().await;
+        let contact_lid = "196314885312593"; // hashes to "TNcq"
+        setup_lid_pn(&client, contact_lid, "5511999990000").await;
+        setup_device_record(&client, contact_lid, &[0, 12]).await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("from", "236395184570386@lid")
+            .attr("type", "devices")
+            .attr("id", "NOTIF-UPDATE-HASH-2")
+            .attr("t", "1784584925")
+            .children([NodeBuilder::new("update").attr("hash", "TNcq").build()])
+            .build();
+
+        crate::handlers::notification::handle_devices_notification(&client, &node.as_node_ref())
+            .await;
+
+        let hashed: Jid = format!("{contact_lid}@lid").parse().expect("jid");
+        assert!(
+            client
+                .pending_device_sync
+                .take_all()
+                .await
+                .contains(&hashed),
+            "the hashed contact must be queued for a device-list refresh"
+        );
+    }
+
+    /// A hash no contact matches must not touch anything: WA Web logs
+    /// "missing side contact hash" and moves on.
+    #[tokio::test]
+    async fn unresolvable_contact_hash_syncs_nothing() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let client = create_test_client().await;
+        setup_lid_pn(&client, "196314885312593", "5511999990000").await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("from", "236395184570386@lid")
+            .attr("type", "devices")
+            .attr("id", "NOTIF-UPDATE-HASH-3")
+            .attr("t", "1784584925")
+            .children([NodeBuilder::new("update").attr("hash", "AAAA").build()])
+            .build();
+
+        crate::handlers::notification::handle_devices_notification(&client, &node.as_node_ref())
+            .await;
+
+        assert!(
+            client.pending_device_sync.take_all().await.is_empty(),
+            "an unresolvable hash must not refresh an unrelated contact"
+        );
+    }
 }

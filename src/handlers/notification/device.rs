@@ -402,6 +402,31 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
     ));
 }
 
+/// Refresh the device list of the contact a hash-only `<update>` names.
+///
+/// The wire hash is `base64(md5(user + "WA_ADD_NOTIF")[..3])`; the LID-PN cache
+/// keeps the reverse index. An unresolvable hash is a contact we never learned
+/// a mapping for — nothing to refresh, which is also what WA Web does when
+/// `getContactRecordByHash` misses ("missing side contact hash").
+async fn sync_hashed_contact(client: &Arc<Client>, wire_hash: Option<&str>) {
+    let Some(hash) = wire_hash.and_then(wacore::crypto::parse_contact_notification_hash) else {
+        debug!("Device update with unusable contact hash {wire_hash:?}");
+        return;
+    };
+    let Some(lid) = client.lid_pn_cache.lid_for_contact_hash(hash).await else {
+        debug!("Device update for an unknown contact hash {wire_hash:?}");
+        return;
+    };
+    // Mirrors WA Web: an in-progress offline resume batches the refresh
+    // (`addUserToPendingDeviceSync`) instead of firing a usync mid-drain.
+    let is_offline = client
+        .offline_sync_metrics
+        .active
+        .load(std::sync::atomic::Ordering::Acquire);
+    let jid = Jid::new(lid.as_ref(), wacore_binary::Server::Lid);
+    client.schedule_unknown_device_sync(jid, is_offline).await;
+}
+
 /// Handle device list change notifications.
 /// Matches WhatsApp Web's WAWebHandleDeviceNotification.handleDevicesNotification().
 ///
@@ -464,9 +489,13 @@ pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &Nod
         }
         wacore::stanza::devices::DeviceNotificationType::Update => {
             if op.devices.is_empty() {
-                // Hash-only update without device list — fall back to
-                // invalidation so the next read rehydrates from the server.
-                client.invalidate_device_cache(notification.user()).await;
+                // The `hash` names the *contact* whose device list changed, not
+                // the notification's `from` (our own account). WA Web resolves it
+                // with `getContactRecordByHash` and runs `syncDeviceListJob` for
+                // that contact alone; invalidating `from` instead dropped our own
+                // companion list and made its next message look like an unknown
+                // device.
+                sync_hashed_contact(client, op.contact_hash.as_deref()).await;
             } else {
                 for device in &op.devices {
                     client

@@ -21,6 +21,37 @@ pub fn md5_digest(input: &[u8]) -> [u8; 16] {
     md5::compute(input).into()
 }
 
+/// Suffix WA Web mixes into the contact hash (`WAWebApiContact`).
+const CONTACT_NOTIFICATION_HASH_SUFFIX: &[u8] = b"WA_ADD_NOTIF";
+
+/// The contact identifier carried by `<notification type="devices">
+/// <update hash="..."/></notification>`: the first 3 bytes of
+/// `md5(user + "WA_ADD_NOTIF")`, base64-encoded on the wire (4 chars).
+///
+/// `user` is the bare user part of the contact's JID (WA Web hashes
+/// `createWid(contact.id).user`, which is LID-namespaced for migrated
+/// contacts). Fed incrementally so no concatenation buffer is allocated.
+pub fn contact_notification_hash(user: &str) -> [u8; 3] {
+    let mut context = md5::Context::new();
+    context.consume(user.as_bytes());
+    context.consume(CONTACT_NOTIFICATION_HASH_SUFFIX);
+    let digest: [u8; 16] = context.finalize().into();
+    [digest[0], digest[1], digest[2]]
+}
+
+/// Decode the wire form of [`contact_notification_hash`] (4 base64 chars) back
+/// into its 3 bytes. Returns `None` for anything that is not exactly one
+/// base64 group, so a malformed attribute can never alias a real contact.
+pub fn parse_contact_notification_hash(wire: &str) -> Option<[u8; 3]> {
+    use base64::Engine as _;
+
+    let mut decoded = [0u8; 3];
+    let written = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode_slice(wire.as_bytes(), &mut decoded)
+        .ok()?;
+    (written == decoded.len()).then_some(decoded)
+}
+
 /// Rejects output beyond HKDF's 255-block expansion limit before allocating.
 pub fn hkdf_sha256(
     input_key_material: &[u8],
@@ -64,6 +95,39 @@ pub fn calculate_curve_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vectors captured from a live `<notification type="devices">
+    /// <update hash="..."/>` stream, cross-checked against the LIDs seen in the
+    /// same session.
+    #[test]
+    fn contact_notification_hash_matches_wire_vectors() {
+        use base64::Engine as _;
+        for (user, wire) in [
+            ("196314885312593", "TNcq"),
+            ("171588355903730", "XYZ6"),
+            ("202018165633152", "dcjp"),
+        ] {
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(contact_notification_hash(user));
+            assert_eq!(encoded, wire, "contact hash for {user}");
+            assert_eq!(
+                parse_contact_notification_hash(wire),
+                Some(contact_notification_hash(user)),
+                "wire hash for {user} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_contact_hashes_are_rejected() {
+        for wire in ["", "TNc", "TNcqX", "TNcq==", "!!!!", "TNcqTNcq"] {
+            assert_eq!(
+                parse_contact_notification_hash(wire),
+                None,
+                "{wire:?} is not a single base64 group"
+            );
+        }
+    }
 
     #[test]
     fn hashes_and_expands_known_vectors() {
