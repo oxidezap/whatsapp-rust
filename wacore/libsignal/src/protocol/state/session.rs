@@ -593,8 +593,9 @@ impl SessionState {
             .expect("called set_receiver_chain_key for a non-existent chain");
 
         use bytes::Bytes;
-        // Same in-place update as the sender chain: this runs once per received
-        // message, and the box only ever holds these two fields.
+        // The None arm still has to initialize: a receiver chain added by
+        // add_receiver_chain carries its key from the start, but a chain
+        // deserialized from a record that predates it may not.
         let target = &mut self.session.receiver_chains[chain_idx].chain_key;
         match target.as_option_mut() {
             Some(existing) => {
