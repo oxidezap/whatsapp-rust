@@ -33,12 +33,14 @@ impl Client {
         &self,
         to: &Jid,
         extra_nodes: &mut Vec<Node>,
+        sent_at: SendInstant,
     ) -> bool {
         use wacore::iq::abprops::web;
         use wacore::iq::tctoken::{
             PrivacyTokenChoice, build_cs_token_node, build_tc_token_node, choose_privacy_token,
-            compute_cs_token, is_tc_token_expired_with, should_send_new_tc_token_with,
+            compute_cs_token, is_tc_token_expired_with_at, should_send_new_tc_token_with_at,
         };
+        let now = sent_at.unix_secs();
 
         // Skip for own JID — no need to send a privacy token to ourselves.
         if self.is_own_jid(to) {
@@ -72,16 +74,17 @@ impl Client {
 
         // Issuance scheduling is independent of the AB props — WA Web's sendTcToken
         // in MsgJob.js fires regardless of whether a token was attached to the stanza.
-        let should_issue_after_send = should_send_new_tc_token_with(
+        let should_issue_after_send = should_send_new_tc_token_with_at(
             existing.as_ref().and_then(|entry| entry.sender_timestamp),
             &tc_config,
+            now,
         );
 
         // Bind the token payloads up front so the match arms encode the choice
         // without re-checking invariants that choose_privacy_token already proved.
         let valid_tc_token: Option<&[u8]> = existing.as_ref().and_then(|entry| {
             (!entry.token.is_empty()
-                && !is_tc_token_expired_with(entry.token_timestamp, &tc_config))
+                && !is_tc_token_expired_with_at(entry.token_timestamp, &tc_config, now))
             .then_some(entry.token.as_slice())
         });
         // cstoken needs both the NCT salt and a resolved account LID (WA Web `D`).

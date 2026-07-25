@@ -189,10 +189,16 @@ impl RequestUtils {
     }
 
     pub fn generate_message_id(&self, user_jid: Option<&Jid>) -> String {
+        self.generate_message_id_at(user_jid, crate::time::now_secs_u64())
+    }
+
+    /// Same as [`Self::generate_message_id`], but against a caller-supplied
+    /// second, so a send that already sampled the clock for its own timestamps
+    /// derives the id from that same instant instead of reading again.
+    pub fn generate_message_id_at(&self, user_jid: Option<&Jid>, unix_secs: u64) -> String {
         let mut data = Vec::with_capacity(8 + 20 + 16);
 
-        let timestamp = crate::time::now_secs_u64();
-        data.extend_from_slice(&timestamp.to_be_bytes());
+        data.extend_from_slice(&unix_secs.to_be_bytes());
 
         if let Some(jid) = user_jid {
             data.extend_from_slice(jid.user.as_bytes());

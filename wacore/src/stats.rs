@@ -11,9 +11,10 @@
 //!   on a path that already does AEAD crypto plus a transport write.
 //! - Clock reads: zero per frame sent while the dead-socket anchor is armed,
 //!   one on the send that arms it, one per received transport event, plus one
-//!   more when that event carries several frames. On wasm32/embedded every read
-//!   leaves the module, so a new timestamp field here buys a read on the
-//!   client's hottest path and needs a reader to justify it.
+//!   more when that event carries several frames. A new timestamp field here
+//!   buys a read on the client's hottest path and needs a reader to justify it:
+//!   one direct message arrives as roughly four transport events (the message,
+//!   its ack, the receipt, the receipt's ack), so per-event is per-message x4.
 //! - [`HeapSize`] / memory reports only run when called; unused report code
 //!   is dropped by fat LTO.
 //! - [`TaskInstrument`] is resolved once at client build: unset leaves the

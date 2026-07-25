@@ -95,13 +95,13 @@ fn unix_now() -> i64 {
 
 /// Check if a tcToken has expired using configurable receiver-side timing.
 pub fn is_tc_token_expired_with(token_timestamp: i64, config: &TcTokenConfig) -> bool {
+    is_tc_token_expired_with_at(token_timestamp, config, unix_now())
+}
+
+/// Same as [`is_tc_token_expired_with`], but against a caller-supplied `now`.
+pub fn is_tc_token_expired_with_at(token_timestamp: i64, config: &TcTokenConfig, now: i64) -> bool {
     let cfg = config.clamped();
-    is_tc_token_expired_at(
-        token_timestamp,
-        unix_now(),
-        cfg.bucket_duration,
-        cfg.num_buckets,
-    )
+    is_tc_token_expired_at(token_timestamp, now, cfg.bucket_duration, cfg.num_buckets)
 }
 
 /// Check if a sender-side timestamp has expired using sender-specific timing.
@@ -141,8 +141,17 @@ pub fn should_send_new_tc_token_with(
     sender_timestamp: Option<i64>,
     config: &TcTokenConfig,
 ) -> bool {
+    should_send_new_tc_token_with_at(sender_timestamp, config, unix_now())
+}
+
+/// Same as [`should_send_new_tc_token_with`], but against a caller-supplied `now`.
+pub fn should_send_new_tc_token_with_at(
+    sender_timestamp: Option<i64>,
+    config: &TcTokenConfig,
+    now: i64,
+) -> bool {
     let cfg = config.clamped();
-    should_send_new_tc_token_at(sender_timestamp, unix_now(), cfg.sender_bucket_duration)
+    should_send_new_tc_token_at(sender_timestamp, now, cfg.sender_bucket_duration)
 }
 
 fn should_send_new_tc_token_at(
@@ -423,6 +432,35 @@ mod tests {
         assert_eq!(bucket_index(604800, DUR), 1);
         assert_eq!(bucket_index(1209599, DUR), 1);
         assert_eq!(bucket_index(1209600, DUR), 2);
+    }
+
+    /// The send path hands one instant to both privacy-token decisions instead
+    /// of letting each read the clock. Pin the boundary they land on.
+    #[test]
+    fn supplied_instant_decides_the_same_bucket_boundary() {
+        let config = TcTokenConfig::default().clamped();
+        let issued = 10 * config.sender_bucket_duration;
+
+        let last_second_of_bucket = issued + config.sender_bucket_duration - 1;
+        assert!(!should_send_new_tc_token_with_at(
+            Some(issued),
+            &config,
+            last_second_of_bucket
+        ));
+        assert!(should_send_new_tc_token_with_at(
+            Some(issued),
+            &config,
+            last_second_of_bucket + 1
+        ));
+
+        let stamped = 10 * config.bucket_duration;
+        let still_valid = stamped + (config.num_buckets - 1) * config.bucket_duration;
+        assert!(!is_tc_token_expired_with_at(stamped, &config, still_valid));
+        assert!(is_tc_token_expired_with_at(
+            stamped,
+            &config,
+            still_valid + config.bucket_duration
+        ));
     }
 
     #[test]

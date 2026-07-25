@@ -11354,6 +11354,7 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
             outbound_id,
             &secret,
             wacore::msg_secret::RetentionClass::Bot,
+            crate::send::SendInstant::now(),
         )
         .await;
 

@@ -1,3 +1,10 @@
+//! Outgoing message pipeline.
+//!
+//! Cost model, clock reads: one per send operation, sampled as [`SendInstant`]
+//! and carried to every stamp. A new timestamp here should take that instant
+//! rather than read again, or the path silently accumulates reads the way it
+//! had accumulated four.
+
 use crate::client::Client;
 use crate::types::message::EditAttribute;
 use anyhow::anyhow;
@@ -175,6 +182,7 @@ struct DmBranchRequest<'a> {
     to: Jid,
     message: &'a wa::Message,
     request_id: String,
+    sent_at: SendInstant,
     edit: Option<EditAttribute>,
     extra_stanza_nodes: Vec<Node>,
     is_status_addon: bool,
@@ -363,8 +371,35 @@ impl EditOptions {
     }
 }
 
+/// The wall-clock second one send operation is stamped with.
+///
+/// Sampled once where the operation starts and carried down, so the message id,
+/// the biz node, the privacy-token decision and the outbound message secret
+/// describe one instant instead of four reads that can straddle a second
+/// boundary, on a path where a clock read is not always cheap.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SendInstant(i64);
+
+impl SendInstant {
+    pub(crate) fn now() -> Self {
+        Self(wacore::time::now_secs())
+    }
+
+    pub(crate) fn unix_secs(self) -> i64 {
+        self.0
+    }
+
+    /// Saturated at 0 for the encodings that carry unsigned seconds.
+    pub(crate) fn unix_secs_u64(self) -> u64 {
+        self.0.max(0) as u64
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SendPipelineOptions {
+    /// Instant this operation is stamped with, when the caller already sampled
+    /// one. `None` makes [`Client::send_message_impl`] sample its own.
+    pub(crate) sent_at: Option<SendInstant>,
     pub(crate) request_id: Option<String>,
     pub(crate) peer: bool,
     pub(crate) force_key_distribution: bool,
@@ -878,9 +913,10 @@ impl Client {
         let stanza_type_override = options.stanza_type_override;
         let group_metadata_freshness = options.group_metadata_freshness;
         let device_freshness = options.device_freshness;
+        let sent_at = SendInstant::now();
         let request_id = match options.message_id {
             Some(id) => id,
-            None => self.generate_message_id(),
+            None => self.generate_message_id_at(sent_at.unix_secs_u64()),
         };
         // Both paths below consume `to` and `request_id`, so save copies for the result.
         let result = SendResult {
@@ -917,8 +953,7 @@ impl Client {
         }
 
         let (edit, inferred_meta) = infer_stanza_metadata(&message);
-        let now_unix_secs = wacore::time::now_secs_u64();
-        let biz = infer_biz_node(&message, now_unix_secs);
+        let biz = infer_biz_node(&message, sent_at.unix_secs_u64());
 
         let extra_nodes =
             build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
@@ -930,6 +965,7 @@ impl Client {
             to,
             &message,
             SendPipelineOptions {
+                sent_at: Some(sent_at),
                 request_id: Some(request_id),
                 edit,
                 extra_stanza_nodes: extra_nodes,
@@ -1637,6 +1673,7 @@ impl Client {
         options: SendPipelineOptions,
     ) -> Result<(), anyhow::Error> {
         let SendPipelineOptions {
+            sent_at,
             request_id: request_id_override,
             peer,
             force_key_distribution,
@@ -1647,6 +1684,9 @@ impl Client {
             device_freshness,
             borrowed_message_id,
         } = options;
+        // Callers that already stamped their message hand the instant down; the
+        // rest sample here so the pipeline below still has exactly one.
+        let sent_at = sent_at.unwrap_or_else(SendInstant::now);
         validate_extra_stanza_nodes(&extra_stanza_nodes)?;
         if request_id_override.as_ref().is_some_and(String::is_empty) {
             return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
@@ -1732,6 +1772,7 @@ impl Client {
                 to,
                 message,
                 request_id,
+                sent_at,
                 edit,
                 extra_stanza_nodes,
                 is_status_addon,
@@ -1800,6 +1841,7 @@ impl Client {
                     &outbound_id_clone,
                     secret,
                     class,
+                    sent_at,
                 )
                 .await;
             }
@@ -2269,6 +2311,7 @@ impl Client {
             to,
             message,
             request_id,
+            sent_at,
             edit,
             extra_stanza_nodes,
             is_status_addon,
@@ -2443,7 +2486,7 @@ impl Client {
             // path but WA Web does not attach tctokens to them.
             if !to.is_group() && !to.is_newsletter() && !is_status_addon {
                 should_issue_tc_token_after_send = self
-                    .maybe_include_tc_token(&to, &mut extra_stanza_nodes)
+                    .maybe_include_tc_token(&to, &mut extra_stanza_nodes, sent_at)
                     .await;
             }
             if should_issue_tc_token_after_send {
@@ -2502,6 +2545,7 @@ impl Client {
         msg_id: &str,
         secret: &[u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
         class: wacore::msg_secret::RetentionClass,
+        sent_at: SendInstant,
     ) {
         let policy = self.cache_config.msg_secret_policy;
         if !policy.persists() {
@@ -2512,9 +2556,9 @@ impl Client {
         if policy.bot_only() && class != wacore::msg_secret::RetentionClass::Bot {
             return;
         }
-        // Outbound secrets are minted "now", so the parent event time is the
-        // current clock.
-        let now = wacore::time::now_secs();
+        // Outbound secrets are minted with the parent event, so the send's own
+        // instant IS the parent event time.
+        let now = sent_at.unix_secs();
         let expires_at = wacore::msg_secret::expires_at(
             policy,
             &self.cache_config.msg_secret_retention,
@@ -5328,6 +5372,7 @@ mod tests {
                 "MID_1",
                 &secret,
                 wacore::msg_secret::RetentionClass::Text,
+                SendInstant::now(),
             )
             .await;
         client.msg_secret_buffer.wait_flushed().await;
@@ -5356,6 +5401,7 @@ mod tests {
                 "MID_4",
                 &[2u8; 32],
                 wacore::msg_secret::RetentionClass::Text,
+                SendInstant::now(),
             )
             .await;
         client.msg_secret_buffer.wait_flushed().await;
@@ -5438,6 +5484,7 @@ mod tests {
                 "GROUP_MID",
                 &secret,
                 wacore::msg_secret::RetentionClass::Text,
+                SendInstant::now(),
             )
             .await;
         client.msg_secret_buffer.wait_flushed().await;
@@ -5608,7 +5655,7 @@ mod clock_budget_tests {
     /// Budget for one steady-state DM send, in clock reads. On wasm32 and
     /// embedded targets every read leaves the module, so this is a real cost of
     /// the send path and not just an instruction count.
-    const SEND_WALL_READS: u64 = 4;
+    const SEND_WALL_READS: u64 = 1;
     const SEND_MONOTONIC_READS: u64 = 2;
 
     async fn seed_devices(client: &Arc<Client>, user: &str) {
@@ -5715,6 +5762,42 @@ mod clock_budget_tests {
             reads.monotonic <= SEND_MONOTONIC_READS,
             "monotonic reads per DM send rose to {} (budget {SEND_MONOTONIC_READS})",
             reads.monotonic
+        );
+
+        client.disconnect().await;
+    }
+
+    /// One send, one instant: the message id, the biz node, the privacy-token
+    /// decision and the outbound secret are stamped from a single read, so they
+    /// cannot end up describing different seconds for the same message.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_reads_the_clock_once() {
+        let (client, _transport, peer) = warm_send_client().await;
+
+        let base = clock_reads::snapshot();
+        let sent = client.send_text(peer.clone(), "hello").await.expect("send");
+        assert_eq!(
+            clock_reads::since(base).wall,
+            1,
+            "every stamp on the send path must come from the same read"
+        );
+
+        // The outbound secret is one of the stamps, so its presence proves the
+        // measured window really covered that write.
+        client.msg_secret_buffer.wait_flushed().await;
+        let stored = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                &peer.to_non_ad_string(),
+                &format!("{OWN_PN}@s.whatsapp.net"),
+                &sent.message_id,
+            )
+            .await
+            .expect("msg secret lookup");
+        assert!(
+            stored.is_some(),
+            "the send persisted an outbound secret under the measured instant"
         );
 
         client.disconnect().await;

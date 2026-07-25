@@ -120,6 +120,7 @@ impl<'a> Comments<'a> {
                 &result.message_id,
                 &comment_secret,
                 wacore::msg_secret::RetentionClass::Text,
+                crate::send::SendInstant::now(),
             )
             .await;
         Ok(result)

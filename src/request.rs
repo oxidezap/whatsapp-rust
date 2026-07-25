@@ -183,9 +183,15 @@ impl Client {
     ///
     /// A string containing the generated message ID in the format expected by WhatsApp.
     pub fn generate_message_id(&self) -> String {
+        self.generate_message_id_at(wacore::time::now_secs_u64())
+    }
+
+    /// Same as [`Self::generate_message_id`], but against a caller-supplied
+    /// second (see [`RequestUtils::generate_message_id_at`]).
+    pub(crate) fn generate_message_id_at(&self, unix_secs: u64) -> String {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         self.get_request_utils()
-            .generate_message_id(device_snapshot.pn.as_ref())
+            .generate_message_id_at(device_snapshot.pn.as_ref(), unix_secs)
     }
 
     fn get_request_utils(&self) -> RequestUtils {

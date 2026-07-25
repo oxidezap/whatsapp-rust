@@ -98,6 +98,9 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
                     log::debug!(target: "MessageQueue", "Stale worker exiting; remaining messages will be redelivered by server");
                     break;
                 }
+                // Two clock reads per message, kept: sampling or gating on lane
+                // backlog would stop reporting the single pathological message
+                // this guard exists to catch.
                 let start = wacore::time::Instant::now();
                 let client = client_for_worker.clone();
                 // Awaited inline (not boxed): the future lives in this
