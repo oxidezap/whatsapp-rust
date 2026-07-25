@@ -1226,26 +1226,27 @@ impl Client {
         // (same rule as the DM/group send path); a failure aborts the send.
         self.persist_signal_state_pre_wire().await?;
 
-        let ack = if let Some(phash) = stanza
+        let ack = stanza
             .attrs()
             .optional_string("phash")
-            .map(|s| wacore_binary::CompactString::from(s.as_ref()))
-        {
-            let rx = self.register_ack_waiter(&request_id);
-            Some((rx, phash))
-        } else {
-            None
-        };
+            .map(|s| wacore_binary::CompactString::from(s.as_ref()));
+        if let Some(phash) = ack.clone() {
+            // This path samples no send instant of its own (status posts are
+            // not on the per-message budget), so read the wall second here.
+            self.register_phash_waiter(
+                &request_id,
+                phash,
+                to.clone(),
+                true,
+                wacore::time::now_secs(),
+            );
+        }
 
         if let Err(e) = self.send_node(stanza).await {
             if ack.is_some() {
                 self.response_waiters_guard().remove(&request_id);
             }
             return Err(e.into());
-        }
-
-        if let Some((rx, phash)) = ack {
-            self.spawn_phash_validation(rx, phash, to.clone(), true, request_id.clone());
         }
 
         self.update_sender_key_devices(&to_str, &prepared.skdm_devices)
@@ -1544,58 +1545,12 @@ impl Client {
         }
     }
 
-    /// Spawn a background task to validate phash from server ack.
-    /// On mismatch, invalidates sender key device cache and group info cache.
-    fn spawn_phash_validation(
-        &self,
-        rx: futures::channel::oneshot::Receiver<std::sync::Arc<wacore_binary::OwnedNodeRef>>,
-        our_phash: wacore_binary::CompactString,
-        jid: Jid,
-        invalidate_group_cache: bool,
-        message_id: String,
-    ) {
-        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
-            return;
-        };
-        self.runtime
-            .spawn(Box::pin(async move {
-                let ack = match wacore::runtime::timeout(
-                    &*client.runtime,
-                    std::time::Duration::from_secs(10),
-                    rx,
-                )
-                .await
-                {
-                    Ok(Ok(node)) => node,
-                    _ => {
-                        // Remove leaked waiter to prevent keepalive suppression
-                        client.response_waiters_guard().remove(&message_id);
-                        return;
-                    }
-                };
-                // Cold path: box the heavy mismatch handler so the common
-                // (phash matches) spawned future stays small instead of carrying
-                // all the invalidation/clear awaits inline.
-                if let Some(server) = ack.get().get_attr("phash").map(|v| v.as_str())
-                    && server != our_phash
-                {
-                    Box::pin(client.handle_phash_mismatch(
-                        &jid,
-                        &our_phash,
-                        &server,
-                        invalidate_group_cache,
-                    ))
-                    .await;
-                }
-            }))
-            .detach();
-    }
-
-    /// Cold path of [`spawn_phash_validation`](Self::spawn_phash_validation): the
-    /// server's phash disagreed with ours, so invalidate the relevant
-    /// device/group caches and (for groups) force sender-key redistribution.
+    /// Cold path of the phash check: the server's phash disagreed with ours, so
+    /// invalidate the relevant device/group caches and (for groups) force
+    /// sender-key redistribution. Spawned only on a mismatch, which is why the
+    /// common path costs a string comparison on the read loop.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.phash_mismatch", level = "debug", skip_all, fields(jid = %jid.observe())))]
-    async fn handle_phash_mismatch(
+    pub(crate) async fn handle_phash_mismatch(
         &self,
         jid: &Jid,
         our_phash: &str,
@@ -1795,15 +1750,27 @@ impl Client {
         // keyed by outer stanza id, so it would overwrite the original send's
         // waiter (either ack could resolve the wrong send, and the older timeout
         // could remove the replacement). The edit's own ack is best-effort.
-        let ack = if !borrowed_message_id
+        // Registered before the stanza goes out: the ack can arrive while
+        // send_node is still returning, and a waiter installed afterwards would
+        // miss it.
+        let ack_message_id = if !borrowed_message_id
             && let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
                 .attrs()
                 .optional_string("id")
                 .map(|s| s.into_owned())
         {
-            let rx = self.register_ack_waiter(&msg_id);
-            Some((rx, phash, msg_id))
+            // Group sends also invalidate group cache on mismatch: the server's
+            // participant set diverged, so the next send needs a fresh query.
+            let invalidate_group = tc_issue_target.is_group();
+            self.register_phash_waiter(
+                &msg_id,
+                phash,
+                tc_issue_target.clone(),
+                invalidate_group,
+                sent_at.unix_secs(),
+            );
+            Some(msg_id)
         } else {
             None
         };
@@ -1819,7 +1786,7 @@ impl Client {
         }
 
         if let Err(e) = self.send_node(stanza_to_send).await {
-            if let Some((_, _, ref msg_id)) = ack {
+            if let Some(ref msg_id) = ack_message_id {
                 self.response_waiters_guard().remove(msg_id);
             }
             return Err(e.into());
@@ -1845,19 +1812,6 @@ impl Client {
                 )
                 .await;
             }
-        }
-
-        if let Some((rx, phash, msg_id)) = ack {
-            // Group sends also invalidate group cache on mismatch — server's
-            // participant set diverged, the next send needs a fresh query.
-            let invalidate_group = tc_issue_target.is_group();
-            self.spawn_phash_validation(
-                rx,
-                phash,
-                tc_issue_target.clone(),
-                invalidate_group,
-                msg_id,
-            );
         }
 
         if let Some(update) = skdm_update {

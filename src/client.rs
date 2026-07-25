@@ -709,9 +709,35 @@ pub(crate) struct OfflineSyncMetrics {
 
 type ResponseWaiterSender = futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>;
 
+/// What a pending ack/IQ entry is waiting to do once the response arrives.
+///
+/// A phash check used to be an `Iq` waiter plus a spawned task holding the
+/// receiver and a ten second timer, which is a task, a channel and a timer per
+/// outgoing message for a comparison that almost always succeeds. Carrying the
+/// expected value in the map instead lets the read loop compare it inline and
+/// spawn only on the rare mismatch.
+pub(crate) enum ResponseWaiter {
+    /// Classic request/response: hand the node to whoever is awaiting it.
+    Iq(ResponseWaiterSender),
+    /// Compare the server's `phash` against ours; act only if they differ.
+    Phash(PhashWaiter),
+}
+
+pub(crate) struct PhashWaiter {
+    pub(crate) expected: wacore_binary::CompactString,
+    pub(crate) jid: Jid,
+    pub(crate) invalidate_group_cache: bool,
+    /// Wall second after which the sweep may drop this entry. Nothing polls the
+    /// waiter, so a lost ack has to be swept or it sits in the map suppressing
+    /// keepalive pings, which the previous timeout path guarded against. Wall
+    /// rather than monotonic because the send has already sampled this clock;
+    /// reading a second one per message is what the send clock budget forbids.
+    pub(crate) expires_at_secs: i64,
+}
+
 struct ResponseWaiterEntry {
     generation: NonZeroU64,
-    sender: ResponseWaiterSender,
+    sender: ResponseWaiter,
 }
 
 /// Map of pending IQ/ack response waiters, keyed by request id.
@@ -737,7 +763,7 @@ impl ResponseWaiterMap {
     pub(crate) fn try_insert_guarded(
         &mut self,
         request_id: String,
-        sender: ResponseWaiterSender,
+        sender: ResponseWaiter,
     ) -> Option<NonZeroU64> {
         use std::collections::hash_map::Entry;
 
@@ -754,16 +780,26 @@ impl ResponseWaiterMap {
     pub(crate) fn insert(
         &mut self,
         request_id: String,
-        sender: ResponseWaiterSender,
-    ) -> Option<ResponseWaiterSender> {
+        sender: ResponseWaiter,
+    ) -> Option<ResponseWaiter> {
         let generation = self.next_generation();
         self.entries
             .insert(request_id, ResponseWaiterEntry { generation, sender })
             .map(|entry| entry.sender)
     }
 
-    pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiterSender> {
+    pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiter> {
         self.entries.remove(request_id).map(|entry| entry.sender)
+    }
+
+    /// Drop phash waiters whose ack never came. Called from the keepalive tick,
+    /// which is also the code that treats a non-empty map as "IQs pending" and
+    /// would otherwise stop pinging forever after one lost ack.
+    pub(crate) fn drop_expired_phash(&mut self, now_secs: i64) {
+        self.entries.retain(|_, entry| match &entry.sender {
+            ResponseWaiter::Phash(waiter) => waiter.expires_at_secs > now_secs,
+            ResponseWaiter::Iq(_) => true,
+        });
     }
 
     pub(crate) fn remove_guarded(&mut self, request_id: &str, cleanup_generation: NonZeroU64) {

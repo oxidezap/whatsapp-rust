@@ -389,5 +389,8 @@ pub(crate) async fn answer_iq(client: &Arc<Client>, request_id: &str, response: 
     .await
     .unwrap_or_else(|_| panic!("an IQ waiter should be registered for {request_id}"));
 
-    let _ = sender.send(node_to_owned_ref(response));
+    // Test helper: the map only ever holds Iq waiters in these fixtures.
+    if let crate::client::ResponseWaiter::Iq(sender) = sender {
+        let _ = sender.send(node_to_owned_ref(response));
+    }
 }

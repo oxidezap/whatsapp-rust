@@ -78,7 +78,15 @@ impl Client {
 
         // WA Web: skip ping if there are pending IQs
         // (`activePing || ackHandlers.length || pendingIqs.size`)
-        let has_pending = !self.response_waiters_guard().is_empty();
+        //
+        // Sweep first: a phash waiter is resolved by an ack that may never come,
+        // and nothing else polls it. Leaving one behind would read as "IQ
+        // pending" and silence keepalives for the life of the connection.
+        let has_pending = {
+            let mut waiters = self.response_waiters_guard();
+            waiters.drop_expired_phash(wacore::time::now_secs());
+            !waiters.is_empty()
+        };
         if has_pending {
             debug!(target: "Client/Keepalive", "Skipping ping: IQ responses pending");
             return KeepaliveResult::Ok;

@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// How long a registered phash waiter stays valid, in seconds. Matches the
+/// timeout the previous per-send validation task used.
+const PHASH_ACK_TIMEOUT_SECS: i64 = 10;
+
 impl Client {
     /// Send pre-marshaled plaintext bytes through the noise socket.
     ///
@@ -269,14 +273,28 @@ impl Client {
     /// Register a oneshot waiter for a server ack by message ID.
     /// Returns the receiver — caller sends the node separately and awaits this in background.
     /// Sync: registration is just a `std::sync::Mutex` insert (no await).
-    pub(crate) fn register_ack_waiter(
+    /// Register the phash the server is expected to echo for this send.
+    ///
+    /// Nothing awaits the result: the read loop compares inline when the ack
+    /// lands and only acts on a mismatch, so a send costs a map entry instead of
+    /// a task, a oneshot and a timer.
+    pub(crate) fn register_phash_waiter(
         &self,
         message_id: &str,
-    ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.response_waiters_guard()
-            .insert(message_id.to_string(), tx);
-        rx
+        expected: wacore_binary::CompactString,
+        jid: Jid,
+        invalidate_group_cache: bool,
+        sent_at_secs: i64,
+    ) {
+        self.response_waiters_guard().insert(
+            message_id.to_string(),
+            ResponseWaiter::Phash(PhashWaiter {
+                expected,
+                jid,
+                invalidate_group_cache,
+                expires_at_secs: sent_at_secs + PHASH_ACK_TIMEOUT_SECS,
+            }),
+        );
     }
 
     /// Creates a normalized ChatMessageId by resolving PN to LID JIDs.
