@@ -1731,7 +1731,7 @@ impl Client {
         // Generate request ID early (doesn't need lock)
         let request_id = match request_id_override {
             Some(id) => id,
-            None => self.generate_message_id(),
+            None => self.generate_message_id_at(sent_at.unix_secs_u64()),
         };
         // `request_id` is moved into the branch-specific stanza builders below;
         // keep a copy for the post-send messageSecret persistence (the secret
