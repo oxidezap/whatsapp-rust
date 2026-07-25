@@ -27,7 +27,7 @@ CI pins the mock-server image by digest, so an unchanged client commit always ru
 
 ## Connect, disconnect, reconnect
 
-The distinction that catches people: **`reconnect()` tears the socket down in a background task**, so the client is still online when it returns. `Event::Disconnected` is suppressed for expected disconnects, which makes the connection flag the only observable.
+The distinction that catches people: **`reconnect()` tears the socket down in a background task**, so the client is still online when it returns. Do not wait for `Event::Disconnected` — it is suppressed for expected disconnects and will never arrive. Observe the connection state instead, which is what `wait_for_disconnected()` polls.
 
 ```rust
 client_b.client.reconnect().await;

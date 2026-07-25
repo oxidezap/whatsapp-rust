@@ -86,4 +86,4 @@ Known sharp edges:
 
 `docs/captured-js/` is the raw dump (untracked, local). Navigation and grep patterns are in `feature_implementation.md`. Go there when the IR is silent, degraded, or when the question is *when* rather than *what*.
 
-Either way, reading gives you a hypothesis. If the answer is an algorithm — a hash, a derivation, a constant — run it against real captured data and report the hit rate against chance before building on it.
+Either way, reading gives you a hypothesis, not a fact. Validating one against a real capture — and keeping that capture's contents out of tests, commits, and PR bodies — is covered under "Reading evidence honestly" in `feature_implementation.md`.

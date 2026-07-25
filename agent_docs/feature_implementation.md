@@ -22,6 +22,8 @@ Patterns worth grepping across the dump: `xmlns:` for namespaces, `action:` for 
 
 Reading the JS gives you a hypothesis. If a capture yields an algorithm — a hash, a key derivation, a constant — run it against real captured data and report the hit rate against chance before building on it. "6 of 113 matched, 0.012 expected by chance" is evidence; "the code says md5" is a reading.
 
+The capture stays local, and only the aggregate leaves it: report the rate, never the rows. Real JIDs, phone numbers, and vectors derived from them do not belong in tests, commits, PR bodies, or issues — regenerate fixtures from fictitious identifiers once the hypothesis holds.
+
 ## Which crate
 
 - **wacore** — protocol logic, state traits, crypto helpers, data models. Platform-agnostic: it also builds for wasm32 and ESP32.

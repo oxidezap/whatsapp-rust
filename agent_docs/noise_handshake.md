@@ -11,11 +11,14 @@ Three Noise patterns coexist, mirroring WA Web's `WAWebOpenChatSocket`.
 ## Selection (`src/handshake.rs::select_pattern`)
 
 ```text
-ik_failures >= 1  ───────────────────────────────────────► XX
+device not registered ───────────────────────────────────► XX
+ik_failures >= IK_FAILURE_THRESHOLD ─────────────────────► XX
 no cached server_cert_chain ─────────────────────────────► XX
-leaf.not_after < now OR intermediate.not_after < now ────► XX
+now outside [not_before, not_after) of leaf OR intermediate ► XX
 otherwise ──────────────────────────────────────────────► IK with leaf.key
 ```
+
+Both ends of the validity window are checked on both certs: `not_after` is ordinary expiry, `not_before` catches backwards clock skew. The unregistered gate exists for legacy databases written before the registration gate, which can hold a cached chain that IK must refuse.
 
 `Client.ik_handshake_failures: AtomicU32` is per-process and deliberately not persisted, matching WA Web's `K = 0` reset on process start.
 
@@ -34,7 +37,9 @@ The split is `HandshakeError::is_transient()` vs `is_crypto_fatal()`. Misclassif
 
 `Device.server_cert_chain` holds `CachedServerCertChain { intermediate, leaf }`, each cert reduced to `{ key: [u8; 32], not_before: i64, not_after: i64 }` — the same fields WA Web writes in `PrefsInfoStore.js:setCertificateChain`.
 
-`verify_server_cert` checks structural shape, the issuer-serial pin, the chain link, and that `leaf.key` matches the decrypted Noise static. Ed25519 signature verification against `WA_CERT_PUB_KEY` is intentionally skipped — it would break the e2e mock server, and whatsmeow takes the same posture. The constant staying unused is deliberate.
+`verify_server_cert` checks structural shape, the issuer-serial pin against `WA_CERT_ISSUER_SERIAL`, the chain link (the leaf's issuer serial must equal the intermediate's serial), that `leaf.key` equals the decrypted Noise static, and **both XEdDSA signatures**: the intermediate's over `WA_CERT_PUB_KEY`, then the leaf's over the intermediate's key.
+
+Signature verification is bypassed only under `cfg(test)` and the `danger-skip-cert-chain-verify` feature, which exist so callers can drive the surrounding code against zero-signed fixtures — `tests/e2e` enables the feature because the mock server does not sign its chain. **Production builds verify.** If you are changing this path, `wacore/noise/tests/cert_chain_verify.rs` is compiled with `#![cfg(not(feature = "danger-skip-cert-chain-verify"))]` precisely so the real path keeps coverage.
 
 ## Logs
 
