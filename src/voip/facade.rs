@@ -193,7 +193,7 @@ impl<'a> AcceptCall<'a> {
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
         // a call that has already ended.
-        let mut registration = RegisteredCall::new(self.client, session);
+        let mut registration = RegisteredCall::new(self.client, session).await;
         let mut teardown = AnswerTeardown::new(self.client, &registration);
         let preaccept_id = self.client.generate_request_id();
         let accept_id = self.client.generate_request_id();
@@ -1223,9 +1223,9 @@ pub(crate) async fn attach_outgoing_relay(
     Ok(true)
 }
 
-/// A call generation registered before any answer-side await. Until disarmed, dropping this guard
-/// removes only its own generation, so setup/signaling errors cannot leak a task-less registry entry
-/// or reap a same-call-id replacement.
+/// A call generation registered before any fallible answer-side work. Until disarmed, dropping this
+/// guard removes only its own generation, so setup/signaling errors cannot leak a task-less registry
+/// entry or reap a same-call-id replacement.
 struct RegisteredCall {
     registry: Arc<wacore::voip::CallRegistry>,
     call_id: String,
@@ -1237,11 +1237,15 @@ struct RegisteredCall {
 }
 
 impl RegisteredCall {
-    fn new(client: &Client, session: wacore::voip::CallSession) -> Self {
+    async fn new(client: &Client, session: wacore::voip::CallSession) -> Self {
         let registry = client.call_registry();
         let call_id = session.call_id.clone();
         let peer_jid = session.peer_jid.clone();
         let call_creator = session.call_creator.clone();
+        // Serialize this insertion with a teardown for the same call-id. In particular, a failed
+        // generation keeps the lane across its terminal send, closing the remove-before-send window
+        // in which a re-offer could otherwise become current and then be killed by the stale stanza.
+        let _transition = client.lock_answer_transition(&call_id).await;
         let generation = registry.insert(session);
         let ended = Arc::new(EndedFlag::default());
         // Wake setup/connect and any eventual CallHandle whenever this generation is removed,
@@ -1284,7 +1288,8 @@ impl Drop for RegisteredCall {
 }
 
 /// Owns peer cleanup once answer signaling begins. Claiming removes only this registration
-/// generation before any async send, so a superseding same-call-id offer is never torn down.
+/// generation while holding the call-id transition lane through the async terminal send, so a
+/// superseding same-call-id offer cannot be installed in the removal-before-send window.
 struct AnswerTeardown {
     client: std::sync::Weak<Client>,
     registry: Arc<wacore::voip::CallRegistry>,
@@ -1293,6 +1298,8 @@ struct AnswerTeardown {
     call_creator: Jid,
     generation: u64,
     armed: bool,
+    claimed: bool,
+    transition: Option<async_lock::MutexGuardArc<()>>,
 }
 
 impl AnswerTeardown {
@@ -1305,6 +1312,8 @@ impl AnswerTeardown {
             call_creator: registration.call_creator.clone(),
             generation: registration.generation,
             armed: false,
+            claimed: false,
+            transition: None,
         }
     }
 
@@ -1312,29 +1321,33 @@ impl AnswerTeardown {
         self.armed = true;
     }
 
-    fn claim(&mut self) -> bool {
-        if !self.armed {
-            return false;
-        }
-        self.armed = false;
-        self.registry
-            .remove_if_current(&self.call_id, self.generation)
-    }
-
     fn disarm(&mut self) {
         self.armed = false;
+        self.claimed = false;
+        self.transition = None;
     }
 
     async fn terminate(&mut self, client: &Client) {
-        if self.claim() {
+        if !self.armed {
+            return;
+        }
+        // Store the owned guard in `self`: if this future is cancelled during the terminal write,
+        // Drop can move the still-held lane into its detached retry without reopening the race.
+        self.transition = Some(client.lock_answer_transition(&self.call_id).await);
+        if self
+            .registry
+            .remove_if_current(&self.call_id, self.generation)
+        {
+            self.claimed = true;
             send_answer_terminate(client, &self.call_id, &self.peer_jid, &self.call_creator).await;
         }
+        self.disarm();
     }
 }
 
 impl Drop for AnswerTeardown {
     fn drop(&mut self) {
-        if !self.claim() {
+        if !self.armed {
             return;
         }
         let Some(client) = self.client.upgrade() else {
@@ -1343,10 +1356,20 @@ impl Drop for AnswerTeardown {
         let call_id = self.call_id.clone();
         let peer_jid = self.peer_jid.clone();
         let call_creator = self.call_creator.clone();
+        let registry = self.registry.clone();
+        let generation = self.generation;
+        let claimed = self.claimed;
+        let transition = self.transition.take();
         let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
-                send_answer_terminate(&client, &call_id, &peer_jid, &call_creator).await;
+                let _transition = match transition {
+                    Some(transition) => transition,
+                    None => client.lock_answer_transition(&call_id).await,
+                };
+                if claimed || registry.remove_if_current(&call_id, generation) {
+                    send_answer_terminate(&client, &call_id, &peer_jid, &call_creator).await;
+                }
             }))
             .detach();
     }
@@ -1377,7 +1400,7 @@ async fn spawn_call(
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
-    let mut registration = RegisteredCall::new(client, session);
+    let mut registration = RegisteredCall::new(client, session).await;
     let result = spawn_registered_call(client, &registration, engine, factory, audio, video).await;
     if result.is_ok() {
         registration.disarm();
@@ -2479,14 +2502,14 @@ mod tests {
         )
     }
 
-    fn register_answer(client: &Client, incoming: &IncomingCall) -> RegisteredCall {
+    async fn register_answer(client: &Client, incoming: &IncomingCall) -> RegisteredCall {
         let mut session = wacore::voip::CallSession::new_incoming(
             incoming.action.call_id(),
             incoming.from.clone(),
             incoming.action.call_creator().clone(),
         );
         session.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
-        RegisteredCall::new(client, session)
+        RegisteredCall::new(client, session).await
     }
 
     #[tokio::test]
@@ -2541,7 +2564,7 @@ mod tests {
         client
             .call_registry()
             .mark_incoming_ringing(incoming.action.call_id());
-        let registration = register_answer(&client, &incoming);
+        let registration = register_answer(&client, &incoming).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
 
         // A terminal stanza may land after registration but before the first answer send.
@@ -2619,7 +2642,7 @@ mod tests {
         let (transport, entered_rx, release_tx) = gated_send_transport(0, false);
         install_noise_transport(&client, transport).await;
         let incoming = incoming_offer(false);
-        let registration = register_answer(&client, &incoming);
+        let registration = register_answer(&client, &incoming).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         let preaccept_waiter = client.wait_for_sent_node(
             crate::client::NodeFilter::tag("call").attr("id", "PREACCEPT-ORDER-ID"),
@@ -2684,7 +2707,7 @@ mod tests {
     async fn preaccept_precedes_slow_answer_preparation() {
         let (client, _sent_count) = make_sending_client().await;
         let incoming = incoming_offer(false);
-        let registration = register_answer(&client, &incoming);
+        let registration = register_answer(&client, &incoming).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         let (preaccept, _accept) = build_answer_signaling(
             &incoming,
@@ -2728,7 +2751,7 @@ mod tests {
     async fn peer_terminate_during_preparation_stops_before_accept() {
         let (client, sent_count) = make_sending_client().await;
         let incoming = incoming_offer(false);
-        let registration = register_answer(&client, &incoming);
+        let registration = register_answer(&client, &incoming).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         let (preaccept, accept) = build_answer_signaling(
             &incoming,
@@ -2773,7 +2796,7 @@ mod tests {
         let (transport, entered_rx, release_tx) = gated_send_transport(1, true);
         install_noise_transport(&client, transport).await;
         let incoming = incoming_offer(false);
-        let registration = register_answer(&client, &incoming);
+        let registration = register_answer(&client, &incoming).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         let preaccept_waiter = client.wait_for_sent_node(
             crate::client::NodeFilter::tag("call").attr("id", "PREACCEPT-FAIL-ID"),
@@ -4265,7 +4288,7 @@ mod tests {
     #[tokio::test]
     async fn answered_call_connect_failure_terminates_the_peer() {
         let (client, sent_count) = make_sending_client().await;
-        let mut registration = RegisteredCall::new(&client, mk_session());
+        let mut registration = RegisteredCall::new(&client, mk_session()).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         teardown.arm();
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
@@ -4298,7 +4321,7 @@ mod tests {
     #[tokio::test]
     async fn answered_call_supersession_does_not_terminate_replacement() {
         let (client, sent_count) = make_sending_client().await;
-        let mut registration = RegisteredCall::new(&client, mk_session());
+        let mut registration = RegisteredCall::new(&client, mk_session()).await;
         let stale_generation = registration.generation;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         teardown.arm();
@@ -4323,15 +4346,15 @@ mod tests {
         );
         let replace = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            client.call_registry().insert(mk_session())
+            RegisteredCall::new(&client, mk_session()).await
         };
-        let (result, replacement_generation) = tokio::join!(spawn, replace);
+        let (result, replacement) = tokio::join!(spawn, replace);
 
         assert!(matches!(result, Err(CallError::Connect(_))));
-        assert_ne!(replacement_generation, stale_generation);
+        assert_ne!(replacement.generation, stale_generation);
         assert_eq!(
             client.call_registry().generation_of("CID-FACADE"),
-            Some(replacement_generation),
+            Some(replacement.generation),
             "the replacement generation must remain registered"
         );
         assert_eq!(
@@ -4339,15 +4362,60 @@ mod tests {
             0,
             "supersession must not send a terminate for the replacement call"
         );
-        client
-            .call_registry()
-            .remove_if_current("CID-FACADE", replacement_generation);
+    }
+
+    #[tokio::test]
+    async fn answer_teardown_serializes_reoffer_until_terminate_is_sent() {
+        let client = make_client().await;
+        let (transport, entered_rx, release_tx) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let registration = RegisteredCall::new(&client, mk_session()).await;
+        let stale_generation = registration.generation;
+        let mut teardown = AnswerTeardown::new(&client, &registration);
+        teardown.arm();
+
+        let terminate = teardown.terminate(&client);
+        let replace = async {
+            entered_rx
+                .recv()
+                .await
+                .expect("terminate transport attempt");
+            assert_eq!(
+                client.call_registry().generation_of("CID-FACADE"),
+                None,
+                "the failed generation is claimed before its terminal send"
+            );
+
+            let mut replacement = Box::pin(RegisteredCall::new(&client, mk_session()));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), replacement.as_mut())
+                    .await
+                    .is_err(),
+                "a same-call-id re-offer must wait while terminate is in flight"
+            );
+            assert_eq!(
+                client.call_registry().generation_of("CID-FACADE"),
+                None,
+                "the replacement must not enter the registry before terminate is written"
+            );
+
+            release_tx.send(()).await.expect("release terminate send");
+            replacement.await
+        };
+
+        let ((), replacement) = tokio::join!(terminate, replace);
+        assert_ne!(replacement.generation, stale_generation);
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            Some(replacement.generation),
+            "the replacement may register only after the stale terminal send completes"
+        );
     }
 
     #[tokio::test]
     async fn cancelling_answered_call_startup_terminates_the_peer() {
         let (client, _sent_count) = make_sending_client().await;
-        let mut registration = RegisteredCall::new(&client, mk_session());
+        let mut registration = RegisteredCall::new(&client, mk_session()).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         teardown.arm();
         let (_gate_tx, gate_rx) = async_channel::bounded::<()>(1);

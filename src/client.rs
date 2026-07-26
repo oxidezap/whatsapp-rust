@@ -1324,6 +1324,13 @@ pub struct Client {
     #[cfg(feature = "voip-runtime")]
     pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
 
+    /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
+    /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
+    /// current in the removal-before-send window. Stripes bound storage while allowing independent
+    /// lanes to progress concurrently.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; 16],
+
     /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
     /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
     /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id

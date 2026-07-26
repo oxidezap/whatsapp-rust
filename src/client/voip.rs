@@ -29,6 +29,22 @@ impl Client {
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
         self.call_registry.clone()
     }
+
+    /// Lock the striped answer-transition lane for `call_id`. Incoming answer registration and
+    /// answer teardown both use this, preventing a replacement generation from being installed
+    /// after the old one is claimed but before its terminal stanza reaches the wire.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn lock_answer_transition(
+        &self,
+        call_id: &str,
+    ) -> async_lock::MutexGuardArc<()> {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        call_id.hash(&mut hasher);
+        let lane = hasher.finish() as usize % self.answer_transition_locks.len();
+        self.answer_transition_locks[lane].clone().lock_arc().await
+    }
 }
 
 /// Errors from call-control operations. `#[non_exhaustive]` so new variants stay

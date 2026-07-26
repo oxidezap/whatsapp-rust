@@ -942,6 +942,21 @@ enum VideoUi {
     Active,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundMediaFailureStage {
+    /// Microphone, speaker, codec bridge, or video endpoints failed before the facade took ownership.
+    LocalPreparation,
+    /// `accept().start()` ran, so its generation-aware guard owns peer teardown.
+    Facade,
+}
+
+fn should_reject_failed_media_start(
+    stage: InboundMediaFailureStage,
+    peer_already_ended: bool,
+) -> bool {
+    stage == InboundMediaFailureStage::LocalPreparation && !peer_already_ended
+}
+
 impl CallObserver {
     fn new(client: Arc<Client>, accept: bool, video: bool, audio: AudioMode) -> Self {
         Self {
@@ -1059,8 +1074,16 @@ impl EventHandler for CallObserver {
                             .await
                         {
                             Ok(handle) => register_handle(&state, cid.clone(), handle).await,
-                            Err(e) => {
-                                complete_call_startup(&state, &cid);
+                            Err((stage, e)) => {
+                                let peer_already_ended = complete_call_startup(&state, &cid);
+                                if should_reject_failed_media_start(stage, peer_already_ended)
+                                    && let Err(reject_error) = client.voip().reject(&call).await
+                                {
+                                    warn!(
+                                        "failed to reject call after local media setup failed: \
+                                         {reject_error}"
+                                    );
+                                }
                                 warn!("inbound media failed: {e}");
                             }
                         }
@@ -1091,42 +1114,50 @@ async fn start_media(
     auto_video: bool,
     audio: AudioMode,
     state: &Arc<Mutex<CallState>>,
-) -> Result<Arc<CallHandle>> {
-    let mic = spawn_mic()?;
-    let speaker = spawn_speaker()?;
-    let event_speaker = speaker.clone();
-    info!("🔌 connecting media via client.voip().accept(..)…");
-    let video_endpoints = if initial_video {
-        let opts = VideoOpts::from_env().await?;
-        let cid = call.action.call_id();
-        Some((
-            video::spawn_video_source(&opts).await?,
-            video::spawn_video_sink(&opts, cid).await?,
-        ))
-    } else {
-        None
-    };
-    if peer_terminated_during_startup(state, call.action.call_id()) {
-        bail!("peer ended the call during media preparation");
-    }
+) -> std::result::Result<Arc<CallHandle>, (InboundMediaFailureStage, anyhow::Error)> {
     let voip = client.voip();
-    let mut builder = match audio {
-        #[cfg(feature = "voip-mlow")]
-        AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
-        #[cfg(feature = "voip-opus")]
-        AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
-            let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
-            voip.accept(call)
-                .encoded_audio(audio.format(), source, sink)
+    let (builder, event_speaker) = async {
+        let mic = spawn_mic()?;
+        let speaker = spawn_speaker()?;
+        let event_speaker = speaker.clone();
+        info!("🔌 connecting media via client.voip().accept(..)…");
+        let video_endpoints = if initial_video {
+            let opts = VideoOpts::from_env().await?;
+            let cid = call.action.call_id();
+            Some((
+                video::spawn_video_source(&opts).await?,
+                video::spawn_video_sink(&opts, cid).await?,
+            ))
+        } else {
+            None
+        };
+        if peer_terminated_during_startup(state, call.action.call_id()) {
+            bail!("peer ended the call during media preparation");
         }
-    };
-    if let Some((source, sink)) = video_endpoints {
-        builder = builder.video(source, sink);
+        let mut builder = match audio {
+            #[cfg(feature = "voip-mlow")]
+            AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
+            #[cfg(feature = "voip-opus")]
+            AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
+                let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
+                voip.accept(call)
+                    .encoded_audio(audio.format(), source, sink)
+            }
+        };
+        if let Some((source, sink)) = video_endpoints {
+            builder = builder.video(source, sink);
+        }
+        Ok::<_, anyhow::Error>((builder, event_speaker))
     }
-    let handle = builder
-        .start()
-        .await
-        .map_err(|e| anyhow!("accept media: {e}"))?;
+    .await
+    .map_err(|error| (InboundMediaFailureStage::LocalPreparation, error))?;
+
+    let handle = builder.start().await.map_err(|error| {
+        (
+            InboundMediaFailureStage::Facade,
+            anyhow!("accept media: {error}"),
+        )
+    })?;
     info!(
         "🎙  {} media flow live for call {} — speak into the mic.{}",
         audio.name(),
@@ -1645,6 +1676,7 @@ mod tests {
         CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
         parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
     };
+    use super::{InboundMediaFailureStage, should_reject_failed_media_start};
 
     fn argv(parts: &[&str]) -> Vec<String> {
         std::iter::once("voip")
@@ -1750,6 +1782,22 @@ mod tests {
         let st = state.lock().unwrap();
         assert!(st.starting.is_empty());
         assert!(st.terminated_during_startup.is_empty());
+    }
+
+    #[test]
+    fn only_local_pre_facade_failures_need_reject_cleanup() {
+        assert!(should_reject_failed_media_start(
+            InboundMediaFailureStage::LocalPreparation,
+            false
+        ));
+        assert!(!should_reject_failed_media_start(
+            InboundMediaFailureStage::LocalPreparation,
+            true
+        ));
+        assert!(!should_reject_failed_media_start(
+            InboundMediaFailureStage::Facade,
+            false
+        ));
     }
 
     #[test]
