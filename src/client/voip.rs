@@ -1,5 +1,5 @@
-//! Call-control accessor. Signaling (reject/terminate) is always available since
-//! the stanza builders live in core; media (call/accept) needs the `voip` feature.
+//! Call-control accessor. Reject/terminate are always available since their stanza builders live in
+//! core; the high-level call/accept flows, including their signaling, need the `voip` feature.
 
 #[cfg(feature = "voip-runtime")]
 use std::sync::Arc;
@@ -120,11 +120,11 @@ impl Voip<'_> {
         Ok(())
     }
 
-    /// Begin answering an incoming call's MEDIA plane: returns a builder; call
-    /// `.audio(source, sink)` then `.start().await` to decrypt the callKey, connect the relay, and
-    /// drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Signaling (preaccept /
-    /// accept) is the consumer's concern; this drives only media. Requires `voip-runtime` or a
-    /// profile that enables it: `voip`, `voip-encoded`, `voip-mlow`, or `voip-libopus`.
+    /// Begin answering an incoming call: returns a builder; call `.audio(source, sink)` then
+    /// `.start().await` to decrypt the callKey, send `<preaccept>` followed by `<accept>`, connect the
+    /// relay, and drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Requires
+    /// `voip-runtime` or a profile that enables it: `voip`, `voip-encoded`, `voip-mlow`, or
+    /// `voip-libopus`.
     #[cfg(feature = "voip-runtime")]
     pub fn accept<'b>(&'b self, incoming: &'b IncomingCall) -> crate::voip::AcceptCall<'b> {
         crate::voip::facade::AcceptCall::new(self.client, incoming)

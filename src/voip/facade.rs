@@ -1,8 +1,8 @@
-//! The incoming-call MEDIA facade: `client.voip().accept(&incoming).audio(src, sink).start()` ->
-//! [`CallHandle`]. It internalizes the offer-decrypt -> relay-connect -> engine-spawn orchestration
-//! the example drove by hand, so a consumer never touches the relay socket, the Signal session, or
-//! the sans-IO engine directly. Behind the `voip` feature; signaling (reject/terminate) stays
-//! feature-free in `super`.
+//! The incoming-call facade: `client.voip().accept(&incoming).audio(src, sink).start()` ->
+//! [`CallHandle`]. It internalizes the offer-decrypt -> preaccept -> accept -> relay-connect ->
+//! engine-spawn orchestration the example drove by hand, so a consumer never touches call-signaling
+//! builders, the relay socket, the Signal session, or the sans-IO engine directly. Behind the `voip`
+//! feature; reject/terminate stay feature-free in `super`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,9 +14,10 @@ use log::warn;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
-    CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
-    CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams, build_offer,
-    build_video_state,
+    AcceptParams, CAPABILITY_OFFER, CAPABILITY_PREACCEPT, CAPABILITY_STANDARD_OPUS_OFFER,
+    CAPABILITY_STANDARD_OPUS_PREACCEPT, CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+    CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams, build_accept,
+    build_offer, build_preaccept_with_capability, build_video_state, standard_opus_voip_settings,
 };
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::voip::relay_parse::RelayData;
@@ -62,9 +63,10 @@ impl AudioEndpoints {
     }
 }
 
-/// Builder returned by [`Voip::accept`](crate::Voip::accept). Holds the offer
-/// and, once [`audio`](Self::audio) is called, the source/sink, then [`start`](Self::start) drives
-/// the call. Borrows the client so it can't outlive it.
+/// Builder returned by [`Voip::accept`](crate::Voip::accept). Holds the offer and, once
+/// [`audio`](Self::audio) is called, the source/sink; [`start`](Self::start) prepares the engine,
+/// sends the callee's `<preaccept>` then `<accept>`, and starts the media plane. Borrows the
+/// client so it can't outlive it.
 pub struct AcceptCall<'a> {
     pub(crate) client: &'a Client,
     pub(crate) incoming: &'a IncomingCall,
@@ -123,9 +125,10 @@ impl<'a> AcceptCall<'a> {
         self
     }
 
-    /// Decrypt the callKey, connect the relay, spawn the call driver, and register it. The returned
-    /// [`CallHandle`] controls the live call. Live-only past the relay connect (DTLS/SCTP need a real
-    /// relay); everything up to the connect is offline testable.
+    /// Decrypt the callKey, send `<preaccept>` followed by `<accept>`, then connect the relay and
+    /// spawn and register the call driver. The returned [`CallHandle`] controls the live call. The
+    /// relay path needs a live DTLS/SCTP endpoint; engine and stanza construction remain offline
+    /// testable.
     // Lifecycle span over accept/start. PII-safe: the caller JID goes through `observe()`.
     #[cfg_attr(
         feature = "tracing",
@@ -159,6 +162,7 @@ impl<'a> AcceptCall<'a> {
                 "video RTP timestamp stride must be non-zero",
             ));
         }
+        let answer_with_video = video.is_some();
         // Answering consumes the ringing flag now, BEFORE the media-setup awaits (callKey decrypt /
         // relay connect): a peer <terminate> racing this window must not record a missed call for a
         // call we are answering. A failed start() leaves it cleared -- an attempted answer reads as
@@ -166,7 +170,7 @@ impl<'a> AcceptCall<'a> {
         self.client
             .call_registry()
             .take_ringing(self.incoming.action.call_id());
-        let (engine, call_id, addr) = self.build_engine(video.is_some(), audio_config).await?;
+        let (engine, call_id, addr) = self.build_engine(answer_with_video, audio_config).await?;
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state already ran with no registry entry to abort, so bail
         // rather than register + connect a relay that would outlive the connection.
@@ -181,6 +185,16 @@ impl<'a> AcceptCall<'a> {
         );
         session.audio_format = Some(audio_config.format);
         session.is_video = video.is_some();
+        // Signal the selected device before starting its stream. The order is load-bearing for a
+        // sole online companion: preaccept resolves the answering device before the caller applies
+        // the final accept and participant keys.
+        send_answer_signaling(
+            self.client,
+            self.incoming,
+            audio_config.format,
+            answer_with_video,
+        )
+        .await?;
         spawn_call(
             self.client,
             call_id,
@@ -520,6 +534,90 @@ fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
         (true, false) => &CAPABILITY_VIDEO_OFFER,
         (false, false) => &CAPABILITY_OFFER,
     }
+}
+
+fn answer_preaccept_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
+    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
+    match (video, standard_opus) {
+        (true, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
+        (false, true) => &CAPABILITY_STANDARD_OPUS_PREACCEPT,
+        (true, false) => &CAPABILITY_OFFER,
+        (false, false) => &CAPABILITY_PREACCEPT,
+    }
+}
+
+fn build_answer_signaling(
+    incoming: &IncomingCall,
+    audio: AudioFormat,
+    video: bool,
+    preaccept_id: &str,
+    accept_id: &str,
+) -> Result<(wacore_binary::Node, wacore_binary::Node), CallError> {
+    let CallAction::Offer {
+        call_id,
+        call_creator,
+        ..
+    } = &incoming.action
+    else {
+        return Err(CallError::NotAnOffer);
+    };
+    let audio_rate = audio.signaling_rate.to_string();
+    let audio_rates = [audio_rate.as_str()];
+    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
+    let preaccept = build_preaccept_with_capability(
+        call_id,
+        &incoming.from,
+        call_creator,
+        preaccept_id,
+        &audio_rates,
+        answer_preaccept_capability(video, audio),
+        video,
+    );
+    let metadata = if video {
+        incoming.media.as_deref()
+    } else {
+        None
+    };
+    let accept = build_accept(&AcceptParams {
+        call_id,
+        to: &incoming.from,
+        id: accept_id,
+        call_creator,
+        audio_rates: &audio_rates,
+        relay_te: None,
+        rte: None,
+        voip_settings: standard_opus
+            .then(|| standard_opus_voip_settings(audio.rtp_clock_rate == 48_000)),
+        // A captured from-start video accept carries no capability child; audio answers advertise
+        // the selected MLOW/standard-Opus capability.
+        capability: if video {
+            None
+        } else if standard_opus {
+            Some(&CAPABILITY_STANDARD_OPUS_OFFER)
+        } else {
+            Some(&CAPABILITY_OFFER)
+        },
+        video,
+        peer_abtest_bucket: metadata.and_then(|offer| offer.peer_abtest_bucket.as_deref()),
+        peer_abtest_bucket_id_list: metadata
+            .and_then(|offer| offer.peer_abtest_bucket_id_list.as_deref()),
+    });
+    Ok((preaccept, accept))
+}
+
+async fn send_answer_signaling(
+    client: &Client,
+    incoming: &IncomingCall,
+    audio: AudioFormat,
+    video: bool,
+) -> Result<(), CallError> {
+    let preaccept_id = client.generate_request_id();
+    let accept_id = client.generate_request_id();
+    let (preaccept, accept) =
+        build_answer_signaling(incoming, audio, video, &preaccept_id, &accept_id)?;
+    client.send_node(preaccept).await?;
+    client.send_node(accept).await?;
+    Ok(())
 }
 
 /// Drain every dormant outgoing call (relay never arrived) and notify each one's `ended` so any
@@ -2027,6 +2125,111 @@ mod tests {
             result,
             Err(CallError::AudioFormatNotOffered(16_000))
         ));
+    }
+
+    fn incoming_offer(video: bool) -> IncomingCall {
+        IncomingCall::new_for_test(
+            caller(),
+            "STANZA-ANSWER-SIGNALING".into(),
+            wacore::time::from_secs(1_700_000_000).expect("timestamp"),
+            CallAction::Offer {
+                call_id: "CALL-ANSWER-SIGNALING".into(),
+                call_creator: caller(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: false,
+                is_video: video,
+                audio: vec![wacore::types::call::CallAudioCodec {
+                    enc: "opus".into(),
+                    rate: 16_000,
+                }],
+                group_jid: None,
+            },
+        )
+    }
+
+    #[test]
+    fn answer_signaling_sends_preaccept_before_accept_with_selected_audio() {
+        let (preaccept, accept) = build_answer_signaling(
+            &incoming_offer(false),
+            AudioFormat::MLOW_16KHZ_60MS,
+            false,
+            "PREACCEPT-ID",
+            "ACCEPT-ID",
+        )
+        .expect("answer signaling");
+
+        let preaccept_ref = preaccept.as_node_ref();
+        assert_eq!(
+            preaccept_ref.attrs().optional_string("id").as_deref(),
+            Some("PREACCEPT-ID")
+        );
+        let preaccept_action = &preaccept_ref.children().expect("preaccept action")[0];
+        assert_eq!(preaccept_action.tag.as_ref(), "preaccept");
+        assert_eq!(
+            preaccept_action
+                .get_optional_child("audio")
+                .and_then(|audio| audio.attrs().optional_string("rate"))
+                .as_deref(),
+            Some("16000")
+        );
+        assert_eq!(
+            preaccept_action
+                .get_optional_child("capability")
+                .and_then(|capability| capability.content_bytes()),
+            Some(CAPABILITY_PREACCEPT.as_slice())
+        );
+
+        let accept_ref = accept.as_node_ref();
+        assert_eq!(
+            accept_ref.attrs().optional_string("id").as_deref(),
+            Some("ACCEPT-ID")
+        );
+        let accept_action = &accept_ref.children().expect("accept action")[0];
+        assert_eq!(accept_action.tag.as_ref(), "accept");
+        assert_eq!(
+            accept_action
+                .get_optional_child("capability")
+                .and_then(|capability| capability.content_bytes()),
+            Some(CAPABILITY_OFFER.as_slice())
+        );
+    }
+
+    #[test]
+    fn standard_opus_video_answer_keeps_signaling_profile_aligned() {
+        let (preaccept, accept) = build_answer_signaling(
+            &incoming_offer(true),
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+            true,
+            "PREACCEPT-VIDEO-ID",
+            "ACCEPT-VIDEO-ID",
+        )
+        .expect("video answer signaling");
+
+        let preaccept_ref = preaccept.as_node_ref();
+        let preaccept_action = &preaccept_ref.children().expect("preaccept action")[0];
+        assert!(preaccept_action.get_optional_child("video").is_some());
+        assert_eq!(
+            preaccept_action
+                .get_optional_child("capability")
+                .and_then(|capability| capability.content_bytes()),
+            Some(CAPABILITY_STANDARD_OPUS_OFFER.as_slice())
+        );
+
+        let accept_ref = accept.as_node_ref();
+        let accept_action = &accept_ref.children().expect("accept action")[0];
+        assert!(accept_action.get_optional_child("video").is_some());
+        assert!(
+            accept_action.get_optional_child("capability").is_none(),
+            "captured video accepts omit capability"
+        );
+        assert_eq!(
+            accept_action
+                .get_optional_child("voip_settings")
+                .and_then(|settings| settings.content_bytes()),
+            Some(standard_opus_voip_settings(true))
+        );
     }
 
     // peer_jid() is the <terminate> target: the bare peer until an <accept> records the answering
