@@ -206,11 +206,11 @@ pub struct AddressBuf(AddressRepr);
 ///
 /// `clear` only rewinds the length, so the tail of an inline buffer still
 /// holds the previous address's bytes. A derived `Debug` would print all of
-/// [`INLINE_CAPACITY`] and leak an unrelated peer's JID into any log line that
+/// the inline capacity and leak an unrelated peer's JID into any log line that
 /// formats an address, or an error that embeds one.
-impl std::fmt::Debug for AddressBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_str(), f)
+impl fmt::Debug for AddressBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
