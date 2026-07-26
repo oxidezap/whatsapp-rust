@@ -177,14 +177,10 @@ async fn nameless_verified_cert_creates_no_contact_row() {
 async fn outgoing_status_advances_monotonically() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
+    let local_timestamp = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
 
     chat_store
-        .record_outgoing(
-            &chat,
-            "OUT-1",
-            &wa::Message::text("oi"),
-            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
-        )
+        .record_outgoing(&chat, "OUT-1", &wa::Message::text("oi"), local_timestamp)
         .unwrap();
     chat_store.flush().await.unwrap();
     let msg = chat_store.message(&chat, "OUT-1").await.unwrap().unwrap();
@@ -205,6 +201,7 @@ async fn outgoing_status_advances_monotonically() {
     .await;
     let msg = chat_store.message(&chat, "OUT-1").await.unwrap().unwrap();
     assert_eq!(msg.status, MessageStatus::ServerAck);
+    assert_eq!(msg.timestamp, local_timestamp);
 
     // Read receipt from the peer.
     feed(
@@ -247,6 +244,168 @@ async fn outgoing_status_advances_monotonically() {
     .await;
     let msg = chat_store.message(&chat, "OUT-1").await.unwrap().unwrap();
     assert_eq!(msg.status, MessageStatus::Read);
+}
+
+#[tokio::test]
+async fn server_ack_reconciles_outgoing_timestamp_and_thread_order() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let server_timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let reply_timestamp = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+    let local_timestamp = Utc.timestamp_opt(1_700_000_200, 0).unwrap();
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-CLOCK",
+            &wa::Message::text("question"),
+            local_timestamp,
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("reply"),
+            incoming_info(PEER, PEER, "REPLY-CLOCK", reply_timestamp.timestamp()),
+        )],
+    )
+    .await;
+
+    let before = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(before[0].id, "OUT-CLOCK");
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_at, Some(local_timestamp));
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("question"));
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-CLOCK".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .timestamp(server_timestamp)
+                .build(),
+        )],
+    )
+    .await;
+
+    let after = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["REPLY-CLOCK", "OUT-CLOCK"]
+    );
+    assert_eq!(after[1].timestamp, server_timestamp);
+    assert_eq!(after[1].status, MessageStatus::ServerAck);
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_at, Some(reply_timestamp));
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("reply"));
+}
+
+#[tokio::test]
+async fn server_ack_can_move_outgoing_message_to_thread_head() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let local_timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let reply_timestamp = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+    let server_timestamp = Utc.timestamp_opt(1_700_000_200, 0).unwrap();
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-CLOCK-FORWARD",
+            &wa::Message::text("question"),
+            local_timestamp,
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("reply"),
+            incoming_info(
+                PEER,
+                PEER,
+                "REPLY-CLOCK-FORWARD",
+                reply_timestamp.timestamp(),
+            ),
+        )],
+    )
+    .await;
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-CLOCK-FORWARD".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .timestamp(server_timestamp)
+                .build(),
+        )],
+    )
+    .await;
+
+    let messages = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(messages[0].id, "OUT-CLOCK-FORWARD");
+    assert_eq!(messages[0].timestamp, server_timestamp);
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_at, Some(server_timestamp));
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("question"));
+}
+
+#[tokio::test]
+async fn server_ack_reconciles_timestamp_after_receipt_advanced_status() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let server_timestamp = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-RECEIPT-FIRST",
+            &wa::Message::text("hello"),
+            Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [
+            Event::Receipt(
+                Receipt::builder()
+                    .source(MessageSource {
+                        chat: chat.clone(),
+                        sender: chat.clone(),
+                        ..Default::default()
+                    })
+                    .message_ids(vec!["OUT-RECEIPT-FIRST".to_string()])
+                    .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                    .r#type(ReceiptType::Delivered)
+                    .offline(false)
+                    .build(),
+            ),
+            Event::ServerAck(
+                ServerAck::builder()
+                    .id("OUT-RECEIPT-FIRST".to_string())
+                    .class("message".to_string())
+                    .from(chat.clone())
+                    .timestamp(server_timestamp)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&chat, "OUT-RECEIPT-FIRST")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Delivered);
+    assert_eq!(msg.timestamp, server_timestamp);
 }
 
 #[tokio::test]
