@@ -199,10 +199,22 @@ const INLINE_CAPACITY: usize = 47;
 /// `HashMap` key in the session cache, so equality, ordering and hashing all go
 /// through [`AddressBuf::as_str`] and never look at the representation: the
 /// same characters answer identically whether they were built inline or spilled.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AddressBuf(AddressRepr);
 
-#[derive(Clone, Debug)]
+/// Prints what the buffer currently holds, never the array behind it.
+///
+/// `clear` only rewinds the length, so the tail of an inline buffer still
+/// holds the previous address's bytes. A derived `Debug` would print all of
+/// [`INLINE_CAPACITY`] and leak an unrelated peer's JID into any log line that
+/// formats an address, or an error that embeds one.
+impl std::fmt::Debug for AddressBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+#[derive(Clone)]
 enum AddressRepr {
     Inline {
         bytes: [u8; INLINE_CAPACITY],
@@ -383,6 +395,55 @@ impl fmt::Display for ProtocolAddress {
 
 #[cfg(test)]
 mod address_buffer_tests {
+
+    /// Reusing an address for a shorter name leaves the previous one's bytes in
+    /// the inline tail, because the reset only rewinds the length. Anything
+    /// that prints the backing array rather than the live slice therefore leaks
+    /// the peer we were talking to before, into any log line that formats an
+    /// address or an error carrying one.
+    #[test]
+    fn debug_never_shows_the_address_that_was_there_before() {
+        let mut address = ProtocolAddress::new("5511999998888@s.whatsapp.net", 1.into());
+        assert!(
+            address.buf.is_inline(),
+            "precondition: this name fits inline"
+        );
+        let previous_tail = "8888@s.whatsapp.net";
+        assert!(
+            format!("{:?}", address.buf).contains(previous_tail),
+            "precondition: the long name is what the buffer holds"
+        );
+
+        address.reset_with(|buf| buf.push_str("55119@lid"));
+
+        let shown = format!("{:?}", address.buf);
+        assert!(
+            !shown.contains(previous_tail),
+            "the previous address must not survive into the output: {shown}"
+        );
+        assert!(
+            !shown.contains('['),
+            "printing the backing array is what leaks the tail: {shown}"
+        );
+    }
+
+    /// The same guarantee one level up, since this is the type that actually
+    /// reaches logs and error messages.
+    #[test]
+    fn a_protocol_address_prints_only_its_own_name() {
+        let mut addr = ProtocolAddress::new("5511999998888@s.whatsapp.net", 1.into());
+        addr.reset_with(|buf| buf.push_str("55119@lid"));
+
+        let shown = format!("{addr:?}");
+        assert!(
+            !shown.contains("8888"),
+            "a reused address must not print the previous peer: {shown}"
+        );
+        assert!(
+            shown.contains("55119@lid"),
+            "it must still print what it holds: {shown}"
+        );
+    }
     use super::*;
     use std::collections::hash_map::DefaultHasher;
 
