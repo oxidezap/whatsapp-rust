@@ -271,9 +271,11 @@ impl Client {
     /// Sync: registration is just a `std::sync::Mutex` insert (no await).
     /// Register a waiter that receives the ack node itself.
     ///
-    /// Used where the caller needs the response (the VoIP offer reads the relay
-    /// out of its ack); a phash check does not, which is why that path uses
-    /// [`Self::register_phash_waiter`] and pays no channel per message.
+    /// Used where the caller needs the response: the VoIP offer reads the relay
+    /// out of its ack. A phash check does not, which is why that path uses
+    /// [`Self::register_phash_waiter`] and pays no channel per message. Gated on
+    /// the only consumer's feature, or it is dead code in a default build.
+    #[cfg(feature = "voip-runtime")]
     pub(crate) fn register_ack_waiter(
         &self,
         message_id: &str,
