@@ -85,6 +85,22 @@ fn playout_bounds(packet_samps: usize) -> (usize, usize) {
     let target = PLAYOUT_TARGET.max(packet_samps.saturating_mul(2));
     (target, PLAYOUT_CAP.max(target + PLAYOUT_DRAIN))
 }
+
+/// The ceiling to enforce now, given the one in force, the peer's current packet and what is queued.
+///
+/// It rises with the packet immediately, but only falls once the backlog fits underneath: a stream
+/// dropping to a shorter packet (a genuine switch, or the SID that DTX canonicalizes to) would
+/// otherwise trim audio that was legally queued under the previous bound and has not been played.
+/// The ceiling exists to bound latency under a burst, not to punish a change of packet size.
+#[cfg(feature = "voip-mlow")]
+fn effective_playout_cap(current: usize, packet_samps: usize, queued: usize) -> usize {
+    let want = playout_bounds(packet_samps).1;
+    if want >= current || queued <= want {
+        want
+    } else {
+        current
+    }
+}
 /// Bound on how long playout primes before flushing a partial buffer: if the peer sends one frame
 /// then goes DTX the jitter buffer never reaches `PLAYOUT_TARGET`, so after this many 20ms ticks
 /// (~200ms) drain whatever is queued instead of holding it (silent) forever. Comfortably above the
@@ -471,6 +487,9 @@ struct PcmAudioState {
     /// Samples in the peer's most recent packet, the input to [`playout_bounds`]. Starts at the
     /// 60ms default until the first decode reports otherwise.
     packet_samps: usize,
+    /// Latency ceiling in force, tracked rather than recomputed so it can lag a shrinking packet
+    /// until the backlog drains; see [`effective_playout_cap`].
+    playout_cap: usize,
 }
 
 /// The video half of the media plane. No jitter buffer or playout tick: an AU is handed to the
@@ -685,6 +704,7 @@ impl CallEngine {
                     priming: true,
                     priming_ticks: 0,
                     packet_samps: OPUS_FRAME_SAMPS_60MS,
+                    playout_cap: playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
                 }),
                 playout_deadline: NEVER,
             })
@@ -955,11 +975,14 @@ impl CallEngine {
         {
             #[cfg(feature = "voip-mlow")]
             if let Some(pcm) = m.pcm.as_mut() {
+                pcm.playout_cap =
+                    effective_playout_cap(pcm.playout_cap, pcm.packet_samps, pcm.jitter.len());
                 let frame = drain_playout(
                     &mut pcm.jitter,
                     &mut pcm.priming,
                     &mut pcm.priming_ticks,
                     pcm.packet_samps,
+                    pcm.playout_cap,
                 );
                 m.playout_deadline = next_tick(m.playout_deadline, now, PLAYOUT_MS);
                 self.outbox.push_back(Output::Playout(frame));
@@ -1208,9 +1231,10 @@ impl CallEngine {
         // tick). Drop oldest past the same ceiling the drain path uses.
         #[cfg(feature = "voip-mlow")]
         {
-            let cap = playout_bounds(pcm.packet_samps).1;
-            if pcm.jitter.len() > cap {
-                let drop_n = pcm.jitter.len() - cap;
+            pcm.playout_cap =
+                effective_playout_cap(pcm.playout_cap, pcm.packet_samps, pcm.jitter.len());
+            if pcm.jitter.len() > pcm.playout_cap {
+                let drop_n = pcm.jitter.len() - pcm.playout_cap;
                 pcm.jitter.drain(..drop_n);
             }
         }
@@ -1338,8 +1362,9 @@ fn drain_playout(
     priming: &mut bool,
     priming_ticks: &mut u32,
     packet_samps: usize,
+    cap: usize,
 ) -> Vec<i16> {
-    let (target, cap) = playout_bounds(packet_samps);
+    let target = playout_bounds(packet_samps).0;
     if jitter.len() > cap {
         let drop_n = jitter.len() - cap;
         jitter.drain(..drop_n);
@@ -1749,7 +1774,8 @@ mod tests {
                 &mut buf,
                 &mut priming,
                 &mut priming_ticks,
-                OPUS_FRAME_SAMPS_60MS
+                OPUS_FRAME_SAMPS_60MS,
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1
             )
             .iter()
             .all(|&s| s == 0),
@@ -1763,12 +1789,48 @@ mod tests {
                 &mut buf,
                 &mut priming,
                 &mut priming_ticks,
-                OPUS_FRAME_SAMPS_60MS
+                OPUS_FRAME_SAMPS_60MS,
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1
             )
             .iter()
             .any(|&s| s != 0),
             "at the prebuffer target playout starts real audio"
         );
+    }
+
+    /// Shrinking the ceiling must never discard audio that is already queued. A 120 ms stream that
+    /// drops to a shorter packet -- a genuine switch, or the `0x90` SID that `packetize_opus_for_mlow`
+    /// canonicalizes DTX to, which declares 60 ms -- would otherwise trim the backlog built under the
+    /// larger bound, clipping the tail of the utterance that is still playing out.
+    #[test]
+    fn a_smaller_packet_does_not_trim_the_existing_backlog() {
+        const BIG: usize = 1920; // 120 ms
+        const SMALL: usize = 960; // 60 ms, e.g. the canonical SID
+        let (big_cap, small_cap) = (playout_bounds(BIG).1, playout_bounds(SMALL).1);
+        assert!(
+            small_cap < big_cap,
+            "the premise: the ceiling really does shrink"
+        );
+
+        // A primed 120 ms stream carrying more than the smaller ceiling would allow.
+        let mut cap = big_cap;
+        let queued = small_cap + 480;
+        assert!(
+            queued <= big_cap,
+            "the premise: legal under the bound it was built with"
+        );
+
+        // The shorter packet arrives: the ceiling must not drop below what is already queued.
+        cap = effective_playout_cap(cap, SMALL, queued);
+        assert!(
+            cap >= queued,
+            "shrinking to {cap} would discard {} queued samples",
+            queued - cap
+        );
+
+        // Once the backlog has drained under the smaller bound, the ceiling follows it down.
+        cap = effective_playout_cap(cap, SMALL, small_cap - 320);
+        assert_eq!(cap, small_cap, "the ceiling must not stay large forever");
     }
 
     /// A peer sending 120 ms packets (WhatsApp Desktop) delivers 1920 samples at a time. The
@@ -1786,7 +1848,7 @@ mod tests {
         // empty again exactly when the next one is due, leaving nothing for a late arrival.
         let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
         feed_120(&mut buf);
-        let first = drain_playout(&mut buf, &mut priming, &mut ticks, P);
+        let first = drain_playout(&mut buf, &mut priming, &mut ticks, P, playout_bounds(P).1);
         assert!(
             first.iter().all(|&s| s == 0),
             "a single 120ms packet is a zero cushion; playout must keep priming"
@@ -1795,7 +1857,7 @@ mod tests {
         // Two in flight must survive: the ceiling has to hold the cushion it just asked for.
         feed_120(&mut buf);
         let before = buf.len();
-        let _ = drain_playout(&mut buf, &mut priming, &mut ticks, P);
+        let _ = drain_playout(&mut buf, &mut priming, &mut ticks, P, playout_bounds(P).1);
         assert!(
             buf.len() + PLAYOUT_DRAIN >= before,
             "the latency ceiling trimmed the 120ms cushion: {before} -> {} samples",
@@ -1856,6 +1918,7 @@ mod tests {
                     &mut priming,
                     &mut priming_ticks,
                     OPUS_FRAME_SAMPS_60MS,
+                    playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
                 )
                 .iter()
                 .any(|&s| s != 0)
@@ -2823,6 +2886,7 @@ mod tests {
                 &mut priming,
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
             );
             max_occupancy = max_occupancy.max(buf.len());
         }
@@ -2841,6 +2905,7 @@ mod tests {
                 &mut priming,
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
             )
             .iter()
             .any(|&s| s != 0)
@@ -2870,6 +2935,7 @@ mod tests {
                 &mut priming,
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
             );
             assert!(f.iter().all(|&s| s == 0), "still priming -> silence");
             assert_eq!(
@@ -2884,6 +2950,7 @@ mod tests {
             &mut priming,
             &mut priming_ticks,
             OPUS_FRAME_SAMPS_60MS,
+            playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
         );
         assert!(
             flushed.iter().any(|&s| s != 0),
@@ -2909,6 +2976,7 @@ mod tests {
                 &mut priming,
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
             );
             assert!(f.iter().all(|&s| s == 0), "empty buffer -> silence");
         }
@@ -2919,6 +2987,7 @@ mod tests {
             &mut priming,
             &mut priming_ticks,
             OPUS_FRAME_SAMPS_60MS,
+            playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
         );
         assert!(
             f.iter().all(|&s| s == 0),
@@ -2932,6 +3001,7 @@ mod tests {
             &mut priming,
             &mut priming_ticks,
             OPUS_FRAME_SAMPS_60MS,
+            playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
         );
         assert!(
             f.iter().any(|&s| s != 0),
