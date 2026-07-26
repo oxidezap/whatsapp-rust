@@ -25,10 +25,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tokio-websockets = { version = "0.13.3", features = [
-  "client",
-  "rustls-bring-your-own-connector",
-  "rand",
-  "ring",
+    "client",
+    "rustls-bring-your-own-connector",
+    "rand",
+    "ring",
 ] }
 wacore = { workspace = true }
 webpki-roots = "1.0.9"
