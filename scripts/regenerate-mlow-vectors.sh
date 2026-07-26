@@ -49,9 +49,24 @@ expected_rev="84b076e0809412df22e8a0d26f944610c4a3e40f"
 actual_rev="$(git -C "$ref" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [[ "$actual_rev" == "unknown" ]]; then
   echo "warning: $ref is not a git checkout; cannot confirm the oracle revision" >&2
-elif [[ "$actual_rev" != "$expected_rev" ]]; then
-  echo "warning: oracle is $actual_rev, fixtures were generated with $expected_rev" >&2
-  echo "         differences below may come from the reference, not from this repository" >&2
+else
+  # The revision alone does not identify the build: uncommitted changes still compile into the
+  # static library while rev-parse keeps reporting the pinned commit, so a modified oracle would
+  # silently rewrite the fixtures and look like a legitimate update. Refuse unless told otherwise.
+  if [[ -n "$(git -C "$ref" status --porcelain 2>/dev/null)" ]]; then
+    if [[ "${MLOW_ALLOW_DIRTY_REFERENCE:-}" == "1" ]]; then
+      echo "warning: oracle worktree is DIRTY; output does not correspond to $actual_rev" >&2
+    else
+      echo "error: oracle worktree has uncommitted changes, so the fixtures it produces would not" >&2
+      echo "       correspond to any recorded revision. Commit or stash them, or re-run with" >&2
+      echo "       MLOW_ALLOW_DIRTY_REFERENCE=1 if you mean to generate from a modified oracle." >&2
+      exit 1
+    fi
+  fi
+  if [[ "$actual_rev" != "$expected_rev" ]]; then
+    echo "warning: oracle is $actual_rev, fixtures were generated with $expected_rev" >&2
+    echo "         differences below may come from the reference, not from this repository" >&2
+  fi
 fi
 echo "==> oracle: $ref @ $actual_rev"
 
