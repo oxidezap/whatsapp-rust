@@ -439,11 +439,6 @@ pub struct SessionPlan {
     /// Empty means "no device is overridden"; otherwise one slot per device.
     /// See [`record_encryption_override`].
     encryption_overrides: Vec<Option<Jid>>,
-    /// The scratch address the session phase interrogated the store with,
-    /// handed on so the single-device encrypt can rewrite it instead of
-    /// building a second one for the very device that was just checked.
-    /// `None` when no session phase ran ([`SessionPlan::assume_ready`]).
-    reusable_addr: Option<ProtocolAddress>,
     pub had_unregistered_device: bool,
     first_error: Option<anyhow::Error>,
 }
@@ -457,7 +452,6 @@ impl SessionPlan {
         Self {
             device_count,
             encryption_overrides: Vec::new(),
-            reusable_addr: None,
             had_unregistered_device: false,
             first_error: None,
         }
@@ -704,7 +698,6 @@ pub async fn ensure_sessions_for_devices(
     Ok(SessionPlan {
         device_count: devices.len(),
         encryption_overrides,
-        reusable_addr: Some(reusable_addr),
         had_unregistered_device: had_406,
         first_error,
     })
@@ -826,7 +819,6 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     let SessionPlan {
         device_count: _,
         encryption_overrides,
-        reusable_addr,
         had_unregistered_device,
         mut first_error,
     } = plan;
@@ -843,18 +835,9 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         // a FuturesUnordered, and two store clones), with no parallelism to gain.
         // Encrypt inline.
         let device_jid = devices[0].clone();
-        let encryption_jid =
-            encryption_override_at(&encryption_overrides, 0).unwrap_or(&devices[0]);
-        // The session phase already built an address buffer to ask the store
-        // about this very device; rewriting it costs no allocation, while
-        // `to_protocol_address` would build a second one for the same name.
-        let addr = match reusable_addr {
-            Some(mut addr) => {
-                encryption_jid.reset_protocol_address(&mut addr);
-                addr
-            }
-            None => encryption_jid.to_protocol_address(),
-        };
+        let addr = encryption_override_at(&encryption_overrides, 0)
+            .unwrap_or(&devices[0])
+            .to_protocol_address();
         let res = encrypt_one_device(
             plaintext_to_encrypt,
             &addr,
