@@ -208,7 +208,7 @@ impl Peer {
         .expect("valid bundle");
 
         let peer = Self {
-            address: ProtocolAddress::new(name.to_string(), 1u32.into()),
+            address: ProtocolAddress::new(name, 1u32.into()),
             identity_store: InMemoryIdentityKeyStore {
                 identity_key_pair,
                 registration_id,

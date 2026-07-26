@@ -1,4 +1,4 @@
-use crate::libsignal::protocol::{DeviceId, ProtocolAddress};
+use crate::libsignal::protocol::{AddressBuf, DeviceId, ProtocolAddress};
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use wacore_binary::{DEFAULT_USER_SERVER, Jid, LEGACY_USER_SERVER};
 
@@ -26,15 +26,57 @@ pub fn make_address_buffer() -> String {
     String::with_capacity(SIGNAL_ADDRESS_CAPACITY)
 }
 
-/// Create a pre-allocated `ProtocolAddress` for hot loops.
+/// Create a reusable `ProtocolAddress` for hot loops.
 /// Call `reset_protocol_address` to fill without allocation.
 pub fn make_reusable_protocol_address() -> ProtocolAddress {
-    ProtocolAddress::with_capacity(SIGNAL_ADDRESS_CAPACITY, SIGNAL_DEVICE_ID)
+    ProtocolAddress::empty(SIGNAL_DEVICE_ID)
+}
+
+/// Somewhere an address name can be written.
+///
+/// The address format lives in exactly one function, and that function has to
+/// serve both a plain `String` and the buffer inside a `ProtocolAddress` (which
+/// is inline, not a `String`). This is what lets it do that without the format
+/// existing in two places.
+pub trait AddressSink {
+    fn clear(&mut self);
+    fn push_str(&mut self, s: &str);
+    fn push(&mut self, c: char);
+}
+
+impl AddressSink for String {
+    #[inline]
+    fn clear(&mut self) {
+        String::clear(self);
+    }
+    #[inline]
+    fn push_str(&mut self, s: &str) {
+        String::push_str(self, s);
+    }
+    #[inline]
+    fn push(&mut self, c: char) {
+        String::push(self, c);
+    }
+}
+
+impl AddressSink for AddressBuf {
+    #[inline]
+    fn clear(&mut self) {
+        AddressBuf::clear(self);
+    }
+    #[inline]
+    fn push_str(&mut self, s: &str) {
+        AddressBuf::push_str(self, s);
+    }
+    #[inline]
+    fn push(&mut self, c: char) {
+        AddressBuf::push(self, c);
+    }
 }
 
 /// Write the signal address name (`{user}[:device]@{server}`) into `buf`,
 /// clearing it first. All other address helpers delegate to this.
-pub fn write_signal_address_to(jid: &Jid, buf: &mut String) {
+pub fn write_signal_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
     buf.clear();
     let server = mapped_server(jid.server.as_str());
     buf.push_str(&jid.user);
@@ -47,7 +89,7 @@ pub fn write_signal_address_to(jid: &Jid, buf: &mut String) {
 }
 
 /// Write the full protocol address (`{signal_address}.0`) into `buf`.
-pub fn write_protocol_address_to(jid: &Jid, buf: &mut String) {
+pub fn write_protocol_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
     write_signal_address_to(jid, buf);
     buf.push_str(".0");
 }
@@ -111,7 +153,11 @@ impl JidExt for Jid {
     }
 
     fn to_protocol_address(&self) -> ProtocolAddress {
-        ProtocolAddress::new(self.to_signal_address_string(), SIGNAL_DEVICE_ID)
+        // Written straight into the address: the intermediate `String` this
+        // used to build was allocated only to be copied in and dropped.
+        let mut addr = make_reusable_protocol_address();
+        self.reset_protocol_address(&mut addr);
+        addr
     }
 
     fn to_protocol_address_string(&self) -> String {
@@ -217,6 +263,56 @@ mod tests {
         }
     }
 
+    /// The one writer must produce the same bytes into either sink, or the
+    /// heap path and the inline path would name the same device differently.
+    #[test]
+    fn both_sinks_receive_the_same_address() {
+        let cases = [
+            "123456789@lid",
+            "123456789:33@lid",
+            "100000000000001.1:75@lid",
+            "15550000001@s.whatsapp.net",
+            "15550000001:33@s.whatsapp.net",
+            "120363000000000001@g.us",
+            "999999999999999999@newsletter",
+        ];
+        for jid_str in cases {
+            let jid = Jid::from_str(jid_str).unwrap();
+
+            let mut string_sink = String::new();
+            write_protocol_address_to(&jid, &mut string_sink);
+
+            let mut address = make_reusable_protocol_address();
+            jid.reset_protocol_address(&mut address);
+
+            assert_eq!(
+                address.as_str(),
+                string_sink,
+                "the two sinks disagree for {jid_str}"
+            );
+        }
+    }
+
+    /// Reusing one buffer across JIDs must leave no trace of the previous one,
+    /// including when the previous name was longer.
+    #[test]
+    fn a_reused_address_keeps_nothing_from_the_previous_jid() {
+        let long = Jid::from_str("100000000000001.1:75@lid").unwrap();
+        let short = Jid::from_str("1@lid").unwrap();
+
+        let mut address = make_reusable_protocol_address();
+        address.reset_with(|buf| buf.push_str(&"z".repeat(200)));
+        jid_reset(&mut address, &long);
+        assert_eq!(address.as_str(), "100000000000001.1:75@lid.0");
+        jid_reset(&mut address, &short);
+        assert_eq!(address.as_str(), "1@lid.0");
+        assert_eq!(address.name(), "1@lid");
+    }
+
+    fn jid_reset(address: &mut ProtocolAddress, jid: &Jid) {
+        jid.reset_protocol_address(address);
+    }
+
     #[test]
     fn test_write_functions_dry() {
         let jid = Jid::from_str("15550000001@s.whatsapp.net").unwrap();
@@ -227,5 +323,20 @@ mod tests {
 
         write_protocol_address_to(&jid, &mut buf);
         assert_eq!(buf, "15550000001@c.us.0");
+    }
+
+    /// The writer's "clears it first" contract holds for the inline sink too:
+    /// a reused buffer must be overwritten, not appended to.
+    #[test]
+    fn the_inline_sink_is_cleared_before_each_write() {
+        let first = Jid::from_str("15550000001@s.whatsapp.net").unwrap();
+        let second = Jid::from_str("123456789:33@lid").unwrap();
+
+        let mut buf = AddressBuf::empty();
+        write_signal_address_to(&first, &mut buf);
+        assert_eq!(buf.as_str(), "15550000001@c.us");
+
+        write_protocol_address_to(&second, &mut buf);
+        assert_eq!(buf.as_str(), "123456789:33@lid.0");
     }
 }

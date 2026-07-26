@@ -1478,7 +1478,7 @@ async fn cleanup_connection_state_flushes_dirty_signal_state() {
     let client = create_offline_sync_test_client().await;
 
     // A dirty identity lives only in the write-back cache until flushed.
-    let addr = ProtocolAddress::new("5550001000@s.whatsapp.net".to_string(), 1u32.into());
+    let addr = ProtocolAddress::new("5550001000@s.whatsapp.net", 1u32.into());
     client.signal_cache.put_identity(&addr, &[7u8; 32]).await;
 
     client.cleanup_connection_state().await;
@@ -1579,7 +1579,7 @@ async fn cleanup_connection_state_keeps_state_when_flush_fails() {
 
     // A malformed identity (not 32 bytes) makes flush() error out, standing
     // in for a transient backend write failure during cleanup.
-    let bad = ProtocolAddress::new("5550002000@s.whatsapp.net".to_string(), 1u32.into());
+    let bad = ProtocolAddress::new("5550002000@s.whatsapp.net", 1u32.into());
     client.signal_cache.put_identity(&bad, &[0u8; 16]).await;
 
     // A valid dirty sender key that must not be dropped when the flush fails.

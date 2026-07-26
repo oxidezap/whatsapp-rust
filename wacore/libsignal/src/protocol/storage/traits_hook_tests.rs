@@ -12,7 +12,7 @@ use crate::protocol::{IdentityKey, IdentityKeyPair, ProtocolAddress, SignalProto
 use futures::executor::block_on;
 
 fn test_address() -> ProtocolAddress {
-    ProtocolAddress::new("5511987650001@s.whatsapp.net".to_string(), 1.into())
+    ProtocolAddress::new("5511987650001@s.whatsapp.net", 1.into())
 }
 
 fn test_identity() -> IdentityKey {

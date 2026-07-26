@@ -2494,10 +2494,13 @@ impl Client {
         jids: &[Jid],
     ) -> Vec<async_lock::MutexGuardArc<()>> {
         let mut guards = Vec::with_capacity(jids.len());
-        let mut buf = wacore::types::jid::make_address_buffer();
+        // A `ProtocolAddress` IS the "{name}.0" string the lock map is keyed by,
+        // and it holds it inline, so the whole loop names its keys without
+        // allocating a formatting buffer.
+        let mut addr = wacore::types::jid::make_reusable_protocol_address();
         for jid in jids {
-            wacore::types::jid::write_protocol_address_to(jid, &mut buf);
-            let mutex = self.session_lock_for(&buf).await;
+            jid.reset_protocol_address(&mut addr);
+            let mutex = self.session_lock_for(addr.as_str()).await;
             guards.push(mutex.lock_arc().await);
         }
         guards
@@ -2512,10 +2515,10 @@ impl Client {
         jids: &[Jid],
     ) -> Vec<std::sync::Arc<async_lock::Mutex<()>>> {
         let mut mutexes = Vec::with_capacity(jids.len());
-        let mut buf = wacore::types::jid::make_address_buffer();
+        let mut addr = wacore::types::jid::make_reusable_protocol_address();
         for jid in jids {
-            wacore::types::jid::write_protocol_address_to(jid, &mut buf);
-            mutexes.push(self.session_lock_for(&buf).await);
+            jid.reset_protocol_address(&mut addr);
+            mutexes.push(self.session_lock_for(addr.as_str()).await);
         }
         mutexes
     }

@@ -1708,7 +1708,7 @@ mod sender_key_lock_tests {
     async fn try_put_session_marks_dirty_and_flushes() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550009999", 1.into());
 
         assert!(
             cache
@@ -1731,7 +1731,7 @@ mod sender_key_lock_tests {
     #[tokio::test]
     async fn try_session_paths_fall_back_under_contention() {
         let cache = SignalStoreCache::new();
-        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550009999", 1.into());
 
         let guard = cache.sessions.lock().await;
         assert!(
@@ -1770,7 +1770,7 @@ mod sender_key_lock_tests {
     async fn cancelled_checkout_queues_under_contention_and_remains_flushable() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550008888".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550008888", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
 
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
@@ -1801,7 +1801,7 @@ mod sender_key_lock_tests {
     async fn lossy_clear_rejects_an_older_checkout_generation() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550007777".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007777", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
 
@@ -1822,7 +1822,7 @@ mod sender_key_lock_tests {
     async fn lossy_clear_invalidates_checkouts_before_waiting_for_the_cache() {
         let cache = Arc::new(SignalStoreCache::new());
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550007776".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007776", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
         let (record, checkout) = cache.checkout_session(&addr, &backend).await.unwrap();
 
@@ -1859,7 +1859,7 @@ mod sender_key_lock_tests {
     #[tokio::test]
     async fn stale_checkout_cannot_overwrite_a_new_owner() {
         let cache = SignalStoreCache::new();
-        let addr = ProtocolAddress::new("15550007775".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007775", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
 
         let (old_record, old_checkout) = cache
@@ -1896,7 +1896,7 @@ mod sender_key_lock_tests {
     #[tokio::test]
     async fn checkout_rejects_a_competing_owner() {
         let cache = SignalStoreCache::new();
-        let addr = ProtocolAddress::new("15550007770".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007770", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
 
         let (record, generation) = cache
@@ -1926,7 +1926,7 @@ mod sender_key_lock_tests {
     async fn restore_does_not_resurrect_a_deleted_slot() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550007771".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007771", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
 
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
@@ -1947,7 +1947,7 @@ mod sender_key_lock_tests {
     async fn queued_restore_does_not_overwrite_a_delete() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550007772".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007772", 1.into());
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
 
@@ -1972,7 +1972,7 @@ mod sender_key_lock_tests {
     async fn empty_checkout_reserves_and_releases_its_slot() {
         let cache = SignalStoreCache::new();
         let backend = crate::store::in_memory::InMemoryBackend::new();
-        let addr = ProtocolAddress::new("15550007773".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007773", 1.into());
 
         let (record, generation) = cache.checkout_session(&addr, &backend).await.unwrap();
         assert!(record.is_none());
@@ -1995,7 +1995,7 @@ mod sender_key_lock_tests {
     async fn peek_prefers_a_cache_write_that_wins_the_backend_race() {
         let cache = Arc::new(SignalStoreCache::new());
         let backend = Arc::new(BlockingSessionLookup::new());
-        let addr = ProtocolAddress::new("15550007774".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007774", 1.into());
 
         let peek = tokio::spawn({
             let cache = cache.clone();
@@ -2014,7 +2014,7 @@ mod sender_key_lock_tests {
     async fn existence_prefers_a_cache_write_that_wins_the_backend_race() {
         let cache = Arc::new(SignalStoreCache::new());
         let backend = Arc::new(BlockingSessionLookup::new());
-        let addr = ProtocolAddress::new("15550007772".to_string(), 2.into());
+        let addr = ProtocolAddress::new("15550007772", 2.into());
 
         let exists = tokio::spawn({
             let cache = cache.clone();
@@ -2032,7 +2032,7 @@ mod sender_key_lock_tests {
     #[tokio::test]
     async fn try_has_session_reports_known_absent() {
         let cache = SignalStoreCache::new();
-        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550009999", 1.into());
 
         cache.delete_session(&addr).await;
         assert_eq!(
@@ -2045,7 +2045,7 @@ mod sender_key_lock_tests {
     #[tokio::test]
     async fn try_identity_paths_cover_hit_miss_and_contention() {
         let cache = SignalStoreCache::new();
-        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550009999", 1.into());
         let key_bytes = [7u8; 32];
 
         assert_eq!(
@@ -2089,7 +2089,7 @@ mod consumed_prekey_atomicity_tests {
             .store_prekey(PREKEY_ID, b"durable-prekey", false)
             .await
             .unwrap();
-        ProtocolAddress::new("bob".to_string(), 1.into())
+        ProtocolAddress::new("bob", 1.into())
     }
 
     /// The inbound pkmsg decrypt promotes the session into the volatile cache and
@@ -2194,8 +2194,8 @@ mod consumed_prekey_atomicity_tests {
         backend.store_prekey(PREKEY_A, b"a", false).await.unwrap();
         backend.store_prekey(PREKEY_B, b"b", false).await.unwrap();
 
-        let addr_a = ProtocolAddress::new("alice".to_string(), 1.into());
-        let addr_b = ProtocolAddress::new("bob".to_string(), 1.into());
+        let addr_a = ProtocolAddress::new("alice", 1.into());
+        let addr_b = ProtocolAddress::new("bob", 1.into());
 
         // Both decrypts promote their session (dirty) and buffer their prekey.
         cache.put_session(&addr_a, SessionRecord::new_fresh()).await;
@@ -2650,8 +2650,8 @@ mod consumed_prekey_atomicity_tests {
             .await
             .unwrap();
 
-        let addr_a = ProtocolAddress::new("alice".to_string(), 1.into());
-        let addr_b = ProtocolAddress::new("bob".to_string(), 1.into());
+        let addr_a = ProtocolAddress::new("alice", 1.into());
+        let addr_b = ProtocolAddress::new("bob", 1.into());
 
         let cache = StdArc::new(SignalStoreCache::new());
         let violation = StdArc::new(AtomicBool::new(false));
@@ -2756,7 +2756,7 @@ mod eviction_tests {
     use crate::store::in_memory::InMemoryBackend;
 
     fn addr(i: usize) -> ProtocolAddress {
-        ProtocolAddress::new(format!("user{i}@s.whatsapp.net"), DeviceId::new(0))
+        ProtocolAddress::new(&format!("user{i}@s.whatsapp.net"), DeviceId::new(0))
     }
 
     #[test]
@@ -2983,8 +2983,8 @@ mod lease_reload_tests {
     async fn post_flush_clear_preserves_only_live_checkouts() {
         let backend = InMemoryBackend::new();
         let cache = SignalStoreCache::new();
-        let active = ProtocolAddress::new("15550001007".to_string(), 1.into());
-        let idle = ProtocolAddress::new("15550001008".to_string(), 1.into());
+        let active = ProtocolAddress::new("15550001007", 1.into());
+        let idle = ProtocolAddress::new("15550001008", 1.into());
         cache.put_session(&active, leased_session()).await;
         cache.put_session(&idle, leased_session()).await;
         cache.flush(&backend).await.expect("flush");
@@ -3020,7 +3020,7 @@ mod lease_reload_tests {
             DEFAULT_MAX_CACHE_ENTRIES,
             [0xA1; 16],
         );
-        let address = ProtocolAddress::new("15550001001".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550001001", 1.into());
         cache.put_session(&address, leased_session()).await;
         cache.flush(&backend).await.expect("flush");
         cache.clear_after_flush().await;
@@ -3054,7 +3054,7 @@ mod lease_reload_tests {
             DEFAULT_MAX_CACHE_ENTRIES,
             [0xA1; 16],
         );
-        let address = ProtocolAddress::new("15550001002".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550001002", 1.into());
         cache.put_session(&address, leased_session()).await;
         cache.flush(&backend).await.expect("initial flush");
 
@@ -3271,7 +3271,7 @@ mod pre_wire_gate_tests {
     use async_lock::Barrier;
 
     fn addr(user: &str) -> ProtocolAddress {
-        ProtocolAddress::new(user.to_string(), 1.into())
+        ProtocolAddress::new(user, 1.into())
     }
 
     fn leased_record() -> SessionRecord {

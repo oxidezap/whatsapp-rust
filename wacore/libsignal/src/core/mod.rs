@@ -8,6 +8,6 @@ mod address;
 pub mod curve;
 
 pub use address::{
-    Aci, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes, ServiceIdKind,
-    WrongKindOfServiceIdError,
+    Aci, AddressBuf, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes,
+    ServiceIdKind, WrongKindOfServiceIdError,
 };

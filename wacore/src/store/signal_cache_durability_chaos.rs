@@ -135,7 +135,7 @@ impl ChaosHarness {
                 32,
                 incarnation(seed ^ 0xA5A5_A5A5_A5A5_A5A5, 0),
             ),
-            dm_address: ProtocolAddress::new("15550007001".to_string(), 1.into()),
+            dm_address: ProtocolAddress::new("15550007001", 1.into()),
             group_name: SenderKeyName::from_parts(
                 "120363000000070001@g.us",
                 "15550007002@s.whatsapp.net:0",

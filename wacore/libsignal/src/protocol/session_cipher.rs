@@ -1887,12 +1887,12 @@ mod tests {
     fn setup_established_session() -> TestPair {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-        let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+        let alice_addr = ProtocolAddress::new("alice", 1.into());
         let alice_id = IdentityKeyPair::generate(&mut rng);
         let mut alice_sessions = MemSessionStore::new();
         let mut alice_identity = MemIdentityStore::new(alice_id, 1);
 
-        let bob_addr = ProtocolAddress::new("bob".to_string(), 1.into());
+        let bob_addr = ProtocolAddress::new("bob", 1.into());
         let bob_id = IdentityKeyPair::generate(&mut rng);
         let bob_identity_key = *bob_id.identity_key();
 
@@ -2439,7 +2439,7 @@ mod tests {
         MemSignedPreKeyStore,
         PreKeyBundle,
     ) {
-        let bob_addr = ProtocolAddress::new("bob".to_string(), 1.into());
+        let bob_addr = ProtocolAddress::new("bob", 1.into());
         let bob_id = IdentityKeyPair::generate(rng);
         let bob_identity_key = *bob_id.identity_key();
 
@@ -2550,7 +2550,7 @@ mod tests {
             (false, IdentityChange::NewOrUnchanged),
             (true, IdentityChange::ReplacedExisting),
         ] {
-            let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+            let alice_addr = ProtocolAddress::new("alice", 1.into());
             let alice_id = IdentityKeyPair::generate(&mut rng);
             let mut alice_sessions = MemSessionStore::new();
             let mut alice_identity = MemIdentityStore::new(alice_id, 1);
@@ -2613,7 +2613,7 @@ mod tests {
     #[test]
     fn process_prekey_signals_reuse_for_established_session() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+        let alice_addr = ProtocolAddress::new("alice", 1.into());
         let alice_id = IdentityKeyPair::generate(&mut rng);
         let mut alice_sessions = MemSessionStore::new();
         let mut alice_identity = MemIdentityStore::new(alice_id, 1);
@@ -2902,7 +2902,7 @@ mod tests {
     fn decrypt_with_empty_session_returns_session_not_found() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-        let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+        let alice_addr = ProtocolAddress::new("alice", 1.into());
         let alice_id = IdentityKeyPair::generate(&mut rng);
         let bob_id = IdentityKeyPair::generate(&mut rng);
         let alice_identity_key = *alice_id.identity_key();

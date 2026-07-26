@@ -512,7 +512,7 @@ mod tests {
         let cache = Arc::new(SignalStoreCache::new());
         let adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
 
-        let addr = ProtocolAddress::new("bob".to_string(), 1.into());
+        let addr = ProtocolAddress::new("bob", 1.into());
         // The real path stores the promoted session before buffering the prekey.
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
         adapter
@@ -635,7 +635,7 @@ mod tests {
 
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
         let cache = Arc::new(SignalStoreCache::new());
-        let address = ProtocolAddress::new("15550006666".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550006666", 1.into());
         let (record, identity_pair) = outbound_session();
         let expected = record.serialize().expect("serialize session");
         cache.put_session(&address, record).await;
@@ -717,7 +717,7 @@ mod tests {
         let cache = Arc::new(SignalStoreCache::new());
         let device = Arc::new(RwLock::new(Device::new(backend)));
         let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
-        let address = ProtocolAddress::new("15550005555".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550005555", 1.into());
         cache
             .put_session(&address, SessionRecord::new_fresh())
             .await;
@@ -743,7 +743,7 @@ mod tests {
     async fn session_store_fast_paths_round_trip() {
         use wacore::libsignal::protocol::SessionStore as _;
         let mut adapter = test_adapter();
-        let addr = ProtocolAddress::new("15550002222".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550002222", 1.into());
 
         // Cold cache: goes through the async fallback (backend consult).
         assert!(!adapter.session_store.has_session(&addr).await.unwrap());
@@ -783,7 +783,7 @@ mod tests {
     async fn identity_fast_paths_keep_change_semantics() {
         use wacore::libsignal::protocol::{IdentityKeyPair, IdentityKeyStore as _};
         let mut adapter = test_adapter();
-        let addr = ProtocolAddress::new("15550003333".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550003333", 1.into());
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let first = *IdentityKeyPair::generate(&mut rng).identity_key();
@@ -861,7 +861,7 @@ mod hook_alloc_tests {
     #[test]
     fn the_trusted_identity_hook_answers_without_allocating() {
         let adapter = adapter_for_test();
-        let address = ProtocolAddress::new("bob@s.whatsapp.net".to_string(), 1.into());
+        let address = ProtocolAddress::new("bob@s.whatsapp.net", 1.into());
         let identity = some_identity();
 
         // Through the resolver, not the hook directly: the point is that the
@@ -888,7 +888,7 @@ mod hook_alloc_tests {
     #[test]
     fn the_save_identity_hook_declines_when_nothing_is_cached() {
         let mut adapter = adapter_for_test();
-        let address = ProtocolAddress::new("never-seen@s.whatsapp.net".to_string(), 1.into());
+        let address = ProtocolAddress::new("never-seen@s.whatsapp.net", 1.into());
         let identity = some_identity();
 
         assert!(
@@ -906,7 +906,7 @@ mod hook_alloc_tests {
     #[tokio::test]
     async fn the_save_identity_hook_answers_once_the_entry_is_cached() {
         let mut adapter = adapter_for_test();
-        let address = ProtocolAddress::new("bob@s.whatsapp.net".to_string(), 1.into());
+        let address = ProtocolAddress::new("bob@s.whatsapp.net", 1.into());
         let first = some_identity();
         let second = some_identity();
 
@@ -939,7 +939,7 @@ mod hook_alloc_tests {
     #[test]
     fn the_session_hook_declines_when_the_cache_cannot_answer() {
         let adapter = adapter_for_test();
-        let address = ProtocolAddress::new("never-seen@s.whatsapp.net".to_string(), 1.into());
+        let address = ProtocolAddress::new("never-seen@s.whatsapp.net", 1.into());
 
         assert!(
             adapter.session_store.try_has_session(&address).is_none(),

@@ -213,7 +213,7 @@ impl Peer {
         });
 
         Self {
-            address: ProtocolAddress::new(name.to_string(), device_id.into()),
+            address: ProtocolAddress::new(name, device_id.into()),
             identity_store,
             prekey_store,
             signed_prekey_store,
@@ -502,8 +502,8 @@ fn alice_delete_then_rebuild_loses_old_chain() {
 
 #[test]
 fn pkmsg_reset_does_not_fix_peer_outbound_if_delivered_to_wrong_store_key() {
-    let bob_lid = ProtocolAddress::new("100000000000001@lid".to_string(), 0.into());
-    let bob_pn = ProtocolAddress::new("15550001000@c.us".to_string(), 0.into());
+    let bob_lid = ProtocolAddress::new("100000000000001@lid", 0.into());
+    let bob_pn = ProtocolAddress::new("15550001000@c.us", 0.into());
 
     let mut alice = Peer::new("alice", 1);
     let mut bob = Peer::new("100000000000001@lid", 0);

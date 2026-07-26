@@ -172,15 +172,8 @@ impl fmt::Display for DeviceId {
     }
 }
 
-const fn digit_count(n: u32) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    n.ilog10() as usize + 1
-}
-
 #[inline]
-fn append_device_suffix(buf: &mut String, device_id: DeviceId) {
+fn append_device_suffix(buf: &mut AddressBuf, device_id: DeviceId) {
     let id = u32::from(device_id);
     if id == 0 {
         buf.push_str(".0");
@@ -190,34 +183,142 @@ fn append_device_suffix(buf: &mut String, device_id: DeviceId) {
     }
 }
 
+/// Longest address held without touching the heap.
+///
+/// A real address is short: `"5511987650001:5@c.us.0"` is 22 bytes and the
+/// longest server the JID enum can render adds ten more, so this covers every
+/// address the protocol produces with room for drift. Anything longer still
+/// works -- it spills to a `String`, which is where every address used to live
+/// unconditionally.
+const INLINE_CAPACITY: usize = 47;
+
+/// A protocol address's characters: inline while they fit, heap when they do
+/// not.
+///
+/// Which arm holds them is not part of the value. `ProtocolAddress` is a
+/// `HashMap` key in the session cache, so equality, ordering and hashing all go
+/// through [`AddressBuf::as_str`] and never look at the representation: the
+/// same characters answer identically whether they were built inline or spilled.
+#[derive(Clone, Debug)]
+pub struct AddressBuf(AddressRepr);
+
+#[derive(Clone, Debug)]
+enum AddressRepr {
+    Inline {
+        bytes: [u8; INLINE_CAPACITY],
+        len: u8,
+    },
+    Heap(String),
+}
+
+impl Default for AddressBuf {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl AddressBuf {
+    /// An empty buffer, holding nothing on the heap.
+    #[inline]
+    pub fn empty() -> Self {
+        Self(AddressRepr::Inline {
+            bytes: [0; INLINE_CAPACITY],
+            len: 0,
+        })
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            // Only whole `&str` fragments are ever appended, never split, so
+            // the inline bytes are valid UTF-8 by construction.
+            AddressRepr::Inline { bytes, len } => std::str::from_utf8(&bytes[..usize::from(*len)])
+                .expect("address is built from whole str fragments"),
+            AddressRepr::Heap(buf) => buf,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match &self.0 {
+            AddressRepr::Inline { len, .. } => usize::from(*len),
+            AddressRepr::Heap(buf) => buf.len(),
+        }
+    }
+
+    /// Empty the buffer, keeping whatever room it already has: an address that
+    /// once needed the heap is usually rewritten to something just as long.
+    #[inline]
+    pub fn clear(&mut self) {
+        match &mut self.0 {
+            AddressRepr::Inline { len, .. } => *len = 0,
+            AddressRepr::Heap(buf) => buf.clear(),
+        }
+    }
+
+    pub fn push_str(&mut self, s: &str) {
+        match &mut self.0 {
+            AddressRepr::Inline { bytes, len } => {
+                let start = usize::from(*len);
+                let end = start + s.len();
+                if end <= INLINE_CAPACITY {
+                    bytes[start..end].copy_from_slice(s.as_bytes());
+                    *len = end as u8;
+                    return;
+                }
+                let mut heap = String::with_capacity(end);
+                // Valid UTF-8 for the same reason as in `as_str`.
+                heap.push_str(
+                    std::str::from_utf8(&bytes[..start])
+                        .expect("address is built from whole str fragments"),
+                );
+                heap.push_str(s);
+                self.0 = AddressRepr::Heap(heap);
+            }
+            AddressRepr::Heap(buf) => buf.push_str(s),
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, c: char) {
+        self.push_str(c.encode_utf8(&mut [0u8; 4]));
+    }
+}
+
+impl fmt::Write for AddressBuf {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
 /// Single-buffer protocol address. The buffer stores `"{name}.{device_id}"` and
 /// `name_len` marks where the name ends, so `name()` and `as_str()` are both
-/// zero-cost slices. One String instead of two — halves allocation count for
-/// one-shot construction and eliminates the copy in `reset_with()`.
+/// zero-cost slices. One buffer instead of two — halves allocation count for
+/// one-shot construction and eliminates the copy in `reset_with()`. The buffer
+/// itself is inline up to [`INLINE_CAPACITY`], so the common address is a value
+/// with nothing behind it.
 #[derive(Clone, Debug)]
 pub struct ProtocolAddress {
-    buf: String,
+    buf: AddressBuf,
     name_len: usize,
     device_id: DeviceId,
 }
 
 impl ProtocolAddress {
-    pub fn new(name: String, device_id: DeviceId) -> Self {
-        let name_len = name.len();
-        let mut buf = name;
-        append_device_suffix(&mut buf, device_id);
-        Self {
-            buf,
-            name_len,
-            device_id,
-        }
+    pub fn new(name: &str, device_id: DeviceId) -> Self {
+        let mut address = Self::empty(device_id);
+        address.reset_with(|buf| buf.push_str(name));
+        address
     }
 
-    /// Pre-allocated empty address. Call `reset_with()` to fill.
-    pub fn with_capacity(capacity: usize, device_id: DeviceId) -> Self {
-        let suffix_len = 1 + digit_count(u32::from(device_id));
+    /// An empty address, ready for [`Self::reset_with`]. No capacity argument:
+    /// the buffer starts inline and grows only if an address ever exceeds it.
+    pub fn empty(device_id: DeviceId) -> Self {
         Self {
-            buf: String::with_capacity(capacity + suffix_len),
+            buf: AddressBuf::empty(),
             name_len: 0,
             device_id,
         }
@@ -225,7 +326,7 @@ impl ProtocolAddress {
 
     /// Write the name via closure, then append the device_id suffix.
     /// Single write pass — no intermediate copy.
-    pub fn reset_with(&mut self, write_name: impl FnOnce(&mut String)) {
+    pub fn reset_with(&mut self, write_name: impl FnOnce(&mut AddressBuf)) {
         self.buf.clear();
         write_name(&mut self.buf);
         self.name_len = self.buf.len();
@@ -234,7 +335,7 @@ impl ProtocolAddress {
 
     #[inline]
     pub fn name(&self) -> &str {
-        &self.buf[..self.name_len]
+        &self.buf.as_str()[..self.name_len]
     }
 
     #[inline]
@@ -244,13 +345,13 @@ impl ProtocolAddress {
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        &self.buf
+        self.buf.as_str()
     }
 }
 
 impl PartialEq for ProtocolAddress {
     fn eq(&self, other: &Self) -> bool {
-        self.buf == other.buf
+        self.as_str() == other.as_str()
     }
 }
 
@@ -258,7 +359,7 @@ impl Eq for ProtocolAddress {}
 
 impl Hash for ProtocolAddress {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.buf.hash(state);
+        self.as_str().hash(state);
     }
 }
 
@@ -270,12 +371,170 @@ impl PartialOrd for ProtocolAddress {
 
 impl Ord for ProtocolAddress {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.buf.cmp(&other.buf)
+        self.as_str().cmp(other.as_str())
     }
 }
 
 impl fmt::Display for ProtocolAddress {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.buf)
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod address_buffer_tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    impl AddressBuf {
+        /// Test-only view of the representation. Production code must never
+        /// branch on this: the whole contract is that the two arms are
+        /// indistinguishable as values.
+        fn is_inline(&self) -> bool {
+            matches!(self.0, AddressRepr::Inline { .. })
+        }
+    }
+
+    fn hash_of(address: &ProtocolAddress) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        address.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// A name that fits, plus its device suffix, never reaches the heap, and
+    /// still splits into name and full string at the right place.
+    #[test]
+    fn a_name_that_fits_stays_inline_and_reads_back_whole() {
+        let address = ProtocolAddress::new("5511987650001:5@c.us", DeviceId::new(0));
+        assert!(address.buf.is_inline());
+        assert_eq!(address.name(), "5511987650001:5@c.us");
+        assert_eq!(address.as_str(), "5511987650001:5@c.us.0");
+        assert_eq!(address.device_id(), DeviceId::new(0));
+    }
+
+    /// The exact boundary in both directions: the last name that fits with its
+    /// suffix, and the first one that does not.
+    #[test]
+    fn the_inline_boundary_holds_on_both_sides() {
+        let suffix_len = ".0".len();
+        let longest_fitting = "a".repeat(INLINE_CAPACITY - suffix_len);
+        let fits = ProtocolAddress::new(&longest_fitting, DeviceId::new(0));
+        assert!(
+            fits.buf.is_inline(),
+            "the longest fitting name must stay inline"
+        );
+        assert_eq!(fits.as_str().len(), INLINE_CAPACITY);
+        assert_eq!(fits.name(), longest_fitting);
+
+        let one_too_long = "a".repeat(INLINE_CAPACITY - suffix_len + 1);
+        let spills = ProtocolAddress::new(&one_too_long, DeviceId::new(0));
+        assert!(!spills.buf.is_inline(), "one byte over must spill");
+        assert_eq!(spills.name(), one_too_long);
+        assert_eq!(spills.as_str(), format!("{one_too_long}.0"));
+    }
+
+    /// The representation is not part of the value. `ProtocolAddress` is a
+    /// `HashMap` key, so an inline value and a heap value holding the same
+    /// characters must compare, order and hash the same.
+    #[test]
+    fn the_same_characters_compare_and_hash_alike_from_either_representation() {
+        let name = "5511987650001:5@c.us";
+        let inline = ProtocolAddress::new(name, DeviceId::new(0));
+
+        // Force the heap arm, then rewrite it to the short name: a cleared
+        // heap buffer keeps its allocation, so this really is the same
+        // characters in the other representation.
+        let mut spilled = ProtocolAddress::new(&"z".repeat(INLINE_CAPACITY * 2), DeviceId::new(0));
+        assert!(!spilled.buf.is_inline());
+        spilled.reset_with(|buf| buf.push_str(name));
+        assert!(
+            !spilled.buf.is_inline(),
+            "the fixture must still be on the heap, or it proves nothing"
+        );
+        assert!(inline.buf.is_inline());
+
+        assert_eq!(inline, spilled);
+        assert_eq!(inline.cmp(&spilled), std::cmp::Ordering::Equal);
+        assert_eq!(hash_of(&inline), hash_of(&spilled));
+        assert_eq!(inline.name(), spilled.name());
+        assert_eq!(inline.as_str(), spilled.as_str());
+        assert_eq!(inline.to_string(), spilled.to_string());
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(inline, "value");
+        assert_eq!(
+            map.get(&spilled).copied(),
+            Some("value"),
+            "a heap-built key must find the inline-built entry"
+        );
+    }
+
+    /// Different characters must still differ, whichever arm holds them --
+    /// otherwise the equality above would be trivially true.
+    #[test]
+    fn different_characters_stay_different_across_representations() {
+        let inline = ProtocolAddress::new("alice@c.us", DeviceId::new(0));
+        let mut spilled = ProtocolAddress::new(&"z".repeat(INLINE_CAPACITY * 2), DeviceId::new(0));
+        spilled.reset_with(|buf| buf.push_str("bob@c.us"));
+        assert!(!spilled.buf.is_inline());
+
+        assert_ne!(inline, spilled);
+        assert_eq!(inline.cmp(&spilled), std::cmp::Ordering::Less);
+    }
+
+    /// Multi-byte characters survive both the inline copy and the spill. The
+    /// spill copies whole appended fragments, so it can never land inside a
+    /// character.
+    #[test]
+    fn multibyte_names_survive_inline_and_spilled() {
+        let short = "héllo✅@c.us";
+        let inline = ProtocolAddress::new(short, DeviceId::new(0));
+        assert!(inline.buf.is_inline());
+        assert_eq!(inline.name(), short);
+
+        // Fill to one byte short of the limit, then append a two-byte char:
+        // the append cannot fit, so the whole fragment moves to the heap.
+        let filler = "a".repeat(INLINE_CAPACITY - 1);
+        let mut spilled = ProtocolAddress::empty(DeviceId::new(0));
+        spilled.reset_with(|buf| {
+            buf.push_str(&filler);
+            buf.push('é');
+        });
+        assert!(!spilled.buf.is_inline());
+        assert_eq!(spilled.name(), format!("{filler}é"));
+        assert_eq!(spilled.as_str(), format!("{filler}é.0"));
+    }
+
+    /// An empty name is a real state (a freshly reset address), and the
+    /// suffix still lands.
+    #[test]
+    fn an_empty_name_still_carries_its_device_suffix() {
+        let address = ProtocolAddress::new("", DeviceId::new(0));
+        assert!(address.buf.is_inline());
+        assert_eq!(address.name(), "");
+        assert_eq!(address.as_str(), ".0");
+    }
+
+    /// A non-zero device id is rendered, and the name boundary still excludes
+    /// the suffix however many digits it takes.
+    #[test]
+    fn a_multi_digit_device_id_is_appended_outside_the_name() {
+        let address = ProtocolAddress::new("alice@c.us", DeviceId::new(123));
+        assert_eq!(address.name(), "alice@c.us");
+        assert_eq!(address.as_str(), "alice@c.us.123");
+        assert_eq!(address.device_id(), DeviceId::new(123));
+    }
+
+    /// Rewriting an address must replace its content, not append to it.
+    #[test]
+    fn resetting_replaces_the_previous_name() {
+        let mut address = ProtocolAddress::new("alice@c.us", DeviceId::new(0));
+        address.reset_with(|buf| buf.push_str("bob@c.us"));
+        assert_eq!(address.name(), "bob@c.us");
+        assert_eq!(address.as_str(), "bob@c.us.0");
+
+        let mut spilled = ProtocolAddress::new(&"z".repeat(INLINE_CAPACITY * 2), DeviceId::new(0));
+        spilled.reset_with(|buf| buf.push_str("bob@c.us"));
+        assert_eq!(spilled.as_str(), "bob@c.us.0");
     }
 }
