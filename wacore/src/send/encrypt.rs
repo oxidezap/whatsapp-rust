@@ -377,6 +377,12 @@ pub async fn encrypt_for_devices(
 /// [`ensure_sessions_for_devices`]; consumed by
 /// [`encrypt_for_devices_with_sessions`] over the same `devices` slice.
 pub struct SessionPlan {
+    /// Device count the plan was built for. Kept alongside the (possibly empty)
+    /// override map so the "same slice" invariant is still checkable now that an
+    /// override-free plan carries no vector at all.
+    device_count: usize,
+    /// Empty means "no device is overridden"; otherwise one slot per device.
+    /// See [`record_encryption_override`].
     encryption_overrides: Vec<Option<Jid>>,
     pub had_unregistered_device: bool,
     first_error: Option<anyhow::Error>,
@@ -389,11 +395,36 @@ impl SessionPlan {
     /// and must not touch the network during the encrypt fan-out.
     pub fn assume_ready(device_count: usize) -> Self {
         Self {
-            encryption_overrides: vec![None; device_count],
+            device_count,
+            encryption_overrides: Vec::new(),
             had_unregistered_device: false,
             first_error: None,
         }
     }
+}
+
+/// The LID address recorded for `index`, or `None` when that device encrypts
+/// against its own JID. Indexing tolerates the empty (no-override) map, which
+/// is what a warm send carries.
+fn encryption_override_at(overrides: &[Option<Jid>], index: usize) -> Option<&Jid> {
+    overrides.get(index).and_then(Option::as_ref)
+}
+
+/// Record a per-index LID override, materializing the map on its first entry.
+///
+/// A steady-state send overrides nothing, so the all-`None` vector it would
+/// otherwise allocate (once per encrypt fan-out, twice per DM that also has
+/// companion devices) never exists.
+fn record_encryption_override(
+    overrides: &mut Vec<Option<Jid>>,
+    device_count: usize,
+    index: usize,
+    jid: Jid,
+) {
+    if overrides.is_empty() {
+        overrides.resize(device_count, None);
+    }
+    overrides[index] = Some(jid);
 }
 
 /// Resolve LID overrides and establish missing Signal sessions (prekey
@@ -411,10 +442,12 @@ pub async fn ensure_sessions_for_devices(
     // None = use devices[i] as-is; Some(jid) = use this LID-upgraded version.
     // The Vec replaces a HashMap<&Jid, Jid> that paid hash + alloc per insert
     // and per get (~666 of each on a large group). Plain Vec<Option<Jid>> is
-    // direct indexing and contiguous memory.
-    let mut encryption_overrides: Vec<Option<Jid>> = vec![None; devices.len()];
+    // direct indexing and contiguous memory. Both vectors stay unallocated
+    // until something is actually recorded in them, which on a warm send is
+    // never.
+    let mut encryption_overrides: Vec<Option<Jid>> = Vec::new();
     // Indices into `devices` for those needing prekey fetch.
-    let mut indices_needing_prekeys: Vec<usize> = Vec::with_capacity(devices.len());
+    let mut indices_needing_prekeys: Vec<usize> = Vec::new();
     let mut had_406 = false;
     let mut first_error = None;
 
@@ -437,7 +470,7 @@ pub async fn ensure_sessions_for_devices(
                     lid_jid.observe(),
                     device_jid.observe()
                 );
-                encryption_overrides[idx] = Some(lid_jid);
+                record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
                 continue;
             }
         }
@@ -459,7 +492,7 @@ pub async fn ensure_sessions_for_devices(
                 lid_jid.observe(),
                 device_jid.observe()
             );
-            encryption_overrides[idx] = Some(lid_jid);
+            record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
         }
         indices_needing_prekeys.push(idx);
     }
@@ -516,8 +549,8 @@ pub async fn ensure_sessions_for_devices(
         let make_session_task = |spawn_idx: usize| {
             let idx = indices_needing_prekeys[spawn_idx];
             let device_jid = devices[idx].clone();
-            let mut encryption_jid = encryption_overrides[idx]
-                .clone()
+            let mut encryption_jid = encryption_override_at(&encryption_overrides, idx)
+                .cloned()
                 .unwrap_or_else(|| device_jid.clone());
 
             // Normalize agent to 0 for LID JIDs to match how pre-key bundles are stored.
@@ -607,6 +640,7 @@ pub async fn ensure_sessions_for_devices(
     }
 
     Ok(SessionPlan {
+        device_count: devices.len(),
         encryption_overrides,
         had_unregistered_device: had_406,
         first_error,
@@ -722,11 +756,12 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     plan: SessionPlan,
 ) -> Result<RawEncryptAttempt> {
     debug_assert_eq!(
-        plan.encryption_overrides.len(),
+        plan.device_count,
         devices.len(),
         "SessionPlan built for a different device list"
     );
     let SessionPlan {
+        device_count: _,
         encryption_overrides,
         had_unregistered_device,
         mut first_error,
@@ -744,9 +779,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         // a FuturesUnordered, and two store clones), with no parallelism to gain.
         // Encrypt inline.
         let device_jid = devices[0].clone();
-        let addr = encryption_overrides
-            .first()
-            .and_then(|o| o.as_ref())
+        let addr = encryption_override_at(&encryption_overrides, 0)
             .unwrap_or(&devices[0])
             .to_protocol_address();
         let res = encrypt_one_device(
@@ -782,9 +815,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             // The 'static task can't borrow devices/encryption_overrides.
             let jobs: Vec<(ProtocolAddress, Jid)> = (chunk_start..chunk_end)
                 .map(|idx| {
-                    let addr = encryption_overrides
-                        .get(idx)
-                        .and_then(|o| o.as_ref())
+                    let addr = encryption_override_at(&encryption_overrides, idx)
                         .unwrap_or(&devices[idx])
                         .to_protocol_address();
                     (addr, devices[idx].clone())
@@ -848,4 +879,81 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         },
         first_error,
     })
+}
+
+#[cfg(test)]
+mod encryption_override_tests {
+    use super::{SessionPlan, encryption_override_at, record_encryption_override};
+    use wacore_binary::Jid;
+
+    fn lid(user: &str, device: u16) -> Jid {
+        Jid::lid_device(user.to_owned(), device)
+    }
+
+    /// The steady state: nothing is overridden, so the per-device map is never
+    /// allocated and every lookup still answers "use the device's own JID".
+    #[test]
+    fn an_empty_map_answers_every_index_without_allocating() {
+        let overrides: Vec<Option<Jid>> = Vec::new();
+        assert_eq!(overrides.capacity(), 0, "no override must mean no buffer");
+        for index in [0, 1, 7, usize::MAX] {
+            assert!(encryption_override_at(&overrides, index).is_none());
+        }
+
+        let plan = SessionPlan::assume_ready(4);
+        assert!(
+            plan.encryption_overrides.is_empty(),
+            "a plan that overrides nothing must carry no override buffer"
+        );
+        assert_eq!(plan.device_count, 4, "the slice length is still recorded");
+    }
+
+    /// The first recorded override materializes the full map, so later indices
+    /// stay addressable and earlier ones stay `None`.
+    #[test]
+    fn recording_materializes_the_whole_map_once() {
+        let mut overrides: Vec<Option<Jid>> = Vec::new();
+        record_encryption_override(&mut overrides, 3, 2, lid("100000000000001", 5));
+        assert_eq!(overrides.len(), 3);
+        assert!(encryption_override_at(&overrides, 0).is_none());
+        assert!(encryption_override_at(&overrides, 1).is_none());
+        assert_eq!(
+            encryption_override_at(&overrides, 2),
+            Some(&lid("100000000000001", 5))
+        );
+
+        // A second record must not resize again, nor clear the first.
+        record_encryption_override(&mut overrides, 3, 0, lid("100000000000002", 0));
+        assert_eq!(overrides.len(), 3);
+        assert_eq!(
+            encryption_override_at(&overrides, 0),
+            Some(&lid("100000000000002", 0))
+        );
+        assert_eq!(
+            encryption_override_at(&overrides, 2),
+            Some(&lid("100000000000001", 5))
+        );
+
+        // Overwriting an index replaces it rather than appending.
+        record_encryption_override(&mut overrides, 3, 2, lid("100000000000003", 1));
+        assert_eq!(overrides.len(), 3);
+        assert_eq!(
+            encryption_override_at(&overrides, 2),
+            Some(&lid("100000000000003", 1))
+        );
+    }
+
+    /// A single-device fan-out is the DM hot path, and it reads index 0 off a
+    /// map that may not exist.
+    #[test]
+    fn a_single_device_plan_records_and_reads_index_zero() {
+        let mut overrides: Vec<Option<Jid>> = Vec::new();
+        assert!(encryption_override_at(&overrides, 0).is_none());
+        record_encryption_override(&mut overrides, 1, 0, lid("100000000000009", 33));
+        assert_eq!(
+            encryption_override_at(&overrides, 0),
+            Some(&lid("100000000000009", 33))
+        );
+        assert!(encryption_override_at(&overrides, 1).is_none());
+    }
 }

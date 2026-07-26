@@ -22,6 +22,21 @@ impl ParsedSessionMessage {
     }
 }
 
+/// Append to one of the three per-kind enc buckets, allocating that bucket only
+/// once it actually receives a payload.
+///
+/// A stanza's enc nodes are overwhelmingly all one kind, so reserving all three
+/// buckets up front spent two allocations per message on buffers that stayed
+/// empty for their whole lifetime. Reserving the stanza's full enc count on the
+/// first push keeps a mixed stanza at one allocation per non-empty bucket,
+/// exactly as before.
+fn push_enc_payload(bucket: &mut Vec<EncPayload>, stanza_enc_count: usize, payload: EncPayload) {
+    if bucket.capacity() == 0 {
+        bucket.reserve_exact(stanza_enc_count);
+    }
+    bucket.push(payload);
+}
+
 async fn decrypt_session_message(
     message: &mut ParsedSessionMessage,
     signal_address: &wacore::libsignal::protocol::ProtocolAddress,
@@ -222,9 +237,9 @@ impl Client {
             return None;
         }
 
-        let mut session_payloads = Vec::with_capacity(all_enc_nodes.len());
-        let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
-        let mut bot_payloads = Vec::with_capacity(all_enc_nodes.len());
+        let mut session_payloads = Vec::new();
+        let mut group_payloads = Vec::new();
+        let mut bot_payloads = Vec::new();
         let mut max_sender_retry_count = 0;
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
@@ -301,13 +316,14 @@ impl Client {
                 }
             };
 
-            if payload.enc_type.is_bot_secret() {
-                bot_payloads.push(payload);
+            let bucket = if payload.enc_type.is_bot_secret() {
+                &mut bot_payloads
             } else if payload.enc_type.is_session() {
-                session_payloads.push(payload);
+                &mut session_payloads
             } else {
-                group_payloads.push(payload);
-            }
+                &mut group_payloads
+            };
+            push_enc_payload(bucket, all_enc_nodes.len(), payload);
         }
 
         // WA Web diagnostic: validate skmsg is not first in multi-enc messages.
@@ -1747,6 +1763,76 @@ impl Client {
         let default_jid = Jid::default();
         let own_jid = device_snapshot.pn.as_ref().unwrap_or(&default_jid);
         wacore::messages::parse_message_info(node, own_jid, device_snapshot.lid.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod enc_bucket_tests {
+    use super::push_enc_payload;
+    use crate::message::EncPayload;
+    use wacore::message_processing::EncType;
+
+    fn payload(enc_type: EncType) -> EncPayload {
+        EncPayload {
+            ciphertext: bytes::Bytes::from_static(b"ct"),
+            enc_type,
+            padding_version: 2,
+        }
+    }
+
+    /// The DM shape: one enc node, one bucket used, two buckets untouched. The
+    /// used bucket must be sized to the stanza exactly (not to `Vec`'s default
+    /// growth step) and the unused ones must own no buffer at all.
+    #[test]
+    fn a_one_enc_stanza_sizes_one_bucket_exactly_and_leaves_the_rest_empty() {
+        let mut used: Vec<EncPayload> = Vec::new();
+        let unused: Vec<EncPayload> = Vec::new();
+
+        push_enc_payload(&mut used, 1, payload(EncType::Message));
+
+        assert_eq!(used.len(), 1);
+        assert_eq!(
+            used.capacity(),
+            1,
+            "the bucket must be reserved to the stanza's enc count, not grown"
+        );
+        assert_eq!(unused.capacity(), 0, "an empty bucket must own no buffer");
+        assert!(unused.is_empty());
+    }
+
+    /// The first push must reserve the stanza's whole enc count, so a multi-enc
+    /// stanza still pays exactly one allocation for the bucket it fills. Eight
+    /// is past `Vec`'s own first growth step, so plain pushes would reallocate.
+    #[test]
+    fn the_first_push_reserves_the_whole_stanza() {
+        const ENC_COUNT: usize = 8;
+        let mut bucket: Vec<EncPayload> = Vec::new();
+        push_enc_payload(&mut bucket, ENC_COUNT, payload(EncType::Message));
+        let reserved = bucket.as_ptr();
+        assert_eq!(bucket.capacity(), ENC_COUNT);
+
+        for _ in 1..ENC_COUNT {
+            push_enc_payload(&mut bucket, ENC_COUNT, payload(EncType::PreKeyMessage));
+        }
+        assert_eq!(bucket.len(), ENC_COUNT);
+        assert_eq!(
+            bucket.as_ptr(),
+            reserved,
+            "filling up to the stanza's enc count must not reallocate"
+        );
+        assert_eq!(bucket[0].enc_type, EncType::Message);
+        assert_eq!(bucket[ENC_COUNT - 1].enc_type, EncType::PreKeyMessage);
+    }
+
+    /// A degenerate count must not make the helper skip its reservation and
+    /// leave the bucket re-reserving on every later push.
+    #[test]
+    fn a_zero_count_still_stores_the_payload() {
+        let mut bucket: Vec<EncPayload> = Vec::new();
+        push_enc_payload(&mut bucket, 0, payload(EncType::SenderKey));
+        assert_eq!(bucket.len(), 1);
+        push_enc_payload(&mut bucket, 0, payload(EncType::SenderKey));
+        assert_eq!(bucket.len(), 2);
     }
 }
 

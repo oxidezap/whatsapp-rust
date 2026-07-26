@@ -240,11 +240,16 @@ pub async fn prepare_dm_stanza(
         ));
     }
 
-    let mut message_content_nodes = vec![
+    // Sized for everything that can follow `<participants>`: the optional
+    // `<device-identity>`, the optional `<reporting>`, and the caller's extra
+    // nodes. `vec![one]` reserves exactly one slot, so each later push
+    // reallocated and memcpy'd the whole (large) `Node` values.
+    let mut message_content_nodes = Vec::with_capacity(3 + extra_stanza_nodes.len());
+    message_content_nodes.push(
         NodeBuilder::new("participants")
             .children(participant_nodes)
             .build(),
-    ];
+    );
 
     // DM stays lenient when pkmsg lacks an account (no pre-flight here): map the
     // helper's error back to omission so the wire shape is unchanged.

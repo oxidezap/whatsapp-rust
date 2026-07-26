@@ -616,6 +616,31 @@ mod tests {
         buf.wait_flushed().await;
     }
 
+    /// Building a row costs one allocation per *distinct* identifier and
+    /// nothing else. The naive spelling (`to_non_ad_string().into()` per JID)
+    /// cost five for a direct message; this is the per-message saving on both
+    /// the inbound capture and the outbound persist.
+    #[test]
+    fn entry_construction_allocates_once_per_distinct_identifier() {
+        let chat: wacore_binary::Jid = "5511987650001@s.whatsapp.net".parse().unwrap();
+        let peer_device: wacore_binary::Jid = "5511987650001:33@s.whatsapp.net".parse().unwrap();
+        let me: wacore_binary::Jid = "5511987650002@s.whatsapp.net".parse().unwrap();
+        let secret = [0u8; wacore::reporting_token::MESSAGE_SECRET_SIZE];
+
+        // A DM: chat and sender are the same user, so the row holds two
+        // allocations (the shared identifier and the message id).
+        let dm = crate::test_alloc::min_allocs(2, || {
+            MsgSecretEntry::new(&chat, &peer_device, "3EB0AABBCCDDEEFF0011", secret, 0, 0)
+        });
+        assert_eq!(dm, 2, "a direct-message row: shared identifier + msg id");
+
+        // Outbound: the sender is us, a different user, so it needs its own.
+        let outbound = crate::test_alloc::min_allocs(3, || {
+            MsgSecretEntry::new(&chat, &me, "3EB0AABBCCDDEEFF0011", secret, 0, 0)
+        });
+        assert_eq!(outbound, 3, "distinct users cost one identifier each");
+    }
+
     /// Cloning a buffered entry must stay allocation-free: identifiers share
     /// their Arc allocations and the protocol-sized secret lives inline.
     #[test]

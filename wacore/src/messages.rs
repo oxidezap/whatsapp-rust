@@ -1125,9 +1125,12 @@ pub fn parse_message_info(
             .unwrap_or_default(),
         timestamp: crate::time::from_secs_or_now(attrs.unix_time("t")),
         category,
+        // Parse from the borrowed attribute: `From<String>` immediately
+        // re-borrows it, so materializing a String first only buys a discarded
+        // allocation for every known variant.
         edit: attrs
             .optional_string("edit")
-            .map(|s| EditAttribute::from(s.to_string()))
+            .map(|s| EditAttribute::from(s.as_ref()))
             .unwrap_or_default(),
         is_offline,
         server_timestamp_us,

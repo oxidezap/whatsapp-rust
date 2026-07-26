@@ -659,6 +659,20 @@ impl Jid {
         buf
     }
 
+    /// [`Self::to_non_ad_string`] as a shareable `Arc<str>`, in exactly one
+    /// allocation. Going through the `String` first costs two — the buffer, then
+    /// the `Arc<str>` its bytes are copied into — and the message-secret rows
+    /// build two of these per message.
+    pub fn to_non_ad_arc_str(&self) -> std::sync::Arc<str> {
+        let mut writer = JidStackWriter::new();
+        if write_jid_fallible(&mut writer, &self.user, self.server, 0, 0).is_ok() {
+            return std::sync::Arc::from(writer.as_str());
+        }
+        // A user part too long for the stack buffer (never seen on the wire)
+        // still renders, just back through the heap.
+        std::sync::Arc::from(self.to_non_ad_string())
+    }
+
     /// Check if this JID matches the user or their LID.
     /// Useful for checking if a participant is "us" in group messages.
     #[inline]
@@ -1974,6 +1988,48 @@ mod tests {
                 "mismatch for {s}"
             );
         }
+    }
+
+    /// The stack-buffered `Arc<str>` form must render exactly what the `String`
+    /// form does, including for inputs that overflow the stack buffer and fall
+    /// back to the heap, and for multibyte user parts (the buffer is bounded in
+    /// bytes, and a split fragment would be invalid UTF-8).
+    #[test]
+    fn to_non_ad_arc_str_matches_to_non_ad_string() {
+        let long_user = "9".repeat(80);
+        let multibyte_user = "ẞünïcodé-ñ".repeat(3);
+        let owned = [
+            format!("{long_user}:12@s.whatsapp.net"),
+            format!("{multibyte_user}@g.us"),
+            format!("{multibyte_user}@s.whatsapp.net"),
+        ];
+        let cases = [
+            "1234567890:33@s.whatsapp.net",
+            "1234567890@s.whatsapp.net",
+            "100000012345678:25@lid",
+            "867051314767696:0@bot",
+            "120363021033254949@g.us",
+            "status@broadcast",
+        ]
+        .into_iter()
+        .chain(owned.iter().map(String::as_str));
+
+        for s in cases {
+            let jid: Jid = s.parse().unwrap_or_else(|e| panic!("parse {s}: {e}"));
+            assert_eq!(
+                &*jid.to_non_ad_arc_str(),
+                jid.to_non_ad_string().as_str(),
+                "mismatch for {s}"
+            );
+        }
+
+        // A default (empty-user) JID has no wire form to render but must still
+        // agree with the String path rather than panic in the stack writer.
+        let empty = Jid::default();
+        assert_eq!(
+            &*empty.to_non_ad_arc_str(),
+            empty.to_non_ad_string().as_str()
+        );
     }
 
     #[test]

@@ -2432,14 +2432,9 @@ impl Client {
             u64::try_from(now).ok(),
             now,
         );
-        let entry = wacore::store::traits::MsgSecretEntry {
-            chat: chat.to_non_ad_string().into(),
-            sender: sender.to_non_ad_string().into(),
-            msg_id: msg_id.into(),
-            secret: *secret,
-            expires_at,
-            message_ts: now,
-        };
+        let entry = wacore::store::traits::MsgSecretEntry::new(
+            chat, sender, msg_id, *secret, expires_at, now,
+        );
         // Same write-behind buffer as inbound captures: visible immediately,
         // flushed off the send path (msmsg replies read buffer-first).
         self.msg_secret_buffer.queue_one(entry).await;

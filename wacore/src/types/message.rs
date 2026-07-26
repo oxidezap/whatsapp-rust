@@ -382,6 +382,28 @@ mod tests {
     use super::*;
     use buffa::MessageField;
 
+    /// The stanza parser reads `edit` as a borrowed attribute and parses it
+    /// directly. That is only safe while the borrowed and owned constructors
+    /// agree on every input, including the `Unknown` fallback that is the one
+    /// case actually needing an allocation.
+    #[test]
+    fn edit_attribute_parses_identically_from_borrowed_and_owned() {
+        for wire in ["", "1", "2", "3", "7", "8", "0", "99", "revogação", " 7"] {
+            assert_eq!(
+                EditAttribute::from(wire),
+                EditAttribute::from(wire.to_owned()),
+                "mismatch for {wire:?}"
+            );
+        }
+        assert_eq!(EditAttribute::from("7"), EditAttribute::SenderRevoke);
+        // An unrecognized value must keep its exact wire bytes so the resend
+        // path can echo them back verbatim.
+        assert_eq!(
+            EditAttribute::from("99"),
+            EditAttribute::Unknown("99".to_owned())
+        );
+    }
+
     #[test]
     fn message_info_serde_omits_only_absent_optional_fields() {
         let mut info = MessageInfo::default();

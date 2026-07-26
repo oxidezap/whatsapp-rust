@@ -164,11 +164,7 @@ impl HistorySecretSeedCollector {
             Err(_) => return,
         };
         for sender in senders.into_iter().flatten() {
-            let sender_id = if sender.is_same_chat_as(chat) {
-                Arc::clone(&chat_id)
-            } else {
-                Arc::from(sender.to_non_ad_string())
-            };
+            let sender_id = MsgSecretEntry::sender_id_for(chat, &chat_id, &sender);
             self.entries.push(MsgSecretEntry {
                 chat: Arc::clone(&chat_id),
                 sender: sender_id,

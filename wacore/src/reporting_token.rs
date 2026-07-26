@@ -758,8 +758,11 @@ pub fn generate_reporting_token_from_encoded(
     tracing::instrument(name = "wa.send.reporting_node", level = "debug", skip_all)
 )]
 pub fn build_reporting_node(result: &ReportingTokenResult) -> Node {
+    // The integer goes in as an integer: `NodeValue`'s numeric conversion
+    // formats through `itoa` into an inline `CompactString`, while a
+    // `to_string()` first would heap-allocate a one-byte String per message.
     let token_node = NodeBuilder::new("reporting_token")
-        .attrs([("v", result.version.to_string())])
+        .attr("v", result.version)
         .bytes(result.reporting_token.to_vec())
         .build();
 
@@ -1252,6 +1255,17 @@ mod tests {
                 );
             }
         }
+
+        // `v` carries the result's version, not a baked-in constant: the
+        // integer goes through `NodeValue`'s itoa conversion, so a version
+        // bump must reach the wire without touching this builder.
+        let bumped = ReportingTokenResult {
+            version: 7,
+            ..result
+        };
+        let node = build_reporting_node(&bumped);
+        let token_node = node.get_children_by_tag("reporting_token").next().unwrap();
+        assert!(token_node.attrs.get("v").is_some_and(|v| v == "7"));
     }
 
     #[test]
