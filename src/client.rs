@@ -359,8 +359,9 @@ impl std::fmt::Display for MemoryReport {
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
         // caches; the next SIGNAL_CACHES are Signal store caches. The final
-        // entry is transient history-sync retention.
-        const TTL_BOUNDED: usize = 7;
+        // entry is transient history-sync retention. Adding a cache to
+        // collections() means moving this boundary, or the sections shift.
+        const TTL_BOUNDED: usize = 8;
         const SIGNAL_CACHES: usize = 3;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;

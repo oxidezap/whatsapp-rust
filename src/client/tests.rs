@@ -3811,6 +3811,45 @@ async fn received_stanza_handling_reads_no_clock() {
 
 /// memory_report must be callable on a fresh client and internally
 /// consistent: empty collections report zero entries and zero bytes.
+/// The Display sections are sliced by hard-coded boundaries over
+/// `collections()`, so adding a cache without moving the boundary silently
+/// prints it under the wrong heading and drops the last one of the next
+/// section. This pins the layout instead of the individual counts.
+#[tokio::test]
+async fn memory_report_display_sections_stay_aligned() {
+    let client = crate::test_utils::create_test_client_with_name("memory_report_sections").await;
+    let rendered = client.memory_report().await.to_string();
+
+    let ttl_start = rendered
+        .find("--- TTL-bounded caches ---")
+        .expect("ttl section");
+    let signal_start = rendered.find("--- Signal store").expect("signal section");
+    let ttl_block = &rendered[ttl_start..signal_start];
+
+    for name in [
+        "group_cache:",
+        "device_registry_cache:",
+        "recent_messages:",
+        "group_devices_memo:",
+        "dm_devices_memo:",
+    ] {
+        assert!(
+            ttl_block.contains(name),
+            "{name} must render under the TTL-bounded heading, got:\n{rendered}"
+        );
+    }
+    for name in [
+        "signal_sessions:",
+        "signal_identities:",
+        "signal_sender_keys:",
+    ] {
+        assert!(
+            rendered[signal_start..].contains(name),
+            "{name} must render under the Signal heading, got:\n{rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn memory_report_on_fresh_client() {
     // recent_messages is capacity-0 (disabled) by default; enable it so the

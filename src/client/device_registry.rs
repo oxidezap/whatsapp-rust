@@ -360,7 +360,14 @@ impl Client {
             && memo.own_pn == *own_jid
             && memo.own_lid.as_ref() == own_lid
         {
-            if memo.generation == generation {
+            // Re-read after the await above: a device-list update can land
+            // while the memo is being loaded, and validating the hit against
+            // the pre-await snapshot would serve the pre-write fan-out, which
+            // is exactly the missed-device case this memo must never cause.
+            // The store below deliberately keeps the earlier snapshot, so a
+            // racing write leaves the stored entry stale by its own stamp.
+            let observed = self.device_topology.current();
+            if memo.generation == observed {
                 // Refcount bump: the snapshot is immutable, so a hit shares
                 // it (and its warm phash) instead of rebuilding.
                 return Ok(Arc::clone(&memo.devices));
@@ -377,7 +384,7 @@ impl Client {
                     .insert(
                         recipient_bare.clone(),
                         Arc::new(DmDevicesMemo {
-                            generation,
+                            generation: observed,
                             own_pn: memo.own_pn.clone(),
                             own_lid: memo.own_lid.clone(),
                             members: Arc::clone(&memo.members),
