@@ -273,6 +273,21 @@ impl Client {
     /// Register a oneshot waiter for a server ack by message ID.
     /// Returns the receiver — caller sends the node separately and awaits this in background.
     /// Sync: registration is just a `std::sync::Mutex` insert (no await).
+    /// Register a waiter that receives the ack node itself.
+    ///
+    /// Used where the caller needs the response (the VoIP offer reads the relay
+    /// out of its ack); a phash check does not, which is why that path uses
+    /// [`Self::register_phash_waiter`] and pays no channel per message.
+    pub(crate) fn register_ack_waiter(
+        &self,
+        message_id: &str,
+    ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.response_waiters_guard()
+            .insert(message_id.to_string(), ResponseWaiter::Iq(tx));
+        rx
+    }
+
     /// Register the phash the server is expected to echo for this send.
     ///
     /// Nothing awaits the result: the read loop compares inline when the ack
