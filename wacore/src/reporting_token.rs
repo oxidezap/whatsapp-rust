@@ -659,6 +659,15 @@ pub fn extract_reporting_token_content(
             Piece::Owned(bytes) => result.extend_from_slice(&bytes),
         }
     }
+    // The reservation is only worth making if it matches what was written; an
+    // understated `Piece::len` would reallocate here and go unnoticed
+    // otherwise. Checked rather than asserted on capacity, which the allocator
+    // is free to round up.
+    debug_assert_eq!(
+        result.len(),
+        total_len,
+        "the reservation disagreed with the bytes written"
+    );
     Some(result)
 }
 
@@ -1833,10 +1842,16 @@ mod tests {
         for (data, whitelist) in cases {
             let extracted =
                 extract_reporting_token_content(data, whitelist).expect("content extracts");
-            assert_eq!(
-                extracted.capacity(),
-                extracted.len(),
-                "the result grew past its reservation, so a piece was not counted"
+            // The property is that the length reserved from `Piece::len` is the
+            // length actually written; an understated reservation reallocates
+            // silently. That is checked by the `debug_assert` inside the
+            // extractor, which every call here exercises, so this case exists
+            // to feed it shapes: flat fields, a nested field, and both mixed.
+            // Asserting `capacity()` instead would be testing the allocator,
+            // which is free to round a request up.
+            assert!(
+                !extracted.is_empty(),
+                "each case must actually extract something, or it feeds the check nothing"
             );
         }
     }

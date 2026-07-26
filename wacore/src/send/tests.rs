@@ -4456,12 +4456,27 @@ mod local_identity_change_on_send {
             fan_out_into(&second, &resolver, &mut nodes).await;
 
             assert_eq!(nodes[0].tag.as_ref(), "sentinel");
-            let mut expected: Vec<String> = first.iter().map(Jid::to_string).collect();
-            expected.extend(second.iter().map(Jid::to_string));
+
+            // Within a half the fan-out drains a FuturesUnordered, so it makes
+            // no promise about which device finishes first, and asserting an
+            // order would only pass while these futures happen not to pend.
+            // What the sink does guarantee, because the two halves are
+            // sequential awaits, is that every device of the first half lands
+            // before any of the second.
+            let written = participant_jids(&nodes[1..]);
+            let (first_half, second_half) = written.split_at(first.len());
+            let as_set = |jids: &[String]| -> std::collections::BTreeSet<String> {
+                jids.iter().cloned().collect()
+            };
             assert_eq!(
-                participant_jids(&nodes[1..]),
-                expected,
-                "each half appends its own devices, in order, after the last"
+                as_set(first_half),
+                first.iter().map(Jid::to_string).collect(),
+                "the first half must contribute exactly its own devices, before the second"
+            );
+            assert_eq!(
+                as_set(second_half),
+                second.iter().map(Jid::to_string).collect(),
+                "the second half must land after the first, contributing exactly its own"
             );
         }
 

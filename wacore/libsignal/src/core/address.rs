@@ -326,11 +326,19 @@ impl ProtocolAddress {
         address
     }
 
-    /// An empty address, ready for [`Self::reset_with`]. No capacity argument:
-    /// the buffer starts inline and grows only if an address ever exceeds it.
+    /// An address with no name yet, ready for [`Self::reset_with`]. No capacity
+    /// argument: the buffer starts inline and grows only if an address ever
+    /// exceeds it.
+    ///
+    /// The device suffix is written immediately even though the name is empty.
+    /// `Hash`, `Eq` and `Ord` all read the rendered string, so leaving the
+    /// buffer truly empty would make every unnamed address compare equal
+    /// regardless of its device, and two of them would collide as map keys.
     pub fn empty(device_id: DeviceId) -> Self {
+        let mut buf = AddressBuf::empty();
+        append_device_suffix(&mut buf, device_id);
         Self {
-            buf: AddressBuf::empty(),
+            buf,
             name_len: 0,
             device_id,
         }
@@ -395,6 +403,25 @@ impl fmt::Display for ProtocolAddress {
 
 #[cfg(test)]
 mod address_buffer_tests {
+
+    /// Every comparison reads the rendered string, so an address with no name
+    /// yet still has to carry its device. Two unnamed addresses that differ
+    /// only by device would otherwise be the same map key, and the session
+    /// cache would serve one device's entry to another.
+    #[test]
+    fn unnamed_addresses_still_differ_by_device() {
+        let first = ProtocolAddress::empty(DeviceId::new(1));
+        let second = ProtocolAddress::empty(DeviceId::new(2));
+
+        assert_ne!(first, second, "the device must keep them apart");
+        assert_ne!(
+            hash_of(&first),
+            hash_of(&second),
+            "equal hashes would collide them in the session cache"
+        );
+        assert_eq!(first.name(), "", "neither has a name yet");
+        assert_eq!(first.device_id(), DeviceId::new(1));
+    }
 
     /// Reusing an address for a shorter name leaves the previous one's bytes in
     /// the inline tail, because the reset only rewinds the length. Anything
