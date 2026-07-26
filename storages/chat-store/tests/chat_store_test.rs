@@ -933,6 +933,71 @@ async fn local_reaction_requires_a_target_id() {
 }
 
 #[tokio::test]
+async fn local_reaction_checks_the_target_author_on_id_collision() {
+    let (store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let mallory = "559900000066@s.whatsapp.net";
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("surviving target"),
+                incoming_info(GROUP, PEER, "REACTION-COLLISION", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("colliding target"),
+                incoming_info(GROUP, mallory, "REACTION-COLLISION", 1_700_000_010),
+            ),
+        ],
+    )
+    .await;
+
+    let target_for = |participant: &str| wa::MessageKey {
+        remote_jid: Some(GROUP.into()),
+        from_me: Some(false),
+        id: Some("REACTION-COLLISION".into()),
+        participant: Some(participant.into()),
+    };
+    chat_store
+        .record_reaction(
+            &chat,
+            &target_for(mallory),
+            "👎",
+            Utc.timestamp_opt(1_700_000_020, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .reactions(&chat, "REACTION-COLLISION")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a key for the colliding author must not attach to the surviving target"
+    );
+
+    // Device suffixes and the peer's mapped PN/LID alias do not change the
+    // participant's author identity.
+    add_lid_mapping(&store).await;
+    chat_store
+        .record_reaction(
+            &chat,
+            &target_for("111000011112222:48@lid"),
+            "👍",
+            Utc.timestamp_opt(1_700_000_030, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let reactions = chat_store
+        .reactions(&chat, "REACTION-COLLISION")
+        .await
+        .unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+}
+
+#[tokio::test]
 async fn local_reaction_removal_blocks_stale_history_reaction() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(GROUP);

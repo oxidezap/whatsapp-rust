@@ -64,6 +64,8 @@ pub(crate) enum WriterMsg {
     Reaction {
         chat: Jid,
         target_id: String,
+        target_from_me: bool,
+        target_participant: Option<String>,
         emoji: String,
         timestamp_ms: i64,
     },
@@ -248,7 +250,8 @@ impl ChatStore {
     /// client's existing reaction, matching the inbound event semantics.
     ///
     /// `target` is the same message key passed to `Client::send_reaction` and
-    /// must contain an id. Goes through the writer queue; use
+    /// must contain an id. If no stored message matches its authorship, the
+    /// queued reaction is a no-op. Goes through the writer queue; use
     /// [`flush`](Self::flush) to await completion.
     pub fn record_reaction(
         &self,
@@ -266,6 +269,8 @@ impl ChatStore {
             .send(WriterMsg::Reaction {
                 chat: chat.clone(),
                 target_id,
+                target_from_me: target.from_me.unwrap_or(false),
+                target_participant: target.participant.clone(),
                 emoji: emoji.to_owned(),
                 timestamp_ms: timestamp.timestamp_millis(),
             })
@@ -709,21 +714,32 @@ fn apply_writer_msg(
         WriterMsg::Reaction {
             chat,
             target_id,
+            target_from_me,
+            target_participant,
             emoji,
             timestamp_ms,
         } => {
             let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
-            // Own senders are stored as the empty JID, the same sentinel used
-            // by history sync for key.from_me reactions.
-            apply_reaction(
+            if local_reaction_target_matches(
                 conn,
                 device_id,
                 &chat_str,
                 target_id,
-                "",
-                emoji,
-                *timestamp_ms,
-            )?;
+                *target_from_me,
+                target_participant.as_deref(),
+            )? {
+                // Own reactors are stored as the empty JID, the same sentinel
+                // used by history sync for key.from_me reactions.
+                apply_reaction(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    target_id,
+                    "",
+                    emoji,
+                    *timestamp_ms,
+                )?;
+            }
             cs.message_chats.insert(chat_str);
             Ok(())
         }
@@ -758,6 +774,50 @@ fn local_target_collides_with_peer(
         message_row(device_id, chat, target_id).filter(schema::messages::from_me.eq(false)),
     ))
     .get_result(conn)
+}
+
+/// Match the full target identity, not just its sender-chosen id. Device
+/// suffixes and known PN/LID aliases normalize before participant comparison.
+fn local_reaction_target_matches(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target_id: &str,
+    target_from_me: bool,
+    target_participant: Option<&str>,
+) -> QueryResult<bool> {
+    let target: Option<(bool, String)> = message_row(device_id, chat, target_id)
+        .select((schema::messages::from_me, schema::messages::sender_jid))
+        .first(conn)
+        .optional()?;
+    let Some((stored_from_me, stored_sender)) = target else {
+        return Ok(false);
+    };
+    if stored_from_me != target_from_me {
+        return Ok(false);
+    }
+    if target_from_me {
+        return Ok(true);
+    }
+    let Some(participant) = target_participant else {
+        let needs_participant = Jid::from_str(chat).is_ok_and(|jid| {
+            jid.is_group() || jid.is_status_broadcast() || jid.is_broadcast_list()
+        });
+        return Ok(!needs_participant);
+    };
+    let (Ok(stored), Ok(target)) = (Jid::from_str(&stored_sender), Jid::from_str(participant))
+    else {
+        return Ok(stored_sender == participant);
+    };
+    let stored = stored.to_non_ad_string();
+    let target = target.to_non_ad_string();
+    if stored == target {
+        return Ok(true);
+    }
+    Ok(
+        crate::lid::counterpart_chat_key(conn, device_id, &stored)?.as_deref()
+            == Some(target.as_str()),
+    )
 }
 
 fn apply_event(
