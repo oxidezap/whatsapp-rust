@@ -330,7 +330,6 @@ pub(crate) struct CelpDecParams {
 }
 
 /// Persistent decoder synthesis state (float domain).
-#[derive(Clone)]
 pub(crate) struct CelpDecState {
     noise: NoiseGenerator,
     acb_state: Vec<f32>,
@@ -343,6 +342,26 @@ pub(crate) struct CelpDecState {
     /// Test-only capture of the per-subframe pre-noise excitation (`exc_pre`), 80/subframe.
     #[cfg(test)]
     pub(crate) dbg_exc_pre: Vec<f32>,
+}
+
+// Hand-written so the test-only excitation trace is NOT carried along. It accumulates every
+// synthesized subframe for the whole stream and is never cleared, so copying it in the per-packet
+// rollback snapshot would make decoding quadratic in stream length. It is a diagnostic capture, not
+// codec state that concealment has to restore.
+impl Clone for CelpDecState {
+    fn clone(&self) -> Self {
+        Self {
+            noise: self.noise.clone(),
+            acb_state: self.acb_state.clone(),
+            acb_state_len: self.acb_state_len,
+            lpc_synth_mem: self.lpc_synth_mem,
+            lsf_prev: self.lsf_prev,
+            prev_nrgres: self.prev_nrgres,
+            hp: self.hp.clone(),
+            #[cfg(test)]
+            dbg_exc_pre: Vec::new(),
+        }
+    }
 }
 
 impl Default for CelpDecState {
