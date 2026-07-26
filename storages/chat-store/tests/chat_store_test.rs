@@ -710,6 +710,212 @@ async fn reactions_add_replace_and_remove() {
 }
 
 #[tokio::test]
+async fn local_edit_updates_own_message_and_preview() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-EDIT",
+            &wa::Message::text("typo"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_edit(
+            &chat,
+            "OUT-EDIT",
+            &wa::Message::text("fixed"),
+            Utc.timestamp_opt(1_700_000_050, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&chat, "OUT-EDIT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(msg.from_me);
+    assert_eq!(msg.text.as_deref(), Some("fixed"));
+    assert_eq!(
+        msg.message
+            .as_deref()
+            .and_then(|message| message.conversation.as_deref()),
+        Some("fixed")
+    );
+    assert_eq!(
+        msg.edited_at.map(|timestamp| timestamp.timestamp()),
+        Some(1_700_000_050)
+    );
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("fixed"));
+
+    // The local API keeps the event path's monotonic edit semantics.
+    chat_store
+        .record_edit(
+            &chat,
+            "OUT-EDIT",
+            &wa::Message::text("stale"),
+            Utc.timestamp_opt(1_700_000_025, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let msg = chat_store
+        .message(&chat, "OUT-EDIT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.text.as_deref(), Some("fixed"));
+}
+
+#[tokio::test]
+async fn local_revoke_tombstones_own_message_and_absorbs_edits() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-REVOKE",
+            &wa::Message::text("delete me"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_revoke(
+            &chat,
+            "OUT-REVOKE",
+            Utc.timestamp_opt(1_700_000_050, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&chat, "OUT-REVOKE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(msg.revoked);
+    assert!(msg.text.is_none());
+    assert!(msg.message.is_none());
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert!(chats[0].last_message_preview.is_none());
+
+    chat_store
+        .record_edit(
+            &chat,
+            "OUT-REVOKE",
+            &wa::Message::text("resurrected"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let msg = chat_store
+        .message(&chat, "OUT-REVOKE")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(msg.revoked);
+    assert!(msg.text.is_none());
+}
+
+#[tokio::test]
+async fn local_reaction_adds_replaces_and_removes_own_reaction() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let target = wa::MessageKey {
+        remote_jid: Some(GROUP.into()),
+        from_me: Some(false),
+        id: Some("MSG-LOCAL-REACTION".into()),
+        participant: Some(PEER.into()),
+    };
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("target"),
+            incoming_info(GROUP, PEER, "MSG-LOCAL-REACTION", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "👍",
+            Utc.timestamp_opt(1_700_000_020, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let reactions = chat_store
+        .reactions(&chat, "MSG-LOCAL-REACTION")
+        .await
+        .unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+    assert_eq!(reactions[0].sender_jid, Jid::default());
+
+    // A stale local mirror cannot replace the latest reaction.
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "❤️",
+            Utc.timestamp_opt(1_700_000_010, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let reactions = chat_store
+        .reactions(&chat, "MSG-LOCAL-REACTION")
+        .await
+        .unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "❤️",
+            Utc.timestamp_opt(1_700_000_030, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "",
+            Utc.timestamp_opt(1_700_000_040, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert!(
+        chat_store
+            .reactions(&chat, "MSG-LOCAL-REACTION")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn local_reaction_requires_a_target_id() {
+    let (_store, chat_store) = test_store().await;
+    let err = chat_store
+        .record_reaction(
+            &jid(PEER),
+            &wa::MessageKey::default(),
+            "👍",
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .expect_err("missing target id must fail");
+    assert!(err.to_string().contains("storage error"));
+}
+
+#[tokio::test]
 async fn keyset_pagination_covers_all_pages_in_order() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
