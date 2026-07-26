@@ -55,16 +55,21 @@ pub fn encode_frame_into(
     append_frame_into(payload, header, out)
 }
 
-/// Like [`encode_frame_into`], but appends to `out` instead of clearing it, so
-/// several frames can be laid out back to back in one buffer and handed to the
-/// transport as a single write.
-pub fn append_frame_into(
-    payload: &[u8],
+/// Appends a frame's prefix for a payload of `payload_len` and reserves room for
+/// the payload itself, without needing the payload's bytes.
+///
+/// Exists for producers that write the payload straight into `out` afterwards
+/// (encrypting in place where the bytes will already be on the wire) instead of
+/// building it elsewhere and copying it in. The length prefix is derivable ahead
+/// of the payload because AEAD ciphertext length is a fixed function of the
+/// plaintext length.
+///
+/// On error nothing is written, so `out` is left exactly as it was.
+pub fn append_frame_header_into(
+    payload_len: usize,
     header: Option<&[u8]>,
     out: &mut impl FrameBuf,
 ) -> Result<(), anyhow::Error> {
-    let payload_len = payload.len();
-
     if payload_len >= FRAME_MAX_SIZE {
         return Err(anyhow::anyhow!(
             "Frame is too large (max: {}, got: {})",
@@ -85,6 +90,19 @@ pub fn append_frame_into(
 
     let len_bytes = u32::to_be_bytes(payload_len as u32);
     out.extend_from_slice(&len_bytes[1..]);
+
+    Ok(())
+}
+
+/// Like [`encode_frame_into`], but appends to `out` instead of clearing it, so
+/// several frames can be laid out back to back in one buffer and handed to the
+/// transport as a single write.
+pub fn append_frame_into(
+    payload: &[u8],
+    header: Option<&[u8]>,
+    out: &mut impl FrameBuf,
+) -> Result<(), anyhow::Error> {
+    append_frame_header_into(payload.len(), header, out)?;
     out.extend_from_slice(payload);
 
     Ok(())
@@ -319,6 +337,48 @@ mod tests {
         let frame2 = decoder.decode_frame().expect("second frame");
         assert_eq!(&frame2[..], &[0xCC, 0xDD, 0xEE]);
         assert!(decoder.decode_frame().is_none());
+    }
+
+    /// The header-only form has to lay down exactly what `append_frame_into`
+    /// lays down before the payload, or a caller that writes its payload in
+    /// place afterwards produces a frame the peer cannot split. Asserted
+    /// against the literal big-endian bytes, not against `append_frame_into`:
+    /// that one delegates here, so comparing the two would agree with itself
+    /// no matter what either wrote.
+    #[test]
+    fn append_frame_header_writes_the_length_big_endian() {
+        let mut out = vec![0x5Au8];
+        append_frame_header_into(0x012345, None, &mut out).expect("header only");
+        assert_eq!(
+            out,
+            vec![0x5A, 0x01, 0x23, 0x45],
+            "the header must append 3 big-endian length bytes after what was staged"
+        );
+
+        // A length that only fills the low byte must still occupy all three.
+        let mut short = Vec::new();
+        append_frame_header_into(5, None, &mut short).expect("header only");
+        assert_eq!(short, vec![0x00, 0x00, 0x05]);
+        assert_eq!(short.len(), FRAME_LENGTH_SIZE);
+    }
+
+    /// Reserving for the payload is the header call's job: the caller writes the
+    /// payload straight into `out` and must not have to grow it again.
+    #[test]
+    fn append_frame_header_reserves_room_for_the_payload() {
+        let mut out = Vec::new();
+        append_frame_header_into(1000, None, &mut out).expect("header only");
+        assert!(out.capacity() >= FRAME_LENGTH_SIZE + 1000);
+    }
+
+    /// An oversize frame is rejected before a single byte is written, so a
+    /// buffer that is already staging other frames survives the rejection.
+    #[test]
+    fn append_frame_header_rejects_oversize_without_writing() {
+        let mut out = vec![0xEE; 7];
+        let err = append_frame_header_into(FRAME_MAX_SIZE, None, &mut out);
+        assert!(err.is_err());
+        assert_eq!(out, vec![0xEE; 7]);
     }
 
     #[test]

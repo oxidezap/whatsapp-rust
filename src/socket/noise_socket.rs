@@ -6,9 +6,50 @@ use futures::channel::oneshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use wacore::handshake::{NoiseCipher, NoiseError};
+use wacore::libsignal::crypto::GcmInPlaceBuffer;
 use wacore::runtime::{AbortHandle, Runtime};
 
 const INLINE_ENCRYPT_THRESHOLD: usize = 16 * 1024;
+
+/// AES-GCM tag length. A frame's wire size is a fixed function of its plaintext
+/// length, which is what lets the length prefix be written before the ciphertext
+/// exists.
+const TAG_LEN: usize = 16;
+
+/// The region of the batch buffer one frame's ciphertext occupies, exposed to
+/// AES-GCM as if it were a buffer of its own.
+///
+/// Sealing through this view puts the ciphertext and its tag straight where the
+/// transport will read them. The alternative, sealing into scratch space and
+/// copying the result in, costs a second full pass over every byte sent, which
+/// is the copy comparable stacks are built to avoid: quinn seals with
+/// `PacketKey::encrypt(&self, packet, buf, header_len)` directly in the datagram
+/// buffer, and rustls encrypts each fragment into the record it will send.
+struct FrameBody<'a> {
+    out: &'a mut BytesMut,
+    /// Offset in `out` where this frame's ciphertext starts, i.e. just past its
+    /// length prefix. Held as an offset rather than a slice so the AEAD can grow
+    /// the buffer by the tag through the same view.
+    base: usize,
+}
+
+impl GcmInPlaceBuffer for FrameBody<'_> {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.out[self.base..]
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.out[self.base..]
+    }
+
+    fn resize(&mut self, new_len: usize, value: u8) {
+        self.out.resize(self.base + new_len, value);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.out.truncate(self.base + len);
+    }
+}
 
 /// Ceilings on one batched write. They bound how much is buffered before the
 /// first frame reaches the socket; the batch never waits for work, so these
@@ -23,7 +64,6 @@ type SendResult = std::result::Result<(), EncryptSendError>;
 /// plus the length prefix. Used to test a queued frame against the batch ceiling
 /// before paying to encrypt it.
 fn frame_wire_len(plaintext_len: usize) -> usize {
-    const TAG_LEN: usize = 16;
     plaintext_len + TAG_LEN + wacore::framing::FRAME_LENGTH_SIZE
 }
 
@@ -124,7 +164,6 @@ impl NoiseSocket {
         stats: Option<Arc<wacore::stats::SessionStats>>,
     ) {
         let mut write_counter: u32 = 0;
-        let mut enc_buf = Vec::with_capacity(4096);
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
         let mut out_buf = BytesMut::with_capacity(4096);
@@ -173,7 +212,6 @@ impl NoiseSocket {
                     &write_key,
                     &mut write_counter,
                     job.plaintext,
-                    &mut enc_buf,
                     &mut out_buf,
                 )
                 .await
@@ -297,16 +335,15 @@ impl NoiseSocket {
     /// Encrypt one plaintext and append the framed result to `out_buf`,
     /// returning its wire size. The counter is burned once the framed ciphertext
     /// is committed to `out_buf`, whether or not the write that carries it
-    /// succeeds. Every error path returns before writing a byte into `out_buf`,
-    /// which is the only reason leaving the counter unburned there is sound: a
-    /// change that keeps partial output must burn the counter too, or the next
-    /// frame reuses its nonce.
+    /// succeeds. Every error path leaves `out_buf` exactly as it found it, which
+    /// is the only reason leaving the counter unburned there is sound: a change
+    /// that keeps partial output must burn the counter too, or the next frame
+    /// reuses its nonce.
     async fn encrypt_frame_into(
         runtime: &Arc<dyn Runtime>,
         write_key: &Arc<NoiseCipher>,
         write_counter: &mut u32,
         plaintext: bytes::Bytes,
-        enc_buf: &mut Vec<u8>,
         out_buf: &mut BytesMut,
     ) -> std::result::Result<usize, EncryptSendError> {
         let counter = *write_counter;
@@ -320,13 +357,27 @@ impl NoiseSocket {
         let before = out_buf.len();
 
         if plaintext.len() <= INLINE_ENCRYPT_THRESHOLD {
-            enc_buf.clear();
-            enc_buf.extend_from_slice(&plaintext);
-            if let Err(e) = write_key.encrypt_in_place_with_counter(counter, enc_buf) {
-                return Err(EncryptSendError::crypto(e));
-            }
-            if let Err(e) = wacore::framing::append_frame_into(enc_buf, None, out_buf) {
+            // Ciphertext is exactly the plaintext plus the tag, so the length
+            // prefix is known before the bytes it counts exist and the frame can
+            // be sealed where it already sits in the batch.
+            let body_len = plaintext.len() + TAG_LEN;
+            if let Err(e) = wacore::framing::append_frame_header_into(body_len, None, out_buf) {
                 return Err(EncryptSendError::framing(e));
+            }
+            let base = out_buf.len();
+            out_buf.extend_from_slice(&plaintext);
+            if let Err(e) = write_key
+                .encrypt_in_place_with_counter(counter, &mut FrameBody { out: out_buf, base })
+            {
+                // Unlike the paths above, this one has already appended the
+                // prefix and the plaintext. Rolling both back is what keeps the
+                // rest of the batch, which still has to go out, contiguous, and
+                // what keeps this counter safe to hand to the next frame. The
+                // default AEAD cannot fail on a fixed-size key and nonce, so
+                // only a `set_crypto_provider` backend reaches this: it is the
+                // contract for those, not dead code.
+                out_buf.truncate(before);
+                return Err(EncryptSendError::crypto(e));
             }
         } else {
             let write_key = write_key.clone();
@@ -655,7 +706,6 @@ mod tests {
         let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
 
         let mut write_counter: u32 = 0;
-        let mut enc_buf = Vec::new();
         let mut out_buf = BytesMut::new();
 
         for expected_counter in 0..2u32 {
@@ -665,7 +715,6 @@ mod tests {
                 &write_key,
                 &mut write_counter,
                 bytes::Bytes::from(vec![expected_counter as u8; 32]),
-                &mut enc_buf,
                 &mut out_buf,
             )
             .await
@@ -685,6 +734,151 @@ mod tests {
                 .expect("each frame must decrypt under its own distinct counter");
             assert_eq!(body, vec![counter as u8; 32]);
         }
+    }
+
+    /// The frame is sealed straight into the batch buffer, so the offset it is
+    /// sealed at is load-bearing in a way a staging copy never was: too low and
+    /// AES-GCM overwrites the length prefix or the frame before it, too high and
+    /// the plaintext leaks past the ciphertext. Pinned by encrypting a second
+    /// frame behind a first and checking the first is untouched, the header
+    /// counts exactly the ciphertext, and the body decrypts under its counter.
+    #[tokio::test]
+    async fn a_frame_is_sealed_in_place_behind_the_one_before_it() {
+        let key = [0x21u8; 32];
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
+        let mut write_counter: u32 = 0;
+        let mut out_buf = BytesMut::new();
+
+        let first = bytes::Bytes::from(vec![0xA1u8; 40]);
+        NoiseSocket::encrypt_frame_into(
+            &runtime,
+            &write_key,
+            &mut write_counter,
+            first,
+            &mut out_buf,
+        )
+        .await
+        .expect("first frame");
+        let first_frame = out_buf.to_vec();
+
+        let second_plain = vec![0xB2u8; 77];
+        let wire_len = NoiseSocket::encrypt_frame_into(
+            &runtime,
+            &write_key,
+            &mut write_counter,
+            bytes::Bytes::from(second_plain.clone()),
+            &mut out_buf,
+        )
+        .await
+        .expect("second frame");
+
+        assert_eq!(
+            &out_buf[..first_frame.len()],
+            &first_frame[..],
+            "sealing the second frame must not reach back into the first"
+        );
+        assert_eq!(wire_len, frame_wire_len(second_plain.len()));
+        assert_eq!(out_buf.len(), first_frame.len() + wire_len);
+
+        let second = &out_buf[first_frame.len()..];
+        let declared =
+            ((second[0] as usize) << 16) | ((second[1] as usize) << 8) | second[2] as usize;
+        assert_eq!(
+            declared,
+            second_plain.len() + TAG_LEN,
+            "the header must count the ciphertext that was sealed after it"
+        );
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let mut body = BytesMut::from(&second[FRAME_LENGTH_SIZE..]);
+        read_key
+            .decrypt_in_place_with_counter(1, &mut body)
+            .expect("the sealed body must authenticate under its own counter");
+        assert_eq!(&body[..], &second_plain[..]);
+    }
+
+    /// The AEAD grows and shrinks the buffer through this view, so every one of
+    /// its operations has to be relative to the frame's own start. An absolute
+    /// `resize` or `truncate` here would silently eat the frames already staged
+    /// for the same write.
+    #[test]
+    fn the_frame_body_view_never_reaches_before_its_own_frame() {
+        let mut out = BytesMut::from(&b"earlier-frame"[..]);
+        let base = out.len();
+        out.extend_from_slice(b"body");
+
+        let mut view = FrameBody {
+            out: &mut out,
+            base,
+        };
+        assert_eq!(view.as_slice(), b"body");
+        assert_eq!(view.len(), 4);
+        view.as_mut_slice()[0] = b'B';
+
+        // Growing by a tag-sized amount, the way sealing does.
+        view.resize(4 + TAG_LEN, 0);
+        assert_eq!(view.len(), 4 + TAG_LEN);
+        view.truncate(4);
+        assert_eq!(view.as_slice(), b"Body");
+
+        assert_eq!(
+            &out[..base],
+            &b"earlier-frame"[..],
+            "no view operation may touch the bytes staged before this frame"
+        );
+    }
+
+    /// A frame that cannot be encrypted must leave the batch buffer byte for byte
+    /// as it found it: the frames already in it still have to reach the wire, and
+    /// the counter it declined to burn is handed to whoever comes next. Counter
+    /// exhaustion is the failure that is reachable without swapping the process
+    /// wide crypto provider.
+    #[tokio::test]
+    async fn a_failed_frame_leaves_the_batch_buffer_byte_identical() {
+        let key = [0x22u8; 32];
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
+        let mut out_buf = BytesMut::new();
+
+        // One frame already staged, then the counter runs out mid-batch.
+        let mut write_counter: u32 = u32::MAX - 1;
+        NoiseSocket::encrypt_frame_into(
+            &runtime,
+            &write_key,
+            &mut write_counter,
+            bytes::Bytes::from(vec![0xC3u8; 24]),
+            &mut out_buf,
+        )
+        .await
+        .expect("the last usable counter must still encrypt");
+        let staged = out_buf.to_vec();
+        assert_eq!(write_counter, u32::MAX);
+
+        let err = NoiseSocket::encrypt_frame_into(
+            &runtime,
+            &write_key,
+            &mut write_counter,
+            bytes::Bytes::from(vec![0xD4u8; 24]),
+            &mut out_buf,
+        )
+        .await
+        .expect_err("an exhausted counter must not wrap");
+        assert!(matches!(err.kind, EncryptSendErrorKind::Crypto));
+        assert_eq!(
+            out_buf.to_vec(),
+            staged,
+            "the rejected frame must not leave a header or a plaintext behind"
+        );
+        assert_eq!(write_counter, u32::MAX, "a rejected frame burns no counter");
+
+        // The staged frame is intact and complete, not just the right length.
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let mut body = BytesMut::from(&staged[FRAME_LENGTH_SIZE..]);
+        read_key
+            .decrypt_in_place_with_counter(u32::MAX - 1, &mut body)
+            .expect("the frame staged before the failure must still be sendable");
+        assert_eq!(&body[..], &[0xC3u8; 24][..]);
     }
 
     /// Order must survive a full job channel, not just an empty one.
