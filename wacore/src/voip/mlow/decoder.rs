@@ -48,6 +48,10 @@ pub struct MlowDecoder {
     /// frame would desync the range coder if decoded, so it is dropped (treated as a lost frame). The
     /// count drives a once + every-100th `warn` naming the offending dimension.
     dropped_unsupported: u32,
+    /// Frames concealed because the decode did not end where the body said it should. Drives a
+    /// once + every-100th `warn`, so a peer sending a stream this decoder cannot read is visible in
+    /// a log rather than silently quiet.
+    malformed: u32,
     /// Samples the last packet DECLARED, from its TOC, which is not always what `decode` returned:
     /// a SID, a drop or a standard-Opus escape emits a fixed slot regardless of duration. Consumers
     /// sizing a jitter cushion need the declared value, since that is what sets arrival cadence.
@@ -67,6 +71,7 @@ impl MlowDecoder {
             redundancy: 0,
             had_error: false,
             dropped_unsupported: 0,
+            malformed: 0,
             last_packet_samps: OPUS_FRAME_SAMPS,
         }
     }
@@ -284,6 +289,30 @@ impl MlowDecoder {
             );
             self.state.prev_nlsf = nlsf;
             out.extend_from_slice(&sig);
+        }
+
+        // Endpoint check, before the postfilter as in the reference: the range decoder returns zero
+        // past either end of its storage WITHOUT flagging it, so an impossible stream decodes into
+        // plausible-looking symbols and the synthesis can diverge to full scale. Comparing where the
+        // decode ended against what the body actually held is the only way to see it. A valid stream
+        // finishes within two bytes of its storage; anything else is a malformed frame, concealed as
+        // a lost one rather than synthesized. State already advanced is left as-is, matching the
+        // reference, which also returns without rolling back.
+        let consumed_bytes = (dec.tell().max(0) as u32).div_ceil(8);
+        let body = dec.storage();
+        if body > consumed_bytes || body + 2 < consumed_bytes || dec.err != 0 {
+            self.malformed += 1;
+            if self.malformed == 1 || self.malformed.is_multiple_of(100) {
+                log::warn!(
+                    "mlow: concealing malformed frame #{} (TOC 0x{:02x}: decode ended at {} bytes \
+                     of a {}-byte body)",
+                    self.malformed,
+                    frame[0],
+                    consumed_bytes,
+                    body
+                );
+            }
+            return vec![0.0; out_len];
         }
 
         // Per-packet harmonic postfilter (the codec's final pitch comb + 48-sample group delay), run
@@ -543,6 +572,38 @@ mod tests {
         );
     }
 
+    /// A stream that ends where it claims to must be accepted. This is the guard against the
+    /// endpoint check being too strict: the synthetic 120 ms vector is a well-formed six-frame
+    /// packet, and rejecting it would silence audio that decodes correctly.
+    #[test]
+    fn endpoint_check_accepts_a_well_formed_packet() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_120ms_frames.json")).unwrap();
+        let mut dec = MlowDecoder::new();
+        for hex_frame in &frames {
+            let out = dec.decode(&hex::decode(hex_frame).unwrap());
+            assert!(
+                out.iter().any(|&s| s != 0.0),
+                "a valid packet must not be rejected as malformed"
+            );
+        }
+    }
+
+    /// A body whose decode consumes far more bits than it holds is malformed: the range decoder
+    /// returns zero past the end without flagging it, so the synthesis runs on invented symbols and
+    /// can diverge to full scale. Conceal it as a lost frame rather than emitting that.
+    #[test]
+    fn endpoint_check_rejects_an_overrunning_body() {
+        // A 120 ms TOC with a body far too short for six internal frames.
+        let mut dec = MlowDecoder::new();
+        let out = dec.decode(&[0x58, 0x03, 0x1a, 0xfb, 0x0a]);
+        assert_eq!(out.len(), 6 * SMPL_INTF_LEN, "still a full 120 ms slot");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "an over-running body must be concealed, not synthesized"
+        );
+    }
+
     /// Real 120 ms packets captured from a live WhatsApp Desktop peer must decode to speech, not to
     /// full-scale noise. Reported on #1105 after the multi-frame admission landed: frames are now
     /// accepted, but the decode diverges partway through the packet and saturates, which is audibly
@@ -551,12 +612,11 @@ mod tests {
     /// The assertions are deliberately coarse — this pins "the output is not garbage", which is what
     /// regressed, without pretending to a bit-exact target the fixture cannot supply.
     ///
-    /// IGNORED because it currently FAILS: the fix is not in yet. It is committed now so the repro
-    /// travels with the investigation rather than living in someone's scratch directory. Run it with
-    /// `cargo test -p wacore --features voip-mlow --lib live_desktop -- --ignored`, and delete this
-    /// attribute in the commit that makes it pass.
+    /// Under the entropy grammar this decoder implements, all 40 of these bodies end far from where
+    /// they claim to, so they are currently concealed rather than decoded — the same verdict the C
+    /// reference reaches on them. What this pins is that the output is never garbage; if a future
+    /// change lets them decode to real speech, that is progress and this test still passes.
     #[test]
-    #[ignore = "reproduces the open 120 ms decode divergence; no fix yet"]
     fn live_desktop_packets_decode_without_saturating() {
         let frames: Vec<String> =
             serde_json::from_str(include_str!("testdata/live_120ms_frames.json"))
