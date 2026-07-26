@@ -1110,11 +1110,12 @@ impl Client {
                 let result = async {
                     self.ensure_e2e_sessions(std::slice::from_ref(&peer))
                         .await?;
+                    let request_id = self.generate_message_id();
                     self.send_message_impl(
                         peer,
                         msg,
                         crate::send::SendPipelineOptions {
-                            request_id: Some(self.generate_message_id()),
+                            request_id: Some(&request_id),
                             peer: true,
                             ..Default::default()
                         },

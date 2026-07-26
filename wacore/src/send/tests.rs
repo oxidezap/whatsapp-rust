@@ -2086,7 +2086,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "peer-test-1".into(),
+            "peer-test-1",
             account,
             options,
         )
@@ -2191,7 +2191,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "peer-test-no-account".into(),
+            "peer-test-no-account",
             None,
         )
         .await;
@@ -2242,7 +2242,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "peer-preflight-1".into(),
+            "peer-preflight-1",
             None,
         )
         .await;
@@ -2409,7 +2409,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "preflight-take-bail".into(),
+            "preflight-take-bail",
             None,
         )
         .await;
@@ -2428,7 +2428,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "preflight-take-pass".into(),
+            "preflight-take-pass",
             Some(&account),
         )
         .await;

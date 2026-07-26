@@ -197,7 +197,7 @@ impl Client {
             &edit_container_message,
             crate::send::SendPipelineOptions {
                 edit: Some(crate::types::message::EditAttribute::MessageEdit),
-                request_id,
+                request_id: request_id.as_deref(),
                 borrowed_message_id,
                 ..Default::default()
             },

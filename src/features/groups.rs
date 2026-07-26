@@ -1400,7 +1400,7 @@ impl<'a> Groups<'a> {
                 group_jid.clone(),
                 &msg,
                 crate::send::SendPipelineOptions {
-                    request_id: Some(message_id.clone()),
+                    request_id: Some(&message_id),
                     extra_stanza_nodes: meta.into_iter().collect(),
                     ..Default::default()
                 },

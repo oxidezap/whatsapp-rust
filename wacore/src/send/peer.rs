@@ -9,7 +9,7 @@ pub async fn prepare_peer_stanza<S, I>(
     transport_jid: Jid,
     signal_address: &ProtocolAddress,
     message: &wa::Message,
-    request_id: String,
+    request_id: &str,
     account: Option<&wa::ADVSignedDeviceIdentity>,
 ) -> Result<Node>
 where
@@ -38,7 +38,7 @@ pub async fn prepare_peer_stanza_with_options<S, I>(
     transport_jid: Jid,
     signal_address: &ProtocolAddress,
     message: &wa::Message,
-    request_id: String,
+    request_id: &str,
     account: Option<&wa::ADVSignedDeviceIdentity>,
     options: PeerMessageOptions,
 ) -> Result<Node>

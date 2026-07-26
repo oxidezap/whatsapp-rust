@@ -354,7 +354,7 @@ impl Client {
             requester.clone(),
             message,
             crate::send::SendPipelineOptions {
-                request_id: Some(message_id.to_owned()),
+                request_id: Some(message_id),
                 peer: true,
                 ..Default::default()
             },

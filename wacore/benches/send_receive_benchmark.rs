@@ -784,7 +784,7 @@ fn bench_dm_send(bencher: divan::Bencher) {
             d.bob_jid.clone(),
             &signal_addr,
             &d.msg,
-            "b-001".into(),
+            "b-001",
             None,
         ))
         .unwrap();
