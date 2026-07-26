@@ -127,9 +127,9 @@ impl Client {
         let _ = tx.try_send((Arc::clone(info), guard));
     }
 
-    /// How many queued receipts one burst may take; mirrors the ack worker and
-    /// the noise sender's own per-batch frame ceiling.
-    const MAX_RECEIPT_BURST: usize = 16;
+    /// How many queued receipts one burst may take; mirrors the ack worker's
+    /// [`MAX_ACK_BURST`](Client::MAX_ACK_BURST), where the tradeoff is measured.
+    const MAX_RECEIPT_BURST: usize = 4;
 
     /// Worker task shared by every live delivery receipt. Holds only a `Weak`
     /// so a dropped `Client` closes the channel and ends the task instead of

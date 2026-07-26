@@ -651,10 +651,16 @@ impl Client {
         let _ = tx.try_send((node, guard));
     }
 
-    /// How many queued acks one burst may take. Matches the noise sender's own
-    /// per-batch frame ceiling: sending more in one go cannot coalesce further,
-    /// it would only hold flush guards for longer.
-    const MAX_ACK_BURST: usize = 16;
+    /// How many queued acks one burst may take.
+    ///
+    /// Measured, not guessed: the send-job channel holds 8, so a larger burst
+    /// fills it and makes unrelated producers (a reply, a receipt) wait for a
+    /// slot. At 16 the harness showed 29% fewer writes but 3.7% worse pong
+    /// latency (paired t = 2.8); at 4 the write saving is ~16% and latency is
+    /// no worse than main. Raising the channel instead recovers the latency but
+    /// gives back most of the coalescing, because a sender that never waits
+    /// consumes jobs one at a time.
+    const MAX_ACK_BURST: usize = 4;
 
     /// Worker shared by every deferred ack. Holds a `Weak`, so a dropped
     /// `Client` closes the channel and ends the task instead of keeping the
