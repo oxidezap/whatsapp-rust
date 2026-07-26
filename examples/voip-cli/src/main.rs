@@ -1060,23 +1060,7 @@ impl EventHandler for CallObserver {
                         {
                             Ok(handle) => register_handle(&state, cid.clone(), handle).await,
                             Err(e) => {
-                                let peer_ended = peer_terminated_during_startup(&state, &cid);
                                 complete_call_startup(&state, &cid);
-                                if !peer_ended
-                                    && let CallAction::Offer {
-                                        call_id,
-                                        call_creator,
-                                        ..
-                                    } = &call.action
-                                    && let Err(terminate_error) = client
-                                        .voip()
-                                        .terminate(call_id, &call.from, call_creator)
-                                        .await
-                                {
-                                    warn!(
-                                        "failed to terminate incomplete inbound call: {terminate_error}"
-                                    );
-                                }
                                 warn!("inbound media failed: {e}");
                             }
                         }

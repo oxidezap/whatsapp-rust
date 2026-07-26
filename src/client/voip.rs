@@ -129,8 +129,8 @@ impl Voip<'_> {
     }
 
     /// Begin answering an incoming call: returns a builder; call `.audio(source, sink)` then
-    /// `.start().await` to decrypt the callKey, send `<preaccept>` followed by `<accept>`, connect the
-    /// relay, and drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Requires
+    /// `.start().await` to send `<preaccept>`, decrypt the callKey, send `<accept>`, connect the relay,
+    /// and drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Requires
     /// `voip-runtime` or a profile that enables it: `voip`, `voip-encoded`, `voip-mlow`, or
     /// `voip-libopus`.
     #[cfg(feature = "voip-runtime")]
