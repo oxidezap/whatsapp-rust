@@ -30,6 +30,11 @@ pub enum EncryptSendErrorKind {
     Join,
     #[error("sender channel closed")]
     ChannelClosed,
+    /// A previous frame failed at the transport, so this connection's write
+    /// keystream can no longer be extended safely. See
+    /// [`EncryptSendError::poisoned`].
+    #[error("sender poisoned by an earlier transport failure")]
+    Poisoned,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,11 +82,31 @@ impl EncryptSendError {
         }
     }
 
-    /// The transport is gone (broken pipe, closed connection, channel dropped).
+    /// A transport write failed earlier on this connection, so the peer's view
+    /// of the frame stream is unknown: it may have consumed the frame, seen a
+    /// truncated prefix, or nothing at all. Encrypting anything else under the
+    /// same write key would have to guess a counter, and guessing wrong reuses
+    /// an AES-GCM nonce (two ciphertexts under one key/nonce leak both
+    /// plaintexts). The only safe recovery is a new connection with fresh
+    /// handshake keys, so the sender refuses every later frame instead.
+    pub fn poisoned() -> Self {
+        Self {
+            kind: EncryptSendErrorKind::Poisoned,
+            source: anyhow::anyhow!(
+                "noise sender disabled after a transport failure; reconnect to rekey"
+            ),
+        }
+    }
+
+    /// The transport is gone (broken pipe, closed connection, channel dropped)
+    /// or was declared unusable by [`Self::poisoned`]. Callers treat all three
+    /// the same way: stop retrying on this connection and reconnect.
     pub fn is_transport_unavailable(&self) -> bool {
         matches!(
             self.kind,
-            EncryptSendErrorKind::Transport | EncryptSendErrorKind::ChannelClosed
+            EncryptSendErrorKind::Transport
+                | EncryptSendErrorKind::ChannelClosed
+                | EncryptSendErrorKind::Poisoned
         )
     }
 }

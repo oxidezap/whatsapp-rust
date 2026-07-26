@@ -1,4 +1,4 @@
-use crate::socket::error::{EncryptSendError, Result, SocketError};
+use crate::socket::error::{EncryptSendError, EncryptSendErrorKind, Result, SocketError};
 use crate::transport::Transport;
 use async_channel;
 use bytes::BytesMut;
@@ -95,19 +95,40 @@ impl NoiseSocket {
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
         let mut out_buf = BytesMut::with_capacity(4096);
+        // A failed transport write says nothing about how much of the frame the
+        // peer received, so the counter that frame consumed can neither be
+        // reused (nonce reuse under the same write key) nor confidently skipped
+        // (the peer's read counter would desync). Both outcomes are unrecoverable
+        // in-band, so the whole sender goes out of service and the connection
+        // must be re-established with a fresh handshake key.
+        let mut poisoned = false;
 
         while let Ok(job) = send_job_rx.recv().await {
-            let result = Self::process_send_job(
-                &runtime,
-                &transport,
-                &write_key,
-                &mut write_counter,
-                job.plaintext,
-                &mut enc_buf,
-                &mut out_buf,
-                stats.as_deref(),
-            )
-            .await;
+            let result = if poisoned {
+                Err(EncryptSendError::poisoned())
+            } else {
+                let outcome = Self::process_send_job(
+                    &runtime,
+                    &transport,
+                    &write_key,
+                    &mut write_counter,
+                    job.plaintext,
+                    &mut enc_buf,
+                    &mut out_buf,
+                    stats.as_deref(),
+                )
+                .await;
+                // Crypto and framing failures are rejected before any byte
+                // reaches the wire and leave the counter untouched, so they do
+                // not compromise the keystream. Only a transport failure is
+                // ambiguous.
+                if let Err(err) = &outcome
+                    && matches!(err.kind, EncryptSendErrorKind::Transport)
+                {
+                    poisoned = true;
+                }
+                outcome
+            };
 
             let _ = job.response_tx.send(result);
         }
@@ -170,14 +191,18 @@ impl NoiseSocket {
         // allocated capacity for the next frame.
         let frame = out_buf.split().freeze();
         let wire_bytes = frame.len();
+        // Burn the counter at the moment the nonce leaves this function, not
+        // when the write is confirmed: a `transport.send` that returns Err may
+        // still have put those bytes on the wire, and a second frame derived
+        // from the same counter would reuse the AES-GCM nonce. The counter is
+        // known to be below u32::MAX from the guard above, so `+ 1` is exact.
+        *write_counter = counter + 1;
         if let Err(e) = transport.send(frame).await {
             return Err(EncryptSendError::transport(e));
         }
         if let Some(stats) = stats {
             stats.record_frame_sent(wire_bytes);
         }
-
-        *write_counter = write_counter.wrapping_add(1);
 
         Ok(())
     }
@@ -226,6 +251,7 @@ impl NoiseSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wacore::framing::FRAME_LENGTH_SIZE;
 
     #[tokio::test]
     async fn test_encrypt_and_send_succeeds() {
@@ -335,6 +361,186 @@ mod tests {
             got[1], large,
             "large (>16KB) frame must round-trip via the moved-Bytes path"
         );
+    }
+
+    /// A transport that accepts (and records) the frame and *then* reports
+    /// failure: the ambiguous case where the peer may well have consumed the
+    /// frame, so its read counter has already advanced.
+    struct AcceptThenFailTransport {
+        sent: std::sync::Mutex<Vec<bytes::Bytes>>,
+        fail_from: usize,
+    }
+
+    impl AcceptThenFailTransport {
+        fn new(fail_from: usize) -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                fail_from,
+            }
+        }
+
+        fn sent(&self) -> Vec<bytes::Bytes> {
+            self.sent.lock().expect("send mutex").clone()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl Transport for AcceptThenFailTransport {
+        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            let mut sent = self.sent.lock().expect("send mutex");
+            sent.push(data);
+            if sent.len() > self.fail_from {
+                return Err(anyhow::anyhow!(
+                    "injected failure after accepting the frame"
+                ));
+            }
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    fn test_socket(transport: Arc<dyn Transport>) -> NoiseSocket {
+        let key = [0x11u8; 32];
+        NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport,
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        )
+    }
+
+    /// Transport failure *before* anything is written: every later send on the
+    /// same connection must be refused, so no second frame can be encrypted
+    /// under the counter the failed frame consumed.
+    #[tokio::test]
+    async fn send_error_before_write_poisons_the_sender() {
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        transport.fail_next_sends(1);
+        let socket = test_socket(transport.clone());
+
+        let first = socket
+            .encrypt_and_send(bytes::Bytes::from_static(b"first"))
+            .await
+            .expect_err("injected transport failure");
+        assert!(matches!(first.kind, EncryptSendErrorKind::Transport));
+
+        for attempt in 0..3 {
+            let err = socket
+                .encrypt_and_send(bytes::Bytes::from_static(b"later"))
+                .await
+                .expect_err("sends after a transport failure must be refused");
+            assert!(
+                matches!(err.kind, EncryptSendErrorKind::Poisoned),
+                "attempt {attempt} should be rejected as poisoned, got {err:?}"
+            );
+            assert!(err.is_transport_unavailable(), "must force a reconnect");
+        }
+
+        assert_eq!(
+            transport.sent_count(),
+            0,
+            "no frame may reach the wire after the sender is poisoned"
+        );
+        assert_eq!(transport.failed_sends(), 1, "only the first send was tried");
+    }
+
+    /// Transport failure *after* the frame was accepted (the ambiguous case:
+    /// the peer may have decrypted it and advanced its read counter). The
+    /// sender must still refuse everything that follows.
+    #[tokio::test]
+    async fn ambiguous_send_error_poisons_the_sender() {
+        let transport = Arc::new(AcceptThenFailTransport::new(0));
+        let socket = test_socket(transport.clone());
+
+        let first = socket
+            .encrypt_and_send(bytes::Bytes::from_static(b"first"))
+            .await
+            .expect_err("transport reported failure after accepting the frame");
+        assert!(matches!(first.kind, EncryptSendErrorKind::Transport));
+
+        let second = socket
+            .encrypt_and_send(bytes::Bytes::from_static(b"second"))
+            .await
+            .expect_err("sends after an ambiguous failure must be refused");
+        assert!(matches!(second.kind, EncryptSendErrorKind::Poisoned));
+
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "exactly the one ambiguous frame reached the transport"
+        );
+    }
+
+    /// Drives the per-frame primitive directly against an always-failing
+    /// transport: even without the sender-task poison flag, a counter value is
+    /// never handed to the cipher twice. Proven by decrypting the two captured
+    /// frames with counters 0 and 1 - reuse would make the second decrypt fail.
+    #[tokio::test]
+    async fn write_counter_is_never_reused_after_a_send_error() {
+        let key = [0x33u8; 32];
+        let transport: Arc<AcceptThenFailTransport> = Arc::new(AcceptThenFailTransport::new(0));
+        let transport_dyn: Arc<dyn Transport> = transport.clone();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
+
+        let mut write_counter: u32 = 0;
+        let mut enc_buf = Vec::new();
+        let mut out_buf = BytesMut::new();
+
+        for expected_counter in 0..2u32 {
+            assert_eq!(write_counter, expected_counter);
+            let err = NoiseSocket::process_send_job(
+                &runtime,
+                &transport_dyn,
+                &write_key,
+                &mut write_counter,
+                bytes::Bytes::from(vec![expected_counter as u8; 32]),
+                &mut enc_buf,
+                &mut out_buf,
+                None,
+            )
+            .await
+            .expect_err("transport always fails");
+            assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+            assert_eq!(
+                write_counter,
+                expected_counter + 1,
+                "a failed send must still consume its counter"
+            );
+        }
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        for (counter, frame) in transport.sent().into_iter().enumerate() {
+            let mut body = frame[FRAME_LENGTH_SIZE..].to_vec();
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("each frame must decrypt under its own distinct counter");
+            assert_eq!(body, vec![counter as u8; 32]);
+        }
+    }
+
+    /// A framing failure is detected before any byte reaches the wire, so it
+    /// must not disable the connection the way a transport failure does.
+    #[tokio::test]
+    async fn framing_error_does_not_poison_the_sender() {
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        let socket = test_socket(transport.clone());
+
+        // Ciphertext = payload + 16-byte tag, so this is the smallest payload
+        // whose frame no longer fits the 24-bit length prefix.
+        let oversize = bytes::Bytes::from(vec![0u8; wacore::framing::FRAME_MAX_SIZE - 16]);
+        let err = socket
+            .encrypt_and_send(oversize)
+            .await
+            .expect_err("frame exceeds the 24-bit length prefix");
+        assert!(matches!(err.kind, EncryptSendErrorKind::Framing));
+
+        socket
+            .encrypt_and_send(bytes::Bytes::from_static(b"still usable"))
+            .await
+            .expect("a rejected oversize frame must leave the connection usable");
+        assert_eq!(transport.sent_count(), 1);
     }
 
     #[tokio::test]
