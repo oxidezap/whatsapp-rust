@@ -19,6 +19,14 @@ const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024;
 /// Result type for send operations.
 type SendResult = std::result::Result<(), EncryptSendError>;
 
+/// Wire size a plaintext will occupy once encrypted and framed: the AES-GCM tag
+/// plus the length prefix. Used to test a queued frame against the batch ceiling
+/// before paying to encrypt it.
+fn frame_wire_len(plaintext_len: usize) -> usize {
+    const TAG_LEN: usize = 16;
+    plaintext_len + TAG_LEN + wacore::framing::FRAME_LENGTH_SIZE
+}
+
 /// One batched write's failure, handed to every waiter in that batch.
 ///
 /// `anyhow::Error` is not `Clone`, so a shared reference is what lets all the
@@ -130,8 +138,20 @@ impl NoiseSocket {
         // Reused across batches: one allocation for the life of the connection
         // instead of one per batch.
         let mut waiters: Vec<(oneshot::Sender<SendResult>, usize)> = Vec::new();
+        // A job pulled off the channel that would have overflowed the byte
+        // ceiling, held over to open the next batch. Dropping it (on shutdown)
+        // drops its response channel, which the caller sees as a closed sender:
+        // a held-over job can be lost, but it can never hang its caller.
+        let mut carry_over: Option<SendJob> = None;
 
-        while let Ok(job) = send_job_rx.recv().await {
+        loop {
+            let job = match carry_over.take() {
+                Some(job) => job,
+                None => match send_job_rx.recv().await {
+                    Ok(job) => job,
+                    Err(_) => break,
+                },
+            };
             if poisoned {
                 let _ = job.response_tx.send(Err(EncryptSendError::poisoned()));
                 continue;
@@ -171,7 +191,18 @@ impl NoiseSocket {
                     break;
                 }
                 match send_job_rx.try_recv() {
-                    Ok(next) => job = next,
+                    Ok(next) => {
+                        // Check the ceiling before appending, not after, or a
+                        // nearly-full batch overshoots it by a whole frame. A
+                        // frame that cannot fit any batch still goes alone
+                        // rather than deadlocking against the ceiling.
+                        let projected = out_buf.len() + frame_wire_len(next.plaintext.len());
+                        if projected > MAX_BATCH_WIRE_BYTES {
+                            carry_over = Some(next);
+                            break;
+                        }
+                        job = next;
+                    }
                     Err(_) => break,
                 }
             }
@@ -632,6 +663,68 @@ mod tests {
         }
     }
 
+    /// The byte ceiling must hold across a burst. Checking it after appending
+    /// would let a nearly-full batch overshoot by a whole frame, which for a
+    /// large stanza is the difference between a bounded buffer and an unbounded
+    /// one.
+    #[tokio::test]
+    async fn a_batch_never_overshoots_the_byte_ceiling() {
+        let key = [0x66u8; 32];
+        let transport = GatedTransport::closed();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = Arc::new(NoiseSocket::new(
+            runtime,
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        // Sized so three fit under the ceiling and the fourth cannot: the batch
+        // has to stop and hold it over rather than append it.
+        const FRAME_BYTES: usize = 20 * 1024;
+        const FRAMES: usize = 5;
+        let mut handles = Vec::new();
+        for i in 0..FRAMES {
+            let socket = socket.clone();
+            handles.push(tokio::spawn(async move {
+                socket
+                    .encrypt_and_send(bytes::Bytes::from(vec![i as u8; FRAME_BYTES]))
+                    .await
+            }));
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        transport.gate.add_permits(FRAMES);
+        for handle in handles {
+            handle.await.expect("task").expect("send must succeed");
+        }
+
+        let writes = transport.writes();
+        for write in &writes {
+            let frames = split_frames(write);
+            assert!(
+                frames.len() == 1 || write.len() <= MAX_BATCH_WIRE_BYTES,
+                "a multi-frame write must respect the ceiling: {} bytes in {} frames",
+                write.len(),
+                frames.len()
+            );
+        }
+        assert!(
+            writes.iter().any(|w| split_frames(w).len() > 1),
+            "the burst must still coalesce, otherwise this proves nothing"
+        );
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = writes.iter().flat_map(|w| split_frames(w)).collect();
+        assert_eq!(bodies.len(), FRAMES, "a held-over frame must still be sent");
+        for (counter, mut body) in bodies.into_iter().enumerate() {
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("holding a frame over must not disturb counter order");
+        }
+    }
+
     /// The transport's own error must survive the hop to every caller. It cannot
     /// be cloned, and `EncryptSendError`'s Display renders only the kind, so a
     /// naive rebuild silently degrades "connection reset by peer" into
@@ -662,6 +755,38 @@ mod tests {
         );
     }
 
+    /// A transport whose writes block until permits are handed out, so a test
+    /// can pile jobs into the sender's channel and then release them: the state
+    /// batching exists for.
+    struct GatedTransport {
+        writes: std::sync::Mutex<Vec<bytes::Bytes>>,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GatedTransport {
+        fn closed() -> Arc<Self> {
+            Arc::new(Self {
+                writes: std::sync::Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn writes(&self) -> Vec<bytes::Bytes> {
+            self.writes.lock().expect("writes mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for GatedTransport {
+        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            let permit = self.gate.acquire().await.expect("gate open");
+            permit.forget();
+            self.writes.lock().expect("writes mutex").push(data);
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
     /// Splits a concatenated run of length-prefixed frames into their bodies.
     fn split_frames(mut wire: &[u8]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
@@ -683,31 +808,8 @@ mod tests {
     /// desync the peer's read counter.
     #[tokio::test]
     async fn queued_frames_leave_in_one_write_in_counter_order() {
-        use std::sync::Mutex;
-
-        struct GatedTransport {
-            writes: Mutex<Vec<bytes::Bytes>>,
-            gate: tokio::sync::Semaphore,
-        }
-
-        #[async_trait::async_trait]
-        impl Transport for GatedTransport {
-            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
-                // Hold the first write open so the remaining sends pile up in
-                // the job channel, which is the state batching exists for.
-                let permit = self.gate.acquire().await.expect("gate open");
-                permit.forget();
-                self.writes.lock().unwrap().push(data);
-                Ok(())
-            }
-            async fn disconnect(&self) {}
-        }
-
         let key = [0x44u8; 32];
-        let transport = Arc::new(GatedTransport {
-            writes: Mutex::new(Vec::new()),
-            gate: tokio::sync::Semaphore::new(0),
-        });
+        let transport = GatedTransport::closed();
         let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
         let socket = Arc::new(NoiseSocket::new(
             runtime,
@@ -738,7 +840,7 @@ mod tests {
             handle.await.expect("task").expect("send must succeed");
         }
 
-        let writes = transport.writes.lock().unwrap().clone();
+        let writes = transport.writes();
         assert!(
             writes.len() < FRAMES,
             "queued frames must coalesce, got {} writes for {FRAMES} frames",
