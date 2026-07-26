@@ -1217,9 +1217,7 @@ impl CallEngine {
         #[cfg(feature = "voip-mlow")]
         {
             let decoded = pcm.decoder.decode(&encoded);
-            // The DECLARED duration, not the decoded length: a SID emits a fixed silence slot, so
-            // reading it off the output would shrink the cushion at a DTX transition and discard
-            // buffered speech that has not been played yet.
+            // Declared, not decoded; see `MlowDecoder::last_packet_samps`.
             pcm.packet_samps = pcm.decoder.last_packet_samps();
             for s in decoded {
                 pcm.jitter

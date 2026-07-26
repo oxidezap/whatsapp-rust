@@ -23,6 +23,10 @@
 #
 #   MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh
 #
+# The script refuses to run against a reference worktree with uncommitted changes, or against a
+# library older than the checkout, because neither can be attributed to a recorded revision. Set
+# MLOW_ALLOW_DIRTY_REFERENCE=1 when generating from a modified oracle is the actual intent.
+#
 # Regenerating changes committed fixtures. Re-run the decoder suite afterwards and treat any
 # correlation change as a finding, not as a number to paper over:
 #
@@ -68,6 +72,20 @@ else
     echo "         differences below may come from the reference, not from this repository" >&2
   fi
 fi
+# A clean worktree at the right commit still proves nothing about the ARCHIVE: switching revisions
+# without rebuilding leaves a stale .a that links fine and attributes its output to a commit it was
+# never built from. Compare against the last thing that changed the checkout.
+lib="$ref/.libs/libopus.a"
+if [[ -e "$ref/.git" ]]; then
+  head_file="$ref/.git/HEAD"
+  [[ -f "$ref/.git" ]] && head_file="$(git -C "$ref" rev-parse --git-dir)/HEAD"
+  if [[ -f "$head_file" && "$head_file" -nt "$lib" ]]; then
+    echo "error: $lib predates the current checkout, so it was not built from $actual_rev." >&2
+    echo "       Rebuild it (make -j\"\$(nproc)\" in \$MLOW_REFERENCE) and re-run." >&2
+    exit 1
+  fi
+fi
+
 echo "==> oracle: $ref @ $actual_rev"
 
 work="$(mktemp -d)"
