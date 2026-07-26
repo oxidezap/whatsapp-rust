@@ -156,35 +156,53 @@ impl<'a> AcceptCall<'a> {
                 audio_config.format.signaling_rate,
             ));
         }
+        let CallAction::Offer {
+            call_id,
+            call_creator,
+            is_video: offered_video,
+            ..
+        } = &self.incoming.action
+        else {
+            return Err(CallError::NotAnOffer);
+        };
+        if call_id.is_empty() {
+            return Err(CallError::EmptyCallId);
+        }
         let video = self.video.take();
         if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
             return Err(CallError::Media(
                 "video RTP timestamp stride must be non-zero",
             ));
         }
+        if video.is_some() && !offered_video {
+            return Err(CallError::VideoNotOffered);
+        }
+        if self.incoming.media.is_none() {
+            return Err(CallError::NotAnOffer);
+        }
         let answer_with_video = video.is_some();
-        // Answering consumes the ringing flag now, BEFORE the media-setup awaits (callKey decrypt /
-        // relay connect): a peer <terminate> racing this window must not record a missed call for a
-        // call we are answering. A failed start() leaves it cleared -- an attempted answer reads as
-        // ended, not an ignored missed ring.
-        self.client
-            .call_registry()
-            .take_ringing(self.incoming.action.call_id());
-        let (engine, call_id, addr) = self.build_engine(answer_with_video, audio_config).await?;
+        let mut session = wacore::voip::CallSession::new_incoming(
+            call_id,
+            self.incoming.from.clone(),
+            call_creator.clone(),
+        );
+        session.audio_format = Some(audio_config.format);
+        session.is_video = answer_with_video;
+        // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
+        // setup, instead of falling through terminate_call as an unknown call and letting us accept
+        // a call that has already ended.
+        let mut registration = RegisteredCall::new(self.client, session);
+        let (engine, built_call_id, addr) =
+            self.build_engine(answer_with_video, audio_config).await?;
+        debug_assert_eq!(built_call_id, registration.call_id);
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
-        // meanwhile, cleanup_connection_state already ran with no registry entry to abort, so bail
-        // rather than register + connect a relay that would outlive the connection.
+        // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
+        // connection-specific error before checking the generation.
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
+        registration.ensure_current()?;
         let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
-        let mut session = wacore::voip::CallSession::new_incoming(
-            &call_id,
-            self.incoming.from.clone(),
-            self.incoming.action.call_creator().clone(),
-        );
-        session.audio_format = Some(audio_config.format);
-        session.is_video = video.is_some();
         // Signal the selected device before starting its stream. The order is load-bearing for a
         // sole online companion: preaccept resolves the answering device before the caller applies
         // the final accept and participant keys.
@@ -193,12 +211,12 @@ impl<'a> AcceptCall<'a> {
             self.incoming,
             audio_config.format,
             answer_with_video,
+            &registration,
         )
         .await?;
-        spawn_call(
+        spawn_answered_call(
             self.client,
-            call_id,
-            session,
+            &mut registration,
             engine,
             &factory,
             audio,
@@ -610,13 +628,19 @@ async fn send_answer_signaling(
     incoming: &IncomingCall,
     audio: AudioFormat,
     video: bool,
+    registration: &RegisteredCall,
 ) -> Result<(), CallError> {
     let preaccept_id = client.generate_request_id();
     let accept_id = client.generate_request_id();
     let (preaccept, accept) =
         build_answer_signaling(incoming, audio, video, &preaccept_id, &accept_id)?;
+    registration.ensure_current()?;
     client.send_node(preaccept).await?;
+    // Sending may yield long enough for the caller's <terminate> to remove our pending generation.
+    // Never follow a now-stale preaccept with a final accept.
+    registration.ensure_current()?;
     client.send_node(accept).await?;
+    registration.ensure_current()?;
     Ok(())
 }
 
@@ -1151,71 +1175,173 @@ pub(crate) async fn attach_outgoing_relay(
     Ok(true)
 }
 
-/// Spawn the call driver over `factory` and register it. Generic over the relay factory so a test
-/// can inject an in-memory transport instead of the real DTLS/SCTP dialer. The session is supplied so
-/// both incoming (`new_incoming`) and outgoing (`new_outgoing`) callers register the right direction.
+/// A call generation registered before any answer-side await. Until disarmed, dropping this guard
+/// removes only its own generation, so setup/signaling errors cannot leak a task-less registry entry
+/// or reap a same-call-id replacement.
+struct RegisteredCall {
+    registry: Arc<wacore::voip::CallRegistry>,
+    call_id: String,
+    peer_jid: Jid,
+    call_creator: Jid,
+    generation: u64,
+    ended: Arc<EndedFlag>,
+    armed: bool,
+}
+
+impl RegisteredCall {
+    fn new(client: &Client, session: wacore::voip::CallSession) -> Self {
+        let registry = client.call_registry();
+        let call_id = session.call_id.clone();
+        let peer_jid = session.peer_jid.clone();
+        let call_creator = session.call_creator.clone();
+        let generation = registry.insert(session);
+        let ended = Arc::new(EndedFlag::default());
+        // Wake setup/connect and any eventual CallHandle whenever this generation is removed,
+        // including before a media task exists.
+        registry.set_ended_notify(&call_id, generation, {
+            let ended = ended.clone();
+            move || ended.notify()
+        });
+        Self {
+            registry,
+            call_id,
+            peer_jid,
+            call_creator,
+            generation,
+            ended,
+            armed: true,
+        }
+    }
+
+    fn ensure_current(&self) -> Result<(), CallError> {
+        if self.registry.generation_of(&self.call_id) == Some(self.generation) {
+            Ok(())
+        } else {
+            Err(CallError::CallEndedDuringSetup)
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RegisteredCall {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .remove_if_current(&self.call_id, self.generation);
+        }
+    }
+}
+
+/// Spawn the call driver over `factory` after registering it. Generic over the relay factory so a
+/// test can inject an in-memory transport instead of the real DTLS/SCTP dialer.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn spawn_call(
     client: &Client,
-    call_id: String,
     session: wacore::voip::CallSession,
     engine: CallEngine,
     factory: &dyn RelayTransportFactory,
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
-    // Register BEFORE connecting so the entry exists before the driver task can self-clean.
-    let registry = client.call_registry();
-    let peer_jid = session.peer_jid.clone();
-    let call_creator = session.call_creator.clone();
-    let generation = registry.insert(session);
+    let mut registration = RegisteredCall::new(client, session);
+    let result = spawn_registered_call(client, &registration, engine, factory, audio, video).await;
+    if result.is_ok() {
+        registration.disarm();
+    }
+    result
+}
 
+/// Attach media to a generation that is already registered. Answering uses this after registering
+/// before call-key decryption; the generic spawn wrapper above uses the same path for tests.
+async fn spawn_registered_call(
+    client: &Client,
+    registration: &RegisteredCall,
+    engine: CallEngine,
+    factory: &dyn RelayTransportFactory,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+) -> Result<CallHandle, CallError> {
+    registration.ensure_current()?;
+    let registry = &registration.registry;
     let muted = Arc::new(AtomicBool::new(false));
-    let ended = Arc::new(EndedFlag::default());
-    // Wake wait_ended() whenever this registry entry is removed -- including a terminal stanza or a
-    // disconnect that lands while attach_engine is still dialing (no media task yet).
-    registry.set_ended_notify(&call_id, generation, {
-        let ended = ended.clone();
-        move || ended.notify()
-    });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
     let video_shared = Arc::new(VideoShared::new());
     registry.set_video_channels(
-        &call_id,
-        generation,
+        &registration.call_id,
+        registration.generation,
         ev_tx.clone(),
         video_shared.ctl_tx.clone(),
         video_teardown_hook(&video_shared),
     );
     attach_engine(
         client,
-        &call_id,
-        generation,
+        &registration.call_id,
+        registration.generation,
         engine,
         factory,
         audio,
         video,
         video_shared.clone(),
         muted.clone(),
-        ended.clone(),
+        registration.ended.clone(),
         ev_tx,
         // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
         None,
     )
     .await?;
     Ok(CallHandle {
-        call_id,
-        generation,
-        peer_jid,
-        call_creator,
+        call_id: registration.call_id.clone(),
+        generation: registration.generation,
+        peer_jid: registration.peer_jid.clone(),
+        call_creator: registration.call_creator.clone(),
         client_registry: client.call_registry(),
         pending_outgoing_calls: client.pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
         events: ev_rx,
-        ended,
+        ended: registration.ended.clone(),
     })
+}
+
+/// Finish an answer after the peer has received `<accept>`. A relay startup failure is local, so the
+/// facade must explicitly end the peer side instead of leaving it accepted until its timeout.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_answered_call(
+    client: &Client,
+    registration: &mut RegisteredCall,
+    engine: CallEngine,
+    factory: &dyn RelayTransportFactory,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+) -> Result<CallHandle, CallError> {
+    match spawn_registered_call(client, registration, engine, factory, audio, video).await {
+        Ok(handle) => {
+            registration.disarm();
+            Ok(handle)
+        }
+        Err(error) => {
+            if let Err(terminate_error) = client
+                .voip()
+                .terminate(
+                    &registration.call_id,
+                    &registration.peer_jid,
+                    &registration.call_creator,
+                )
+                .await
+            {
+                warn!(
+                    "voip: failed to terminate peer after answer startup failed call_id={}: {terminate_error}",
+                    registration.call_id
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Connect the relay and spawn the driver task against pre-built shared handle state (mute flag,
@@ -2149,6 +2275,66 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn audio_offer_rejects_from_start_video_endpoints() {
+        let client = make_client().await;
+        let incoming = incoming_offer(false);
+        let (_audio_tx, audio_rx) = async_channel::unbounded::<Bytes>();
+        let (audio_out, _audio_out_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+        let (_video_tx, video_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (video_out, _video_out_rx) = async_channel::unbounded::<VideoFrame>();
+
+        let result = client
+            .voip()
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::OPUS_16KHZ_60MS, audio_rx, audio_out)
+            .video(video_rx, video_out)
+            .start()
+            .await;
+
+        assert!(matches!(result, Err(CallError::VideoNotOffered)));
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "invalid video configuration must fail before registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_terminate_reaps_pending_answer_before_signaling() {
+        let (client, sent_count) = make_sending_client().await;
+        let incoming = incoming_offer(false);
+        client
+            .call_registry()
+            .mark_incoming_ringing(incoming.action.call_id());
+        let mut session = wacore::voip::CallSession::new_incoming(
+            incoming.action.call_id(),
+            incoming.from.clone(),
+            incoming.action.call_creator().clone(),
+        );
+        session.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
+        let registration = RegisteredCall::new(&client, session);
+
+        // This is the terminal-stanza path that can run while build_engine().await is suspended.
+        terminate_call(&client, incoming.action.call_id());
+        let result = send_answer_signaling(
+            &client,
+            &incoming,
+            AudioFormat::MLOW_16KHZ_60MS,
+            false,
+            &registration,
+        )
+        .await;
+
+        assert!(matches!(result, Err(CallError::CallEndedDuringSetup)));
+        assert_eq!(
+            sent_count.load(Ordering::SeqCst),
+            0,
+            "neither preaccept nor accept may be sent after the caller terminates"
+        );
+        assert_eq!(client.call_registry().active_count(), 0);
+    }
+
     #[test]
     fn answer_signaling_sends_preaccept_before_accept_with_selected_audio() {
         let (preaccept, accept) = build_answer_signaling(
@@ -2331,7 +2517,6 @@ mod tests {
 
         let handle = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &factory,
@@ -2398,7 +2583,6 @@ mod tests {
 
         let handle = spawn_call(
             &client,
-            "CID-FACADE".into(),
             session,
             engine(),
             &factory,
@@ -2451,7 +2635,6 @@ mod tests {
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let handle = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &factory,
@@ -2489,7 +2672,6 @@ mod tests {
         let (f1, mic1, spk1) = spawn(&client);
         let stale = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &f1,
@@ -2502,7 +2684,6 @@ mod tests {
         let (f2, mic2, spk2) = spawn(&client);
         let live = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &f2,
@@ -2549,7 +2730,6 @@ mod tests {
         let (f1, mic1, spk1) = spawn(&client);
         let stale = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &f1,
@@ -2561,7 +2741,6 @@ mod tests {
         let (f2, mic2, spk2) = spawn(&client);
         let _live = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &f2,
@@ -2595,7 +2774,6 @@ mod tests {
         let handle = Arc::new(
             spawn_call(
                 &client,
-                "CID-FACADE".into(),
                 mk_session(),
                 engine(),
                 &factory,
@@ -3292,7 +3470,6 @@ mod tests {
             async move {
                 spawn_call(
                     &client,
-                    "CID-FACADE".into(),
                     mk_session(),
                     engine(),
                     &factory,
@@ -3357,7 +3534,6 @@ mod tests {
 
         let res = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &factory,
@@ -3638,7 +3814,6 @@ mod tests {
         // CallHandle has no Debug, so match on the Result rather than expect_err.
         let res = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &FailingFactory,
@@ -3654,6 +3829,36 @@ mod tests {
             client.call_registry().active_count(),
             0,
             "a connect failure must not leak the registry entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn answered_call_connect_failure_terminates_the_peer() {
+        let (client, sent_count) = make_sending_client().await;
+        let mut registration = RegisteredCall::new(&client, mk_session());
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let result = spawn_answered_call(
+            &client,
+            &mut registration,
+            engine(),
+            &FailingFactory,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(CallError::Connect(_))));
+        assert_eq!(
+            sent_count.load(Ordering::SeqCst),
+            1,
+            "a post-accept relay failure must send one terminate stanza"
+        );
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "the failed answer must not leak its registered generation"
         );
     }
 
@@ -3994,7 +4199,6 @@ mod tests {
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let handle = spawn_call(
             &client,
-            "CID-FACADE".into(),
             mk_session(),
             engine(),
             &factory,

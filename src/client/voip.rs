@@ -52,6 +52,14 @@ pub enum CallError {
     #[cfg(feature = "voip-runtime")]
     #[error("incoming offer does not advertise the selected audio rate {0}")]
     AudioFormatNotOffered(u32),
+    /// Video endpoints were supplied for an offer that only advertised audio.
+    #[cfg(feature = "voip-runtime")]
+    #[error("incoming offer did not advertise video; use start_video() after answering")]
+    VideoNotOffered,
+    /// The peer ended or superseded the call while the answer was being prepared.
+    #[cfg(feature = "voip-runtime")]
+    #[error("call ended during answer setup")]
+    CallEndedDuringSetup,
     /// Decrypting the offer's encrypted callKey failed.
     #[cfg(feature = "voip-runtime")]
     #[error("callKey decrypt failed: {0}")]
