@@ -370,6 +370,7 @@ impl NoiseSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wacore::framing::FRAME_LENGTH_SIZE;
 
@@ -807,7 +808,7 @@ mod tests {
         joined
     }
 
-    type BoxSend = std::pin::Pin<Box<dyn std::future::Future<Output = SendResult> + Send>>;
+    type BoxSend = std::pin::Pin<Box<dyn Future<Output = SendResult> + Send>>;
 
     /// Splits a concatenated run of length-prefixed frames into their bodies.
     fn split_frames(mut wire: &[u8]) -> Vec<Vec<u8>> {
