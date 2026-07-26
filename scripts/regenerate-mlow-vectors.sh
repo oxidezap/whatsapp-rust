@@ -76,14 +76,16 @@ fi
 # without rebuilding leaves a stale .a that links fine and attributes its output to a commit it was
 # never built from. Compare against the last thing that changed the checkout.
 lib="$ref/.libs/libopus.a"
-if [[ -e "$ref/.git" ]]; then
-  head_file="$ref/.git/HEAD"
-  [[ -f "$ref/.git" ]] && head_file="$(git -C "$ref" rev-parse --git-dir)/HEAD"
-  if [[ -f "$head_file" && "$head_file" -nt "$lib" ]]; then
-    echo "error: $lib predates the current checkout, so it was not built from $actual_rev." >&2
-    echo "       Rebuild it (make -j\"\$(nproc)\" in \$MLOW_REFERENCE) and re-run." >&2
-    exit 1
-  fi
+# Compare against the SOURCES rather than any git metadata file: `git reset --hard` on the same
+# branch moves the branch ref while leaving .git/HEAD untouched, so a HEAD mtime check would accept
+# an archive built from a different revision. A source newer than the archive is the direct
+# statement that the archive does not correspond to the tree it would be attributed to.
+if newer="$(find "$ref/smpl" "$ref/src" "$ref/celt" \
+             \( -name '*.c' -o -name '*.h' \) -newer "$lib" -print -quit 2>/dev/null)" \
+   && [[ -n "$newer" ]]; then
+  echo "error: $lib is older than $newer, so it was not built from the current tree." >&2
+  echo "       Rebuild it (make -j\"\$(nproc)\" in \$MLOW_REFERENCE) and re-run." >&2
+  exit 1
 fi
 
 echo "==> oracle: $ref @ $actual_rev"
