@@ -683,21 +683,13 @@ mod tests {
         // has to stop and hold it over rather than append it.
         const FRAME_BYTES: usize = 20 * 1024;
         const FRAMES: usize = 5;
-        let mut handles = Vec::new();
-        for i in 0..FRAMES {
-            let socket = socket.clone();
-            handles.push(tokio::spawn(async move {
-                socket
-                    .encrypt_and_send(bytes::Bytes::from(vec![i as u8; FRAME_BYTES]))
-                    .await
-            }));
-        }
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
+        let mut sends = queue_all(
+            &socket,
+            (0..FRAMES).map(|i| bytes::Bytes::from(vec![i as u8; FRAME_BYTES])),
+        );
         transport.gate.add_permits(FRAMES);
-        for handle in handles {
-            handle.await.expect("task").expect("send must succeed");
+        for result in (&mut sends).await {
+            result.expect("send must succeed");
         }
 
         let writes = transport.writes();
@@ -788,6 +780,35 @@ mod tests {
         async fn disconnect(&self) {}
     }
 
+    /// Queues every payload on `socket` and returns the joined sends, still
+    /// pending.
+    ///
+    /// This is the batching tests' precondition: all N frames sitting in the
+    /// sender's channel at once. It holds by construction rather than by
+    /// waiting - `send` on a channel with room resolves on its first poll, so
+    /// polling the joined future once has queued every job - which is why these
+    /// tests do not spin on `yield_now` and hope the scheduler cooperated.
+    fn queue_all(
+        socket: &Arc<NoiseSocket>,
+        payloads: impl Iterator<Item = bytes::Bytes>,
+    ) -> futures::future::JoinAll<BoxSend> {
+        let sends: Vec<BoxSend> = payloads
+            .map(|payload| {
+                let socket = socket.clone();
+                Box::pin(async move { socket.encrypt_and_send(payload).await }) as BoxSend
+            })
+            .collect();
+        let mut joined = futures::future::join_all(sends);
+        let queued = futures::FutureExt::now_or_never(&mut joined);
+        assert!(
+            queued.is_none(),
+            "the sends must still be in flight: the transport gate is closed"
+        );
+        joined
+    }
+
+    type BoxSend = std::pin::Pin<Box<dyn std::future::Future<Output = SendResult> + Send>>;
+
     /// Splits a concatenated run of length-prefixed frames into their bodies.
     fn split_frames(mut wire: &[u8]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
@@ -820,25 +841,13 @@ mod tests {
         ));
 
         const FRAMES: usize = 5;
-        let mut handles = Vec::new();
-        for i in 0..FRAMES {
-            let socket = socket.clone();
-            handles.push(tokio::spawn(async move {
-                socket
-                    .encrypt_and_send(bytes::Bytes::from(vec![i as u8; 32]))
-                    .await
-            }));
-        }
-
-        // Let every sender reach the job channel before the first write is
-        // released; the channel holds 8, so none of them block.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
+        let mut sends = queue_all(
+            &socket,
+            (0..FRAMES).map(|i| bytes::Bytes::from(vec![i as u8; 32])),
+        );
         transport.gate.add_permits(FRAMES);
-
-        for handle in handles {
-            handle.await.expect("task").expect("send must succeed");
+        for result in (&mut sends).await {
+            result.expect("send must succeed");
         }
 
         let writes = transport.writes();
