@@ -127,6 +127,10 @@ impl Client {
         let _ = tx.try_send((Arc::clone(info), guard));
     }
 
+    /// How many queued receipts one burst may take; mirrors the ack worker and
+    /// the noise sender's own per-batch frame ceiling.
+    const MAX_RECEIPT_BURST: usize = 16;
+
     /// Worker task shared by every live delivery receipt. Holds only a `Weak`
     /// so a dropped `Client` closes the channel and ends the task instead of
     /// keeping the client alive.
@@ -138,12 +142,53 @@ impl Client {
         let client = Arc::downgrade(self);
         self.runtime
             .spawn(Box::pin(async move {
-                while let Ok((info, guard)) = rx.recv().await {
+                while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
                     };
-                    client.send_delivery_receipt(&info).await;
-                    drop(guard);
+
+                    // Same reasoning as the ack worker: awaiting each receipt
+                    // before reading the next means the noise sender never has
+                    // two frames to coalesce. `try_recv` only, so nothing waits
+                    // on work that has not arrived.
+                    let mut batch = vec![first];
+                    while batch.len() < Self::MAX_RECEIPT_BURST
+                        && let Ok(next) = rx.try_recv()
+                    {
+                        batch.push(next);
+                    }
+
+                    let mut frames = Vec::with_capacity(batch.len());
+                    let mut guards = Vec::with_capacity(batch.len());
+                    for (info, guard) in batch {
+                        // Building the node is synchronous, so the burst is
+                        // fully prepared before anything reaches the socket.
+                        if let Some(frame) = client.prepare_delivery_receipt(&info) {
+                            frames.push(frame);
+                            guards.push(guard);
+                        }
+                    }
+                    if frames.is_empty() {
+                        continue;
+                    }
+
+                    match client.send_raw_bytes_burst(frames).await {
+                        Ok(results) => {
+                            for result in results {
+                                if let Err(e) = result
+                                    && !e.is_transport_unavailable()
+                                {
+                                    log::warn!(target: "Client/Receipt", "Failed to send delivery receipt: {e:?}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !matches!(e, crate::client::ClientError::NotConnected) {
+                                log::warn!(target: "Client/Receipt", "Failed to send delivery receipt burst: {e:?}");
+                            }
+                        }
+                    }
+                    drop(guards);
                 }
             }))
             .detach();

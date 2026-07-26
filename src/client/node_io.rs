@@ -651,6 +651,11 @@ impl Client {
         let _ = tx.try_send((node, guard));
     }
 
+    /// How many queued acks one burst may take. Matches the noise sender's own
+    /// per-batch frame ceiling: sending more in one go cannot coalesce further,
+    /// it would only hold flush guards for longer.
+    const MAX_ACK_BURST: usize = 16;
+
     /// Worker shared by every deferred ack. Holds a `Weak`, so a dropped
     /// `Client` closes the channel and ends the task instead of keeping the
     /// client alive.
@@ -667,16 +672,63 @@ impl Client {
         let client = Arc::downgrade(self);
         self.runtime
             .spawn(Box::pin(async move {
-                while let Ok((node, guard)) = rx.recv().await {
+                while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
                     };
-                    if let Err(e) = client.send_ack_for(node.get()).await
-                        && !e.is_transport_unavailable()
+
+                    // Take everything already waiting, not just the one job that
+                    // woke us. Awaiting each ack before reading the next is what
+                    // kept the noise sender from ever seeing two frames at once,
+                    // so its batching only fired when some *other* producer
+                    // happened to interleave. `try_recv` only: this never waits
+                    // for work that has not arrived.
+                    let mut batch = vec![first];
+                    while batch.len() < Self::MAX_ACK_BURST
+                        && let Ok(next) = rx.try_recv()
                     {
-                        warn!("Failed to send ack: {e:?}");
+                        batch.push(next);
                     }
-                    drop(guard);
+
+                    // Encoding is synchronous, so the whole burst is marshalled
+                    // before anything is sent and arrival order survives.
+                    let mut frames = Vec::with_capacity(batch.len());
+                    let mut guards = Vec::with_capacity(batch.len());
+                    for (node, guard) in batch {
+                        match client.encode_ack_from_snapshot(
+                            node.get(),
+                            AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+                        ) {
+                            Ok(buf) => {
+                                frames.push(buf);
+                                guards.push(guard);
+                            }
+                            // Matches the single-ack path: log and drop this one
+                            // rather than failing the rest of the burst.
+                            Err(e) => warn!("Failed to encode ack: {e}"),
+                        }
+                    }
+                    if frames.is_empty() {
+                        continue;
+                    }
+
+                    match client.send_raw_bytes_burst(frames).await {
+                        Ok(results) => {
+                            for result in results {
+                                if let Err(e) = result
+                                    && !e.is_transport_unavailable()
+                                {
+                                    warn!("Failed to send ack: {e:?}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !matches!(e, ClientError::NotConnected) {
+                                warn!("Failed to send ack burst: {e:?}");
+                            }
+                        }
+                    }
+                    drop(guards);
                 }
             }))
             .detach();

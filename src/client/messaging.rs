@@ -21,8 +21,43 @@ impl Client {
         Ok(())
     }
 
+    /// Send several pre-marshaled stanzas as one burst, returning a result per
+    /// stanza in the order given.
+    ///
+    /// The noise sender coalesces whatever is queued when it wakes, but a
+    /// worker that awaits each send before starting the next never has two
+    /// frames queued at once, so the coalescing it was built for never fires.
+    /// Handing over the whole burst is what turns batching from incidental into
+    /// the normal case.
+    ///
+    /// Order is preserved, which the ack worker depends on. The socket is
+    /// resolved once up front, so the only await left inside each send is the
+    /// channel push, and a channel with room resolves that on its first poll:
+    /// polling the joined sends in order therefore queues them in order.
+    /// Resolving the socket per send instead would put a contended mutex
+    /// between the futures and let them queue in any order.
+    pub(crate) async fn send_raw_bytes_burst(
+        &self,
+        frames: Vec<Vec<u8>>,
+    ) -> Result<Vec<crate::socket::error::EncryptSendResult>, ClientError> {
+        let noise_socket = self.get_noise_socket().await?;
+        let sends = frames
+            .into_iter()
+            .map(|plaintext| noise_socket.encrypt_and_send(bytes::Bytes::from(plaintext)));
+        Ok(futures::future::join_all(sends).await)
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
     pub async fn send_node(&self, node: Node) -> Result<(), ClientError> {
+        let plaintext_buf = self.marshal_node_for_send(node)?;
+        self.send_raw_bytes(plaintext_buf).await
+    }
+
+    /// Everything [`send_node`](Client::send_node) does short of the send:
+    /// logging, waiter resolution and marshalling. Split out so a burst can
+    /// marshal its whole batch before touching the socket, which is what keeps
+    /// the sends orderable.
+    pub(crate) fn marshal_node_for_send(&self, node: Node) -> Result<Vec<u8>, ClientError> {
         debug!(target: "Client/Send", "{}", DisplayableNode(&node));
         if self.sent_node_waiter_count.load(Ordering::Acquire) > 0 {
             self.resolve_sent_node_waiters(&Arc::new(node.clone()));
@@ -30,12 +65,10 @@ impl Client {
 
         // Exact two-pass sizing: typical stanzas are a few hundred bytes, so
         // the 1 KiB default reserve of the one-pass path mostly over-allocates.
-        let plaintext_buf = wacore_binary::marshal::marshal_exact(&node).map_err(|e| {
+        wacore_binary::marshal::marshal_exact(&node).map_err(|e| {
             error!("Failed to marshal node: {e:?}");
-            SocketError::Marshal(e)
-        })?;
-
-        self.send_raw_bytes(plaintext_buf).await
+            SocketError::Marshal(e).into()
+        })
     }
 
     #[cfg_attr(

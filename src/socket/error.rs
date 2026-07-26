@@ -17,6 +17,9 @@ pub enum SocketError {
 
 pub type Result<T> = std::result::Result<T, SocketError>;
 
+/// Outcome of one frame's trip through the noise sender.
+pub type EncryptSendResult = std::result::Result<(), EncryptSendError>;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EncryptSendErrorKind {
