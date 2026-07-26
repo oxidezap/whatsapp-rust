@@ -665,18 +665,20 @@ fn apply_writer_msg(
             timestamp_ms,
         } => {
             let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
-            if apply_edit(
-                conn,
-                device_id,
-                &chat_str,
-                target_id,
-                "",
-                true,
-                text.as_deref(),
-                kind,
-                proto,
-                *timestamp_ms,
-            )? {
+            if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
+                && apply_edit(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    target_id,
+                    "",
+                    true,
+                    text.as_deref(),
+                    kind,
+                    proto,
+                    *timestamp_ms,
+                )?
+            {
                 cs.chats = true;
             }
             cs.message_chats.insert(chat_str);
@@ -688,15 +690,17 @@ fn apply_writer_msg(
             timestamp_ms,
         } => {
             let chat_str = route_writer_chat(conn, device_id, chat, cs)?;
-            if apply_revoke(
-                conn,
-                device_id,
-                &chat_str,
-                target_id,
-                "",
-                true,
-                *timestamp_ms,
-            )? {
+            if !local_target_collides_with_peer(conn, device_id, &chat_str, target_id)?
+                && apply_revoke(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    target_id,
+                    "",
+                    true,
+                    *timestamp_ms,
+                )?
+            {
                 cs.chats = true;
             }
             cs.message_chats.insert(chat_str);
@@ -739,6 +743,21 @@ fn route_writer_chat(
         cs.message_chats.insert(wire);
     }
     Ok(routed)
+}
+
+/// A local amendment may create an own-message placeholder when its target is
+/// absent, but an existing peer row with the same sender-chosen id belongs to
+/// a different message and must remain untouched.
+fn local_target_collides_with_peer(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target_id: &str,
+) -> QueryResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        message_row(device_id, chat, target_id).filter(schema::messages::from_me.eq(false)),
+    ))
+    .get_result(conn)
 }
 
 fn apply_event(
@@ -1450,47 +1469,34 @@ fn apply_reaction(
     ts_ms: i64,
 ) -> QueryResult<()> {
     use schema::reactions::dsl;
-    if emoji.is_empty() {
-        // Same monotonic rule as the add path: a stale remove (older than the
-        // stored reaction) must not delete a newer live one.
-        diesel::delete(
-            dsl::reactions.filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::chat_jid.eq(chat))
-                    .and(dsl::msg_id.eq(target_id))
-                    .and(dsl::sender_jid.eq(sender))
-                    .and(dsl::ts_ms.le(ts_ms)),
-            ),
-        )
+    // Empty emoji is a removal tombstone, not a deletion: retaining its
+    // timestamp prevents an older history chunk from resurrecting the prior
+    // reaction. The read API hides these rows.
+    diesel::insert_into(dsl::reactions)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(chat),
+            dsl::msg_id.eq(target_id),
+            dsl::sender_jid.eq(sender),
+            dsl::emoji.eq(emoji),
+            dsl::ts_ms.eq(ts_ms),
+        ))
+        .on_conflict_do_nothing()
         .execute(conn)?;
-    } else {
-        diesel::insert_into(dsl::reactions)
-            .values((
-                dsl::device_id.eq(device_id),
-                dsl::chat_jid.eq(chat),
-                dsl::msg_id.eq(target_id),
-                dsl::sender_jid.eq(sender),
-                dsl::emoji.eq(emoji),
-                dsl::ts_ms.eq(ts_ms),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?;
-        // Latest reaction per sender wins; a stale copy (e.g. from a history
-        // chunk) must not replace a newer live one.
-        diesel::update(
-            dsl::reactions.filter(
-                dsl::device_id
-                    .eq(device_id)
-                    .and(dsl::chat_jid.eq(chat))
-                    .and(dsl::msg_id.eq(target_id))
-                    .and(dsl::sender_jid.eq(sender))
-                    .and(dsl::ts_ms.le(ts_ms)),
-            ),
-        )
-        .set((dsl::emoji.eq(emoji), dsl::ts_ms.eq(ts_ms)))
-        .execute(conn)?;
-    }
+    // Latest reaction per sender wins; a stale copy (e.g. from a history
+    // chunk) must not replace either a newer live reaction or its tombstone.
+    diesel::update(
+        dsl::reactions.filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::msg_id.eq(target_id))
+                .and(dsl::sender_jid.eq(sender))
+                .and(dsl::ts_ms.le(ts_ms)),
+        ),
+    )
+    .set((dsl::emoji.eq(emoji), dsl::ts_ms.eq(ts_ms)))
+    .execute(conn)?;
     Ok(())
 }
 

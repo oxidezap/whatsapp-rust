@@ -254,7 +254,8 @@ impl ChatStore {
                         dsl::device_id
                             .eq(device_id)
                             .and(dsl::chat_jid.eq_any(keys))
-                            .and(dsl::msg_id.eq(&msg_id)),
+                            .and(dsl::msg_id.eq(&msg_id))
+                            .and(dsl::emoji.ne("")),
                     )
                     .select((dsl::sender_jid, dsl::emoji, dsl::ts_ms))
                     .order(dsl::ts_ms.asc())

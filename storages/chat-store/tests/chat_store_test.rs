@@ -78,6 +78,23 @@ async fn feed(chat_store: &ChatStore, events: impl IntoIterator<Item = Event>) {
     chat_store.flush().await.expect("flush");
 }
 
+fn history_sync_event(history: wa::HistorySync) -> Event {
+    use buffa::Message as _;
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+
+    let raw = history.encode_to_vec();
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&raw).unwrap();
+    Event::HistorySync(Box::new(LazyHistorySync::new(
+        enc.finish().unwrap().into(),
+        raw.len(),
+        wa::history_sync::HistorySyncType::RECENT as i32,
+        None,
+        None,
+    )))
+}
+
 #[tokio::test]
 async fn live_text_message_materializes_chat_and_message() {
     let (_store, chat_store) = test_store().await;
@@ -916,6 +933,144 @@ async fn local_reaction_requires_a_target_id() {
 }
 
 #[tokio::test]
+async fn local_reaction_removal_blocks_stale_history_reaction() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let target = wa::MessageKey {
+        remote_jid: Some(GROUP.into()),
+        from_me: Some(false),
+        id: Some("MSG-REACTION-TOMBSTONE".into()),
+        participant: Some(PEER.into()),
+    };
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("target"),
+            incoming_info(GROUP, PEER, "MSG-REACTION-TOMBSTONE", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "👍",
+            Utc.timestamp_opt(1_700_000_010, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "",
+            Utc.timestamp_opt(1_700_000_020, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let history = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::RECENT,
+        conversations: vec![wa::Conversation {
+            id: GROUP.to_string(),
+            messages: vec![wa::HistorySyncMsg {
+                message: MessageField::some(wa::WebMessageInfo {
+                    key: MessageField::some(target.clone()),
+                    reactions: vec![wa::Reaction {
+                        key: MessageField::some(wa::MessageKey {
+                            from_me: Some(true),
+                            ..target.clone()
+                        }),
+                        text: Some("👍".into()),
+                        sender_timestamp_ms: Some(1_700_000_010_000),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    feed(&chat_store, [history_sync_event(history)]).await;
+    assert!(
+        chat_store
+            .reactions(&chat, "MSG-REACTION-TOMBSTONE")
+            .await
+            .unwrap()
+            .is_empty(),
+        "stale history must not resurrect a removed reaction"
+    );
+
+    // A genuinely newer reaction still replaces the hidden tombstone.
+    chat_store
+        .record_reaction(
+            &chat,
+            &target,
+            "❤️",
+            Utc.timestamp_opt(1_700_000_030, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let reactions = chat_store
+        .reactions(&chat, "MSG-REACTION-TOMBSTONE")
+        .await
+        .unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "❤️");
+}
+
+#[tokio::test]
+async fn local_amendments_do_not_mutate_a_colliding_peer_message() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("peer content"),
+            incoming_info(GROUP, PEER, "COLLIDING-ID", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_outgoing(
+            &chat,
+            "COLLIDING-ID",
+            &wa::Message::text("own colliding content"),
+            Utc.timestamp_opt(1_700_000_010, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_edit(
+            &chat,
+            "COLLIDING-ID",
+            &wa::Message::text("own edit"),
+            Utc.timestamp_opt(1_700_000_020, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_revoke(
+            &chat,
+            "COLLIDING-ID",
+            Utc.timestamp_opt(1_700_000_030, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&chat, "COLLIDING-ID")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.sender_jid, jid(PEER));
+    assert!(!msg.from_me);
+    assert_eq!(msg.text.as_deref(), Some("peer content"));
+    assert!(!msg.revoked);
+}
+
+#[tokio::test]
 async fn keyset_pagination_covers_all_pages_in_order() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
@@ -1020,26 +1175,7 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
         ..Default::default()
     };
 
-    use buffa::Message as _;
-    let raw = history.encode_to_vec();
-    let compressed = {
-        use flate2::{Compression, write::ZlibEncoder};
-        use std::io::Write;
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&raw).unwrap();
-        enc.finish().unwrap()
-    };
-    feed(
-        &chat_store,
-        [Event::HistorySync(Box::new(LazyHistorySync::new(
-            compressed.into(),
-            raw.len(),
-            wa::history_sync::HistorySyncType::RECENT as i32,
-            None,
-            None,
-        )))],
-    )
-    .await;
+    feed(&chat_store, [history_sync_event(history)]).await;
 
     // Chat identity from history; live message content preserved.
     let chats = chat_store.chats(false, 10).await.unwrap();
