@@ -718,7 +718,20 @@ impl Client {
                         continue;
                     }
 
-                    match client.send_raw_bytes_burst(frames).await {
+                    // The per-ack `wa.conn.ack` span lived in `send_ack_for`,
+                    // which this path no longer calls; a burst reports itself
+                    // once, with its size, rather than N times. `instrument`
+                    // rather than `entered()`: an EnteredSpan is not Send and
+                    // cannot be held across the await.
+                    #[cfg(feature = "tracing")]
+                    let burst = {
+                        use tracing::Instrument;
+                        let span = tracing::trace_span!("wa.conn.ack_burst", frames = frames.len());
+                        client.send_raw_bytes_burst(frames).instrument(span).await
+                    };
+                    #[cfg(not(feature = "tracing"))]
+                    let burst = client.send_raw_bytes_burst(frames).await;
+                    match burst {
                         Ok(results) => {
                             for result in results {
                                 if let Err(e) = result

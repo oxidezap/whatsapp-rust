@@ -687,6 +687,62 @@ mod tests {
         }
     }
 
+    /// Order must survive a full job channel, not just an empty one.
+    ///
+    /// A burst larger than the channel leaves some sends parked waiting for a
+    /// slot, and the whole ordering guarantee (`send_raw_bytes_burst` promises
+    /// arrival order, and the ack worker relies on it) then rests on those
+    /// parked senders being woken in the order they queued. Frame N decrypts
+    /// only under counter N, so any reordering fails here.
+    #[tokio::test]
+    async fn order_survives_a_full_job_channel() {
+        let key = [0x88u8; 32];
+        let transport = GatedTransport::closed();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = Arc::new(NoiseSocket::new(
+            runtime,
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        // Comfortably past the channel's capacity, so later sends must park.
+        const FRAMES: usize = 20;
+        let sends: Vec<BoxSend> = (0..FRAMES)
+            .map(|i| {
+                let socket = socket.clone();
+                Box::pin(async move {
+                    socket
+                        .encrypt_and_send(bytes::Bytes::from(vec![i as u8; 32]))
+                        .await
+                }) as BoxSend
+            })
+            .collect();
+        let mut joined = futures::future::join_all(sends);
+        assert!(
+            futures::FutureExt::now_or_never(&mut joined).is_none(),
+            "the gate is closed, so nothing can have completed"
+        );
+
+        transport.gate.add_permits(FRAMES);
+        for result in joined.await {
+            result.expect("send must succeed");
+        }
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = transport
+            .writes()
+            .iter()
+            .flat_map(|w| split_frames(w))
+            .collect();
+        assert_eq!(bodies.len(), FRAMES, "every frame must reach the wire");
+        for (counter, mut body) in bodies.into_iter().enumerate() {
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("a frame written out of counter order cannot authenticate");
+        }
+    }
+
     /// A single-frame send hands its caller the transport's own error, not a
     /// wrapper. Callers with a custom `Transport` downcast to their own error
     /// type to decide whether a failure is retryable, and `downcast_ref` looks
