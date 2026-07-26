@@ -4573,14 +4573,31 @@ mod local_identity_change_on_send {
                 .get_optional_child("participants")
                 .expect("stanza has a participants node");
             let entries = participants.children().expect("participants has children");
+            // Same reasoning as the sink tests: the recipient half drains a
+            // FuturesUnordered, so which of its devices lands first is not
+            // promised. The boundary between the halves is, because they are
+            // sequential awaits, and that is what this test is about.
+            let written = participant_jids(entries);
             assert_eq!(
-                participant_jids(entries),
-                vec![
-                    recipient_a.to_string(),
-                    recipient_b.to_string(),
-                    own_companion.to_string(),
-                ],
-                "recipient half first, own-device half after, one list"
+                written.len(),
+                3,
+                "each device contributes exactly one participant node"
+            );
+            let (recipients, own) = written.split_at(2);
+            assert_eq!(
+                recipients
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [recipient_a.to_string(), recipient_b.to_string()]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "both recipient devices belong to the first half"
+            );
+            assert_eq!(
+                own,
+                [own_companion.to_string()],
+                "the own-device half lands after the recipient half, in one list"
             );
         }
 
