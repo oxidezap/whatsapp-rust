@@ -298,7 +298,7 @@ impl fmt::Write for AddressBuf {
 /// `name_len` marks where the name ends, so `name()` and `as_str()` are both
 /// zero-cost slices. One buffer instead of two — halves allocation count for
 /// one-shot construction and eliminates the copy in `reset_with()`. The buffer
-/// itself is inline up to [`INLINE_CAPACITY`], so the common address is a value
+/// itself is inline up to 47 bytes, so the common address is a value
 /// with nothing behind it.
 #[derive(Clone, Debug)]
 pub struct ProtocolAddress {
