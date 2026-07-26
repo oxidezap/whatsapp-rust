@@ -543,6 +543,47 @@ mod tests {
         );
     }
 
+    /// Real 120 ms packets captured from a live WhatsApp Desktop peer must decode to speech, not to
+    /// full-scale noise. Reported on #1105 after the multi-frame admission landed: frames are now
+    /// accepted, but the decode diverges partway through the packet and saturates, which is audibly
+    /// worse than the silence it replaced.
+    ///
+    /// The assertions are deliberately coarse — this pins "the output is not garbage", which is what
+    /// regressed, without pretending to a bit-exact target the fixture cannot supply.
+    ///
+    /// IGNORED because it currently FAILS: the fix is not in yet. It is committed now so the repro
+    /// travels with the investigation rather than living in someone's scratch directory. Run it with
+    /// `cargo test -p wacore --features voip-mlow --lib live_desktop -- --ignored`, and delete this
+    /// attribute in the commit that makes it pass.
+    #[test]
+    #[ignore = "reproduces the open 120 ms decode divergence; no fix yet"]
+    fn live_desktop_packets_decode_without_saturating() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/live_120ms_frames.json"))
+                .expect("live_120ms_frames.json");
+        assert_eq!(frames.len(), 40, "fixture lost frames");
+
+        let mut dec = MlowDecoder::new();
+        let (mut saturating, mut clipped, mut total) = (0usize, 0usize, 0usize);
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            assert_eq!(frame[0], 0x58, "fixture must stay 120 ms active packets");
+            let out = dec.decode(&frame);
+            assert_eq!(out.len(), 6 * SMPL_INTF_LEN);
+            if out.iter().any(|s| s.abs() >= 0.999) {
+                saturating += 1;
+            }
+            clipped += out.iter().filter(|s| s.abs() >= 0.999).count();
+            total += out.len();
+        }
+
+        let clipped_pct = clipped as f64 * 100.0 / total as f64;
+        assert_eq!(
+            saturating, 0,
+            "{saturating}/40 packets hit full scale ({clipped_pct:.2}% of samples clipped);              speech at this bitrate never does that"
+        );
+    }
+
     /// The two halves of a cross-check vector come out of one harness run and mean nothing apart:
     /// refreshing only one leaves the comparison reading mismatched data, which surfaces as a
     /// correlation number that moved rather than as an obvious error. Pin what ties them, and pin
