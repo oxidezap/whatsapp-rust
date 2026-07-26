@@ -371,6 +371,61 @@ pub async fn encrypt_for_devices(
     .await
 }
 
+/// What a fan-out reports back when its `<to><enc>` nodes went straight into
+/// the caller's stanza buffer instead of a per-fan-out [`EncryptResult`].
+pub struct EncryptFanoutSummary {
+    pub includes_prekey_message: bool,
+    /// True if any device returned 406 (unregistered) during prekey fetch.
+    pub had_unregistered_device: bool,
+}
+
+/// [`encrypt_for_devices`] for a caller that already owns the buffer the nodes
+/// belong in.
+///
+/// [`EncryptResult`] is shaped for the group path, which needs the encrypted
+/// device list to tell a partial SKDM distribution from a complete one. A DM
+/// never asks that question and knows up front how many participants it can
+/// have, so it sizes one vector and lets each fan-out append into it: the
+/// per-fan-out node vector and the device list it would otherwise carry are
+/// both work done only to be moved and dropped.
+#[allow(clippy::too_many_arguments)]
+pub async fn encrypt_for_devices_into(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    hide_decrypt_fail: bool,
+    mediatype: Option<&str>,
+    participant_nodes: &mut Vec<Node>,
+) -> Result<EncryptFanoutSummary> {
+    let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
+    // `first_error` is dropped here exactly as `encrypt_for_devices` drops it:
+    // a DM reports failure through the empty-participants check, not per device.
+    let RawEncryptAttempt { result: raw, .. } = encrypt_for_devices_with_sessions_raw_detailed(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        plan,
+    )
+    .await?;
+
+    participant_nodes.reserve(raw.devices.len());
+    for one in raw.devices {
+        participant_nodes.push(encrypted_device_to_participant_node(
+            one,
+            mediatype,
+            hide_decrypt_fail,
+        ));
+    }
+
+    Ok(EncryptFanoutSummary {
+        includes_prekey_message: raw.includes_prekey_message,
+        had_unregistered_device: raw.had_unregistered_device,
+    })
+}
+
 /// Session material prepared for one encrypt fan-out: per-index LID
 /// encryption overrides (mirroring the `devices` slice it was built from)
 /// plus whether any device 406'd during prekey fetch. Produced only by

@@ -201,8 +201,10 @@ pub async fn prepare_dm_stanza(
     // a bare-enc mode would require refactoring the encryption layer.
     // The <participants> form is accepted by the server regardless.
 
+    // Both fan-outs append into the vector already sized for the whole
+    // participant set, so neither stages a node list of its own.
     if !recipient_devices.is_empty() {
-        let result = encrypt_for_devices(
+        let summary = encrypt_for_devices_into(
             runtime,
             stores,
             resolver,
@@ -210,14 +212,14 @@ pub async fn prepare_dm_stanza(
             &recipient_plaintext,
             hide_decrypt_fail,
             mediatype,
+            &mut participant_nodes,
         )
         .await?;
-        participant_nodes.extend(result.participant_nodes);
-        includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
+        includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
     }
 
     if !own_other_devices.is_empty() {
-        let result = encrypt_for_devices(
+        let summary = encrypt_for_devices_into(
             runtime,
             stores,
             resolver,
@@ -225,10 +227,10 @@ pub async fn prepare_dm_stanza(
             &own_devices_plaintext,
             hide_decrypt_fail,
             mediatype,
+            &mut participant_nodes,
         )
         .await?;
-        participant_nodes.extend(result.participant_nodes);
-        includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
+        includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
     }
 
     // All per-device encrypts failed: an empty <participants> would silently

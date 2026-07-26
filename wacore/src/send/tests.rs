@@ -4351,4 +4351,289 @@ mod local_identity_change_on_send {
             "replaced identity on the send path must be reported via the resolver"
         );
     }
+
+    /// The DM fan-out writes its `<to><enc>` nodes into the stanza's own
+    /// participant vector instead of staging one per half.
+    mod dm_fanout_sink {
+        use super::*;
+
+        fn sentinel() -> Node {
+            NodeBuilder::new("sentinel").build()
+        }
+
+        fn participant_jids(nodes: &[Node]) -> Vec<String> {
+            nodes
+                .iter()
+                .map(|n| {
+                    n.attrs()
+                        .optional_string("jid")
+                        .expect("participant node carries a jid")
+                        .into_owned()
+                })
+                .collect()
+        }
+
+        async fn fan_out_into(
+            devices: &[Jid],
+            resolver: &MockSendContextResolver,
+            nodes: &mut Vec<Node>,
+        ) -> EncryptFanoutSummary {
+            let (mut session_store, mut identity_store) = stores_with_sessions(devices).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            encrypt_for_devices_into(
+                &TokioTestRuntime,
+                &mut stores,
+                resolver,
+                devices,
+                b"payload",
+                false,
+                None,
+                nodes,
+            )
+            .await
+            .expect("fan-out into the caller's buffer")
+        }
+
+        /// A half with no devices must contribute nothing at all: it may not
+        /// clear, replace, or grow the buffer it was handed.
+        #[tokio::test]
+        async fn an_empty_half_leaves_the_buffer_exactly_as_it_found_it() {
+            let mut nodes = vec![sentinel()];
+            let resolver = MockSendContextResolver::new();
+
+            let summary = fan_out_into(&[], &resolver, &mut nodes).await;
+
+            assert_eq!(nodes.len(), 1, "an empty half must append nothing");
+            assert_eq!(nodes[0].tag.as_ref(), "sentinel", "and remove nothing");
+            assert!(!summary.includes_prekey_message);
+            assert!(!summary.had_unregistered_device);
+        }
+
+        /// The single-device DM, which is the whole fan-out on a steady 1:1
+        /// chat: one node, appended after whatever the caller already had.
+        #[tokio::test]
+        async fn one_device_appends_one_node_after_the_existing_content() {
+            let device: Jid = "5511900000001:0@s.whatsapp.net".parse().unwrap();
+            let mut nodes = vec![sentinel()];
+            let resolver = MockSendContextResolver::new();
+
+            let summary = fan_out_into(std::slice::from_ref(&device), &resolver, &mut nodes).await;
+
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(
+                nodes[0].tag.as_ref(),
+                "sentinel",
+                "the sink appends; it does not overwrite"
+            );
+            assert_eq!(participant_jids(&nodes[1..]), vec![device.to_string()]);
+            assert!(
+                summary.includes_prekey_message,
+                "a session whose pre-key is still unacked emits pkmsg"
+            );
+        }
+
+        /// Several devices, appended in fan-out order after the existing
+        /// content, so two halves in a row concatenate rather than interleave.
+        #[tokio::test]
+        async fn many_devices_append_in_order_after_the_existing_content() {
+            let first: Vec<Jid> = (0..3u16)
+                .map(|i| format!("5511900000002:{i}@s.whatsapp.net").parse().unwrap())
+                .collect();
+            let second: Vec<Jid> = vec!["5511900000003:1@s.whatsapp.net".parse().unwrap()];
+            let mut nodes = vec![sentinel()];
+            let resolver = MockSendContextResolver::new();
+
+            fan_out_into(&first, &resolver, &mut nodes).await;
+            fan_out_into(&second, &resolver, &mut nodes).await;
+
+            assert_eq!(nodes[0].tag.as_ref(), "sentinel");
+            let mut expected: Vec<String> = first.iter().map(Jid::to_string).collect();
+            expected.extend(second.iter().map(Jid::to_string));
+            assert_eq!(
+                participant_jids(&nodes[1..]),
+                expected,
+                "each half appends its own devices, in order, after the last"
+            );
+        }
+
+        /// Skip-on-fail: a device with neither a session nor a bundle drops out
+        /// of the fan-out, and the surviving devices still land in the buffer.
+        #[tokio::test]
+        async fn a_device_that_cannot_encrypt_contributes_no_node() {
+            let good: Jid = "5511900000004:0@s.whatsapp.net".parse().unwrap();
+            let sessionless: Jid = "5511900000005:0@s.whatsapp.net".parse().unwrap();
+
+            // Only `good` gets a session; the resolver offers no bundle for the
+            // other, so its encrypt has nothing to work with.
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&good)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_missing_bundle(sessionless.clone());
+
+            let mut nodes = vec![sentinel()];
+            encrypt_for_devices_into(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[good.clone(), sessionless],
+                b"payload",
+                false,
+                None,
+                &mut nodes,
+            )
+            .await
+            .expect("one bad device must not abort the fan-out");
+
+            assert_eq!(
+                participant_jids(&nodes[1..]),
+                vec![good.to_string()],
+                "only the device that could encrypt is in the participant list"
+            );
+        }
+
+        /// End to end through `prepare_dm_stanza`: recipient devices and own
+        /// companion devices are two separate fan-outs but one participant
+        /// list, recipients first.
+        #[tokio::test]
+        async fn a_dm_stanza_carries_both_halves_in_one_participants_node() {
+            let own_jid: Jid = "5511900000010:0@s.whatsapp.net".parse().unwrap();
+            let recipient_a: Jid = "5511900000011:0@s.whatsapp.net".parse().unwrap();
+            let recipient_b: Jid = "5511900000011:1@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000010:2@s.whatsapp.net".parse().unwrap();
+            let all = vec![
+                recipient_a.clone(),
+                recipient_b.clone(),
+                own_companion.clone(),
+                own_jid.clone(),
+            ];
+
+            let (mut session_store, mut identity_store) = stores_with_sessions(&[
+                recipient_a.clone(),
+                recipient_b.clone(),
+                own_companion.clone(),
+            ])
+            .await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new();
+            let devices = ResolvedDmDevices::new(all, &own_jid, None);
+            let to = recipient_a.to_non_ad();
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let prepared = prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    account: None,
+                    to: &to,
+                    message: &message,
+                    message_id: "DM_SINK_1",
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("dm stanza");
+
+            let participants = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node");
+            let entries = participants.children().expect("participants has children");
+            assert_eq!(
+                participant_jids(entries),
+                vec![
+                    recipient_a.to_string(),
+                    recipient_b.to_string(),
+                    own_companion.to_string(),
+                ],
+                "recipient half first, own-device half after, one list"
+            );
+        }
+
+        /// The empty-participants guard still fires when every device drops
+        /// out: an empty `<participants>` would silently drop the message.
+        #[tokio::test]
+        async fn a_dm_whose_every_device_fails_is_refused() {
+            let own_jid: Jid = "5511900000020:0@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "5511900000021:0@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) = stores_with_sessions(&[]).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_missing_bundle(recipient.clone());
+            let devices =
+                ResolvedDmDevices::new(vec![recipient.clone(), own_jid.clone()], &own_jid, None);
+            let to = recipient.to_non_ad();
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let err = prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    account: None,
+                    to: &to,
+                    message: &message,
+                    message_id: "DM_SINK_2",
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .err()
+            .expect("a stanza with no participants must not be built");
+            assert!(
+                err.to_string().contains("encryption failed for all"),
+                "unexpected error: {err}"
+            );
+        }
+    }
 }
