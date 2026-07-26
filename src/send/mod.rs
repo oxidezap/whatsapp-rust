@@ -163,7 +163,7 @@ struct SendBranchOutput {
     /// cold send re-resolves against the winner's warm marking.
     distribution_guard: Option<async_lock::MutexGuardArc<()>>,
     issue_tc_token_after_send: bool,
-    dm_phash: Option<String>,
+    dm_phash: Option<wacore_binary::CompactString>,
 }
 
 struct GroupBranchRequest<'a> {
@@ -1229,7 +1229,7 @@ impl Client {
         let ack = if let Some(phash) = stanza
             .attrs()
             .optional_string("phash")
-            .map(|s| s.into_owned())
+            .map(|s| wacore_binary::CompactString::from(s.as_ref()))
         {
             let rx = self.register_ack_waiter(&request_id);
             Some((rx, phash))
@@ -1448,7 +1448,7 @@ impl Client {
                 // generation catches an in-place cold flip that keeps the
                 // same Arc; the memoized needs are a pure function of that
                 // identity.
-                if self.group_devices_memo_enabled
+                if self.device_memos_enabled
                     && let Some((dw, cw, memo_gen, memo_sender, memo_needs)) =
                         self.skdm_warm_memo.get(group).await
                     && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
@@ -1464,7 +1464,7 @@ impl Client {
                     &cached_map,
                     own_sending_jid,
                 );
-                if self.group_devices_memo_enabled
+                if self.device_memos_enabled
                     && (needs_skdm.is_empty() || {
                         let snapshot = self.persistence_manager.get_device_snapshot();
                         skdm_needs_only_own_devices(
@@ -1549,7 +1549,7 @@ impl Client {
     fn spawn_phash_validation(
         &self,
         rx: futures::channel::oneshot::Receiver<std::sync::Arc<wacore_binary::OwnedNodeRef>>,
-        our_phash: String,
+        our_phash: wacore_binary::CompactString,
         jid: Jid,
         invalidate_group_cache: bool,
         message_id: String,
@@ -2386,100 +2386,27 @@ impl Client {
                 }
             }
 
-            // DM fanout: all known recipient devices + own companions.
-            // WAWebSendUserMsgJob reads local device table only on the send
-            // path; WAWebDBDeviceListFanout excludes hosted devices.
             // The LID-vs-PN wire namespace is an account-level decision: the
             // server 400-nacks LID-addressed DMs from accounts that are not
             // 1:1-LID-migrated (issue #941).
             let recipient_bare = self.resolve_dm_wire_jid(&to).await;
-            let recipient_is_lid = recipient_bare.is_lid();
 
             let stanza_to = dm_stanza_to(&recipient_bare, &to);
 
-            if device_freshness == crate::cache::Freshness::Refresh {
-                self.refresh_user_devices(vec![recipient_bare.to_non_ad(), own_jid.to_non_ad()])
-                    .await?;
-            }
+            // DM fanout, memoized per recipient: a warm repeat DM skips both
+            // registry lookups, the list rebuild and the phash. See
+            // `resolve_dm_devices_memoized` for its freshness contract.
+            let dm_devices = self
+                .resolve_dm_devices_memoized(
+                    &to,
+                    &recipient_bare,
+                    own_jid,
+                    device_snapshot.lid.as_ref(),
+                    device_freshness,
+                )
+                .await?;
 
-            // Local registry first; network warm only on miss to avoid
-            // unnecessary LID-migration side effects from get_user_devices
-            let mut recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
-            if recipient_cached.is_none() {
-                if let Err(e) = self.get_user_devices(std::slice::from_ref(&to)).await {
-                    // The bare-JID fallback below can drop companion devices, so
-                    // leave a trace when the warmup that would prevent it fails.
-                    log::warn!("device-list warmup for {} failed: {e:#}", to.observe());
-                }
-                recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
-            }
-
-            let is_self_dm =
-                is_self_dm_recipient(&recipient_bare, own_jid, device_snapshot.lid.as_ref());
-
-            // Skip the own-device lookup only when we already have the
-            // recipient's list — that record covers every own device in a
-            // single namespace. If `recipient_cached` is `None` (cache miss
-            // + warmup failed), the PN-keyed `own_cached` is the only thing
-            // standing between us and a bare-JID fallback that would drop
-            // companion devices.
-            let own_cached: Option<Vec<Jid>> = if is_self_dm && recipient_cached.is_some() {
-                None
-            } else {
-                let mut cached = self.get_devices_from_registry(own_jid).await;
-                if cached.is_none() {
-                    if let Err(e) = self.get_user_devices(std::slice::from_ref(own_jid)).await {
-                        log::warn!("own device-list warmup failed: {e:#}");
-                    }
-                    cached = self.get_devices_from_registry(own_jid).await;
-                }
-                cached
-            };
-
-            // Build device list, filter hosted in-place, reuse Vecs
-            let mut all_dm_jids = match recipient_cached {
-                Some(mut devices) => {
-                    devices.retain(|j| !j.is_hosted());
-                    devices
-                }
-                // No record at all — bare JID, server handles fanout
-                None => vec![recipient_bare],
-            };
-
-            if let Some(mut own_devices) = own_cached {
-                own_devices.retain(|j| !j.is_hosted());
-                all_dm_jids.append(&mut own_devices);
-            }
-
-            // Exclude exact sender device (WA Web: isMeDevice in getFanOutList)
-            // so ensure_e2e_sessions never creates a self-session
-            let own_lid = device_snapshot.lid.as_ref();
-            all_dm_jids.retain(|j| {
-                let is_sender = (j.is_same_user_as(own_jid) && j.device == own_jid.device)
-                    || own_lid.is_some_and(|lid| j.is_same_user_as(lid) && j.device == lid.device);
-                !is_sender
-            });
-
-            // own_cached is keyed by the bot's PN, so own devices come back
-            // PN-addressed. The server rejects a stanza that mixes PN and LID
-            // participants, so align own devices to LID for a LID recipient
-            // (whatsmeow switches ownID to LID before fanout).
-            if recipient_is_lid {
-                let lid = own_lid.ok_or_else(|| {
-                    anyhow!("Cannot send a LID-addressed DM before the device LID is known")
-                })?;
-                for j in all_dm_jids.iter_mut() {
-                    if j.is_pn() && j.is_same_user_as(own_jid) {
-                        *j = Jid::lid_device(lid.user.clone(), j.device);
-                    }
-                }
-            }
-
-            // Same-namespace dedup only; cross-namespace overlap is avoided
-            // upstream via `is_self_dm_recipient`.
-            wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
-
-            self.ensure_e2e_sessions(&all_dm_jids).await?;
+            self.ensure_e2e_sessions(dm_devices.devices()).await?;
 
             let mut extra_stanza_nodes = extra_stanza_nodes;
             // tctoken applies to 1:1 chats; status reactions share the fanout
@@ -2493,7 +2420,7 @@ impl Client {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
-            let lock_jids = self.build_session_lock_keys(&all_dm_jids).await;
+            let lock_jids = self.build_session_lock_keys(dm_devices.devices()).await;
             let _session_mutexes = self.session_mutexes_for(&lock_jids).await;
             let mut _session_guards = Vec::with_capacity(_session_mutexes.len());
             for mutex in &_session_mutexes {
@@ -2510,14 +2437,13 @@ impl Client {
                 self,
                 wacore::send::DmStanzaRequest {
                     own_jid,
-                    own_lid: device_snapshot.lid.as_ref(),
                     account: device_snapshot.account.as_deref(),
                     to: &stanza_to,
                     message,
                     message_id: &request_id,
                     edit: edit.as_ref(),
                     extra_nodes: &extra_stanza_nodes,
-                    devices: all_dm_jids,
+                    devices: &dm_devices,
                     pre_encoded: shared_content.as_deref().map(Vec::as_slice),
                 },
             )

@@ -180,6 +180,10 @@ impl Client {
             .group_devices_memo
             .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
             .await;
+        let dm_devices_memo = self
+            .dm_devices_memo
+            .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
+            .await;
         let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
 
         // Each count read into a local so no two guards are ever held at once.
@@ -239,6 +243,7 @@ impl Client {
             recent_messages,
             sender_key_device_cache: self.sender_key_device_cache.memory_stats().await,
             group_devices_memo,
+            dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),

@@ -48,6 +48,13 @@ pub(crate) struct PartitionedDmDevices {
     recipient_count: usize,
 }
 
+impl crate::stats::HeapSize for PartitionedDmDevices {
+    fn heap_bytes(&self) -> usize {
+        self.devices.capacity() * size_of::<Jid>()
+            + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
+    }
+}
+
 impl PartitionedDmDevices {
     pub(crate) fn valid_devices(&self) -> &[Jid] {
         &self.devices
@@ -69,7 +76,7 @@ pub struct PreparedDmStanza {
     /// Locally computed phash from the sent device set. Not sent on the
     /// wire (WA Web only sends phash for groups). Used by the caller to
     /// compare against the server's ACK phash for device-list drift detection.
-    pub phash: Option<String>,
+    pub phash: Option<CompactString>,
     /// `MessageContextInfo.message_secret` generated for this stanza so the
     /// caller can persist it for later addon (msmsg/poll/edit) decryption.
     /// `None` when the message had no reporting token (no secret was used).
@@ -78,14 +85,16 @@ pub struct PreparedDmStanza {
 
 pub struct DmStanzaRequest<'a> {
     pub own_jid: &'a Jid,
-    pub own_lid: Option<&'a Jid>,
     pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
     pub to: &'a Jid,
     pub message: &'a wa::Message,
     pub message_id: &'a str,
     pub edit: Option<&'a crate::types::message::EditAttribute>,
     pub extra_nodes: &'a [Node],
-    pub devices: Vec<Jid>,
+    /// The already-partitioned fan-out. Borrowed, not owned: the caller's
+    /// per-recipient memo hands out the same `Arc` on every repeat send, so
+    /// neither the device list nor its phash is rebuilt here.
+    pub devices: &'a ResolvedDmDevices,
     pub pre_encoded: Option<&'a [u8]>,
 }
 
@@ -101,14 +110,13 @@ pub async fn prepare_dm_stanza(
 ) -> Result<PreparedDmStanza> {
     let DmStanzaRequest {
         own_jid,
-        own_lid,
         account,
         to: to_jid,
         message,
         message_id: request_id,
         edit,
         extra_nodes: extra_stanza_nodes,
-        devices: all_devices,
+        devices: resolved_devices,
         pre_encoded,
     } = request;
     // Encode the message at most once (reusing the caller's `pre_encoded` bytes when
@@ -148,15 +156,14 @@ pub async fn prepare_dm_stanza(
     // via prepare_message_with_context just to attach two fields.
     let extra_context = reporting_result.as_ref().map(reporting_context_info);
 
-    // Partition first so phash reflects the actual sent set (sender excluded) and so
-    // the own-device plaintext can be skipped when there's nothing to send it to.
-    let partitioned_devices = partition_dm_devices(all_devices, own_jid, own_lid);
-    let valid_devices = partitioned_devices.valid_devices();
-    let recipient_devices = partitioned_devices.recipient_devices();
-    let own_other_devices = partitioned_devices.own_other_devices();
-    let total_devices = valid_devices.len();
+    // The set arrives partitioned (sender excluded) so phash reflects the actual
+    // sent set and the own-device plaintext can be skipped when there's nothing
+    // to send it to.
+    let recipient_devices = resolved_devices.recipient_devices();
+    let own_other_devices = resolved_devices.own_other_devices();
+    let total_devices = resolved_devices.devices().len();
 
-    let phash = MessageUtils::participant_list_hash(valid_devices).ok();
+    let phash = resolved_devices.phash();
 
     // Splice the shared content into the recipient plaintext and, when present, the
     // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an

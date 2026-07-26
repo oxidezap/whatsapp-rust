@@ -6,6 +6,11 @@ use super::*;
 /// accounts in more groups; an evicted entry just recomputes on next send.
 const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 
+/// Max 1:1 chats with a cached resolved-device snapshot. Higher than the
+/// group bound because a bot's active DM set is typically much wider; each
+/// entry is only the device list plus its member set.
+const DM_DEVICES_MEMO_CAPACITY: u64 = 512;
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.signal_shutdown_sync();
@@ -373,11 +378,16 @@ impl Client {
                 Arc::clone(&device_topology),
             ),
             device_topology,
-            group_devices_memo_enabled: cache_config.cache_stores.device_registry_cache.is_none()
+            device_memos_enabled: cache_config.cache_stores.device_registry_cache.is_none()
                 && cache_config.cache_stores.lid_pn_cache.is_none(),
             group_devices_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),
+            dm_devices_memo: Cache::builder()
+                .max_capacity(DM_DEVICES_MEMO_CAPACITY)
+                .build(),
+            #[cfg(test)]
+            dm_devices_memo_recomputes: AtomicU64::new(0),
             // A live lane also protects recipient-tracker reset/update ordering.
             group_distribution_locks: Cache::builder()
                 .max_capacity(cache_config.group_distribution_locks_capacity.max(1))

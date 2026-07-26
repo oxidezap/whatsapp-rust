@@ -265,6 +265,7 @@ pub struct MemoryReport {
     pub recent_messages: CollectionStats,
     pub sender_key_device_cache: CollectionStats,
     pub group_devices_memo: CollectionStats,
+    pub dm_devices_memo: CollectionStats,
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
@@ -321,7 +322,7 @@ pub struct MemoryReport {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 11] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 12] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -330,6 +331,7 @@ impl MemoryReport {
             ("recent_messages:", &self.recent_messages),
             ("sk_device_cache:", &self.sender_key_device_cache),
             ("group_devices_memo:", &self.group_devices_memo),
+            ("dm_devices_memo:", &self.dm_devices_memo),
             ("signal_sessions:", &self.signal_sessions),
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
@@ -1126,22 +1128,32 @@ pub struct Client {
     /// Maps user ID to DeviceListRecord for fast device existence checks.
     /// Backed by persistent storage.
     /// Device registry fused with its topology tracker: every write records
-    /// the change by construction, so the group-devices memo below can never
+    /// the change by construction, so the device-list memos below can never
     /// be left stale by a forgotten bump.
     pub(crate) device_registry_cache: device_topology::DeviceRegistryCache,
     /// Shared topology tracker (generation + changed-users log). LidPnCache
-    /// records mapping changes into it; the memo validates against it.
+    /// records mapping changes into it; the memos validate against it.
     pub(crate) device_topology: Arc<device_topology::DeviceTopology>,
-    /// Whether the group-devices memo may be used: false when the registry
-    /// or LID-PN caches are store-backed (a shared external store can be
-    /// written by other processes, which the in-process topology tracker
-    /// cannot observe).
-    pub(crate) group_devices_memo_enabled: bool,
+    /// Whether the device-list memos (group and DM) may be used: false when
+    /// the registry or LID-PN caches are store-backed (a shared external
+    /// store can be written by other processes, which the in-process
+    /// topology tracker cannot observe).
+    pub(crate) device_memos_enabled: bool,
     /// Per-group memo of the fully resolved (LID-converted) device list,
     /// validated by GroupInfo identity + the device topology. Serves the
     /// per-send full-set resolution in `resolve_skdm_targets` so a warm
     /// repeat send skips the per-member cache fan-out.
     pub(crate) group_devices_memo: Cache<Jid, Arc<device_registry::GroupDevicesMemo>>,
+    /// Per-recipient memo of the resolved DM fan-out (recipient devices +
+    /// own companions, partitioned, with its phash), keyed by the resolved
+    /// wire jid and validated by the sending identity + the device topology.
+    /// A warm repeat DM skips both registry lookups, the list rebuild and
+    /// the phash.
+    pub(crate) dm_devices_memo: Cache<Jid, Arc<device_registry::DmDevicesMemo>>,
+    /// Full DM fan-out recomputes (memo miss or bypass), so tests can prove a
+    /// repeat send really served the memo instead of redoing the resolution.
+    #[cfg(test)]
+    pub(crate) dm_devices_memo_recomputes: AtomicU64,
 
     /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
     /// cold sends each re-ran the full per-member fan-out before any of them
