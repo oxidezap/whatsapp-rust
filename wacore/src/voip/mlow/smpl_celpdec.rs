@@ -330,6 +330,7 @@ pub(crate) struct CelpDecParams {
 }
 
 /// Persistent decoder synthesis state (float domain).
+#[derive(Clone)]
 pub(crate) struct CelpDecState {
     noise: NoiseGenerator,
     acb_state: Vec<f32>,

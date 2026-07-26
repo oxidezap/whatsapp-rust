@@ -202,6 +202,14 @@ impl MlowDecoder {
         // The low_rate bit of the smpl TOC (this capture is low_rate==0; the synth gates on it).
         let low_rate = (frame[0] >> 2) & 1 != 0;
 
+        // The overrun that invalidates a body is only detectable after the last internal frame, by
+        // which point the loop has already advanced the LSF predictor, the CELP history and
+        // `prev_nlsf`. Keep a copy so concealment can undo them: parameters invented past the end of
+        // a bad body must not seed the next packet. The reference leaves them advanced, but it never
+        // meets a stream it cannot read; this decoder does, and the leak is audible in the frame
+        // after. The copy is a few KB once per packet, against 20-120 ms of audio.
+        let state_before = self.state.clone();
+
         let mut out: Vec<f32> = Vec::with_capacity(frames * SMPL_INTF_LEN);
         // Collect the per-40-block lags (8 per internal frame) and the average normalized bitrate
         // for the per-packet harmonic postfilter.
@@ -301,6 +309,12 @@ impl MlowDecoder {
         let consumed_bytes = (dec.tell().max(0) as u32).div_ceil(8);
         let body = dec.storage();
         if body > consumed_bytes || body + 2 < consumed_bytes || dec.err != 0 {
+            // Sticky flag first: this branch swallows the range-decoder failure it is reporting, and
+            // `had_error` is what the suites read to see it.
+            if dec.err != 0 {
+                self.had_error = true;
+            }
+            self.state = state_before;
             self.malformed += 1;
             if self.malformed == 1 || self.malformed.is_multiple_of(100) {
                 log::warn!(
@@ -612,35 +626,29 @@ mod tests {
     /// The assertions are deliberately coarse — this pins "the output is not garbage", which is what
     /// regressed, without pretending to a bit-exact target the fixture cannot supply.
     ///
-    /// Under the entropy grammar this decoder implements, all 40 of these bodies end far from where
-    /// they claim to, so they are currently concealed rather than decoded — the same verdict the C
-    /// reference reaches on them. What this pins is that the output is never garbage; if a future
-    /// change lets them decode to real speech, that is progress and this test still passes.
+    /// Concealing a malformed frame must leave no trace: the decode loop mutates the LSF predictor,
+    /// the CELP history and `prev_nlsf` before the overrun is detectable, so without a rollback the
+    /// NEXT packet is synthesized partly from parameters invented past the end of the bad body.
+    /// The reference does not roll back, but it also never meets these packets; we do, repeatedly.
     #[test]
-    fn live_desktop_packets_decode_without_saturating() {
+    fn a_concealed_frame_does_not_contaminate_the_next() {
         let frames: Vec<String> =
-            serde_json::from_str(include_str!("testdata/live_120ms_frames.json"))
-                .expect("live_120ms_frames.json");
-        assert_eq!(frames.len(), 40, "fixture lost frames");
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let real = hex::decode(&frames[0]).unwrap();
 
-        let mut dec = MlowDecoder::new();
-        let (mut saturating, mut clipped, mut total) = (0usize, 0usize, 0usize);
-        for hex_frame in &frames {
-            let frame = hex::decode(hex_frame).unwrap();
-            assert_eq!(frame[0], 0x58, "fixture must stay 120 ms active packets");
-            let out = dec.decode(&frame);
-            assert_eq!(out.len(), 6 * SMPL_INTF_LEN);
-            if out.iter().any(|s| s.abs() >= 0.999) {
-                saturating += 1;
-            }
-            clipped += out.iter().filter(|s| s.abs() >= 0.999).count();
-            total += out.len();
-        }
+        let mut fresh = MlowDecoder::new();
+        let want = fresh.decode(&real);
 
-        let clipped_pct = clipped as f64 * 100.0 / total as f64;
-        assert_eq!(
-            saturating, 0,
-            "{saturating}/40 packets hit full scale ({clipped_pct:.2}% of samples clipped);              speech at this bitrate never does that"
+        let mut contaminated = MlowDecoder::new();
+        let bad = contaminated.decode(&[0x58, 0x03, 0x1a, 0xfb, 0x0a]);
+        assert!(bad.iter().all(|&s| s == 0.0), "the bad frame is concealed");
+        let got = contaminated.decode(&real);
+
+        assert_eq!(got.len(), want.len());
+        assert!(
+            got == want,
+            "a real frame after a concealed one must decode identically to one decoded on a fresh \
+             decoder; state from the malformed body leaked into it"
         );
     }
 

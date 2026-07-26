@@ -539,7 +539,7 @@ pub(crate) fn synth_internal_frame(
 }
 
 /// Cross-frame decoder state (the persistent LSF/pitch predictor, prev NLSF, CELP synthesis).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct SmplDecoderState {
     pub(crate) lstate: super::smpl_decode::SmplLsfState,
     pub(crate) prev_nlsf: Vec<f32>,
