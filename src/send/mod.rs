@@ -2493,6 +2493,16 @@ impl Client {
         &self,
         jids: &[Jid],
     ) -> Vec<async_lock::MutexGuardArc<()>> {
+        // A duplicate key would have this loop await a lock it already holds,
+        // which is a silent self-deadlock rather than a panic: the send just
+        // never returns. Every caller goes through `build_session_lock_keys`,
+        // which sorts and dedups, so this only fires if a future path forgets
+        // to.
+        debug_assert!(
+            jids.windows(2).all(|pair| pair[0] != pair[1]),
+            "session lock keys must be deduped before acquisition, or the loop deadlocks on itself"
+        );
+
         let mut guards = Vec::with_capacity(jids.len());
         // A `ProtocolAddress` IS the "{name}.0" string the lock map is keyed by,
         // and it holds it inline, so the whole loop names its keys without

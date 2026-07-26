@@ -521,6 +521,35 @@ mod address_buffer_tests {
         assert_eq!(spills.as_str(), format!("{one_too_long}.0"));
     }
 
+    /// A multi-digit device id takes a different path than `".0"`: the suffix
+    /// is written through `write!` rather than one `push_str`, so the spill can
+    /// land *between* the dot and the digits. Getting that wrong would leave a
+    /// half-written suffix or a `name_len` measured after it, which is why the
+    /// case is worth pinning separately from the fast path above.
+    #[test]
+    fn a_multi_digit_suffix_spills_without_splitting_itself() {
+        let suffix = ".123";
+        // Sized so the name alone fits and the suffix is what pushes it over.
+        let name = "b".repeat(INLINE_CAPACITY - suffix.len() + 1);
+        let address = ProtocolAddress::new(&name, DeviceId::new(123));
+
+        assert!(
+            !address.buf.is_inline(),
+            "the suffix is what must have pushed this past the inline capacity"
+        );
+        assert_eq!(
+            address.as_str(),
+            format!("{name}{suffix}"),
+            "a fragment written across the spill would corrupt the address"
+        );
+        assert_eq!(
+            address.name(),
+            name,
+            "name_len must still point at the end of the name, not into the suffix"
+        );
+        assert_eq!(address.device_id(), DeviceId::new(123));
+    }
+
     /// The representation is not part of the value. `ProtocolAddress` is a
     /// `HashMap` key, so an inline value and a heap value holding the same
     /// characters must compare, order and hash the same.
