@@ -213,6 +213,16 @@ impl NoiseSocket {
                 // Zero-copy: split() hands the written bytes over and out_buf
                 // keeps its capacity for the next batch.
                 let wire = out_buf.split().freeze();
+                if waiters.len() > 1 {
+                    // The only externally visible sign that a batch happened.
+                    // Without it, "does the peer accept several frames in one
+                    // WebSocket message?" cannot be answered from a live run.
+                    log::debug!(
+                        "noise: coalesced {} frames into one {}-byte write",
+                        waiters.len(),
+                        wire.len()
+                    );
+                }
                 match transport.send(wire).await {
                     Ok(()) => {
                         if let Some(stats) = stats.as_deref() {
