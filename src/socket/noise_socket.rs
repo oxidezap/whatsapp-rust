@@ -126,6 +126,16 @@ impl NoiseSocket {
                     && matches!(err.kind, EncryptSendErrorKind::Transport)
                 {
                     poisoned = true;
+                    // Poisoning only stops this half. A write can fail while
+                    // the read half stays open (half-open socket, or a
+                    // Transport that reports Err without emitting
+                    // Disconnected), and then nothing else would notice: the
+                    // read loop keeps running and the client reports itself
+                    // connected while every send fails forever. Closing the
+                    // transport makes the existing disconnect path observe the
+                    // drop and reconnect with a fresh handshake key, which is
+                    // the only way this sender becomes usable again.
+                    transport.disconnect().await;
                 }
                 outcome
             };
@@ -251,6 +261,7 @@ impl NoiseSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use wacore::framing::FRAME_LENGTH_SIZE;
 
     #[tokio::test]
@@ -369,6 +380,7 @@ mod tests {
     struct AcceptThenFailTransport {
         sent: std::sync::Mutex<Vec<bytes::Bytes>>,
         fail_from: usize,
+        disconnected: AtomicBool,
     }
 
     impl AcceptThenFailTransport {
@@ -376,11 +388,16 @@ mod tests {
             Self {
                 sent: std::sync::Mutex::new(Vec::new()),
                 fail_from,
+                disconnected: AtomicBool::new(false),
             }
         }
 
         fn sent(&self) -> Vec<bytes::Bytes> {
             self.sent.lock().expect("send mutex").clone()
+        }
+
+        fn disconnected(&self) -> bool {
+            self.disconnected.load(Ordering::SeqCst)
         }
     }
 
@@ -397,7 +414,9 @@ mod tests {
             }
             Ok(())
         }
-        async fn disconnect(&self) {}
+        async fn disconnect(&self) {
+            self.disconnected.store(true, Ordering::SeqCst);
+        }
     }
 
     fn test_socket(transport: Arc<dyn Transport>) -> NoiseSocket {
@@ -469,6 +488,26 @@ mod tests {
             transport.sent().len(),
             1,
             "exactly the one ambiguous frame reached the transport"
+        );
+    }
+
+    /// Poisoning the sender is only half a recovery: a write can fail while the
+    /// read half stays open, and then nothing tears the connection down. The
+    /// sender must close the transport so the existing disconnect path
+    /// reconnects, instead of leaving a client that looks connected and cannot
+    /// send.
+    #[tokio::test]
+    async fn poisoning_the_sender_closes_the_transport() {
+        let transport: Arc<AcceptThenFailTransport> = Arc::new(AcceptThenFailTransport::new(0));
+        let socket = test_socket(transport.clone());
+
+        let first = socket
+            .encrypt_and_send(bytes::Bytes::from_static(b"first"))
+            .await;
+        assert!(first.is_err(), "the injected failure must surface");
+        assert!(
+            transport.disconnected(),
+            "the first transport error must close the transport so the client reconnects"
         );
     }
 
