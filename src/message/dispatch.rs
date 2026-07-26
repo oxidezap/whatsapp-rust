@@ -2,6 +2,16 @@
 
 use super::*;
 
+#[inline]
+fn delivery_receipt_burst_warning(
+    result: &crate::socket::error::EncryptSendResult,
+) -> Option<&crate::socket::error::EncryptSendError> {
+    match result {
+        Err(error) if !error.is_transport_unavailable() => Some(error),
+        Ok(()) | Err(_) => None,
+    }
+}
+
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
@@ -142,6 +152,12 @@ impl Client {
         let client = Arc::downgrade(self);
         self.runtime
             .spawn(Box::pin(async move {
+                // Reuse the bounded control buffers for the worker's lifetime.
+                // Encoded payload allocations still move into `Bytes`; only
+                // the outer storage stays here.
+                let mut batch = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                let mut frames = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                let mut guards = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
                 while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
@@ -151,7 +167,7 @@ impl Client {
                     // before reading the next means the noise sender never has
                     // two frames to coalesce. `try_recv` only, so nothing waits
                     // on work that has not arrived.
-                    let mut batch = vec![first];
+                    batch.push(first);
                     while batch.len() < Self::MAX_RECEIPT_BURST
                         && let Ok(next) = rx.try_recv()
                     {
@@ -163,9 +179,7 @@ impl Client {
                     // the socket reporting NotConnected), and adding one for
                     // symmetry would silently start dropping receipts that
                     // today still go out.
-                    let mut frames = Vec::with_capacity(batch.len());
-                    let mut guards = Vec::with_capacity(batch.len());
-                    for (info, guard) in batch {
+                    for (info, guard) in batch.drain(..) {
                         // Building the node is synchronous, so the burst is
                         // fully prepared before anything reaches the socket.
                         if let Some(frame) = client.prepare_delivery_receipt(&info) {
@@ -177,39 +191,96 @@ impl Client {
                         continue;
                     }
 
-                    // Spans the await, not just the preparation: a receipt that
-                    // stalls in the transport has to show up inside the span.
-                    // The per-receipt `wa.receipt.send_delivery` span stays on
-                    // the single-receipt path, which this one does not use.
-                    #[cfg(feature = "tracing")]
-                    let burst = {
-                        use tracing::Instrument;
-                        let span =
-                            tracing::debug_span!("wa.receipt.delivery_burst", frames = frames.len());
-                        client.send_raw_bytes_burst(frames).instrument(span).await
-                    };
-                    #[cfg(not(feature = "tracing"))]
-                    let burst = client.send_raw_bytes_burst(frames).await;
-                    match burst {
-                        Ok(results) => {
-                            for result in results {
-                                if let Err(e) = result
-                                    && !e.is_transport_unavailable()
-                                {
-                                    log::warn!(target: "Client/Receipt", "Failed to send delivery receipt: {e:?}");
+                    // Spans the await *and* the result inspection: a receipt
+                    // that stalls or fails in the transport has to show up
+                    // inside the span, not after it closed. The per-receipt
+                    // `wa.receipt.send_delivery` span stays on the
+                    // single-receipt path, which this one does not use.
+                    let frame_count = frames.len();
+                    let send_and_report = async {
+                        match client.send_raw_bytes_burst(&mut frames).await {
+                            Ok(results) => {
+                                for result in results {
+                                    if let Some(error) = delivery_receipt_burst_warning(&result) {
+                                        log::warn!(target: "Client/Receipt", "Failed to send delivery receipt: {error:?}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if !matches!(e, crate::client::ClientError::NotConnected) {
+                                    log::warn!(target: "Client/Receipt", "Failed to send delivery receipt burst: {e:?}");
                                 }
                             }
                         }
-                        Err(e) => {
-                            if !matches!(e, crate::client::ClientError::NotConnected) {
-                                log::warn!(target: "Client/Receipt", "Failed to send delivery receipt burst: {e:?}");
-                            }
-                        }
+                    };
+                    #[cfg(feature = "tracing")]
+                    {
+                        use tracing::Instrument;
+                        send_and_report
+                            .instrument(tracing::debug_span!(
+                                "wa.receipt.delivery_burst",
+                                frames = frame_count
+                            ))
+                            .await;
                     }
-                    drop(guards);
+                    #[cfg(not(feature = "tracing"))]
+                    {
+                        let _ = frame_count;
+                        send_and_report.await;
+                    }
+                    debug_assert!(
+                        frames.is_empty(),
+                        "send_raw_bytes_burst must always drain its input"
+                    );
+                    guards.clear();
                 }
             }))
             .detach();
         tx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delivery_receipt_burst_warning;
+    use crate::socket::error::EncryptSendError;
+
+    #[test]
+    fn receipt_burst_logging_is_quiet_for_success_and_reconnect_failures() {
+        let reconnect_failures = [
+            Ok(()),
+            Err(EncryptSendError::transport(anyhow::anyhow!(
+                "transport unavailable"
+            ))),
+            Err(EncryptSendError::channel_closed()),
+            Err(EncryptSendError::poisoned()),
+        ];
+
+        for result in &reconnect_failures {
+            assert!(
+                delivery_receipt_burst_warning(result).is_none(),
+                "success and reconnect-related failures must stay quiet: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_burst_logging_keeps_actionable_local_failures_visible() {
+        let actionable_failures = [
+            Err(EncryptSendError::crypto(anyhow::anyhow!(
+                "encryption failed"
+            ))),
+            Err(EncryptSendError::framing(anyhow::anyhow!("framing failed"))),
+            Err(EncryptSendError::join(anyhow::anyhow!(
+                "sender join failed"
+            ))),
+        ];
+
+        for result in &actionable_failures {
+            assert!(
+                delivery_receipt_burst_warning(result).is_some(),
+                "local send failures must remain visible: {result:?}"
+            );
+        }
     }
 }

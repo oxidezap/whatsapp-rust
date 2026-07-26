@@ -36,13 +36,30 @@ impl Client {
     /// polling the joined sends in order therefore queues them in order.
     /// Resolving the socket per send instead would put a contended mutex
     /// between the futures and let them queue in any order.
+    ///
+    /// Always drains `frames`, including when no socket is installed, while
+    /// retaining its outer allocation for the persistent workers to reuse.
     pub(crate) async fn send_raw_bytes_burst(
         &self,
-        frames: Vec<Vec<u8>>,
+        frames: &mut Vec<Vec<u8>>,
     ) -> Result<Vec<crate::socket::error::EncryptSendResult>, ClientError> {
-        let noise_socket = self.get_noise_socket().await?;
+        let noise_socket = match self.get_noise_socket().await {
+            Ok(socket) => socket,
+            Err(error) => {
+                frames.clear();
+                return Err(error);
+            }
+        };
+        if frames.len() == 1 {
+            let plaintext = frames.pop().expect("length checked");
+            return Ok(vec![
+                noise_socket
+                    .encrypt_and_send(bytes::Bytes::from(plaintext))
+                    .await,
+            ]);
+        }
         let sends = frames
-            .into_iter()
+            .drain(..)
             .map(|plaintext| noise_socket.encrypt_and_send(bytes::Bytes::from(plaintext)));
         Ok(futures::future::join_all(sends).await)
     }

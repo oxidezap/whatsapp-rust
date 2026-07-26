@@ -689,6 +689,12 @@ impl Client {
         let client = Arc::downgrade(self);
         self.runtime
             .spawn(Box::pin(async move {
+                // Reuse the bounded control buffers for the worker's lifetime.
+                // Encoded payload allocations still move into `Bytes`; only
+                // the outer storage stays here.
+                let mut batch = Vec::with_capacity(Self::MAX_ACK_BURST);
+                let mut frames = Vec::with_capacity(Self::MAX_ACK_BURST);
+                let mut guards = Vec::with_capacity(Self::MAX_ACK_BURST);
                 while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
@@ -700,7 +706,7 @@ impl Client {
                     // so its batching only fired when some *other* producer
                     // happened to interleave. `try_recv` only: this never waits
                     // for work that has not arrived.
-                    let mut batch = vec![first];
+                    batch.push(first);
                     while batch.len() < Self::MAX_ACK_BURST
                         && let Ok(next) = rx.try_recv()
                     {
@@ -710,14 +716,13 @@ impl Client {
                     // The queue is still drained, exactly as the
                     // one-at-a-time worker did; only the send is skipped.
                     if client.outbound_teardown_in_progress() {
+                        batch.clear();
                         continue;
                     }
 
                     // Encoding is synchronous, so the whole burst is marshalled
                     // before anything is sent and arrival order survives.
-                    let mut frames = Vec::with_capacity(batch.len());
-                    let mut guards = Vec::with_capacity(batch.len());
-                    for (node, guard) in batch {
+                    for (node, guard) in batch.drain(..) {
                         match client.encode_ack_from_snapshot(
                             node.get(),
                             AckParticipantPolicy::OmitReceiptDestinationDuplicate,
@@ -737,34 +742,51 @@ impl Client {
 
                     // The per-ack `wa.conn.ack` span lived in `send_ack_for`,
                     // which this path no longer calls; a burst reports itself
-                    // once, with its size, rather than N times. `instrument`
-                    // rather than `entered()`: an EnteredSpan is not Send and
-                    // cannot be held across the await.
-                    #[cfg(feature = "tracing")]
-                    let burst = {
-                        use tracing::Instrument;
-                        let span = tracing::trace_span!("wa.conn.ack_burst", frames = frames.len());
-                        client.send_raw_bytes_burst(frames).instrument(span).await
-                    };
-                    #[cfg(not(feature = "tracing"))]
-                    let burst = client.send_raw_bytes_burst(frames).await;
-                    match burst {
-                        Ok(results) => {
-                            for result in results {
-                                if let Err(e) = result
-                                    && !e.is_transport_unavailable()
-                                {
-                                    warn!("Failed to send ack: {e:?}");
+                    // once, with its size, rather than N times. The result
+                    // inspection is inside the instrumented future, not after
+                    // it: a failure has to be recorded while the span is open,
+                    // the way `send_ack_for`'s `err(Debug)` used to. And
+                    // `instrument` rather than `entered()`, because an
+                    // EnteredSpan is not Send and cannot cross the await.
+                    let frame_count = frames.len();
+                    let send_and_report = async {
+                        match client.send_raw_bytes_burst(&mut frames).await {
+                            Ok(results) => {
+                                for result in results {
+                                    if let Err(e) = result
+                                        && !e.is_transport_unavailable()
+                                    {
+                                        warn!("Failed to send ack: {e:?}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if !matches!(e, ClientError::NotConnected) {
+                                    warn!("Failed to send ack burst: {e:?}");
                                 }
                             }
                         }
-                        Err(e) => {
-                            if !matches!(e, ClientError::NotConnected) {
-                                warn!("Failed to send ack burst: {e:?}");
-                            }
-                        }
+                    };
+                    #[cfg(feature = "tracing")]
+                    {
+                        use tracing::Instrument;
+                        send_and_report
+                            .instrument(tracing::trace_span!(
+                                "wa.conn.ack_burst",
+                                frames = frame_count
+                            ))
+                            .await;
                     }
-                    drop(guards);
+                    #[cfg(not(feature = "tracing"))]
+                    {
+                        let _ = frame_count;
+                        send_and_report.await;
+                    }
+                    debug_assert!(
+                        frames.is_empty(),
+                        "send_raw_bytes_burst must always drain its input"
+                    );
+                    guards.clear();
                 }
             }))
             .detach();

@@ -3333,6 +3333,25 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
     );
 }
 
+async fn install_test_noise_socket(
+    client: &Arc<Client>,
+    transport: Arc<dyn crate::transport::Transport>,
+    runtime: Arc<dyn Runtime>,
+) {
+    use crate::socket::NoiseSocket;
+    use wacore::handshake::NoiseCipher;
+
+    let key = [0u8; 32];
+    let noise_socket = NoiseSocket::new(
+        runtime,
+        transport,
+        NoiseCipher::new(&key).expect("valid key"),
+        NoiseCipher::new(&key).expect("valid key"),
+    );
+    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.set_connected_for_test(true);
+}
+
 fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
     Arc::new(crate::types::message::MessageInfo {
         id: id.to_string(),
@@ -3343,6 +3362,180 @@ fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
         },
         ..Default::default()
     })
+}
+
+#[derive(Debug)]
+struct DropSpawnRuntime;
+
+#[async_trait::async_trait]
+impl Runtime for DropSpawnRuntime {
+    fn spawn(
+        &self,
+        _future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> wacore::runtime::AbortHandle {
+        // Dropping the sender future closes its receiver synchronously.
+        wacore::runtime::AbortHandle::noop()
+    }
+
+    fn sleep(&self, _duration: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
+
+    fn spawn_blocking(
+        &self,
+        operation: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move { operation() })
+    }
+
+    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_drains_and_reuses_input_on_happy_paths() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.push(vec![0x11; 32]);
+    let single = client
+        .send_raw_bytes_burst(&mut frames)
+        .await
+        .expect("installed socket");
+    assert_eq!(single.len(), 1);
+    assert!(single.into_iter().all(|result| result.is_ok()));
+    assert!(frames.is_empty(), "the single-frame fast path must drain");
+    assert_eq!(frames.capacity(), retained_capacity);
+
+    frames.extend((0..4).map(|index| vec![index; 32]));
+    let burst = client
+        .send_raw_bytes_burst(&mut frames)
+        .await
+        .expect("installed socket");
+    assert_eq!(burst.len(), 4);
+    assert!(burst.into_iter().all(|result| result.is_ok()));
+    assert!(frames.is_empty(), "the joined path must drain");
+    assert_eq!(frames.capacity(), retained_capacity);
+    assert_eq!(transport.sent_count(), 5, "every frame must reach the wire");
+    assert_eq!(
+        transport.write_count(),
+        2,
+        "the four-frame call must remain one coalesced transport write"
+    );
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_drains_input_when_disconnected() {
+    let client = crate::test_utils::create_test_client().await;
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.extend([vec![0x21; 32], vec![0x22; 32]]);
+
+    let result = client.send_raw_bytes_burst(&mut frames).await;
+    assert!(
+        matches!(result, Err(ClientError::NotConnected)),
+        "a missing socket must remain an outer NotConnected error: {result:?}"
+    );
+    assert!(frames.is_empty(), "the outer-error path must also drain");
+    assert_eq!(frames.capacity(), retained_capacity);
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
+    use crate::socket::error::EncryptSendErrorKind;
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    transport.fail_next_sends(1);
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.push(vec![0x31; 32]);
+    let mut failed = client
+        .send_raw_bytes_burst(&mut frames)
+        .await
+        .expect("the socket lookup itself succeeds");
+    let transport_error = failed
+        .pop()
+        .expect("one result")
+        .expect_err("the transport is configured to fail");
+    assert!(matches!(
+        transport_error.kind,
+        EncryptSendErrorKind::Transport
+    ));
+    assert!(transport_error.is_transport_unavailable());
+    assert!(frames.is_empty());
+    assert_eq!(frames.capacity(), retained_capacity);
+
+    frames.push(vec![0x32; 32]);
+    let mut poisoned = client
+        .send_raw_bytes_burst(&mut frames)
+        .await
+        .expect("the installed socket remains reachable");
+    let poisoned_error = poisoned
+        .pop()
+        .expect("one result")
+        .expect_err("the sender must reject work after an ambiguous write");
+    assert!(matches!(
+        poisoned_error.kind,
+        EncryptSendErrorKind::Poisoned
+    ));
+    assert!(poisoned_error.is_transport_unavailable());
+    assert!(frames.is_empty());
+    assert_eq!(frames.capacity(), retained_capacity);
+    assert_eq!(transport.failed_sends(), 1);
+    assert_eq!(
+        transport.write_count(),
+        0,
+        "a poisoned sender must not attempt another transport write"
+    );
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_surfaces_a_closed_sender_per_frame() {
+    use crate::socket::error::EncryptSendErrorKind;
+
+    let client = crate::test_utils::create_test_client().await;
+    install_test_noise_socket(
+        &client,
+        Arc::new(crate::transport::mock::MockTransport),
+        Arc::new(DropSpawnRuntime),
+    )
+    .await;
+
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.push(vec![0x41; 32]);
+    let mut results = client
+        .send_raw_bytes_burst(&mut frames)
+        .await
+        .expect("the installed socket remains reachable");
+    let error = results
+        .pop()
+        .expect("one result")
+        .expect_err("the sender receiver was dropped at construction");
+    assert!(matches!(error.kind, EncryptSendErrorKind::ChannelClosed));
+    assert!(error.is_transport_unavailable());
+    assert!(frames.is_empty());
+    assert_eq!(frames.capacity(), retained_capacity);
 }
 
 /// Live delivery receipts flow through the persistent worker: the receipt
@@ -3404,6 +3597,39 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
         0,
         "worker must release the flush guard after the send"
     );
+}
+
+/// Transport loss and the poisoned follow-up are reconnect signals, not
+/// receipt-worker stalls: both must release their flush guards without a
+/// second write attempt.
+#[tokio::test]
+async fn delivery_receipt_worker_releases_flush_after_transport_and_poisoned_failures() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    transport.fail_next_sends(1);
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    client.ack_received_message(&receipt_test_info("RCPT-FAIL-1"));
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(client.outbound_flush.pending(), 0);
+    assert_eq!(transport.failed_sends(), 1);
+
+    client.ack_received_message(&receipt_test_info("RCPT-POISONED-2"));
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(client.outbound_flush.pending(), 0);
+    assert_eq!(
+        transport.failed_sends(),
+        1,
+        "the poisoned sender must reject locally instead of touching transport"
+    );
+    assert_eq!(transport.write_count(), 0);
 }
 
 /// A closed flush scope (disconnect in progress) drops live receipts without
@@ -3582,6 +3808,53 @@ async fn outbound_teardown_gate_covers_both_disconnect_signals() {
         client.outbound_teardown_in_progress(),
         "a disconnected client must gate sends even without the expected flag"
     );
+}
+
+/// Exercise the actual deferred-ack worker, not only its predicate. Dropped
+/// teardown batches must release guards, and reusing the batch buffer must not
+/// leak either dropped ack into the next live burst.
+#[tokio::test]
+async fn deferred_ack_worker_drops_teardown_batches_and_recovers_cleanly() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+    let receipt = |id| {
+        let node = NodeBuilder::new("receipt")
+            .attr("from", "15550001111@s.whatsapp.net")
+            .attr("id", id)
+            .build();
+        crate::test_utils::node_to_owned_ref(&node)
+    };
+
+    client.expected_disconnect.store(true, Ordering::Relaxed);
+    client
+        .process_node(receipt("ACK-EXPECTED-DISCONNECT"))
+        .await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(transport.sent_count(), 0);
+
+    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.set_connected_for_test(false);
+    client.process_node(receipt("ACK-DISCONNECTED")).await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(transport.sent_count(), 0);
+
+    client.set_connected_for_test(true);
+    client.process_node(receipt("ACK-LIVE")).await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        transport.sent_count(),
+        1,
+        "only the live ack may survive into the reusable batch"
+    );
+    assert_eq!(client.outbound_flush.pending(), 0);
 }
 
 /// Verifies that `send_ack_for` returns Ok when expected_disconnect is set,
