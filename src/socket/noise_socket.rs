@@ -19,6 +19,25 @@ const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024;
 /// Result type for send operations.
 type SendResult = std::result::Result<(), EncryptSendError>;
 
+/// One batched write's failure, handed to every waiter in that batch.
+///
+/// `anyhow::Error` is not `Clone`, so a shared reference is what lets all the
+/// callers see the real cause instead of a re-worded copy.
+#[derive(Debug)]
+struct SharedSendFailure(Arc<EncryptSendError>);
+
+impl std::fmt::Display for SharedSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SharedSendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(self.0.as_ref())
+    }
+}
+
 /// A job sent to the dedicated sender task.
 struct SendJob {
     plaintext: bytes::Bytes,
@@ -199,14 +218,19 @@ impl NoiseSocket {
             }
 
             // Every frame in this batch shares the fate of the single write.
-            // The error is rebuilt per waiter rather than cloned: it carries an
-            // anyhow::Error, and the only failure reachable here is Transport,
-            // which is what each caller must see to treat the send as lost.
-            let failure = outcome.as_ref().err().map(|e| e.to_string());
+            // EncryptSendError carries an anyhow::Error and is not Clone, and
+            // its Display renders only the kind, so flattening the failure to a
+            // string would hand every caller "transport error" with the actual
+            // cause discarded. Sharing one Arc keeps the whole chain intact for
+            // all of them at the cost of a refcount bump each.
+            let failure = match outcome {
+                Ok(()) => None,
+                Err(err) => Some(Arc::new(err)),
+            };
             for (response_tx, _) in waiters.drain(..) {
                 let result = match &failure {
                     None => Ok(()),
-                    Some(message) => Err(EncryptSendError::transport(anyhow::anyhow!("{message}"))),
+                    Some(err) => Err(EncryptSendError::transport(SharedSendFailure(err.clone()))),
                 };
                 let _ = response_tx.send(result);
             }
@@ -217,9 +241,12 @@ impl NoiseSocket {
     }
 
     /// Encrypt one plaintext and append the framed result to `out_buf`,
-    /// returning its wire size. The counter is burned here because the nonce is
-    /// spent the moment the frame exists, whether or not the write that carries
-    /// it succeeds.
+    /// returning its wire size. The counter is burned once the framed ciphertext
+    /// is committed to `out_buf`, whether or not the write that carries it
+    /// succeeds. Every error path returns before writing a byte into `out_buf`,
+    /// which is the only reason leaving the counter unburned there is sound: a
+    /// change that keeps partial output must burn the counter too, or the next
+    /// frame reuses its nonce.
     async fn encrypt_frame_into(
         runtime: &Arc<dyn Runtime>,
         write_key: &Arc<NoiseCipher>,
@@ -605,6 +632,36 @@ mod tests {
         }
     }
 
+    /// The transport's own error must survive the hop to every caller. It cannot
+    /// be cloned, and `EncryptSendError`'s Display renders only the kind, so a
+    /// naive rebuild silently degrades "connection reset by peer" into
+    /// "transport error" and the caller loses the only diagnostic there was.
+    #[tokio::test]
+    async fn the_transport_cause_reaches_the_caller() {
+        let key = [0x55u8; 32];
+        let transport: Arc<AcceptThenFailTransport> = Arc::new(AcceptThenFailTransport::new(0));
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = NoiseSocket::new(
+            runtime,
+            transport,
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        );
+
+        let err = socket
+            .encrypt_and_send(bytes::Bytes::from(vec![7u8; 32]))
+            .await
+            .expect_err("the transport always fails");
+
+        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        // `{:#}` walks the anyhow chain; the injected message must still be in it.
+        let chain = format!("{:#}", err.source);
+        assert!(
+            chain.contains("injected failure after accepting the frame"),
+            "the transport's cause was lost on the way to the caller: {chain}"
+        );
+    }
+
     /// Splits a concatenated run of length-prefixed frames into their bodies.
     fn split_frames(mut wire: &[u8]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
@@ -691,17 +748,29 @@ mod tests {
         let read_key = NoiseCipher::new(&key).expect("32-byte key");
         let bodies: Vec<Vec<u8>> = writes.iter().flat_map(|w| split_frames(w)).collect();
         assert_eq!(bodies.len(), FRAMES, "every frame must reach the wire");
+
+        // Decrypting frame N under counter N is the order proof: the counter is
+        // the AES-GCM nonce, so a frame written out of order fails to
+        // authenticate here.
+        let mut payloads = Vec::new();
         for (counter, body) in bodies.into_iter().enumerate() {
             let mut body = body;
             read_key
                 .decrypt_in_place_with_counter(counter as u32, &mut body)
                 .expect("frames must be written in counter order");
-            assert_eq!(
-                body,
-                vec![body[0]; 32],
-                "frame body must survive the batch intact"
-            );
+            assert_eq!(body, vec![body[0]; 32], "frame body must survive intact");
+            payloads.push(body[0]);
         }
+
+        // Which producer wins which counter is not fixed - the senders race into
+        // the channel - so the invariant is that each one's payload is on the
+        // wire exactly once, none dropped and none duplicated.
+        payloads.sort_unstable();
+        let expected: Vec<u8> = (0..FRAMES as u8).collect();
+        assert_eq!(
+            payloads, expected,
+            "each producer's payload must appear exactly once"
+        );
     }
 
     /// A framing failure is detected before any byte reaches the wire, so it
