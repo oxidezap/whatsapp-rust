@@ -1356,17 +1356,15 @@ pub(crate) async fn fanout_group_epoch(
             return Err(error);
         }
     };
-    let account = client
-        .persistence_manager()
-        .get_device_snapshot()
-        .account
-        .clone();
-    let device_identity =
-        wacore::send::needs_device_identity(encrypted.includes_prekey_message, account.as_deref())
-            .map_err(|_| {
-                raw_epoch.fill(0);
-                CallError::MissingDeviceIdentity
-            })?;
+    let device = client.persistence_manager().get_device_snapshot();
+    let device_identity = wacore::send::needs_device_identity(
+        encrypted.includes_prekey_message,
+        device.account.as_deref(),
+    )
+    .map_err(|_| {
+        raw_epoch.fill(0);
+        CallError::MissingDeviceIdentity
+    })?;
     client
         .persist_signal_state_pre_wire()
         .await
@@ -2743,7 +2741,8 @@ impl CallHandle {
 
     /// Latest transaction-ordered group state, including waiting-room and participant controls.
     pub fn group_state(&self) -> Option<wacore::voip::GroupCallState> {
-        self.client_registry.group_state(&self.call_id)
+        self.client_registry
+            .group_state_if_current(&self.call_id, self.generation)
     }
 
     /// Invite a user who does not yet belong to the current authoritative roster.
@@ -2768,8 +2767,9 @@ impl CallHandle {
             .await
             .ok_or(CallError::NoDevices)?
             .to_non_ad();
-        let (participants, video) = if let Some(state) =
-            self.client_registry.group_state(&self.call_id)
+        let (participants, video) = if let Some(state) = self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
             && let Some(snapshot) = state.snapshot()
         {
             let member = snapshot
@@ -2808,7 +2808,7 @@ impl CallHandle {
             }
             let session = self
                 .client_registry
-                .snapshot(&self.call_id)
+                .snapshot_if_current(&self.call_id, self.generation)
                 .ok_or(CallError::Media("call is no longer active"))?;
             let participants = self
                 .client_registry
@@ -2821,10 +2821,12 @@ impl CallHandle {
         if participants.is_empty() {
             return Err(CallError::Media("call has no connected invite roster"));
         }
-        let devices = client
-            .get_user_devices(std::slice::from_ref(&target))
-            .await
-            .map_err(|error| CallError::Setup(error.to_string()))?;
+        let devices = drop_hosted_devices(
+            client
+                .get_user_devices(std::slice::from_ref(&target))
+                .await
+                .map_err(|error| CallError::Setup(error.to_string()))?,
+        );
         if devices.is_empty() {
             return Err(CallError::NoDevices);
         }
@@ -2839,6 +2841,7 @@ impl CallHandle {
             video,
         })
         .map_err(|error| CallError::Response(error.to_string()))?;
+        self.ensure_current()?;
         client.send_node(node).await?;
         Ok(())
     }

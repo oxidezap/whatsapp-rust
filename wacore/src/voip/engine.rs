@@ -955,6 +955,9 @@ impl CallEngine {
             group
                 .video_reception
                 .retain(|participant, _| active.contains(participant));
+            group
+                .reaction_last_seen
+                .retain(|participant, _| active.contains(participant));
             group.video_orientations.retain(|jid, _| {
                 update.participants.iter().any(|participant| {
                     participant.state == "connected"
@@ -1031,28 +1034,27 @@ impl CallEngine {
     }
 
     fn refresh_group_allocate(&mut self, update: &GroupCallUpdate) -> Result<(), GroupMediaError> {
-        let Some(relay) = update.relay.as_ref() else {
-            return Ok(());
-        };
-        let (relay_token, endpoint_xor, integrity_key) = group_relay_allocate_material(relay)?;
+        if let Some(relay) = update.relay.as_ref() {
+            let (relay_token, endpoint_xor, integrity_key) = group_relay_allocate_material(relay)?;
+            self.relay_token = relay_token;
+            self.endpoint_xor = endpoint_xor;
+            self.integrity_key = integrity_key;
+        }
         let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
         let pids = remote_group_pids(update, &self.self_participant_id);
         let transaction_id = self.tx_ids.next_tx_id();
         let allocate = Bytes::from(stun::build_wasm_group_stun_allocate_request(
             &stun::WasmGroupStunAllocateRequest {
                 transaction_id: &transaction_id,
-                relay_token: &relay_token,
-                endpoint_xor: &endpoint_xor,
-                integrity_key: &integrity_key,
+                relay_token: &self.relay_token,
+                endpoint_xor: &self.endpoint_xor,
+                integrity_key: &self.integrity_key,
                 stream_ssrcs: &group.stream_ssrcs,
                 app_data_ssrc: group.app_data_ssrc,
                 hbh_fec_ssrcs: &group.hbh_fec_ssrcs,
                 participant_pids: &pids,
             },
         ));
-        self.relay_token = relay_token;
-        self.endpoint_xor = endpoint_xor;
-        self.integrity_key = integrity_key;
         self.allocate = allocate.clone();
         if self.started {
             self.outbox.push_back(Output::Transmit(allocate));
@@ -2308,6 +2310,56 @@ mod encoded_tests {
     }
 
     #[test]
+    fn roster_only_group_update_rebuilds_cached_relay_subscriptions() {
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+        engine
+            .apply_group_update(&group_update())
+            .expect("promote to group");
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        let mut update = group_update();
+        update.transaction_id = 8;
+        let participant = Jid::new("15550003333", Server::Lid);
+        update.participants.push(GroupCallParticipant {
+            jid: participant.clone(),
+            pn: None,
+            state: "connected".to_string(),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: participant,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert!(
+            update.relay.is_none(),
+            "the update intentionally reuses relay state"
+        );
+
+        engine
+            .apply_group_update(&update)
+            .expect("apply roster-only update");
+        let allocation = drain(&mut engine)
+            .into_iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet) => Some(packet),
+                _ => None,
+            })
+            .expect("updated allocation");
+        let subscriptions = stun::create_wasm_group_receiver_subscriptions(&[2, 3]);
+        assert!(
+            allocation
+                .windows(subscriptions.len())
+                .any(|window| window == subscriptions),
+            "the refreshed allocation must subscribe to the complete current PID roster"
+        );
+    }
+
+    #[test]
     fn group_reaction_uses_pt119_retransmits_and_deduplicates_per_sender() {
         let epoch = [0x42; 32];
         let update = group_update();
@@ -2394,6 +2446,29 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::Reaction { .. })))
         );
+
+        let mut departed = group_update();
+        departed.transaction_id = 8;
+        departed.participants.truncate(1);
+        engine
+            .apply_group_update(&departed)
+            .expect("remove participant");
+        let mut rejoined = group_update();
+        rejoined.transaction_id = 9;
+        engine
+            .apply_group_update(&rejoined)
+            .expect("rejoin participant");
+        let restarted = sender.protect_audio(&app_data::encode_reaction(1, "✅").unwrap());
+        engine.handle_input(502, Input::RelayPacket(&restarted));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Event(CallEvent::Reaction {
+                participant,
+                emoji,
+                removed: false,
+                ..
+            }) if *participant == peer_jid.to_non_ad() && emoji == "✅"
+        )));
     }
 
     #[test]

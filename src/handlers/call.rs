@@ -409,15 +409,30 @@ impl StanzaHandler for CallHandler {
                                     _ => false,
                                 };
                         }
-                        CallAction::RaiseHand { raised, .. } => {
-                            let participant = routed_call_sender(&call).to_non_ad();
-                            if client.call_registry().set_raised_hand(
-                                call.action.call_id(),
-                                &participant,
-                                *raised,
+                        CallAction::RaiseHand {
+                            call_id,
+                            call_creator,
+                            raised,
+                        } => {
+                            let sender = routed_call_sender(&call);
+                            if !client.call_registry().group_sender_authorized(
+                                call_id,
+                                call_creator,
+                                &sender,
                             ) {
+                                warn!(
+                                    "call: rejected hand state from unauthorized sender for {call_id}"
+                                );
+                                dispatch_call = false;
+                            } else {
+                                let participant = sender.to_non_ad();
+                                client.call_registry().set_raised_hand(
+                                    call_id,
+                                    &participant,
+                                    *raised,
+                                );
                                 client.call_registry().send_call_event(
-                                    call.action.call_id(),
+                                    call_id,
                                     CallEvent::HandRaised {
                                         participant,
                                         raised: *raised,
@@ -425,15 +440,30 @@ impl StanzaHandler for CallHandler {
                                 );
                             }
                         }
-                        CallAction::ScreenShare { screen_share, .. } => {
-                            let participant = routed_call_sender(&call).to_non_ad();
-                            if client.call_registry().set_screen_share(
-                                call.action.call_id(),
-                                &participant,
-                                screen_share.clone(),
+                        CallAction::ScreenShare {
+                            call_id,
+                            call_creator,
+                            screen_share,
+                        } => {
+                            let sender = routed_call_sender(&call);
+                            if !client.call_registry().group_sender_authorized(
+                                call_id,
+                                call_creator,
+                                &sender,
                             ) {
+                                warn!(
+                                    "call: rejected screen-share state from unauthorized sender for {call_id}"
+                                );
+                                dispatch_call = false;
+                            } else {
+                                let participant = sender.to_non_ad();
+                                client.call_registry().set_screen_share(
+                                    call_id,
+                                    &participant,
+                                    screen_share.clone(),
+                                );
                                 client.call_registry().send_call_event(
-                                    call.action.call_id(),
+                                    call_id,
                                     CallEvent::ScreenShareChanged {
                                         participant,
                                         screen_share: screen_share.clone(),
@@ -839,6 +869,79 @@ mod tests {
         assert_eq!(routed_call_sender(&call), wrapper);
         call.participant = Some(participant.clone());
         assert_eq!(routed_call_sender(&call), participant);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn routed_group_control_rejects_sender_outside_authoritative_roster() {
+        use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
+        use wacore::voip::{CallSession, GroupStateApply};
+
+        let client = make_sending_client().await;
+        let creator = fake_caller_lid();
+        let registry = client.call_registry();
+        let generation = registry.insert(CallSession::new_outgoing(
+            "GROUP-CALL",
+            Jid::new("GROUP-CALL", Server::Call),
+            creator.clone(),
+        ));
+        let update = GroupCallUpdate::builder()
+            .call_id("GROUP-CALL".to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                creator.clone(),
+                vec![GroupCallDevice::new(creator.clone().with_device(1))],
+            )])
+            .build();
+        assert_eq!(
+            registry.apply_group_update(update),
+            GroupStateApply::Applied
+        );
+        let (handler, global_rx) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let outsider = Jid::new("999999999999999", Server::Lid).with_device(9);
+        let stanza = NodeBuilder::new("call")
+            .attr("from", Jid::new("GROUP-CALL", Server::Call))
+            .attr("participant", outsider)
+            .attr("id", "UNAUTHORIZED-CONTROL")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("user_action")
+                .attr("call-id", "GROUP-CALL")
+                .attr("call-creator", creator)
+                .attr("action", "raise_hand")
+                .children([NodeBuilder::new("raise_hand")
+                    .attr("raise-hand-state", "1")
+                    .build()])
+                .build()])
+            .build();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&stanza), &mut cancelled)
+                .await
+        );
+        assert!(
+            cancelled,
+            "the typed control must still receive its typed ACK"
+        );
+        assert!(
+            registry
+                .group_state("GROUP-CALL")
+                .expect("group state")
+                .raised_hands()
+                .is_empty()
+        );
+        assert!(
+            global_rx.try_recv().is_err(),
+            "an unauthorized control must not reach the public event bus"
+        );
+        registry.remove_if_current("GROUP-CALL", generation);
     }
 
     #[cfg(feature = "voip-runtime")]

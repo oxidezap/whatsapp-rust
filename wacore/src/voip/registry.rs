@@ -322,6 +322,16 @@ impl CallRegistry {
             .and_then(|entry| entry.group.clone())
     }
 
+    /// Read group state only when `generation` still owns this call-id.
+    pub fn group_state_if_current(&self, call_id: &str, generation: u64) -> Option<GroupCallState> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.group.clone())
+    }
+
     /// Whether a routed signaling sender belongs to this exact active group call.
     pub fn group_sender_authorized(&self, call_id: &str, call_creator: &Jid, sender: &Jid) -> bool {
         let map = self.inner.lock().expect("registry lock poisoned");
@@ -1148,6 +1158,16 @@ impl CallRegistry {
             .map(|e| e.session.clone())
     }
 
+    /// Read a call session only when `generation` still owns this call-id.
+    pub fn snapshot_if_current(&self, call_id: &str, generation: u64) -> Option<CallSession> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.session.clone())
+    }
+
     /// Take an outgoing call's sibling-dismiss targets: `(call_creator, rung_device_jids)`, leaving
     /// the session's `ring_devices` empty so a duplicate accept/reject can't re-dismiss. Returns
     /// `None` when the call is unknown or has no devices to dismiss (already taken, single-device, or
@@ -1358,6 +1378,29 @@ mod tests {
             &device
         ));
         assert!(!reg.group_sender_authorized("OTHER-CALL", &creator, &device));
+    }
+
+    #[test]
+    fn session_and_group_snapshots_are_generation_scoped() {
+        let reg = CallRegistry::new();
+        let first = reg.insert(session("GROUP-CALL"));
+        assert_eq!(
+            reg.apply_group_update(group_update(1)),
+            GroupStateApply::Applied
+        );
+        assert!(
+            reg.snapshot_if_current("GROUP-CALL", first).is_some()
+                && reg.group_state_if_current("GROUP-CALL", first).is_some()
+        );
+
+        let replacement = reg.insert(session("GROUP-CALL"));
+        assert_ne!(replacement, first);
+        assert!(reg.snapshot_if_current("GROUP-CALL", first).is_none());
+        assert!(
+            reg.group_state_if_current("GROUP-CALL", first).is_none(),
+            "a stale invite handle must not read the replacement roster"
+        );
+        assert!(reg.snapshot_if_current("GROUP-CALL", replacement).is_some());
     }
 
     #[test]

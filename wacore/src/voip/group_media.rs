@@ -348,6 +348,9 @@ impl GroupMediaRegistry {
         let ssrc = parse_rtp_header(packet)?.ssrc;
         let participant_id = self.video_routes.get(&ssrc)?.clone();
         let receiver = self.receivers.get_mut(&participant_id)?;
+        if !receiver.video_enabled {
+            return None;
+        }
         let (header, access_units) = receiver.video.as_mut()?.unprotect_video_packet(packet)?;
         Some(ParticipantVideo {
             participant_id,
@@ -589,7 +592,8 @@ impl GroupMediaRegistry {
             {
                 return Err(GroupMediaError::InvalidSnapshot);
             }
-            if receiver.video.is_some()
+            if receiver.video_enabled
+                && receiver.video.is_some()
                 && video_routes
                     .insert(receiver.video_ssrc, receiver.participant_id.clone())
                     .is_some()
@@ -732,6 +736,19 @@ mod tests {
         .unwrap()
     }
 
+    fn peer_video_sender(key: &[u8], peer: &Jid) -> VideoPipeline {
+        let participant = format_e2e_srtp_participant_id(&peer.to_string());
+        VideoPipeline::new(&VideoPipelineParams {
+            call_key: key,
+            self_lid: &peer.to_string(),
+            peer_lid: "100001:1@lid",
+            ssrc: derive_video_participant_ssrc("CALL", &participant),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn future_epoch_activates_when_roster_arrives_and_routes_by_ssrc() {
         let epoch = [0x42; 32];
@@ -808,6 +825,48 @@ mod tests {
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x52; 20]))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn audio_only_roster_update_disables_retained_video_receiver() {
+        let epoch = [0x35; 32];
+        let alice = Jid::new("200002", Server::Lid).with_device(2);
+        let participants = vec![device("100001", 1, 1), device("200002", 2, 2)];
+        let mut registry = registry();
+        registry
+            .apply_group_update(&update(1, participants.clone()))
+            .unwrap();
+        registry.apply_raw_epoch(1, &epoch).unwrap();
+        let mut sender = peer_video_sender(&epoch, &alice);
+        let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21];
+        let initial = sender.protect_video(&access_unit);
+        assert!(
+            initial
+                .iter()
+                .any(|packet| registry.unprotect_video(packet).is_some())
+        );
+
+        let mut audio_only = update(2, participants.clone());
+        audio_only.media = "audio".to_string();
+        registry.apply_group_update(&audio_only).unwrap();
+        assert!(
+            sender
+                .protect_video(&access_unit)
+                .iter()
+                .all(|packet| registry.unprotect_video(packet).is_none()),
+            "PT-97 must be dropped while the authoritative media mode is audio"
+        );
+
+        registry
+            .apply_group_update(&update(3, participants))
+            .unwrap();
+        assert!(
+            sender
+                .protect_video(&access_unit)
+                .iter()
+                .any(|packet| registry.unprotect_video(packet).is_some()),
+            "a later video roster may reactivate the retained receiver"
         );
     }
 

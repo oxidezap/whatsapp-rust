@@ -41,6 +41,40 @@ pub struct Voip<'a> {
     client: &'a Client,
 }
 
+#[cfg(feature = "voip-runtime")]
+struct CallLinkRegistrationGuard {
+    registry: Arc<wacore::voip::CallRegistry>,
+    call_id: String,
+    generation: u64,
+    armed: bool,
+}
+
+#[cfg(feature = "voip-runtime")]
+impl CallLinkRegistrationGuard {
+    fn new(registry: Arc<wacore::voip::CallRegistry>, call_id: &str, generation: u64) -> Self {
+        Self {
+            registry,
+            call_id: call_id.to_string(),
+            generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "voip-runtime")]
+impl Drop for CallLinkRegistrationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .remove_if_current(&self.call_id, self.generation);
+        }
+    }
+}
+
 impl Client {
     /// Call control: reject/terminate are always available; media (call/accept)
     /// needs the `voip` feature.
@@ -359,6 +393,8 @@ impl Voip<'_> {
         });
         let registry = self.client.call_registry();
         let generation = registry.insert(session);
+        let mut registration =
+            CallLinkRegistrationGuard::new(registry.clone(), &join.call_id, generation);
 
         if join.in_waiting_room {
             let Some(room) = join.pending_waiting_room() else {
@@ -409,6 +445,7 @@ impl Voip<'_> {
             generation,
             wacore::types::group_call::GroupCallDevice::new(own_lid).with_capability(1, capability),
         );
+        registration.disarm();
         Ok(join)
     }
 
@@ -1305,6 +1342,105 @@ mod tests {
         assert!(
             !client.response_waiters_guard().contains_key(&request_id),
             "cancelling a call-service request must not leak its waiter"
+        );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn cancelling_registered_call_link_join_removes_its_generation() {
+        use wacore::handshake::NoiseCipher;
+
+        struct BlockingTransport {
+            started: async_channel::Sender<()>,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for BlockingTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                let _ = self.started.try_send(());
+                futures::future::pending().await
+            }
+
+            async fn disconnect(&self) {}
+        }
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let join_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let join_client = client.clone();
+        let join = tokio::spawn(async move {
+            join_client
+                .voip()
+                .join_call_link_with_audio(
+                    "CANCELLED-CALL-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        let request = join_sent.await.expect("link_join request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let blocking_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(BlockingTransport {
+                started: started_tx,
+            }),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(blocking_socket));
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .attr("id", request_id.as_str())
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "CANCELLED-CALL-ID")
+                    .attr("call-creator", creator)
+                    .attr("link-token", "CANCELLED-CALL-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "1")
+                    .build()])
+                .build(),
+        )
+        .await;
+        started_rx.recv().await.expect("heartbeat send must start");
+        assert!(
+            client
+                .call_registry()
+                .generation_of("CANCELLED-CALL-ID")
+                .is_some(),
+            "the join must register before its heartbeat completes"
+        );
+
+        join.abort();
+        assert!(
+            join.await
+                .expect_err("join should be cancelled")
+                .is_cancelled()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            client.call_registry().generation_of("CANCELLED-CALL-ID"),
+            None,
+            "cancelling after registration must reap only that generation"
         );
     }
 
