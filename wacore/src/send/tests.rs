@@ -4464,6 +4464,14 @@ mod local_identity_change_on_send {
             // sequential awaits, is that every device of the first half lands
             // before any of the second.
             let written = participant_jids(&nodes[1..]);
+            // Before comparing as sets: a set hides a duplicate, so without
+            // this a device written twice while another was dropped could still
+            // match. The count is also what makes `split_at` below meaningful.
+            assert_eq!(
+                written.len(),
+                first.len() + second.len(),
+                "each device must contribute exactly one participant node"
+            );
             let (first_half, second_half) = written.split_at(first.len());
             let as_set = |jids: &[String]| -> std::collections::BTreeSet<String> {
                 jids.iter().cloned().collect()
