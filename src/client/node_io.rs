@@ -687,109 +687,107 @@ impl Client {
             crate::flush_scope::FlushGuard,
         )>();
         let client = Arc::downgrade(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                // Reuse the bounded control buffers for the worker's lifetime.
-                // Encoded payload allocations still move into `Bytes`; only
-                // the outer storage stays here.
-                let mut batch = Vec::with_capacity(Self::MAX_ACK_BURST);
-                let mut frames = Vec::with_capacity(Self::MAX_ACK_BURST);
-                let mut guards = Vec::with_capacity(Self::MAX_ACK_BURST);
-                while let Ok(first) = rx.recv().await {
-                    let Some(client) = client.upgrade() else {
-                        break;
-                    };
+        self.runtime.spawn_detached(Box::pin(async move {
+            // Reuse the bounded control buffers for the worker's lifetime.
+            // Encoded payload allocations still move into `Bytes`; only
+            // the outer storage stays here.
+            let mut batch = Vec::with_capacity(Self::MAX_ACK_BURST);
+            let mut frames = Vec::with_capacity(Self::MAX_ACK_BURST);
+            let mut guards = Vec::with_capacity(Self::MAX_ACK_BURST);
+            while let Ok(first) = rx.recv().await {
+                let Some(client) = client.upgrade() else {
+                    break;
+                };
 
-                    // Take everything already waiting, not just the one job that
-                    // woke us. Awaiting each ack before reading the next is what
-                    // kept the noise sender from ever seeing two frames at once,
-                    // so its batching only fired when some *other* producer
-                    // happened to interleave. `try_recv` only: this never waits
-                    // for work that has not arrived.
-                    batch.push(first);
-                    while batch.len() < Self::MAX_ACK_BURST
-                        && let Ok(next) = rx.try_recv()
-                    {
-                        batch.push(next);
-                    }
-
-                    // The queue is still drained, exactly as the
-                    // one-at-a-time worker did; only the send is skipped.
-                    if client.outbound_teardown_in_progress() {
-                        batch.clear();
-                        continue;
-                    }
-
-                    // Encoding is synchronous, so the whole burst is marshalled
-                    // before anything is sent and arrival order survives.
-                    for (node, guard) in batch.drain(..) {
-                        match client.encode_ack_from_snapshot(
-                            node.get(),
-                            AckParticipantPolicy::OmitReceiptDestinationDuplicate,
-                        ) {
-                            Ok(buf) => {
-                                frames.push(buf);
-                                guards.push(guard);
-                            }
-                            // Matches the single-ack path: log and drop this one
-                            // rather than failing the rest of the burst.
-                            Err(e) => warn!("Failed to encode ack: {e}"),
-                        }
-                    }
-                    if frames.is_empty() {
-                        continue;
-                    }
-
-                    // The per-ack `wa.conn.ack` span lived in `send_ack_for`,
-                    // which this path no longer calls; a burst reports itself
-                    // once, with its size, rather than N times. The result
-                    // inspection is inside the instrumented future, not after
-                    // it: a failure has to be recorded while the span is open,
-                    // the way `send_ack_for`'s `err(Debug)` used to. And
-                    // `instrument` rather than `entered()`, because an
-                    // EnteredSpan is not Send and cannot cross the await.
-                    let frame_count = frames.len();
-                    let send_and_report = async {
-                        match client.send_raw_bytes_burst(&mut frames).await {
-                            Ok(results) => {
-                                for result in results {
-                                    if let Err(e) = result
-                                        && !e.is_transport_unavailable()
-                                    {
-                                        warn!("Failed to send ack: {e:?}");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if !matches!(e, ClientError::NotConnected) {
-                                    warn!("Failed to send ack burst: {e:?}");
-                                }
-                            }
-                        }
-                    };
-                    #[cfg(feature = "tracing")]
-                    {
-                        use tracing::Instrument;
-                        send_and_report
-                            .instrument(tracing::trace_span!(
-                                "wa.conn.ack_burst",
-                                frames = frame_count
-                            ))
-                            .await;
-                    }
-                    #[cfg(not(feature = "tracing"))]
-                    {
-                        let _ = frame_count;
-                        send_and_report.await;
-                    }
-                    debug_assert!(
-                        frames.is_empty(),
-                        "send_raw_bytes_burst must always drain its input"
-                    );
-                    guards.clear();
+                // Take everything already waiting, not just the one job that
+                // woke us. Awaiting each ack before reading the next is what
+                // kept the noise sender from ever seeing two frames at once,
+                // so its batching only fired when some *other* producer
+                // happened to interleave. `try_recv` only: this never waits
+                // for work that has not arrived.
+                batch.push(first);
+                while batch.len() < Self::MAX_ACK_BURST
+                    && let Ok(next) = rx.try_recv()
+                {
+                    batch.push(next);
                 }
-            }))
-            .detach();
+
+                // The queue is still drained, exactly as the
+                // one-at-a-time worker did; only the send is skipped.
+                if client.outbound_teardown_in_progress() {
+                    batch.clear();
+                    continue;
+                }
+
+                // Encoding is synchronous, so the whole burst is marshalled
+                // before anything is sent and arrival order survives.
+                for (node, guard) in batch.drain(..) {
+                    match client.encode_ack_from_snapshot(
+                        node.get(),
+                        AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+                    ) {
+                        Ok(buf) => {
+                            frames.push(buf);
+                            guards.push(guard);
+                        }
+                        // Matches the single-ack path: log and drop this one
+                        // rather than failing the rest of the burst.
+                        Err(e) => warn!("Failed to encode ack: {e}"),
+                    }
+                }
+                if frames.is_empty() {
+                    continue;
+                }
+
+                // The per-ack `wa.conn.ack` span lived in `send_ack_for`,
+                // which this path no longer calls; a burst reports itself
+                // once, with its size, rather than N times. The result
+                // inspection is inside the instrumented future, not after
+                // it: a failure has to be recorded while the span is open,
+                // the way `send_ack_for`'s `err(Debug)` used to. And
+                // `instrument` rather than `entered()`, because an
+                // EnteredSpan is not Send and cannot cross the await.
+                let frame_count = frames.len();
+                let send_and_report = async {
+                    match client.send_raw_bytes_burst(&mut frames).await {
+                        Ok(results) => {
+                            for result in results {
+                                if let Err(e) = result
+                                    && !e.is_transport_unavailable()
+                                {
+                                    warn!("Failed to send ack: {e:?}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !matches!(e, ClientError::NotConnected) {
+                                warn!("Failed to send ack burst: {e:?}");
+                            }
+                        }
+                    }
+                };
+                #[cfg(feature = "tracing")]
+                {
+                    use tracing::Instrument;
+                    send_and_report
+                        .instrument(tracing::trace_span!(
+                            "wa.conn.ack_burst",
+                            frames = frame_count
+                        ))
+                        .await;
+                }
+                #[cfg(not(feature = "tracing"))]
+                {
+                    let _ = frame_count;
+                    send_and_report.await;
+                }
+                debug_assert!(
+                    frames.is_empty(),
+                    "send_raw_bytes_burst must always drain its input"
+                );
+                guards.clear();
+            }
+        }));
         tx
     }
 
@@ -983,7 +981,7 @@ impl Client {
 
         let client_clone = self.clone();
         let task_generation = current_generation;
-        self.runtime.spawn(Box::pin(async move {
+        self.runtime.spawn_detached(Box::pin(async move {
             // Update LID if changed (moved here to avoid blocking the read loop
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
@@ -1089,7 +1087,7 @@ impl Client {
             let key_generation = task_generation;
             client_clone
                 .runtime
-                .spawn(Box::pin(async move {
+                .spawn_detached(Box::pin(async move {
                     // A newer connection may have taken over between spawn and now.
                     if key_client.connection_generation.load(Ordering::SeqCst) != key_generation {
                         return;
@@ -1110,8 +1108,7 @@ impl Client {
                     {
                         warn!("Signed pre-key rotation check failed: {e:?}");
                     }
-                }))
-                .detach();
+                }));
 
             // === Send active IQ ===
             // The server sends <ib><offline count="X"/></ib> AFTER we exit passive mode.
@@ -1144,7 +1141,7 @@ impl Client {
             // Background initialization queries (can run in parallel, non-blocking)
             let bg_client = client_clone.clone();
             let bg_generation = task_generation;
-            client_clone.runtime.spawn(Box::pin(async move {
+            client_clone.runtime.spawn_detached(Box::pin(async move {
                 // Check connection and generation before starting background queries
                 if bg_client.connection_generation.load(Ordering::SeqCst) != bg_generation {
                     debug!("Skipping background init queries: connection generation changed");
@@ -1238,7 +1235,7 @@ impl Client {
                 {
                     warn!("Background init: Failed to prune expired tc_tokens: {e:?}");
                 }
-            })).detach();
+            }));
 
             check_generation!();
 
@@ -1372,7 +1369,7 @@ impl Client {
                 // Spawn remaining non-critical collections in background
                 let sync_client = client_clone.clone();
                 let sync_generation = task_generation;
-                client_clone.runtime.spawn(Box::pin(async move {
+                client_clone.runtime.spawn_detached(Box::pin(async move {
                     if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
                         debug!("App state sync cancelled: connection generation changed");
                         return;
@@ -1396,7 +1393,7 @@ impl Client {
                         .needs_initial_full_sync
                         .store(false, Ordering::Relaxed);
                     debug!(target: "Client/AppState", "Initial App State Sync Completed.");
-                })).detach();
+                }));
             } else {
                 // === Reconnection path ===
                 // Pushname is already known, send presence and Connected immediately.
@@ -1419,7 +1416,7 @@ impl Client {
 
                 client_clone.dispatch_connected(task_generation).await;
             }
-        })).detach();
+        }));
     }
 
     /// Ack entry point for callers that already share the node: the waiter
@@ -1479,18 +1476,16 @@ impl Client {
         }
         let client = Arc::clone(self);
         let server = server.as_str().to_string();
-        self.runtime
-            .spawn(Box::pin(async move {
-                client
-                    .handle_phash_mismatch(
-                        &waiter.jid,
-                        &waiter.expected,
-                        &server,
-                        waiter.invalidate_group_cache,
-                    )
-                    .await;
-            }))
-            .detach();
+        self.runtime.spawn_detached(Box::pin(async move {
+            client
+                .handle_phash_mismatch(
+                    &waiter.jid,
+                    &waiter.expected,
+                    &server,
+                    waiter.invalidate_group_cache,
+                )
+                .await;
+        }));
     }
 
     fn warn_ack_waiter_dropped(rejected: &Arc<wacore_binary::OwnedNodeRef>) {
@@ -1737,11 +1732,9 @@ impl Client {
             self.is_logged_in.store(false, Ordering::Relaxed);
             let transport_opt = self.transport.lock().await.clone();
             if let Some(transport) = transport_opt {
-                self.runtime
-                    .spawn(Box::pin(async move {
-                        transport.disconnect().await;
-                    }))
-                    .detach();
+                self.runtime.spawn_detached(Box::pin(async move {
+                    transport.disconnect().await;
+                }));
             }
             info!("Notifying connection shutdown from stream error handler");
             self.notify_connection_shutdown();

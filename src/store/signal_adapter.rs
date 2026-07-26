@@ -180,8 +180,8 @@ impl SessionStore for SessionAdapter {
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        if let Some(known) = self.0.cache.try_has_session(address) {
-            return Box::pin(ready(Ok(known)));
+        if let Some(answer) = SessionStore::try_has_session(self, address) {
+            return Box::pin(ready(answer));
         }
         Box::pin(async move {
             let device = self.0.device.read().await;
