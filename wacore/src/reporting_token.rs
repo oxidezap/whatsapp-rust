@@ -17,6 +17,7 @@
 //! without seeing the full message content. Only specific fields are extracted
 //! based on a predefined whitelist matching WhatsApp Web behavior.
 
+use smallvec::SmallVec;
 use std::{fmt, sync::LazyLock};
 
 use anyhow::{Result, anyhow};
@@ -499,6 +500,25 @@ fn encode_varint(value: u64) -> Vec<u8> {
     buf[..len].to_vec()
 }
 
+/// One extracted field's bytes on the way to the token.
+///
+/// A field the token copies verbatim is named by its range in the input, so it
+/// is copied once, into the result. Only a nested field, whose content is
+/// re-framed under a fresh tag and length, has bytes of its own.
+enum Piece {
+    Borrowed(core::ops::Range<usize>),
+    Owned(Vec<u8>),
+}
+
+impl Piece {
+    fn len(&self) -> usize {
+        match self {
+            Piece::Borrowed(range) => range.len(),
+            Piece::Owned(bytes) => bytes.len(),
+        }
+    }
+}
+
 /// Extract reporting token content from encoded protobuf message bytes.
 ///
 /// This function parses raw protobuf bytes and extracts only the fields
@@ -514,8 +534,12 @@ pub fn extract_reporting_token_content(
     data: &[u8],
     whitelist: &[ReportingField],
 ) -> Option<Vec<u8>> {
-    // Pre-size: most messages have 1-3 fields
-    let mut extracted: Vec<(u32, Vec<u8>)> = Vec::with_capacity(4);
+    // The token's bytes are contract: fields are concatenated in ascending
+    // field-number order, ties in wire order (`sort_by_key` is stable). Only
+    // where the bytes come from changed -- a flat field is named by its range
+    // in the input, and the staging list is inline for the field counts a real
+    // message has.
+    let mut extracted: SmallVec<[(u32, Piece); 4]> = SmallVec::new();
     let mut pos = 0;
 
     while pos < data.len() {
@@ -539,7 +563,7 @@ pub fn extract_reporting_token_content(
                 let (_, val_len) = decode_varint(&data[pos..])?;
                 pos += val_len;
                 if entry.is_some() {
-                    extracted.push((field_number, data[field_start..pos].to_vec()));
+                    extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                 }
             }
             wire_type::FIXED64 => {
@@ -548,7 +572,7 @@ pub fn extract_reporting_token_content(
                 }
                 pos += 8;
                 if entry.is_some() {
-                    extracted.push((field_number, data[field_start..pos].to_vec()));
+                    extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                 }
             }
             wire_type::FIXED32 => {
@@ -557,7 +581,7 @@ pub fn extract_reporting_token_content(
                 }
                 pos += 4;
                 if entry.is_some() {
-                    extracted.push((field_number, data[field_start..pos].to_vec()));
+                    extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                 }
             }
             wire_type::LENGTH_DELIMITED => {
@@ -588,7 +612,7 @@ pub fn extract_reporting_token_content(
                             field_bytes.extend_from_slice(&tag_buf[..tag_len]);
                             field_bytes.extend_from_slice(&len_buf[..len_len]);
                             field_bytes.extend(nested);
-                            extracted.push((field_number, field_bytes));
+                            extracted.push((field_number, Piece::Owned(field_bytes)));
                         }
                     } else if let Some(subfields) = entry.subfields {
                         if let Some(nested) = extract_reporting_token_content(
@@ -607,10 +631,10 @@ pub fn extract_reporting_token_content(
                             field_bytes.extend_from_slice(&tag_buf[..tag_len]);
                             field_bytes.extend_from_slice(&len_buf[..len_len]);
                             field_bytes.extend(nested);
-                            extracted.push((field_number, field_bytes));
+                            extracted.push((field_number, Piece::Owned(field_bytes)));
                         }
                     } else {
-                        extracted.push((field_number, data[field_start..pos].to_vec()));
+                        extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                     }
                 }
             }
@@ -627,10 +651,13 @@ pub fn extract_reporting_token_content(
 
     extracted.sort_by_key(|(num, _)| *num);
 
-    let total_len: usize = extracted.iter().map(|(_, v)| v.len()).sum();
+    let total_len: usize = extracted.iter().map(|(_, piece)| piece.len()).sum();
     let mut result = Vec::with_capacity(total_len);
-    for (_, bytes) in extracted {
-        result.extend(bytes);
+    for (_, piece) in extracted {
+        match piece {
+            Piece::Borrowed(range) => result.extend_from_slice(&data[range]),
+            Piece::Owned(bytes) => result.extend_from_slice(&bytes),
+        }
     }
     Some(result)
 }
@@ -1627,6 +1654,191 @@ mod tests {
             extracted, expected,
             "Nested extraction with subfield filtering failed"
         );
+    }
+
+    /// Nothing whitelisted matched: the token has no content at all, which is
+    /// a distinct answer from "content that happens to be empty".
+    #[test]
+    fn no_matching_field_yields_no_content() {
+        let data = vec![
+            0x08, 0x96, 0x01, // field 1: varint 150
+            0x12, 0x05, b'h', b'e', b'l', b'l', b'o', // field 2: "hello"
+        ];
+        let whitelist = &[ReportingField::new(9)];
+        assert!(extract_reporting_token_content(&data, whitelist).is_none());
+        assert!(extract_reporting_token_content(&[], whitelist).is_none());
+    }
+
+    /// The concatenation order is by ascending field number, not wire order:
+    /// a message that puts a higher-numbered field first must still hash the
+    /// same as one that does not.
+    #[test]
+    fn fields_are_concatenated_in_field_number_order_not_wire_order() {
+        let low = [0x0a, 0x01, b'a']; // field 1: "a"
+        let high = [0x12, 0x01, b'b']; // field 2: "b"
+        let whitelist = &[ReportingField::new(1), ReportingField::new(2)];
+
+        let mut wire_ascending = Vec::new();
+        wire_ascending.extend_from_slice(&low);
+        wire_ascending.extend_from_slice(&high);
+        let mut wire_descending = Vec::new();
+        wire_descending.extend_from_slice(&high);
+        wire_descending.extend_from_slice(&low);
+
+        let expected = [0x0a, 0x01, b'a', 0x12, 0x01, b'b'];
+        assert_eq!(
+            extract_reporting_token_content(&wire_ascending, whitelist).unwrap(),
+            expected
+        );
+        assert_eq!(
+            extract_reporting_token_content(&wire_descending, whitelist).unwrap(),
+            expected
+        );
+    }
+
+    /// Repeats of the same field keep their wire order relative to each other,
+    /// which is what makes the sort's stability part of the wire contract.
+    #[test]
+    fn repeats_of_one_field_keep_their_wire_order() {
+        let data = vec![
+            0x0a, 0x01, b'x', // field 1: "x"
+            0x12, 0x01, b'm', // field 2: "m"
+            0x0a, 0x01, b'y', // field 1: "y"
+        ];
+        let whitelist = &[ReportingField::new(1), ReportingField::new(2)];
+
+        assert_eq!(
+            extract_reporting_token_content(&data, whitelist).unwrap(),
+            vec![0x0a, 0x01, b'x', 0x0a, 0x01, b'y', 0x12, 0x01, b'm'],
+        );
+    }
+
+    /// More fields than the inline staging list holds: spilling must not
+    /// reorder or drop anything.
+    #[test]
+    fn more_fields_than_the_inline_list_holds_still_concatenate_in_order() {
+        let mut data = Vec::new();
+        let mut whitelist = Vec::new();
+        // Emit fields 8..=1 (descending on the wire) so the sort has work to do.
+        for field in (1u8..=8).rev() {
+            data.push((field << 3) | 2);
+            data.push(1);
+            data.push(b'a' + field);
+            whitelist.push(ReportingField::new(u32::from(field)));
+        }
+
+        let extracted = extract_reporting_token_content(&data, &whitelist)
+            .expect("eight whitelisted fields extract");
+
+        let mut expected = Vec::new();
+        for field in 1u8..=8 {
+            expected.push((field << 3) | 2);
+            expected.push(1);
+            expected.push(b'a' + field);
+        }
+        assert_eq!(extracted, expected);
+    }
+
+    /// A multi-byte payload must be copied byte for byte: a range-based piece
+    /// that got its bounds wrong would slice a UTF-8 sequence in half.
+    #[test]
+    fn a_multibyte_payload_survives_the_copy_byte_for_byte() {
+        let text = "héllo ✅ 日本";
+        let bytes = text.as_bytes();
+        let mut data = vec![0x0a, u8::try_from(bytes.len()).unwrap()];
+        data.extend_from_slice(bytes);
+        // A second, unwhitelisted field so the extraction is not the whole input.
+        data.extend_from_slice(&[0x12, 0x02, 0xff, 0xfe]);
+
+        let whitelist = &[ReportingField::new(1)];
+        let extracted = extract_reporting_token_content(&data, whitelist)
+            .expect("the whitelisted field extracts");
+
+        assert_eq!(extracted, data[..2 + bytes.len()]);
+        assert_eq!(std::str::from_utf8(&extracted[2..]).unwrap(), text);
+    }
+
+    /// A nested field is re-framed under a fresh length, so it is the one kind
+    /// of piece that cannot be a range into the input.
+    #[test]
+    fn a_nested_field_is_rebuilt_and_still_ordered_with_the_flat_ones() {
+        let inner = vec![
+            0x0a, 0x01, b'a', // field 1: "a" (kept)
+            0x12, 0x01, b'b', // field 2: "b" (dropped)
+        ];
+        // field 1 (flat, kept) then field 6 (nested), emitted in that order.
+        let mut data = vec![0x0a, 0x01, b'z'];
+        data.push(0x32);
+        data.push(u8::try_from(inner.len()).unwrap());
+        data.extend_from_slice(&inner);
+
+        static TEST_SUBFIELDS: &[ReportingField] = &[ReportingField::new(1)];
+        let whitelist = &[
+            ReportingField::new(1),
+            ReportingField::with_subfields(6, TEST_SUBFIELDS),
+        ];
+
+        let extracted = extract_reporting_token_content(&data, whitelist)
+            .expect("flat + nested fields extract");
+
+        assert_eq!(
+            extracted,
+            vec![
+                0x0a, 0x01, b'z', // field 1 verbatim
+                0x32, 0x03, 0x0a, 0x01, b'a', // field 6 re-framed around field 1 only
+            ],
+        );
+    }
+
+    /// A nested field whose every subfield is filtered out contributes
+    /// nothing, rather than an empty re-framed wrapper.
+    #[test]
+    fn a_nested_field_with_nothing_kept_contributes_nothing() {
+        let inner = vec![0x12, 0x01, b'b']; // field 2 only
+        let mut data = vec![0x32, u8::try_from(inner.len()).unwrap()];
+        data.extend_from_slice(&inner);
+
+        static TEST_SUBFIELDS: &[ReportingField] = &[ReportingField::new(1)];
+        let whitelist = &[ReportingField::with_subfields(6, TEST_SUBFIELDS)];
+
+        assert!(extract_reporting_token_content(&data, whitelist).is_none());
+    }
+
+    /// The result is allocated once, from a length summed over every piece.
+    /// A piece kind left out of that sum makes the buffer grow mid-write,
+    /// which is exactly the allocation this staging model exists to avoid.
+    #[test]
+    fn the_result_is_allocated_once_for_the_exact_length_it_holds() {
+        // Sizes chosen so an understated reservation cannot land back on the
+        // final length by accident: Vec grows to at least twice its capacity.
+        let inner = vec![0x0a, 0x01, b'a'];
+        let mut nested_and_flat = vec![0x0a, 0x0a];
+        nested_and_flat.extend_from_slice(b"0123456789");
+        nested_and_flat.push(0x32);
+        nested_and_flat.push(u8::try_from(inner.len()).unwrap());
+        nested_and_flat.extend_from_slice(&inner);
+
+        static TEST_SUBFIELDS: &[ReportingField] = &[ReportingField::new(1)];
+        let cases: [(&[u8], &[ReportingField]); 2] = [
+            (&[0x0a, 0x01, b'z'], &[ReportingField::new(1)]),
+            (
+                &nested_and_flat,
+                &[
+                    ReportingField::new(1),
+                    ReportingField::with_subfields(6, TEST_SUBFIELDS),
+                ],
+            ),
+        ];
+
+        for (data, whitelist) in cases {
+            let extracted =
+                extract_reporting_token_content(data, whitelist).expect("content extracts");
+            assert_eq!(
+                extracted.capacity(),
+                extracted.len(),
+                "the result grew past its reservation, so a piece was not counted"
+            );
+        }
     }
 
     #[test]

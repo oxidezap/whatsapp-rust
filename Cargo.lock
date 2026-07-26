@@ -3959,6 +3959,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "smallvec",
  "smoothutf8",
  "subtle",
  "thiserror 2.0.19",

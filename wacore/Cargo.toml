@@ -81,6 +81,7 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+smallvec = "1.15"
 smoothutf8 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
