@@ -1,0 +1,1 @@
+ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e
