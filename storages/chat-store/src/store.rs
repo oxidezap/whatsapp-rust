@@ -1164,6 +1164,45 @@ fn refresh_preview_if_latest(
     Ok(true)
 }
 
+struct ChatHead {
+    timestamp_ms: i64,
+    preview: Option<String>,
+    kind: Option<String>,
+}
+
+fn newest_chat_head(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+) -> QueryResult<Option<ChatHead>> {
+    use schema::messages::dsl;
+    let newest: Option<(i64, Option<String>, String, bool)> = dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+        .select((
+            dsl::timestamp_ms,
+            dsl::text_content,
+            dsl::kind,
+            dsl::revoked,
+        ))
+        .first(conn)
+        .optional()?;
+    Ok(newest.map(|(timestamp_ms, text, kind, revoked)| {
+        // A tombstone previews as nothing at all — its pre-revoke kind must
+        // not leak back into the chat head.
+        let (preview, kind) = if revoked {
+            (None, None)
+        } else {
+            (text, Some(kind))
+        };
+        ChatHead {
+            timestamp_ms,
+            preview,
+            kind,
+        }
+    }))
+}
+
 /// Re-derive the chat-list preview from the newest remaining message (used
 /// after deletions, where the previewed row may be gone).
 ///
@@ -1176,18 +1215,9 @@ fn recompute_chat_preview(
     device_id: i32,
     chat: &str,
 ) -> QueryResult<()> {
-    use schema::messages::dsl;
-    let newest: Option<(Option<String>, String, bool)> = dsl::messages
-        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
-        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
-        .select((dsl::text_content, dsl::kind, dsl::revoked))
-        .first(conn)
-        .optional()?;
-    let (preview, kind) = match newest {
-        // A tombstone previews as nothing at all — its pre-revoke kind must
-        // not leak back (mirrors the revoke path's (None, None)).
-        Some((_, _, true)) | None => (None, None),
-        Some((text, kind, false)) => (text, Some(kind)),
+    let (preview, kind) = match newest_chat_head(conn, device_id, chat)? {
+        Some(head) => (head.preview, head.kind),
+        None => (None, None),
     };
     diesel::update(chat_row(device_id, chat))
         .set((
@@ -1199,9 +1229,8 @@ fn recompute_chat_preview(
 }
 
 /// Re-derive the chat head when the server replaces an optimistic outgoing
-/// timestamp. A deleted newer message deliberately keeps its activity time, so
-/// only touch the chat row when the corrected message owned the old head or
-/// moves at/after the current one.
+/// timestamp. A deleted newer message deliberately keeps its activity time,
+/// while the preview always follows the newest surviving row.
 fn reconcile_chat_head_after_timestamp_change(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1217,42 +1246,26 @@ fn reconcile_chat_head_after_timestamp_change(
     let Some(current_head) = current_head else {
         return Ok(false);
     };
-    if current_head != old_timestamp_ms && new_timestamp_ms < current_head {
-        return Ok(false);
-    }
-
-    use schema::messages::dsl as messages;
-    let newest: Option<(i64, Option<String>, String, bool)> = messages::messages
-        .filter(
-            messages::device_id
-                .eq(device_id)
-                .and(messages::chat_jid.eq(chat)),
-        )
-        .order((messages::timestamp_ms.desc(), messages::msg_id.desc()))
-        .select((
-            messages::timestamp_ms,
-            messages::text_content,
-            messages::kind,
-            messages::revoked,
-        ))
-        .first(conn)
-        .optional()?;
-    let Some((timestamp_ms, text, kind, revoked)) = newest else {
+    let Some(head) = newest_chat_head(conn, device_id, chat)? else {
         return Ok(false);
     };
-    let (preview, kind) = if revoked {
-        (None, None)
+    let updated = if current_head != old_timestamp_ms && new_timestamp_ms < current_head {
+        diesel::update(chat_row(device_id, chat))
+            .set((
+                chats::last_message_preview.eq(head.preview),
+                chats::last_message_kind.eq(head.kind),
+            ))
+            .execute(conn)?
     } else {
-        (text, Some(kind))
+        diesel::update(chat_row(device_id, chat))
+            .set((
+                chats::last_message_ts.eq(head.timestamp_ms),
+                chats::last_message_preview.eq(head.preview),
+                chats::last_message_kind.eq(head.kind),
+            ))
+            .execute(conn)?
     };
-    Ok(diesel::update(chat_row(device_id, chat))
-        .set((
-            chats::last_message_ts.eq(timestamp_ms),
-            chats::last_message_preview.eq(preview),
-            chats::last_message_kind.eq(kind),
-        ))
-        .execute(conn)?
-        > 0)
+    Ok(updated > 0)
 }
 
 fn apply_reaction(
@@ -1473,6 +1486,50 @@ fn apply_receipt(
     Ok(())
 }
 
+fn resolve_server_ack_message(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    ack: &wacore::types::events::ServerAck,
+    cs: &mut ChangeSet,
+) -> QueryResult<Option<(String, i64)>> {
+    use schema::messages::dsl;
+    if let Some(from) = &ack.from {
+        let chat = crate::lid::route_chat_key(conn, device_id, &from.to_string(), cs)?;
+        let timestamp_ms: Option<i64> = message_row(device_id, &chat, &ack.id)
+            .filter(dsl::from_me.eq(true))
+            .select(dsl::timestamp_ms)
+            .first(conn)
+            .optional()?;
+        if let Some(timestamp_ms) = timestamp_ms {
+            return Ok(Some((chat, timestamp_ms)));
+        }
+    }
+
+    // Some server acks omit the chat identity. The id remains safe only when
+    // it identifies exactly one outgoing row for this device.
+    let mut matches: Vec<(String, i64)> = dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::msg_id.eq(&ack.id))
+                .and(dsl::from_me.eq(true)),
+        )
+        .select((dsl::chat_jid, dsl::timestamp_ms))
+        .limit(2)
+        .load(conn)?;
+    if matches.len() == 1 {
+        return Ok(matches.pop());
+    }
+    if matches.len() > 1 {
+        warn!(
+            target: "ChatStore/Ack",
+            "Ignoring ambiguous message ack for reused id {}",
+            ack.id
+        );
+    }
+    Ok(None)
+}
+
 fn apply_server_ack(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1484,17 +1541,8 @@ fn apply_server_ack(
         return Ok(());
     }
     use schema::messages::dsl;
-    let row: Option<(String, i64)> = dsl::messages
-        .filter(
-            dsl::device_id
-                .eq(device_id)
-                .and(dsl::msg_id.eq(&ack.id))
-                .and(dsl::from_me.eq(true)),
-        )
-        .select((dsl::chat_jid, dsl::timestamp_ms))
-        .first(conn)
-        .optional()?;
-    let Some((chat, old_timestamp_ms)) = row else {
+    let Some((chat, old_timestamp_ms)) = resolve_server_ack_message(conn, device_id, ack, cs)?
+    else {
         return Ok(());
     };
     let target = message_row(device_id, &chat, &ack.id).filter(dsl::from_me.eq(true));

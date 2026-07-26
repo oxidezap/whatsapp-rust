@@ -409,6 +409,185 @@ async fn server_ack_reconciles_timestamp_after_receipt_advanced_status() {
 }
 
 #[tokio::test]
+async fn server_nack_does_not_reconcile_timestamp() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let local_timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-NACK-CLOCK",
+            &wa::Message::text("hello"),
+            local_timestamp,
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-NACK-CLOCK".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .timestamp(Utc.timestamp_opt(1_700_000_500, 0).unwrap())
+                .error("479".to_string())
+                .build(),
+        )],
+    )
+    .await;
+
+    let msg = chat_store
+        .message(&chat, "OUT-NACK-CLOCK")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Error);
+    assert_eq!(msg.timestamp, local_timestamp);
+}
+
+#[tokio::test]
+async fn server_ack_disambiguates_reused_message_id_by_chat() {
+    let (_store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+    let group = jid(GROUP);
+    let peer_timestamp = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+    let group_timestamp = Utc.timestamp_opt(1_700_000_200, 0).unwrap();
+    let server_timestamp = Utc.timestamp_opt(1_700_000_300, 0).unwrap();
+    let shared_id = "OUT-SHARED-ID";
+
+    chat_store
+        .record_outgoing(&peer, shared_id, &wa::Message::text("peer"), peer_timestamp)
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &group,
+            shared_id,
+            &wa::Message::text("group"),
+            group_timestamp,
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    // Without a usable chat identity, a duplicate id is ambiguous and must
+    // update neither row.
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id(shared_id.to_string())
+                .class("message".to_string())
+                .timestamp(server_timestamp)
+                .build(),
+        )],
+    )
+    .await;
+    for (chat, timestamp) in [(&peer, peer_timestamp), (&group, group_timestamp)] {
+        let msg = chat_store.message(chat, shared_id).await.unwrap().unwrap();
+        assert_eq!(msg.status, MessageStatus::Pending);
+        assert_eq!(msg.timestamp, timestamp);
+    }
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id(shared_id.to_string())
+                .class("message".to_string())
+                .from(group.clone())
+                .timestamp(server_timestamp)
+                .build(),
+        )],
+    )
+    .await;
+
+    let peer_msg = chat_store.message(&peer, shared_id).await.unwrap().unwrap();
+    assert_eq!(peer_msg.status, MessageStatus::Pending);
+    assert_eq!(peer_msg.timestamp, peer_timestamp);
+    let group_msg = chat_store
+        .message(&group, shared_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group_msg.status, MessageStatus::ServerAck);
+    assert_eq!(group_msg.timestamp, server_timestamp);
+}
+
+#[tokio::test]
+async fn server_ack_refreshes_preview_behind_retained_activity_timestamp() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let server_timestamp = Utc.timestamp_opt(1_700_000_050, 0).unwrap();
+    let survivor_timestamp = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+    let local_timestamp = Utc.timestamp_opt(1_700_000_200, 0).unwrap();
+    let deleted_timestamp = Utc.timestamp_opt(1_700_000_300, 0).unwrap();
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-RETAINED-HEAD",
+            &wa::Message::text("question"),
+            local_timestamp,
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("survivor"),
+                incoming_info(PEER, PEER, "MSG-SURVIVOR", survivor_timestamp.timestamp()),
+            ),
+            message_event(
+                wa::Message::text("delete me"),
+                incoming_info(
+                    PEER,
+                    PEER,
+                    "MSG-DELETED-HEAD",
+                    deleted_timestamp.timestamp(),
+                ),
+            ),
+        ],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [Event::DeleteMessageForMeUpdate(
+            wacore::types::events::DeleteMessageForMeUpdate::builder()
+                .chat_jid(chat.clone())
+                .message_id("MSG-DELETED-HEAD".to_string())
+                .from_me(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_400, 0).unwrap())
+                .action(Box::new(
+                    wa::sync_action_value::DeleteMessageForMeAction::default(),
+                ))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_at, Some(deleted_timestamp));
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("question"));
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-RETAINED-HEAD".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .timestamp(server_timestamp)
+                .build(),
+        )],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_at, Some(deleted_timestamp));
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("survivor"));
+}
+
+#[tokio::test]
 async fn edit_updates_and_revoke_tombstones() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
