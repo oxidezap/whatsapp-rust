@@ -12,14 +12,17 @@
 //! logic so the Tokio driver, the WASM bridge, and (for the control plane) embedded consumers all
 //! drive one implementation.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 
+use super::app_data;
 use super::audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
 };
-use super::demux::{RelayPacketKind, classify_relay_packet};
+use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
+use super::group_audio::ParticipantAudioMixer;
+use super::group_media::{GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupRosterApply};
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
@@ -30,13 +33,16 @@ use super::rtcp::{
 #[cfg(feature = "voip-mlow")]
 use super::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use super::rtp::{
-    RTP_PAYLOAD_TYPE_H264, VIDEO_CLOCK_RATE, VIDEO_TS_STRIDE_15FPS, parse_rtp_header,
+    RTP_PAYLOAD_TYPE_APP_DATA, RTP_PAYLOAD_TYPE_H264, VIDEO_CLOCK_RATE, VIDEO_TS_STRIDE_15FPS,
+    parse_rtp_header,
 };
 use super::session::{
     CallDirection, MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
 };
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
+use crate::types::group_call::{GroupCallRelay, GroupCallUpdate, ScreenShare, WaitingRoom};
+use wacore_binary::Jid;
 
 /// Monotonic milliseconds. The shell supplies it; the engine never reads a clock.
 pub type Millis = u64;
@@ -54,6 +60,8 @@ const RTCP_MS: Millis = 1500;
 const ALLOCATE_TIMEOUT_MS: Millis = 10_000;
 /// Playout drain cadence: hand the speaker a fixed slice every 20ms so it stays fed at 16kHz.
 const PLAYOUT_MS: Millis = 20;
+const APP_DATA_RETRANSMIT_MS: Millis = 50;
+const APP_DATA_RETRANSMIT_COUNT: u8 = 10;
 /// 20ms @ 16kHz: samples drained to the speaker per playout tick.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_DRAIN: usize = 320;
@@ -152,6 +160,16 @@ pub struct CallConfig {
     pub enable_sframe: bool,
 }
 
+/// Group-media inputs layered onto a regular engine before it starts.
+pub struct GroupEngineConfig {
+    pub call_creator: Jid,
+    pub self_jid: Jid,
+    pub initial_update: GroupCallUpdate,
+    /// Present when a live direct call is upgraded in place. The existing
+    /// authenticated receiver stays active until a PID-bearing roster arrives.
+    pub direct_peer: Option<(Jid, Jid, Vec<u8>)>,
+}
+
 // Manual Debug so a stray `{:?}` can't leak the SRTP callKey, the STUN integrity key, or the relay
 // token (all live call credentials), matching the redaction the sibling key structs already apply
 // (E2eSrtpKeys, SrtpKeyingMaterial).
@@ -191,6 +209,8 @@ pub enum EngineError {
     UnsupportedPcmAudio,
     #[error("PCM MLOW audio requires the `voip-mlow` feature")]
     MlowUnavailable,
+    #[error("group media setup failed: {0}")]
+    GroupMedia(#[from] GroupMediaError),
 }
 
 /// Why an incoming call's [`CallConfig`] could not be assembled from the offer's relay block.
@@ -320,6 +340,58 @@ impl CallConfig {
             relay,
         )
     }
+
+    /// Build a native group-call engine before its shared keygen-v2 epoch arrives. Media is gated
+    /// until [`CallEngine::apply_group_raw_epoch`] installs an authenticated epoch, so the zeroed
+    /// bootstrap key is never permitted onto the wire.
+    pub fn for_group(
+        direction: CallDirection,
+        call_id: &str,
+        self_lid: &str,
+        call_creator: &str,
+        relay: &GroupCallRelay,
+    ) -> Result<Self, SetupError> {
+        let endpoint = get_group_media_relay_endpoint(relay).ok_or(SetupError::NoRelayEndpoint)?;
+        let relay_ip = endpoint.ipv4.clone().ok_or(SetupError::NoRelayIpv4)?;
+        let relay_port = endpoint.port.ok_or(SetupError::NoRelayEndpoint)?;
+        let relay_token = relay
+            .tokens
+            .get(endpoint.token_id as usize)
+            .filter(|token| !token.is_empty())
+            .cloned()
+            .ok_or(SetupError::NoRelayToken(endpoint.token_id))?;
+        if relay.key.is_empty() {
+            return Err(SetupError::NoIntegrityKey);
+        }
+        let warp_mi_tag_len = relay
+            .warp_mi_tag_len
+            .map(|value| value as usize)
+            .unwrap_or(super::warp::WARP_MI_TAG_LEN);
+        if !(1..=20).contains(&warp_mi_tag_len) {
+            return Err(SetupError::BadWarpMiTagLen(warp_mi_tag_len));
+        }
+        Ok(Self {
+            call_id: call_id.to_string(),
+            direction,
+            self_lid: self_lid.to_string(),
+            peer_lid: call_creator.to_string(),
+            call_key: vec![0; 32],
+            ssrc: ssrc::derive_wasm_participant_ssrc(
+                call_id,
+                &ssrc::format_e2e_srtp_participant_id(self_lid),
+                0,
+            ),
+            audio: AudioConfig::MLOW_PCM,
+            relay_token,
+            relay_ip,
+            relay_port,
+            integrity_key: relay.key.clone(),
+            warp_mi_tag_len,
+            enable_media: true,
+            enable_video: false,
+            enable_sframe: false,
+        })
+    }
 }
 
 /// One input to the engine, applied with the current monotonic timestamp.
@@ -366,6 +438,9 @@ pub enum CallEvent {
     /// A standard Opus packet carried through MLOW's in-profile escape while PCM/MLOW I/O is
     /// selected. Shells with an Opus decoder can play it; codec selection still follows signaling.
     ForeignAudio(Bytes),
+    /// A standard Opus fallback packet received in PCM/MLOW mode from one authenticated group
+    /// participant. The participant metadata lets consumers keep one stateful decoder per sender.
+    ForeignGroupAudio(EncodedAudioFrame),
     /// The peer selected signaling rates incompatible with the single profile offered locally.
     AudioFormatMismatch {
         expected_rate: u32,
@@ -385,6 +460,25 @@ pub enum CallEvent {
         /// Accepting requires this exact token. `None` means simultaneous local and peer requests
         /// were already resolved by the signaling state machine.
         upgrade_token: Option<super::VideoUpgradeToken>,
+    },
+    /// A newer authoritative group membership/relay snapshot was committed.
+    GroupUpdated(Box<GroupCallUpdate>),
+    /// A newer authoritative call-link admission snapshot was committed.
+    WaitingRoomUpdated(Box<WaitingRoom>),
+    /// One participant raised or lowered their hand.
+    HandRaised { participant: Jid, raised: bool },
+    /// One participant started or stopped screen sharing.
+    ScreenShareChanged {
+        participant: Jid,
+        screen_share: ScreenShare,
+    },
+    /// One authenticated, participant-attributed RTC reaction. An empty emoji removes it.
+    Reaction {
+        participant: Jid,
+        device: Jid,
+        pid: Option<u32>,
+        emoji: String,
+        removed: bool,
     },
     /// Authenticated peer RTCP. A referenced local video SSRC proves the peer built a receiver for
     /// our outbound stream; RR, NACK, PLI and FIR are all represented here.
@@ -526,6 +620,31 @@ fn make_video_plane(
     })
 }
 
+struct GroupEngineState {
+    registry: GroupMediaRegistry,
+    local_epoch_transaction: Option<u32>,
+    direct_fallback_active: bool,
+    stream_ssrcs: [u32; 9],
+    app_data_ssrc: u32,
+    hbh_fec_ssrcs: [u32; 2],
+    app_data: MediaPipeline,
+    reaction_transaction: u64,
+    reaction_last_seen: HashMap<String, u64>,
+    pending_reactions: VecDeque<PendingReaction>,
+    mixer: ParticipantAudioMixer,
+    video_orientations: HashMap<Jid, u8>,
+    audio_reception: HashMap<String, RtpReceptionStats>,
+    video_reception: HashMap<String, RtpReceptionStats>,
+    #[cfg(feature = "voip-mlow")]
+    decoders: HashMap<String, mlow::MlowDecoder>,
+}
+
+struct PendingReaction {
+    payload: Vec<u8>,
+    remaining: u8,
+    next_at: Millis,
+}
+
 /// The sans-IO call engine. See the module docs for the drive contract.
 pub struct CallEngine {
     call_id: String,
@@ -553,6 +672,7 @@ pub struct CallEngine {
     /// Our SRTP participant id (LID normalized to `<user>:<device>@lid`), the HKDF input for every
     /// stream SSRC. Retained so the STUN allocate announces this call's live SSRCs.
     self_participant_id: String,
+    group: Option<GroupEngineState>,
     // Media plane (None = control plane only, e.g. esp32).
     media: Option<MediaState>,
     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
@@ -687,6 +807,7 @@ impl CallEngine {
             started: false,
             terminated: false,
             self_participant_id: ssrc::format_e2e_srtp_participant_id(&config.self_lid),
+            group: None,
             media,
             peer_video_orientation: 0,
             outbox: VecDeque::new(),
@@ -699,6 +820,298 @@ impl CallEngine {
 
     pub fn direction(&self) -> CallDirection {
         self.direction
+    }
+
+    /// Whether participant-indexed group media has been configured.
+    pub fn is_group(&self) -> bool {
+        self.group.is_some()
+    }
+
+    /// Enable participant-indexed media before [`start`](Self::start).
+    pub fn configure_group(&mut self, config: GroupEngineConfig) -> Result<(), EngineError> {
+        let audio = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?.audio;
+        let mut registry = GroupMediaRegistry::new(
+            self.call_id.clone(),
+            config.call_creator,
+            &config.self_jid,
+            audio.format.rtp_timestamp_step,
+            self.media
+                .as_ref()
+                .ok_or(GroupMediaError::Pipeline)?
+                .warp_mi_tag_len,
+            VIDEO_TS_STRIDE_15FPS,
+        )?;
+        let direct_fallback_active = config.direct_peer.is_some();
+        if let Some((user_jid, device_jid, mut call_key)) = config.direct_peer {
+            registry.seed_direct_peer(
+                &call_key,
+                &user_jid,
+                &device_jid,
+                self.media
+                    .as_ref()
+                    .and_then(|media| media.video.as_ref())
+                    .is_some(),
+            )?;
+            call_key.fill(0);
+        }
+        registry.apply_group_update(&config.initial_update)?;
+
+        let app_data_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &self.call_id,
+            &self.self_participant_id,
+            ssrc::APP_DATA_SSRC_SLOT_WORD,
+        );
+        let stream_ssrcs = self.prepare_group_stream_ssrcs(app_data_ssrc)?;
+        let media = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?;
+        let mut app_data = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &media.call_key,
+            self_lid: &media.self_lid,
+            peer_lid: &media.recv_peer_lid,
+            ssrc: app_data_ssrc,
+            samples_per_packet: APP_DATA_RETRANSMIT_MS as u32,
+            warp_mi_tag_len: media.warp_mi_tag_len,
+        })
+        .ok_or(GroupMediaError::Pipeline)?;
+        if !app_data.set_audio_payload_type(RTP_PAYLOAD_TYPE_APP_DATA) {
+            return Err(GroupMediaError::Pipeline.into());
+        }
+        app_data.set_audio_mlow_profile(false);
+        let hbh_fec_ssrcs = [
+            ssrc::derive_wasm_participant_ssrc(
+                &self.call_id,
+                &self.self_participant_id,
+                ssrc::HBH_FEC_TX_SSRC_SLOT_WORD,
+            ),
+            ssrc::derive_wasm_participant_ssrc(
+                &self.call_id,
+                &self.self_participant_id,
+                ssrc::HBH_FEC_RX_SSRC_SLOT_WORD,
+            ),
+        ];
+        let mut group = GroupEngineState {
+            registry,
+            local_epoch_transaction: None,
+            direct_fallback_active,
+            stream_ssrcs,
+            app_data_ssrc,
+            hbh_fec_ssrcs,
+            app_data,
+            reaction_transaction: 0,
+            reaction_last_seen: HashMap::new(),
+            pending_reactions: VecDeque::new(),
+            mixer: ParticipantAudioMixer::new(),
+            video_orientations: HashMap::new(),
+            audio_reception: HashMap::new(),
+            video_reception: HashMap::new(),
+            #[cfg(feature = "voip-mlow")]
+            decoders: HashMap::new(),
+        };
+        group.mixer.retain(group.registry.active_participant_ids());
+        self.group = Some(group);
+        self.refresh_group_allocate(&config.initial_update)?;
+        self.sync_group_epoch()?;
+        Ok(())
+    }
+
+    pub fn apply_group_update(
+        &mut self,
+        update: &GroupCallUpdate,
+    ) -> Result<GroupRosterApply, GroupMediaError> {
+        if self.group.is_none() {
+            let (self_jid, peer_device, call_key) = {
+                let media = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?;
+                let self_jid = media
+                    .self_lid
+                    .parse::<Jid>()
+                    .map_err(|_| GroupMediaError::Pipeline)?;
+                let peer_device = media
+                    .recv_peer_lid
+                    .parse::<Jid>()
+                    .map_err(|_| GroupMediaError::Pipeline)?;
+                (self_jid, peer_device, media.call_key.clone())
+            };
+            self.configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid,
+                initial_update: update.clone(),
+                direct_peer: Some((peer_device.to_non_ad(), peer_device, call_key)),
+            })
+            .map_err(|_| GroupMediaError::Pipeline)?;
+            return Ok(GroupRosterApply::Applied);
+        }
+        let result = self
+            .group
+            .as_mut()
+            .ok_or(GroupMediaError::Pipeline)?
+            .registry
+            .apply_group_update(update)?;
+        if result == GroupRosterApply::Applied {
+            let group = self.group.as_mut().ok_or(GroupMediaError::Pipeline)?;
+            let active = group.registry.active_participant_ids();
+            group.mixer.retain(active.iter().cloned());
+            group
+                .audio_reception
+                .retain(|participant, _| active.contains(participant));
+            group
+                .video_reception
+                .retain(|participant, _| active.contains(participant));
+            group.video_orientations.retain(|jid, _| {
+                update.participants.iter().any(|participant| {
+                    participant.state == "connected"
+                        && (participant.jid == *jid
+                            || participant.devices.iter().any(|device| device.jid == *jid))
+                })
+            });
+            #[cfg(feature = "voip-mlow")]
+            group
+                .decoders
+                .retain(|participant, _| active.contains(participant));
+            self.refresh_group_allocate(update)?;
+            self.sync_group_epoch()?;
+        }
+        Ok(result)
+    }
+
+    pub fn apply_group_raw_epoch(
+        &mut self,
+        transaction_id: u32,
+        raw_epoch: &[u8],
+    ) -> Result<GroupEpochApply, GroupMediaError> {
+        let result = self
+            .group
+            .as_mut()
+            .ok_or(GroupMediaError::Pipeline)?
+            .registry
+            .apply_raw_epoch(transaction_id, raw_epoch)?;
+        self.sync_group_epoch()?;
+        Ok(result)
+    }
+
+    /// Queue a reaction on the authenticated RTC app-data stream. The captured sender repeats each
+    /// transaction ten times at 50 ms intervals; receivers suppress duplicates per participant.
+    pub fn send_group_reaction(&mut self, now: Millis, emoji: &str) -> Result<(), GroupMediaError> {
+        if !self.group_epoch_ready() {
+            return Err(GroupMediaError::Pipeline);
+        }
+        let group = self.group.as_mut().ok_or(GroupMediaError::Pipeline)?;
+        group.reaction_transaction = group.reaction_transaction.wrapping_add(1).max(1);
+        let payload = app_data::encode_reaction(group.reaction_transaction, emoji)
+            .map_err(|_| GroupMediaError::Pipeline)?;
+        let packet = group.app_data.protect_audio(&payload);
+        self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+        group.pending_reactions.push_back(PendingReaction {
+            payload,
+            remaining: APP_DATA_RETRANSMIT_COUNT - 1,
+            next_at: now + APP_DATA_RETRANSMIT_MS,
+        });
+        Ok(())
+    }
+
+    fn prepare_group_stream_ssrcs(&mut self, app_data_ssrc: u32) -> Result<[u32; 9], EngineError> {
+        let mut stream_ssrcs =
+            ssrc::derive_wasm_relay_stream_ssrcs(&self.call_id, &self.self_participant_id);
+        let mut used = stream_ssrcs[..6]
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        used.insert(app_data_ssrc);
+        for stream_ssrc in &mut stream_ssrcs[6..] {
+            let mut selected = None;
+            for _ in 0..64 {
+                let random = self.tx_ids.next_tx_id();
+                let candidate = u32::from_be_bytes([random[4], random[5], random[6], random[7]]);
+                if candidate != 0 && used.insert(candidate) {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+            *stream_ssrc = selected.ok_or(GroupMediaError::Pipeline)?;
+        }
+        Ok(stream_ssrcs)
+    }
+
+    fn refresh_group_allocate(&mut self, update: &GroupCallUpdate) -> Result<(), GroupMediaError> {
+        let Some(relay) = update.relay.as_ref() else {
+            return Ok(());
+        };
+        let (relay_token, endpoint_xor, integrity_key) = group_relay_allocate_material(relay)?;
+        let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
+        let pids = remote_group_pids(update, &self.self_participant_id);
+        let transaction_id = self.tx_ids.next_tx_id();
+        let allocate = Bytes::from(stun::build_wasm_group_stun_allocate_request(
+            &stun::WasmGroupStunAllocateRequest {
+                transaction_id: &transaction_id,
+                relay_token: &relay_token,
+                endpoint_xor: &endpoint_xor,
+                integrity_key: &integrity_key,
+                stream_ssrcs: &group.stream_ssrcs,
+                app_data_ssrc: group.app_data_ssrc,
+                hbh_fec_ssrcs: &group.hbh_fec_ssrcs,
+                participant_pids: &pids,
+            },
+        ));
+        self.relay_token = relay_token;
+        self.endpoint_xor = endpoint_xor;
+        self.integrity_key = integrity_key;
+        self.allocate = allocate.clone();
+        if self.started {
+            self.outbox.push_back(Output::Transmit(allocate));
+        }
+        Ok(())
+    }
+
+    fn sync_group_epoch(&mut self) -> Result<(), GroupMediaError> {
+        let Some((transaction_id, mut epoch)) = self
+            .group
+            .as_ref()
+            .and_then(|group| group.registry.installed_epoch())
+            .map(|(transaction, epoch)| (transaction, epoch.to_vec()))
+        else {
+            return Ok(());
+        };
+        if self
+            .group
+            .as_ref()
+            .and_then(|group| group.local_epoch_transaction)
+            .is_some_and(|current| transaction_id <= current)
+        {
+            epoch.fill(0);
+            return Ok(());
+        }
+        let (Some(media), Some(group)) = (&mut self.media, &mut self.group) else {
+            epoch.fill(0);
+            return Err(GroupMediaError::Pipeline);
+        };
+        if !media.pipe.rekey_send_from_raw(&epoch, &media.self_lid) {
+            epoch.fill(0);
+            return Err(GroupMediaError::InvalidEpoch);
+        }
+        if let Some(video) = media.video.as_mut()
+            && !video.pipe.rekey_send_from_raw(&epoch, &media.self_lid)
+        {
+            epoch.fill(0);
+            return Err(GroupMediaError::InvalidEpoch);
+        }
+        if !group.app_data.rekey_send_from_raw(&epoch, &media.self_lid) {
+            epoch.fill(0);
+            return Err(GroupMediaError::InvalidEpoch);
+        }
+        media.call_key.fill(0);
+        media.call_key.clear();
+        media.call_key.extend_from_slice(&epoch);
+        group.local_epoch_transaction = Some(transaction_id);
+        group.direct_fallback_active = false;
+        epoch.fill(0);
+        if self.allocated {
+            self.announce_audio_rtcp_session();
+        }
+        Ok(())
+    }
+
+    fn group_epoch_ready(&self) -> bool {
+        self.group.as_ref().is_none_or(|group| {
+            group.local_epoch_transaction.is_some() || group.direct_fallback_active
+        })
     }
 
     /// Whether the relay has acknowledged our allocate.
@@ -738,6 +1151,13 @@ impl CallEngine {
             .as_ref()
             .and_then(|m| m.video.as_ref())
             .is_some_and(|v| v.active)
+    }
+
+    /// Re-arm outbound H.264 recovery after the application switches camera/screen sources.
+    pub fn require_video_keyframe(&mut self) {
+        if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+            video.keyframe_required = true;
+        }
     }
 
     /// Set the nominal RTP cadence for subsequent video access units. The source must pace access
@@ -819,6 +1239,18 @@ impl CallEngine {
         self.peer_video_orientation = orientation & 0x03;
     }
 
+    /// Record orientation for one authenticated group participant/device.
+    pub fn set_participant_video_orientation(&mut self, participant: Jid, orientation: u8) {
+        let Some(group) = self.group.as_mut() else {
+            return;
+        };
+        let orientation = orientation & 0x03;
+        group
+            .video_orientations
+            .insert(participant.to_non_ad(), orientation);
+        group.video_orientations.insert(participant, orientation);
+    }
+
     /// Begin the media session with separate monotonic and Unix clocks. RTCP scheduling must not
     /// leak wall-clock jumps, while Sender Reports require a real NTP epoch. Idempotent.
     pub fn start(&mut self, now: Millis, wallclock_ms: u64) {
@@ -828,17 +1260,19 @@ impl CallEngine {
         self.started = true;
         self.rtcp_monotonic_origin = now;
         self.rtcp_wallclock_origin_ms = wallclock_ms;
-        let tx = self.tx_ids.next_tx_id();
-        // Built once here; the 1s keepalive re-sends it, so store it as Bytes and refcount-clone
-        // rather than re-allocating the buffer every tick.
-        self.allocate = Bytes::from(stun::build_wasm_stun_allocate_request(
-            &tx,
-            &self.relay_token,
-            &self.endpoint_xor,
-            &self.integrity_key,
-            &self.call_id,
-            &self.self_participant_id,
-        ));
+        if self.allocate.is_empty() {
+            let tx = self.tx_ids.next_tx_id();
+            // Built once here; the 1s keepalive re-sends it, so store it as Bytes and refcount-clone
+            // rather than re-allocating the buffer every tick.
+            self.allocate = Bytes::from(stun::build_wasm_stun_allocate_request(
+                &tx,
+                &self.relay_token,
+                &self.endpoint_xor,
+                &self.integrity_key,
+                &self.call_id,
+                &self.self_participant_id,
+            ));
+        }
         self.outbox
             .push_back(Output::Transmit(self.allocate.clone()));
         self.keepalive_deadline = now + KEEPALIVE_MS;
@@ -888,6 +1322,14 @@ impl CallEngine {
             next = next.min(m.playout_deadline);
             next = next.min(self.rtcp_deadline);
         }
+        if let Some(deadline) = self
+            .group
+            .as_ref()
+            .and_then(|group| group.pending_reactions.front())
+            .map(|reaction| reaction.next_at)
+        {
+            next = next.min(deadline);
+        }
         Some(next)
     }
 
@@ -926,15 +1368,31 @@ impl CallEngine {
                 .push_back(Output::Transmit(Bytes::copy_from_slice(&ping)));
             self.keepalive_deadline = next_tick(self.keepalive_deadline, now, KEEPALIVE_MS);
         }
-        if let Some(m) = self.media.as_mut()
-            && self.started
-            && m.audio.io == AudioIo::Pcm
-            && now >= m.playout_deadline
-        {
+        let playout_due = self.media.as_ref().is_some_and(|media| {
+            self.started && media.audio.io == AudioIo::Pcm && now >= media.playout_deadline
+        });
+        if playout_due {
             #[cfg(feature = "voip-mlow")]
-            if let Some(pcm) = m.pcm.as_mut() {
-                let frame =
-                    drain_playout(&mut pcm.jitter, &mut pcm.priming, &mut pcm.priming_ticks);
+            let group_frame = self.group.as_mut().map(|group| {
+                let mut frame = Vec::with_capacity(PLAYOUT_DRAIN);
+                for _ in 0..2 {
+                    if let Some(chunk) = group.mixer.mix_chunk() {
+                        frame.extend(chunk);
+                    } else {
+                        frame.resize(frame.len() + PLAYOUT_DRAIN / 2, 0);
+                    }
+                }
+                frame
+            });
+            #[cfg(feature = "voip-mlow")]
+            if let Some(m) = self.media.as_mut() {
+                let frame = if let Some(frame) = group_frame {
+                    frame
+                } else if let Some(pcm) = m.pcm.as_mut() {
+                    drain_playout(&mut pcm.jitter, &mut pcm.priming, &mut pcm.priming_ticks)
+                } else {
+                    Vec::new()
+                };
                 m.playout_deadline = next_tick(m.playout_deadline, now, PLAYOUT_MS);
                 self.outbox.push_back(Output::Playout(frame));
             }
@@ -942,6 +1400,37 @@ impl CallEngine {
         if self.started && self.allocated && self.media.is_some() && now >= self.rtcp_deadline {
             self.emit_sender_reports(now, self.rtcp_wallclock_at(now));
             self.rtcp_deadline = next_tick(self.rtcp_deadline, now, RTCP_MS);
+        }
+        self.retransmit_group_reactions(now);
+    }
+
+    fn retransmit_group_reactions(&mut self, now: Millis) {
+        loop {
+            let due = self
+                .group
+                .as_ref()
+                .and_then(|group| group.pending_reactions.front())
+                .is_some_and(|reaction| now >= reaction.next_at);
+            if !due {
+                break;
+            }
+            let Some(mut pending) = self
+                .group
+                .as_mut()
+                .and_then(|group| group.pending_reactions.pop_front())
+            else {
+                break;
+            };
+            let Some(group) = self.group.as_mut() else {
+                break;
+            };
+            let packet = group.app_data.protect_audio(&pending.payload);
+            self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+            pending.remaining = pending.remaining.saturating_sub(1);
+            if pending.remaining != 0 {
+                pending.next_at = next_tick(pending.next_at, now, APP_DATA_RETRANSMIT_MS);
+                group.pending_reactions.push_back(pending);
+            }
         }
     }
 
@@ -951,6 +1440,9 @@ impl CallEngine {
     }
 
     fn announce_audio_rtcp_session(&mut self) {
+        if !self.group_epoch_ready() {
+            return;
+        }
         let Some(m) = self.media.as_mut().filter(|m| !m.audio_rtcp_announced) else {
             return;
         };
@@ -961,9 +1453,48 @@ impl CallEngine {
 
     /// Audio and video share one wall-clock sample for lip sync.
     fn emit_sender_reports(&mut self, monotonic_ms: Millis, wallclock_ms: u64) {
+        if !self.group_epoch_ready() {
+            return;
+        }
+        let group_reports = self.group.as_mut().map(|group| {
+            let audio = group
+                .audio_reception
+                .values_mut()
+                .filter_map(|stats| stats.report(monotonic_ms))
+                .collect::<Vec<_>>();
+            let video = group
+                .video_reception
+                .values_mut()
+                .filter_map(|stats| stats.report(monotonic_ms))
+                .collect::<Vec<_>>();
+            (audio, video)
+        });
         let Some(m) = self.media.as_mut() else {
             return;
         };
+        if let Some((audio_reports, video_reports)) = group_reports {
+            if audio_reports.is_empty() {
+                let report = m.pipe.audio_sender_report(wallclock_ms, None);
+                self.outbox.push_back(Output::Transmit(Bytes::from(report)));
+            } else {
+                for reception in &audio_reports {
+                    let report = m.pipe.audio_sender_report(wallclock_ms, Some(reception));
+                    self.outbox.push_back(Output::Transmit(Bytes::from(report)));
+                }
+            }
+            if let Some(v) = m.video.as_mut().filter(|v| v.active && !v.send_gated) {
+                if video_reports.is_empty() {
+                    let report = v.pipe.video_sender_report(wallclock_ms, None);
+                    self.outbox.push_back(Output::Transmit(Bytes::from(report)));
+                } else {
+                    for reception in &video_reports {
+                        let report = v.pipe.video_sender_report(wallclock_ms, Some(reception));
+                        self.outbox.push_back(Output::Transmit(Bytes::from(report)));
+                    }
+                }
+            }
+            return;
+        }
         let audio_report = m.audio_reception.report(monotonic_ms);
         let audio_sr = m
             .pipe
@@ -981,6 +1512,10 @@ impl CallEngine {
     }
 
     fn on_packet(&mut self, now: Millis, pkt: &[u8]) {
+        let Ok(pkt) = unwrap_group_forwarding_packet(pkt) else {
+            return;
+        };
+        let pkt = pkt.payload;
         match classify_relay_packet(pkt) {
             RelayPacketKind::Stun => self.on_stun(now, pkt),
             RelayPacketKind::Rtp => self.on_rtp(now, pkt),
@@ -990,6 +1525,59 @@ impl CallEngine {
     }
 
     fn on_rtcp(&mut self, now: Millis, pkt: &[u8]) {
+        if self.group.is_some() {
+            let (audio_ssrc, video_ssrc) = match self.media.as_ref() {
+                Some(media) => (
+                    media.pipe.send_ssrc(),
+                    media.video.as_ref().map(|video| video.pipe.send_ssrc()),
+                ),
+                None => return,
+            };
+            let participant = match self
+                .group
+                .as_mut()
+                .and_then(|group| group.registry.unprotect_rtcp(pkt))
+            {
+                Some(media) => media,
+                None => return,
+            };
+            let Some(summary) = summarize_rtcp(&participant.payload) else {
+                return;
+            };
+            if let Some(video_ssrc) = video_ssrc
+                && requests_keyframe(&summary.feedback, video_ssrc)
+                && let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
+            {
+                video.keyframe_required = true;
+            }
+            if let Some((sender, ntp_seconds, ntp_fraction)) =
+                parse_sender_report_timing(&participant.payload)
+                && let Some(group) = self.group.as_mut()
+            {
+                group
+                    .audio_reception
+                    .entry(participant.participant_id.clone())
+                    .or_default()
+                    .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
+                group
+                    .video_reception
+                    .entry(participant.participant_id.clone())
+                    .or_default()
+                    .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
+            }
+            self.outbox
+                .push_back(Output::Event(CallEvent::RtcpReceived {
+                    reports_audio: summary.referenced_ssrcs.contains(&audio_ssrc),
+                    reports_video: video_ssrc
+                        .is_some_and(|ssrc| summary.referenced_ssrcs.contains(&ssrc)),
+                    packet_types: summary.packet_types,
+                    sender_ssrc: summary.sender_ssrc,
+                    referenced_ssrcs: summary.referenced_ssrcs,
+                    report_blocks: summary.report_blocks,
+                    feedback: summary.feedback,
+                }));
+            return;
+        }
         let event = {
             let Some(m) = self.media.as_mut() else {
                 return;
@@ -1078,13 +1666,17 @@ impl CallEngine {
     }
 
     fn on_rtp(&mut self, now: Millis, pkt: &[u8]) {
-        let Some(m) = self.media.as_mut() else {
-            return;
-        };
         // Demux by payload type BEFORE unprotect: audio and video share E2E keys but have
         // distinct SSRCs/ROC trackers, so feeding a video packet through the audio pipeline
         // would fail its MI tag at best and desync at worst.
         let Some(wire_header) = parse_rtp_header(pkt) else {
+            return;
+        };
+        if self.group.is_some() {
+            self.on_group_rtp(now, pkt, wire_header);
+            return;
+        }
+        let Some(m) = self.media.as_mut() else {
             return;
         };
         if wire_header.payload_type == RTP_PAYLOAD_TYPE_H264 {
@@ -1107,6 +1699,9 @@ impl CallEngine {
                         data: au,
                         keyframe,
                         orientation: self.peer_video_orientation,
+                        sender: None,
+                        device: None,
+                        pid: None,
                     }));
                 }
             }
@@ -1151,6 +1746,9 @@ impl CallEngine {
                     sequence_number: header.sequence_number,
                     timestamp: header.timestamp,
                     marker: header.marker,
+                    sender: None,
+                    device: None,
+                    pid: None,
                 }));
             return;
         }
@@ -1180,8 +1778,153 @@ impl CallEngine {
         }
     }
 
+    fn on_group_rtp(&mut self, now: Millis, pkt: &[u8], wire_header: crate::voip::rtp::RtpHeader) {
+        let Some(audio) = self.media.as_ref().map(|media| media.audio) else {
+            return;
+        };
+        let Some(group) = self.group.as_mut() else {
+            return;
+        };
+        if wire_header.payload_type == RTP_PAYLOAD_TYPE_H264 {
+            let Some(video) = group.registry.unprotect_video(pkt) else {
+                return;
+            };
+            group
+                .video_reception
+                .entry(video.participant_id.clone())
+                .or_default()
+                .observe(
+                    video.header.ssrc,
+                    video.header.sequence_number,
+                    video.header.timestamp,
+                    now,
+                    VIDEO_CLOCK_RATE,
+                );
+            let orientation = group
+                .video_orientations
+                .get(&video.device_jid)
+                .or_else(|| group.video_orientations.get(&video.user_jid))
+                .copied()
+                .unwrap_or(self.peer_video_orientation);
+            for access_unit in video.access_units {
+                let keyframe = au_is_keyframe(&access_unit);
+                self.outbox.push_back(Output::VideoPlayout(VideoFrame {
+                    data: access_unit,
+                    keyframe,
+                    orientation,
+                    sender: Some(video.user_jid.clone()),
+                    device: Some(video.device_jid.clone()),
+                    pid: video.pid,
+                }));
+            }
+            return;
+        }
+        if wire_header.payload_type == RTP_PAYLOAD_TYPE_APP_DATA {
+            let Some(participant) = group.registry.unprotect_app_data(pkt) else {
+                return;
+            };
+            let Ok(reactions) = app_data::decode_reactions(&participant.payload) else {
+                return;
+            };
+            let last_seen = group
+                .reaction_last_seen
+                .entry(participant.participant_id)
+                .or_default();
+            for reaction in reactions {
+                if reaction.transaction_id <= *last_seen {
+                    continue;
+                }
+                *last_seen = reaction.transaction_id;
+                self.outbox.push_back(Output::Event(CallEvent::Reaction {
+                    participant: participant.user_jid.clone(),
+                    device: participant.device_jid.clone(),
+                    pid: participant.pid,
+                    removed: reaction.emoji.is_empty(),
+                    emoji: reaction.emoji,
+                }));
+            }
+            return;
+        }
+        if !audio
+            .format
+            .accepts_rtp_payload_type(wire_header.payload_type)
+        {
+            return;
+        }
+        let Some(participant) = group.registry.unprotect_audio(pkt) else {
+            return;
+        };
+        group
+            .audio_reception
+            .entry(participant.participant_id.clone())
+            .or_default()
+            .observe(
+                participant.header.ssrc,
+                participant.header.sequence_number,
+                participant.header.timestamp,
+                now,
+                audio.format.rtp_clock_rate,
+            );
+        let codec = audio
+            .format
+            .inbound_codec(participant.header.payload_type, &participant.payload);
+        if audio.io == AudioIo::Encoded {
+            self.outbox
+                .push_back(Output::EncodedAudio(EncodedAudioFrame {
+                    format: audio.format,
+                    codec,
+                    data: Bytes::from(participant.payload),
+                    payload_type: participant.header.payload_type,
+                    sequence_number: participant.header.sequence_number,
+                    timestamp: participant.header.timestamp,
+                    marker: participant.header.marker,
+                    sender: Some(participant.user_jid),
+                    device: Some(participant.device_jid),
+                    pid: participant.pid,
+                }));
+            return;
+        }
+        #[cfg(feature = "voip-mlow")]
+        {
+            if codec == AudioCodec::Opus {
+                self.outbox
+                    .push_back(Output::Event(CallEvent::ForeignGroupAudio(
+                        EncodedAudioFrame {
+                            format: audio.format,
+                            codec,
+                            data: Bytes::from(participant.payload),
+                            payload_type: participant.header.payload_type,
+                            sequence_number: participant.header.sequence_number,
+                            timestamp: participant.header.timestamp,
+                            marker: participant.header.marker,
+                            sender: Some(participant.user_jid),
+                            device: Some(participant.device_jid),
+                            pid: participant.pid,
+                        },
+                    )));
+                return;
+            }
+            let decoder = group
+                .decoders
+                .entry(participant.participant_id.clone())
+                .or_insert_with(mlow::MlowDecoder::new);
+            decoder.set_redundancy(i32::from(
+                participant.header.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED,
+            ));
+            let pcm = decoder
+                .decode(&participant.payload)
+                .iter()
+                .map(|sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                .collect::<Vec<_>>();
+            group.mixer.push(&participant.participant_id, &pcm);
+        }
+    }
+
     #[cfg(feature = "voip-mlow")]
     fn on_mic(&mut self, pcm: &[i16]) {
+        if !self.group_epoch_ready() {
+            return;
+        }
         let Some(m) = self.media.as_mut() else {
             return;
         };
@@ -1227,6 +1970,9 @@ impl CallEngine {
     fn on_mic(&mut self, _pcm: &[i16]) {}
 
     fn on_encoded_audio(&mut self, payload: &[u8]) {
+        if !self.group_epoch_ready() {
+            return;
+        }
         let Some(m) = self
             .media
             .as_mut()
@@ -1254,6 +2000,9 @@ impl CallEngine {
     }
 
     fn on_video(&mut self, au: &[u8]) {
+        if !self.group_epoch_ready() {
+            return;
+        }
         // Drop unless the plane is active AND ungated: an inactive plane (audio-only / post-
         // downgrade) or a send-gated one (upgrade requested but not yet accepted) must not put video
         // on the wire. Either way the pipe's send seq/ROC stay frozen for a later resume.
@@ -1277,6 +2026,73 @@ impl CallEngine {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
         }
     }
+}
+
+type GroupRelayAllocateMaterial = (Vec<u8>, [u8; 6], Vec<u8>);
+
+fn get_group_media_relay_endpoint(
+    relay: &GroupCallRelay,
+) -> Option<&crate::types::group_call::GroupCallRelayEndpoint> {
+    let usable = |endpoint: &&crate::types::group_call::GroupCallRelayEndpoint| {
+        !endpoint.is_fna
+            && endpoint.ipv4.is_some()
+            && endpoint.port.is_some_and(|port| port != 0)
+            && relay
+                .tokens
+                .get(endpoint.token_id as usize)
+                .is_some_and(|token| !token.is_empty())
+            && relay
+                .auth_tokens
+                .get(endpoint.auth_token_id as usize)
+                .is_some_and(|token| !token.is_empty())
+    };
+    relay
+        .endpoints
+        .iter()
+        .filter(usable)
+        .find(|endpoint| endpoint.port == Some(super::relay_parse::WEB_CLIENT_RELAY_PORT))
+        .or_else(|| relay.endpoints.iter().find(usable))
+}
+
+fn group_relay_allocate_material(
+    relay: &GroupCallRelay,
+) -> Result<GroupRelayAllocateMaterial, GroupMediaError> {
+    if relay.key.is_empty() {
+        return Err(GroupMediaError::InvalidSnapshot);
+    }
+    if let Some(endpoint) = get_group_media_relay_endpoint(relay) {
+        let (Some(ipv4), Some(port)) = (endpoint.ipv4.as_deref(), endpoint.port) else {
+            return Err(GroupMediaError::InvalidSnapshot);
+        };
+        let Some(token) = relay
+            .tokens
+            .get(endpoint.token_id as usize)
+            .filter(|token| !token.is_empty())
+        else {
+            return Err(GroupMediaError::InvalidSnapshot);
+        };
+        let Some(endpoint_xor) = stun::encode_xor_relay_endpoint(ipv4, port) else {
+            return Err(GroupMediaError::InvalidSnapshot);
+        };
+        return Ok((token.clone(), endpoint_xor, relay.key.clone()));
+    }
+    Err(GroupMediaError::InvalidSnapshot)
+}
+
+fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec<u32> {
+    let mut pids = update
+        .participants
+        .iter()
+        .filter(|participant| participant.state == "connected")
+        .flat_map(|participant| participant.devices.iter())
+        .filter(|device| {
+            ssrc::format_e2e_srtp_participant_id(&device.jid.to_string()) != self_participant_id
+        })
+        .filter_map(|device| device.pid)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 /// Advance a periodic deadline past `now`. Normally one interval; if the shell fell far behind
@@ -1339,6 +2155,10 @@ fn drain_playout(
 #[cfg(test)]
 mod encoded_tests {
     use super::*;
+    use crate::types::group_call::{
+        GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
+    };
+    use wacore_binary::Server;
 
     const SELF_LID: &str = "15550001111:0@lid";
     const PEER_LID: &str = "15550002222:0@lid";
@@ -1371,6 +2191,209 @@ mod encoded_tests {
                 output => outputs.push(output),
             }
         }
+    }
+
+    fn group_update() -> GroupCallUpdate {
+        let creator = Jid::new("15550001111", Server::Lid);
+        let peer = Jid::new("15550002222", Server::Lid);
+        GroupCallUpdate {
+            call_id: "ENCODED-AUDIO-TEST".to_string(),
+            call_creator: creator.clone(),
+            group_jid: None,
+            transaction_id: 7,
+            media: "audio".to_string(),
+            connected_limit: 32,
+            joinable: true,
+            av_upgradable: true,
+            rekey_requested: false,
+            participants: vec![
+                GroupCallParticipant {
+                    jid: creator.clone(),
+                    pn: None,
+                    state: "connected".to_string(),
+                    participant_type: None,
+                    devices: vec![GroupCallDevice {
+                        jid: creator,
+                        platform: None,
+                        pid: Some(1),
+                        capability_version: None,
+                        capability: Vec::new(),
+                    }],
+                },
+                GroupCallParticipant {
+                    jid: peer.clone(),
+                    pn: None,
+                    state: "connected".to_string(),
+                    participant_type: None,
+                    devices: vec![GroupCallDevice {
+                        jid: peer,
+                        platform: None,
+                        pid: Some(2),
+                        capability_version: None,
+                        capability: Vec::new(),
+                    }],
+                },
+            ],
+            relay: None,
+        }
+    }
+
+    #[test]
+    fn group_media_prefers_the_web_relay_port() {
+        let endpoint = |relay_id, token_id, port| GroupCallRelayEndpoint {
+            relay_id,
+            token_id,
+            auth_token_id: token_id,
+            relay_name: format!("relay-{relay_id}"),
+            domain_name: None,
+            rtt_ms: None,
+            is_fna: false,
+            address: Vec::new(),
+            ipv4: Some("203.0.113.7".to_string()),
+            port: Some(port),
+        };
+        let relay = GroupCallRelay {
+            transaction_id: Some(1),
+            self_pid: Some(1),
+            uuid: "relay".to_string(),
+            participant_uuid: "participant".to_string(),
+            attribute_padding: false,
+            warp_mi_tag_len: Some(4),
+            key: b"relay-key".to_vec(),
+            hbh_key: Vec::new(),
+            tokens: vec![vec![0x47], vec![0x48]],
+            auth_tokens: vec![vec![0x57], vec![0x58]],
+            endpoints: vec![endpoint(1, 0, 3478), endpoint(2, 1, 3480)],
+        };
+
+        let selected = get_group_media_relay_endpoint(&relay).expect("usable relay");
+        assert_eq!(selected.port, Some(3480));
+        let config = CallConfig::for_group(
+            CallDirection::Outgoing,
+            "GROUP-CALL",
+            SELF_LID,
+            SELF_LID,
+            &relay,
+        )
+        .expect("group config");
+        assert_eq!(config.relay_port, 3480);
+        assert_eq!(config.relay_token, vec![0x48]);
+        assert_eq!(
+            group_relay_allocate_material(&relay)
+                .expect("allocate material")
+                .0,
+            vec![0x48]
+        );
+    }
+
+    #[test]
+    fn direct_engine_promotes_when_group_roster_arrives() {
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+        assert!(!engine.is_group());
+
+        assert_eq!(
+            engine
+                .apply_group_update(&group_update())
+                .expect("promote to group"),
+            GroupRosterApply::Applied
+        );
+        assert!(engine.is_group());
+        assert_eq!(
+            engine
+                .apply_group_raw_epoch(7, &[0x42; 32])
+                .expect("install group epoch"),
+            GroupEpochApply::Installed
+        );
+    }
+
+    #[test]
+    fn group_reaction_uses_pt119_retransmits_and_deduplicates_per_sender() {
+        let epoch = [0x42; 32];
+        let update = group_update();
+        let self_jid = update.participants[0].devices[0].jid.clone();
+        let peer_jid = update.participants[1].devices[0].jid.clone();
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("engine");
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: self_jid.clone(),
+                initial_update: update,
+                direct_peer: None,
+            })
+            .unwrap();
+        engine.apply_group_raw_epoch(7, &epoch).unwrap();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        engine.send_group_reaction(10, "👍").unwrap();
+        let first = drain(&mut engine)
+            .into_iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet) => Some(packet),
+                _ => None,
+            })
+            .expect("initial reaction packet");
+        let mut receiver = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &epoch,
+            self_lid: &peer_jid.to_string(),
+            peer_lid: &self_jid.to_string(),
+            ssrc: 1,
+            samples_per_packet: 50,
+            warp_mi_tag_len: 4,
+        })
+        .unwrap();
+        let (header, payload) = receiver.unprotect_audio(&first).unwrap();
+        assert_eq!(header.payload_type, RTP_PAYLOAD_TYPE_APP_DATA);
+        assert_eq!(app_data::decode_reactions(&payload).unwrap()[0].emoji, "👍");
+        for retransmit in 1..APP_DATA_RETRANSMIT_COUNT {
+            engine.handle_input(
+                10 + u64::from(retransmit) * APP_DATA_RETRANSMIT_MS,
+                Input::Timeout,
+            );
+            assert_eq!(
+                drain(&mut engine)
+                    .iter()
+                    .filter(|output| matches!(output, Output::Transmit(_)))
+                    .count(),
+                1
+            );
+        }
+
+        let peer_id = ssrc::format_e2e_srtp_participant_id(&peer_jid.to_string());
+        let mut sender = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &epoch,
+            self_lid: &peer_jid.to_string(),
+            peer_lid: &self_jid.to_string(),
+            ssrc: ssrc::derive_wasm_participant_ssrc(
+                "ENCODED-AUDIO-TEST",
+                &peer_id,
+                ssrc::APP_DATA_SSRC_SLOT_WORD,
+            ),
+            samples_per_packet: 50,
+            warp_mi_tag_len: 4,
+        })
+        .unwrap();
+        assert!(sender.set_audio_payload_type(RTP_PAYLOAD_TYPE_APP_DATA));
+        sender.set_audio_mlow_profile(false);
+        let inbound = sender.protect_audio(&app_data::encode_reaction(9, "👏").unwrap());
+        engine.handle_input(500, Input::RelayPacket(&inbound));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Event(CallEvent::Reaction {
+                participant,
+                emoji,
+                removed: false,
+                ..
+            }) if *participant == peer_jid.to_non_ad() && emoji == "👏"
+        )));
+        engine.handle_input(501, Input::RelayPacket(&inbound));
+        assert!(
+            !drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::Reaction { .. })))
+        );
     }
 
     #[test]
@@ -1492,10 +2515,12 @@ mod encoded_tests {
 #[cfg(all(test, feature = "voip-mlow"))]
 mod tests {
     use super::*;
+    use crate::types::group_call::{GroupCallDevice, GroupCallParticipant};
     use crate::voip::e2e_srtp::SRTCP_AUTH_TAG_LEN;
     use crate::voip::mlow::MlowEncoder;
     use crate::voip::rtcp::parse_rtcp_sender_ssrc;
     use crate::voip::warp::WARP_MI_TAG_LEN;
+    use wacore_binary::Server;
 
     const SELF_LID: &str = "111111111111111:0@lid";
     const PEER_LID: &str = "222222222222222:0@lid";
@@ -1551,6 +2576,104 @@ mod tests {
 
     fn engine(enable_media: bool) -> CallEngine {
         CallEngine::new(config(enable_media), Box::new(SequentialTxIds::new())).unwrap()
+    }
+
+    fn group_update(media: &str) -> GroupCallUpdate {
+        let self_user = Jid::new("111111111111111", Server::Lid);
+        let peer_user = Jid::new("222222222222222", Server::Lid);
+        let self_device = SELF_LID.parse::<Jid>().expect("self JID");
+        let peer_device = PEER_LID.parse::<Jid>().expect("peer JID");
+        GroupCallUpdate {
+            call_id: "CID".to_string(),
+            call_creator: self_user.clone(),
+            group_jid: None,
+            transaction_id: 7,
+            media: media.to_string(),
+            connected_limit: 32,
+            joinable: true,
+            av_upgradable: true,
+            rekey_requested: false,
+            participants: vec![
+                GroupCallParticipant {
+                    jid: self_user,
+                    pn: None,
+                    state: "connected".to_string(),
+                    participant_type: None,
+                    devices: vec![GroupCallDevice {
+                        jid: self_device,
+                        platform: None,
+                        pid: Some(1),
+                        capability_version: None,
+                        capability: Vec::new(),
+                    }],
+                },
+                GroupCallParticipant {
+                    jid: peer_user,
+                    pn: None,
+                    state: "connected".to_string(),
+                    participant_type: None,
+                    devices: vec![GroupCallDevice {
+                        jid: peer_device,
+                        platform: None,
+                        pid: Some(2),
+                        capability_version: None,
+                        capability: Vec::new(),
+                    }],
+                },
+            ],
+            relay: None,
+        }
+    }
+
+    fn group_engine(video: bool) -> (CallEngine, [u8; 32]) {
+        let mut cfg = config(true);
+        cfg.enable_video = video;
+        let mut engine =
+            CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("group engine");
+        let update = group_update(if video { "video" } else { "audio" });
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: SELF_LID.parse().expect("self JID"),
+                initial_update: update,
+                direct_peer: None,
+            })
+            .expect("configure group");
+        let epoch = [0x42; 32];
+        assert_eq!(
+            engine
+                .apply_group_raw_epoch(7, &epoch)
+                .expect("install epoch"),
+            GroupEpochApply::Installed
+        );
+        (engine, epoch)
+    }
+
+    fn group_peer_audio(epoch: &[u8]) -> MediaPipeline {
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        MediaPipeline::new(&MediaPipelineParams {
+            call_key: epoch,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: ssrc::derive_wasm_participant_ssrc("CID", &peer_id, 0),
+            samples_per_packet: SAMPLES,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .expect("peer audio pipeline")
+    }
+
+    fn group_peer_video(epoch: &[u8]) -> VideoPipeline {
+        use crate::voip::session::{VideoPipeline, VideoPipelineParams};
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        VideoPipeline::new(&VideoPipelineParams {
+            call_key: epoch,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: ssrc::derive_video_participant_ssrc("CID", &peer_id),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .expect("peer video pipeline")
     }
 
     // CallConfig::for_incoming pulls the relay endpoint/token/integrity-key out of a parsed RelayData
@@ -2192,6 +3315,90 @@ mod tests {
     }
 
     #[test]
+    fn group_foreign_opus_keeps_sender_metadata_and_updates_rtcp_reception() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys_from_raw, unprotect_srtcp};
+
+        let (mut eng, epoch) = group_engine(false);
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate =
+            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let mut peer = group_peer_audio(&epoch);
+        let embedded_opus = [0xF8u8, 0xFF, 0xFE];
+        let packet = peer.protect_audio(&embedded_opus);
+        let peer_ssrc = parse_rtp_header(&packet).expect("RTP header").ssrc;
+        eng.handle_input(100, Input::RelayPacket(&packet));
+        let (outputs, _) = drain(&mut eng);
+        let frame = outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::Event(CallEvent::ForeignGroupAudio(frame)) => Some(frame),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing foreign group audio event: {outputs:?}"));
+        assert_eq!(frame.data.as_ref(), embedded_opus);
+        assert_eq!(
+            frame.sender.as_ref().map(ToString::to_string).as_deref(),
+            Some("222222222222222@lid")
+        );
+        let expected_device = PEER_LID.parse::<Jid>().expect("peer JID").to_string();
+        assert_eq!(
+            frame.device.as_ref().map(ToString::to_string).as_deref(),
+            Some(expected_device.as_str())
+        );
+        assert_eq!(frame.pid, Some(2));
+
+        eng.handle_input(1 + RTCP_MS, Input::Timeout);
+        let (outputs, _) = drain(&mut eng);
+        let protected = outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet)
+                    if classify_relay_packet(packet) == RelayPacketKind::Rtcp =>
+                {
+                    Some(packet)
+                }
+                _ => None,
+            })
+            .expect("group audio Sender Report");
+        let sender_ssrc = parse_rtcp_sender_ssrc(protected).expect("sender SSRC");
+        let self_id = ssrc::format_e2e_srtp_participant_id(SELF_LID);
+        let keys = derive_srtcp_keys_from_raw(&epoch, &self_id).expect("group SRTCP keys");
+        let (plain, _) = unprotect_srtcp(&keys, sender_ssrc, protected).expect("group SRTCP");
+        let summary = summarize_rtcp(&plain).expect("RTCP summary");
+        assert_eq!(summary.referenced_ssrcs, [peer_ssrc]);
+        assert_eq!(summary.report_blocks.len(), 1);
+    }
+
+    #[test]
+    fn group_video_uses_per_participant_orientation() {
+        let (mut eng, epoch) = group_engine(true);
+        let peer_device = PEER_LID.parse::<Jid>().expect("peer JID");
+        eng.set_participant_video_orientation(peer_device.clone(), 2);
+        let mut peer = group_peer_video(&epoch);
+        let packet = peer
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video");
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let (outputs, _) = drain(&mut eng);
+        let peer_user = Jid::new("222222222222222", Server::Lid);
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            Output::VideoPlayout(VideoFrame {
+                orientation: 2,
+                sender: Some(sender),
+                device: Some(device),
+                pid: Some(2),
+                ..
+            }) if *sender == peer_user && *device == peer_device
+        )));
+    }
+
+    #[test]
     fn mlow_red_payload_type_is_depacketized_before_toc_dispatch() {
         let mut eng = engine(true);
         eng.start(0, 0);
@@ -2645,6 +3852,47 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_group_pli_requires_a_new_idr() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys_from_raw, protect_srtcp};
+
+        let (mut eng, epoch) = group_engine(true);
+        eng.handle_input(1, Input::VideoFrame(&video_au(100)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "the initial IDR opens group video transmission"
+        );
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(100)));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 1);
+
+        let self_id = ssrc::format_e2e_srtp_participant_id(SELF_LID);
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        let local_video_ssrc = ssrc::derive_video_participant_ssrc("CID", &self_id);
+        let peer_audio_ssrc = ssrc::derive_wasm_participant_ssrc("CID", &peer_id, 0);
+        let mut pli = vec![0x81, RTCP_PT_PSFB, 0, 2];
+        pli.extend_from_slice(&peer_audio_ssrc.to_be_bytes());
+        pli.extend_from_slice(&local_video_ssrc.to_be_bytes());
+        let peer_keys =
+            derive_srtcp_keys_from_raw(&epoch, &peer_id).expect("peer group SRTCP keys");
+        let protected = protect_srtcp(&peer_keys, peer_audio_ssrc, 0, &pli);
+        eng.handle_input(3, Input::RelayPacket(&protected));
+        let _ = drain(&mut eng);
+
+        eng.handle_input(4, Input::VideoFrame(&video_delta_au(100)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "PLI must suppress dependent group AUs"
+        );
+        eng.handle_input(5, Input::VideoFrame(&video_au(100)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "the next IDR must recover group transmission"
+        );
+    }
+
+    #[test]
     fn sender_reports_use_transport_srtcp_for_audio_and_video() {
         use crate::voip::e2e_srtp::{derive_srtcp_keys, unprotect_srtcp};
 
@@ -2896,6 +4144,34 @@ mod tests {
             let h = parse_rtp_header(b).expect("valid RTP header");
             assert_eq!(h.payload_type, RTP_PAYLOAD_TYPE_H264);
         }
+    }
+
+    #[test]
+    fn source_role_change_rearms_the_outbound_keyframe_gate() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        eng.handle_input(1, Input::VideoFrame(&video_au(100)));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 1);
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(100)));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 1);
+
+        eng.require_video_keyframe();
+        eng.handle_input(3, Input::VideoFrame(&video_delta_au(100)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a replacement camera/screen source must not start on a dependent frame"
+        );
+        eng.handle_input(4, Input::VideoFrame(&video_au(100)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "an IDR must release the replacement source"
+        );
     }
 
     #[test]

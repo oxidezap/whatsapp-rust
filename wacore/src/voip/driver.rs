@@ -19,12 +19,55 @@ use futures::future::{Fuse, FusedFuture};
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
+use crate::types::group_call::GroupCallUpdate;
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::h264::VideoFrame;
 use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
+
+/// Lossless, ordered signaling mutations consumed by the sans-I/O group-media engine.
+pub enum GroupControl {
+    Update(Box<GroupCallUpdate>),
+    RawEpoch(GroupRawEpoch),
+    Reaction(String),
+}
+
+/// One decrypted keygen-v2 epoch. Debug output is deliberately redacted and the bytes are erased
+/// when the command leaves the driver, regardless of whether the engine accepted it.
+pub struct GroupRawEpoch {
+    pub transaction_id: u32,
+    raw_epoch: Vec<u8>,
+}
+
+impl GroupRawEpoch {
+    pub fn new(transaction_id: u32, raw_epoch: Vec<u8>) -> Self {
+        Self {
+            transaction_id,
+            raw_epoch,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.raw_epoch
+    }
+}
+
+impl core::fmt::Debug for GroupRawEpoch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GroupRawEpoch")
+            .field("transaction_id", &self.transaction_id)
+            .field("raw_epoch", &"[redacted]")
+            .finish()
+    }
+}
+
+impl Drop for GroupRawEpoch {
+    fn drop(&mut self) {
+        self.raw_epoch.fill(0);
+    }
+}
 
 /// Mid-call video-plane commands from the shell (upgrade / downgrade / peer orientation). Kept out
 /// of the engine so it stays sans-IO; the drive loop translates each into an engine method call.
@@ -42,8 +85,15 @@ pub enum VideoControl {
     EnableAwaitingAccept,
     /// Tear the video plane down (downgrade to audio).
     Disable,
+    /// Require the next outbound access unit to be an IDR frame after changing its source role.
+    RequireKeyframe,
     /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
     SetOrientation(u8),
+    /// One routed group participant's device orientation.
+    SetParticipantOrientation {
+        participant: wacore_binary::Jid,
+        orientation: u8,
+    },
 }
 
 /// State changes stay FIFO so `Disable` performs its purge before a later `Enable`; only the latest
@@ -168,6 +218,8 @@ pub struct CallChannels {
     pub video_out: async_channel::Sender<VideoFrame>,
     /// Mid-call video-plane control (lossless state, coalesced orientation).
     pub video_ctl: VideoControlReceiver,
+    /// Group roster and decrypted epoch transitions. `None` for a 1:1 call.
+    pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
 }
 
 /// Bound slow relay writes without truncating a complete video access unit.
@@ -462,6 +514,7 @@ async fn run_call_with_clock_and_wallclock(
     // false after the first event -- a rekey or the sender closing -- so the closed channel's
     // always-ready `Err` doesn't busy-spin the select (the mic arm has the same guard).
     let mut rekey_open = true;
+    let mut group_ctl_open = true;
 
     // Same closed-channel guards for the video arms: a call that never wires a video source/control
     // sender must not busy-spin on their always-ready `Err`.
@@ -611,6 +664,22 @@ async fn run_call_with_clock_and_wallclock(
         .fuse();
         futures::pin_mut!(rekey_fut);
 
+        let group_ctl_live = group_ctl_open && channels.group_ctl.is_some();
+        let group_ctl_ch = channels.group_ctl.as_ref();
+        let group_ctl_fut = async move {
+            if group_ctl_live {
+                group_ctl_ch
+                    .expect("group_ctl_live implies Some")
+                    .recv()
+                    .await
+                    .ok()
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(group_ctl_fut);
+
         // Video source and control arms, guarded like the mic: a closed channel disables the arm
         // (a video source EOF must not end the call — audio keeps running after a downgrade).
         let video_in = &channels.video_in;
@@ -660,6 +729,36 @@ async fn run_call_with_clock_and_wallclock(
                     break 'drive; // malformed stored call_key (a setup invariant violated)
                 }
             },
+            group = group_ctl_fut => {
+                match group {
+                    Some(GroupControl::Update(update)) => {
+                        if eng.apply_group_update(&update).is_err() {
+                            break 'drive;
+                        }
+                    }
+                    Some(GroupControl::RawEpoch(epoch)) => {
+                        if eng
+                            .apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes())
+                            .is_err()
+                        {
+                            break 'drive;
+                        }
+                    }
+                    Some(GroupControl::Reaction(emoji)) => {
+                        if eng.send_group_reaction(now_ms(), &emoji).is_err() {
+                            break 'drive;
+                        }
+                    }
+                    None => group_ctl_open = false,
+                }
+                let now = now_ms();
+                if let Some(at) = eng.poll_timeout()
+                    && at != engine::NEVER
+                    && now >= at
+                {
+                    eng.handle_input(now, Input::Timeout);
+                }
+            },
             // State control before orientation and media, so a Disable always purges before a later
             // Enable can admit frames from the replacement source.
             ctl = video_ctl_fut => {
@@ -693,7 +792,12 @@ async fn run_call_with_clock_and_wallclock(
                         // channel).
                         drain_video_in = true;
                     }
+                    Ok(VideoControl::RequireKeyframe) => eng.require_video_keyframe(),
                     Ok(VideoControl::SetOrientation(o)) => eng.set_peer_video_orientation(o),
+                    Ok(VideoControl::SetParticipantOrientation {
+                        participant,
+                        orientation,
+                    }) => eng.set_participant_video_orientation(participant, orientation),
                     Err(_) => video_ctl_open = false,
                 }
                 // Fire an overdue timer like the other ready arms so a stream of control messages
@@ -844,9 +948,11 @@ mod tests {
             assert!(tx.send(VideoControl::SetOrientation(orientation % 4)));
         }
         assert!(tx.send(VideoControl::Enable));
+        assert!(tx.send(VideoControl::RequireKeyframe));
 
         assert_eq!(rx.try_recv(), Ok(VideoControl::Disable));
         assert_eq!(rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
@@ -873,6 +979,7 @@ mod tests {
             video_in: vin_rx,
             video_out: vout_tx,
             video_ctl: vctl_rx,
+            group_ctl: None,
         }
     }
 
@@ -1551,6 +1658,7 @@ mod tests {
                 video_in: vin_rx,
                 video_out: vout_tx,
                 video_ctl: vctl_rx,
+                group_ctl: None,
             },
             eng,
         ));

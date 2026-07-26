@@ -23,6 +23,11 @@ const KNOWN_ACTIONS: &[&str] = &[
     "transport",
     "relaylatency",
     "video",
+    "group_update",
+    "enc_rekey",
+    "waiting_room_update",
+    "user_action",
+    "screen_share",
 ];
 
 pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
@@ -56,6 +61,8 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .and_then(|s| (!s.is_empty()).then(|| s.into_owned()));
     let platform = attrs.optional_string("platform").map(|s| s.into_owned());
     let version = attrs.optional_string("version").map(|s| s.into_owned());
+    let participant = attrs.optional_jid("participant");
+    let recipient = attrs.optional_jid("recipient");
     let ts = attrs
         .optional_unix_time("t")
         .ok_or_else(|| anyhow!("<call> missing or invalid 't' attribute"))?;
@@ -67,6 +74,16 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
     let action = parse_action(child)?;
+    let group = if child.tag.as_ref() == "offer" {
+        super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
+    } else {
+        None
+    };
+    #[cfg(feature = "voip")]
+    let media = (child.tag.as_ref() == "offer")
+        .then(|| parse_media_offer(node, child, &from))
+        .flatten()
+        .map(Box::new);
 
     Ok(Some(IncomingCall {
         from,
@@ -74,16 +91,16 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         notify,
         platform,
         version,
+        participant,
+        recipient,
         timestamp,
         offline,
         action,
+        group,
         // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
         // capture them only on an <offer> and only when `voip` is on (RelayData lives there).
         #[cfg(feature = "voip")]
-        media: (child.tag.as_ref() == "offer")
-            .then(|| parse_media_offer(node, child))
-            .flatten()
-            .map(Box::new),
+        media,
     }))
 }
 
@@ -94,8 +111,10 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 fn parse_media_offer(
     call: &NodeRef<'_>,
     offer: &NodeRef<'_>,
+    peer: &Jid,
 ) -> Option<crate::types::call::MediaOffer> {
     use crate::types::call::{MediaOffer, OfferRecipientEnc};
+    use crate::types::group_call::GroupCallDevice;
 
     let mut encs = Vec::new();
     if let Some(enc_node) = offer.get_optional_child("enc") {
@@ -147,11 +166,26 @@ fn parse_media_offer(
             )
         })
         .unwrap_or_default();
+    let peer_device = offer
+        .get_optional_child("capability")
+        .and_then(|capability| {
+            let bytes = capability.content_bytes()?.to_vec();
+            if bytes.is_empty() {
+                return None;
+            }
+            let mut attrs = capability.attrs();
+            let version = attrs
+                .optional_u64("ver")
+                .and_then(|version| u32::try_from(version).ok())
+                .unwrap_or(1);
+            Some(GroupCallDevice::new(peer.clone()).with_capability(version, bytes))
+        });
     Some(MediaOffer {
         encs,
         relay,
         peer_abtest_bucket,
         peer_abtest_bucket_id_list,
+        peer_device,
     })
 }
 
@@ -211,6 +245,25 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         .ok_or_else(|| anyhow!("<{}> missing 'call-creator'", node.tag))?;
 
     Ok(match node.tag.as_ref() {
+        "group_update" => CallAction::GroupUpdate {
+            update: super::group_call::parse_group_update(node)?,
+        },
+        "enc_rekey" => CallAction::EncRekey {
+            rekey: super::group_call::parse_group_enc_rekey(node)?,
+        },
+        "waiting_room_update" => CallAction::WaitingRoomUpdate {
+            room: super::group_call::parse_waiting_room_update(node)?,
+        },
+        "user_action" => CallAction::RaiseHand {
+            call_id,
+            call_creator,
+            raised: super::group_call::parse_raise_hand(node)?,
+        },
+        "screen_share" => CallAction::ScreenShare {
+            call_id,
+            call_creator,
+            screen_share: super::group_call::parse_screen_share(node)?,
+        },
         "offer" => {
             let caller_pn = attrs.optional_jid("caller_pn");
             let caller_country_code = attrs
@@ -1018,6 +1071,10 @@ mod tests {
                             .attr("type", "pkmsg")
                             .bytes(vec![1, 2, 3, 4])
                             .build(),
+                        NodeBuilder::new("capability")
+                            .attr("ver", "1")
+                            .bytes(CAPABILITY_OFFER.to_vec())
+                            .build(),
                         NodeBuilder::new("metadata")
                             .attr("peer_abtest_bucket", "video_interop_holdout")
                             .attr("peer_abtest_bucket_id_list", "110001,110002")
@@ -1044,6 +1101,10 @@ mod tests {
             media.peer_abtest_bucket_id_list.as_deref(),
             Some("110001,110002")
         );
+        let peer_device = media.peer_device.as_ref().expect("active peer capability");
+        assert_eq!(peer_device.jid, fake_caller_lid());
+        assert_eq!(peer_device.capability_version, Some(1));
+        assert_eq!(peer_device.capability, CAPABILITY_OFFER);
         let rd = media.relay.expect("the <relay> must be parsed");
         assert_eq!(rd.warp_mi_tag_len, Some(4));
         assert_eq!(rd.relay_tokens[0], vec![0xaa, 0xbb]);

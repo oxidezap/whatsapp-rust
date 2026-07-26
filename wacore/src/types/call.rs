@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use wacore_binary::Jid;
 
+#[cfg(feature = "voip")]
+use super::group_call::GroupCallDevice;
+use super::group_call::{GroupCallEncRekey, GroupCallUpdate, ScreenShare, WaitingRoom};
+
 /// The encrypted callKey + parsed relay carried by an `<offer>`, captured so the media facade can
 /// decrypt the callKey and connect the relay without re-walking the raw stanza. Binary/media-only,
 /// so it is kept off the `serde` shape (downstream JS consumers see only the signaling fields).
@@ -19,6 +23,10 @@ pub struct MediaOffer {
     /// Rollout metadata echoed by official callees in the video accept.
     pub peer_abtest_bucket: Option<String>,
     pub peer_abtest_bucket_id_list: Option<String>,
+    /// The offerer's active device capability. The raw capability stays private inside
+    /// [`GroupCallDevice`], but the runtime can retain it to promote this 1:1 call to ad-hoc group
+    /// media later.
+    pub peer_device: Option<GroupCallDevice>,
 }
 
 #[cfg(feature = "voip")]
@@ -216,6 +224,24 @@ pub enum CallAction {
         #[serde(skip_serializing_if = "Option::is_none")]
         dec: Option<String>,
     },
+    /// Transaction-ordered authoritative membership and relay snapshot.
+    GroupUpdate { update: GroupCallUpdate },
+    /// Signal-encrypted keygen-v2 epoch for a group call.
+    EncRekey { rekey: GroupCallEncRekey },
+    /// Authoritative admission state for a reusable call-link call.
+    WaitingRoomUpdate { room: WaitingRoom },
+    /// Persistent raise/lower-hand state for one participant.
+    RaiseHand {
+        call_id: String,
+        call_creator: Jid,
+        raised: bool,
+    },
+    /// Screen-share state for one participant.
+    ScreenShare {
+        call_id: String,
+        call_creator: Jid,
+        screen_share: ScreenShare,
+    },
 }
 
 impl CallAction {
@@ -229,7 +255,12 @@ impl CallAction {
             | Self::Terminate { call_id, .. }
             | Self::Transport { call_id, .. }
             | Self::RelayLatency { call_id, .. }
-            | Self::VideoState { call_id, .. } => call_id,
+            | Self::VideoState { call_id, .. }
+            | Self::RaiseHand { call_id, .. }
+            | Self::ScreenShare { call_id, .. } => call_id,
+            Self::GroupUpdate { update } => &update.call_id,
+            Self::EncRekey { rekey } => &rekey.call_id,
+            Self::WaitingRoomUpdate { room } => &room.call_id,
         }
     }
 
@@ -243,7 +274,12 @@ impl CallAction {
             | Self::Terminate { call_creator, .. }
             | Self::Transport { call_creator, .. }
             | Self::RelayLatency { call_creator, .. }
-            | Self::VideoState { call_creator, .. } => call_creator,
+            | Self::VideoState { call_creator, .. }
+            | Self::RaiseHand { call_creator, .. }
+            | Self::ScreenShare { call_creator, .. } => call_creator,
+            Self::GroupUpdate { update } => &update.call_creator,
+            Self::EncRekey { rekey } => &rekey.call_creator,
+            Self::WaitingRoomUpdate { room } => &room.call_creator,
         }
     }
 
@@ -259,6 +295,11 @@ impl CallAction {
             Self::Transport { .. } => "transport",
             Self::RelayLatency { .. } => "relaylatency",
             Self::VideoState { .. } => "video",
+            Self::GroupUpdate { .. } => "group_update",
+            Self::EncRekey { .. } => "enc_rekey",
+            Self::WaitingRoomUpdate { .. } => "waiting_room_update",
+            Self::RaiseHand { .. } => "user_action",
+            Self::ScreenShare { .. } => "screen_share",
         }
     }
 }
@@ -275,10 +316,19 @@ pub struct IncomingCall {
     pub platform: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Companion-routing metadata copied from the outer `<call>` wrapper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant: Option<Jid>,
+    /// Companion recipient metadata copied from the outer `<call>` wrapper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<Jid>,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub timestamp: DateTime<Utc>,
     pub offline: bool,
     pub action: CallAction,
+    /// Group snapshot embedded in an initial offer or active-call invitation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<Box<GroupCallUpdate>>,
     /// Media material from an `<offer>` (the encrypted callKey + parsed relay), captured by the
     /// parser so the `voip` media facade can drive the call. `None` for non-offer actions or an
     /// offer with no `<enc>` for us. Boxed so the large `RelayData` doesn't bloat every `Event`
@@ -389,9 +439,12 @@ impl IncomingCall {
             notify: None,
             platform: None,
             version: None,
+            participant: None,
+            recipient: None,
             timestamp,
             offline: false,
             action,
+            group: None,
             #[cfg(feature = "voip")]
             media: None,
         }

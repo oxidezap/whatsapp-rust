@@ -37,10 +37,24 @@ type IqSendFuture<'a> =
 /// cancellation-via-drop, and a lingering waiter suppresses keepalives for the
 /// life of the connection. Dropping the guard removes the entry on every exit
 /// path; on success `resolve_waiters` already removed it, so it's a no-op.
-struct ResponseWaiterGuard {
+pub(crate) struct ResponseWaiterGuard {
     waiters: Arc<std::sync::Mutex<crate::client::ResponseWaiterMap>>,
     req_id: String,
     cleanup_generation: NonZeroU64,
+}
+
+impl ResponseWaiterGuard {
+    pub(crate) fn new(
+        waiters: Arc<std::sync::Mutex<crate::client::ResponseWaiterMap>>,
+        req_id: String,
+        cleanup_generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            waiters,
+            req_id,
+            cleanup_generation,
+        }
+    }
 }
 
 impl Drop for ResponseWaiterGuard {
@@ -434,11 +448,8 @@ impl Client {
         // dropped mid-await (cancellation), which the explicit paths can't
         // catch. So the send-fail / timeout / shutdown arms no longer remove
         // the waiter by hand; the guard does it on drop.
-        let _waiter_guard = ResponseWaiterGuard {
-            waiters: self.response_waiters.clone(),
-            req_id,
-            cleanup_generation,
-        };
+        let _waiter_guard =
+            ResponseWaiterGuard::new(self.response_waiters.clone(), req_id, cleanup_generation);
 
         // Per-connection: pending IQ requests are bound to the current socket;
         // a reconnect aborts them (sender retries on the new connection).

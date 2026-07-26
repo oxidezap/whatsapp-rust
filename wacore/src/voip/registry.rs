@@ -16,8 +16,12 @@ use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
 use crate::types::call::VideoState;
-use crate::voip::driver::{VideoControl, VideoControlSender};
+use crate::types::group_call::{
+    GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShare, WaitingRoom,
+};
+use crate::voip::driver::{GroupControl, GroupRawEpoch, VideoControl, VideoControlSender};
 use crate::voip::engine::CallEvent;
+use crate::voip::group::{GroupCallState, GroupStateApply};
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
 
@@ -112,6 +116,8 @@ impl Drop for EndedNotify {
 struct CallEntry {
     session: CallSession,
     media_task: Option<AbortHandle>,
+    /// Keeps a pending call-link admission alive. Cleared on admission and aborted with the entry.
+    waiting_room_task: Option<AbortHandle>,
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
     /// finishing task only reaps its OWN entry (the ABA hazard).
     generation: u64,
@@ -123,6 +129,11 @@ struct CallEntry {
     event_tx: Option<async_channel::Sender<CallEvent>>,
     /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
     video_ctl_tx: Option<VideoControlSender>,
+    /// Lossless group roster/key transitions into the media driver.
+    group_ctl_tx: Option<async_channel::Sender<GroupControl>>,
+    /// An epoch may arrive after call-scoped accept but before relay media attaches. Replacing or
+    /// dropping this command erases its key bytes through [`GroupRawEpoch`]'s `Drop`.
+    pending_group_epoch: Option<GroupRawEpoch>,
     /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
     /// same teardown without keeping codec resources alive through lingering handles.
     video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
@@ -130,7 +141,15 @@ struct CallEntry {
     event_publication_reserved: Arc<AtomicBool>,
     /// Mirrors WA's stream mutex for user actions, peer signaling, and timeout callbacks.
     video_transition_lock: Arc<AsyncMutex<()>>,
+    /// Serializes participant controls and waiting-room state through their typed ACK.
+    group_transition_lock: Arc<AsyncMutex<()>>,
+    /// Wakes a pending call-link media builder on admission, replacement, or terminal teardown.
+    group_update_event: Arc<event_listener::Event>,
     video: VideoNegotiation,
+    group: Option<GroupCallState>,
+    /// Active 1:1 devices retained so an established call can become an ad-hoc group call.
+    group_invite_self_device: Option<GroupCallDevice>,
+    group_invite_peer_device: Option<GroupCallDevice>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -162,6 +181,7 @@ impl Drop for CallEventPermit {
 
 impl Drop for CallEntry {
     fn drop(&mut self) {
+        self.group_update_event.notify(usize::MAX);
         if let Some(teardown) = self.video_teardown.take() {
             teardown();
         }
@@ -196,18 +216,173 @@ impl CallRegistry {
         tx.is_some_and(|tx| tx.force_send(event).is_ok())
     }
 
+    /// Atomically apply a newer authoritative group snapshot to an active call.
+    pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
+        let (applied, waiting_room_task, event) = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let Some(entry) = map.get_mut(&update.call_id) else {
+                return GroupStateApply::UnknownCall;
+            };
+            let call_id = entry.session.call_id.clone();
+            let call_creator = entry.session.call_creator.clone();
+            let group = entry
+                .group
+                .get_or_insert_with(|| GroupCallState::new(call_id, call_creator));
+            let applied = group.apply_update(update);
+            let admitted = applied == GroupStateApply::Applied
+                && entry.session.phase() == CallPhase::WaitingRoom;
+            if admitted {
+                let _ = entry.session.transition_to(CallPhase::Connecting);
+            }
+            let waiting_room_task = if admitted {
+                entry.waiting_room_task.take()
+            } else {
+                None
+            };
+            (
+                applied,
+                waiting_room_task,
+                (applied == GroupStateApply::Applied).then(|| entry.group_update_event.clone()),
+            )
+        };
+        // Abort the heartbeat outside the registry lock: executor cancellation is an external
+        // callback and must never be able to re-enter while the map is borrowed.
+        drop(waiting_room_task);
+        if let Some(event) = event {
+            event.notify(usize::MAX);
+        }
+        applied
+    }
+
+    /// Atomically apply a newer waiting-room snapshot to an active call-link call.
+    pub fn apply_waiting_room(&self, room: WaitingRoom) -> GroupStateApply {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map.get_mut(&room.call_id) else {
+            return GroupStateApply::UnknownCall;
+        };
+        let call_id = entry.session.call_id.clone();
+        let call_creator = entry.session.call_creator.clone();
+        let group = entry
+            .group
+            .get_or_insert_with(|| GroupCallState::new(call_id, call_creator));
+        group.apply_waiting_room(room)
+    }
+
+    /// Commit a successfully acknowledged local waiting-room approval toggle.
+    pub fn set_waiting_room_enabled(&self, call_id: &str, enabled: bool) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .and_then(|entry| entry.group.as_mut())
+            .is_some_and(|group| group.set_waiting_room_enabled(enabled))
+    }
+
+    /// Update one participant's persistent hand state for an active group call.
+    pub fn set_raised_hand(&self, call_id: &str, participant: &Jid, raised: bool) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map.get_mut(call_id) else {
+            return false;
+        };
+        let own_call_id = entry.session.call_id.clone();
+        let call_creator = entry.session.call_creator.clone();
+        let group = entry
+            .group
+            .get_or_insert_with(|| GroupCallState::new(own_call_id, call_creator));
+        group.set_raised_hand(participant, raised);
+        true
+    }
+
+    /// Update one participant's screen-share state for an active group call.
+    pub fn set_screen_share(
+        &self,
+        call_id: &str,
+        participant: &Jid,
+        screen_share: ScreenShare,
+    ) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map.get_mut(call_id) else {
+            return false;
+        };
+        let own_call_id = entry.session.call_id.clone();
+        let call_creator = entry.session.call_creator.clone();
+        let group = entry
+            .group
+            .get_or_insert_with(|| GroupCallState::new(own_call_id, call_creator));
+        group.set_screen_share(participant, screen_share);
+        true
+    }
+
+    /// Read a clone of the current group-call state.
+    pub fn group_state(&self, call_id: &str) -> Option<GroupCallState> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|entry| entry.group.clone())
+    }
+
+    /// Whether a routed signaling sender belongs to this exact active group call.
+    pub fn group_sender_authorized(&self, call_id: &str, call_creator: &Jid, sender: &Jid) -> bool {
+        let map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get(call_id)
+            .filter(|entry| entry.session.call_creator == *call_creator)
+        else {
+            return false;
+        };
+        let Some(snapshot) = entry.group.as_ref().and_then(GroupCallState::snapshot) else {
+            return false;
+        };
+        let sender_user = sender.to_non_ad();
+        snapshot.participants.iter().any(|participant| {
+            if sender.device == 0 {
+                participant.jid.to_non_ad() == sender_user
+                    || participant
+                        .pn
+                        .as_ref()
+                        .is_some_and(|pn| pn.to_non_ad() == sender_user)
+            } else {
+                participant
+                    .devices
+                    .iter()
+                    .any(|device| device.jid.device_eq(sender))
+            }
+        })
+    }
+
     /// Register a call, returning its generation token. A same-call-id re-offer (retry/glare)
     /// REPLACES the prior registration, aborting its media task; the returned generation
     /// distinguishes the new call from the old. Pass it to [`set_media_task`](Self::set_media_task)
     /// and [`remove_if_current`](Self::remove_if_current) so a finishing task only ever reaps its
     /// OWN entry, never a newer replacement.
     pub fn insert(&self, session: CallSession) -> u64 {
+        self.insert_inner(session, true)
+    }
+
+    /// Register an active-group invitation without marking it answered.
+    ///
+    /// Roster and epoch updates can land while the user decides, while the separate ringing set
+    /// still classifies a remote timeout as a missed call.
+    pub fn insert_ringing_group(&self, session: CallSession) -> u64 {
+        self.insert_inner(session, false)
+    }
+
+    fn insert_inner(&self, session: CallSession, consume_ringing: bool) -> u64 {
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let video = VideoNegotiation::new(session.is_video);
+        let group = session.group.as_ref().map(|update| {
+            let mut state =
+                GroupCallState::new(session.call_id.clone(), session.call_creator.clone());
+            let _ = state.apply_update(update.clone());
+            state
+        });
         // Registering a call as active answers (accept) or places (outgoing) it: it is no longer
         // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
         // offer this clears the ringing flag so a later `<terminate>` reads as ended, not missed.
-        self.take_ringing(&session.call_id);
+        if consume_ringing {
+            self.take_ringing(&session.call_id);
+        }
         let prev = {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             map.insert(
@@ -215,14 +390,22 @@ impl CallRegistry {
                 CallEntry {
                     session,
                     media_task: None,
+                    waiting_room_task: None,
                     generation,
                     rekey_tx: None,
                     event_tx: None,
                     video_ctl_tx: None,
+                    group_ctl_tx: None,
+                    pending_group_epoch: None,
                     video_teardown: None,
                     event_publication_reserved: Arc::new(AtomicBool::new(false)),
                     video_transition_lock: Arc::new(AsyncMutex::new(())),
+                    group_transition_lock: Arc::new(AsyncMutex::new(())),
+                    group_update_event: Arc::new(event_listener::Event::new()),
                     video,
+                    group,
+                    group_invite_self_device: None,
+                    group_invite_peer_device: None,
                     on_terminal: None,
                 },
             )
@@ -232,6 +415,37 @@ impl CallRegistry {
         // from re-entering or poisoning the registry mutex.
         drop(prev);
         generation
+    }
+
+    /// Promote a previously registered active-group invitation into media setup without replacing
+    /// its entry. This preserves any newer roster and buffered epoch that arrived during acceptance.
+    pub fn promote_ringing_group(&self, mut session: CallSession) -> Option<u64> {
+        let call_id = session.call_id.clone();
+        let generation = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let entry = map.get_mut(&call_id)?;
+            if !matches!(
+                entry.session.phase(),
+                CallPhase::Ringing | CallPhase::Connecting
+            ) || entry.session.call_creator != session.call_creator
+                || entry.group.is_none()
+            {
+                return None;
+            }
+            if let Some(latest) = entry
+                .group
+                .as_ref()
+                .and_then(GroupCallState::snapshot)
+                .cloned()
+            {
+                session.group = Some(latest);
+            }
+            entry.video = VideoNegotiation::new(session.is_video);
+            entry.session = session;
+            entry.generation
+        };
+        self.take_ringing(&call_id);
+        Some(generation)
     }
 
     /// Attach (or replace) the media task for the call registered under `generation`. If the call
@@ -251,6 +465,96 @@ impl CallRegistry {
             }
             _ => handle.abort(),
         }
+    }
+
+    /// Attach the repeating waiting-room heartbeat to one call generation.
+    pub fn set_waiting_room_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
+        let replaced = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let Some(entry) = map.get_mut(call_id).filter(|entry| {
+                entry.generation == generation && entry.session.phase() == CallPhase::WaitingRoom
+            }) else {
+                drop(map);
+                drop(handle);
+                return;
+            };
+            entry.waiting_room_task.replace(handle)
+        };
+        drop(replaced);
+    }
+
+    /// Listen for a committed group update or terminal replacement of this generation.
+    pub fn listen_group_update(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<event_listener::EventListener> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.group_update_event.listen())
+    }
+
+    /// Seed the local active device used when an established 1:1 call becomes ad-hoc group media.
+    pub fn set_group_invite_self_device(
+        &self,
+        call_id: &str,
+        generation: u64,
+        device: GroupCallDevice,
+    ) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .is_some_and(|entry| {
+                entry.group_invite_self_device = Some(device);
+                true
+            })
+    }
+
+    /// Record the peer device and capability selected by preaccept/accept signaling.
+    pub fn set_group_invite_peer_device(&self, call_id: &str, device: GroupCallDevice) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .is_some_and(|entry| {
+                entry.group_invite_peer_device = Some(device);
+                true
+            })
+    }
+
+    /// Build the connected two-user roster needed to add the first ad-hoc participant.
+    pub fn group_invite_fallback_roster(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Vec<GroupCallParticipant>> {
+        let map = self.inner.lock().expect("registry lock poisoned");
+        let entry = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        let self_device = entry.group_invite_self_device.clone()?;
+        let peer_device = entry.group_invite_peer_device.clone()?;
+        Some(vec![
+            GroupCallParticipant {
+                jid: self_device.jid.to_non_ad(),
+                pn: None,
+                state: "connected".to_string(),
+                participant_type: None,
+                devices: vec![self_device],
+            },
+            GroupCallParticipant {
+                jid: peer_device.jid.to_non_ad(),
+                pn: None,
+                state: "connected".to_string(),
+                participant_type: None,
+                devices: vec![peer_device],
+            },
+        ])
     }
 
     /// Attach the wake-on-removal hook for the call under `generation`: when the entry is removed
@@ -321,6 +625,81 @@ impl CallRegistry {
         }
     }
 
+    /// Attach the group-media control sender for this call generation.
+    pub fn set_group_control_sender(
+        &self,
+        call_id: &str,
+        generation: u64,
+        tx: async_channel::Sender<GroupControl>,
+    ) {
+        let pending = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let Some(entry) = map
+                .get_mut(call_id)
+                .filter(|entry| entry.generation == generation)
+            else {
+                return;
+            };
+            entry.group_ctl_tx = Some(tx.clone());
+            let update = entry
+                .group
+                .as_ref()
+                .and_then(GroupCallState::snapshot)
+                .cloned();
+            (update, entry.pending_group_epoch.take())
+        };
+        if let Some(update) = pending.0 {
+            let _ = tx.try_send(GroupControl::Update(Box::new(update)));
+        }
+        if let Some(epoch) = pending.1 {
+            let _ = tx.try_send(GroupControl::RawEpoch(epoch));
+        }
+    }
+
+    /// Deliver an authoritative roster to the group-media engine.
+    pub fn send_group_update(&self, call_id: &str, update: GroupCallUpdate) -> bool {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|entry| entry.group_ctl_tx.clone());
+        tx.is_some_and(|tx| tx.try_send(GroupControl::Update(Box::new(update))).is_ok())
+    }
+
+    /// Deliver one decrypted shared epoch to the group-media engine.
+    pub fn send_group_epoch(&self, call_id: &str, transaction_id: u32, raw_epoch: Vec<u8>) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map.get_mut(call_id) else {
+            return false;
+        };
+        let epoch = GroupRawEpoch::new(transaction_id, raw_epoch);
+        if let Some(tx) = entry.group_ctl_tx.clone() {
+            drop(map);
+            tx.try_send(GroupControl::RawEpoch(epoch)).is_ok()
+        } else {
+            let replace = entry
+                .pending_group_epoch
+                .as_ref()
+                .is_none_or(|pending| transaction_id >= pending.transaction_id);
+            if replace {
+                entry.pending_group_epoch = Some(epoch);
+            }
+            true
+        }
+    }
+
+    /// Queue one RTC reaction on the active group media stream.
+    pub fn send_group_reaction(&self, call_id: &str, emoji: String) -> bool {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|entry| entry.group_ctl_tx.clone());
+        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)).is_ok())
+    }
+
     /// Replace the one-shot endpoint teardown for the current call generation.
     pub fn set_video_teardown(
         &self,
@@ -389,6 +768,15 @@ impl CallRegistry {
             .expect("registry lock poisoned")
             .get(call_id)
             .map(|entry| (entry.generation, entry.video_transition_lock.clone()))
+    }
+
+    /// The per-call serialization lock for participant and waiting-room controls.
+    pub fn group_transition_lock(&self, call_id: &str) -> Option<Arc<AsyncMutex<()>>> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .map(|entry| entry.group_transition_lock.clone())
     }
 
     /// The video-transition lock for one known call generation.
@@ -849,6 +1237,7 @@ impl CallRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::group_call::{GroupCallDevice, GroupCallParticipant, GroupCallUpdate};
     use crate::voip::driver::video_control_channel;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -860,6 +1249,115 @@ mod tests {
             Jid::new("222222222222222", Server::Lid),
             Jid::new("111111111111111", Server::Lid),
         )
+    }
+
+    fn group_update(transaction_id: u32) -> GroupCallUpdate {
+        GroupCallUpdate {
+            call_id: "GROUP-CALL".to_string(),
+            call_creator: Jid::new("111111111111111", Server::Lid),
+            group_jid: None,
+            transaction_id,
+            media: "audio".to_string(),
+            connected_limit: 32,
+            joinable: true,
+            av_upgradable: true,
+            rekey_requested: false,
+            participants: Vec::new(),
+            relay: None,
+        }
+    }
+
+    #[test]
+    fn ringing_group_promotion_preserves_newer_roster_and_latest_pending_epoch() {
+        let reg = CallRegistry::new();
+        reg.mark_incoming_ringing("GROUP-CALL");
+        let mut ringing = CallSession::new_incoming(
+            "GROUP-CALL",
+            Jid::new("111111111111111", Server::Lid),
+            Jid::new("111111111111111", Server::Lid),
+        );
+        ringing.group = Some(group_update(1));
+        let generation = reg.insert_ringing_group(ringing);
+        assert!(
+            reg.ringing
+                .lock()
+                .expect("registry lock")
+                .contains("GROUP-CALL"),
+            "registering the enriched offer must not mark it answered"
+        );
+
+        assert_eq!(
+            reg.apply_group_update(group_update(2)),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_epoch("GROUP-CALL", 2, vec![2; 32]));
+        assert!(reg.send_group_epoch("GROUP-CALL", 3, vec![3; 32]));
+        assert!(reg.send_group_epoch("GROUP-CALL", 2, vec![9; 32]));
+        assert!(reg.transition("GROUP-CALL", CallPhase::Connecting));
+
+        let mut accepted = CallSession::new_incoming(
+            "GROUP-CALL",
+            Jid::new("111111111111111", Server::Lid),
+            Jid::new("111111111111111", Server::Lid),
+        );
+        accepted.group = Some(group_update(1));
+        assert_eq!(reg.promote_ringing_group(accepted), Some(generation));
+        assert!(!reg.take_ringing("GROUP-CALL"));
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(2)
+        );
+
+        let (tx, rx) = async_channel::unbounded();
+        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        match rx.try_recv().expect("latest roster") {
+            GroupControl::Update(update) => assert_eq!(update.transaction_id, 2),
+            _ => panic!("expected buffered group update"),
+        }
+        match rx.try_recv().expect("latest epoch") {
+            GroupControl::RawEpoch(epoch) => assert_eq!(epoch.transaction_id, 3),
+            _ => panic!("expected buffered group epoch"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn group_sender_authorization_is_bound_to_creator_and_active_roster() {
+        let reg = CallRegistry::new();
+        reg.insert(session("GROUP-CALL"));
+        let participant = Jid::new("333333333333333", Server::Lid);
+        let device = participant.clone().with_device(3);
+        let mut update = group_update(1);
+        update.participants = vec![
+            GroupCallParticipant::new(
+                update.call_creator.clone(),
+                vec![GroupCallDevice::new(
+                    update.call_creator.clone().with_device(1),
+                )],
+            ),
+            GroupCallParticipant::new(
+                participant.clone(),
+                vec![GroupCallDevice::new(device.clone())],
+            ),
+        ];
+        assert_eq!(reg.apply_group_update(update), GroupStateApply::Applied);
+
+        let creator = Jid::new("111111111111111", Server::Lid);
+        assert!(reg.group_sender_authorized("GROUP-CALL", &creator, &device));
+        assert!(reg.group_sender_authorized("GROUP-CALL", &creator, &participant));
+        assert!(!reg.group_sender_authorized("GROUP-CALL", &creator, &participant.with_device(4)));
+        assert!(!reg.group_sender_authorized(
+            "GROUP-CALL",
+            &creator,
+            &Jid::new("444444444444444", Server::Lid).with_device(4)
+        ));
+        assert!(!reg.group_sender_authorized(
+            "GROUP-CALL",
+            &Jid::new("555555555555555", Server::Lid),
+            &device
+        ));
+        assert!(!reg.group_sender_authorized("OTHER-CALL", &creator, &device));
     }
 
     #[test]
@@ -1131,8 +1629,10 @@ mod tests {
             );
         }
         reg.send_video_ctl("CID", current, VideoControl::Enable);
+        reg.send_video_ctl("CID", current, VideoControl::RequireKeyframe);
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
 
         reg.send_video_ctl("CID", stale, VideoControl::Disable);

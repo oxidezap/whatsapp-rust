@@ -75,6 +75,15 @@ pub fn derive_e2e_keys(call_key: &[u8], participant_lid: &str) -> Option<E2eSrtp
     Some(derive_session_keys_from_master(&master))
 }
 
+/// SRTP keys from one decrypted keygen-v2 group epoch.
+///
+/// The epoch is transaction-wide: callers derive local send keys with the
+/// local participant id and one receive key set per remote participant id.
+#[doc(hidden)]
+pub fn derive_e2e_keys_from_raw(raw_epoch: &[u8], participant_lid: &str) -> Option<E2eSrtpKeys> {
+    derive_e2e_keys(raw_epoch, participant_lid)
+}
+
 /// E2E RTP IV: salt right-aligned into 16 bytes, then SSRC XORed at bytes 4-7 and the
 /// 48-bit packet index (ROC<<16 | seq) XORed at bytes 8-13.
 pub fn build_e2e_rtp_iv(salt: &[u8], ssrc: u32, roc: u32, seq: u16) -> [u8; 16] {
@@ -148,6 +157,12 @@ pub fn derive_srtcp_keys(call_key: &[u8], participant_lid: &str) -> Option<E2eSr
     keys.salt
         .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x05, 14));
     Some(keys)
+}
+
+/// SRTCP sibling of [`derive_e2e_keys_from_raw`], using the native RTCP labels.
+#[doc(hidden)]
+pub fn derive_srtcp_keys_from_raw(raw_epoch: &[u8], participant_lid: &str) -> Option<E2eSrtpKeys> {
+    derive_srtcp_keys(raw_epoch, participant_lid)
 }
 
 /// Protect one RTCP packet as SRTCP (RFC 3711 §3.4): AES-CTR the body, append the 4-byte

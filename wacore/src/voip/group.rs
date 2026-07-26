@@ -1,0 +1,305 @@
+//! Runtime state machine for group-call membership and participant controls.
+//!
+//! The server owns the roster. Updates are transaction ordered and never merge
+//! incrementally: an accepted snapshot replaces the previous one atomically.
+
+use std::collections::{HashMap, HashSet};
+
+use wacore_binary::Jid;
+
+use crate::types::group_call::{
+    GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
+};
+
+/// Result of applying an authoritative group or waiting-room update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupStateApply {
+    Applied,
+    Stale,
+    UnknownCall,
+    IdentityMismatch,
+    InvalidSnapshot,
+}
+
+/// Portable per-call state for authoritative snapshots and participant controls.
+#[derive(Debug, Clone)]
+pub struct GroupCallState {
+    call_id: String,
+    call_creator: Jid,
+    snapshot: Option<GroupCallUpdate>,
+    waiting_room: Option<WaitingRoom>,
+    raised_hands: HashSet<Jid>,
+    screen_shares: HashMap<Jid, ScreenShare>,
+}
+
+impl GroupCallState {
+    pub fn new(call_id: impl Into<String>, call_creator: Jid) -> Self {
+        Self {
+            call_id: call_id.into(),
+            call_creator,
+            snapshot: None,
+            waiting_room: None,
+            raised_hands: HashSet::new(),
+            screen_shares: HashMap::new(),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<&GroupCallUpdate> {
+        self.snapshot.as_ref()
+    }
+
+    pub fn waiting_room(&self) -> Option<&WaitingRoom> {
+        self.waiting_room.as_ref()
+    }
+
+    pub fn raised_hands(&self) -> &HashSet<Jid> {
+        &self.raised_hands
+    }
+
+    pub fn screen_shares(&self) -> &HashMap<Jid, ScreenShare> {
+        &self.screen_shares
+    }
+
+    /// Replace the current authoritative snapshot when its transaction is newer.
+    pub fn apply_update(&mut self, update: GroupCallUpdate) -> GroupStateApply {
+        if !self.matches_identity(&update.call_id, &update.call_creator) {
+            return GroupStateApply::IdentityMismatch;
+        }
+        if !valid_group_snapshot(&update) {
+            return GroupStateApply::InvalidSnapshot;
+        }
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|current| update.transaction_id <= current.transaction_id)
+        {
+            return GroupStateApply::Stale;
+        }
+
+        let connected = update
+            .participants
+            .iter()
+            .filter(|participant| participant.state == "connected")
+            .map(|participant| participant.jid.to_non_ad())
+            .collect::<HashSet<_>>();
+        self.raised_hands
+            .retain(|participant| connected.contains(participant));
+        self.screen_shares
+            .retain(|participant, _| connected.contains(participant));
+        self.snapshot = Some(update);
+        GroupStateApply::Applied
+    }
+
+    /// Replace waiting-room state when its optional transaction is not stale.
+    pub fn apply_waiting_room(&mut self, room: WaitingRoom) -> GroupStateApply {
+        if !self.matches_identity(&room.call_id, &room.call_creator) {
+            return GroupStateApply::IdentityMismatch;
+        }
+        if let (Some(current), Some(next)) = (
+            self.waiting_room
+                .as_ref()
+                .and_then(|waiting| waiting.transaction_id),
+            room.transaction_id,
+        ) && next <= current
+        {
+            return GroupStateApply::Stale;
+        }
+        self.waiting_room = Some(room);
+        GroupStateApply::Applied
+    }
+
+    pub fn set_waiting_room_enabled(&mut self, enabled: bool) -> bool {
+        self.waiting_room.as_mut().is_some_and(|room| {
+            room.enabled = enabled;
+            true
+        })
+    }
+
+    pub fn set_raised_hand(&mut self, participant: &Jid, raised: bool) {
+        let participant = participant.to_non_ad();
+        if raised {
+            self.raised_hands.insert(participant);
+        } else {
+            self.raised_hands.remove(&participant);
+        }
+    }
+
+    pub fn set_screen_share(&mut self, participant: &Jid, screen_share: ScreenShare) {
+        let participant = participant.to_non_ad();
+        if screen_share.state == ScreenShareState::Stopped {
+            self.screen_shares.remove(&participant);
+        } else {
+            self.screen_shares.insert(participant, screen_share);
+        }
+    }
+
+    fn matches_identity(&self, call_id: &str, creator: &Jid) -> bool {
+        self.call_id == call_id && self.call_creator == *creator
+    }
+}
+
+fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
+    if update.transaction_id == 0
+        || update.connected_limit == 0
+        || update.connected_limit as usize > GROUP_CALL_MAX_PARTICIPANTS
+        || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
+        || !matches!(update.media.as_str(), "audio" | "video")
+    {
+        return false;
+    }
+    if update
+        .relay
+        .as_ref()
+        .and_then(|relay| relay.transaction_id)
+        .is_some_and(|transaction_id| transaction_id != update.transaction_id)
+    {
+        return false;
+    }
+
+    let mut users = HashSet::with_capacity(update.participants.len());
+    let mut pids = HashSet::new();
+    update.participants.iter().all(|participant| {
+        users.insert(participant.jid.to_non_ad())
+            && participant
+                .devices
+                .iter()
+                .all(|device| device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid)))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::group_call::{GroupCallDevice, GroupCallParticipant};
+    use wacore_binary::Server;
+
+    fn creator() -> Jid {
+        Jid::new("100001", Server::Lid).with_device(1)
+    }
+
+    fn participant(user: &str, state: &str, pid: u32) -> GroupCallParticipant {
+        GroupCallParticipant {
+            jid: Jid::new(user, Server::Lid),
+            pn: None,
+            state: state.to_string(),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new(user, Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(pid),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        }
+    }
+
+    fn update(transaction_id: u32, users: Vec<GroupCallParticipant>) -> GroupCallUpdate {
+        GroupCallUpdate {
+            call_id: "CALL".to_string(),
+            call_creator: creator(),
+            group_jid: None,
+            transaction_id,
+            media: "video".to_string(),
+            connected_limit: 32,
+            joinable: true,
+            av_upgradable: true,
+            rekey_requested: false,
+            participants: users,
+            relay: None,
+        }
+    }
+
+    #[test]
+    fn snapshots_are_transaction_ordered_and_clear_departed_controls() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let alice = Jid::new("200002", Server::Lid);
+        assert_eq!(
+            state.apply_update(update(
+                3,
+                vec![
+                    participant("100001", "connected", 1),
+                    participant("200002", "connected", 2),
+                ],
+            )),
+            GroupStateApply::Applied
+        );
+        state.set_raised_hand(&alice, true);
+        state.set_screen_share(
+            &alice,
+            ScreenShare {
+                state: ScreenShareState::Started,
+                version: 2,
+                screen_share_id: Some(7),
+            },
+        );
+
+        assert_eq!(
+            state.apply_update(update(3, vec![participant("100001", "connected", 1)],)),
+            GroupStateApply::Stale
+        );
+        assert!(state.raised_hands().contains(&alice));
+        assert_eq!(
+            state.apply_update(update(4, vec![participant("100001", "connected", 1)],)),
+            GroupStateApply::Applied
+        );
+        assert!(state.raised_hands().is_empty());
+        assert!(state.screen_shares().is_empty());
+    }
+
+    #[test]
+    fn invalid_identity_duplicate_pid_and_oversized_limit_are_rejected() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut wrong = update(1, vec![participant("100001", "connected", 1)]);
+        wrong.call_id = "OTHER".to_string();
+        assert_eq!(state.apply_update(wrong), GroupStateApply::IdentityMismatch);
+
+        let duplicate_pid = update(
+            1,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 1),
+            ],
+        );
+        assert_eq!(
+            state.apply_update(duplicate_pid),
+            GroupStateApply::InvalidSnapshot
+        );
+
+        let mut oversized = update(1, vec![]);
+        oversized.connected_limit = 33;
+        assert_eq!(
+            state.apply_update(oversized),
+            GroupStateApply::InvalidSnapshot
+        );
+    }
+
+    #[test]
+    fn stopped_screen_share_and_lowered_hand_remove_state() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let alice = Jid::new("200002", Server::Lid).with_device(3);
+        state.set_raised_hand(&alice, true);
+        state.set_screen_share(
+            &alice,
+            ScreenShare {
+                state: ScreenShareState::Started,
+                version: 2,
+                screen_share_id: Some(9),
+            },
+        );
+        assert_eq!(state.raised_hands().len(), 1);
+        assert_eq!(state.screen_shares().len(), 1);
+
+        state.set_raised_hand(&alice, false);
+        state.set_screen_share(
+            &alice,
+            ScreenShare {
+                state: ScreenShareState::Stopped,
+                version: 2,
+                screen_share_id: None,
+            },
+        );
+        assert!(state.raised_hands().is_empty());
+        assert!(state.screen_shares().is_empty());
+    }
+}
