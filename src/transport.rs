@@ -96,10 +96,7 @@ pub mod mock {
         /// the whole assertion surface ("the Nth frame is ...", decrypted under
         /// counter N) valid whether or not a batch happened to form.
         pub fn sent(&self) -> Vec<bytes::Bytes> {
-            self.sent_writes()
-                .iter()
-                .flat_map(|write| split_framed(write))
-                .collect()
+            self.sent_writes().iter().flat_map(split_framed).collect()
         }
 
         /// The raw `send()` payloads, batches included. Use this to assert on
