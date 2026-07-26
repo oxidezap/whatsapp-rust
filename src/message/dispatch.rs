@@ -158,6 +158,11 @@ impl Client {
                         batch.push(next);
                     }
 
+                    // No teardown gate here, unlike the ack worker: the
+                    // single-receipt path never had one either (it relies on
+                    // the socket reporting NotConnected), and adding one for
+                    // symmetry would silently start dropping receipts that
+                    // today still go out.
                     let mut frames = Vec::with_capacity(batch.len());
                     let mut guards = Vec::with_capacity(batch.len());
                     for (info, guard) in batch {

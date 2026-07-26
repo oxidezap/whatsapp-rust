@@ -3555,6 +3555,35 @@ async fn test_send_ack_for_returns_error_when_disconnected() {
     );
 }
 
+/// The gate that `send_ack_for` applies per ack, and that the burst path
+/// applies once per burst, must agree on what counts as teardown. A burst that
+/// missed it would write stale acks into a socket that is being torn down and
+/// hold the outbound flush open until its timeout.
+#[tokio::test]
+async fn outbound_teardown_gate_covers_both_disconnect_signals() {
+    let client = crate::test_utils::create_test_client().await;
+
+    client.set_connected_for_test(true);
+    client.expected_disconnect.store(false, Ordering::Relaxed);
+    assert!(
+        !client.outbound_teardown_in_progress(),
+        "a live connection must not be treated as tearing down"
+    );
+
+    client.expected_disconnect.store(true, Ordering::Relaxed);
+    assert!(
+        client.outbound_teardown_in_progress(),
+        "an expected disconnect (an intentional close, or a 515) must gate sends"
+    );
+
+    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.set_connected_for_test(false);
+    assert!(
+        client.outbound_teardown_in_progress(),
+        "a disconnected client must gate sends even without the expected flag"
+    );
+}
+
 /// Verifies that `send_ack_for` returns Ok when expected_disconnect is set,
 /// since this is an intentional shutdown path.
 #[tokio::test]

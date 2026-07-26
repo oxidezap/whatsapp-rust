@@ -651,6 +651,17 @@ impl Client {
         let _ = tx.try_send((node, guard));
     }
 
+    /// Whether queued outbound work should be dropped rather than sent.
+    ///
+    /// This is the gate [`Self::send_ack_for`] applies before every ack, hoisted
+    /// so the burst path applies it too: during an expected teardown (an
+    /// intentional disconnect, or a 515) queued acks are deliberately dropped
+    /// rather than raced against the disconnect, and sending them anyway would
+    /// also hold the outbound flush open until its timeout.
+    pub(crate) fn outbound_teardown_in_progress(&self) -> bool {
+        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_connected()
+    }
+
     /// How many queued acks one burst may take.
     ///
     /// Measured, not guessed: the send-job channel holds 8, so a larger burst
@@ -696,15 +707,9 @@ impl Client {
                         batch.push(next);
                     }
 
-                    // The gate `send_ack_for` applies, which bursting would
-                    // otherwise skip: during an expected teardown (an
-                    // intentional disconnect, or a 515) queued acks are
-                    // deliberately dropped rather than raced against the
-                    // disconnect, and sending them here would also hold the
-                    // outbound flush until its timeout. The queue is still
-                    // drained, exactly as the one-at-a-time worker did.
-                    if client.expected_disconnect.load(Ordering::Relaxed) || !client.is_connected()
-                    {
+                    // The queue is still drained, exactly as the
+                    // one-at-a-time worker did; only the send is skipped.
+                    if client.outbound_teardown_in_progress() {
                         continue;
                     }
 
