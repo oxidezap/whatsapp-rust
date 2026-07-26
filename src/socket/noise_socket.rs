@@ -776,7 +776,8 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for GatedTransport {
         async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
             let permit = self.gate.acquire().await.expect("gate open");
