@@ -205,9 +205,9 @@ impl Client {
                                             self.process_decrypted_node(node).await;
                                         } else {
                                             let client = self.clone();
-                                            self.runtime.spawn(Box::pin(async move {
+                                            self.runtime.spawn_detached(Box::pin(async move {
                                                 client.process_decrypted_node(node).await;
-                                            })).detach();
+                                            }));
                                         }
                                     }
 

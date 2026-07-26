@@ -17,6 +17,10 @@ mod tokio_impl {
             AbortHandle::new(move || handle.abort())
         }
 
+        fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            tokio::spawn(future);
+        }
+
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(tokio::time::sleep(duration))
         }

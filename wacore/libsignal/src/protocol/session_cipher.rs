@@ -306,9 +306,13 @@ async fn message_encrypt_inner(
     })?;
 
     // Check trust before doing any crypto work
-    if !identity_store
-        .is_trusted_identity(remote_address, &their_identity_key, Direction::Sending)
-        .await?
+    if !crate::protocol::storage::is_trusted_identity(
+        identity_store,
+        remote_address,
+        &their_identity_key,
+        Direction::Sending,
+    )
+    .await?
     {
         log::warn!(
             "Identity key {} is not trusted for remote address {}",
@@ -390,8 +394,7 @@ async fn message_encrypt_inner(
         Ok::<CiphertextMessage, SignalProtocolError>(message)
     })?;
 
-    identity_store
-        .save_identity(remote_address, &their_identity_key)
+    crate::protocol::storage::save_identity(identity_store, remote_address, &their_identity_key)
         .await?;
 
     session_state.set_sender_chain_key(&next_chain_key)?;
@@ -723,14 +726,21 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
         // delivery is not the peer's current identity changing, so never report
         // it as a change. Doing so would fire a spurious local identity-change
         // reaction and clobber the current identity.
-        identity_store
-            .save_identity(remote_address, &their_identity_key)
-            .await?;
+        crate::protocol::storage::save_identity(
+            identity_store,
+            remote_address,
+            &their_identity_key,
+        )
+        .await?;
         IdentityChange::NewOrUnchanged
     } else {
-        if !identity_store
-            .is_trusted_identity(remote_address, &their_identity_key, Direction::Receiving)
-            .await?
+        if !crate::protocol::storage::is_trusted_identity(
+            identity_store,
+            remote_address,
+            &their_identity_key,
+            Direction::Receiving,
+        )
+        .await?
         {
             log::warn!(
                 "Identity key {} is not trusted for remote address {}",
@@ -742,8 +752,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
             ));
         }
 
-        identity_store
-            .save_identity(remote_address, &their_identity_key)
+        crate::protocol::storage::save_identity(identity_store, remote_address, &their_identity_key)
             .await?
     };
 

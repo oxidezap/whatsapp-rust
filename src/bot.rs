@@ -355,12 +355,9 @@ impl EventHandler for CallbackBusAdapter {
                     let callback = handler.callback.clone();
                     let cb_client = client.clone();
                     let event = Arc::clone(&event);
-                    client
-                        .runtime
-                        .spawn(Box::pin(async move {
-                            callback(event, cb_client).await;
-                        }))
-                        .detach();
+                    client.runtime.spawn_detached(Box::pin(async move {
+                        callback(event, cb_client).await;
+                    }));
                 }
             }
             // Non-blocking on purpose: dropping on a full mailbox keeps a slow

@@ -8,9 +8,11 @@
 #![warn(missing_docs)]
 
 mod traits;
+#[cfg(test)]
+mod traits_hook_tests;
 
 pub use traits::{
     Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
     SessionCheckout, SessionCheckoutKey, SessionCheckoutStoreResult, SessionStore,
-    SignedPreKeyStore,
+    SignedPreKeyStore, has_session, is_trusted_identity, save_identity,
 };

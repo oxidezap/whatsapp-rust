@@ -464,7 +464,8 @@ pub async fn ensure_sessions_for_devices(
             let lid_jid = Jid::lid_device(lid_user, device_jid.device);
             lid_jid.reset_protocol_address(&mut reusable_addr);
 
-            if stores.session_store.has_session(&reusable_addr).await? {
+            if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await?
+            {
                 log::debug!(
                     "Using LID session {} for PN {} (LID-first lookup)",
                     lid_jid.observe(),
@@ -476,7 +477,7 @@ pub async fn ensure_sessions_for_devices(
         }
 
         device_jid.reset_protocol_address(&mut reusable_addr);
-        if stores.session_store.has_session(&reusable_addr).await? {
+        if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await? {
             continue;
         }
 
