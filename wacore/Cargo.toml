@@ -49,7 +49,6 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 aes = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
-zerocopy = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
@@ -81,7 +80,7 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-smallvec = "1.15"
+smallvec = { workspace = true }
 smoothutf8 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
@@ -93,6 +92,7 @@ wacore-derive = { workspace = true }
 wacore-libsignal = { workspace = true }
 wacore-noise = { workspace = true }
 waproto = { workspace = true }
+zerocopy = { workspace = true, optional = true }
 
 [build-dependencies]
 buffa-build = { workspace = true }
