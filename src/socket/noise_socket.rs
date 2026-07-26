@@ -379,6 +379,19 @@ impl NoiseSocket {
                 out_buf.truncate(before);
                 return Err(EncryptSendError::crypto(e));
             }
+            // The length prefix was written from `plaintext.len() + TAG_LEN`
+            // before the ciphertext existed, which is sound only because
+            // `TransportAead` is AES-256-GCM by contract. A `set_crypto_provider`
+            // backend that grows the buffer by anything else would put a frame
+            // on the wire whose prefix disagrees with its body, desyncing the
+            // peer's parser for the rest of the connection. Checking costs one
+            // comparison and turns that into a refused send.
+            if out_buf.len() - base != body_len {
+                out_buf.truncate(before);
+                return Err(EncryptSendError::crypto(NoiseError::Encrypt(
+                    wacore::libsignal::crypto::CryptoProviderError::BackendFailed,
+                )));
+            }
         } else {
             let write_key = write_key.clone();
             // `Bytes` is Send + 'static: move it into the blocking task (a
