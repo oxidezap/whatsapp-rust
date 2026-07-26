@@ -2378,11 +2378,7 @@ impl Client {
             }
 
             let lock_jids = self.build_session_lock_keys(dm_devices.devices()).await;
-            let _session_mutexes = self.session_mutexes_for(&lock_jids).await;
-            let mut _session_guards = Vec::with_capacity(_session_mutexes.len());
-            for mutex in &_session_mutexes {
-                _session_guards.push(mutex.lock().await);
-            }
+            let _session_guards = self.session_guards_for(&lock_jids).await;
 
             let mut store_adapter = self.signal_adapter().await;
 
@@ -2482,7 +2478,35 @@ impl Client {
         keys
     }
 
-    /// Fetch per-device session mutexes in deadlock-free order.
+    /// Take every per-device session lock, in `jids` order.
+    ///
+    /// INVARIANT: acquisition order IS `jids` order, and callers pass keys from
+    /// [`Self::build_session_lock_keys`], which sorts them. That single order is
+    /// what keeps two sends overlapping on a device from deadlocking, so a
+    /// change here has to preserve it.
+    ///
+    /// Each mutex is locked as it is resolved rather than resolving the whole
+    /// set first: the handles exist only to be locked, so the vector holding
+    /// them was pure staging. The guards themselves must still be collected —
+    /// they are what keeps the locks held for the caller's scope.
+    pub(crate) async fn session_guards_for(
+        &self,
+        jids: &[Jid],
+    ) -> Vec<async_lock::MutexGuardArc<()>> {
+        let mut guards = Vec::with_capacity(jids.len());
+        let mut buf = wacore::types::jid::make_address_buffer();
+        for jid in jids {
+            wacore::types::jid::write_protocol_address_to(jid, &mut buf);
+            let mutex = self.session_lock_for(&buf).await;
+            guards.push(mutex.lock_arc().await);
+        }
+        guards
+    }
+
+    /// The mutexes [`Self::session_guards_for`] would take, without taking
+    /// them. Only tests need this: production code always wants the guards, and
+    /// resolving handles it does not lock is what this commit removed.
+    #[cfg(test)]
     pub(crate) async fn session_mutexes_for(
         &self,
         jids: &[Jid],
@@ -4557,6 +4581,88 @@ mod tests {
                 bare[0].to_protocol_address_string(),
                 "100000012345678@lid.0"
             );
+        }
+
+        /// Every key handed in ends up locked, and every one is released when
+        /// the guards are dropped. The device counts are the three the DM path
+        /// actually produces: none (a fan-out that resolved to nothing), one
+        /// (a steady 1:1) and several (companion devices in play).
+        #[tokio::test]
+        async fn taking_guards_locks_every_key_and_releasing_them_frees_every_key() {
+            let client = crate::test_utils::create_test_client_with_name("guards_cover").await;
+
+            for count in [0usize, 1, 3] {
+                let devices: Vec<Jid> = (0..count)
+                    .map(|i| Jid::from_str(&format!("10000001234567{i}:5@lid")).unwrap())
+                    .collect();
+                let keys = client.build_session_lock_keys(&devices).await;
+                assert_eq!(keys.len(), count, "one key per device at count {count}");
+                let mutexes = client.session_mutexes_for(&keys).await;
+
+                let guards = client.session_guards_for(&keys).await;
+                assert_eq!(guards.len(), count, "one guard per key at count {count}");
+                for (i, mutex) in mutexes.iter().enumerate() {
+                    assert!(
+                        mutex.try_lock().is_none(),
+                        "key {i} of {count} must be held while the guards live"
+                    );
+                }
+
+                drop(guards);
+                for (i, mutex) in mutexes.iter().enumerate() {
+                    assert!(
+                        mutex.try_lock().is_some(),
+                        "key {i} of {count} must be free once the guards are dropped"
+                    );
+                }
+            }
+        }
+
+        /// The keys are locked in the order given, which is the sorted order
+        /// `build_session_lock_keys` produces. That single global order is the
+        /// only thing keeping two sends that overlap on a device from
+        /// deadlocking, so acquiring out of order must be observable.
+        ///
+        /// Blocking the SECOND key and then waiting for the FIRST to become
+        /// contended is what pins the order down: a taker that went second-first
+        /// would park on the blocked key and never touch the first one.
+        #[tokio::test]
+        async fn keys_are_locked_in_the_order_they_are_given() {
+            let client = crate::test_utils::create_test_client_with_name("guards_order").await;
+
+            let devices: Vec<Jid> = ["100000012345670:5@lid", "100000012345671:5@lid"]
+                .iter()
+                .map(|s| Jid::from_str(s).unwrap())
+                .collect();
+            let keys = client.build_session_lock_keys(&devices).await;
+            assert_eq!(keys.len(), 2);
+            let mutexes = client.session_mutexes_for(&keys).await;
+
+            let blocker = mutexes[1].lock_arc().await;
+
+            let mut taker = tokio::spawn({
+                let client = client.clone();
+                let keys = keys.clone();
+                async move { client.session_guards_for(&keys).await.len() }
+            });
+
+            // Bounded work, not a deadline: yield until the first key is taken.
+            let mut polls = 0;
+            while mutexes[0].try_lock().is_some() {
+                polls += 1;
+                assert!(
+                    polls < 10_000,
+                    "the first key was never taken, so acquisition did not start there"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                futures::poll!(&mut taker).is_pending(),
+                "the taker must still be parked on the second key"
+            );
+
+            drop(blocker);
+            assert_eq!(taker.await.expect("taker finishes"), 2);
         }
     }
 

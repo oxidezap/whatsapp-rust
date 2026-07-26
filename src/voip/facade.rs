@@ -429,11 +429,7 @@ impl<'a> OutgoingCall<'a> {
             // in the shared pre-flight); hold the per-device session locks place_call's encrypt also
             // takes, so it can't clobber a concurrent send advancing the same session.
             let lock_jids = self.client.build_session_lock_keys(&devices).await;
-            let session_mutexes = self.client.session_mutexes_for(&lock_jids).await;
-            let mut session_guards = Vec::with_capacity(session_mutexes.len());
-            for mutex in &session_mutexes {
-                session_guards.push(mutex.lock().await);
-            }
+            let session_guards = self.client.session_guards_for(&lock_jids).await;
 
             let mut would_pkmsg = Vec::with_capacity(devices.len());
             for d in &devices {
@@ -598,11 +594,7 @@ async fn place_call(
     // lock; concurrent ratchet mutations would corrupt session state.
     let raw = {
         let lock_jids = client.build_session_lock_keys(devices).await;
-        let session_mutexes = client.session_mutexes_for(&lock_jids).await;
-        let mut _session_guards = Vec::with_capacity(session_mutexes.len());
-        for mutex in &session_mutexes {
-            _session_guards.push(mutex.lock().await);
-        }
+        let _session_guards = client.session_guards_for(&lock_jids).await;
 
         // Sessions were asserted upstream (`OutgoingCall::start`), so skip the network session-ensure and
         // encrypt against the existing sessions directly: a device whose session is somehow still

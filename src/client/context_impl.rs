@@ -70,11 +70,6 @@ impl SendContextResolver for Client {
         }
         // Reuse the DM path's helpers so both lock the identical per-device mutexes.
         let keys = self.build_session_lock_keys(device_jids).await;
-        let mutexes = self.session_mutexes_for(&keys).await;
-        let mut guards = Vec::with_capacity(mutexes.len());
-        for mutex in &mutexes {
-            guards.push(mutex.lock_arc().await);
-        }
-        SessionLockGuard::hold(Box::new(guards))
+        SessionLockGuard::hold(Box::new(self.session_guards_for(&keys).await))
     }
 }
