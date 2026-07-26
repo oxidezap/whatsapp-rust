@@ -51,6 +51,18 @@ pub fn encode_frame_into(
     header: Option<&[u8]>,
     out: &mut impl FrameBuf,
 ) -> Result<(), anyhow::Error> {
+    out.clear();
+    append_frame_into(payload, header, out)
+}
+
+/// Like [`encode_frame_into`], but appends to `out` instead of clearing it, so
+/// several frames can be laid out back to back in one buffer and handed to the
+/// transport as a single write.
+pub fn append_frame_into(
+    payload: &[u8],
+    header: Option<&[u8]>,
+    out: &mut impl FrameBuf,
+) -> Result<(), anyhow::Error> {
     let payload_len = payload.len();
 
     if payload_len >= FRAME_MAX_SIZE {
@@ -65,7 +77,6 @@ pub fn encode_frame_into(
     let prefix_len = header_len + FRAME_LENGTH_SIZE;
     let total_len = prefix_len + payload_len;
 
-    out.clear();
     out.reserve(total_len);
 
     if let Some(header_data) = header {
