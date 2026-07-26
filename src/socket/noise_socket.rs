@@ -108,6 +108,9 @@ impl NoiseSocket {
         // in-band, so the whole sender goes out of service and the connection
         // must be re-established with a fresh handshake key.
         let mut poisoned = false;
+        // Reused across batches: one allocation for the life of the connection
+        // instead of one per batch.
+        let mut waiters: Vec<(oneshot::Sender<SendResult>, usize)> = Vec::new();
 
         while let Ok(job) = send_job_rx.recv().await {
             if poisoned {
@@ -121,7 +124,7 @@ impl NoiseSocket {
             // per frame turned into a syscall, a TLS record and a WebSocket
             // message per frame. Only frames that are ALREADY waiting are taken:
             // never block for more, or this trades syscalls for latency.
-            let mut waiters: Vec<(oneshot::Sender<SendResult>, usize)> = Vec::new();
+            waiters.clear();
             let mut encrypt_failure: Option<(oneshot::Sender<SendResult>, EncryptSendError)> = None;
             let mut job = job;
             loop {
@@ -200,7 +203,7 @@ impl NoiseSocket {
             // anyhow::Error, and the only failure reachable here is Transport,
             // which is what each caller must see to treat the send as lost.
             let failure = outcome.as_ref().err().map(|e| e.to_string());
-            for (response_tx, _) in waiters {
+            for (response_tx, _) in waiters.drain(..) {
                 let result = match &failure {
                     None => Ok(()),
                     Some(message) => Err(EncryptSendError::transport(anyhow::anyhow!("{message}"))),
