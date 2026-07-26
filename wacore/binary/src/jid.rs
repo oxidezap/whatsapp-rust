@@ -2008,6 +2008,11 @@ mod tests {
             "1234567890@s.whatsapp.net",
             "100000012345678:25@lid",
             "867051314767696:0@bot",
+            // Nonzero agent on a bot JID: both forms drop the agent (matching
+            // whatsmeow's ToNonAD), while `is_same_chat_as` still treats it as
+            // identity-significant. Pinning it here keeps that asymmetry
+            // deliberate rather than something a later edit can erase quietly.
+            "867051314767696.5:10@bot",
             "120363021033254949@g.us",
             "status@broadcast",
         ]
