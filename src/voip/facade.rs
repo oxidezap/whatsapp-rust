@@ -1206,8 +1206,7 @@ pub(crate) async fn attach_outgoing_relay(
         client,
         call_id,
         pending.generation,
-        // No outer registration guard remains after the pending entry is taken.
-        true,
+        FailureCleanup::Here,
         engine,
         &factory,
         pending.audio,
@@ -1412,8 +1411,7 @@ async fn spawn_registered_call(
         client,
         &registration.call_id,
         registration.generation,
-        // RegisteredCall/AnswerTeardown own cleanup and generation-aware peer termination.
-        false,
+        FailureCleanup::Guard,
         engine,
         factory,
         audio,
@@ -1469,13 +1467,20 @@ async fn spawn_answered_call(
 /// Connect the relay and spawn the driver task against pre-built shared handle state (mute flag,
 /// ended flag, event sender). Shared so the outgoing relay-arrival path can drive the same
 /// already-handed-out [`CallHandle`]. The registry entry under `generation` must already exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureCleanup {
+    /// No outer registration guard remains, so attach_engine reaps failures itself.
+    Here,
+    /// RegisteredCall/AnswerTeardown owns generation-aware cleanup.
+    Guard,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn attach_engine(
     client: &Client,
     call_id: &str,
     generation: u64,
-    // Direct outgoing attaches self-clean; guarded answer/test callers leave cleanup to their guard.
-    remove_registration_on_failure: bool,
+    failure_cleanup: FailureCleanup,
     engine: CallEngine,
     factory: &dyn RelayTransportFactory,
     audio: AudioEndpoints,
@@ -1494,7 +1499,7 @@ async fn attach_engine(
     // sees !is_connected and the direct caller / outer registration guard cleans up. Wake
     // wait_ended() before bailing so a parked waiter resolves.
     if !client.is_connected() {
-        if remove_registration_on_failure {
+        if failure_cleanup == FailureCleanup::Here {
             client
                 .call_registry()
                 .remove_if_current(call_id, generation);
@@ -1518,7 +1523,7 @@ async fn attach_engine(
         match futures::future::select(dial, std::pin::pin!(ended.wait())).await {
             futures::future::Either::Left((Ok(pair), _)) => pair,
             futures::future::Either::Left((Err(e), _)) => {
-                if remove_registration_on_failure {
+                if failure_cleanup == FailureCleanup::Here {
                     client
                         .call_registry()
                         .remove_if_current(call_id, generation);
@@ -4020,7 +4025,7 @@ mod tests {
                     &client,
                     "CID-FACADE",
                     generation,
-                    true,
+                    FailureCleanup::Here,
                     engine(),
                     &*factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
@@ -4098,7 +4103,7 @@ mod tests {
                     &client,
                     "CID-FACADE",
                     generation,
-                    true,
+                    FailureCleanup::Here,
                     engine(),
                     &*factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
@@ -4170,7 +4175,7 @@ mod tests {
                     &client,
                     "CID-FACADE",
                     generation,
-                    true,
+                    FailureCleanup::Here,
                     engine(),
                     &*factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
