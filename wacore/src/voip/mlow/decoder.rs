@@ -32,6 +32,18 @@ fn internal_frames(frame_ms: i32) -> Option<usize> {
     (frame_ms > 10).then(|| ((frame_ms + 10) / 20) as usize)
 }
 
+/// Does a decode that ended after `consumed` bytes of a `storage`-byte body land where a valid
+/// stream can end? Under-running is always malformed; the upper slack absorbs the range coder's
+/// final carry bytes, which the encoder does not emit.
+///
+/// The bound is four, taken from the shipped decoder rather than from the C fork: `WhatsAppNative.dll`
+/// @ `0x180337e30` does `add r8d, 0x4` before its second compare, while the fork's
+/// `smpl_check_end_result` allows only `+2`. Two is the stricter of the pair, so it would conceal
+/// frames the official client plays — a false report of corruption, silencing audio that is fine.
+fn endpoint_is_valid(storage: u32, consumed: u32) -> bool {
+    storage <= consumed && consumed <= storage + 4
+}
+
 /// Stateful pure-Rust MLow decoder. Decodes one RTP payload (a bare MLow frame, or a SplitRed
 /// packet when redundancy was negotiated) into a PCM frame at 16 kHz, one 20 ms internal frame
 /// per chained frame in the packet.
@@ -302,13 +314,13 @@ impl MlowDecoder {
         // Endpoint check, before the postfilter as in the reference: the range decoder returns zero
         // past either end of its storage WITHOUT flagging it, so an impossible stream decodes into
         // plausible-looking symbols and the synthesis can diverge to full scale. Comparing where the
-        // decode ended against what the body actually held is the only way to see it. A valid stream
-        // finishes within two bytes of its storage; anything else is a malformed frame, concealed as
-        // a lost one rather than synthesized. State already advanced is left as-is, matching the
-        // reference, which also returns without rolling back.
+        // decode ended against what the body actually held is the only way to see it. Anything
+        // outside the accepted window is a malformed frame, concealed as a lost one rather than
+        // synthesized. State already advanced is left as-is, matching the reference, which also
+        // returns without rolling back.
         let consumed_bytes = (dec.tell().max(0) as u32).div_ceil(8);
         let body = dec.storage();
-        if body > consumed_bytes || body + 2 < consumed_bytes || dec.err != 0 {
+        if !endpoint_is_valid(body, consumed_bytes) || dec.err != 0 {
             // Sticky flag first: this branch swallows the range-decoder failure it is reporting, and
             // `had_error` is what the suites read to see it.
             if dec.err != 0 {
@@ -606,6 +618,26 @@ mod tests {
     /// A body whose decode consumes far more bits than it holds is malformed: the range decoder
     /// returns zero past the end without flagging it, so the synthesis runs on invented symbols and
     /// can diverge to full scale. Conceal it as a lost frame rather than emitting that.
+    #[test]
+    /// The accepted window is the shipped decoder's, not the C fork's. The fork stops at `+2`, so a
+    /// stream ending three or four bytes long would be concealed here and played by the official
+    /// client. Pinned as arithmetic because no synthetic body lands on `+3` on demand.
+    #[test]
+    fn endpoint_window_matches_the_shipped_decoder() {
+        assert!(endpoint_is_valid(40, 40), "exact end is valid");
+        assert!(endpoint_is_valid(40, 42), "the fork's +2 stays valid");
+        assert!(
+            endpoint_is_valid(40, 44),
+            "+4 is valid: WhatsAppNative.dll @ 0x180337e30 adds 4 before its second compare, and \
+             rejecting here would silence audio the official client plays"
+        );
+        assert!(!endpoint_is_valid(40, 45), "+5 over-runs");
+        assert!(
+            !endpoint_is_valid(40, 39),
+            "under-running is always malformed"
+        );
+    }
+
     #[test]
     fn endpoint_check_rejects_an_overrunning_body() {
         // A 120 ms TOC with a body far too short for six internal frames.
