@@ -288,6 +288,12 @@ pub struct MemoryReport {
     pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
     // -- Unbounded collections --
+    /// Deferred acks queued for the transport-ack worker. Unbounded, and each
+    /// entry retains the full inbound node plus a flush guard, so a stalled
+    /// transport shows up here as a growing backlog.
+    pub transport_ack_queue: usize,
+    /// Delivery receipts queued for their worker, same shape as above.
+    pub delivery_receipt_queue: usize,
     pub response_waiters: usize,
     pub node_waiters: usize,
     pub pending_retries: usize,
@@ -393,6 +399,12 @@ impl std::fmt::Display for MemoryReport {
             self.resend_rate_limiter_chats
         )?;
         writeln!(f, "--- Unbounded collections ---")?;
+        writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
+        writeln!(
+            f,
+            "  delivery_receipt_queue: {}",
+            self.delivery_receipt_queue
+        )?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
@@ -727,17 +739,18 @@ pub(crate) struct PhashWaiter {
     pub(crate) expected: wacore_binary::CompactString,
     pub(crate) jid: Jid,
     pub(crate) invalidate_group_cache: bool,
-    /// Wall second after which the sweep may drop this entry. Nothing polls the
-    /// waiter, so a lost ack has to be swept or it sits in the map suppressing
-    /// keepalive pings, which the previous timeout path guarded against. Wall
-    /// rather than monotonic because the send has already sampled this clock;
-    /// reading a second one per message is what the send clock budget forbids.
-    pub(crate) expires_at_secs: i64,
+    /// Sweep epoch this waiter was registered in. Expiry is counted in sweeps
+    /// rather than seconds: a wall deadline is subject to clock jumps (see
+    /// wacore::time) and would have to be derived from an instant sampled well
+    /// before registration, while reading a fresh clock here is what the send
+    /// clock budget forbids. Surviving one full sweep is the trigger, so the
+    /// window is one keepalive tick (15 to 30 s) instead of the old fixed 10 s.
+    pub(crate) registered_epoch: u64,
 }
 
 struct ResponseWaiterEntry {
     generation: NonZeroU64,
-    sender: ResponseWaiter,
+    waiter: ResponseWaiter,
 }
 
 /// Map of pending IQ/ack response waiters, keyed by request id.
@@ -748,6 +761,9 @@ struct ResponseWaiterEntry {
 pub(crate) struct ResponseWaiterMap {
     entries: HashMap<String, ResponseWaiterEntry>,
     last_generation: u64,
+    /// Advanced once per sweep. Registration reads it under the lock it already
+    /// takes, so a waiter records its age without touching a clock.
+    sweep_epoch: u64,
 }
 
 impl ResponseWaiterMap {
@@ -763,14 +779,14 @@ impl ResponseWaiterMap {
     pub(crate) fn try_insert_guarded(
         &mut self,
         request_id: String,
-        sender: ResponseWaiter,
+        waiter: ResponseWaiter,
     ) -> Option<NonZeroU64> {
         use std::collections::hash_map::Entry;
 
         let generation = self.next_generation();
         match self.entries.entry(request_id) {
             Entry::Vacant(entry) => {
-                entry.insert(ResponseWaiterEntry { generation, sender });
+                entry.insert(ResponseWaiterEntry { generation, waiter });
                 Some(generation)
             }
             Entry::Occupied(_) => None,
@@ -780,26 +796,37 @@ impl ResponseWaiterMap {
     pub(crate) fn insert(
         &mut self,
         request_id: String,
-        sender: ResponseWaiter,
+        waiter: ResponseWaiter,
     ) -> Option<ResponseWaiter> {
         let generation = self.next_generation();
         self.entries
-            .insert(request_id, ResponseWaiterEntry { generation, sender })
-            .map(|entry| entry.sender)
+            .insert(request_id, ResponseWaiterEntry { generation, waiter })
+            .map(|entry| entry.waiter)
     }
 
     pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiter> {
-        self.entries.remove(request_id).map(|entry| entry.sender)
+        self.entries.remove(request_id).map(|entry| entry.waiter)
     }
 
-    /// Drop phash waiters whose ack never came. Called from the keepalive tick,
-    /// which is also the code that treats a non-empty map as "IQs pending" and
-    /// would otherwise stop pinging forever after one lost ack.
-    pub(crate) fn drop_expired_phash(&mut self, now_secs: i64) {
-        self.entries.retain(|_, entry| match &entry.sender {
-            ResponseWaiter::Phash(waiter) => waiter.expires_at_secs > now_secs,
+    /// The epoch a waiter registered now belongs to.
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.sweep_epoch
+    }
+
+    /// Drop phash waiters that lived through a whole sweep without their ack.
+    ///
+    /// Runs on the keepalive tick, before the recent-activity early return: a
+    /// connection with steady inbound traffic skips the ping entirely, and
+    /// sweeping only inside the ping would let lost acks accumulate for as long
+    /// as traffic keeps flowing. The map is also what makes keepalive treat the
+    /// connection as "IQs pending", so a stranded waiter silences pings.
+    pub(crate) fn drop_expired_phash(&mut self) {
+        let epoch = self.sweep_epoch;
+        self.entries.retain(|_, entry| match &entry.waiter {
+            ResponseWaiter::Phash(waiter) => waiter.registered_epoch >= epoch,
             ResponseWaiter::Iq(_) => true,
         });
+        self.sweep_epoch = self.sweep_epoch.wrapping_add(1);
     }
 
     pub(crate) fn remove_guarded(&mut self, request_id: &str, cleanup_generation: NonZeroU64) {

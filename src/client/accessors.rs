@@ -257,6 +257,8 @@ impl Client {
             group_distribution_lock_evictions: group_distribution_locks.evictions,
             group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
+            delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,

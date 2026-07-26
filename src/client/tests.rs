@@ -4113,32 +4113,44 @@ async fn offline_preview_defaults_absent_counts_to_zero() {
 }
 
 /// A phash waiter is resolved by an ack that may never arrive, and nothing
-/// polls it. The keepalive sweep has to drop the stale one, or a non-empty map
-/// reads as "IQ pending" and silences pings for the life of the connection.
+/// polls it. The sweep has to drop the stale one, or a non-empty map reads as
+/// "IQ pending" and silences pings for the life of the connection.
 #[test]
-fn phash_waiter_sweep_drops_only_expired_entries() {
+fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
     use crate::client::{PhashWaiter, ResponseWaiter, ResponseWaiterMap};
+    use futures::channel::oneshot;
 
     let mut map = ResponseWaiterMap::default();
-    let waiter = |expires_at_secs: i64| {
+    let waiter = |registered_epoch: u64| {
         ResponseWaiter::Phash(PhashWaiter {
-            expected: "hash".to_string(),
+            expected: wacore_binary::CompactString::from("hash"),
             jid: "13135550100@s.whatsapp.net".parse().expect("valid jid"),
             invalidate_group_cache: false,
-            expires_at_secs,
+            registered_epoch,
         })
     };
-    map.insert("stale".to_string(), waiter(100));
-    map.insert("fresh".to_string(), waiter(200));
+
+    let epoch = map.current_epoch();
+    map.insert("first".to_string(), waiter(epoch));
     let (iq_tx, _iq_rx) = oneshot::channel();
     map.insert("iq".to_string(), ResponseWaiter::Iq(iq_tx));
 
-    map.drop_expired_phash(150);
-
-    assert!(map.remove("stale").is_none(), "expired phash must be swept");
+    // One sweep is not enough: the waiter registered in the current epoch is
+    // still within its window, so an ack in flight is not discarded early.
+    map.drop_expired_phash();
     assert!(
-        map.remove("fresh").is_some(),
-        "a waiter inside its window must survive"
+        map.remove("first").is_some(),
+        "a waiter must survive the sweep of the epoch it registered in"
+    );
+
+    // Registered before a sweep, then swept again: now it is stale.
+    let epoch = map.current_epoch();
+    map.insert("stale".to_string(), waiter(epoch));
+    map.drop_expired_phash();
+    map.drop_expired_phash();
+    assert!(
+        map.remove("stale").is_none(),
+        "a waiter that lived through a full sweep must be dropped"
     );
     assert!(
         map.remove("iq").is_some(),

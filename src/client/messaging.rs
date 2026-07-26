@@ -2,10 +2,6 @@
 
 use super::*;
 
-/// How long a registered phash waiter stays valid, in seconds. Matches the
-/// timeout the previous per-send validation task used.
-const PHASH_ACK_TIMEOUT_SECS: i64 = 10;
-
 impl Client {
     /// Send pre-marshaled plaintext bytes through the noise socket.
     ///
@@ -299,15 +295,19 @@ impl Client {
         expected: wacore_binary::CompactString,
         jid: Jid,
         invalidate_group_cache: bool,
-        sent_at_secs: i64,
     ) {
-        self.response_waiters_guard().insert(
+        let mut waiters = self.response_waiters_guard();
+        // Stamped with the sweep epoch under the lock the insert already holds:
+        // a deadline derived from the instant the send started would already be
+        // stale here when preparation is slow, and a wall clock can jump.
+        let registered_epoch = waiters.current_epoch();
+        waiters.insert(
             message_id.to_string(),
             ResponseWaiter::Phash(PhashWaiter {
                 expected,
                 jid,
                 invalidate_group_cache,
-                expires_at_secs: sent_at_secs + PHASH_ACK_TIMEOUT_SECS,
+                registered_epoch,
             }),
         );
     }

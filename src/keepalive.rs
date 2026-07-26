@@ -78,15 +78,7 @@ impl Client {
 
         // WA Web: skip ping if there are pending IQs
         // (`activePing || ackHandlers.length || pendingIqs.size`)
-        //
-        // Sweep first: a phash waiter is resolved by an ack that may never come,
-        // and nothing else polls it. Leaving one behind would read as "IQ
-        // pending" and silence keepalives for the life of the connection.
-        let has_pending = {
-            let mut waiters = self.response_waiters_guard();
-            waiters.drop_expired_phash(wacore::time::now_secs());
-            !waiters.is_empty()
-        };
+        let has_pending = !self.response_waiters_guard().is_empty();
         if has_pending {
             debug!(target: "Client/Keepalive", "Skipping ping: IQ responses pending");
             return KeepaliveResult::Ok;
@@ -169,6 +161,14 @@ impl Client {
                         cleanup_counter = 0;
                         self.spawn_retention_cleanup(sent_msg_ttl);
                     }
+
+                    // Same reason as the retention sweep above: driven by the
+                    // tick rather than by send_keepalive, because a connection
+                    // with steady inbound traffic takes the early return below
+                    // and would never sweep. A phash waiter whose ack was lost
+                    // has nothing else to remove it, and it reads as an
+                    // outstanding IQ.
+                    self.response_waiters_guard().drop_expired_phash();
 
                     let last_recv = self.stats.last_data_received_ms();
 

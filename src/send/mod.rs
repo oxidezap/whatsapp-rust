@@ -1231,15 +1231,7 @@ impl Client {
             .optional_string("phash")
             .map(|s| wacore_binary::CompactString::from(s.as_ref()));
         if let Some(phash) = ack.clone() {
-            // This path samples no send instant of its own (status posts are
-            // not on the per-message budget), so read the wall second here.
-            self.register_phash_waiter(
-                &request_id,
-                phash,
-                to.clone(),
-                true,
-                wacore::time::now_secs(),
-            );
+            self.register_phash_waiter(&request_id, phash, to.clone(), true);
         }
 
         if let Err(e) = self.send_node(stanza).await {
@@ -1763,13 +1755,7 @@ impl Client {
             // Group sends also invalidate group cache on mismatch: the server's
             // participant set diverged, so the next send needs a fresh query.
             let invalidate_group = tc_issue_target.is_group();
-            self.register_phash_waiter(
-                &msg_id,
-                phash,
-                tc_issue_target.clone(),
-                invalidate_group,
-                sent_at.unix_secs(),
-            );
+            self.register_phash_waiter(&msg_id, phash, tc_issue_target.clone(), invalidate_group);
             Some(msg_id)
         } else {
             None
