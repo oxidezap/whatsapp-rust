@@ -740,6 +740,16 @@ mod tests {
             read_key
                 .decrypt_in_place_with_counter(counter as u32, &mut body)
                 .expect("a frame written out of counter order cannot authenticate");
+            // Decrypting alone would not catch a reorder: jobs that woke out of
+            // FIFO order would be encrypted in that order too, so their
+            // counters would still line up. The payload is what pins it -
+            // unlike the concurrent-producer test, these sends are polled in
+            // order by one joined future, so submission order is deterministic.
+            assert_eq!(
+                body,
+                vec![counter as u8; 32],
+                "frame {counter} must carry the payload submitted at position {counter}"
+            );
         }
     }
 

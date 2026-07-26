@@ -696,6 +696,18 @@ impl Client {
                         batch.push(next);
                     }
 
+                    // The gate `send_ack_for` applies, which bursting would
+                    // otherwise skip: during an expected teardown (an
+                    // intentional disconnect, or a 515) queued acks are
+                    // deliberately dropped rather than raced against the
+                    // disconnect, and sending them here would also hold the
+                    // outbound flush until its timeout. The queue is still
+                    // drained, exactly as the one-at-a-time worker did.
+                    if client.expected_disconnect.load(Ordering::Relaxed) || !client.is_connected()
+                    {
+                        continue;
+                    }
+
                     // Encoding is synchronous, so the whole burst is marshalled
                     // before anything is sent and arrival order survives.
                     let mut frames = Vec::with_capacity(batch.len());

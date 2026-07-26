@@ -172,7 +172,20 @@ impl Client {
                         continue;
                     }
 
-                    match client.send_raw_bytes_burst(frames).await {
+                    // Spans the await, not just the preparation: a receipt that
+                    // stalls in the transport has to show up inside the span.
+                    // The per-receipt `wa.receipt.send_delivery` span stays on
+                    // the single-receipt path, which this one does not use.
+                    #[cfg(feature = "tracing")]
+                    let burst = {
+                        use tracing::Instrument;
+                        let span =
+                            tracing::debug_span!("wa.receipt.delivery_burst", frames = frames.len());
+                        client.send_raw_bytes_burst(frames).instrument(span).await
+                    };
+                    #[cfg(not(feature = "tracing"))]
+                    let burst = client.send_raw_bytes_burst(frames).await;
+                    match burst {
                         Ok(results) => {
                             for result in results {
                                 if let Err(e) = result

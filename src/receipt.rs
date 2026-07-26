@@ -589,6 +589,7 @@ impl Client {
     ///   `Send/DeliveryReceiptJob.js`); these are NOT skipped anymore.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn send_delivery_receipt(&self, info: &MessageInfo) {
         let Some(frame) = self.prepare_delivery_receipt(info) else {
             return;
@@ -604,11 +605,6 @@ impl Client {
     /// eligibility gate, node construction, logging and marshalling. Returns
     /// `None` when no receipt is owed. Split out so the receipt worker can
     /// prepare a whole burst before touching the socket.
-    ///
-    /// Carries the per-receipt tracing span, because this is the step both the
-    /// single-receipt and the burst path go through - the span used to sit on
-    /// [`Self::send_delivery_receipt`], which the worker no longer calls.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) fn prepare_delivery_receipt(&self, info: &MessageInfo) -> Option<Vec<u8>> {
         if !Self::should_send_delivery_receipt(info) {
             return None;
