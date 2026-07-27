@@ -65,6 +65,15 @@ impl Client {
             );
             return Ok(());
         }
+        // The out-parameter buys nothing here yet: `join_all` allocates its own
+        // storage and a `Vec` for the results, so a multi-frame burst still
+        // pays what it used to, plus this copy. Removing it means enqueueing
+        // every job before awaiting any of them and holding the receivers
+        // inline, which needs `encrypt_and_send` split into enqueue and await;
+        // that is a change to the send path rather than to this function.
+        // Tracked separately. Awaiting in sequence instead is not the fix: the
+        // frames would reach the sender one completion apart and stop batching
+        // into a single write.
         let sends = frames
             .drain(..)
             .map(|plaintext| noise_socket.encrypt_and_send(bytes::Bytes::from(plaintext)));
