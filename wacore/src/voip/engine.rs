@@ -23,7 +23,9 @@ use super::audio::{
 };
 use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
 use super::group_audio::ParticipantAudioMixer;
-use super::group_media::{GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupRosterApply};
+use super::group_media::{
+    GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupMediaStream, GroupRosterApply,
+};
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
@@ -1640,16 +1642,22 @@ impl CallEngine {
                 parse_sender_report_timing(&participant.payload)
                 && let Some(group) = self.group.as_mut()
             {
-                group
-                    .audio_reception
-                    .entry(participant.participant_id.clone())
-                    .or_default()
-                    .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
-                group
-                    .video_reception
-                    .entry(participant.participant_id.clone())
-                    .or_default()
-                    .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
+                match group
+                    .registry
+                    .sender_report_stream(&participant.participant_id, sender)
+                {
+                    Some(GroupMediaStream::Audio) => group
+                        .audio_reception
+                        .entry(participant.participant_id.clone())
+                        .or_default()
+                        .observe_sender_report(sender, ntp_seconds, ntp_fraction, now),
+                    Some(GroupMediaStream::Video) => group
+                        .video_reception
+                        .entry(participant.participant_id.clone())
+                        .or_default()
+                        .observe_sender_report(sender, ntp_seconds, ntp_fraction, now),
+                    None => {}
+                }
             }
             self.outbox
                 .push_back(Output::Event(CallEvent::RtcpReceived {
@@ -2361,18 +2369,17 @@ mod encoded_tests {
     }
 
     fn group_relay() -> GroupCallRelay {
-        GroupCallRelay {
-            transaction_id: Some(7),
-            self_pid: Some(1),
-            uuid: "relay".to_string(),
-            participant_uuid: "participant".to_string(),
-            attribute_padding: false,
-            warp_mi_tag_len: Some(4),
-            key: b"relay-key".to_vec(),
-            hbh_key: Vec::new(),
-            tokens: vec![vec![0x47]],
-            auth_tokens: vec![vec![0x57]],
-            endpoints: vec![GroupCallRelayEndpoint {
+        GroupCallRelay::builder()
+            .transaction_id(7)
+            .self_pid(1)
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![0x47]])
+            .auth_tokens(vec![vec![0x57]])
+            .endpoints(vec![GroupCallRelayEndpoint {
                 relay_id: 1,
                 token_id: 0,
                 auth_token_id: 0,
@@ -2383,8 +2390,8 @@ mod encoded_tests {
                 address: Vec::new(),
                 ipv4: Some("203.0.113.7".to_string()),
                 port: Some(3480),
-            }],
-        }
+            }])
+            .build()
     }
 
     fn group_engine() -> CallEngine {
@@ -2429,19 +2436,18 @@ mod encoded_tests {
             ipv4: Some("203.0.113.7".to_string()),
             port: Some(port),
         };
-        let relay = GroupCallRelay {
-            transaction_id: Some(1),
-            self_pid: Some(1),
-            uuid: "relay".to_string(),
-            participant_uuid: "participant".to_string(),
-            attribute_padding: false,
-            warp_mi_tag_len: Some(4),
-            key: b"relay-key".to_vec(),
-            hbh_key: Vec::new(),
-            tokens: vec![vec![0x47], vec![0x48]],
-            auth_tokens: vec![vec![0x57], vec![0x58]],
-            endpoints: vec![endpoint(1, 0, 3478), endpoint(2, 1, 3480)],
-        };
+        let relay = GroupCallRelay::builder()
+            .transaction_id(1)
+            .self_pid(1)
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![0x47], vec![0x48]])
+            .auth_tokens(vec![vec![0x57], vec![0x58]])
+            .endpoints(vec![endpoint(1, 0, 3478), endpoint(2, 1, 3480)])
+            .build();
 
         let selected = get_group_media_relay_endpoint(&relay).expect("usable relay");
         assert_eq!(selected.port, Some(3480));
@@ -3886,6 +3892,65 @@ mod tests {
         let summary = summarize_rtcp(&plain).expect("RTCP summary");
         assert_eq!(summary.referenced_ssrcs, [peer_ssrc]);
         assert_eq!(summary.report_blocks.len(), 1);
+    }
+
+    #[test]
+    fn group_sender_reports_update_only_the_matching_reception_stream() {
+        let (mut eng, epoch) = group_engine(true);
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        let mut audio = group_peer_audio(&epoch);
+        let mut video = group_peer_video(&epoch);
+
+        let audio_packet = audio.protect_audio(&[0xF8, 0xFF, 0xFE]);
+        eng.handle_input(1, Input::RelayPacket(&audio_packet));
+        for packet in video.protect_video(&video_au(100)) {
+            eng.handle_input(2, Input::RelayPacket(&packet));
+        }
+        let _ = drain(&mut eng);
+
+        let audio_sr = audio.audio_sender_report(1_700_000_000_000, None);
+        eng.handle_input(100, Input::RelayPacket(&audio_sr));
+        let _ = drain(&mut eng);
+        let audio_lsr = {
+            let group = eng.group.as_mut().expect("group engine");
+            let audio_report = group
+                .audio_reception
+                .get_mut(&peer_id)
+                .and_then(|stats| stats.report(101))
+                .expect("audio reception report");
+            let video_report = group
+                .video_reception
+                .get_mut(&peer_id)
+                .and_then(|stats| stats.report(101))
+                .expect("video reception report");
+            assert_ne!(audio_report.last_sender_report, 0);
+            assert_eq!(
+                video_report.last_sender_report, 0,
+                "an audio sender report must not overwrite video timing"
+            );
+            audio_report.last_sender_report
+        };
+
+        let video_sr = video.video_sender_report(1_700_000_100_000, None);
+        eng.handle_input(200, Input::RelayPacket(&video_sr));
+        let _ = drain(&mut eng);
+        let group = eng.group.as_mut().expect("group engine");
+        let audio_report = group
+            .audio_reception
+            .get_mut(&peer_id)
+            .and_then(|stats| stats.report(201))
+            .expect("audio reception report");
+        let video_report = group
+            .video_reception
+            .get_mut(&peer_id)
+            .and_then(|stats| stats.report(201))
+            .expect("video reception report");
+        assert_eq!(
+            audio_report.last_sender_report, audio_lsr,
+            "a video sender report must not overwrite audio timing"
+        );
+        assert_ne!(video_report.last_sender_report, 0);
+        assert_ne!(video_report.last_sender_report, audio_lsr);
     }
 
     #[test]

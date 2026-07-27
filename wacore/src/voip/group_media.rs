@@ -116,6 +116,12 @@ struct ParticipantReceiver {
     video: Option<VideoPipeline>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupMediaStream {
+    Audio,
+    Video,
+}
+
 /// Per-call participant receiver registry with transaction-ordered shared epochs.
 pub struct GroupMediaRegistry {
     call_id: String,
@@ -207,6 +213,24 @@ impl GroupMediaRegistry {
             .collect::<Vec<_>>();
         ids.sort();
         ids
+    }
+
+    pub(crate) fn sender_report_stream(
+        &self,
+        participant_id: &str,
+        sender_ssrc: u32,
+    ) -> Option<GroupMediaStream> {
+        let receiver = self.receivers.get(participant_id)?;
+        if receiver.audio.is_some() && receiver.audio_ssrc == sender_ssrc {
+            Some(GroupMediaStream::Audio)
+        } else if receiver.video_enabled
+            && receiver.video.is_some()
+            && receiver.video_ssrc == sender_ssrc
+        {
+            Some(GroupMediaStream::Video)
+        } else {
+            None
+        }
     }
 
     /// Replace the connected PID-bearing roster. Existing device receivers are

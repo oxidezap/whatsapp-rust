@@ -457,19 +457,19 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
             endpoints.push(parse_group_relay_endpoint(child)?);
         }
     }
-    Ok(GroupCallRelay {
-        transaction_id,
-        self_pid,
-        uuid,
-        participant_uuid,
-        attribute_padding,
-        warp_mi_tag_len,
-        key: content("key"),
-        hbh_key: content("hbh_key"),
-        tokens: parse_indexed_tokens(children, "token"),
-        auth_tokens: parse_indexed_tokens(children, "auth_token"),
-        endpoints,
-    })
+    Ok(GroupCallRelay::builder()
+        .maybe_transaction_id(transaction_id)
+        .maybe_self_pid(self_pid)
+        .uuid(uuid)
+        .participant_uuid(participant_uuid)
+        .attribute_padding(attribute_padding)
+        .maybe_warp_mi_tag_len(warp_mi_tag_len)
+        .key(content("key"))
+        .hbh_key(content("hbh_key"))
+        .tokens(parse_indexed_tokens(children, "token"))
+        .auth_tokens(parse_indexed_tokens(children, "auth_token"))
+        .endpoints(endpoints)
+        .build())
 }
 
 #[cold]
@@ -494,18 +494,18 @@ fn parse_group_relay_endpoint(node: &NodeRef<'_>) -> Result<GroupCallRelayEndpoi
     } else {
         (None, None)
     };
-    Ok(GroupCallRelayEndpoint {
-        relay_id,
-        token_id,
-        auth_token_id,
-        relay_name,
-        domain_name,
-        rtt_ms,
-        is_fna,
-        address,
-        ipv4,
-        port,
-    })
+    Ok(GroupCallRelayEndpoint::builder()
+        .relay_id(relay_id)
+        .token_id(token_id)
+        .auth_token_id(auth_token_id)
+        .relay_name(relay_name)
+        .maybe_domain_name(domain_name)
+        .maybe_rtt_ms(rtt_ms)
+        .is_fna(is_fna)
+        .address(address)
+        .maybe_ipv4(ipv4)
+        .maybe_port(port)
+        .build())
 }
 
 #[cold]

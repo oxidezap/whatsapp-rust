@@ -244,12 +244,32 @@ impl CallRegistry {
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
     pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
+        self.apply_group_update_inner(update, None)
+    }
+
+    /// Apply a group snapshot only while `generation` still owns this call-id.
+    pub fn apply_group_update_if_current(
+        &self,
+        update: GroupCallUpdate,
+        generation: u64,
+    ) -> GroupStateApply {
+        self.apply_group_update_inner(update, Some(generation))
+    }
+
+    fn apply_group_update_inner(
+        &self,
+        update: GroupCallUpdate,
+        generation: Option<u64>,
+    ) -> GroupStateApply {
         if super::engine::validate_group_relay_update(&update).is_err() {
             return GroupStateApply::InvalidSnapshot;
         }
         let (applied, waiting_room_task, event) = {
             let mut map = self.inner.lock().expect("registry lock poisoned");
-            let Some(entry) = map.get_mut(&update.call_id) else {
+            let Some(entry) = map
+                .get_mut(&update.call_id)
+                .filter(|entry| generation.is_none_or(|current| entry.generation == current))
+            else {
                 return GroupStateApply::UnknownCall;
             };
             let applied = entry.group_mut().apply_update(update);
@@ -280,8 +300,28 @@ impl CallRegistry {
 
     /// Atomically apply a newer waiting-room snapshot to an active call-link call.
     pub fn apply_waiting_room(&self, room: WaitingRoom) -> GroupStateApply {
+        self.apply_waiting_room_inner(room, None)
+    }
+
+    /// Apply a waiting-room snapshot only while `generation` still owns this call-id.
+    pub fn apply_waiting_room_if_current(
+        &self,
+        room: WaitingRoom,
+        generation: u64,
+    ) -> GroupStateApply {
+        self.apply_waiting_room_inner(room, Some(generation))
+    }
+
+    fn apply_waiting_room_inner(
+        &self,
+        room: WaitingRoom,
+        generation: Option<u64>,
+    ) -> GroupStateApply {
         let mut map = self.inner.lock().expect("registry lock poisoned");
-        let Some(entry) = map.get_mut(&room.call_id) else {
+        let Some(entry) = map
+            .get_mut(&room.call_id)
+            .filter(|entry| generation.is_none_or(|current| entry.generation == current))
+        else {
             return GroupStateApply::UnknownCall;
         };
         entry.group_mut().apply_waiting_room(room)
@@ -396,6 +436,18 @@ impl CallRegistry {
             .is_some()
     }
 
+    /// Whether a routed sender belongs to one exact active call generation.
+    pub fn group_sender_authorized_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> bool {
+        self.canonical_group_participant_if_current(call_id, generation, call_creator, sender)
+            .is_some()
+    }
+
     /// Resolve an authenticated routed sender to the roster's stable participant JID.
     ///
     /// Bare PN aliases are accepted by signaling but must not become persistent control keys:
@@ -410,6 +462,29 @@ impl CallRegistry {
         let entry = map
             .get(call_id)
             .filter(|entry| entry.session.call_creator == *call_creator)?;
+        Self::canonical_group_participant_for_entry(entry, call_creator, sender)
+    }
+
+    /// Resolve a sender only while `generation` still owns this call-id.
+    pub fn canonical_group_participant_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> Option<Jid> {
+        let map = self.inner.lock().expect("registry lock poisoned");
+        let entry = map.get(call_id).filter(|entry| {
+            entry.generation == generation && entry.session.call_creator == *call_creator
+        })?;
+        Self::canonical_group_participant_for_entry(entry, call_creator, sender)
+    }
+
+    fn canonical_group_participant_for_entry(
+        entry: &CallEntry,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> Option<Jid> {
         if sender.to_non_ad() == call_creator.to_non_ad() {
             return Some(call_creator.to_non_ad());
         }
@@ -965,12 +1040,26 @@ impl CallRegistry {
             .map(|entry| (entry.generation, entry.video_transition_lock.clone()))
     }
 
-    /// The per-call serialization lock for participant and waiting-room controls.
-    pub fn group_transition_lock(&self, call_id: &str) -> Option<Arc<AsyncMutex<()>>> {
+    /// The current call generation and its shared group-transition lock.
+    pub fn current_group_transition(&self, call_id: &str) -> Option<(u64, Arc<AsyncMutex<()>>)> {
         self.inner
             .lock()
             .expect("registry lock poisoned")
             .get(call_id)
+            .map(|entry| (entry.generation, entry.group_transition_lock.clone()))
+    }
+
+    /// The group-transition lock for one known call generation.
+    pub fn group_transition_lock(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Arc<AsyncMutex<()>>> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
             .map(|entry| entry.group_transition_lock.clone())
     }
 
@@ -1344,6 +1433,16 @@ impl CallRegistry {
             .is_some_and(|e| e.session.transition_to(next))
     }
 
+    /// Advance a call phase only while `generation` still owns this call-id.
+    pub fn transition_if_current(&self, call_id: &str, generation: u64, next: CallPhase) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .is_some_and(|entry| entry.session.transition_to(next))
+    }
+
     /// Read a clone of a call's session snapshot.
     pub fn snapshot(&self, call_id: &str) -> Option<CallSession> {
         self.inner
@@ -1486,18 +1585,16 @@ mod tests {
     }
 
     fn group_relay(transaction_id: u32) -> GroupCallRelay {
-        GroupCallRelay {
-            transaction_id: Some(transaction_id),
-            self_pid: Some(1),
-            uuid: "TEST-RELAY".to_string(),
-            participant_uuid: "TEST-PARTICIPANT".to_string(),
-            attribute_padding: false,
-            warp_mi_tag_len: Some(4),
-            key: vec![7; 32],
-            hbh_key: Vec::new(),
-            tokens: vec![vec![9; 16]],
-            auth_tokens: Vec::new(),
-            endpoints: vec![GroupCallRelayEndpoint {
+        GroupCallRelay::builder()
+            .transaction_id(transaction_id)
+            .self_pid(1)
+            .uuid("TEST-RELAY".to_string())
+            .participant_uuid("TEST-PARTICIPANT".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(vec![7; 32])
+            .tokens(vec![vec![9; 16]])
+            .endpoints(vec![GroupCallRelayEndpoint {
                 relay_id: 1,
                 token_id: 0,
                 auth_token_id: 0,
@@ -1508,8 +1605,8 @@ mod tests {
                 address: Vec::new(),
                 ipv4: Some("203.0.113.7".to_string()),
                 port: Some(3478),
-            }],
-        }
+            }])
+            .build()
     }
 
     #[test]

@@ -1225,18 +1225,17 @@ mod tests {
     }
 
     fn group_relay(transaction_id: u32, ip: &str, port: u16) -> GroupCallRelay {
-        GroupCallRelay {
-            transaction_id: Some(transaction_id),
-            self_pid: Some(1),
-            uuid: "relay".to_string(),
-            participant_uuid: "participant".to_string(),
-            attribute_padding: false,
-            warp_mi_tag_len: Some(4),
-            key: b"relay-key".to_vec(),
-            hbh_key: Vec::new(),
-            tokens: vec![vec![0x47]],
-            auth_tokens: vec![vec![0x57]],
-            endpoints: vec![GroupCallRelayEndpoint {
+        GroupCallRelay::builder()
+            .transaction_id(transaction_id)
+            .self_pid(1)
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![0x47]])
+            .auth_tokens(vec![vec![0x57]])
+            .endpoints(vec![GroupCallRelayEndpoint {
                 relay_id: 1,
                 token_id: 0,
                 auth_token_id: 0,
@@ -1247,8 +1246,8 @@ mod tests {
                 address: Vec::new(),
                 ipv4: Some(ip.to_string()),
                 port: Some(port),
-            }],
-        }
+            }])
+            .build()
     }
 
     fn group_update(transaction_id: u32, ip: &str, port: u16) -> GroupCallUpdate {

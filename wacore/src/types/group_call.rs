@@ -142,7 +142,7 @@ impl crate::stats::HeapSize for GroupCallRelayEndpoint {
 }
 
 /// Shared relay allocation embedded in a group snapshot.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct GroupCallRelay {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,12 +155,16 @@ pub struct GroupCallRelay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warp_mi_tag_len: Option<u32>,
     #[serde(skip)]
+    #[builder(default)]
     pub(crate) key: Vec<u8>,
     #[serde(skip)]
+    #[builder(default)]
     pub(crate) hbh_key: Vec<u8>,
     #[serde(skip)]
+    #[builder(default)]
     pub(crate) tokens: Vec<Vec<u8>>,
     #[serde(skip)]
+    #[builder(default)]
     pub(crate) auth_tokens: Vec<Vec<u8>>,
     pub endpoints: Vec<GroupCallRelayEndpoint>,
 }

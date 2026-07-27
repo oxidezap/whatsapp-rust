@@ -1,7 +1,7 @@
 use wacore::types::group_call::{
     CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallDevice, GroupCallParticipant,
-    GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
-    WaitingRoomUser,
+    GroupCallRelay, GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare, ScreenShareState,
+    WaitingRoom, WaitingRoomUser,
 };
 use wacore_binary::{Jid, Server};
 
@@ -40,6 +40,13 @@ fn public_group_call_payloads_are_constructible_with_builders() {
         .is_fna(false)
         .build();
     assert_eq!(endpoint.relay_name, "gru1c02");
+    let relay = GroupCallRelay::builder()
+        .uuid("TEST-RELAY".to_string())
+        .participant_uuid("TEST-PARTICIPANT".to_string())
+        .attribute_padding(false)
+        .endpoints(vec![endpoint])
+        .build();
+    assert_eq!(relay.endpoints.len(), 1);
 
     let link = CallLink::builder()
         .token("TEST-CALL-LINK".to_string())

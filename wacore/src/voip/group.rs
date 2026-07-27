@@ -166,12 +166,13 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
 
     let mut users = HashSet::with_capacity(update.participants.len());
     let mut pids = HashSet::new();
+    let mut devices = HashSet::new();
     update.participants.iter().all(|participant| {
         users.insert(participant.jid.to_non_ad())
-            && participant
-                .devices
-                .iter()
-                .all(|device| device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid)))
+            && participant.devices.iter().all(|device| {
+                devices.insert(device.jid.clone())
+                    && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
+            })
     })
 }
 
@@ -268,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_identity_duplicate_pid_and_oversized_limit_are_rejected() {
+    fn invalid_identity_duplicate_pid_device_and_oversized_limit_are_rejected() {
         let mut state = GroupCallState::new("CALL", creator());
         let mut wrong = update(1, vec![participant("100001", "connected", 1)]);
         wrong.call_id = "OTHER".to_string();
@@ -284,6 +285,15 @@ mod tests {
         assert_eq!(
             state.apply_update(duplicate_pid),
             GroupStateApply::InvalidSnapshot
+        );
+
+        let mut second = participant("200002", "connected", 2);
+        second.devices[0].jid = Jid::new("100001", Server::Lid).with_device(1);
+        let duplicate_device = update(1, vec![participant("100001", "connected", 1), second]);
+        assert_eq!(
+            state.apply_update(duplicate_device),
+            GroupStateApply::InvalidSnapshot,
+            "one device identity cannot belong to two roster participants"
         );
 
         let mut oversized = update(1, vec![]);

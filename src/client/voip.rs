@@ -62,6 +62,12 @@ struct CallLinkRegistrationGuard {
 }
 
 #[cfg(feature = "voip-runtime")]
+pub(crate) struct CallLinkJoinRegistration {
+    pub(crate) join: CallLinkJoin,
+    pub(crate) generation: u64,
+}
+
+#[cfg(feature = "voip-runtime")]
 #[derive(Clone, Copy)]
 enum WaitingRoomUserAction {
     Admit,
@@ -504,6 +510,19 @@ impl Voip<'_> {
         media: CallLinkMedia,
         audio_format: AudioFormat,
     ) -> Result<CallLinkJoin, CallError> {
+        Ok(self
+            .join_call_link_registration_with_audio(token_or_url, media, audio_format)
+            .await?
+            .join)
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn join_call_link_registration_with_audio(
+        &self,
+        token_or_url: &str,
+        media: CallLinkMedia,
+        audio_format: AudioFormat,
+    ) -> Result<CallLinkJoinRegistration, CallError> {
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
         let request_id = self.client.generate_request_id();
@@ -608,7 +627,7 @@ impl Voip<'_> {
             wacore::types::group_call::GroupCallDevice::new(own_lid).with_capability(1, capability),
         );
         registration.disarm();
-        Ok(join)
+        Ok(CallLinkJoinRegistration { join, generation })
     }
 
     /// Enable or disable approval for a live call-link waiting room.
@@ -636,6 +655,11 @@ impl Voip<'_> {
         generation: u64,
         enabled: bool,
     ) -> Result<(), CallError> {
+        let registry = self.client.call_registry();
+        let transition_lock = registry
+            .group_transition_lock(call_id, generation)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
         self.ensure_waiting_room_admin_if_current(call_id, generation)?;
         let request_id = self.client.generate_request_id();
         execute_call_service_request(
@@ -646,11 +670,7 @@ impl Voip<'_> {
             parse_waiting_room_toggle_ack,
         )
         .await?;
-        if self
-            .client
-            .call_registry()
-            .set_waiting_room_enabled_if_current(call_id, generation, enabled)
-        {
+        if registry.set_waiting_room_enabled_if_current(call_id, generation, enabled) {
             Ok(())
         } else {
             Err(CallError::Media(
@@ -1869,6 +1889,92 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn approval_toggle_serializes_with_authoritative_waiting_room_updates() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let call_id = "TEST-APPROVAL-SERIALIZATION";
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let registry = client.call_registry();
+        let generation = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let room = |transaction_id, enabled| {
+            wacore::types::group_call::WaitingRoom::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .link_token("TEST-CALL-LINK".to_string())
+                .media(CallLinkMedia::Audio)
+                .enabled(enabled)
+                .is_admin(true)
+                .transaction_id(transaction_id)
+                .users(Vec::new())
+                .build()
+        };
+        assert_eq!(
+            registry.apply_waiting_room(room(1, false)),
+            wacore::voip::GroupStateApply::Applied
+        );
+        let transition_lock = registry
+            .group_transition_lock(call_id, generation)
+            .expect("active group transition");
+
+        let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let request_client = client.clone();
+        let request_creator = creator.clone();
+        let toggle = tokio::spawn(async move {
+            request_client
+                .voip()
+                .set_approval_required_for_generation(call_id, &request_creator, generation, true)
+                .await
+        });
+        let request = sent.await.expect("waiting-room toggle request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+
+        let update_registry = registry.clone();
+        let update = room(2, false);
+        let authoritative = tokio::spawn(async move {
+            let _guard = transition_lock.lock().await;
+            update_registry.apply_waiting_room_if_current(update, generation)
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !authoritative.is_finished(),
+            "the authoritative snapshot must wait for the toggle ACK and local commit"
+        );
+
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "waiting_room_toggle")
+                .attr("id", request_id.as_str())
+                .build(),
+        )
+        .await;
+        toggle.await.expect("toggle task").expect("toggle response");
+        assert_eq!(
+            authoritative.await.expect("authoritative update task"),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(
+            registry
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.waiting_room().cloned())
+                .is_some_and(|room| room.transaction_id == Some(2) && !room.enabled),
+            "the newer authoritative snapshot must win after the serialized local toggle"
+        );
+        registry.remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn waiting_room_user_acks_are_bound_to_the_originating_generation() {
         let user = Jid::new("444444444444444", Server::Lid);
         for (index, action) in [WaitingRoomUserAction::Admit, WaitingRoomUserAction::Deny]
@@ -2180,7 +2286,7 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
-    async fn immediately_admitted_call_link_preserves_requested_token() {
+    async fn immediately_admitted_call_link_preserves_token_and_origin_generation() {
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
         client
             .persistence_manager()
@@ -2194,7 +2300,7 @@ mod tests {
         let join = tokio::spawn(async move {
             join_client
                 .voip()
-                .join_call_link_with_audio(
+                .join_call_link_registration_with_audio(
                     "REQUESTED-CALL-LINK",
                     CallLinkMedia::Video,
                     AudioFormat::OPUS_16KHZ_60MS,
@@ -2237,13 +2343,18 @@ mod tests {
         )
         .await;
 
-        let admitted = join.await.expect("join task").expect("join response");
+        let admitted_registration = join.await.expect("join task").expect("join response");
+        let admitted = admitted_registration.join;
         assert_eq!(admitted.token, "REQUESTED-CALL-LINK");
         assert!(!admitted.in_waiting_room);
         let generation = client
             .call_registry()
             .generation_of("ADMITTED-CALL-ID")
             .expect("registered admitted call");
+        assert_eq!(
+            admitted_registration.generation, generation,
+            "the join result must retain the generation it created"
+        );
         assert!(
             client
                 .call_registry()
@@ -2252,8 +2363,21 @@ mod tests {
                 .is_some_and(|room| room.is_admin && room.enabled),
             "admitted joins must retain waiting-room admin state from the ACK"
         );
+        let replacement = client.call_registry().insert(CallSession::new_outgoing(
+            "ADMITTED-CALL-ID",
+            Jid::new("ADMITTED-CALL-ID", Server::Call),
+            Jid::new("333333333333333", Server::Lid),
+        ));
+        assert_ne!(replacement, admitted_registration.generation);
+        assert!(
+            client
+                .call_registry()
+                .snapshot_if_current("ADMITTED-CALL-ID", admitted_registration.generation)
+                .is_none(),
+            "a stale starter must not attach through a replacement generation"
+        );
         client
             .call_registry()
-            .remove_if_current("ADMITTED-CALL-ID", generation);
+            .remove_if_current("ADMITTED-CALL-ID", replacement);
     }
 }

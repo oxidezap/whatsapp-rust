@@ -722,6 +722,18 @@ impl<'a> OutgoingGroupCall<'a> {
             request_id.clone(),
             cleanup_generation,
         );
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            &call_id,
+            Jid::new(&call_id, Server::Call),
+            own_lid.clone(),
+        );
+        session.audio_format = Some(audio.config().format);
+        session.is_video = video.is_some();
+        let _ = session.transition_to(CallPhase::Calling);
+        // Register before the offer reaches the wire. A creator-authenticated group update can
+        // overtake the ACK on the independent call-stanza path, and must have a generation where
+        // its roster and first epoch can be retained.
+        let mut registration = RegisteredCall::new(self.client, session).await;
         // Sending is delivery-ambiguous: cancellation can drop this future after the server has
         // accepted the bytes but before send_node returns. Arm cleanup before crossing that await.
         let mut teardown = GroupOfferTeardown::new(self.client, &call_id, &own_lid);
@@ -743,33 +755,47 @@ impl<'a> OutgoingGroupCall<'a> {
             }
             Err(_) => return Err(CallError::ResponseTimeout),
         };
-        let update = parse_initial_group_call_ack(response.get())
+        let ack_update = parse_initial_group_call_ack(response.get())
             .map_err(|error| CallError::Response(error.to_string()))?
             .ok_or_else(|| {
                 CallError::Response("group offer ack has no group snapshot".to_string())
             })?;
-        if update.call_id != call_id || update.call_creator != own_lid {
+        if ack_update.call_id != call_id || ack_update.call_creator != own_lid {
             return Err(CallError::Response(
                 "group offer ack identity mismatch".to_string(),
             ));
         }
+        ensure_group_offer_media(&ack_update, video.is_some())?;
+        let registry = self.client.call_registry();
+        let transition_lock = registry
+            .group_transition_lock(&call_id, registration.generation)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        let transition_guard = transition_lock.lock().await;
+        registration.ensure_current()?;
+        let applied =
+            registry.apply_group_update_if_current(ack_update.clone(), registration.generation);
+        if !matches!(
+            applied,
+            wacore::voip::GroupStateApply::Applied | wacore::voip::GroupStateApply::Stale
+        ) {
+            return Err(CallError::Response(
+                "group offer ack snapshot was rejected".to_string(),
+            ));
+        }
+        let update = registry
+            .group_state_if_current(&call_id, registration.generation)
+            .and_then(|state| state.snapshot().cloned())
+            .ok_or(CallError::CallEndedDuringSetup)?;
         ensure_group_offer_media(&update, video.is_some())?;
-        let mut session = wacore::voip::CallSession::new_outgoing(
-            &call_id,
-            Jid::new(&call_id, Server::Call),
-            own_lid.clone(),
-        );
-        session.audio_format = Some(audio.config().format);
-        session.is_video = video.is_some();
-        session.group = Some(update.clone());
-        let _ = session.transition_to(CallPhase::Calling);
-        let _ = session.transition_to(CallPhase::Connecting);
-        // Register before session establishment and epoch fan-out can await: authoritative roster
-        // updates arriving in that window must be retained for the eventual media consumer.
-        let mut registration = RegisteredCall::new(self.client, session).await;
+        if !registry.transition_if_current(&call_id, registration.generation, CallPhase::Connecting)
+        {
+            return Err(CallError::CallEndedDuringSetup);
+        }
+        let ack_applied = applied == wacore::voip::GroupStateApply::Applied;
         let relay = update
             .relay
             .as_ref()
+            .or(ack_update.relay.as_ref())
             .ok_or(CallError::Media("group offer ack has no relay"))?;
         let mut config = CallConfig::for_group(
             CallDirection::Outgoing,
@@ -792,7 +818,9 @@ impl<'a> OutgoingGroupCall<'a> {
                 direct_peer: None,
             })
             .map_err(|error| CallError::Setup(error.to_string()))?;
-        if update.rekey_requested {
+        // A newer pre-ACK update was already rekeyed by the serialized signaling handler and left
+        // its epoch in the registry. Only the ACK transaction itself still needs startup fan-out.
+        if ack_applied && update.rekey_requested {
             fanout_group_epoch(self.client, &update)
                 .await?
                 .commit(|epoch| {
@@ -801,6 +829,7 @@ impl<'a> OutgoingGroupCall<'a> {
                         .map_err(|error| CallError::Setup(error.to_string()))
                 })?;
         }
+        drop(transition_guard);
 
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
@@ -919,15 +948,18 @@ impl<'a> CallLinkCall<'a> {
             _ => {}
         }
 
-        let join = self
+        let join_registration = self
             .client
             .voip()
-            .join_call_link_with_audio(self.token_or_url, self.media, audio.config().format)
+            .join_call_link_registration_with_audio(
+                self.token_or_url,
+                self.media,
+                audio.config().format,
+            )
             .await?;
+        let join = join_registration.join;
+        let generation = join_registration.generation;
         let registry = self.client.call_registry();
-        let generation = registry
-            .generation_of(&join.call_id)
-            .ok_or(CallError::Media("call-link registration was lost"))?;
         let mut registration =
             RegisteredCall::from_existing(self.client, &join.call_id, generation)?;
 
@@ -6093,6 +6125,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outgoing_group_offer_registers_before_its_ack_can_be_overtaken() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+        let targets = [
+            Jid::new("222222222222222", Server::Lid),
+            Jid::new("333333333333333", Server::Lid),
+        ];
+        for target in &targets {
+            client
+                .update_device_list(DeviceListRecord {
+                    user: target.user.to_string(),
+                    devices: vec![DeviceInfo::new(0, None)],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .expect("seed target device");
+        }
+
+        let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let start_client = client.clone();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+        let start = tokio::spawn(async move {
+            start_client
+                .voip()
+                .group_call(&targets)
+                .audio(mic_rx, speaker_tx)
+                .start()
+                .await
+        });
+        let offer = sent.await.expect("initial group offer");
+        let offer_ref = offer.as_node_ref();
+        let action = &offer_ref.children().expect("offer action")[0];
+        let call_id = action
+            .attrs()
+            .optional_string("call-id")
+            .expect("call id")
+            .into_owned();
+        let generation = client
+            .call_registry()
+            .generation_of(&call_id)
+            .expect("group call must be registered before awaiting its ACK");
+        let overtaking = GroupCallUpdate::builder()
+            .call_id(call_id.clone())
+            .call_creator(own_lid)
+            .transaction_id(2)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client
+                .call_registry()
+                .apply_group_update_if_current(overtaking, generation,),
+            wacore::voip::GroupStateApply::Applied,
+            "a group update that overtakes the ACK must be retained"
+        );
+
+        start.abort();
+        match start.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("start should be cancelled"),
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            None,
+            "cancellation must reap the pre-ACK registration"
+        );
+    }
+
+    #[tokio::test]
     async fn registered_outgoing_group_retains_roster_before_media_attach() {
         use wacore::voip::{GroupControl, GroupStateApply};
 
@@ -6117,13 +6236,20 @@ mod tests {
             Jid::new(call_id, Server::Call),
             creator.clone(),
         );
-        session.group = Some(update(1));
+        let _ = session.transition_to(CallPhase::Calling);
         let registration = RegisteredCall::new(&client, session).await;
 
         assert_eq!(
             client.call_registry().apply_group_update(update(2)),
             GroupStateApply::Applied,
             "an update arriving during epoch fan-out must find the early registration"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .apply_group_update_if_current(update(1), registration.generation),
+            GroupStateApply::Stale,
+            "the older ACK snapshot must not replace an overtaking group update"
         );
         let (tx, rx) = async_channel::bounded(4);
         client

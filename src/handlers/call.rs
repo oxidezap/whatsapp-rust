@@ -75,7 +75,7 @@ impl StanzaHandler for CallHandler {
         match parse_call_stanza(nr) {
             Ok(Some(call)) => {
                 #[cfg(feature = "voip-runtime")]
-                let group_transition_lock = matches!(
+                let group_transition = matches!(
                     call.action,
                     CallAction::GroupUpdate { .. }
                         | CallAction::EncRekey { .. }
@@ -86,11 +86,14 @@ impl StanzaHandler for CallHandler {
                 .then(|| {
                     client
                         .call_registry()
-                        .group_transition_lock(call.action.call_id())
+                        .current_group_transition(call.action.call_id())
                 })
                 .flatten();
                 #[cfg(feature = "voip-runtime")]
-                let _group_transition_guard = if let Some(lock) = group_transition_lock.as_ref() {
+                let group_transition_generation =
+                    group_transition.as_ref().map(|(generation, _)| *generation);
+                #[cfg(feature = "voip-runtime")]
+                let _group_transition_guard = if let Some((_, lock)) = group_transition.as_ref() {
                     Some(lock.lock().await)
                 } else {
                     None
@@ -106,6 +109,19 @@ impl StanzaHandler for CallHandler {
                         warn!("call: failed to send typed {action_type} ack: {error}");
                         return true;
                     }
+                }
+                #[cfg(feature = "voip-runtime")]
+                if let Some(generation) = group_transition_generation
+                    && !client
+                        .call_registry()
+                        .is_current(call.action.call_id(), generation)
+                {
+                    debug!(
+                        "call: discarded stale {} after call generation changed for {}",
+                        call.action.action_kind(),
+                        call.action.call_id()
+                    );
+                    return true;
                 }
                 // Diagnostic: every recognized <call> action we receive (offer/accept/reject/
                 // terminate/transport/relaylatency...). Lets us see whether the caller actually gets a
@@ -329,11 +345,14 @@ impl StanzaHandler for CallHandler {
                             dispatch_call = false;
                         }
                         CallAction::GroupUpdate { update }
-                            if !client.call_registry().group_sender_authorized(
-                                &update.call_id,
-                                &update.call_creator,
-                                &routed_call_sender(&call),
-                            ) =>
+                            if !group_transition_generation.is_some_and(|generation| {
+                                client.call_registry().group_sender_authorized_if_current(
+                                    &update.call_id,
+                                    generation,
+                                    &update.call_creator,
+                                    &routed_call_sender(&call),
+                                )
+                            }) =>
                         {
                             warn!(
                                 "call: rejected group snapshot from unauthorized sender for {}",
@@ -343,98 +362,109 @@ impl StanzaHandler for CallHandler {
                         }
                         CallAction::GroupUpdate { update } => {
                             let registry = client.call_registry();
-                            let generation = registry.generation_of(&update.call_id);
-                            dispatch_call = match registry
-                                .apply_group_update(update.as_ref().clone())
-                            {
-                                GroupStateApply::Applied => {
-                                    if let Some(generation) = generation {
+                            dispatch_call = if let Some(generation) = group_transition_generation {
+                                match registry.apply_group_update_if_current(
+                                    update.as_ref().clone(),
+                                    generation,
+                                ) {
+                                    GroupStateApply::Applied => {
                                         registry.send_group_update_if_current(
                                             &update.call_id,
                                             generation,
                                             update.as_ref().clone(),
                                         );
-                                    }
-                                    if update.rekey_requested {
-                                        match crate::voip::facade::fanout_group_epoch(
-                                            &client, update,
-                                        )
-                                        .await
-                                        {
-                                            Ok(fanout) => {
-                                                let generation = fanout.generation();
-                                                if let Err(error) = fanout.commit(|epoch| {
-                                                    generation
-                                                        .is_some_and(|generation| {
-                                                            client
-                                                                .call_registry()
-                                                                .send_group_epoch_if_current(
-                                                                    &update.call_id,
-                                                                    generation,
-                                                                    update.transaction_id,
-                                                                    epoch.to_vec(),
-                                                                )
-                                                        })
-                                                        .then_some(())
-                                                        .ok_or(CallError::Media(
-                                                            "local group epoch consumer closed",
-                                                        ))
-                                                }) {
+                                        if update.rekey_requested {
+                                            match crate::voip::facade::fanout_group_epoch(
+                                                &client, update,
+                                            )
+                                            .await
+                                            {
+                                                Ok(fanout) => {
+                                                    let fanout_generation = fanout.generation();
+                                                    if let Err(error) = fanout.commit(|epoch| {
+                                                        fanout_generation
+                                                            .is_some_and(|generation| {
+                                                                client
+                                                                    .call_registry()
+                                                                    .send_group_epoch_if_current(
+                                                                        &update.call_id,
+                                                                        generation,
+                                                                        update.transaction_id,
+                                                                        epoch.to_vec(),
+                                                                    )
+                                                            })
+                                                            .then_some(())
+                                                            .ok_or(CallError::Media(
+                                                                "local group epoch consumer closed",
+                                                            ))
+                                                    }) {
+                                                        warn!(
+                                                            "call: failed to commit requested group epoch for {}: {error}",
+                                                            update.call_id
+                                                        );
+                                                        client
+                                                            .call_registry()
+                                                            .send_call_event_if_current(
+                                                                &update.call_id,
+                                                                generation,
+                                                                CallEvent::GroupRekeyFailed,
+                                                            );
+                                                    }
+                                                }
+                                                Err(error) => {
                                                     warn!(
-                                                        "call: failed to commit requested group epoch for {}: {error}",
+                                                        "call: failed to distribute requested group epoch for {}: {error}",
                                                         update.call_id
                                                     );
-                                                    client.call_registry().send_call_event(
-                                                        &update.call_id,
-                                                        CallEvent::GroupRekeyFailed,
-                                                    );
+                                                    client
+                                                        .call_registry()
+                                                        .send_call_event_if_current(
+                                                            &update.call_id,
+                                                            generation,
+                                                            CallEvent::GroupRekeyFailed,
+                                                        );
                                                 }
                                             }
-                                            Err(error) => {
-                                                warn!(
-                                                    "call: failed to distribute requested group epoch for {}: {error}",
-                                                    update.call_id
-                                                );
-                                                client.call_registry().send_call_event(
-                                                    &update.call_id,
-                                                    CallEvent::GroupRekeyFailed,
-                                                );
-                                            }
                                         }
+                                        client.call_registry().send_call_event_if_current(
+                                            &update.call_id,
+                                            generation,
+                                            CallEvent::GroupUpdated(update.clone()),
+                                        );
+                                        true
                                     }
-                                    client.call_registry().send_call_event(
-                                        &update.call_id,
-                                        CallEvent::GroupUpdated(update.clone()),
-                                    );
-                                    true
+                                    GroupStateApply::Stale | GroupStateApply::UnknownCall => false,
+                                    GroupStateApply::IdentityMismatch
+                                    | GroupStateApply::InvalidSnapshot => {
+                                        warn!(
+                                            "call: rejected invalid group snapshot for {}",
+                                            update.call_id
+                                        );
+                                        false
+                                    }
+                                    _ => false,
                                 }
-                                GroupStateApply::Stale | GroupStateApply::UnknownCall => false,
-                                GroupStateApply::IdentityMismatch
-                                | GroupStateApply::InvalidSnapshot => {
-                                    warn!(
-                                        "call: rejected invalid group snapshot for {}",
-                                        update.call_id
-                                    );
-                                    false
-                                }
-                                _ => false,
+                            } else {
+                                false
                             };
                         }
                         CallAction::EncRekey { rekey } => {
                             dispatch_call = false;
                             let sender = routed_call_sender(&call);
-                            if !client.call_registry().group_sender_authorized(
-                                &rekey.call_id,
-                                &rekey.call_creator,
-                                &sender,
-                            ) {
+                            let generation = group_transition_generation;
+                            if !generation.is_some_and(|generation| {
+                                client.call_registry().group_sender_authorized_if_current(
+                                    &rekey.call_id,
+                                    generation,
+                                    &rekey.call_creator,
+                                    &sender,
+                                )
+                            }) {
                                 warn!(
                                     "call: rejected group epoch from unauthorized sender for {}",
                                     rekey.call_id
                                 );
                             } else {
-                                let generation =
-                                    client.call_registry().generation_of(&rekey.call_id);
                                 match decrypt_group_epoch(&client, rekey, &sender).await {
                                     Ok(raw_epoch) => {
                                         if !generation.is_some_and(|generation| {
@@ -461,11 +491,14 @@ impl StanzaHandler for CallHandler {
                             }
                         }
                         CallAction::WaitingRoomUpdate { room }
-                            if !client.call_registry().group_sender_authorized(
-                                &room.call_id,
-                                &room.call_creator,
-                                &routed_call_sender(&call),
-                            ) =>
+                            if !group_transition_generation.is_some_and(|generation| {
+                                client.call_registry().group_sender_authorized_if_current(
+                                    &room.call_id,
+                                    generation,
+                                    &room.call_creator,
+                                    &routed_call_sender(&call),
+                                )
+                            }) =>
                         {
                             warn!(
                                 "call: rejected waiting-room snapshot from unauthorized sender for {}",
@@ -474,11 +507,15 @@ impl StanzaHandler for CallHandler {
                             dispatch_call = false;
                         }
                         CallAction::WaitingRoomUpdate { room } => {
-                            dispatch_call =
-                                match client.call_registry().apply_waiting_room(room.clone()) {
+                            dispatch_call = match group_transition_generation {
+                                Some(generation) => match client
+                                    .call_registry()
+                                    .apply_waiting_room_if_current(room.clone(), generation)
+                                {
                                     GroupStateApply::Applied => {
-                                        client.call_registry().send_call_event(
+                                        client.call_registry().send_call_event_if_current(
                                             &room.call_id,
+                                            generation,
                                             CallEvent::WaitingRoomUpdated(Box::new(room.clone())),
                                         );
                                         true
@@ -493,7 +530,9 @@ impl StanzaHandler for CallHandler {
                                         false
                                     }
                                     _ => false,
-                                };
+                                },
+                                None => false,
+                            };
                         }
                         CallAction::RaiseHand {
                             call_id,
@@ -501,17 +540,28 @@ impl StanzaHandler for CallHandler {
                             raised,
                         } => {
                             let sender = routed_call_sender(&call);
-                            if let Some(participant) = client
-                                .call_registry()
-                                .canonical_group_participant(call_id, call_creator, &sender)
+                            if let Some((generation, participant)) = group_transition_generation
+                                .and_then(|generation| {
+                                    client
+                                        .call_registry()
+                                        .canonical_group_participant_if_current(
+                                            call_id,
+                                            generation,
+                                            call_creator,
+                                            &sender,
+                                        )
+                                        .map(|participant| (generation, participant))
+                                })
                             {
-                                client.call_registry().set_raised_hand(
+                                client.call_registry().set_raised_hand_if_current(
                                     call_id,
+                                    generation,
                                     &participant,
                                     *raised,
                                 );
-                                client.call_registry().send_call_event(
+                                client.call_registry().send_call_event_if_current(
                                     call_id,
+                                    generation,
                                     CallEvent::HandRaised {
                                         participant,
                                         raised: *raised,
@@ -530,17 +580,28 @@ impl StanzaHandler for CallHandler {
                             screen_share,
                         } => {
                             let sender = routed_call_sender(&call);
-                            if let Some(participant) = client
-                                .call_registry()
-                                .canonical_group_participant(call_id, call_creator, &sender)
+                            if let Some((generation, participant)) = group_transition_generation
+                                .and_then(|generation| {
+                                    client
+                                        .call_registry()
+                                        .canonical_group_participant_if_current(
+                                            call_id,
+                                            generation,
+                                            call_creator,
+                                            &sender,
+                                        )
+                                        .map(|participant| (generation, participant))
+                                })
                             {
-                                client.call_registry().set_screen_share(
+                                client.call_registry().set_screen_share_if_current(
                                     call_id,
+                                    generation,
                                     &participant,
                                     screen_share.clone(),
                                 );
-                                client.call_registry().send_call_event(
+                                client.call_registry().send_call_event_if_current(
                                     call_id,
+                                    generation,
                                     CallEvent::ScreenShareChanged {
                                         participant,
                                         screen_share: screen_share.clone(),
@@ -1304,6 +1365,78 @@ mod tests {
             "unauthorized snapshots must not reach the public event bus"
         );
         registry.remove_if_current("GROUP-CALL", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn queued_group_transition_cannot_commit_to_a_replacement_generation() {
+        use wacore::voip::CallSession;
+
+        let client = make_client().await;
+        let call_id = "GROUP-LOCK-GENERATION";
+        let creator = fake_caller_lid();
+        let registry = client.call_registry();
+        let stale_generation = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let stale_lock = registry
+            .group_transition_lock(call_id, stale_generation)
+            .expect("stale generation lock");
+        let stale_guard = stale_lock.lock().await;
+        let update = NodeBuilder::new("call")
+            .attr("from", creator.clone())
+            .attr("id", "STALE-GROUP-UPDATE")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("group_update")
+                .attr("call-id", call_id)
+                .attr("call-creator", creator.clone())
+                .children([NodeBuilder::new("group_info")
+                    .attr("transaction-id", "2")
+                    .attr("media", "audio")
+                    .attr("connected-limit", "32")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", creator.clone())
+                        .attr("state", "connected")
+                        .children([NodeBuilder::new("device")
+                            .attr("jid", creator.clone().with_device(1))
+                            .attr("pid", "1")
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        let handler_client = client.clone();
+        let handler = tokio::spawn(async move {
+            let mut cancelled = false;
+            CallHandler
+                .handle(handler_client, node_to_owned_ref(&update), &mut cancelled)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&stale_lock) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler must retain the stale transition lock");
+
+        let replacement = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator,
+        ));
+        assert_ne!(replacement, stale_generation);
+        drop(stale_guard);
+        assert!(handler.await.expect("handler task"));
+        assert!(
+            registry
+                .group_state_if_current(call_id, replacement)
+                .is_none(),
+            "a transition queued on the removed lock must not mutate the replacement"
+        );
+        registry.remove_if_current(call_id, replacement);
     }
 
     #[cfg(feature = "voip-runtime")]
