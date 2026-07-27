@@ -933,10 +933,6 @@ fn apply_event(
             Ok(())
         }
         Event::UndecryptableMessage(undec) => {
-            // A fanout the phone will never share with a companion is
-            // permanently unavailable, not "not decrypted yet". The two want
-            // opposite UI, so the row records which one it is instead of
-            // flattening both into the same placeholder.
             let kind = unavailable_kind(undec.unavailable_type).unwrap_or(KIND_UNDECRYPTABLE);
             let wire = undec.info.source.chat.to_string();
             let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;

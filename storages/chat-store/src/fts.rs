@@ -100,6 +100,10 @@ fn build_match_query(input: &str) -> Option<String> {
 /// things that start with this" is a defensible answer for a term that short.
 const MIN_RANKED_TERM_LEN: usize = 3;
 
+/// Max rowids per hydration statement, under SQLite's default 999
+/// host-parameter limit.
+const ID_PARAM_CHUNK: usize = 900;
+
 #[derive(QueryableByName)]
 struct FtsHit {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -111,7 +115,8 @@ impl ChatStore {
     /// query is plain words (prefix-matched); FTS5 operators are neutralized.
     ///
     /// A term shorter than three characters is ordered newest-first instead of
-    /// by relevance — see [`MIN_RANKED_TERM_LEN`].
+    /// by relevance: ranking has to score every row such a prefix matches
+    /// before `limit` can discard any, which on a real store means most of it.
     pub async fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<StoredMessage>> {
         self.search(query, None, limit).await
     }
@@ -163,16 +168,25 @@ impl ChatStore {
                     if hits.is_empty() {
                         return Ok(Vec::new());
                     }
-                    // One statement for every hit, instead of a point query per hit
-                    // (each of which used to re-resolve the chat's identity keys
-                    // first, so N hits cost ~2N serialized round trips).
+                    // One statement per chunk of hits, instead of a point query
+                    // per hit (each of which used to re-resolve the chat's
+                    // identity keys first, so N hits cost ~2N serialized round
+                    // trips). `limit` is the caller's, so the id list is chunked
+                    // rather than trusted to stay under SQLite's host-parameter
+                    // ceiling.
                     let ids: Vec<i64> = hits.iter().map(|hit| hit.rowid).collect();
-                    let mut rows: Vec<MessageRow> = schema::messages::dsl::messages
-                        .filter(schema::messages::dsl::rowid.eq_any(&ids))
-                        .load(conn)
-                        .map_err(db_err)?;
-                    // `eq_any` returns table order; restore the order the ranking
-                    // (or the recency scan) put them in.
+                    let mut rows: Vec<MessageRow> = Vec::with_capacity(ids.len());
+                    for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                        rows.extend(
+                            schema::messages::dsl::messages
+                                .filter(schema::messages::dsl::rowid.eq_any(chunk))
+                                .load::<MessageRow>(conn)
+                                .map_err(db_err)?,
+                        );
+                    }
+                    // `eq_any` returns table order, and chunking splits it
+                    // further; restore the order the ranking (or the recency
+                    // scan) put them in.
                     let rank_of: std::collections::HashMap<i64, usize> =
                         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
                     rows.sort_by_key(|row| rank_of.get(&row.rowid).copied().unwrap_or(usize::MAX));

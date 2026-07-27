@@ -97,14 +97,32 @@ const ID_PARAM_CHUNK: usize = 900;
 /// limit while bounding Diesel's temporary insert-expression allocation.
 const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
 
+/// Reader connections and the permits that bound how many run at once.
+#[derive(Clone)]
+pub(crate) struct ReadPool {
+    pub(crate) pool: SqlitePool,
+    /// One permit per connection, so the count of blocking threads parked on
+    /// `pool.get()` is bounded by the pool rather than by the caller.
+    pub(crate) semaphore: Arc<tokio::sync::Semaphore>,
+}
+
 #[derive(Clone)]
 pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
     pub(crate) db_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Permits for read-only work, when [`SqliteStoreConfig::read_pool_size`]
-    /// asked for any. `None` keeps reads on `db_semaphore` — the original
-    /// behaviour, where one queue covers everything.
-    pub(crate) read_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// A separate, `query_only` pool and its permits, when
+    /// [`SqliteStoreConfig::read_pool_size`] asked for reader connections and
+    /// the database is actually in WAL. `None` keeps reads on `pool` behind
+    /// `db_semaphore` — the original behaviour, where one queue covers
+    /// everything.
+    ///
+    /// Deliberately a second pool rather than extra connections in the main
+    /// one: several write paths check a connection out directly, without the
+    /// semaphore, and are serialized today only because the pool hands out one
+    /// connection at a time. Growing that pool would let two of them run at
+    /// once and deadlock on the write-lock upgrade — the exact failure this
+    /// change exists to avoid.
+    pub(crate) reads: Option<ReadPool>,
     pub(crate) database_path: String,
     device_id: i32,
 }
@@ -277,6 +295,10 @@ struct ConnectionOptions {
     busy_timeout_ms: u64,
     synchronous: Synchronous,
     connection_init: Option<ConnectionInitHook>,
+    /// Stamp `PRAGMA query_only` on the connection, making a write through it a
+    /// plain error. Set on the reader pool: those connections must never take
+    /// SQLite's write lock, and enforcing it here beats documenting it.
+    query_only: bool,
 }
 
 impl std::fmt::Debug for ConnectionOptions {
@@ -321,6 +343,11 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
         // SQLite's mmap off (current behavior).
         if let Some(mmap_size) = self.mmap_size.filter(|&n| n > 0) {
             pragmas.push(format!("PRAGMA mmap_size = {mmap_size};"));
+        }
+        // Last, so it cannot block the pragmas above (they are connection
+        // settings, not database writes, but query_only is cheap to order).
+        if self.query_only {
+            pragmas.push("PRAGMA query_only = 1;".to_string());
         }
         for pragma in pragmas {
             diesel::sql_query(pragma)
@@ -418,9 +445,6 @@ impl SqliteStore {
         // store (the default 1) carries exactly one connection, and raising it for real
         // concurrency keeps the two in step.
         let pool_size = config.pool_size.max(1);
-        // Reader connections sit ON TOP of the write pool rather than sharing it,
-        // so readers saturating their permits can never leave the writer waiting
-        // on r2d2 for a connection.
         let read_pool_size = config.read_pool_size;
         let thread_pool = config.thread_pool.unwrap_or_else(shared_r2d2_thread_pool);
 
@@ -437,19 +461,25 @@ impl SqliteStore {
             },
             synchronous: config.synchronous,
             connection_init: config.connection_init,
+            query_only: false,
+        };
+        let read_options = ConnectionOptions {
+            query_only: true,
+            ..options.clone()
         };
 
         // r2d2's build() synchronously opens the pool's initial connection, so build the
         // pool AND run migrations inside one blocking task to keep the async runtime
         // unblocked (matters when many stores open at once).
-        let pool =
-            tokio::task::spawn_blocking(move || -> std::result::Result<SqlitePool, StoreError> {
+        let db_url = database_url.to_string();
+        let (pool, journal_mode) = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(SqlitePool, String), StoreError> {
                 // test_on_check_out(false): a local SQLite file connection doesn't
                 // spontaneously drop, so r2d2's per-checkout SELECT 1 liveness probe guards
                 // nothing — a real failure surfaces on the next query. The shared thread pool
                 // avoids r2d2's per-pool management threads (see shared_r2d2_thread_pool).
                 let pool = Pool::builder()
-                    .max_size(pool_size + read_pool_size)
+                    .max_size(pool_size)
                     .test_on_check_out(false)
                     .thread_pool(thread_pool)
                     .connection_customizer(Box::new(options))
@@ -459,26 +489,66 @@ impl SqliteStore {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                diesel::sql_query("PRAGMA journal_mode = WAL;")
-                    .execute(&mut conn)
-                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                // The PRAGMA reports the mode actually in effect, which is not
+                // always the one asked for — an in-memory database has no WAL
+                // to switch to and stays on its own journal.
+                #[derive(diesel::QueryableByName)]
+                struct JournalMode {
+                    #[diesel(sql_type = diesel::sql_types::Text)]
+                    journal_mode: String,
+                }
+                let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL;")
+                    .get_result::<JournalMode>(&mut conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?
+                    .journal_mode;
                 conn.run_pending_migrations(MIGRATIONS)
                     .map_err(StoreError::Migration)?;
 
-                Ok(pool)
-            })
+                Ok((pool, journal_mode))
+            },
+        )
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+
+        // Reader connections only pay off under WAL. Without it a reader holds a
+        // lock the writer then collides with, so concurrency would trade one
+        // queue for a worse failure; fall back to the single queue instead.
+        let wal = journal_mode.eq_ignore_ascii_case("wal");
+        if read_pool_size > 0 && !wal {
+            log::warn!(
+                "sqlite-storage: read_pool_size={read_pool_size} ignored, journal_mode is \
+                 '{journal_mode}' and concurrent readers need WAL"
+            );
+        }
+        let reads = if read_pool_size > 0 && wal {
+            let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
+            let pool = tokio::task::spawn_blocking(
+                move || -> std::result::Result<SqlitePool, StoreError> {
+                    Pool::builder()
+                        .max_size(read_pool_size)
+                        .test_on_check_out(false)
+                        .thread_pool(shared_r2d2_thread_pool())
+                        .connection_customizer(Box::new(read_options))
+                        .build(manager)
+                        .map_err(|e| StoreError::Connection(Box::new(e)))
+                },
+            )
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))??;
+            Some(ReadPool {
+                pool,
+                semaphore: Arc::new(tokio::sync::Semaphore::new(read_pool_size as usize)),
+            })
+        } else {
+            None
+        };
 
         let database_path = parse_database_path(database_url)?;
 
         Ok(Self {
             pool,
             db_semaphore: Arc::new(tokio::sync::Semaphore::new(pool_size as usize)),
-            // Bounded by the reader connections, so the number of blocking
-            // threads parked on `pool.get()` stays bounded too.
-            read_semaphore: (read_pool_size > 0)
-                .then(|| Arc::new(tokio::sync::Semaphore::new(read_pool_size as usize))),
+            reads,
             database_path,
             device_id,
         })
@@ -4013,6 +4083,7 @@ mod tests {
             connection_init: Some(Arc::new(|_conn: &mut SqliteConnection| {
                 Err("wrong key".into())
             })),
+            query_only: false,
         };
 
         use diesel::r2d2::CustomizeConnection;

@@ -18,7 +18,7 @@ use crate::sqlite_store::{SqlitePool, SqliteStore};
 pub struct SharedSqlite {
     pool: SqlitePool,
     semaphore: Arc<tokio::sync::Semaphore>,
-    read_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    reads: Option<crate::sqlite_store::ReadPool>,
 }
 
 impl SharedSqlite {
@@ -35,7 +35,7 @@ impl SharedSqlite {
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_with(Arc::clone(&self.semaphore), f).await
+        Self::run_on(self.pool.clone(), Arc::clone(&self.semaphore), f).await
     }
 
     /// Run a **read-only** `f` without queueing behind the write permit.
@@ -67,15 +67,18 @@ impl SharedSqlite {
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let semaphore = self
-            .read_semaphore
-            .clone()
-            .unwrap_or_else(|| Arc::clone(&self.semaphore));
-        self.run_with(semaphore, move |conn| read_snapshot(conn, f))
-            .await
+        let (pool, semaphore) = match &self.reads {
+            Some(reads) => (reads.pool.clone(), Arc::clone(&reads.semaphore)),
+            None => (self.pool.clone(), Arc::clone(&self.semaphore)),
+        };
+        Self::run_on(pool, semaphore, move |conn| read_snapshot(conn, f)).await
     }
 
-    async fn run_with<F, T>(&self, semaphore: Arc<tokio::sync::Semaphore>, f: F) -> Result<T>
+    async fn run_on<F, T>(
+        pool: SqlitePool,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        f: F,
+    ) -> Result<T>
     where
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
         T: Send + 'static,
@@ -84,7 +87,6 @@ impl SharedSqlite {
             .acquire_owned()
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))?;
-        let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut conn = pool
@@ -132,7 +134,7 @@ impl SqliteStore {
         SharedSqlite {
             pool: self.pool.clone(),
             semaphore: self.db_semaphore.clone(),
-            read_semaphore: self.read_semaphore.clone(),
+            reads: self.reads.clone(),
         }
     }
 }
@@ -203,6 +205,44 @@ mod tests {
         assert_eq!(rows[0].v, "b");
     }
 
+    /// A file-backed store, since reader connections need real WAL and an
+    /// in-memory database has none to switch to. Removed on drop.
+    struct TempDb(std::path::PathBuf);
+
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            use portable_atomic::AtomicU64;
+            use std::sync::atomic::Ordering;
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("wa_shared_{tag}_{}_{id}.db", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        fn url(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// A reader parks until released, but never forever: a blocking task cannot
+    /// be aborted, and a test that panics while one is parked would hang the
+    /// runtime on shutdown instead of reporting the failure.
+    fn park_until_released(rx: &std::sync::mpsc::Receiver<()>) {
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(20));
+    }
+
     /// With reader connections configured, a slow read must not hold up another
     /// read. Before the split there was one permit for everything, so a long
     /// query stalled every other read on the session for its whole duration.
@@ -210,10 +250,10 @@ mod tests {
     async fn reads_run_concurrently_when_reader_connections_are_configured() {
         use crate::sqlite_store::SqliteStoreConfig;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let db = TempDb::new("read_concurrency");
         let store = SqliteStore::with_config(
-            &unique_db_name("read_concurrency"),
+            &db.url(),
             SqliteStoreConfig {
                 read_pool_size: 4,
                 ..Default::default()
@@ -221,51 +261,62 @@ mod tests {
         )
         .await
         .expect("store with reader connections");
+        assert!(store.reads.is_some(), "a file-backed store reaches WAL");
         let shared = store.shared();
 
-        // Each reader parks until all four have arrived. With a single shared
-        // permit this deadlocks until the test times out; with reader permits
-        // they overlap and the barrier releases.
-        let barrier = Arc::new(std::sync::Barrier::new(4));
-        let observed = Arc::new(AtomicUsize::new(0));
+        // Every reader announces itself and then parks. With a single shared
+        // permit only the first would ever announce, so the collect below is
+        // what actually proves they overlap.
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let mut readers = Vec::new();
         for _ in 0..4 {
             let shared = shared.clone();
-            let barrier = Arc::clone(&barrier);
-            let observed = Arc::clone(&observed);
+            let ready_tx = ready_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
             readers.push(tokio::spawn(async move {
                 shared
                     .read(move |conn| {
                         diesel::sql_query("SELECT 1")
                             .execute(conn)
                             .map_err(db_err)?;
-                        observed.fetch_add(1, Ordering::SeqCst);
-                        // Blocking wait: these are on spawn_blocking threads.
-                        barrier.wait();
+                        let _ = ready_tx.send(());
+                        // Each reader holds its own receiver turn; the guard is
+                        // only contended while parked, which is the point.
+                        park_until_released(&release_rx.lock().expect("release rx"));
                         Ok(())
                     })
                     .await
             }));
         }
-        for reader in readers {
-            tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        drop(ready_tx);
+
+        // All four must be inside `read` at once.
+        for _ in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx.recv())
                 .await
                 .expect("readers must overlap, not serialize")
-                .expect("join")
-                .expect("read");
+                .expect("reader alive");
         }
-        assert_eq!(observed.load(Ordering::SeqCst), 4);
+        for _ in 0..4 {
+            let _ = release_tx.send(());
+        }
+        for reader in readers {
+            reader.await.expect("join").expect("read");
+        }
     }
 
-    /// A write keeps its own connection, so readers saturating their permits
-    /// can never leave the writer waiting on the pool.
+    /// A write keeps its own pool, so readers saturating theirs can never leave
+    /// the writer waiting for a connection.
     #[tokio::test]
     async fn a_write_proceeds_while_every_reader_permit_is_held() {
         use crate::sqlite_store::SqliteStoreConfig;
         use std::sync::Arc;
 
+        let db = TempDb::new("write_not_starved");
         let store = SqliteStore::with_config(
-            &unique_db_name("write_not_starved"),
+            &db.url(),
             SqliteStoreConfig {
                 read_pool_size: 2,
                 ..Default::default()
@@ -284,43 +335,119 @@ mod tests {
             .await
             .expect("create");
 
-        // Both reader permits held for the duration.
-        let release = Arc::new(std::sync::Barrier::new(3));
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let mut readers = Vec::new();
         for _ in 0..2 {
             let shared = shared.clone();
-            let release = Arc::clone(&release);
+            let ready_tx = ready_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
             readers.push(tokio::spawn(async move {
                 shared
                     .read(move |conn| {
                         diesel::sql_query("SELECT 1")
                             .execute(conn)
                             .map_err(db_err)?;
-                        release.wait();
+                        let _ = ready_tx.send(());
+                        park_until_released(&release_rx.lock().expect("release rx"));
                         Ok(())
                     })
                     .await
             }));
         }
+        drop(ready_tx);
 
-        let writer = shared.clone();
+        // Only meaningful once both readers actually hold their permits and
+        // connections — otherwise the writer could simply win the race.
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx.recv())
+                .await
+                .expect("readers must check out")
+                .expect("reader alive");
+        }
+
         let wrote = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            writer.run(|conn| {
+            shared.run(|conn| {
                 diesel::sql_query("INSERT INTO probe (k) VALUES (1)")
                     .execute(conn)
                     .map_err(db_err)?;
                 Ok(())
             }),
         )
-        .await
-        .expect("the writer must not queue behind readers");
-        wrote.expect("insert");
-
-        release.wait();
+        .await;
+        // Release before asserting: a parked blocking task cannot be aborted,
+        // so panicking first would hang the runtime instead of failing.
+        for _ in 0..2 {
+            let _ = release_tx.send(());
+        }
+        wrote
+            .expect("the writer must not queue behind readers")
+            .expect("insert");
         for reader in readers {
             reader.await.expect("join").expect("read");
         }
+    }
+
+    /// Reader connections are `query_only`, so a write sent down the read path
+    /// fails loudly instead of silently escaping the write serialization.
+    #[tokio::test]
+    async fn a_write_through_the_read_path_is_refused() {
+        use crate::sqlite_store::SqliteStoreConfig;
+
+        let db = TempDb::new("read_only");
+        let store = SqliteStore::with_config(
+            &db.url(),
+            SqliteStoreConfig {
+                read_pool_size: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("store with reader connections");
+        let shared = store.shared();
+
+        let result = shared
+            .read(|conn| {
+                diesel::sql_query("CREATE TABLE nope (k INTEGER)")
+                    .execute(conn)
+                    .map_err(db_err)?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(StoreError::Database(_))));
+    }
+
+    /// An in-memory database never reaches WAL, so reader connections would buy
+    /// contention instead of concurrency. The store declines them and keeps the
+    /// single queue rather than pretending.
+    #[tokio::test]
+    async fn reader_connections_are_declined_without_wal() {
+        use crate::sqlite_store::SqliteStoreConfig;
+
+        let store = SqliteStore::with_config(
+            &unique_db_name("no_wal"),
+            SqliteStoreConfig {
+                read_pool_size: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("in-memory store still opens");
+        assert!(store.reads.is_none(), "no WAL, no reader pool");
+
+        // And reads still work, on the write queue.
+        store
+            .shared()
+            .read(|conn| {
+                diesel::sql_query("SELECT 1")
+                    .execute(conn)
+                    .map_err(db_err)?;
+                Ok(())
+            })
+            .await
+            .expect("reads fall back to the write permit");
     }
 
     /// Left at its default, `read` is the write path — same queue, same
