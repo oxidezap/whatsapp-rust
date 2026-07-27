@@ -827,9 +827,7 @@ pub fn generate_reporting_token_from_encoded(
     }
     // Only the presence of content is needed here; the bytes go straight to
     // the HMAC further down without ever being concatenated.
-    if collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS).is_none() {
-        return None;
-    }
+    collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS)?;
 
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
         if secret.len() != MESSAGE_SECRET_SIZE {
@@ -918,35 +916,45 @@ mod tests {
         let key = [0x5au8; REPORTING_TOKEN_KEY_SIZE];
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("flat text field", {
-                let mut m = wa::Message::default();
-                m.conversation = Some("hello reporting".to_string());
+                let m = wa::Message {
+                    conversation: Some("hello reporting".to_string()),
+                    ..Default::default()
+                };
                 waproto::codec::message_to_vec(&m)
             }),
             ("nested field", {
-                let mut m = wa::Message::default();
-                m.extended_text_message =
-                    buffa::MessageField::some(wa::message::ExtendedTextMessage {
-                        text: Some("nested body".to_string()),
-                        ..Default::default()
-                    });
+                let m = wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("nested body".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                };
                 waproto::codec::message_to_vec(&m)
             }),
             // Two whitelisted fields, so the pieces have an order to get wrong.
             // With a single piece the concatenation is trivially the same
             // whatever order it is fed in, and this test would prove nothing.
             ("two fields, so order matters", {
-                let mut m = wa::Message::default();
-                m.conversation = Some("first by field number".to_string());
-                m.extended_text_message =
-                    buffa::MessageField::some(wa::message::ExtendedTextMessage {
-                        text: Some("sixth by field number".to_string()),
-                        ..Default::default()
-                    });
+                let m = wa::Message {
+                    conversation: Some("first by field number".to_string()),
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("sixth by field number".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                };
                 waproto::codec::message_to_vec(&m)
             }),
             ("multibyte payload", {
-                let mut m = wa::Message::default();
-                m.conversation = Some("olá 🌍 ünïcode".repeat(4));
+                let m = wa::Message {
+                    conversation: Some("olá 🌍 ünïcode".repeat(4)),
+                    ..Default::default()
+                };
                 waproto::codec::message_to_vec(&m)
             }),
         ];
