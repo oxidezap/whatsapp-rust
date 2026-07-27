@@ -319,6 +319,13 @@ mod tests {
             record.key_pair()?.private_key.serialize(),
             key_pair.private_key.serialize()
         );
+        // Decoding normalized the field, so re-serializing heals the stored row
+        // instead of writing the tagged key back. This is the only path a store
+        // that round-trips through the record API ever takes.
+        let mut expected = Vec::new();
+        encode_pre_key_record_to(3, &key_pair, &mut expected);
+        assert_eq!(record.serialize()?, expected);
+
         // The bridge accepts it too, and writing it back out normalizes to raw.
         let normalized = prekey_record_to_structure(&prekey_structure_to_record(legacy_prekey)?)?;
         assert_eq!(
@@ -344,18 +351,17 @@ mod tests {
             signed.key_pair()?.private_key.serialize(),
             key_pair.private_key.serialize()
         );
-        assert_eq!(
-            signed_prekey_structure_to_record(legacy_signed)?
-                .serialize()?
-                .len(),
-            // One byte shorter than the legacy input: the tag is gone.
+        let expected_signed =
             waproto::codec::signed_pre_key_record_to_vec(&new_signed_pre_key_record(
                 4,
                 &key_pair,
                 [0u8; 64],
                 chrono::DateTime::from_timestamp(0, 0).expect("epoch is in range"),
-            ))
-            .len()
+            ));
+        assert_eq!(signed.serialize()?, expected_signed);
+        assert_eq!(
+            signed_prekey_structure_to_record(legacy_signed)?.serialize()?,
+            expected_signed
         );
         Ok(())
     }

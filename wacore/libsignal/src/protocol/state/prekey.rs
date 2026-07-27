@@ -36,8 +36,9 @@ impl fmt::Display for PreKeyId {
 /// [`PublicKey::from_stored_public_key_bytes`], because up to 0.6.0 this
 /// constructor wrote it and a downstream store that persisted
 /// [`serialize`](Self::serialize) still holds records in that shape. Such a
-/// record reads correctly and is normalized to the raw form the next time it is
-/// written.
+/// record reads correctly, and [`deserialize`](Self::deserialize) rewrites the
+/// field to the raw form, so re-serializing heals the stored row rather than
+/// carrying the old encoding forward.
 #[derive(Debug, Clone)]
 pub struct PreKeyRecord {
     pre_key: PreKeyRecordStructure,
@@ -57,10 +58,10 @@ impl PreKeyRecord {
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        Ok(Self {
-            pre_key: waproto::codec::pre_key_record_decode(data)
-                .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
-        })
+        let mut pre_key = waproto::codec::pre_key_record_decode(data)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        super::normalize_stored_public_key(&mut pre_key.public_key);
+        Ok(Self { pre_key })
     }
 
     pub fn id(&self) -> Result<PreKeyId> {

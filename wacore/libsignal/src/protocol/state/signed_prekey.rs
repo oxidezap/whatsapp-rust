@@ -88,10 +88,10 @@ pub trait GenericSignedPreKey {
     where
         Self: Sized,
     {
-        Ok(Self::from_storage(
-            waproto::codec::signed_pre_key_record_decode(data)
-                .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
-        ))
+        let mut storage = waproto::codec::signed_pre_key_record_decode(data)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        super::normalize_stored_public_key(&mut storage.public_key);
+        Ok(Self::from_storage(storage))
     }
 
     fn id(&self) -> Result<Self::Id> {
