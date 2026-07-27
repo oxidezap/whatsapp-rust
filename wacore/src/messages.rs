@@ -37,10 +37,23 @@ pub trait DsmDestination {
 /// A blanket `impl<T: Deref<Target = str>>` would cover them in one line but
 /// collides with the `&Jid` implementation below: coherence cannot rule out
 /// `Jid` gaining that `Deref`, so the two overlap as far as the compiler is
-/// concerned. Hence the list.
+/// concerned. Hence the list, and the mutable form of each: `&mut String`
+/// coerced to `&str` just as `&String` did.
 macro_rules! dsm_destination_via_str {
     ($($ty:ty),+ $(,)?) => {$(
         impl DsmDestination for &$ty {
+            #[inline]
+            fn encoded_len(&self) -> usize {
+                str::len(self)
+            }
+
+            #[inline]
+            fn write_into(&self, out: &mut Vec<u8>) {
+                out.extend_from_slice(str::as_bytes(self));
+            }
+        }
+
+        impl DsmDestination for &mut $ty {
             #[inline]
             fn encoded_len(&self) -> usize {
                 str::len(self)
@@ -55,24 +68,13 @@ macro_rules! dsm_destination_via_str {
 }
 
 dsm_destination_via_str!(
+    str,
     String,
     Box<str>,
     std::rc::Rc<str>,
     std::sync::Arc<str>,
     std::borrow::Cow<'_, str>,
 );
-
-impl DsmDestination for &str {
-    #[inline]
-    fn encoded_len(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn write_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(self.as_bytes());
-    }
-}
 
 impl DsmDestination for &wacore_binary::jid::Jid {
     #[inline]
@@ -225,7 +227,7 @@ impl MessageUtils {
     pub fn encode_dm_plaintexts(
         message: &wa::Message,
         extra_context: Option<&wa::MessageContextInfo>,
-        destination_jid: impl DsmDestination + Copy,
+        destination_jid: impl DsmDestination,
     ) -> DmPlaintexts {
         if message.message_context_info.is_set() {
             let mut owned = message.clone();
@@ -2030,16 +2032,36 @@ mod device_sent_tests {
         let content = waproto::codec::message_to_vec(&message);
         let dest = "5511987650001:5@s.whatsapp.net";
 
-        let owned = dest.to_string();
+        let mut owned = dest.to_string();
         let boxed: Box<str> = dest.into();
         let rc: Rc<str> = dest.into();
         let arc: Arc<str> = dest.into();
         let cow: Cow<'_, str> = Cow::Borrowed(dest);
+        let mut owned_mut = dest.to_string();
 
         let reference = MessageUtils::dm_plaintexts_from_encoded(&content, None, dest);
         let prefix = reference.own_devices.len() - 16;
 
+        // A mutable destination coerced to `&str` before this trait existed, so
+        // both forms have to keep working; `&mut str` is reached through the
+        // owned string it borrows from.
+        let by_mut_string =
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &mut owned_mut);
+        let by_mut_str =
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &mut *owned.as_mut_str());
+
+        // Through `encode_dm_plaintexts` specifically: it is the entry point
+        // that carried a `Copy` bound, which no `&mut` destination satisfies.
+        let by_mut_through_encode =
+            MessageUtils::encode_dm_plaintexts(&message, None, &mut owned_mut);
+
         for (name, produced) in [
+            ("&mut String", by_mut_string),
+            ("&mut str", by_mut_str),
+            (
+                "&mut String via encode_dm_plaintexts",
+                by_mut_through_encode,
+            ),
             (
                 "String",
                 MessageUtils::dm_plaintexts_from_encoded(&content, None, &owned),
