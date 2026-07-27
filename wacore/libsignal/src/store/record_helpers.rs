@@ -6,6 +6,10 @@
 //! directions and the structure a record produces is byte-identical to the one
 //! it was built from. What they still do is validate: a structure carrying
 //! malformed key bytes is rejected here rather than at some later use.
+//!
+//! Reads go through `PublicKey::from_stored_public_key_bytes`, so a store
+//! holding the 33-byte form written by pre-0.7 record constructors still loads,
+//! and converting it back out normalizes it.
 
 use crate::protocol::{
     KeyPair, PreKeyRecord, PrivateKey, PublicKey, SignalProtocolError, SignedPreKeyRecord,
@@ -74,7 +78,7 @@ pub fn prekey_structure_to_record(
     structure: wa::PreKeyRecordStructure,
 ) -> Result<PreKeyRecord, SignalProtocolError> {
     let id = structure.id.unwrap_or(0).into();
-    let public_key = PublicKey::from_djb_public_key_bytes(
+    let public_key = PublicKey::from_stored_public_key_bytes(
         structure
             .public_key
             .as_ref()
@@ -107,7 +111,7 @@ pub fn signed_prekey_structure_to_record(
     structure: wa::SignedPreKeyRecordStructure,
 ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
     let id = structure.id.unwrap_or(0).into();
-    let public_key = PublicKey::from_djb_public_key_bytes(
+    let public_key = PublicKey::from_stored_public_key_bytes(
         structure
             .public_key
             .as_ref()
@@ -285,6 +289,74 @@ mod tests {
             &signature,
         );
         assert_eq!(rebuilt.serialize()?, stored);
+        Ok(())
+    }
+
+    /// Records written by the pre-0.7 constructors carry the 33-byte tagged key.
+    /// They predate this crate settling on one encoding, are reachable by any
+    /// downstream store that persisted `record.serialize()`, and must keep
+    /// loading — through the record getters and through the bridges alike.
+    #[test]
+    fn legacy_tagged_records_still_load_and_normalize() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::protocol::PublicKey;
+        use buffa::Message as _;
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        let tagged = key_pair.public_key.serialize().to_vec();
+        assert_eq!(tagged.len(), PublicKey::SERIALIZED_KEY_LEN);
+
+        let legacy_prekey = wa::PreKeyRecordStructure {
+            id: Some(3),
+            public_key: Some(tagged.clone()),
+            private_key: Some(key_pair.private_key.serialize().to_vec()),
+        };
+        let record = PreKeyRecord::deserialize(&legacy_prekey.clone().encode_to_vec())?;
+        assert_eq!(
+            record.public_key()?.public_key_bytes(),
+            key_pair.public_key.public_key_bytes()
+        );
+        assert_eq!(
+            record.key_pair()?.private_key.serialize(),
+            key_pair.private_key.serialize()
+        );
+        // The bridge accepts it too, and writing it back out normalizes to raw.
+        let normalized = prekey_record_to_structure(&prekey_structure_to_record(legacy_prekey)?)?;
+        assert_eq!(
+            normalized.public_key.as_deref(),
+            Some(key_pair.public_key.public_key_bytes())
+        );
+
+        let legacy_signed = wa::SignedPreKeyRecordStructure {
+            id: Some(4),
+            public_key: Some(tagged),
+            private_key: Some(key_pair.private_key.serialize().to_vec()),
+            signature: Some(vec![0u8; 64]),
+            timestamp: Some(0),
+        };
+        let signed = <SignedPreKeyRecord as GenericSignedPreKey>::deserialize(
+            &waproto::codec::signed_pre_key_record_to_vec(&legacy_signed),
+        )?;
+        assert_eq!(
+            signed.public_key()?.public_key_bytes(),
+            key_pair.public_key.public_key_bytes()
+        );
+        assert_eq!(
+            signed.key_pair()?.private_key.serialize(),
+            key_pair.private_key.serialize()
+        );
+        assert_eq!(
+            signed_prekey_structure_to_record(legacy_signed)?
+                .serialize()?
+                .len(),
+            // One byte shorter than the legacy input: the tag is gone.
+            waproto::codec::signed_pre_key_record_to_vec(&new_signed_pre_key_record(
+                4,
+                &key_pair,
+                [0u8; 64],
+                chrono::DateTime::from_timestamp(0, 0).expect("epoch is in range"),
+            ))
+            .len()
+        );
         Ok(())
     }
 

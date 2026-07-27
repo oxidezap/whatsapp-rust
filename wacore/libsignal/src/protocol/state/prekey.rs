@@ -28,10 +28,16 @@ impl fmt::Display for PreKeyId {
 /// Signal's: `uploadPreKeys` puts 32 bytes in each `<key><value>`, and WA Web's
 /// `validateLocalKeyBundle` sizes its digest buffer at `keys.length * 32` and
 /// copies each stored `keyPair.pubKey` into it — a 33-byte field would overrun
-/// it. Every writer in the tree (the store helpers, this constructor) and every
-/// reader (the getters below, the `record_helpers` bridges) agrees on the raw
-/// form, so a record is byte-identical whether it was just built or decoded
-/// back out of the store.
+/// it. Every writer in the tree (the store helpers, this constructor) agrees on
+/// the raw form, so a record is byte-identical whether it was just built or
+/// decoded back out of the store.
+///
+/// Readers additionally accept the 33-byte form via
+/// [`PublicKey::from_stored_public_key_bytes`], because up to 0.6.0 this
+/// constructor wrote it and a downstream store that persisted
+/// [`serialize`](Self::serialize) still holds records in that shape. Such a
+/// record reads correctly and is normalized to the raw form the next time it is
+/// written.
 #[derive(Debug, Clone)]
 pub struct PreKeyRecord {
     pre_key: PreKeyRecordStructure,
@@ -70,7 +76,7 @@ impl PreKeyRecord {
     }
 
     pub fn public_key(&self) -> Result<PublicKey> {
-        Ok(PublicKey::from_djb_public_key_bytes(
+        Ok(PublicKey::from_stored_public_key_bytes(
             self.pre_key
                 .public_key
                 .as_ref()

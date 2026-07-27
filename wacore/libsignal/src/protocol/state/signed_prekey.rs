@@ -172,7 +172,7 @@ impl KeySerde for PublicKey {
     }
 
     fn from_record_bytes<T: AsRef<[u8]>>(bytes: T) -> Result<Self> {
-        Ok(Self::from_djb_public_key_bytes(bytes.as_ref())?)
+        Ok(Self::from_stored_public_key_bytes(bytes.as_ref())?)
     }
 }
 
