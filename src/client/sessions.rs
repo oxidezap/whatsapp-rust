@@ -430,28 +430,29 @@ impl Client {
             .await
         {
             Ok(bundles) => bundles,
-            // A `406` means the server no longer knows these devices, so our
-            // cached list named someone who is gone. Two things follow.
+            // A `406` means the server no longer knows these devices, so the
+            // cached list that named them is stale. Refresh it before giving up,
+            // or the retry resolves the same absent device and collects the same
+            // 406 forever. It cannot affect the send in flight, whose device set
+            // is already resolved.
             //
-            // The send continues: the loop below already treats a device the
-            // server returned no bundle for as missing and carries on, and the
-            // fan-out then skips whatever has no session. Failing the whole DM
-            // because one cached device went away would deny the message to
-            // every device that is still there, which is neither what the group
-            // path does nor what WA Web does (`eagerlyEstablishE2EESession`
-            // logs `ignore prekey err, device unregistered` and continues).
-            //
-            // And the cache is refreshed, or the next send resolves the same
-            // absent device and collects the same 406. It cannot affect this
-            // send, whose device set is already resolved.
+            // The error still propagates, and deliberately so. The fetch is one
+            // IQ over a batch of up to `SESSION_CHECK_BATCH_SIZE` devices, and a
+            // 406 answers for the whole batch without naming which device it is
+            // about. Continuing would mean treating every device in that batch
+            // as having no prekeys, so a registered device that merely lacked a
+            // local session would be skipped by the fan-out and the message
+            // would go out to fewer devices than intended, with nothing to say
+            // so. A failed send is visible and now retries against a refreshed
+            // list; a silently short fan-out is neither.
             Err(e) if is_device_unregistered(&e) => {
                 log::debug!(
                     "Prekey fetch returned 406 for {} device(s); \
-                     treating them as unavailable and refreshing their device lists",
+                     refreshing their device lists before failing the send",
                     jids.len()
                 );
                 self.invalidate_device_caches_for(jids).await;
-                std::collections::HashMap::new()
+                return Err(e);
             }
             Err(e) => return Err(e),
         };
