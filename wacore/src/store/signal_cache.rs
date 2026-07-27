@@ -692,6 +692,35 @@ impl SignalStoreCache {
 
     // === Sessions (object cache — serialize only during flush) ===
 
+    /// Decode a stored session, quarantining a blob this build cannot read.
+    ///
+    /// Deserialization is a pure function of the bytes, so a row that fails
+    /// once fails identically forever — and it fails on *every* path that must
+    /// load the address, including the decrypt of the peer's next pre-key
+    /// message and the retry repair, which are precisely the paths that would
+    /// otherwise replace it. Propagating the error therefore strands the
+    /// address until an operator deletes the row by hand. Reporting it as
+    /// absent instead lets the ordinary no-session recovery fetch a pre-key
+    /// bundle and overwrite it. Nothing is lost: a record we cannot decode can
+    /// derive no key material, so it cannot repeat a counter either.
+    fn decode_stored_session(
+        address: &ProtocolAddress,
+        bytes: &[u8],
+        incarnation: &StoreIncarnation,
+    ) -> Option<SessionRecord> {
+        match SessionRecord::deserialize_for_store(bytes, incarnation) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                log::error!(
+                    "discarding unreadable session row for {}: {error} — recovering with a fresh session",
+                    crate::types::jid::observe_protocol_address(address)
+                );
+                crate::telemetry::session_record_quarantined();
+                None
+            }
+        }
+    }
+
     /// Takes ownership of the cached session, leaving a `CheckedOut` marker.
     /// Callers must return the record with [`put_session`](Self::put_session) after use.
     pub async fn get_session(
@@ -738,9 +767,11 @@ impl SignalStoreCache {
             CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
             CachedSessionCheckout::Missing(checkout) => checkout,
         };
-        match backend_result {
-            Some(bytes) => {
-                let record = SessionRecord::deserialize_for_store(&bytes, &state.incarnation)?;
+        match backend_result
+            .as_deref()
+            .and_then(|bytes| Self::decode_stored_session(address, bytes, &state.incarnation))
+        {
+            Some(record) => {
                 state.cache.insert(
                     Arc::from(key),
                     SessionEntry::CheckedOut {
@@ -808,12 +839,12 @@ impl SignalStoreCache {
                 SessionEntry::Absent | SessionEntry::CheckedOut { .. } => Ok(None),
             };
         }
-        match backend_result {
-            Some(bytes) => {
-                let record = Arc::new(SessionRecord::deserialize_for_store(
-                    &bytes,
-                    &state.incarnation,
-                )?);
+        match backend_result
+            .as_deref()
+            .and_then(|bytes| Self::decode_stored_session(address, bytes, &state.incarnation))
+        {
+            Some(record) => {
+                let record = Arc::new(record);
                 state
                     .cache
                     .insert(Arc::from(key), SessionEntry::Present(record.clone()));
@@ -3044,6 +3075,61 @@ mod lease_reload_tests {
         assert_eq!(
             session_chain_index(&recovered),
             crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    /// A row whose lease is stranded above its chain (issue #1146: written by
+    /// a build that let a DH ratchet retire the chain without rebasing the
+    /// ceiling) cannot be fast-forwarded on recovery. It must not become a
+    /// hard error on every load: that strands the address, because the very
+    /// paths that would replace the session — the peer's next pre-key message
+    /// and the retry repair — have to load it first. Report it absent so the
+    /// no-session recovery replaces it.
+    #[tokio::test]
+    async fn an_unreadable_session_row_is_reported_absent_so_recovery_can_replace_it() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = ProtocolAddress::new("15550001009", 1.into());
+
+        let mut stranded = leased_session();
+        stranded.reserve_sender_chain_counters(
+            crate::libsignal::protocol::consts::MAX_RESERVATION_FAST_FORWARD,
+        );
+        assert_eq!(session_chain_index(&stranded), 0);
+        cache.put_session(&address, stranded).await;
+        cache.flush(&backend).await.expect("flush");
+
+        // A live reload never fast-forwards, so the row still looks fine here.
+        cache.clear_after_flush().await;
+        assert!(
+            cache
+                .get_session(&address, &backend)
+                .await
+                .expect("live reload")
+                .is_some()
+        );
+
+        // A restart (or lossy reset) is where recovery has to fast-forward.
+        let restarted = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        assert!(
+            restarted
+                .get_session(&address, &backend)
+                .await
+                .expect("an unreadable row must not fail the load")
+                .is_none()
+        );
+        assert!(
+            !restarted
+                .has_session(&address, &backend)
+                .await
+                .expect("has_session"),
+            "the quarantined address must look session-less so ensure_e2e_sessions rebuilds it"
         );
     }
 
