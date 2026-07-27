@@ -1883,16 +1883,31 @@ mod tests {
         let (spk_tx, _spk_rx) = async_channel::unbounded();
         let (ev_tx, ev_rx) = async_channel::unbounded();
 
+        let mut eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let allocation = match eng.poll_output() {
+            Output::Transmit(packet) => packet,
+            other => panic!("expected initial allocation, got {other:?}"),
+        };
+        let transaction_id: [u8; 12] = stun::stun_transaction_id(&allocation)
+            .expect("allocation transaction id")
+            .try_into()
+            .expect("STUN transaction IDs are 12 bytes");
+
         // Raw Allocate-error STUN packet carrying ERROR-CODE 486 (class 4, number 86).
         let err_attr = [0x00, 0x09, 0x00, 0x04, 0x00, 0x00, 4u8, 86u8];
-        let err =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_ERROR, &[3u8; 12], &err_attr, None, false);
+        let err = stun::encode_stun_request(
+            stun::MSG_ALLOCATE_ERROR,
+            &transaction_id,
+            &err_attr,
+            None,
+            false,
+        );
         relay_tx
             .try_send(RelayTransportEvent::PacketReceived(Bytes::from(err)))
             .unwrap();
         // Note: the relay stream is intentionally NOT closed; the engine termination must end the loop.
 
-        let eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
         futures::executor::block_on(run_call(
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
@@ -1965,9 +1980,13 @@ mod tests {
             peer.allocates += 1;
             if peer.allocates == 1 {
                 // The relay accepts the allocate, then the mirrored peer streams two MLow tone frames.
+                let transaction_id: [u8; 12] = stun::stun_transaction_id(&data)
+                    .expect("allocate transaction id")
+                    .try_into()
+                    .expect("STUN transaction IDs are 12 bytes");
                 let ok = stun::encode_stun_request(
                     stun::MSG_ALLOCATE_SUCCESS,
-                    &[1u8; 12],
+                    &transaction_id,
                     &[],
                     None,
                     false,

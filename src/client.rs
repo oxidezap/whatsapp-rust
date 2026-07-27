@@ -306,7 +306,7 @@ pub struct MemoryReport {
     /// Admission snapshots retained while a call-link join ACK is in flight.
     #[cfg(feature = "voip-runtime")]
     pub pending_call_link_updates: CollectionStats,
-    /// Active/ringing call registry entries, including authoritative group snapshots and queues.
+    /// Active/ringing calls and bounded pre-offer group controls, including their snapshots/queues.
     #[cfg(feature = "voip-runtime")]
     pub active_calls: CollectionStats,
     #[cfg(feature = "plugins")]

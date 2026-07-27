@@ -790,9 +790,14 @@ mod udp_relay_e2e {
                         {
                             // A bare allocate-success header (magic cookie set, no MI/FP) is all the
                             // engine's is_allocate_or_binding_success requires.
+                            let transaction_id: [u8; 12] =
+                                wacore::voip::stun::stun_transaction_id(&buf[..n])
+                                    .expect("allocate transaction id")
+                                    .try_into()
+                                    .expect("STUN transaction IDs are 12 bytes");
                             let ok = wacore::voip::stun::encode_stun_request(
                                 wacore::voip::stun::MSG_ALLOCATE_SUCCESS,
-                                &[1u8; 12],
+                                &transaction_id,
                                 &[],
                                 None,
                                 false,

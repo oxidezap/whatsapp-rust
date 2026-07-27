@@ -748,6 +748,7 @@ pub struct CallEngine {
     relay_addr: SocketAddr,
     integrity_key: Vec<u8>,
     allocate: Bytes,
+    allocate_transaction_id: Option<[u8; 12]>,
     tx_ids: Box<dyn TxIdSource>,
     keepalive_deadline: Millis,
     /// Next RTCP Sender-Report tick (NEVER until the relay allocates).
@@ -897,6 +898,7 @@ impl CallEngine {
             relay_addr,
             integrity_key: config.integrity_key,
             allocate: Bytes::new(),
+            allocate_transaction_id: None,
             tx_ids,
             keepalive_deadline: 0,
             rtcp_deadline: NEVER,
@@ -1218,6 +1220,7 @@ impl CallEngine {
             },
         ));
         self.allocate = allocate.clone();
+        self.allocate_transaction_id = Some(transaction_id);
         if self.started {
             if let Some(relay_addr) = reconnect {
                 self.outbox.push_back(Output::ReconnectRelay(relay_addr));
@@ -1471,6 +1474,7 @@ impl CallEngine {
                 &self.call_id,
                 &self.self_participant_id,
             ));
+            self.allocate_transaction_id = Some(tx);
         }
         self.outbox
             .push_back(Output::Transmit(self.allocate.clone()));
@@ -1840,8 +1844,13 @@ impl CallEngine {
             );
             self.outbox.push_back(Output::Transmit(Bytes::from(resp)));
         }
-        // The relay acknowledged our allocate; surface it once and stop the allocate timer.
-        if !self.allocated && stun::is_allocate_or_binding_success(pkt) {
+        let matches_allocation = self
+            .allocate_transaction_id
+            .as_ref()
+            .is_some_and(|expected| stun::stun_transaction_id(pkt) == Some(expected.as_slice()));
+        // The relay acknowledged the current allocate; stale replies from a superseded credential
+        // generation must not cancel its timeout or terminate the call.
+        if !self.allocated && matches_allocation && stun::is_allocate_or_binding_success(pkt) {
             self.allocated = true;
             self.allocate_deadline = NEVER;
             #[cfg(feature = "tracing")]
@@ -1857,6 +1866,7 @@ impl CallEngine {
         // A complete allocate-error (a parsed ERROR-CODE) terminates the call; STUN-typed garbage
         // whose error code cannot be parsed is ignored rather than hanging up.
         if !self.allocated
+            && matches_allocation
             && self.allocate_deadline != NEVER
             && stun::is_allocate_error(pkt)
             && let Some(code) = stun::parse_stun_error_code(pkt)
@@ -2434,6 +2444,32 @@ mod encoded_tests {
         }
     }
 
+    fn allocation_success(engine: &CallEngine) -> Vec<u8> {
+        let transaction_id = engine
+            .allocate_transaction_id
+            .expect("current allocation transaction");
+        stun::encode_stun_request(
+            stun::MSG_ALLOCATE_SUCCESS,
+            &transaction_id,
+            &[],
+            None,
+            false,
+        )
+    }
+
+    fn allocation_error(transaction_id: &[u8; 12], code: u16) -> Vec<u8> {
+        let class = (code / 100) as u8;
+        let number = (code % 100) as u8;
+        let error = [0x00, 0x09, 0x00, 0x04, 0x00, 0x00, class, number];
+        stun::encode_stun_request(
+            stun::MSG_ALLOCATE_ERROR,
+            transaction_id,
+            &error,
+            None,
+            false,
+        )
+    }
+
     fn group_update() -> GroupCallUpdate {
         let creator = Jid::new("15550001111", Server::Lid);
         let peer = Jid::new("15550002222", Server::Lid);
@@ -2906,8 +2942,7 @@ mod encoded_tests {
         let mut engine = group_engine();
         engine.start(0, 1_700_000_000_000);
         let _ = drain(&mut engine);
-        let allocate_success =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate_success = allocation_success(&engine);
         engine.handle_input(1, Input::RelayPacket(&allocate_success));
         assert!(
             drain(&mut engine)
@@ -2957,8 +2992,7 @@ mod encoded_tests {
         let mut engine = group_engine();
         engine.start(0, 1_700_000_000_000);
         let _ = drain(&mut engine);
-        let allocate_success =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate_success = allocation_success(&engine);
         engine.handle_input(1, Input::RelayPacket(&allocate_success));
         let _ = drain(&mut engine);
         assert!(engine.is_allocated());
@@ -2999,6 +3033,71 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
             "the replacement allocation must retain the timeout safety net"
+        );
+    }
+
+    #[test]
+    fn group_relay_refresh_ignores_stale_allocation_responses() {
+        let mut engine = group_engine();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let stale_transaction = engine
+            .allocate_transaction_id
+            .expect("initial allocation transaction");
+        let initial_success = allocation_success(&engine);
+        engine.handle_input(1, Input::RelayPacket(&initial_success));
+        let _ = drain(&mut engine);
+        assert!(engine.is_allocated());
+
+        let mut update = group_update();
+        update.transaction_id = 8;
+        let mut relay = group_relay();
+        relay.transaction_id = Some(8);
+        relay.key = b"rotated-relay-key".to_vec();
+        relay.tokens[0] = vec![0x48];
+        relay.auth_tokens[0] = vec![0x58];
+        update.relay = Some(relay);
+        engine
+            .apply_group_update(2_000, &update)
+            .expect("credential refresh");
+        let current_transaction = engine
+            .allocate_transaction_id
+            .expect("replacement allocation transaction");
+        assert_ne!(stale_transaction, current_transaction);
+        let _ = drain(&mut engine);
+
+        let stale_success = stun::encode_stun_request(
+            stun::MSG_ALLOCATE_SUCCESS,
+            &stale_transaction,
+            &[],
+            None,
+            false,
+        );
+        engine.handle_input(2_001, Input::RelayPacket(&stale_success));
+        engine.handle_input(
+            2_002,
+            Input::RelayPacket(&allocation_error(&stale_transaction, 486)),
+        );
+        assert!(
+            !engine.is_allocated() && !engine.is_terminated(),
+            "a previous allocation generation cannot complete or fail the refreshed one"
+        );
+        assert!(
+            drain(&mut engine).iter().all(|output| !matches!(
+                output,
+                Output::Event(CallEvent::RelayAllocated | CallEvent::RelayAllocateFailed(_))
+            )),
+            "stale allocation responses must be silent"
+        );
+
+        let current_success = allocation_success(&engine);
+        engine.handle_input(2_003, Input::RelayPacket(&current_success));
+        assert!(engine.is_allocated());
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocated))),
+            "only the current allocation transaction may complete the refresh"
         );
     }
 
@@ -3532,12 +3631,34 @@ mod tests {
     }
 
     /// Build an Allocate-error STUN packet carrying an ERROR-CODE attr for `code` (class*100+num).
-    fn allocate_error(code: u16) -> Vec<u8> {
+    fn allocate_success(eng: &CallEngine) -> Vec<u8> {
+        let transaction_id = eng
+            .allocate_transaction_id
+            .expect("current allocation transaction");
+        stun::encode_stun_request(
+            stun::MSG_ALLOCATE_SUCCESS,
+            &transaction_id,
+            &[],
+            None,
+            false,
+        )
+    }
+
+    fn allocate_error(eng: &CallEngine, code: u16) -> Vec<u8> {
         let class = (code / 100) as u8;
         let number = (code % 100) as u8;
         // Raw ERROR-CODE (0x0009) TLV: type, len=4, value (2 reserved bytes, class, number).
         let err_attr = [0x00, 0x09, 0x00, 0x04, 0x00, 0x00, class, number];
-        stun::encode_stun_request(stun::MSG_ALLOCATE_ERROR, &[3u8; 12], &err_attr, None, false)
+        let transaction_id = eng
+            .allocate_transaction_id
+            .expect("current allocation transaction");
+        stun::encode_stun_request(
+            stun::MSG_ALLOCATE_ERROR,
+            &transaction_id,
+            &err_attr,
+            None,
+            false,
+        )
     }
 
     fn count_transmits(outs: &[Output]) -> usize {
@@ -3734,8 +3855,7 @@ mod tests {
         let mut eng = engine(true);
         eng.start(0, 0);
         let _ = drain(&mut eng);
-        let ok =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let ok = allocate_success(&eng);
         eng.handle_input(1, Input::RelayPacket(&ok));
         let (outs, _) = drain(&mut eng);
         assert_eq!(
@@ -4050,8 +4170,7 @@ mod tests {
         let (mut eng, epoch) = group_engine(false);
         eng.start(0, 1_700_000_000_000);
         let _ = drain(&mut eng);
-        let allocate =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate = allocate_success(&eng);
         eng.handle_input(1, Input::RelayPacket(&allocate));
         let _ = drain(&mut eng);
 
@@ -4339,8 +4458,7 @@ mod tests {
                 if classify_relay_packet(packet) == RelayPacketKind::Rtcp
         )));
 
-        let allocate =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate = allocate_success(&eng);
         let allocated_at = RTCP_MS + 1;
         eng.handle_input(allocated_at, Input::RelayPacket(&allocate));
         let (outs, _) = drain(&mut eng);
@@ -4416,8 +4534,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 1_700_000_000_000);
         let _ = drain(&mut eng);
-        let allocate =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate = allocate_success(&eng);
         eng.handle_input(1, Input::RelayPacket(&allocate));
         let _ = drain(&mut eng);
 
@@ -4480,8 +4597,7 @@ mod tests {
         let mut eng = engine(true);
         eng.start(100, UNIX_START_MS);
         let _ = drain(&mut eng);
-        let allocate =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate = allocate_success(&eng);
         eng.handle_input(100, Input::RelayPacket(&allocate));
         let _ = drain(&mut eng);
         eng.handle_input(100 + RTCP_MS, Input::Timeout);
@@ -4719,8 +4835,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 1_700_000_000_000);
         let _ = drain(&mut eng);
-        let allocate =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let allocate = allocate_success(&eng);
         eng.handle_input(0, Input::RelayPacket(&allocate));
         let _ = drain(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_au(200)));
@@ -5327,7 +5442,7 @@ mod tests {
         let mut eng = engine(true);
         eng.start(0, 0);
         let _ = drain(&mut eng);
-        let err = allocate_error(486); // class 4, number 86
+        let err = allocate_error(&eng, 486); // class 4, number 86
         eng.handle_input(1, Input::RelayPacket(&err));
         let (outs, _) = drain(&mut eng);
         assert_eq!(
@@ -5383,7 +5498,7 @@ mod tests {
         // Dropping the ERROR-CODE TLV leaves the body-length header still claiming the full body, so
         // the packet is rejected as INCOMPLETE (fails is_complete_stun), not as a parseable error. A
         // garbage relay packet must not be treated as a terminal failure that hangs up the call.
-        let full = allocate_error(486);
+        let full = allocate_error(&eng, 486);
         let garbage = &full[..full.len() - 8]; // drop the ERROR-CODE TLV, keep the message type
         eng.handle_input(1, Input::RelayPacket(garbage));
         let (outs, _) = drain(&mut eng);
@@ -5404,7 +5519,8 @@ mod tests {
         let mut eng = engine(true);
         eng.start(0, 0);
         let _ = drain(&mut eng);
-        eng.handle_input(1, Input::RelayPacket(&allocate_error(486)));
+        let error = allocate_error(&eng, 486);
+        eng.handle_input(1, Input::RelayPacket(&error));
         let _ = drain(&mut eng);
         assert!(eng.is_terminated(), "an allocate-error is terminal");
         assert_eq!(eng.poll_timeout(), None, "no timer once terminated");
@@ -5480,8 +5596,7 @@ mod tests {
         let mut eng = engine(true);
         eng.start(0, 0);
         let _ = drain(&mut eng);
-        let ok =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        let ok = allocate_success(&eng);
         eng.handle_input(1, Input::RelayPacket(&ok));
         let (outs, _) = drain(&mut eng);
         assert_eq!(

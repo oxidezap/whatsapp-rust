@@ -234,9 +234,19 @@ impl Client {
         });
         drop(state);
         if let Some(update) = staged {
-            self.call_registry.apply_group_update(update);
+            self.apply_pending_call_link_update(update, generation);
         }
         generation
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn apply_pending_call_link_update(
+        &self,
+        update: GroupCallUpdate,
+        generation: u64,
+    ) -> wacore::voip::GroupStateApply {
+        self.call_registry
+            .apply_group_update_if_current(update, generation)
     }
 
     /// Lock the striped answer-transition lane for `call_id`. Incoming answer registration and
@@ -2314,6 +2324,54 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn buffered_call_link_admission_cannot_cross_generations() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "BUFFERED-ADMISSION-GENERATION";
+        let mut participant = GroupCallParticipant::new(
+            creator.clone(),
+            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        );
+        participant.state = Some("connected".to_string());
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(8)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .build();
+
+        let registry = client.call_registry();
+        let stale = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let replacement = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator,
+        ));
+        assert_ne!(stale, replacement);
+        assert_eq!(
+            client.apply_pending_call_link_update(update, stale),
+            wacore::voip::GroupStateApply::UnknownCall
+        );
+        assert!(
+            registry
+                .group_state_if_current(call_id, replacement)
+                .is_none(),
+            "a buffered snapshot from the joining generation must not mutate its replacement"
+        );
+        registry.remove_if_current(call_id, replacement);
     }
 
     #[cfg(feature = "voip-runtime")]
