@@ -3562,6 +3562,10 @@ async fn a_multi_frame_burst_stays_one_ordered_write() {
 
     assert_eq!(results.len(), 4);
     assert!(results.iter().all(|result| result.is_ok()));
+    assert!(
+        frames.is_empty(),
+        "the burst must drain its input, which the workers rely on to refill it"
+    );
     assert_eq!(
         transport.write_count(),
         1,
