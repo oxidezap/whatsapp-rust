@@ -1036,7 +1036,7 @@ impl CallEngine {
         };
         group.mixer.retain(group.registry.active_participant_ids());
         self.group = Some(group);
-        self.commit_group_allocate(now, &config.initial_update, relay_refresh)?;
+        self.commit_group_allocate(now, &config.initial_update, relay_refresh, true)?;
         self.sync_group_epoch()?;
         Ok(())
     }
@@ -1077,6 +1077,12 @@ impl CallEngine {
         // Validate fallible relay material before advancing the roster transaction. Otherwise a
         // malformed relay could partially commit the roster and make a corrected resend look stale.
         let relay_refresh = prepare_group_relay_refresh(update)?;
+        let previous_pids = self
+            .group
+            .as_ref()
+            .ok_or(GroupMediaError::Pipeline)?
+            .registry
+            .active_pids();
         let result = self
             .group
             .as_mut()
@@ -1116,11 +1122,12 @@ impl CallEngine {
             group
                 .decoders
                 .retain(|participant, _| active.contains(participant));
+            let subscriptions_changed = group.registry.active_pids() != previous_pids;
             if update.media == "audio" {
                 self.disable_video();
                 self.purge_queued_video_outputs();
             }
-            self.commit_group_allocate(now, update, relay_refresh)?;
+            self.commit_group_allocate(now, update, relay_refresh, subscriptions_changed)?;
             self.sync_group_epoch()?;
         }
         Ok(result)
@@ -1189,20 +1196,34 @@ impl CallEngine {
         now: Millis,
         update: &GroupCallUpdate,
         relay_refresh: Option<GroupRelayRefresh>,
+        subscriptions_changed: bool,
     ) -> Result<(), GroupMediaError> {
         let mut reconnect = None;
+        let relay_material_changed = relay_refresh.as_ref().is_some_and(|refresh| {
+            refresh.relay_addr != self.relay_addr
+                || refresh.relay_token != self.relay_token
+                || refresh.endpoint_xor != self.endpoint_xor
+                || refresh.integrity_key != self.integrity_key
+        });
+        if !relay_material_changed && !subscriptions_changed {
+            return Ok(());
+        }
         if let Some(refresh) = relay_refresh {
             if refresh.relay_addr != self.relay_addr {
                 self.relay_addr = refresh.relay_addr;
                 reconnect = Some(refresh.relay_addr);
             }
-            self.allocated = false;
-            if self.started {
-                self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
-            }
             self.relay_token = refresh.relay_token;
             self.endpoint_xor = refresh.endpoint_xor;
             self.integrity_key = refresh.integrity_key;
+        }
+        if relay_material_changed {
+            // New credentials invalidate the allocation even on the same endpoint; address-only
+            // checks would leave the fresh token/key without an acknowledgement or timeout.
+            self.allocated = false;
+        }
+        if self.started && !self.allocated {
+            self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
         }
         let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
         let pids = remote_group_pids(update, &self.self_participant_id);
@@ -3033,6 +3054,92 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
             "the replacement allocation must retain the timeout safety net"
+        );
+    }
+
+    #[test]
+    fn unchanged_relay_and_subscriptions_keep_the_healthy_allocation() {
+        let mut engine = group_engine();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let success = allocation_success(&engine);
+        engine.handle_input(1, Input::RelayPacket(&success));
+        let _ = drain(&mut engine);
+        assert!(engine.is_allocated());
+
+        let mut update = group_update();
+        update.transaction_id = 8;
+        let mut relay = group_relay();
+        relay.transaction_id = Some(8);
+        update.relay = Some(relay);
+        engine
+            .apply_group_update(2_000, &update)
+            .expect("idempotent relay snapshot");
+        assert!(engine.is_allocated());
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Transmit(_))),
+            "unchanged relay material and PID subscriptions require no replacement allocate"
+        );
+
+        engine.handle_input(2_000 + ALLOCATE_TIMEOUT_MS, Input::Timeout);
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
+            "an idempotent roster refresh cannot arm a fatal allocation timeout"
+        );
+    }
+
+    #[test]
+    fn roster_only_pid_change_refreshes_subscriptions_without_rearming_allocation() {
+        let mut engine = group_engine();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let success = allocation_success(&engine);
+        engine.handle_input(1, Input::RelayPacket(&success));
+        let _ = drain(&mut engine);
+        assert!(engine.is_allocated());
+
+        let mut update = group_update();
+        update.transaction_id = 8;
+        let peer = Jid::new("15550003333", Server::Lid);
+        update.participants.push(GroupCallParticipant {
+            jid: peer.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: peer,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        let mut relay = group_relay();
+        relay.transaction_id = Some(8);
+        update.relay = Some(relay);
+        engine
+            .apply_group_update(2_000, &update)
+            .expect("roster-only PID refresh");
+
+        assert!(
+            engine.is_allocated(),
+            "subscription changes must preserve the healthy relay allocation"
+        );
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Transmit(_))),
+            "new remote PIDs still require an updated group Allocate"
+        );
+        engine.handle_input(2_000 + ALLOCATE_TIMEOUT_MS, Input::Timeout);
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut)))
         );
     }
 

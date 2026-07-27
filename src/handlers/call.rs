@@ -806,14 +806,14 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
     let sender = routed_call_sender(call);
     match &call.action {
         CallAction::GroupUpdate { update } => {
-            if !registry.group_sender_authorized_if_current(
+            if !registry.group_creator_authorized_if_current(
                 &update.call_id,
                 generation,
                 &update.call_creator,
                 &sender,
             ) {
                 warn!(
-                    "call: rejected group snapshot from unauthorized sender for {}",
+                    "call: rejected group snapshot from non-creator sender for {}",
                     update.call_id
                 );
                 return false;
@@ -1351,7 +1351,7 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
-    async fn routed_group_snapshots_reject_sender_outside_authoritative_roster() {
+    async fn routed_group_snapshots_reject_non_creator_roster_writes_and_outsiders() {
         use wacore::types::group_call::{
             CallLinkMedia, GroupCallParticipant, GroupCallUpdate, WaitingRoom,
         };
@@ -1365,6 +1365,7 @@ mod tests {
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
         ));
+        let participant = Jid::new("222222222222222", Server::Lid).with_device(2);
         let update = GroupCallUpdate::builder()
             .call_id("GROUP-CALL".to_string())
             .call_creator(creator.clone())
@@ -1374,10 +1375,16 @@ mod tests {
             .joinable(true)
             .av_upgradable(true)
             .rekey_requested(false)
-            .participants(vec![GroupCallParticipant::new(
-                creator.clone(),
-                vec![GroupCallDevice::new(creator.clone().with_device(1))],
-            )])
+            .participants(vec![
+                GroupCallParticipant::new(
+                    creator.clone(),
+                    vec![GroupCallDevice::new(creator.clone().with_device(1))],
+                ),
+                GroupCallParticipant::new(
+                    participant.to_non_ad(),
+                    vec![GroupCallDevice::new(participant.clone())],
+                ),
+            ])
             .build();
         assert_eq!(
             registry.apply_group_update(update),
@@ -1404,7 +1411,7 @@ mod tests {
         let outsider = Jid::new("999999999999999", Server::Lid).with_device(9);
         let group_update = NodeBuilder::new("call")
             .attr("from", Jid::new("GROUP-CALL", Server::Call))
-            .attr("participant", outsider.clone())
+            .attr("participant", participant)
             .attr("id", "UNAUTHORIZED-GROUP-SNAPSHOT")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("group_update")
@@ -1441,7 +1448,7 @@ mod tests {
                 .group_state("GROUP-CALL")
                 .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
             Some(1),
-            "an outsider must not replace the authoritative roster"
+            "a connected participant must not replace the creator-authoritative roster"
         );
 
         let waiting_room = NodeBuilder::new("call")

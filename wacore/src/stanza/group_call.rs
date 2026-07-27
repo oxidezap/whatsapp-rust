@@ -310,6 +310,16 @@ fn parse_group_snapshot(
     let mut update = parse_group_info(group_info, call_id, call_creator)?;
     match envelope {
         GroupSnapshotEnvelope::Offer => {
+            if let Some(group_jid) = attrs.optional_jid("group-jid") {
+                if update
+                    .group_jid
+                    .as_ref()
+                    .is_some_and(|nested| nested != &group_jid)
+                {
+                    bail!("group_info group-jid does not match offer");
+                }
+                update.group_jid = Some(group_jid);
+            }
             let mut group_attrs = group_info.attrs();
             if let Some(group_call_id) = group_attrs.optional_string("call-id")
                 && group_call_id != update.call_id
@@ -1308,7 +1318,28 @@ mod tests {
                 .attrs
                 .get("group-jid")
                 .and_then(|value| value.to_jid()),
-            Some(group)
+            Some(group.clone())
+        );
+        let mut parseable_action = action.clone();
+        let wacore_binary::NodeContent::Nodes(parseable_children) =
+            parseable_action.content.as_mut().expect("offer children")
+        else {
+            panic!("offer content must contain nodes");
+        };
+        let parseable_group_info = parseable_children
+            .iter_mut()
+            .find(|child| child.tag == "group_info")
+            .expect("group_info");
+        parseable_group_info.attrs.insert("transaction-id", "1");
+        parseable_group_info.attrs.insert("connected-limit", "32");
+        parseable_group_info.attrs.insert("media", "video");
+        assert_eq!(
+            parse_group_invite_snapshot(&parseable_action.as_node_ref())
+                .expect("offer parses")
+                .expect("group snapshot")
+                .group_jid,
+            Some(group),
+            "the parser must preserve the group identity emitted on the offer envelope"
         );
         let action_ref = action.as_node_ref();
         let group_info = action_ref

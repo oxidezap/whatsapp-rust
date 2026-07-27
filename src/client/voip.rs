@@ -512,8 +512,19 @@ impl Voip<'_> {
         let request_id = self.client.generate_request_id();
         let request = build_call_link_query(&token, media, &request_id)
             .map_err(|error| CallError::Response(error.to_string()))?;
-        execute_call_service_request(self.client, &request_id, request, parse_call_link_query_ack)
-            .await
+        let preview = execute_call_service_request(
+            self.client,
+            &request_id,
+            request,
+            parse_call_link_query_ack,
+        )
+        .await?;
+        if preview.token != token || preview.media != media {
+            return Err(CallError::Response(
+                "call-link preview changed the requested link identity".to_string(),
+            ));
+        }
+        Ok(preview)
     }
 
     /// Join a call link. The result explicitly reports whether this endpoint was admitted or placed
@@ -590,7 +601,9 @@ impl Voip<'_> {
             CallLinkRegistrationGuard::new(registry.clone(), &join.call_id, generation);
 
         if let Some(room) = join.waiting_room.clone() {
-            if registry.apply_waiting_room(room) != wacore::voip::GroupStateApply::Applied {
+            if registry.apply_waiting_room_if_current(room, generation)
+                != wacore::voip::GroupStateApply::Applied
+            {
                 return Err(CallError::Response(
                     "call-link waiting-room identity was rejected".to_string(),
                 ));
@@ -1993,6 +2006,52 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn call_link_preview_rejects_a_changed_token_or_media() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        for (response_token, response_media) in
+            [("OTHER-CALL-LINK", "video"), ("TEST-CALL-LINK", "audio")]
+        {
+            let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+            let preview_client = client.clone();
+            let preview = tokio::spawn(async move {
+                preview_client
+                    .voip()
+                    .preview_call_link("TEST-CALL-LINK", CallLinkMedia::Video)
+                    .await
+            });
+            let request = sent.await.expect("link_query request");
+            let request_id = request
+                .as_node_ref()
+                .attrs()
+                .optional_string("id")
+                .expect("request id")
+                .into_owned();
+            crate::test_utils::answer_iq(
+                &client,
+                &request_id,
+                &NodeBuilder::new("ack")
+                    .attr("class", "call")
+                    .attr("type", "link_query")
+                    .attr("id", request_id.as_str())
+                    .children([NodeBuilder::new("link_query")
+                        .attr("token", response_token)
+                        .attr("media", response_media)
+                        .attr("link_creator", creator.clone())
+                        .build()])
+                    .build(),
+            )
+            .await;
+            assert!(matches!(
+                preview.await.expect("preview task"),
+                Err(CallError::Response(message))
+                    if message == "call-link preview changed the requested link identity"
+            ));
+        }
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn approval_ack_cannot_commit_to_a_replacement_generation() {
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
         let call_id = "TEST-APPROVAL-GENERATION";
@@ -2370,6 +2429,48 @@ mod tests {
                 .group_state_if_current(call_id, replacement)
                 .is_none(),
             "a buffered snapshot from the joining generation must not mutate its replacement"
+        );
+        registry.remove_if_current(call_id, replacement);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_waiting_room_cannot_cross_generations() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "WAITING-ROOM-GENERATION";
+        let registry = client.call_registry();
+        let stale = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let replacement = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let room = wacore::types::group_call::WaitingRoom::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator)
+            .link_token("TEST-CALL-LINK".to_string())
+            .media(CallLinkMedia::Audio)
+            .enabled(true)
+            .is_admin(true)
+            .transaction_id(1)
+            .users(Vec::new())
+            .build();
+
+        assert_eq!(
+            registry.apply_waiting_room_if_current(room, stale),
+            wacore::voip::GroupStateApply::UnknownCall
+        );
+        assert!(
+            registry
+                .group_state_if_current(call_id, replacement)
+                .and_then(|state| state.waiting_room().cloned())
+                .is_none(),
+            "a stale join cannot grant waiting-room admin state to its replacement"
         );
         registry.remove_if_current(call_id, replacement);
     }

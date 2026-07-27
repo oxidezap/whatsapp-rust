@@ -939,6 +939,12 @@ async fn run_call_with_clock_and_wallclock(
                                 &mut awaiting_video_keyframe,
                                 &channels.events,
                             );
+                        } else if paired_epoch.is_some() {
+                            // A transition is indivisible: rejecting its roster also discards the
+                            // paired key, so surface both halves instead of hiding the lost epoch.
+                            let _ = channels.events.try_send(CallEvent::GroupControlRejected {
+                                control: engine::GroupControlKind::Epoch,
+                            });
                         }
                     }
                     Some(GroupControl::RawEpoch(epoch)) => {
@@ -1634,6 +1640,49 @@ mod tests {
             )),
             "the non-fatal engine error must be surfaced as a rejected update"
         );
+    }
+
+    #[test]
+    fn rejected_group_transition_surfaces_its_paired_epoch() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        let mut invalid = group_update(2, "203.0.113.7", 3478);
+        invalid.call_id = "WRONG-CALL".to_string();
+        group_tx
+            .try_send(GroupControl::Transition {
+                update: Box::new(invalid),
+                epoch: GroupRawEpoch::new(2, vec![2; 32]),
+            })
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            group_engine(),
+        ));
+
+        let rejected = std::iter::from_fn(|| ev_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                CallEvent::GroupControlRejected { control } => Some(control),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(rejected.contains(&engine::GroupControlKind::Update));
+        assert!(rejected.contains(&engine::GroupControlKind::Epoch));
     }
 
     // The driver wiring: start sends the allocate, an inbound binding request gets a binding-success

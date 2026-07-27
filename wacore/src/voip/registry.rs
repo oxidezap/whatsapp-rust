@@ -729,6 +729,25 @@ impl CallRegistry {
             .is_some()
     }
 
+    /// Whether the routed sender is the creator of this exact active group-call generation.
+    pub fn group_creator_authorized_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .is_some_and(|entry| {
+                entry.generation == generation
+                    && entry.session.call_creator == *call_creator
+                    && sender.to_non_ad() == call_creator.to_non_ad()
+            })
+    }
+
     /// Resolve an authenticated routed sender to the roster's stable participant JID.
     ///
     /// Bare PN aliases are accepted by signaling but must not become persistent control keys:
@@ -840,6 +859,9 @@ impl CallRegistry {
             if let Some(entry) = map.get_mut(&call_id) {
                 if entry.session.phase() != CallPhase::Ringing {
                     return Ok(None);
+                }
+                if entry.session.call_creator != session.call_creator {
+                    return Err(GroupStateApply::IdentityMismatch);
                 }
                 if let Some(update) = session.group.take() {
                     let _ = entry.group_mut().apply_update(update);
@@ -2133,6 +2155,37 @@ mod tests {
         assert!(
             !reg.take_ringing("GROUP-CALL"),
             "the duplicate must not mark an active call as ringing"
+        );
+    }
+
+    #[test]
+    fn ringing_group_offer_cannot_change_the_call_creator() {
+        let reg = CallRegistry::new();
+        let incoming = |creator: Jid| {
+            let mut session =
+                CallSession::new_incoming("GROUP-CALL", creator.clone(), creator.clone());
+            let mut update = group_update(1);
+            update.call_creator = creator;
+            session.group = Some(update);
+            session
+        };
+        let original_creator = Jid::new("111111111111111", Server::Lid);
+        let replacement_creator = Jid::new("222222222222222", Server::Lid);
+        let generation = reg
+            .insert_ringing_group_if_inactive(incoming(original_creator.clone()))
+            .expect("valid initial offer")
+            .expect("first offer registers");
+
+        assert_eq!(
+            reg.insert_ringing_group_if_inactive(incoming(replacement_creator)),
+            Err(GroupStateApply::IdentityMismatch)
+        );
+        assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
+        assert_eq!(
+            reg.snapshot("GROUP-CALL")
+                .map(|session| session.call_creator),
+            Some(original_creator),
+            "a conflicting redelivery must leave the original signaling/media identity intact"
         );
     }
 

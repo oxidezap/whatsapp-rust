@@ -21,7 +21,8 @@ use crate::voip::session::{
     MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
 };
 use crate::voip::ssrc::{
-    derive_video_participant_ssrc, derive_wasm_participant_ssrc, format_e2e_srtp_participant_id,
+    derive_video_participant_ssrc, derive_wasm_participant_ssrc, derive_wasm_relay_stream_ssrcs,
+    format_e2e_srtp_participant_id,
 };
 
 const MAX_BUFFERED_EPOCHS: usize = 8;
@@ -215,6 +216,17 @@ impl GroupMediaRegistry {
         ids
     }
 
+    pub(crate) fn active_pids(&self) -> Vec<u32> {
+        let mut pids = self
+            .receivers
+            .values()
+            .filter_map(|receiver| receiver.pid)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
     pub(crate) fn sender_report_stream(
         &self,
         participant_id: &str,
@@ -258,6 +270,9 @@ impl GroupMediaRegistry {
             return Ok(GroupRosterApply::Applied);
         }
 
+        // Route derivation is fallible protocol validation. Complete it before moving any existing
+        // receiver or advancing the roster transaction so a corrected resend remains admissible.
+        self.validate_active_route_keys(&active)?;
         let mut previous = std::mem::take(&mut self.receivers);
         let mut next = HashMap::with_capacity(active.len());
         for (participant, device) in active {
@@ -446,6 +461,29 @@ impl GroupMediaRegistry {
         self.install_epoch(transaction, epoch.as_slice())?;
         self.pending_epochs
             .retain(|pending_transaction, _| *pending_transaction > transaction);
+        Ok(())
+    }
+
+    fn validate_active_route_keys(
+        &self,
+        active: &[(&GroupCallParticipant, &GroupCallDevice)],
+    ) -> Result<(), GroupMediaError> {
+        let mut audio = HashSet::with_capacity(active.len());
+        let mut video = HashSet::with_capacity(active.len());
+        let mut app_data = HashSet::with_capacity(active.len());
+        let mut rtcp = HashSet::with_capacity(active.len() * RELAY_STREAM_SLOT_COUNT as usize);
+        for (_, device) in active {
+            let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
+            let routes = derive_wasm_relay_stream_ssrcs(&self.call_id, &participant_id);
+            if !audio.insert(routes[0]) || !video.insert(routes[3]) || !app_data.insert(routes[8]) {
+                return Err(GroupMediaError::InvalidSnapshot);
+            }
+            for route in routes {
+                if !rtcp.insert(route) {
+                    return Err(GroupMediaError::InvalidSnapshot);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -814,6 +852,37 @@ mod tests {
                 .unprotect_audio(&unknown.protect_audio(&payload))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn colliding_routes_do_not_advance_or_replace_the_roster() {
+        let mut registry = registry();
+        registry
+            .apply_group_update(&update(
+                1,
+                vec![device("100001", 1, 1), device("200002", 2, 2)],
+            ))
+            .expect("initial roster");
+        registry
+            .apply_raw_epoch(1, &[0x42; 32])
+            .expect("initial epoch");
+        let previous_participants = registry.active_participant_ids();
+
+        // These fictitious LIDs collide for CALL's slot-0 HKDF-derived SSRC.
+        let colliding = update(
+            2,
+            vec![
+                device("100001", 1, 1),
+                device("37774", 1, 2),
+                device("53838", 1, 3),
+            ],
+        );
+        assert_eq!(
+            registry.apply_group_update(&colliding),
+            Err(GroupMediaError::InvalidSnapshot)
+        );
+        assert_eq!(registry.roster_transaction(), Some(1));
+        assert_eq!(registry.active_participant_ids(), previous_participants);
     }
 
     #[test]
