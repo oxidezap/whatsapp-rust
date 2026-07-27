@@ -188,10 +188,7 @@ impl Client {
                                 self.stats.mark_recv_activity();
                                 let wire_bytes = data.len();
 
-                                // Feed data into the frame decoder. The payload is
-                                // adopted zero-copy when it is the sole reference
-                                // and no partial frame is pending (steady state).
-                                frame_decoder.feed_bytes(data);
+                                frame_decoder.feed(&data);
 
                                 // Process all complete frames.
                                 // Frame decryption must be sequential (noise protocol counter),

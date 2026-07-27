@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use log::trace;
 
 pub const FRAME_LENGTH_SIZE: usize = 3;
@@ -118,7 +118,32 @@ pub fn encode_frame(payload: &[u8], header: Option<&[u8]>) -> Result<Vec<u8>, an
     Ok(data)
 }
 
+/// Headroom claimed whenever the accumulation buffer runs out of room.
+///
+/// Every frame split out of a chunk keeps that whole chunk alive for as long as
+/// the frame lives, so the chunk size is also the memory floor of a retained
+/// inbound node (a chat lane queue, or an offline/history-sync backlog of ~1000
+/// stanzas). 1 KiB bounds such a backlog at ~1 MB; 8 KiB would cost ~8 MB to
+/// save a further ~0.16 allocations per frame, which is not the trade this
+/// receive path wants.
+const CHUNK_SIZE: usize = 1024;
+
+/// Capacity a drained accumulation buffer may keep before it is released.
+///
+/// `BytesMut::reserve` reclaims an oversized unique allocation instead of
+/// freeing it, so without this a single multi-megabyte history-sync frame would
+/// pin its buffer for the rest of the connection.
+const MAX_IDLE_CAPACITY: usize = 64 * 1024;
+
 /// A frame decoder that buffers incoming data and extracts complete frames.
+///
+/// Transport reads accumulate in one long-lived buffer and each frame is split
+/// out of it, the shape `tokio_util::codec::Decoder` uses. Two `bytes`
+/// properties make that cheaper than handing the buffer itself downstream per
+/// frame: the accumulation allocation amortizes over every frame that fits in a
+/// chunk, and a buffer that has been split is already reference-counted, so the
+/// `freeze()` further down the receive path is a pointer move rather than a
+/// fresh `Shared` allocation.
 pub struct FrameDecoder {
     buffer: BytesMut,
 }
@@ -126,31 +151,28 @@ pub struct FrameDecoder {
 impl FrameDecoder {
     pub fn new() -> Self {
         Self {
-            buffer: BytesMut::new(),
+            // `with_capacity`, not `new`: `bytes` remembers the initial capacity
+            // and uses it as the floor when it has to allocate a fresh buffer
+            // because a live frame still references the current one, which is
+            // the steady-state path here.
+            buffer: BytesMut::with_capacity(CHUNK_SIZE),
         }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
+        self.reserve_for(data.len());
         self.buffer.extend_from_slice(data);
     }
 
-    /// Feed an owned payload, adopting its allocation when possible.
+    /// Makes room for `incoming` more bytes.
     ///
-    /// In steady state each transport message starts on a frame boundary
-    /// (`buffer` is empty) and the payload has no other references, so
-    /// `try_into_mut` succeeds and the bytes are adopted wholesale — the one
-    /// remaining full copy of inbound traffic on the receive path is skipped.
-    /// A pending partial frame or a shared payload falls back to [`feed`].
-    ///
-    /// [`feed`]: Self::feed
-    pub fn feed_bytes(&mut self, data: Bytes) {
-        if self.buffer.is_empty() {
-            match data.try_into_mut() {
-                Ok(owned) => self.buffer = owned,
-                Err(shared) => self.buffer.extend_from_slice(&shared),
-            }
-        } else {
-            self.buffer.extend_from_slice(&data);
+    /// Growing only once the bytes genuinely do not fit uses up the tail of the
+    /// current chunk first. A read bigger than a chunk asks for exactly what it
+    /// needs, so a megabyte-sized history-sync frame is not rounded up to the
+    /// next growth step.
+    fn reserve_for(&mut self, incoming: usize) {
+        if self.buffer.capacity() - self.buffer.len() < incoming {
+            self.buffer.reserve(incoming.max(CHUNK_SIZE));
         }
     }
 
@@ -169,23 +191,23 @@ impl FrameDecoder {
             | ((self.buffer[1] as usize) << 8)
             | (self.buffer[2] as usize);
 
-        if self.buffer.len() >= FRAME_LENGTH_SIZE + frame_len {
-            self.buffer.advance(FRAME_LENGTH_SIZE);
-            let frame_data = if self.buffer.len() == frame_len {
-                // Steady-state transport reads contain one complete frame. Move
-                // its allocation out of the decoder instead of leaving an empty
-                // BytesMut view behind: downstream parsing can then preserve
-                // unique ownership all the way to in-place authenticated
-                // decryption of large payloads.
-                std::mem::take(&mut self.buffer)
-            } else {
-                self.buffer.split_to(frame_len)
-            };
-            trace!("<-- Decoded frame: {} bytes", frame_data.len());
-            Some(frame_data)
-        } else {
-            None
+        if self.buffer.len() < FRAME_LENGTH_SIZE + frame_len {
+            // The length prefix is known before the payload is, so an outsized
+            // frame sizes the buffer once here instead of growing geometrically
+            // across the transport reads that carry it.
+            self.reserve_for(FRAME_LENGTH_SIZE + frame_len - self.buffer.len());
+            return None;
         }
+
+        self.buffer.advance(FRAME_LENGTH_SIZE);
+        let frame_data = self.buffer.split_to(frame_len);
+        trace!("<-- Decoded frame: {} bytes", frame_data.len());
+
+        if self.buffer.is_empty() && self.buffer.capacity() > MAX_IDLE_CAPACITY {
+            self.buffer = BytesMut::with_capacity(CHUNK_SIZE);
+        }
+
+        Some(frame_data)
     }
 
     /// Returns the number of bytes currently buffered waiting for more data.
@@ -208,6 +230,7 @@ impl Default for FrameDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::NoiseCipher;
 
     #[test]
     fn test_encode_frame_no_header() {
@@ -269,74 +292,215 @@ mod tests {
         assert!(decoder.decode_frame().is_none());
     }
 
+    /// Deterministic stand-in for a payload of `len` bytes.
+    fn payload(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// The whole point of the accumulation buffer: consecutive frames are cut
+    /// out of one allocation rather than each carrying its own. Their addresses
+    /// prove it: frame 2 begins exactly one length prefix past the end of frame
+    /// 1, in the same chunk, even though they arrived in separate feeds.
     #[test]
-    fn test_feed_bytes_adopts_unique_payload_without_copy() {
-        let mut data = vec![0, 0, 5];
-        data.extend_from_slice(&[1, 2, 3, 4, 5]);
-        let payload_addr = data.as_ptr() as usize;
-
+    fn consecutive_frames_are_split_out_of_one_buffer() {
         let mut decoder = FrameDecoder::new();
-        decoder.feed_bytes(Bytes::from(data));
 
-        let frame = decoder.decode_frame().expect("complete frame");
-        assert_eq!(&frame[..], &[1, 2, 3, 4, 5]);
-        // Zero-copy: the frame points into the original allocation, offset by
-        // the 3-byte length prefix.
-        assert_eq!(frame.as_ptr() as usize, payload_addr + FRAME_LENGTH_SIZE);
-        assert!(
-            frame.freeze().is_unique(),
-            "a fully drained decoder must not retain an empty shared view"
+        decoder.feed(&encode_frame(&payload(40, 1), None).expect("encode"));
+        let first = decoder.decode_frame().expect("first frame");
+
+        decoder.feed(&encode_frame(&payload(40, 2), None).expect("encode"));
+        let second = decoder.decode_frame().expect("second frame");
+
+        assert_eq!(&first[..], &payload(40, 1)[..]);
+        assert_eq!(&second[..], &payload(40, 2)[..]);
+        assert_eq!(
+            second.as_ptr() as usize,
+            first.as_ptr() as usize + first.len() + FRAME_LENGTH_SIZE,
+            "the second frame must be cut from the chunk the first one left behind"
         );
     }
 
+    /// A buffer whose chunk has run out claims a whole new one rather than just
+    /// the bytes in hand, which is what amortizes the allocation over the frames
+    /// that follow. Every frame is kept alive so the exhausted chunk cannot be
+    /// reclaimed and the buffer is forced to grow.
     #[test]
-    fn test_feed_bytes_shared_payload_falls_back_to_copy() {
-        let mut data = vec![0, 0, 2];
-        data.extend_from_slice(&[0xAA, 0xBB]);
-        let shared = Bytes::from(data);
-        let keep_alive = shared.clone(); // refcount > 1 → try_into_mut fails
-
+    fn growing_the_buffer_claims_a_whole_chunk() {
+        let frame = encode_frame(&payload(60, 0x88), None).expect("encode");
         let mut decoder = FrameDecoder::new();
-        decoder.feed_bytes(shared);
+        let mut retained = Vec::new();
 
-        let frame = decoder.decode_frame().expect("complete frame");
-        assert_eq!(&frame[..], &[0xAA, 0xBB]);
-        assert_eq!(&keep_alive[3..], &[0xAA, 0xBB]);
+        while decoder.buffer.capacity() >= frame.len() {
+            decoder.feed(&frame);
+            retained.push(decoder.decode_frame().expect("frame"));
+        }
+
+        decoder.feed(&frame);
+        assert!(
+            decoder.buffer.capacity() >= CHUNK_SIZE,
+            "a grown buffer holds {} bytes, less than one chunk",
+            decoder.buffer.capacity()
+        );
+        assert_eq!(
+            &decoder.decode_frame().expect("frame after growth")[..],
+            &payload(60, 0x88)[..]
+        );
     }
 
+    /// A frame that outgrows a chunk still decodes byte for byte, whether it
+    /// arrives whole or spread over reads that each fit in a chunk.
     #[test]
-    fn test_feed_bytes_partial_frame_accumulates() {
+    fn frame_larger_than_a_chunk_round_trips() {
+        let expected = payload(CHUNK_SIZE * 3 + 7, 0x5A);
+        let encoded = encode_frame(&expected, None).expect("encode");
+
         let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let whole = decoder.decode_frame().expect("oversize frame in one feed");
+        assert_eq!(&whole[..], &expected[..]);
 
-        decoder.feed_bytes(Bytes::from(vec![0, 0, 4, 1, 2]));
+        let mut decoder = FrameDecoder::new();
+        let mut pieces = encoded.chunks(600);
+        decoder.feed(pieces.next().expect("at least one piece"));
         assert!(decoder.decode_frame().is_none());
-
-        // Buffer non-empty → append path; the frame completes across feeds.
-        decoder.feed_bytes(Bytes::from(vec![3, 4]));
-        let frame = decoder.decode_frame().expect("complete frame");
-        assert_eq!(&frame[..], &[1, 2, 3, 4]);
-
-        // Drained again → the next unique payload is adopted zero-copy.
-        let mut data = vec![0, 0, 1];
-        data.push(0xCC);
-        let payload_addr = data.as_ptr() as usize;
-        decoder.feed_bytes(Bytes::from(data));
-        let frame = decoder.decode_frame().expect("complete frame");
-        assert_eq!(frame.as_ptr() as usize, payload_addr + FRAME_LENGTH_SIZE);
+        assert!(
+            decoder.buffer.capacity() >= encoded.len(),
+            "the length prefix must size the buffer for the whole frame in one step"
+        );
+        for piece in pieces {
+            decoder.feed(piece);
+        }
+        let pieced = decoder.decode_frame().expect("oversize frame across feeds");
+        assert_eq!(&pieced[..], &expected[..]);
+        assert!(decoder.decode_frame().is_none());
     }
 
+    /// The chunk boundary itself: a frame whose payload exactly fills a chunk
+    /// leaves no room behind it, so the frame after it must still decode.
     #[test]
-    fn test_feed_bytes_multiple_frames_single_payload() {
-        let mut decoder = FrameDecoder::new();
-        decoder.feed_bytes(Bytes::from(vec![
-            0, 0, 2, 0xAA, 0xBB, 0, 0, 3, 0xCC, 0xDD, 0xEE,
-        ]));
+    fn frame_exactly_one_chunk_long_round_trips() {
+        let first = payload(CHUNK_SIZE, 0x11);
+        let second = payload(9, 0x22);
 
-        let frame1 = decoder.decode_frame().expect("first frame");
-        assert_eq!(&frame1[..], &[0xAA, 0xBB]);
-        let frame2 = decoder.decode_frame().expect("second frame");
-        assert_eq!(&frame2[..], &[0xCC, 0xDD, 0xEE]);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encode_frame(&first, None).expect("encode"));
+        assert_eq!(
+            &decoder.decode_frame().expect("chunk-sized frame")[..],
+            &first[..]
+        );
+
+        decoder.feed(&encode_frame(&second, None).expect("encode"));
+        assert_eq!(
+            &decoder.decode_frame().expect("following frame")[..],
+            &second[..]
+        );
+    }
+
+    /// The retention case: a decoded frame is held (a queued node) while later
+    /// frames keep arriving and reusing the buffer. Holding it must not let the
+    /// later traffic overwrite its bytes, and must not corrupt the later frames
+    /// either.
+    #[test]
+    fn a_retained_frame_is_not_disturbed_by_later_frames() {
+        let mut decoder = FrameDecoder::new();
+        let retained_payload = payload(64, 0x77);
+
+        decoder.feed(&encode_frame(&retained_payload, None).expect("encode"));
+        let retained = decoder.decode_frame().expect("retained frame");
+
+        let mut still_live = Vec::new();
+        for i in 0..200u16 {
+            let expected = payload(50 + (i as usize % 40), i as u8);
+            decoder.feed(&encode_frame(&expected, None).expect("encode"));
+            let frame = decoder.decode_frame().expect("later frame");
+            assert_eq!(&frame[..], &expected[..], "frame {i} decoded wrong");
+            // Keep a window of frames alive so the buffer keeps being split
+            // while several of its chunks are still referenced.
+            still_live.push(frame);
+            if still_live.len() > 16 {
+                still_live.remove(0);
+            }
+        }
+
+        assert_eq!(&retained[..], &retained_payload[..]);
+    }
+
+    /// A frame big enough to have grown the buffer must not leave that
+    /// allocation attached to the decoder for the rest of the connection.
+    #[test]
+    fn an_oversized_buffer_is_released_once_drained() {
+        let big = payload(200 * 1024, 0x33);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encode_frame(&big, None).expect("encode"));
+
+        let frame = decoder.decode_frame().expect("big frame");
+        assert_eq!(&frame[..], &big[..]);
+        // Dropping it makes the decoder the sole owner, which is the case where
+        // `reserve` would otherwise reclaim the oversized allocation forever.
+        drop(frame);
+
+        let small = payload(5, 0x44);
+        decoder.feed(&encode_frame(&small, None).expect("encode"));
+        assert_eq!(
+            &decoder.decode_frame().expect("small frame")[..],
+            &small[..]
+        );
+
+        assert!(
+            decoder.buffer.capacity() <= MAX_IDLE_CAPACITY,
+            "decoder still holds {} bytes after a large frame drained",
+            decoder.buffer.capacity()
+        );
+    }
+
+    /// Decoded frames go straight into in-place AEAD decryption, which writes
+    /// through the buffer it is handed. A frame that is a split-off view of a
+    /// shared chunk must therefore still round trip, and must not touch the
+    /// neighbouring frame that shares its allocation.
+    #[test]
+    fn a_split_frame_decrypts_in_place() {
+        let cipher = NoiseCipher::new(&[0x2A; 32]).expect("32-byte key");
+        let plaintext = payload(300, 0x66);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(
+            &encode_frame(
+                &cipher.encrypt_with_counter(0, &plaintext).expect("encrypt"),
+                None,
+            )
+            .expect("encode"),
+        );
+        let neighbour_payload = payload(70, 0x99);
+        decoder.feed(&encode_frame(&neighbour_payload, None).expect("encode"));
+
+        let mut frame = decoder.decode_frame().expect("encrypted frame");
+        let neighbour = decoder.decode_frame().expect("neighbouring frame");
+
+        cipher
+            .decrypt_in_place_with_counter(0, &mut frame)
+            .expect("the tag must verify over a split-off frame");
+        assert_eq!(&frame[..], &plaintext[..]);
+        assert_eq!(&neighbour[..], &neighbour_payload[..]);
+    }
+
+    /// A frame whose length prefix is corrupted upwards never completes, and the
+    /// decoder must keep waiting instead of handing out short or foreign bytes.
+    #[test]
+    fn a_frame_shorter_than_its_length_prefix_is_withheld() {
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&[0, 0, 8, 1, 2, 3]);
         assert!(decoder.decode_frame().is_none());
+        assert_eq!(decoder.buffered_len(), 6);
+
+        // Not even a following frame's bytes may be borrowed to complete it.
+        decoder.feed(&[4, 5]);
+        assert!(decoder.decode_frame().is_none());
+
+        decoder.feed(&[6, 7, 8]);
+        let frame = decoder.decode_frame().expect("now complete");
+        assert_eq!(&frame[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     /// The header-only form has to lay down exactly what `append_frame_into`
