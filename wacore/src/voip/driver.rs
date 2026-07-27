@@ -307,44 +307,19 @@ fn purge_unstarted_video(
     dropped
 }
 
-fn purge_queued_video(
+fn purge_queued(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
     awaiting_video_keyframe: &mut bool,
+    discard: impl Fn(&SendBatch) -> bool,
 ) -> DroppedMedia {
     let mut dropped = DroppedMedia::default();
     queue.retain(|batch| {
-        let discard = batch.kind == SendBatchKind::Video;
-        if discard {
+        let drop_batch = discard(batch);
+        if drop_batch {
             record_drop(&mut dropped, batch);
         }
-        !discard
-    });
-    if !pending_video.is_empty() {
-        dropped.video_access_units = dropped.video_access_units.saturating_add(1);
-        dropped.packets = dropped
-            .packets
-            .saturating_add(pending_video.len().try_into().unwrap_or(u32::MAX));
-        pending_video.clear();
-    }
-    if dropped.video_access_units != 0 {
-        *awaiting_video_keyframe = true;
-    }
-    dropped
-}
-
-fn purge_queued_encrypted_media(
-    queue: &mut VecDeque<SendBatch>,
-    pending_video: &mut Vec<Bytes>,
-    awaiting_video_keyframe: &mut bool,
-) -> DroppedMedia {
-    let mut dropped = DroppedMedia::default();
-    queue.retain(|batch| {
-        let discard = batch.kind != SendBatchKind::Control;
-        if discard {
-            record_drop(&mut dropped, batch);
-        }
-        !discard
+        !drop_batch
     });
     if !pending_video.is_empty() {
         dropped.video_access_units = dropped.video_access_units.saturating_add(1);
@@ -810,10 +785,11 @@ async fn run_call_with_clock_and_wallclock(
                             Ok(crate::voip::GroupRosterApply::Applied)
                                 if update.media == "audio" =>
                             {
-                                let dropped = purge_queued_video(
+                                let dropped = purge_queued(
                                     &mut send_queue,
                                     &mut pending_video,
                                     &mut awaiting_video_keyframe,
+                                    |batch| batch.kind == SendBatchKind::Video,
                                 );
                                 if dropped.packets != 0 {
                                     let _ = channels.events.try_send(
@@ -849,10 +825,11 @@ async fn run_call_with_clock_and_wallclock(
                     Some(GroupControl::RawEpoch(epoch)) => {
                         match eng.apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes()) {
                             Ok(crate::voip::GroupEpochApply::Installed) => {
-                                let dropped = purge_queued_encrypted_media(
+                                let dropped = purge_queued(
                                     &mut send_queue,
                                     &mut pending_video,
                                     &mut awaiting_video_keyframe,
+                                    |batch| batch.kind != SendBatchKind::Control,
                                 );
                                 if dropped.packets != 0 {
                                     let _ = channels.events.try_send(
@@ -1149,10 +1126,11 @@ mod tests {
         ]);
         let mut pending_video = vec![Bytes::from_static(b"fragment")];
         let mut awaiting_keyframe = false;
-        let dropped = purge_queued_video(
+        let dropped = purge_queued(
             &mut downgrade_queue,
             &mut pending_video,
             &mut awaiting_keyframe,
+            |batch| batch.kind == SendBatchKind::Video,
         );
         assert_eq!(dropped.video_access_units, 2);
         assert_eq!(dropped.packets, 3);
@@ -1166,10 +1144,11 @@ mod tests {
 
         downgrade_queue.push_back(batch(SendBatchKind::Video, 2, false));
         pending_video.push(Bytes::from_static(b"fragment"));
-        let dropped = purge_queued_encrypted_media(
+        let dropped = purge_queued(
             &mut downgrade_queue,
             &mut pending_video,
             &mut awaiting_keyframe,
+            |batch| batch.kind != SendBatchKind::Control,
         );
         assert_eq!(dropped.video_access_units, 2);
         assert_eq!(dropped.packets, 4);
