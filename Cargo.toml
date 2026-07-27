@@ -122,7 +122,7 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 uuid = { version = "1", default-features = false }
-zeroize = { version = "1.8", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
 # Internal workspace crates
 wacore = { path = "./wacore", default-features = false, version = "0.6.0" }

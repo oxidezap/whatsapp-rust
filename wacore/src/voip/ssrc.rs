@@ -75,6 +75,11 @@ mod tests {
 
     #[test]
     fn relay_stream_bundle_uses_the_protocol_slot_order() {
+        assert_eq!(
+            WASM_RELAY_STREAM_SLOT_WORDS,
+            crate::voip::stun::wasm_stream_slot_words(),
+            "the descriptor builder zips these positionally; they must not drift"
+        );
         let call_id = "CALL-ID-0001";
         let participant = "12345:0@lid";
         let bundle = derive_wasm_relay_stream_ssrcs(call_id, participant);

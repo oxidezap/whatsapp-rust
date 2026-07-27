@@ -6,6 +6,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub const GROUP_MIX_CHUNK_SAMPLES: usize = 160;
 /// Two 60 ms codec frames before a participant joins playout.
 pub const GROUP_MIX_PREFILL_SAMPLES: usize = 1_920;
+/// Bound partial-buffer priming to roughly 200 ms (20 mixer chunks at 10 ms each). A participant
+/// that speaks briefly and then enters DTX must not have that utterance retained until later speech.
+const GROUP_MIX_MAX_PRIME_CHUNKS: u32 = 20;
 /// Four 60 ms frames; overflow drops oldest samples to preserve real time.
 pub const GROUP_MIX_QUEUE_CAPACITY: usize = 3_840;
 /// Public sink frame size (60 ms at 16 kHz).
@@ -14,6 +17,7 @@ pub const GROUP_MIX_OUTPUT_SAMPLES: usize = 960;
 struct ParticipantQueue {
     samples: VecDeque<i16>,
     primed: bool,
+    priming_chunks: u32,
 }
 
 impl ParticipantQueue {
@@ -21,6 +25,7 @@ impl ParticipantQueue {
         Self {
             samples: VecDeque::with_capacity(GROUP_MIX_QUEUE_CAPACITY),
             primed: false,
+            priming_chunks: 0,
         }
     }
 }
@@ -74,6 +79,7 @@ impl ParticipantAudioMixer {
         }
         if queue.samples.len() >= GROUP_MIX_PREFILL_SAMPLES {
             queue.primed = true;
+            queue.priming_chunks = 0;
         }
         true
     }
@@ -81,10 +87,21 @@ impl ParticipantAudioMixer {
     /// Mix one 10 ms chunk. A single ready participant is bit-identical;
     /// simultaneous speakers sum with i16 saturation.
     pub fn mix_chunk(&mut self) -> Option<Vec<i16>> {
+        for queue in self.queues.values_mut().filter(|queue| !queue.primed) {
+            if queue.samples.is_empty() {
+                queue.priming_chunks = 0;
+                continue;
+            }
+            queue.priming_chunks = queue.priming_chunks.saturating_add(1);
+            if queue.priming_chunks >= GROUP_MIX_MAX_PRIME_CHUNKS {
+                queue.primed = true;
+                queue.priming_chunks = 0;
+            }
+        }
         let ready = self
             .queues
             .values()
-            .filter(|queue| queue.primed && queue.samples.len() >= GROUP_MIX_CHUNK_SAMPLES)
+            .filter(|queue| queue.primed && !queue.samples.is_empty())
             .count();
         if ready == 0 {
             return None;
@@ -94,13 +111,14 @@ impl ParticipantAudioMixer {
         for queue in self
             .queues
             .values_mut()
-            .filter(|queue| queue.primed && queue.samples.len() >= GROUP_MIX_CHUNK_SAMPLES)
+            .filter(|queue| queue.primed && !queue.samples.is_empty())
         {
             for sample in &mut mixed {
                 *sample += i32::from(queue.samples.pop_front().unwrap_or_default());
             }
-            if queue.samples.len() < GROUP_MIX_CHUNK_SAMPLES {
+            if queue.samples.is_empty() {
                 queue.primed = false;
+                queue.priming_chunks = 0;
             }
         }
         Some(
@@ -126,6 +144,11 @@ impl ParticipantAudioFramer {
     }
 
     pub fn push(&mut self, chunk: &[i16]) -> Option<Vec<i16>> {
+        debug_assert_eq!(
+            chunk.len(),
+            GROUP_MIX_CHUNK_SAMPLES,
+            "group mixer chunks must be exactly 10 ms"
+        );
         if chunk.len() != GROUP_MIX_CHUNK_SAMPLES {
             return None;
         }
@@ -154,6 +177,29 @@ mod tests {
             mixer.mix_chunk().unwrap(),
             vec![1234; GROUP_MIX_CHUNK_SAMPLES]
         );
+    }
+
+    #[test]
+    fn short_burst_flushes_after_bounded_priming() {
+        let mut mixer = ParticipantAudioMixer::new();
+        assert!(mixer.push("alice", &vec![1234; GROUP_MIX_OUTPUT_SAMPLES]));
+        for _ in 1..GROUP_MIX_MAX_PRIME_CHUNKS {
+            assert!(
+                mixer.mix_chunk().is_none(),
+                "partial speech stays buffered during the bounded jitter cushion"
+            );
+        }
+        assert_eq!(
+            mixer.mix_chunk().expect("short burst must eventually play"),
+            vec![1234; GROUP_MIX_CHUNK_SAMPLES]
+        );
+        for _ in 1..(GROUP_MIX_OUTPUT_SAMPLES / GROUP_MIX_CHUNK_SAMPLES) {
+            assert_eq!(
+                mixer.mix_chunk().expect("the admitted burst drains"),
+                vec![1234; GROUP_MIX_CHUNK_SAMPLES]
+            );
+        }
+        assert!(mixer.mix_chunk().is_none());
     }
 
     #[test]
@@ -216,5 +262,12 @@ mod tests {
             &frame[5 * GROUP_MIX_CHUNK_SAMPLES..],
             &[5; GROUP_MIX_CHUNK_SAMPLES]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "group mixer chunks must be exactly 10 ms")]
+    fn framer_rejects_wrong_sized_chunks_loudly_in_debug_builds() {
+        let mut framer = ParticipantAudioFramer::new();
+        let _ = framer.push(&[0; GROUP_MIX_CHUNK_SAMPLES - 1]);
     }
 }

@@ -439,7 +439,12 @@ impl Voip<'_> {
                 .await?
                 .commit(|epoch| {
                     registry
-                        .send_group_epoch(&join.call_id, update.transaction_id, epoch.to_vec())
+                        .send_group_epoch_if_current(
+                            &join.call_id,
+                            generation,
+                            update.transaction_id,
+                            epoch.to_vec(),
+                        )
                         .then_some(())
                         .ok_or(CallError::Media(
                             "call-link group epoch could not be retained",
@@ -464,7 +469,12 @@ impl Voip<'_> {
         call_creator: &Jid,
         enabled: bool,
     ) -> Result<(), CallError> {
-        self.ensure_waiting_room_admin(call_id)?;
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.ensure_waiting_room_admin_if_current(call_id, generation)?;
         let request_id = self.client.generate_request_id();
         execute_call_service_request(
             self.client,
@@ -474,10 +484,17 @@ impl Voip<'_> {
             parse_waiting_room_toggle_ack,
         )
         .await?;
-        self.client
+        if self
+            .client
             .call_registry()
-            .set_waiting_room_enabled(call_id, enabled);
-        Ok(())
+            .set_waiting_room_enabled_if_current(call_id, generation, enabled)
+        {
+            Ok(())
+        } else {
+            Err(CallError::Media(
+                "call was replaced while applying group control",
+            ))
+        }
     }
 
     /// Keep a pending call-link admission alive.
@@ -560,6 +577,14 @@ impl Voip<'_> {
         generation: u64,
         raised: bool,
     ) -> Result<(), CallError> {
+        if self
+            .client
+            .call_registry()
+            .group_state_if_current(call_id, generation)
+            .is_none()
+        {
+            return Err(CallError::Media("call is not an active group call"));
+        }
         let participant = self
             .client
             .lid()
@@ -629,6 +654,14 @@ impl Voip<'_> {
         state: ScreenShareState,
         screen_share_id: Option<u32>,
     ) -> Result<(), CallError> {
+        if self
+            .client
+            .call_registry()
+            .group_state_if_current(call_id, generation)
+            .is_none()
+        {
+            return Err(CallError::Media("call is not an active group call"));
+        }
         let participant = self
             .client
             .lid()
@@ -669,9 +702,9 @@ impl Voip<'_> {
                 "call was replaced while applying group control",
             ));
         }
-        if state == ScreenShareState::Started {
-            registry.send_video_ctl(call_id, generation, VideoControl::RequireKeyframe);
-        }
+        // Both directions swap the encoder source, so the peer needs an IDR before either stream
+        // can safely resume.
+        registry.send_video_ctl(call_id, generation, VideoControl::RequireKeyframe);
         Ok(())
     }
 
@@ -686,10 +719,24 @@ impl Voip<'_> {
 
     #[cfg(feature = "voip-runtime")]
     fn ensure_waiting_room_admin(&self, call_id: &str) -> Result<(), CallError> {
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.ensure_waiting_room_admin_if_current(call_id, generation)
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn ensure_waiting_room_admin_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Result<(), CallError> {
         let room = self
             .client
             .call_registry()
-            .group_state(call_id)
+            .group_state_if_current(call_id, generation)
             .and_then(|state| state.waiting_room().cloned())
             .ok_or(CallError::Media("call has no waiting-room state"))?;
         if !room.is_admin {
@@ -870,7 +917,9 @@ mod tests {
     use wacore::handshake::NoiseCipher;
     use wacore::types::call::{CallAction, IncomingCall};
     #[cfg(feature = "voip-runtime")]
-    use wacore::types::group_call::{CallLinkMedia, ScreenShareState};
+    use wacore::types::group_call::{
+        CallLinkMedia, GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
+    };
     #[cfg(feature = "voip-runtime")]
     use wacore::voip::{
         AudioFormat, CallEvent, CallPhase, CallSession, VideoControl, video_control_channel,
@@ -879,7 +928,7 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
 
-    use crate::client::Client;
+    use crate::client::{CallError, Client};
 
     #[cfg(feature = "voip-runtime")]
     #[test]
@@ -1130,11 +1179,25 @@ mod tests {
         let creator = participant.clone();
         let call_id = "TEST-GROUP-CONTROLS";
         let registry = client.call_registry();
-        let generation = registry.insert(CallSession::new_outgoing(
-            call_id,
-            Jid::new(call_id, Server::Call),
-            creator.clone(),
-        ));
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator.clone());
+        session.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(vec![GroupCallParticipant::new(
+                    participant.clone(),
+                    vec![GroupCallDevice::new(participant.clone().with_device(1))],
+                )])
+                .build(),
+        );
+        let generation = registry.insert(session);
         let (event_tx, event_rx) = async_channel::bounded(4);
         let (video_tx, video_rx) = video_control_channel();
         registry.set_video_channels(call_id, generation, event_tx, video_tx, Box::new(|| {}));
@@ -1207,9 +1270,57 @@ mod tests {
             }) if event_participant == participant
                 && screen_share.state == ScreenShareState::Stopped
         ));
-        assert_eq!(video_rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+        assert_eq!(
+            video_rx.try_recv(),
+            Ok(VideoControl::RequireKeyframe),
+            "returning to the camera must re-arm the H.264 recovery gate"
+        );
         assert_eq!(transport.sent_count(), 3);
         registry.remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn direct_calls_reject_group_controls_before_sending() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let own_device = Jid::new("111111111111111", Server::Lid).with_device(1);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_device,
+            )))
+            .await;
+        let call_id = "TEST-DIRECT-CONTROLS";
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let generation = client.call_registry().insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new("222222222222222", Server::Lid),
+            creator.clone(),
+        ));
+
+        assert!(
+            client
+                .voip()
+                .set_hand_raised(call_id, &creator, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .voip()
+                .set_screen_share(call_id, &creator, ScreenShareState::Started, Some(7))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            transport.sent_count(),
+            0,
+            "group-only controls must not be emitted for a direct call"
+        );
+        assert!(client.call_registry().group_state(call_id).is_none());
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -1431,6 +1542,81 @@ mod tests {
         client
             .call_registry()
             .remove_if_current("TEST-CALL-ID", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn approval_ack_cannot_commit_to_a_replacement_generation() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let call_id = "TEST-APPROVAL-GENERATION";
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let registry = client.call_registry();
+        let first = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        assert_eq!(
+            registry.apply_waiting_room(
+                wacore::types::group_call::WaitingRoom::builder()
+                    .call_id(call_id.to_string())
+                    .call_creator(creator.clone())
+                    .link_token("TEST-CALL-LINK".to_string())
+                    .media(CallLinkMedia::Audio)
+                    .enabled(false)
+                    .is_admin(true)
+                    .transaction_id(1)
+                    .users(Vec::new())
+                    .build(),
+            ),
+            wacore::voip::GroupStateApply::Applied
+        );
+
+        let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let request_client = client.clone();
+        let request_creator = creator.clone();
+        let toggle = tokio::spawn(async move {
+            request_client
+                .voip()
+                .set_approval_required(call_id, &request_creator, true)
+                .await
+        });
+        let request = sent.await.expect("waiting-room toggle request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+
+        let replacement = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator,
+        ));
+        assert_ne!(replacement, first);
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "waiting_room_toggle")
+                .attr("id", request_id.as_str())
+                .build(),
+        )
+        .await;
+
+        assert!(matches!(
+            toggle.await.expect("toggle task"),
+            Err(CallError::Media(
+                "call was replaced while applying group control"
+            ))
+        ));
+        assert!(
+            registry.group_state(call_id).is_none(),
+            "the stale ACK must not synthesize waiting-room state on the replacement"
+        );
+        registry.remove_if_current(call_id, replacement);
     }
 
     #[cfg(feature = "voip-runtime")]

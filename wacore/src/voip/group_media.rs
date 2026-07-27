@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 use crate::types::group_call::{
     GROUP_CALL_MAX_PARTICIPANTS, GroupCallDevice, GroupCallParticipant, GroupCallUpdate,
 };
+use crate::voip::app_data::APP_DATA_RTP_TIMESTAMP_STRIDE;
 use crate::voip::e2e_srtp::{derive_e2e_keys_from_raw, derive_srtcp_keys_from_raw};
 use crate::voip::rtp::RTP_PAYLOAD_TYPE_APP_DATA;
 use crate::voip::rtp::{RtpHeader, parse_rtp_header};
@@ -517,7 +518,7 @@ impl GroupMediaRegistry {
             self_lid: &self.self_lid,
             peer_lid: &participant_id,
             ssrc: app_data_ssrc,
-            samples_per_packet: 50,
+            samples_per_packet: APP_DATA_RTP_TIMESTAMP_STRIDE,
             warp_mi_tag_len: self.warp_mi_tag_len,
         })
         .ok_or(GroupMediaError::Pipeline)?;

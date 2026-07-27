@@ -173,12 +173,14 @@ fn parse_media_offer(
             if bytes.is_empty() {
                 return None;
             }
-            let mut attrs = capability.attrs();
-            let version = attrs
-                .optional_u64("ver")
-                .and_then(|version| u32::try_from(version).ok())
-                .unwrap_or(1);
-            Some(GroupCallDevice::new(peer.clone()).with_capability(version, bytes))
+            let capability_version = match capability.get_attr("ver") {
+                None => Some(1),
+                Some(version) => version.as_str().parse::<u32>().ok(),
+            };
+            let mut device = GroupCallDevice::new(peer.clone());
+            device.capability_version = capability_version;
+            device.capability = bytes;
+            Some(device)
         });
     Some(MediaOffer {
         encs,
@@ -244,6 +246,8 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         .optional_jid("call-creator")
         .ok_or_else(|| anyhow!("<{}> missing 'call-creator'", node.tag))?;
 
+    // The group parsers re-read the action identity and finish their own attribute readers because
+    // they also own the action-specific attributes.
     Ok(match node.tag.as_ref() {
         "group_update" => CallAction::GroupUpdate {
             update: super::group_call::parse_group_update(node)?.into(),
@@ -1035,6 +1039,47 @@ mod tests {
 
     fn as_ref<'a>(n: &'a Node) -> NodeRef<'a> {
         n.as_node_ref()
+    }
+
+    #[cfg(feature = "voip")]
+    fn parsed_peer_capability_version(version: Option<&str>) -> Option<u32> {
+        let mut capability = NodeBuilder::new("capability").bytes(CAPABILITY_OFFER.to_vec());
+        if let Some(version) = version {
+            capability = capability.attr("ver", version);
+        }
+        let node = base_call_builder()
+            .children([offer_builder_base()
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("enc", "opus")
+                        .attr("rate", "16000")
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![1, 2, 3, 4])
+                        .build(),
+                    capability.build(),
+                ])
+                .build()])
+            .build();
+        parse_call_stanza(&as_ref(&node))
+            .expect("offer parses")
+            .expect("recognized call")
+            .media
+            .expect("media offer")
+            .peer_device
+            .expect("peer capability")
+            .capability_version
+    }
+
+    #[cfg(feature = "voip")]
+    #[test]
+    fn capability_version_defaults_only_when_absent() {
+        assert_eq!(parsed_peer_capability_version(None), Some(1));
+        assert_eq!(parsed_peer_capability_version(Some("7")), Some(7));
+        assert_eq!(parsed_peer_capability_version(Some("invalid")), None);
+        assert_eq!(parsed_peer_capability_version(Some("4294967296")), None);
     }
 
     // An offer carrying an <enc> (the encrypted callKey) and a <relay> must surface both on

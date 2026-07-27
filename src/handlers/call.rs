@@ -28,7 +28,7 @@ use wacore::voip::{CallEvent, PeerVideoTransition, VideoControl};
 use wacore_binary::Jid;
 use wacore_binary::{OwnedNodeRef, Server};
 #[cfg(feature = "voip-runtime")]
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 #[cfg(feature = "voip-runtime")]
 use crate::client::CallError;
@@ -213,17 +213,23 @@ impl StanzaHandler for CallHandler {
                         && let Some(bytes) =
                             capability.content_bytes().filter(|bytes| !bytes.is_empty())
                     {
-                        let mut attrs = capability.attrs();
-                        let version = attrs
-                            .optional_u64("ver")
-                            .and_then(|version| u32::try_from(version).ok())
-                            .unwrap_or(1);
-                        client.call_registry().set_group_invite_peer_device(
-                            call.action.call_id(),
-                            generation,
-                            GroupCallDevice::new(call.from.clone())
-                                .with_capability(version, bytes.to_vec()),
-                        );
+                        let version = match capability.get_attr("ver") {
+                            None => Some(1),
+                            Some(version) => version.as_str().parse::<u32>().ok(),
+                        };
+                        if let Some(version) = version {
+                            client.call_registry().set_group_invite_peer_device(
+                                call.action.call_id(),
+                                generation,
+                                GroupCallDevice::new(routed_call_sender(&call))
+                                    .with_capability(version, bytes.to_vec()),
+                            );
+                        } else {
+                            warn!(
+                                "call: ignored invalid peer capability version for {}",
+                                call.action.call_id()
+                            );
+                        }
                     }
                     // Caller-side: key our recv path to the device that actually answered. We dial the
                     // base callee LID, but a companion answers from `:N` and encrypts under its own
@@ -320,15 +326,19 @@ impl StanzaHandler for CallHandler {
                             dispatch_call = false;
                         }
                         CallAction::GroupUpdate { update } => {
-                            dispatch_call = match client
-                                .call_registry()
+                            let registry = client.call_registry();
+                            let generation = registry.generation_of(&update.call_id);
+                            dispatch_call = match registry
                                 .apply_group_update(update.as_ref().clone())
                             {
                                 GroupStateApply::Applied => {
-                                    client.call_registry().send_group_update(
-                                        &update.call_id,
-                                        update.as_ref().clone(),
-                                    );
+                                    if let Some(generation) = generation {
+                                        registry.send_group_update_if_current(
+                                            &update.call_id,
+                                            generation,
+                                            update.as_ref().clone(),
+                                        );
+                                    }
                                     if update.rekey_requested {
                                         match crate::voip::facade::fanout_group_epoch(
                                             &client, update,
@@ -336,14 +346,19 @@ impl StanzaHandler for CallHandler {
                                         .await
                                         {
                                             Ok(fanout) => {
+                                                let generation = fanout.generation();
                                                 if let Err(error) = fanout.commit(|epoch| {
-                                                    client
-                                                        .call_registry()
-                                                        .send_group_epoch(
-                                                            &update.call_id,
-                                                            update.transaction_id,
-                                                            epoch.to_vec(),
-                                                        )
+                                                    generation
+                                                        .is_some_and(|generation| {
+                                                            client
+                                                                .call_registry()
+                                                                .send_group_epoch_if_current(
+                                                                    &update.call_id,
+                                                                    generation,
+                                                                    update.transaction_id,
+                                                                    epoch.to_vec(),
+                                                                )
+                                                        })
                                                         .then_some(())
                                                         .ok_or(CallError::Media(
                                                             "local group epoch consumer closed",
@@ -402,13 +417,18 @@ impl StanzaHandler for CallHandler {
                                     rekey.call_id
                                 );
                             } else {
+                                let generation =
+                                    client.call_registry().generation_of(&rekey.call_id);
                                 match decrypt_group_epoch(&client, rekey, &sender).await {
                                     Ok(raw_epoch) => {
-                                        if !client.call_registry().send_group_epoch(
-                                            &rekey.call_id,
-                                            rekey.transaction_id,
-                                            raw_epoch,
-                                        ) {
+                                        if !generation.is_some_and(|generation| {
+                                            client.call_registry().send_group_epoch_if_current(
+                                                &rekey.call_id,
+                                                generation,
+                                                rekey.transaction_id,
+                                                raw_epoch.to_vec(),
+                                            )
+                                        }) {
                                             debug!(
                                                 "call: group epoch for {} has no active media consumer",
                                                 rekey.call_id
@@ -543,6 +563,20 @@ impl StanzaHandler for CallHandler {
                             return true;
                         };
                         let _transition_guard = transition_lock.lock().await;
+                        if registry
+                            .group_state_if_current(call_id, generation)
+                            .is_some()
+                            && !registry.group_sender_authorized(
+                                call_id,
+                                call.action.call_creator(),
+                                &routed_call_sender(&call),
+                            )
+                        {
+                            warn!(
+                                "call: rejected video state from unauthorized group sender for {call_id}"
+                            );
+                            return true;
+                        }
                         let event_permit = registry
                             .is_current(call_id, generation)
                             .then(|| registry.reserve_call_event(call_id))
@@ -735,14 +769,16 @@ async fn decrypt_group_epoch(
     client: &Client,
     rekey: &GroupCallEncRekey,
     sender: &Jid,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let enc_type = EncType::from_wire(&rekey.encryption_type)
         .ok_or_else(|| anyhow::anyhow!("unsupported Signal envelope type"))?;
-    let mut plaintext = client
-        .signal()
-        .decrypt_message(sender, enc_type, &rekey.ciphertext)
-        .await
-        .map_err(|error| anyhow::anyhow!("Signal decrypt failed: {error}"))?;
+    let plaintext = Zeroizing::new(
+        client
+            .signal()
+            .decrypt_message(sender, enc_type, &rekey.ciphertext)
+            .await
+            .map_err(|error| anyhow::anyhow!("Signal decrypt failed: {error}"))?,
+    );
     let decoded = MessageUtils::unpad_message_ref(
         &plaintext,
         u8::try_from(rekey.encryption_version)
@@ -752,15 +788,15 @@ async fn decrypt_group_epoch(
     .and_then(|unpadded| {
         waproto::codec::message_decode(unpadded)
             .map_err(|error| anyhow::anyhow!("message decode failed: {error}"))
-    });
-    plaintext.zeroize();
-    let mut raw_epoch = decoded?
-        .call
-        .into_option()
-        .and_then(|call| call.call_key)
-        .ok_or_else(|| anyhow::anyhow!("message has no call key"))?;
+    })?;
+    let raw_epoch = Zeroizing::new(
+        decoded
+            .call
+            .into_option()
+            .and_then(|call| call.call_key)
+            .ok_or_else(|| anyhow::anyhow!("message has no call key"))?,
+    );
     if raw_epoch.len() < 32 {
-        raw_epoch.zeroize();
         anyhow::bail!("call key is shorter than 32 bytes");
     }
     Ok(raw_epoch)
@@ -930,11 +966,13 @@ mod tests {
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
         let registry = client.call_registry();
-        let generation = registry.insert(CallSession::new_outgoing(
+        let mut session = CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
-        ));
+        );
+        session.is_video = true;
+        let generation = registry.insert(session);
         let update = GroupCallUpdate::builder()
             .call_id("GROUP-CALL".to_string())
             .call_creator(creator.clone())
@@ -958,12 +996,12 @@ mod tests {
         let outsider = Jid::new("999999999999999", Server::Lid).with_device(9);
         let stanza = NodeBuilder::new("call")
             .attr("from", Jid::new("GROUP-CALL", Server::Call))
-            .attr("participant", outsider)
+            .attr("participant", outsider.clone())
             .attr("id", "UNAUTHORIZED-CONTROL")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("user_action")
                 .attr("call-id", "GROUP-CALL")
-                .attr("call-creator", creator)
+                .attr("call-creator", creator.clone())
                 .attr("action", "raise_hand")
                 .children([NodeBuilder::new("raise_hand")
                     .attr("raise-hand-state", "1")
@@ -990,6 +1028,33 @@ mod tests {
         assert!(
             global_rx.try_recv().is_err(),
             "an unauthorized control must not reach the public event bus"
+        );
+
+        let video = NodeBuilder::new("call")
+            .attr("from", Jid::new("GROUP-CALL", Server::Call))
+            .attr("participant", outsider)
+            .attr("id", "UNAUTHORIZED-VIDEO")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("video")
+                .attr("call-id", "GROUP-CALL")
+                .attr("call-creator", creator)
+                .attr("state", "0")
+                .build()])
+            .build();
+        cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&video), &mut cancelled)
+                .await
+        );
+        assert_eq!(
+            registry.video_states("GROUP-CALL", generation),
+            Some((VideoState::Enabled, VideoState::Enabled)),
+            "an outsider must not disable the group video plane"
+        );
+        assert!(
+            global_rx.try_recv().is_err(),
+            "unauthorized video state must not reach the public event bus"
         );
         registry.remove_if_current("GROUP-CALL", generation);
     }
@@ -1401,6 +1466,55 @@ mod tests {
             }))
         ));
         assert!(!cancelled);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_scoped_accept_records_the_routed_participant_device() {
+        let client = make_sending_client().await;
+        let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
+        let participant = fake_caller_lid().with_device(4);
+        let accept = NodeBuilder::new("call")
+            .attr("from", Jid::new("CALL-ID-0001", Server::Call))
+            .attr("participant", participant.clone())
+            .attr("id", "STANZA-ID-GROUP-ACCEPT")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("enc", "opus")
+                        .attr("rate", "16000")
+                        .build(),
+                    NodeBuilder::new("capability")
+                        .attr("ver", "1")
+                        .bytes(wacore::stanza::call::CAPABILITY_OFFER.to_vec())
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let accept = node_to_owned_ref(&accept);
+        let routed_participant = parse_call_stanza(accept.get())
+            .expect("valid accept")
+            .expect("known action")
+            .participant
+            .expect("participant metadata");
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), accept, &mut cancelled,)
+                .await
+        );
+        let fallback = client
+            .call_registry()
+            .group_invite_fallback_roster("CALL-ID-0001", generation)
+            .expect("accepted call retains both active device capabilities");
+        assert_eq!(fallback[1].devices[0].jid, routed_participant);
+        client
+            .call_registry()
+            .remove_if_current("CALL-ID-0001", generation);
     }
 
     #[cfg(feature = "voip-runtime")]

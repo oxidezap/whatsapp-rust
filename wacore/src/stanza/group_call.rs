@@ -153,6 +153,8 @@ pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<N
     children.push(destination_to(params.target_devices));
     children.push(
         NodeBuilder::new("group_info")
+            // Preserve the server-authoritative roster verbatim: a video invitation advertises
+            // video separately and must not upgrade capability blobs owned by other participants.
             .children(build_group_users(params.participants, None, false)?)
             .build(),
     );
@@ -270,6 +272,9 @@ pub fn parse_group_update(node: &NodeRef<'_>) -> Result<GroupCallUpdate> {
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id", "group_update")?;
     let creator = required_jid(&mut attrs, "call-creator", "group_update")?;
+    attrs
+        .finish()
+        .map_err(|error| anyhow!("<group_update> attrs: {error}"))?;
     let group_info = node
         .get_optional_child("group_info")
         .ok_or_else(|| anyhow!("<group_update> missing <group_info>"))?;
@@ -532,6 +537,9 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
     let call_id = required_string(&mut attrs, "call-id", "enc_rekey")?;
     let call_creator = required_jid(&mut attrs, "call-creator", "enc_rekey")?;
     let transaction_id = required_u32(&mut attrs, "transaction-id", "enc_rekey")?;
+    attrs
+        .finish()
+        .map_err(|error| anyhow!("<enc_rekey> attrs: {error}"))?;
     let encopt = node
         .get_optional_child("encopt")
         .ok_or_else(|| anyhow!("<enc_rekey> missing <encopt>"))?;
@@ -732,6 +740,9 @@ pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id", "waiting_room_update")?;
     let creator = required_jid(&mut attrs, "call-creator", "waiting_room_update")?;
+    attrs
+        .finish()
+        .map_err(|error| anyhow!("<waiting_room_update> attrs: {error}"))?;
     let waiting = node
         .get_optional_child("waiting_room")
         .ok_or_else(|| anyhow!("<waiting_room_update> missing <waiting_room>"))?;
@@ -927,6 +938,9 @@ pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
     let action = required_string(&mut attrs, "action", "user_action")?;
     let _ = required_string(&mut attrs, "call-id", "user_action")?;
     let _ = required_jid(&mut attrs, "call-creator", "user_action")?;
+    attrs
+        .finish()
+        .map_err(|error| anyhow!("<user_action> attrs: {error}"))?;
     if action != "raise_hand" {
         bail!("unsupported user action {action:?}");
     }
@@ -975,10 +989,15 @@ pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
     let _ = required_string(&mut attrs, "call-id", "screen_share")?;
     let _ = required_jid(&mut attrs, "call-creator", "screen_share")?;
     let state_value = required_u32(&mut attrs, "screenshare_state", "screen_share")?;
-    let state = ScreenShareState::try_from(state_value as i32)
+    let state_code = i32::try_from(state_value)
+        .map_err(|_| anyhow!("unsupported screen-share state {state_value}"))?;
+    let state = ScreenShareState::try_from(state_code)
         .map_err(|_| anyhow!("unsupported screen-share state {state_value}"))?;
     let version = required_u32(&mut attrs, "version", "screen_share")?;
     let screen_share_id = optional_u32(&mut attrs, "screen_share_id", "screen_share")?;
+    attrs
+        .finish()
+        .map_err(|error| anyhow!("<screen_share> attrs: {error}"))?;
     Ok(ScreenShare {
         state,
         version,
@@ -1739,6 +1758,13 @@ mod tests {
         assert_eq!(parsed.state, ScreenShareState::Started);
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.screen_share_id, Some(7));
+        let overflow = NodeBuilder::new("screen_share")
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .attr("screenshare_state", u32::MAX.to_string())
+            .attr("version", "2")
+            .build();
+        assert!(parse_screen_share(&overflow.as_node_ref()).is_err());
 
         let from = jid("100001", 1);
         let participant = jid("100001", 2);

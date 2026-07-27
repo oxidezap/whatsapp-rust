@@ -748,6 +748,19 @@ impl<'a> OutgoingGroupCall<'a> {
                 "group offer ack identity mismatch".to_string(),
             ));
         }
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            &call_id,
+            Jid::new(&call_id, Server::Call),
+            own_lid.clone(),
+        );
+        session.audio_format = Some(audio.config().format);
+        session.is_video = video.is_some();
+        session.group = Some(update.clone());
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::Connecting);
+        // Register before session establishment and epoch fan-out can await: authoritative roster
+        // updates arriving in that window must be retained for the eventual media consumer.
+        let mut registration = RegisteredCall::new(self.client, session).await;
         let relay = update
             .relay
             .as_ref()
@@ -787,17 +800,10 @@ impl<'a> OutgoingGroupCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
-        let mut session = wacore::voip::CallSession::new_outgoing(
-            &call_id,
-            Jid::new(&call_id, Server::Call),
-            own_lid,
-        );
-        session.audio_format = Some(audio.config().format);
-        session.is_video = video.is_some();
-        session.group = Some(update);
-        let _ = session.transition_to(CallPhase::Calling);
-        let _ = session.transition_to(CallPhase::Connecting);
-        let handle = spawn_call(self.client, session, engine, &factory, audio, video).await?;
+        let handle =
+            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+                .await?;
+        registration.disarm();
         teardown.disarm();
         Ok(handle)
     }
@@ -936,6 +942,9 @@ impl<'a> CallLinkCall<'a> {
             }
             listener.await;
         };
+        // Admission has committed this endpoint server-side. Keep a call-scoped terminate armed
+        // until the relay driver owns the join, covering setup errors and cancellation.
+        let mut teardown = GroupOfferTeardown::new(self.client, &join.call_id, &join.call_creator);
         if update.call_creator != join.call_creator {
             return Err(CallError::Response(
                 "call-link admitted snapshot changed call identity".to_string(),
@@ -983,6 +992,7 @@ impl<'a> CallLinkCall<'a> {
         let _ = session.transition_to(CallPhase::Calling);
         let _ = session.transition_to(CallPhase::Connecting);
         let handle = spawn_call(self.client, session, engine, &factory, audio, video).await?;
+        teardown.disarm();
         let _ = scopeguard::ScopeGuard::into_inner(cleanup);
         Ok(handle)
     }
@@ -1185,6 +1195,10 @@ pub(crate) struct GroupEpochFanout {
 }
 
 impl GroupEpochFanout {
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.teardown.generation
+    }
+
     /// Commit the local epoch before disarming partial-fanout teardown. If `apply` fails or this
     /// future's caller is cancelled before calling `commit`, dropping the guard terminates the call.
     pub(crate) fn commit<T>(
@@ -2688,10 +2702,17 @@ impl CallHandle {
     }
 
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
-    /// callee device that answered (learned from the inbound `<accept>`) once one has, since call
-    /// signaling is addressed per device; before any accept, or for an incoming call, it is the bare
-    /// peer the offer rang. Returns owned so it can merge the answering device tracked on the registry.
+    /// call-scoped JID after an ad-hoc group promotion, otherwise the callee device that answered
+    /// (learned from the inbound `<accept>`) once one has, since direct-call signaling is addressed
+    /// per device. Before either transition it is the bare peer the offer rang.
     pub fn peer_jid(&self) -> Jid {
+        if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_some()
+        {
+            return Jid::new(&self.call_id, Server::Call);
+        }
         self.client_registry
             .answering_device_if_current(&self.call_id, self.generation)
             .unwrap_or_else(|| self.peer_jid.clone())
@@ -3454,7 +3475,7 @@ mod tests {
         use wacore::types::message::AddressingMode;
 
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
-        let own_pn = Jid::new("15550001000", Server::Pn);
+        let own_pn = Jid::new("12025550111", Server::Pn);
         let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
         for command in [
             crate::store::commands::DeviceCommand::SetId(Some(own_pn.clone())),
@@ -4069,8 +4090,8 @@ mod tests {
         );
     }
 
-    // peer_jid() is the <terminate> target: the bare peer until an <accept> records the answering
-    // device on the registry, then that device (call signaling is addressed per device).
+    // peer_jid() is the <terminate> target: bare/direct device until promotion installs group state,
+    // then the call-scoped address used by every subsequent group signaling transition.
     #[tokio::test]
     async fn peer_jid_upgrades_to_the_answering_device() {
         let client = make_client().await;
@@ -4098,6 +4119,27 @@ mod tests {
             handle.peer_jid(),
             device,
             "after the accept the terminate target is the answering device"
+        );
+
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client.call_registry().apply_group_update(update),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert_eq!(
+            handle.peer_jid(),
+            Jid::new("CID-FACADE", Server::Call),
+            "promotion must retarget later signaling to the call scope"
         );
     }
 
@@ -5654,6 +5696,49 @@ mod tests {
             action.attrs().optional_string("call-id").as_deref(),
             Some(call_id)
         );
+    }
+
+    #[tokio::test]
+    async fn registered_outgoing_group_retains_roster_before_media_attach() {
+        use wacore::voip::{GroupControl, GroupStateApply};
+
+        let client = make_client().await;
+        let call_id = "OUTGOING-GROUP-SETUP";
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let update = |transaction_id| {
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(transaction_id)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build()
+        };
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        );
+        session.group = Some(update(1));
+        let registration = RegisteredCall::new(&client, session).await;
+
+        assert_eq!(
+            client.call_registry().apply_group_update(update(2)),
+            GroupStateApply::Applied,
+            "an update arriving during epoch fan-out must find the early registration"
+        );
+        let (tx, rx) = async_channel::bounded(4);
+        client
+            .call_registry()
+            .set_group_control_sender(call_id, registration.generation, tx);
+        match rx.try_recv().expect("latest roster reaches attached media") {
+            GroupControl::Update(update) => assert_eq!(update.transaction_id, 2),
+            _ => panic!("expected the retained roster"),
+        }
     }
 
     #[tokio::test]

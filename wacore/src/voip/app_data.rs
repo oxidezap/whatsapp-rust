@@ -2,6 +2,7 @@
 
 const MAX_APP_DATA_BYTES: usize = 4096;
 const MAX_REACTION_BYTES: usize = 256;
+pub(crate) const APP_DATA_RTP_TIMESTAMP_STRIDE: u32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallReaction {

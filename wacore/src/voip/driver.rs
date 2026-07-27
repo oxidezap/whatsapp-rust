@@ -307,6 +307,58 @@ fn purge_unstarted_video(
     dropped
 }
 
+fn purge_queued_video(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    queue.retain(|batch| {
+        let discard = batch.kind == SendBatchKind::Video;
+        if discard {
+            record_drop(&mut dropped, batch);
+        }
+        !discard
+    });
+    if !pending_video.is_empty() {
+        dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+        dropped.packets = dropped
+            .packets
+            .saturating_add(pending_video.len().try_into().unwrap_or(u32::MAX));
+        pending_video.clear();
+    }
+    if dropped.video_access_units != 0 {
+        *awaiting_video_keyframe = true;
+    }
+    dropped
+}
+
+fn purge_queued_encrypted_media(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    queue.retain(|batch| {
+        let discard = batch.kind != SendBatchKind::Control;
+        if discard {
+            record_drop(&mut dropped, batch);
+        }
+        !discard
+    });
+    if !pending_video.is_empty() {
+        dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+        dropped.packets = dropped
+            .packets
+            .saturating_add(pending_video.len().try_into().unwrap_or(u32::MAX));
+        pending_video.clear();
+    }
+    if dropped.video_access_units != 0 {
+        *awaiting_video_keyframe = true;
+    }
+    dropped
+}
+
 fn discard_video_until_keyframe(
     queue: &mut VecDeque<SendBatch>,
     dropped: &mut DroppedMedia,
@@ -754,36 +806,72 @@ async fn run_call_with_clock_and_wallclock(
             group = group_ctl_fut => {
                 match group {
                     Some(GroupControl::Update(update)) => {
-                        if let Err(error) = eng.apply_group_update(&update) {
-                            if matches!(
-                                error,
-                                engine::EngineError::GroupMedia(
-                                    crate::voip::GroupMediaError::IdentityMismatch
-                                        | crate::voip::GroupMediaError::InvalidSnapshot
-                                        | crate::voip::GroupMediaError::InvalidEpoch
-                                        | crate::voip::GroupMediaError::ConflictingEpoch
-                                )
-                            ) {
-                                let _ = channels.events.try_send(
-                                    CallEvent::GroupControlRejected {
-                                        control: engine::GroupControlKind::Update,
-                                    },
+                        match eng.apply_group_update(now_ms(), &update) {
+                            Ok(crate::voip::GroupRosterApply::Applied)
+                                if update.media == "audio" =>
+                            {
+                                let dropped = purge_queued_video(
+                                    &mut send_queue,
+                                    &mut pending_video,
+                                    &mut awaiting_video_keyframe,
                                 );
-                            } else {
-                                break 'drive;
+                                if dropped.packets != 0 {
+                                    let _ = channels.events.try_send(
+                                        CallEvent::OutboundMediaDropped {
+                                            video_access_units: dropped.video_access_units,
+                                            packets: dropped.packets,
+                                        },
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                if matches!(
+                                    error,
+                                    engine::EngineError::GroupMedia(
+                                        crate::voip::GroupMediaError::IdentityMismatch
+                                            | crate::voip::GroupMediaError::InvalidSnapshot
+                                            | crate::voip::GroupMediaError::InvalidEpoch
+                                            | crate::voip::GroupMediaError::ConflictingEpoch
+                                    )
+                                ) {
+                                    let _ = channels.events.try_send(
+                                        CallEvent::GroupControlRejected {
+                                            control: engine::GroupControlKind::Update,
+                                        },
+                                    );
+                                } else {
+                                    break 'drive;
+                                }
                             }
                         }
                     }
                     Some(GroupControl::RawEpoch(epoch)) => {
-                        if let Err(error) = eng
-                            .apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes())
-                        {
-                            if matches!(error, crate::voip::GroupMediaError::Pipeline) {
-                                break 'drive;
+                        match eng.apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes()) {
+                            Ok(crate::voip::GroupEpochApply::Installed) => {
+                                let dropped = purge_queued_encrypted_media(
+                                    &mut send_queue,
+                                    &mut pending_video,
+                                    &mut awaiting_video_keyframe,
+                                );
+                                if dropped.packets != 0 {
+                                    let _ = channels.events.try_send(
+                                        CallEvent::OutboundMediaDropped {
+                                            video_access_units: dropped.video_access_units,
+                                            packets: dropped.packets,
+                                        },
+                                    );
+                                }
                             }
-                            let _ = channels.events.try_send(CallEvent::GroupControlRejected {
-                                control: engine::GroupControlKind::Epoch,
-                            });
+                            Ok(_) => {}
+                            Err(error) => {
+                                if matches!(error, crate::voip::GroupMediaError::Pipeline) {
+                                    break 'drive;
+                                }
+                                let _ = channels.events.try_send(CallEvent::GroupControlRejected {
+                                    control: engine::GroupControlKind::Epoch,
+                                });
+                            }
                         }
                     }
                     Some(GroupControl::Reaction(emoji)) => {
@@ -1040,6 +1128,57 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn group_transitions_purge_only_packets_protected_under_stale_state() {
+        let batch = |kind, packets: usize, started| SendBatch {
+            packets: (0..packets)
+                .map(|_| Bytes::from_static(b"packet"))
+                .collect(),
+            bytes: packets * 6,
+            kind,
+            started,
+            video_keyframe: false,
+        };
+
+        let mut downgrade_queue = VecDeque::from([
+            batch(SendBatchKind::Control, 1, false),
+            batch(SendBatchKind::Media, 1, false),
+            batch(SendBatchKind::Video, 2, true),
+        ]);
+        let mut pending_video = vec![Bytes::from_static(b"fragment")];
+        let mut awaiting_keyframe = false;
+        let dropped = purge_queued_video(
+            &mut downgrade_queue,
+            &mut pending_video,
+            &mut awaiting_keyframe,
+        );
+        assert_eq!(dropped.video_access_units, 2);
+        assert_eq!(dropped.packets, 3);
+        assert_eq!(downgrade_queue.len(), 2);
+        assert!(
+            downgrade_queue
+                .iter()
+                .all(|batch| batch.kind != SendBatchKind::Video)
+        );
+        assert!(awaiting_keyframe);
+
+        downgrade_queue.push_back(batch(SendBatchKind::Video, 2, false));
+        pending_video.push(Bytes::from_static(b"fragment"));
+        let dropped = purge_queued_encrypted_media(
+            &mut downgrade_queue,
+            &mut pending_video,
+            &mut awaiting_keyframe,
+        );
+        assert_eq!(dropped.video_access_units, 2);
+        assert_eq!(dropped.packets, 4);
+        assert_eq!(downgrade_queue.len(), 1);
+        assert_eq!(downgrade_queue[0].kind, SendBatchKind::Control);
+        assert!(
+            pending_video.is_empty(),
+            "a new epoch must not leave a partial old-key access unit"
+        );
     }
 
     /// CallChannels with idle video plumbing (senders/receivers dropped immediately), for the

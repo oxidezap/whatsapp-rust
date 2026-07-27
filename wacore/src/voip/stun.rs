@@ -160,6 +160,11 @@ const WASM_STREAM_SLOTS: [(u32, u32, u32); 9] = [
     (2, 2, 6),
 ];
 
+#[cfg(test)]
+pub(crate) fn wasm_stream_slot_words() -> [u32; 9] {
+    WASM_STREAM_SLOTS.map(|(_, _, slot)| slot)
+}
+
 /// Build call-specific WASM `StreamDescriptors` (0x4024).
 pub fn create_wasm_stream_descriptors(call_id: &str, self_participant_id: &str) -> Vec<u8> {
     let ssrcs = WASM_STREAM_SLOTS.map(|(_, _, slot)| {
