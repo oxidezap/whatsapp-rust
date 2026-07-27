@@ -4718,6 +4718,66 @@ async fn ambiguous_ack_is_dropped_rather_than_deferred() {
     );
 }
 
+/// An ack that names its chat must stay inside it. Ids are sender-chosen and
+/// unique only within a chat, so a same-id row in an unrelated thread is a
+/// different message — resolving to it would acknowledge the wrong send and
+/// leave the real one pending.
+#[tokio::test]
+async fn a_named_ack_does_not_resolve_to_another_chats_row() {
+    let (_store, chat_store) = test_store().await;
+    let named = jid(PEER);
+    let other = jid("559900000002@s.whatsapp.net");
+    let sent_at = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+
+    // Only the OTHER chat has a row under this id.
+    chat_store
+        .record_outgoing(&other, "OUT-CROSS", &wa::Message::text("theirs"), sent_at)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-CROSS".to_string())
+                .class("message".to_string())
+                .from(named.clone())
+                .timestamp(Utc.timestamp_opt(1_700_000_222, 0).unwrap())
+                .build(),
+        )],
+    )
+    .await;
+    let untouched = chat_store
+        .message(&other, "OUT-CROSS")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        untouched.status,
+        MessageStatus::Pending,
+        "an ack for another chat must not lift this row"
+    );
+    assert_eq!(
+        untouched.timestamp, sent_at,
+        "nor rewrite its clock to that ack's server time"
+    );
+
+    // It was held for the chat it named, so that chat's send still gets it.
+    chat_store
+        .record_outgoing(&named, "OUT-CROSS", &wa::Message::text("mine"), sent_at)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .message(&named, "OUT-CROSS")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::ServerAck
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Hook-committed batches (#1140)
 // ---------------------------------------------------------------------------

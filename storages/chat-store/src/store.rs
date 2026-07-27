@@ -1842,9 +1842,9 @@ fn resolve_server_ack_message(
     cs: &mut ChangeSet,
 ) -> QueryResult<AckTarget> {
     use schema::messages::dsl;
-    let mut named_chat = None;
     if let Some(from) = &ack.from {
-        let chat = crate::lid::route_chat_key(conn, device_id, &from.to_string(), cs)?;
+        let wire = from.to_string();
+        let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
         let timestamp_ms: Option<i64> = message_row(device_id, &chat, &ack.id)
             .filter(dsl::from_me.eq(true))
             .select(dsl::timestamp_ms)
@@ -1853,11 +1853,31 @@ fn resolve_server_ack_message(
         if let Some(timestamp_ms) = timestamp_ms {
             return Ok(AckTarget::Resolved { chat, timestamp_ms });
         }
-        named_chat = Some(chat);
+        // The row may sit under the peer's other identity, so retry across the
+        // PN/LID pair — but ONLY that pair. Message ids are sender-chosen and
+        // unique within a chat, so widening this to every chat on the device
+        // would let a named ack land on an unrelated thread that happens to
+        // reuse the id.
+        let keys = crate::lid::chat_key_candidates(conn, device_id, &wire)?;
+        let aliased: Option<(String, i64)> = dsl::messages
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::chat_jid.eq_any(keys))
+                    .and(dsl::msg_id.eq(&ack.id))
+                    .and(dsl::from_me.eq(true)),
+            )
+            .select((dsl::chat_jid, dsl::timestamp_ms))
+            .first(conn)
+            .optional()?;
+        return Ok(match aliased {
+            Some((chat, timestamp_ms)) => AckTarget::Resolved { chat, timestamp_ms },
+            None => AckTarget::NotYet { chat: Some(chat) },
+        });
     }
 
-    // Some server acks omit the chat identity. The id remains safe only when
-    // it identifies exactly one outgoing row for this device.
+    // Only a chatless ack falls back to the whole device, and then the id is
+    // safe only when it names exactly one outgoing row.
     let matches: Vec<(String, i64)> = dsl::messages
         .filter(
             dsl::device_id
@@ -1870,7 +1890,7 @@ fn resolve_server_ack_message(
         .load(conn)?;
     match <[(String, i64); 1]>::try_from(matches) {
         Ok([(chat, timestamp_ms)]) => Ok(AckTarget::Resolved { chat, timestamp_ms }),
-        Err(matches) if matches.is_empty() => Ok(AckTarget::NotYet { chat: named_chat }),
+        Err(matches) if matches.is_empty() => Ok(AckTarget::NotYet { chat: None }),
         Err(_) => {
             warn!(
                 target: "ChatStore/Ack",
