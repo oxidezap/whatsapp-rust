@@ -30,20 +30,37 @@ pub trait DsmDestination {
     fn write_into(&self, out: &mut Vec<u8>);
 }
 
-/// So a caller holding an owned string keeps compiling: a generic parameter
-/// does not deref-coerce `&String` to `&str` the way the old `&str` argument
-/// did.
-impl DsmDestination for &String {
-    #[inline]
-    fn encoded_len(&self) -> usize {
-        self.len()
-    }
+/// So every caller that relied on deref coercion keeps compiling: a generic
+/// parameter does not coerce the way the old `&str` argument did, so each
+/// wrapper a destination can arrive in needs to be named.
+///
+/// A blanket `impl<T: Deref<Target = str>>` would cover them in one line but
+/// collides with the `&Jid` implementation below: coherence cannot rule out
+/// `Jid` gaining that `Deref`, so the two overlap as far as the compiler is
+/// concerned. Hence the list.
+macro_rules! dsm_destination_via_str {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl DsmDestination for &$ty {
+            #[inline]
+            fn encoded_len(&self) -> usize {
+                str::len(self)
+            }
 
-    #[inline]
-    fn write_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(self.as_bytes());
-    }
+            #[inline]
+            fn write_into(&self, out: &mut Vec<u8>) {
+                out.extend_from_slice(str::as_bytes(self));
+            }
+        }
+    )+};
 }
+
+dsm_destination_via_str!(
+    String,
+    Box<str>,
+    std::rc::Rc<str>,
+    std::sync::Arc<str>,
+    std::borrow::Cow<'_, str>,
+);
 
 impl DsmDestination for &str {
     #[inline]
@@ -1994,6 +2011,62 @@ mod device_sent_tests {
             by_string.own_devices[..prefix],
             "the DSM bytes must not depend on how the destination was named"
         );
+    }
+
+    /// The generic parameter does not deref-coerce, so every wrapper a caller
+    /// may hold its destination in has to be named by an implementation. This
+    /// is a compile-time check as much as a runtime one: a wrapper missing from
+    /// the list fails to build here rather than in a downstream crate.
+    #[test]
+    fn every_string_wrapper_names_the_same_destination() {
+        use std::borrow::Cow;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let message = wa::Message {
+            conversation: Some("wrapper check".to_string()),
+            ..Default::default()
+        };
+        let content = waproto::codec::message_to_vec(&message);
+        let dest = "5511987650001:5@s.whatsapp.net";
+
+        let owned = dest.to_string();
+        let boxed: Box<str> = dest.into();
+        let rc: Rc<str> = dest.into();
+        let arc: Arc<str> = dest.into();
+        let cow: Cow<'_, str> = Cow::Borrowed(dest);
+
+        let reference = MessageUtils::dm_plaintexts_from_encoded(&content, None, dest);
+        let prefix = reference.own_devices.len() - 16;
+
+        for (name, produced) in [
+            (
+                "String",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &owned),
+            ),
+            (
+                "Box<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &boxed),
+            ),
+            (
+                "Rc<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &rc),
+            ),
+            (
+                "Arc<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &arc),
+            ),
+            (
+                "Cow<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &cow),
+            ),
+        ] {
+            assert_eq!(
+                produced.own_devices[..prefix],
+                reference.own_devices[..prefix],
+                "a destination held in {name} must name itself exactly as &str does"
+            );
+        }
     }
     use super::*;
 
