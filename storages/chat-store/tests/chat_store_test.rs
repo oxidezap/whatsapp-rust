@@ -4864,3 +4864,166 @@ async fn unmarked_batch_is_still_materialized() {
         Some("only copy")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scoped and bounded full-text search (#1147)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn search_can_be_scoped_to_one_chat() {
+    let (_store, chat_store) = test_store().await;
+    let other = "559900000002@s.whatsapp.net";
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("orçamento aprovado"),
+                incoming_info(PEER, PEER, "MSG-SC1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("orçamento recusado"),
+                incoming_info(other, other, "MSG-SC2", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+
+    // Unscoped sees both threads.
+    assert_eq!(
+        chat_store
+            .search_messages("orçamento", 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Scoped sees only its own, without the caller over-fetching and filtering.
+    let scoped = chat_store
+        .search_messages_in_chat(&jid(PEER), "orçamento", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        scoped.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-SC1"]
+    );
+}
+
+/// A chat addressed by either of the peer's identities is the same thread, so
+/// the scope has to resolve through the alias like every other read.
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn scoped_search_resolves_the_peer_alias() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("combinado então"),
+            incoming_info(PEER, PEER, "MSG-SC-LID", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let by_lid = chat_store
+        .search_messages_in_chat(&jid(PEER_LID), "combinado", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        by_lid.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-SC-LID"]
+    );
+}
+
+/// Hits come back fully hydrated from one statement rather than a point query
+/// each, so everything a caller reads off a hit still has to be there.
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn search_hits_are_fully_hydrated() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("documento anexado"),
+            incoming_info(PEER, PEER, "MSG-HY", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let hits = chat_store.search_messages("documento", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    let hit = &hits[0];
+    assert_eq!(hit.id, "MSG-HY");
+    assert_eq!(hit.chat_jid, jid(PEER));
+    assert_eq!(hit.sender_jid, jid(PEER));
+    assert_eq!(hit.text.as_deref(), Some("documento anexado"));
+    assert_eq!(hit.kind, MessageKind::Text);
+    assert!(!hit.from_me);
+    assert!(hit.seq > 0, "arrival sequence survives the bulk load");
+    // The proto still decodes — hydration did not drop the blob.
+    assert_eq!(
+        hit.message
+            .as_ref()
+            .expect("decoded proto")
+            .conversation
+            .as_deref(),
+        Some("documento anexado")
+    );
+}
+
+/// A one- or two-character prefix skips relevance ranking, which would
+/// otherwise have to score every row it matches before `LIMIT` discarded any.
+/// It still has to return that many hits, newest first.
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn a_short_prefix_returns_newest_first_within_its_limit() {
+    let (_store, chat_store) = test_store().await;
+
+    let events: Vec<Event> = (0..6)
+        .map(|i| {
+            message_event(
+                wa::Message::text(format!("hoje{i}")),
+                incoming_info(PEER, PEER, &format!("MSG-SP-{i}"), 1_700_000_000 + i),
+            )
+        })
+        .collect();
+    feed(&chat_store, events).await;
+
+    let hits = chat_store.search_messages("h", 3).await.unwrap();
+    assert_eq!(
+        hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-SP-5", "MSG-SP-4", "MSG-SP-3"],
+        "newest first, capped at the limit"
+    );
+
+    // A long-enough term still ranks, and still finds its message.
+    let ranked = chat_store.search_messages("hoje4", 10).await.unwrap();
+    assert_eq!(
+        ranked.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-SP-4"]
+    );
+}
+
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn scoped_search_rejects_an_empty_query_like_the_unscoped_one() {
+    let (_store, chat_store) = test_store().await;
+    assert!(
+        chat_store
+            .search_messages_in_chat(&jid(PEER), "   ", 10)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        chat_store
+            .search_messages_in_chat(&jid(PEER), "olá", 0)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+}

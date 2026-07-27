@@ -92,7 +92,7 @@ impl From<ChatRow> for ChatEntry {
 }
 
 #[derive(Queryable)]
-struct MessageRow {
+pub(crate) struct MessageRow {
     #[allow(dead_code)]
     device_id: i32,
     chat_jid: String,
@@ -107,7 +107,7 @@ struct MessageRow {
     starred: bool,
     edited_at_ms: Option<i64>,
     revoked: bool,
-    rowid: i64,
+    pub(crate) rowid: i64,
 }
 
 impl From<MessageRow> for StoredMessage {
@@ -175,7 +175,7 @@ impl ChatStore {
         let device_id = self.device_id();
         let rows: Vec<ChatRow> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 // A cursor in the activity run has already passed every pinned
                 // chat, so that run is skipped entirely rather than re-read.
                 let resume_pinned = match &after {
@@ -275,7 +275,7 @@ impl ChatStore {
         let jid = jid.to_string();
         let row: Option<ChatRow> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &jid).map_err(db_err)?;
                 dsl::chats
@@ -312,7 +312,7 @@ impl ChatStore {
         let chat = chat.to_string();
         let rows: Vec<MessageRow> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 let mut query = dsl::messages
@@ -346,7 +346,7 @@ impl ChatStore {
         let msg_id = msg_id.to_owned();
         let row: Option<MessageRow> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 dsl::messages
@@ -371,7 +371,7 @@ impl ChatStore {
         let msg_id = msg_id.to_owned();
         let rows: Vec<(String, String, i64)> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 dsl::reactions
@@ -406,7 +406,7 @@ impl ChatStore {
         let msg_id = msg_id.to_owned();
         let rows: Vec<(String, i32, i64)> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 let keys =
                     crate::lid::chat_key_candidates(conn, device_id, &chat).map_err(db_err)?;
                 dsl::message_receipts
@@ -440,7 +440,7 @@ impl ChatStore {
         let jid_str = jid.to_non_ad_string();
         let row: Option<ContactRow> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 dsl::contacts
                     .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq(&jid_str)))
                     .select((
@@ -472,7 +472,7 @@ impl ChatStore {
         let device_id = self.device_id();
         let total: Option<i64> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 dsl::chats
                     .filter(dsl::device_id.eq(device_id).and(dsl::unread_count.gt(0)))
                     .select(diesel::dsl::sum(dsl::unread_count))
@@ -528,7 +528,7 @@ impl ChatStore {
         let sha = file_sha256.to_vec();
         let row: Option<MediaRefRow> = self
             .db()
-            .run(move |conn| {
+            .read(move |conn| {
                 dsl::media_refs
                     .filter(dsl::device_id.eq(device_id).and(dsl::file_sha256.eq(&sha)))
                     .select((

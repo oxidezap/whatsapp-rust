@@ -101,6 +101,10 @@ const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
 pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
     pub(crate) db_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Permits for read-only work, when [`SqliteStoreConfig::read_pool_size`]
+    /// asked for any. `None` keeps reads on `db_semaphore` — the original
+    /// behaviour, where one queue covers everything.
+    pub(crate) read_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     pub(crate) database_path: String,
     device_id: i32,
 }
@@ -152,7 +156,28 @@ pub type ConnectionInitHook = Arc<
 pub struct SqliteStoreConfig {
     /// Max concurrent operations: r2d2 `max_size` AND the internal semaphore permits,
     /// kept in lockstep. Clamped to at least 1.
+    ///
+    /// Raising this makes *writes* concurrent, which SQLite does not want: two
+    /// deferred transactions that both read and then write deadlock on the
+    /// upgrade, and `busy_timeout` cannot break it. Leave it at 1 and reach for
+    /// [`read_pool_size`](Self::read_pool_size) instead — that is the knob for
+    /// concurrency, and it is safe because WAL readers never contend for the
+    /// write lock.
     pub pool_size: u32,
+    /// Extra connections reserved for read-only work, each free to run while a
+    /// write holds the write permit. `0` (default) keeps every operation on the
+    /// single queue, exactly as before this knob existed.
+    ///
+    /// WAL supports many concurrent readers alongside one writer, but that was
+    /// unreachable while one `pool_size` governed both the pool and the
+    /// serialization semaphore: the setting that would admit readers also
+    /// admitted concurrent writers. These connections are additional — the write
+    /// path keeps its own, so a burst of readers can never starve the writer.
+    ///
+    /// Costs one connection's page cache ([`cache_size_kib`](Self::cache_size_kib))
+    /// each, which is why it is off by default in a process holding many
+    /// per-session stores.
+    pub read_pool_size: u32,
     /// `PRAGMA cache_size`, in KiB per connection.
     pub cache_size_kib: u32,
     /// `PRAGMA mmap_size`, in bytes. `None` (default) leaves mmap off — the
@@ -182,6 +207,7 @@ impl Default for SqliteStoreConfig {
     fn default() -> Self {
         Self {
             pool_size: 1,
+            read_pool_size: 0,
             cache_size_kib: 512,
             mmap_size: None,
             busy_timeout: Duration::from_secs(30),
@@ -384,6 +410,10 @@ impl SqliteStore {
         // store (the default 1) carries exactly one connection, and raising it for real
         // concurrency keeps the two in step.
         let pool_size = config.pool_size.max(1);
+        // Reader connections sit ON TOP of the write pool rather than sharing it,
+        // so readers saturating their permits can never leave the writer waiting
+        // on r2d2 for a connection.
+        let read_pool_size = config.read_pool_size;
         let thread_pool = config.thread_pool.unwrap_or_else(shared_r2d2_thread_pool);
 
         let options = ConnectionOptions {
@@ -411,7 +441,7 @@ impl SqliteStore {
                 // nothing — a real failure surfaces on the next query. The shared thread pool
                 // avoids r2d2's per-pool management threads (see shared_r2d2_thread_pool).
                 let pool = Pool::builder()
-                    .max_size(pool_size)
+                    .max_size(pool_size + read_pool_size)
                     .test_on_check_out(false)
                     .thread_pool(thread_pool)
                     .connection_customizer(Box::new(options))
@@ -437,6 +467,10 @@ impl SqliteStore {
         Ok(Self {
             pool,
             db_semaphore: Arc::new(tokio::sync::Semaphore::new(pool_size as usize)),
+            // Bounded by the reader connections, so the number of blocking
+            // threads parked on `pool.get()` stays bounded too.
+            read_semaphore: (read_pool_size > 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(read_pool_size as usize))),
             database_path,
             device_id,
         })
@@ -3823,6 +3857,7 @@ mod tests {
         // thread pool) must build and operate identically — only the resource profile differs.
         let config = SqliteStoreConfig {
             pool_size: 2,
+            read_pool_size: 0,
             cache_size_kib: 4096,
             mmap_size: None,
             busy_timeout: Duration::from_secs(7),
