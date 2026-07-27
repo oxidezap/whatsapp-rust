@@ -135,7 +135,7 @@ const CHUNK_SIZE: usize = 1024;
 /// pin its buffer for the rest of the connection.
 const MAX_IDLE_CAPACITY: usize = 64 * 1024;
 
-/// Most the decoder will reserve for a frame whose bytes have not arrived.
+/// The most the decoder will reserve for a frame whose bytes have not arrived.
 ///
 /// The length prefix is the peer's claim, not evidence. Reserving the whole
 /// declared frame lets anyone who sends three bytes announcing 16 MiB, and then
@@ -214,9 +214,7 @@ impl FrameDecoder {
         if self.buffer.len() < FRAME_LENGTH_SIZE + frame_len {
             // The length prefix is known before the payload is, so a large frame
             // sizes the buffer ahead instead of growing geometrically across the
-            // reads that carry it. Capped, because the prefix is only the peer's
-            // claim: honouring it in full would let three bytes reserve 16 MiB
-            // that never arrives.
+            // reads that carry it, capped per [`MAX_EAGER_RESERVE`].
             let missing = FRAME_LENGTH_SIZE + frame_len - self.buffer.len();
             self.reserve_for(missing.min(MAX_EAGER_RESERVE));
             return None;
@@ -226,10 +224,18 @@ impl FrameDecoder {
         let frame_data = self.buffer.split_to(frame_len);
         trace!("<-- Decoded frame: {} bytes", frame_data.len());
 
-        if self.buffer.is_empty()
-            && (self.grew_oversized || self.buffer.capacity() > MAX_IDLE_CAPACITY)
+        // A frame rarely ends exactly on a read boundary, so what is left behind
+        // is usually the head of the next one, and that residue keeps the whole
+        // oversized allocation alive however few bytes it is. Copying a short
+        // residue into a fresh chunk lets the large allocation die with the
+        // frame. A long one is a frame still arriving that would have to grow
+        // the buffer straight back, so it is left where it already is.
+        if (self.grew_oversized || self.buffer.capacity() > MAX_IDLE_CAPACITY)
+            && self.buffer.len() <= CHUNK_SIZE
         {
-            self.buffer = BytesMut::with_capacity(CHUNK_SIZE);
+            let mut fresh = BytesMut::with_capacity(CHUNK_SIZE);
+            fresh.extend_from_slice(&self.buffer);
+            self.buffer = fresh;
             self.grew_oversized = false;
         }
 
@@ -514,6 +520,70 @@ mod tests {
             decoder.capacity_for_test() <= MAX_IDLE_CAPACITY,
             "decoder still holds {} bytes after an exactly consumed frame",
             decoder.capacity_for_test()
+        );
+    }
+
+    /// A read almost never ends on a frame boundary, so the realistic shape of
+    /// the case above is an oversized frame trailed by the first bytes of the
+    /// next one. Those few bytes are a live view into the large allocation and
+    /// keep all of it alive, for the rest of the connection if the rest of that
+    /// frame never arrives.
+    #[test]
+    fn an_oversized_buffer_is_released_when_a_short_tail_remains() {
+        let big = payload(200 * 1024, 0x55);
+        let mut decoder = FrameDecoder::new();
+
+        let mut wire = encode_frame(&big, None).expect("encode");
+        // Two bytes of the next frame's length prefix: not enough to decode, so
+        // the decoder parks holding them.
+        wire.extend_from_slice(&[0x00, 0x00]);
+        decoder.feed(&wire);
+
+        let frame = decoder.decode_frame().expect("big frame");
+        assert_eq!(&frame[..], &big[..]);
+
+        // `capacity()` cannot see this: the residue is a two-byte view, so it
+        // reports two bytes whether or not 200 KiB sits underneath it. Where it
+        // points is the observable fact. Adjacency to the frame just handed out
+        // means it is still the tail of that same allocation.
+        assert_ne!(
+            decoder.buffer.as_ptr() as usize,
+            frame.as_ptr() as usize + frame.len(),
+            "the residue is still a view into the oversized allocation"
+        );
+        drop(frame);
+
+        // And with the frame gone the decoder is sole owner of whatever it kept,
+        // so a reserve here would reclaim the large one rather than free it.
+        decoder.feed(&[0x01, 0x7F]);
+        assert!(
+            decoder.capacity_for_test() <= MAX_IDLE_CAPACITY,
+            "decoder reclaimed {} bytes behind a 2-byte tail",
+            decoder.capacity_for_test()
+        );
+
+        // The tail has to survive the move, or the stream desyncs.
+        let next = decoder.decode_frame().expect("the tailed frame completes");
+        assert_eq!(&next[..], &[0x7F]);
+    }
+
+    /// The counterpart: a residue that is itself a frame in flight is left
+    /// alone. Copying it would be paid per frame through a history sync, and
+    /// the buffer it was copied out of would have to be grown straight back.
+    #[test]
+    fn a_long_residue_is_not_copied_out_of_its_buffer() {
+        let big = payload(200 * 1024, 0x66);
+        let mut decoder = FrameDecoder::new();
+
+        let mut wire = encode_frame(&big, None).expect("encode");
+        wire.extend_from_slice(&encode_frame(&payload(8 * 1024, 0x77), None).expect("encode")[..]);
+        decoder.feed(&wire);
+
+        let frame = decoder.decode_frame().expect("big frame");
+        assert_eq!(
+            decoder.buffer.as_ptr() as usize,
+            frame.as_ptr() as usize + frame.len(),
+            "an 8 KiB frame in flight was copied out of the buffer it arrived in"
         );
     }
 
