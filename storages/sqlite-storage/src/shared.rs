@@ -45,13 +45,23 @@ impl SharedSqlite {
     /// Reads still take a permit — one per reader connection — so the number of
     /// blocking threads stays bounded by the pool.
     ///
+    /// `f` runs inside a deferred transaction, so every statement in it sees
+    /// one snapshot. The write permit used to supply that for free — while a
+    /// read held it the writer could not commit between its statements — and a
+    /// reader that resolves a chat's identity keys and then queries by them, or
+    /// collects search hits and then hydrates them, would otherwise straddle
+    /// two committed states and come back short. A deferred transaction over
+    /// read-only statements never asks for the write lock, so it pins the
+    /// snapshot without contending with the writer.
+    ///
     /// Only correct for statements that cannot write. A write sent through here
     /// escapes the serialization the store relies on and can deadlock against
     /// the real writer on the transaction upgrade, which `busy_timeout` cannot
     /// resolve. When a store has no reader connections configured
     /// ([`SqliteStoreConfig::read_pool_size`](crate::SqliteStoreConfig::read_pool_size)
-    /// left at 0) this is exactly [`run`](Self::run), so it is always safe to
-    /// call — it simply buys nothing until the embedder opts in.
+    /// left at 0) this queues on the write permit exactly like
+    /// [`run`](Self::run), so it is always safe to call — it simply buys no
+    /// concurrency until the embedder opts in.
     pub async fn read<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
@@ -61,7 +71,8 @@ impl SharedSqlite {
             .read_semaphore
             .clone()
             .unwrap_or_else(|| Arc::clone(&self.semaphore));
-        self.run_with(semaphore, f).await
+        self.run_with(semaphore, move |conn| read_snapshot(conn, f))
+            .await
     }
 
     async fn run_with<F, T>(&self, semaphore: Arc<tokio::sync::Semaphore>, f: F) -> Result<T>
@@ -84,6 +95,34 @@ impl SharedSqlite {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
+}
+
+/// Run `f` under one read snapshot.
+///
+/// Diesel's `transaction` needs an error type it can build from its own, and
+/// [`StoreError`] deliberately has no such conversion (callers choose how a
+/// database error is classified), so both travel in one enum and unwrap on the
+/// way out.
+fn read_snapshot<T>(
+    conn: &mut SqliteConnection,
+    f: impl FnOnce(&mut SqliteConnection) -> Result<T>,
+) -> Result<T> {
+    use diesel::connection::Connection as _;
+
+    enum TxnError {
+        Store(StoreError),
+        Diesel(diesel::result::Error),
+    }
+    impl From<diesel::result::Error> for TxnError {
+        fn from(e: diesel::result::Error) -> Self {
+            Self::Diesel(e)
+        }
+    }
+    conn.transaction::<T, TxnError, _>(|conn| f(conn).map_err(TxnError::Store))
+        .map_err(|e| match e {
+            TxnError::Store(e) => e,
+            TxnError::Diesel(e) => StoreError::Database(Box::new(e)),
+        })
 }
 
 impl SqliteStore {

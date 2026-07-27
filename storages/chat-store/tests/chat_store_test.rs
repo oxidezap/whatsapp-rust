@@ -4986,7 +4986,7 @@ async fn a_short_prefix_returns_newest_first_within_its_limit() {
     let events: Vec<Event> = (0..6)
         .map(|i| {
             message_event(
-                wa::Message::text(format!("hoje{i}")),
+                wa::Message::text(format!("hoje{i} agora")),
                 incoming_info(PEER, PEER, &format!("MSG-SP-{i}"), 1_700_000_000 + i),
             )
         })
@@ -4998,6 +4998,14 @@ async fn a_short_prefix_returns_newest_first_within_its_limit() {
         hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
         ["MSG-SP-5", "MSG-SP-4", "MSG-SP-3"],
         "newest first, capped at the limit"
+    );
+
+    // One short token demotes the WHOLE query to recency — the rule is `all`,
+    // not `any`, so a mixed-length search must not quietly go back to ranking.
+    let mixed = chat_store.search_messages("hoje a", 3).await.unwrap();
+    assert_eq!(
+        mixed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["MSG-SP-5", "MSG-SP-4", "MSG-SP-3"]
     );
 
     // A long-enough term still ranks, and still finds its message.
@@ -5026,4 +5034,110 @@ async fn scoped_search_rejects_an_empty_query_like_the_unscoped_one() {
             .len(),
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// Unavailable fanouts keep their type (#1150)
+// ---------------------------------------------------------------------------
+
+fn unavailable_event(
+    id: &str,
+    ts: i64,
+    unavailable_type: wacore::types::events::UnavailableType,
+) -> Event {
+    Event::UndecryptableMessage(
+        wacore::types::events::UndecryptableMessage::builder()
+            .info(Arc::new(incoming_info(PEER, PEER, id, ts)))
+            .is_unavailable(true)
+            .unavailable_type(unavailable_type)
+            .decrypt_fail_mode(wacore::types::events::DecryptFailMode::Show)
+            .build(),
+    )
+}
+
+/// The three unrecoverable fanouts are content the phone never shares with a
+/// companion, so their rows are permanent by design. Flattening them into the
+/// generic placeholder left a frontend rendering "waiting for this message"
+/// for something that will never arrive.
+#[tokio::test]
+async fn unrecoverable_fanouts_keep_their_type() {
+    use wacore::types::events::UnavailableType;
+
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let cases = [
+        (UnavailableType::ViewOnce, MessageKind::ViewOnce, "MSG-VO"),
+        (UnavailableType::Hosted, MessageKind::Hosted, "MSG-HO"),
+        (UnavailableType::Bot, MessageKind::Bot, "MSG-BO"),
+    ];
+
+    for (at, (unavailable_type, _, id)) in cases.iter().enumerate() {
+        feed(
+            &chat_store,
+            [unavailable_event(
+                id,
+                1_700_000_000 + at as i64,
+                *unavailable_type,
+            )],
+        )
+        .await;
+    }
+
+    for (unavailable_type, expected, id) in cases {
+        let row = chat_store
+            .message(&chat, id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{unavailable_type:?} should materialize"));
+        assert_eq!(row.kind, expected, "{unavailable_type:?}");
+        assert!(row.message.is_none(), "{unavailable_type:?}: no content");
+    }
+
+    // The chat preview carries it too, so a chat list can render the chip
+    // without opening the thread.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_kind, Some(MessageKind::Bot));
+}
+
+/// A plain fanout is still recoverable — PDO may fill it in — so it must keep
+/// the placeholder kind and the "yet" it implies.
+#[tokio::test]
+async fn a_recoverable_fanout_stays_undecryptable() {
+    use wacore::types::events::UnavailableType;
+
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    feed(
+        &chat_store,
+        [unavailable_event(
+            "MSG-PLAIN",
+            1_700_000_000,
+            UnavailableType::Unknown,
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        chat_store
+            .message(&chat, "MSG-PLAIN")
+            .await
+            .unwrap()
+            .unwrap()
+            .kind,
+        MessageKind::Undecryptable
+    );
+}
+
+/// The labels are on-disk values, so a reader on an older build still round
+/// trips them rather than losing the row.
+#[test]
+fn unavailable_kind_labels_are_stable() {
+    for (kind, label) in [
+        (MessageKind::ViewOnce, "view_once"),
+        (MessageKind::Hosted, "hosted"),
+        (MessageKind::Bot, "bot"),
+        (MessageKind::Undecryptable, "undecryptable"),
+    ] {
+        assert_eq!(kind.as_str(), label);
+    }
 }

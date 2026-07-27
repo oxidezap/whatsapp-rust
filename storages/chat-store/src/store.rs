@@ -21,7 +21,9 @@ use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 
 use crate::error::{ChatStoreError, Result, db_err};
-use crate::materialize::{KIND_UNDECRYPTABLE, MessageOp, classify, extract_text, message_kind};
+use crate::materialize::{
+    KIND_UNDECRYPTABLE, MessageOp, classify, extract_text, message_kind, unavailable_kind,
+};
 use crate::schema;
 use crate::types::StoreChange;
 
@@ -931,6 +933,11 @@ fn apply_event(
             Ok(())
         }
         Event::UndecryptableMessage(undec) => {
+            // A fanout the phone will never share with a companion is
+            // permanently unavailable, not "not decrypted yet". The two want
+            // opposite UI, so the row records which one it is instead of
+            // flattening both into the same placeholder.
+            let kind = unavailable_kind(undec.unavailable_type).unwrap_or(KIND_UNDECRYPTABLE);
             let wire = undec.info.source.chat.to_string();
             let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
             if chat != wire {
@@ -946,7 +953,7 @@ fn apply_event(
                     sender_jid: &sender,
                     from_me: undec.info.source.is_from_me,
                     timestamp_ms: undec.info.timestamp.timestamp_millis(),
-                    kind: KIND_UNDECRYPTABLE,
+                    kind,
                     text: None,
                     proto: None,
                     status: wa::web_message_info::Status::DELIVERY_ACK as i32,
@@ -965,7 +972,7 @@ fn apply_event(
                         msg_id: &undec.info.id,
                         ts_ms: undec.info.timestamp.timestamp_millis(),
                         preview: None,
-                        kind: Some(KIND_UNDECRYPTABLE),
+                        kind: Some(kind),
                         unread_delta: i32::from(!undec.info.source.is_from_me),
                     },
                 )?;

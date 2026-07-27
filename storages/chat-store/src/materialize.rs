@@ -2,7 +2,10 @@
 //! No I/O here so every rule is unit-testable without a database.
 
 use wacore::proto_helpers::MessageExt;
+use wacore::types::events::UnavailableType;
 use waproto::whatsapp as wa;
+
+use crate::types::MessageKind;
 
 /// What the writer should do with one inbound message.
 #[derive(Debug)]
@@ -93,6 +96,28 @@ pub(crate) fn message_kind(base: &wa::Message) -> &'static str {
 
 /// Kind label for a placeholder row of a message we could not decrypt.
 pub(crate) const KIND_UNDECRYPTABLE: &str = "undecryptable";
+
+/// Kind label for an `<unavailable>` fanout, or `None` when the failure is the
+/// ordinary kind a retry can still resolve.
+///
+/// The three unrecoverable subtypes are content the phone will never hand to a
+/// companion, so their rows are permanent by design — a frontend has to render
+/// them as their own thing (WA Web's one-time chip, for view-once) rather than
+/// as "waiting for this message", and it can only do that if the store keeps
+/// the distinction the wire made.
+///
+/// Deliberately re-stated here instead of forwarding `UnavailableType::as_str`:
+/// that string is the wire value and belongs to the protocol, while these are
+/// on-disk labels that must not move when a wire attribute is renamed.
+pub(crate) fn unavailable_kind(unavailable_type: UnavailableType) -> Option<&'static str> {
+    match unavailable_type {
+        UnavailableType::ViewOnce => Some(MessageKind::ViewOnce.as_str()),
+        UnavailableType::Hosted => Some(MessageKind::Hosted.as_str()),
+        UnavailableType::Bot => Some(MessageKind::Bot.as_str()),
+        // A plain fanout stays recoverable; PDO may still fill it in.
+        UnavailableType::Unknown => None,
+    }
+}
 
 /// Classify one decrypted message into its materialization op.
 pub(crate) fn classify(msg: &wa::Message) -> MessageOp {

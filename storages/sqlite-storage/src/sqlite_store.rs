@@ -219,6 +219,14 @@ impl Default for SqliteStoreConfig {
 }
 
 impl SqliteStoreConfig {
+    /// Reserve `n` connections for read-only work, so reads stop queueing
+    /// behind the write permit. See [`read_pool_size`](Self::read_pool_size)
+    /// for what it costs and why raising `pool_size` is not the same thing.
+    pub fn with_read_pool_size(mut self, n: u32) -> Self {
+        self.read_pool_size = n;
+        self
+    }
+
     /// Set `PRAGMA mmap_size` (bytes), enabling file-backed memory-mapped reads.
     /// Builder-style so new optional knobs don't force struct-literal churn;
     /// pass `0` to keep mmap off. See the [`SqliteStoreConfig::mmap_size`] caveat.

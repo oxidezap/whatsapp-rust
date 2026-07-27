@@ -34,8 +34,21 @@ pub enum MessageKind {
     ListResponse,
     Interactive,
     InteractiveResponse,
-    /// Placeholder for a message that could not be decrypted (yet).
+    /// Placeholder for a message that could not be decrypted **yet** — a
+    /// retry or a PDO placeholder-resend may still fill it in.
     Undecryptable,
+    /// A view-once photo, video or voice note the server fanned out as
+    /// `<unavailable>`. The phone never shares that content with a companion,
+    /// so unlike [`Undecryptable`](Self::Undecryptable) this will not resolve —
+    /// it is the one-time chip WA Web renders ("open on your phone"), not a
+    /// "waiting for this message" placeholder.
+    ViewOnce,
+    /// A hosted-content fanout. Permanently unavailable to a companion, like
+    /// [`ViewOnce`](Self::ViewOnce).
+    Hosted,
+    /// A bot-message fanout. Permanently unavailable to a companion, like
+    /// [`ViewOnce`](Self::ViewOnce).
+    Bot,
     /// Real content this crate version doesn't classify.
     Unknown,
     /// A database label written by a newer crate version.
@@ -68,6 +81,9 @@ impl MessageKind {
             Self::Interactive => "interactive",
             Self::InteractiveResponse => "interactive_response",
             Self::Undecryptable => "undecryptable",
+            Self::ViewOnce => "view_once",
+            Self::Hosted => "hosted",
+            Self::Bot => "bot",
             Self::Unknown => "unknown",
             Self::Other(label) => label,
         }
@@ -97,6 +113,9 @@ impl MessageKind {
             "interactive" => Self::Interactive,
             "interactive_response" => Self::InteractiveResponse,
             "undecryptable" => Self::Undecryptable,
+            "view_once" => Self::ViewOnce,
+            "hosted" => Self::Hosted,
+            "bot" => Self::Bot,
             "unknown" => Self::Unknown,
             _ => Self::Other(label),
         }

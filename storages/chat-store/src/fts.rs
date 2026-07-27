@@ -195,8 +195,11 @@ fn fts_hits(
 ) -> wacore::store::error::Result<Vec<FtsHit>> {
     use diesel::sql_types::{BigInt, Integer, Text};
 
-    // Constant fragments, never caller input.
-    let order = if ranked { "rank" } else { "f.rowid DESC" };
+    // Constant fragments, never caller input. `rank` is qualified because it is
+    // only unambiguous today by accident — `messages` has no such column, and
+    // an unqualified reference would silently start resolving to it if one were
+    // ever added.
+    let order = if ranked { "f.rank" } else { "f.rowid DESC" };
     let Some(first_key) = keys.first() else {
         return diesel::sql_query(format!(
             "SELECT f.rowid AS rowid
