@@ -97,6 +97,28 @@ pub(crate) enum ReceiverChainState {
     Closed { next_index: u32 },
 }
 
+/// Writes a chain key's material into the protobuf field, reusing the buffer
+/// already there when it is ours to reuse.
+///
+/// `Bytes` is immutable, so assigning a fresh `copy_from_slice` allocates on
+/// every ratchet advance, and the ratchet advances three times per message
+/// round trip. After a checkout the record is uniquely owned (the cache takes
+/// it out of its `Arc` with `try_unwrap`), so the old buffer is almost always
+/// reusable: take it, overwrite in place, and freeze it back. A buffer that is
+/// still shared, or one of an unexpected length, falls back to allocating,
+/// which is exactly the previous behaviour.
+fn write_chain_key(field: &mut Option<bytes::Bytes>, key: &[u8]) {
+    if let Some(existing) = field.take()
+        && existing.len() == key.len()
+        && let Ok(mut owned) = existing.try_into_mut()
+    {
+        owned.copy_from_slice(key);
+        *field = Some(owned.freeze());
+        return;
+    }
+    *field = Some(bytes::Bytes::copy_from_slice(key));
+}
+
 impl SessionState {
     pub fn from_session_structure(session: SessionStructure) -> Self {
         Self { session }
@@ -456,7 +478,7 @@ impl SessionState {
         match chain.chain_key.as_option_mut() {
             Some(existing) => {
                 existing.index = Some(next_chain_key.index());
-                existing.key = Some(Bytes::copy_from_slice(next_chain_key.key()));
+                write_chain_key(&mut existing.key, next_chain_key.key());
             }
             None => {
                 chain.chain_key = MessageField::some(session_structure::chain::ChainKey {
@@ -600,7 +622,7 @@ impl SessionState {
         match target.as_option_mut() {
             Some(existing) => {
                 existing.index = Some(chain_key.index());
-                existing.key = Some(Bytes::copy_from_slice(chain_key.key()));
+                write_chain_key(&mut existing.key, chain_key.key());
             }
             None => {
                 *target = MessageField::some(session_structure::chain::ChainKey {
@@ -2021,5 +2043,77 @@ mod tests {
             restored.previous_session_count(),
             consts::ARCHIVED_STATES_MAX_LENGTH
         );
+    }
+}
+
+#[cfg(test)]
+mod chain_key_buffer_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// The ratchet advances three times per message round trip, so the buffer
+    /// this writes into is the difference between one allocation per advance
+    /// and none. Reuse is only valid when the buffer is ours alone.
+    #[test]
+    fn a_uniquely_owned_buffer_is_written_in_place() {
+        let mut field = Some(Bytes::copy_from_slice(&[0u8; 32]));
+        let before = field.as_ref().expect("seeded").as_ptr();
+
+        write_chain_key(&mut field, &[7u8; 32]);
+
+        let after = field.as_ref().expect("written");
+        assert_eq!(
+            after.as_ref(),
+            &[7u8; 32],
+            "the new key must be what is read back"
+        );
+        assert_eq!(
+            after.as_ptr(),
+            before,
+            "a uniquely owned buffer must be reused, not replaced"
+        );
+    }
+
+    /// Bad path: a buffer someone else still holds cannot be overwritten, or
+    /// that holder would observe a key it never asked for. Falling back to a
+    /// fresh allocation is the whole point of the guard.
+    #[test]
+    fn a_shared_buffer_is_never_overwritten() {
+        let shared = Bytes::copy_from_slice(&[1u8; 32]);
+        let observer = shared.clone();
+        let mut field = Some(shared);
+
+        write_chain_key(&mut field, &[9u8; 32]);
+
+        assert_eq!(
+            observer.as_ref(),
+            &[1u8; 32],
+            "the other holder must still see what it had"
+        );
+        assert_eq!(field.expect("written").as_ref(), &[9u8; 32]);
+    }
+
+    /// Bad path: a stored key of the wrong length (a record from an older
+    /// format) must not be partially overwritten, leaving a key that is half
+    /// old and half new.
+    #[test]
+    fn a_buffer_of_the_wrong_length_is_replaced_whole() {
+        let mut field = Some(Bytes::copy_from_slice(&[3u8; 16]));
+
+        write_chain_key(&mut field, &[4u8; 32]);
+
+        let written = field.expect("written");
+        assert_eq!(written.len(), 32, "the new key's length wins");
+        assert_eq!(written.as_ref(), &[4u8; 32]);
+    }
+
+    /// An empty field is the None arm: nothing to reuse, so it allocates.
+    #[test]
+    fn an_absent_buffer_is_created() {
+        let mut field: Option<Bytes> = None;
+
+        write_chain_key(&mut field, &[5u8; 32]);
+
+        assert_eq!(field.expect("written").as_ref(), &[5u8; 32]);
     }
 }
