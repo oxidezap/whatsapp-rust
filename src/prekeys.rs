@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use wacore::iq::prekeys::{
     DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
 };
-use wacore::libsignal::protocol::{KeyPair, PreKeyBundle, PublicKey};
+use wacore::libsignal::protocol::{KeyPair, PublicKey};
 use wacore::libsignal::store::record_helpers::encode_pre_key_record_to;
 use wacore::store::commands::DeviceCommand;
 use wacore_binary::Jid;
@@ -147,7 +147,7 @@ impl Client {
         &self,
         jids: &[Jid],
         reason: Option<PreKeyFetchReason>,
-    ) -> Result<std::collections::HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         let spec = match reason {
             Some(r) => PreKeyFetchSpec::with_reason(jids.to_vec(), r),
             None => PreKeyFetchSpec::new(jids.to_vec()),
@@ -161,13 +161,13 @@ impl Client {
         // identity as the fallback in validateADVwithIdentityKey).
         let spec = spec.with_account_identities(self.collect_account_identities(jids).await);
 
-        let bundles = self.execute(spec).await?;
+        let outcome = self.execute(spec).await?;
 
-        for jid in bundles.keys() {
+        for jid in outcome.bundles.keys() {
             log::debug!("Successfully parsed pre-key bundle for {}", jid.observe());
         }
 
-        Ok(bundles)
+        Ok(outcome)
     }
 
     /// Load, for each companion JID, its account (device 0) identity key from the

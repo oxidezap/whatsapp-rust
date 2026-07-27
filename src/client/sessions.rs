@@ -323,9 +323,13 @@ impl Client {
 /// `wacore::request::ServerErrorCode` to cross the crate boundary. A downcast
 /// to either one alone silently answers `false` for the other, and the failure
 /// mode of that is the send failing exactly as it did before.
+/// The `<error code>` the server attaches to a device it no longer knows.
+const UNREGISTERED_DEVICE_CODE: u16 = 406;
+
 fn is_device_unregistered(err: &anyhow::Error) -> bool {
     use crate::error::ErrorChainExt;
-    err.server_rejection().is_some_and(|r| r.code == 406)
+    err.server_rejection()
+        .is_some_and(|r| r.code == UNREGISTERED_DEVICE_CODE)
 }
 
 /// The distinct users named by `jids`, in first-seen order.
@@ -457,6 +461,30 @@ impl Client {
             Err(e) => return Err(e),
         };
 
+        // The server named these individually, which is the per-device signal a
+        // batch-wide failure cannot give: refresh exactly their device lists and
+        // leave the rest of the batch alone. The send continues, because the
+        // devices that did come back with a bundle are unaffected and skipping
+        // them would deliver to fewer devices for a reason that only concerns
+        // the named ones.
+        if !prekey_bundles.rejected.is_empty() {
+            let rejected: Vec<Jid> = prekey_bundles
+                .rejected
+                .iter()
+                .filter(|device| device.code == UNREGISTERED_DEVICE_CODE)
+                .map(|device| device.jid.clone())
+                .collect();
+            if !rejected.is_empty() {
+                log::debug!(
+                    "prekey fetch rejected {} of {} device(s) as unregistered; \
+                     refreshing their device lists",
+                    rejected.len(),
+                    jids.len()
+                );
+                self.invalidate_device_caches_for(&rejected).await;
+            }
+        }
+
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<StdRng>();
 
@@ -465,7 +493,10 @@ impl Client {
         let mut failed_count = 0;
 
         for jid in jids {
-            if let Some(bundle) = prekey_bundles.get(&jid.normalize_for_prekey_bundle()) {
+            if let Some(bundle) = prekey_bundles
+                .bundles
+                .get(&jid.normalize_for_prekey_bundle())
+            {
                 match self
                     .install_prekey_bundle_cached(jid, bundle, &mut adapter, &mut rng)
                     .await

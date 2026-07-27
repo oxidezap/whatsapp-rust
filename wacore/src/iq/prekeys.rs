@@ -144,7 +144,7 @@ impl PreKeyFetchSpec {
 }
 
 impl IqSpec for PreKeyFetchSpec {
-    type Response = std::collections::HashMap<Jid, PreKeyBundle>;
+    type Response = crate::prekeys::PreKeyFetchOutcome;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let content = PreKeyUtils::build_fetch_prekeys_request(
