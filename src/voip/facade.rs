@@ -927,12 +927,8 @@ impl<'a> CallLinkCall<'a> {
         let generation = registry
             .generation_of(&join.call_id)
             .ok_or(CallError::Media("call-link registration was lost"))?;
-        let cleanup = scopeguard::guard(
-            (registry.clone(), join.call_id.clone(), generation),
-            |(registry, call_id, generation)| {
-                registry.remove_if_current(&call_id, generation);
-            },
-        );
+        let mut registration =
+            RegisteredCall::from_existing(self.client, &join.call_id, generation)?;
 
         let mut teardown = None;
         let update = loop {
@@ -996,19 +992,11 @@ impl<'a> CallLinkCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
-        let mut session = wacore::voip::CallSession::new_outgoing(
-            &join.call_id,
-            Jid::new(&join.call_id, Server::Call),
-            join.call_creator,
-        );
-        session.audio_format = Some(audio.config().format);
-        session.is_video = video.is_some();
-        session.group = Some(update);
-        let _ = session.transition_to(CallPhase::Calling);
-        let _ = session.transition_to(CallPhase::Connecting);
-        let handle = spawn_call(self.client, session, engine, &factory, audio, video).await?;
+        let handle =
+            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+                .await?;
+        registration.disarm();
         teardown.disarm();
-        let _ = scopeguard::ScopeGuard::into_inner(cleanup);
         Ok(handle)
     }
 }
@@ -1960,6 +1948,27 @@ impl RegisteredCall {
         }
     }
 
+    fn from_existing(client: &Client, call_id: &str, generation: u64) -> Result<Self, CallError> {
+        let registry = client.call_registry();
+        let session = registry
+            .snapshot_if_current(call_id, generation)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        let ended = Arc::new(EndedFlag::default());
+        registry.set_ended_notify(call_id, generation, {
+            let ended = ended.clone();
+            move || ended.notify()
+        });
+        Ok(Self {
+            registry,
+            call_id: call_id.to_string(),
+            peer_jid: session.peer_jid,
+            call_creator: session.call_creator,
+            generation,
+            ended,
+            armed: true,
+        })
+    }
+
     fn ensure_current(&self) -> Result<(), CallError> {
         if self.registry.generation_of(&self.call_id) == Some(self.generation) {
             Ok(())
@@ -2191,6 +2200,7 @@ async fn send_answer_terminate(client: &Client, call_id: &str, peer_jid: &Jid, c
 
 /// Spawn the call driver over `factory` after registering it. Generic over the relay factory so a
 /// test can inject an in-memory transport instead of the real DTLS/SCTP dialer.
+#[cfg(test)]
 async fn spawn_call(
     client: &Client,
     session: wacore::voip::CallSession,
@@ -6063,6 +6073,78 @@ mod tests {
             GroupControl::Update(update) => assert_eq!(update.transaction_id, 2),
             _ => panic!("expected the retained roster"),
         }
+    }
+
+    #[tokio::test]
+    async fn call_link_media_attachment_preserves_registered_generation_and_epoch() {
+        use wacore::voip::{GroupControl, GroupStateApply};
+
+        let client = make_client().await;
+        let call_id = "CALL-LINK-ATTACH";
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(7)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(true)
+            .participants(Vec::new())
+            .build();
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator,
+        );
+        session.group = Some(update);
+        let registry = client.call_registry();
+        let generation = registry.insert(session);
+        assert_eq!(
+            registry.apply_waiting_room(
+                wacore::types::group_call::WaitingRoom::builder()
+                    .call_id(call_id.to_string())
+                    .call_creator(Jid::new("111111111111111", Server::Lid))
+                    .link_token("TEST-CALL-LINK".to_string())
+                    .media(CallLinkMedia::Audio)
+                    .enabled(false)
+                    .is_admin(true)
+                    .transaction_id(7)
+                    .users(Vec::new())
+                    .build(),
+            ),
+            GroupStateApply::Applied
+        );
+        assert!(registry.send_group_epoch_if_current(call_id, generation, 7, vec![7; 32]));
+
+        let mut registration =
+            RegisteredCall::from_existing(&client, call_id, generation).expect("existing call");
+        assert_eq!(
+            registry.generation_of(call_id),
+            Some(generation),
+            "media attachment must not replace the admitted call-link generation"
+        );
+        assert!(
+            registry
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.waiting_room().cloned())
+                .is_some_and(|room| room.is_admin),
+            "the retained waiting-room/admin snapshot must survive media attachment"
+        );
+
+        let (tx, rx) = async_channel::bounded(4);
+        registry.set_group_control_sender(call_id, generation, tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 7
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 7
+        ));
+        registration.disarm();
+        registry.remove_if_current(call_id, generation);
     }
 
     #[tokio::test]

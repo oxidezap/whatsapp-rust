@@ -476,9 +476,9 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
 #[inline(never)]
 fn parse_group_relay_endpoint(node: &NodeRef<'_>) -> Result<GroupCallRelayEndpoint> {
     let mut attrs = node.attrs();
-    let relay_id = optional_u32(&mut attrs, "relay_id", "te2")?.unwrap_or_default();
-    let token_id = optional_u32(&mut attrs, "token_id", "te2")?.unwrap_or_default();
-    let auth_token_id = optional_u32(&mut attrs, "auth_token_id", "te2")?.unwrap_or_default();
+    let relay_id = required_u32(&mut attrs, "relay_id", "te2")?;
+    let token_id = required_u32(&mut attrs, "token_id", "te2")?;
+    let auth_token_id = required_u32(&mut attrs, "auth_token_id", "te2")?;
     let relay_name = required_string(&mut attrs, "relay_name", "te2")?;
     let domain_name = attrs
         .optional_string("domain_name")
@@ -774,6 +774,11 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>) -> Result<CallLinkJoin> {
         && (group.call_id != call_id || group.call_creator != call_creator)
     {
         bail!("waiting-room and admitted group identities differ");
+    }
+    if let Some(group) = &group
+        && group.media != media.as_str()
+    {
+        bail!("waiting-room and admitted group media modes differ");
     }
     Ok(CallLinkJoin {
         token,
@@ -1760,6 +1765,23 @@ mod tests {
     }
 
     #[test]
+    fn relay_endpoint_rejects_missing_credential_bindings() {
+        for missing in ["relay_id", "token_id", "auth_token_id"] {
+            let mut endpoint = NodeBuilder::new("te2").attr("relay_name", "gru1c02");
+            for (name, value) in [("relay_id", "3"), ("token_id", "0"), ("auth_token_id", "0")] {
+                if name != missing {
+                    endpoint = endpoint.attr(name, value);
+                }
+            }
+            let endpoint = endpoint.bytes(vec![1, 2, 3, 4, 0x1f, 0x90]).build();
+            assert!(
+                parse_group_relay_endpoint(&endpoint.as_node_ref()).is_err(),
+                "a relay endpoint without {missing} must not acquire credential zero"
+            );
+        }
+    }
+
+    #[test]
     fn call_link_join_distinguishes_waiting_and_admitted() {
         let creator = jid("100001", 1);
         let waiting = NodeBuilder::new("ack")
@@ -1793,6 +1815,33 @@ mod tests {
         let result = parse_call_link_join_ack(&admitted.as_node_ref()).unwrap();
         assert!(!result.in_waiting_room);
         assert_eq!(result.group.unwrap().transaction_id, 5);
+
+        let conflicting_media = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "link_join")
+            .children([
+                NodeBuilder::new("waiting_room")
+                    .attr("call-id", "CID")
+                    .attr("call-creator", &creator)
+                    .attr("link-token", "TOKEN")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "4")
+                    .build(),
+                NodeBuilder::new("group_info")
+                    .attr("call-id", "CID")
+                    .attr("call-creator", &creator)
+                    .attr("transaction-id", "5")
+                    .attr("media", "video")
+                    .attr("connected-limit", "8")
+                    .build(),
+            ])
+            .build();
+        assert!(
+            parse_call_link_join_ack(&conflicting_media.as_node_ref()).is_err(),
+            "one admitted ACK cannot describe two authoritative media modes"
+        );
 
         let disabled_waiting_only = NodeBuilder::new("ack")
             .attr("class", "call")
