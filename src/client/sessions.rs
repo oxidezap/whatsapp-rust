@@ -315,8 +315,17 @@ impl Client {
 ///
 /// Batch-wide by nature: the fetch is one IQ, so a `406` answers for every jid
 /// in it rather than naming one.
+///
+/// Asked through `server_rejection` rather than by downcasting to one error
+/// type. This preflight calls `fetch_pre_keys` directly and gets a
+/// `crate::request::IqError::ServerError`; the fan-out reaches the same fetch
+/// through `SendContextResolver`, which re-wraps it as a
+/// `wacore::request::ServerErrorCode` to cross the crate boundary. A downcast
+/// to either one alone silently answers `false` for the other, and the failure
+/// mode of that is the send failing exactly as it did before.
 fn is_device_unregistered(err: &anyhow::Error) -> bool {
-    wacore::request::ServerErrorCode::from_anyhow(err).is_some_and(|e| e.code == 406)
+    use crate::error::ErrorChainExt;
+    err.server_rejection().is_some_and(|r| r.code == 406)
 }
 
 /// The distinct users named by `jids`, in first-seen order.
@@ -587,25 +596,38 @@ mod tests {
     /// prekeys" and the message would go out to fewer devices than it should.
     #[test]
     fn only_a_406_counts_as_an_unregistered_device() {
-        let unregistered = anyhow::Error::new(wacore::request::ServerErrorCode {
-            code: 406,
-            text: "not-acceptable".to_string(),
-            error_type: None,
-            backoff: None,
-        });
-        assert!(is_device_unregistered(&unregistered));
-
-        for code in [400, 401, 403, 404, 429, 500, 503] {
-            let other = anyhow::Error::new(wacore::request::ServerErrorCode {
+        // Both spellings, because they are both real: this preflight calls
+        // `fetch_pre_keys` directly and receives the first, while the fan-out
+        // goes through `SendContextResolver`, which re-wraps it as the second.
+        let as_iq_error = |code| {
+            anyhow::Error::new(crate::request::IqError::ServerError {
                 code,
-                text: "other".to_string(),
+                text: "not-acceptable".to_string(),
                 error_type: None,
                 backoff: None,
-            });
+            })
+        };
+        let as_shared = |code| {
+            anyhow::Error::new(wacore::request::ServerErrorCode {
+                code,
+                text: "not-acceptable".to_string(),
+                error_type: None,
+                backoff: None,
+            })
+        };
+
+        assert!(
+            is_device_unregistered(&as_iq_error(406)),
+            "the error this preflight actually receives must be recognised"
+        );
+        assert!(is_device_unregistered(&as_shared(406)));
+
+        for code in [400, 401, 403, 404, 429, 500, 503] {
             assert!(
-                !is_device_unregistered(&other),
+                !is_device_unregistered(&as_iq_error(code)),
                 "a {code} must not be treated as an unregistered device"
             );
+            assert!(!is_device_unregistered(&as_shared(code)));
         }
 
         // Not every failure is a server error at all.
