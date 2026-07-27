@@ -81,6 +81,14 @@ pub struct PreparedDmStanza {
     /// caller can persist it for later addon (msmsg/poll/edit) decryption.
     /// `None` when the message had no reporting token (no secret was used).
     pub message_secret: Option<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>,
+    /// Whether a prekey fetch during this fan-out came back `406`, meaning the
+    /// server no longer knows a device our cached list still names.
+    ///
+    /// The caller invalidates the recipient's device cache on this, the way the
+    /// group path already does with `stale_device_users`. Without it the next
+    /// send to the same chat fans out to the same absent device and gets the
+    /// same 406.
+    pub had_unregistered_device: bool,
 }
 
 pub struct DmStanzaRequest<'a> {
@@ -186,6 +194,7 @@ pub async fn prepare_dm_stanza(
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
+    let mut had_unregistered_device = false;
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
 
@@ -212,6 +221,7 @@ pub async fn prepare_dm_stanza(
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        had_unregistered_device |= summary.had_unregistered_device;
     }
 
     if !own_other_devices.is_empty() {
@@ -227,6 +237,7 @@ pub async fn prepare_dm_stanza(
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        had_unregistered_device |= summary.had_unregistered_device;
     }
 
     // All per-device encrypts failed: an empty <participants> would silently
@@ -286,6 +297,7 @@ pub async fn prepare_dm_stanza(
     let stanza = stanza_builder.children(message_content_nodes).build();
 
     Ok(PreparedDmStanza {
+        had_unregistered_device,
         node: stanza,
         phash,
         message_secret: reporting_result.map(|r| r.message_secret),

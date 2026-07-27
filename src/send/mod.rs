@@ -164,6 +164,12 @@ struct SendBranchOutput {
     distribution_guard: Option<async_lock::MutexGuardArc<()>>,
     issue_tc_token_after_send: bool,
     dm_phash: Option<wacore_binary::CompactString>,
+    /// DM sends: the user whose device cache went stale, because a prekey fetch
+    /// in this fan-out came back `406` for a device we still had cached.
+    ///
+    /// The group path carries the same signal as `SkdmUpdate::stale_users`. Both
+    /// are acted on in the same place after the send.
+    dm_stale_device_user: Option<wacore_binary::CompactString>,
 }
 
 struct GroupBranchRequest<'a> {
@@ -261,6 +267,7 @@ impl SendBranchOutput {
             group_sender_identity: None,
             skdm_update: None,
             distribution_guard: None,
+            dm_stale_device_user: None,
             issue_tc_token_after_send: false,
             dm_phash: None,
         }
@@ -1709,6 +1716,7 @@ impl Client {
             distribution_guard,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             dm_phash,
+            dm_stale_device_user,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
@@ -1823,6 +1831,17 @@ impl Client {
             for user in &update.stale_users {
                 self.invalidate_device_cache(user).await;
             }
+        }
+        // After the send, not before: the fan-out that produced this signal
+        // already skipped the absent device, so invalidating first would only
+        // delay the stanza behind a usync the next send pays for anyway.
+        //
+        // The phash check can reach the same conclusion from the server's ACK
+        // and invalidate the same user, but only when the ACK carries a phash.
+        // This path does not depend on that, and `invalidate_device_cache` is
+        // idempotent, so the overlap costs nothing.
+        if let Some(user) = &dm_stale_device_user {
+            self.invalidate_device_cache(user).await;
         }
         // Warm marking is visible; a waiting cold send may now re-resolve.
         drop(distribution_guard);
@@ -2252,6 +2271,8 @@ impl Client {
             msg_secret: outbound_msg_secret,
             group_sender_identity: outbound_group_sender_identity,
             skdm_update,
+            // Groups carry the same signal through `SkdmUpdate::stale_users`.
+            dm_stale_device_user: None,
             distribution_guard,
             issue_tc_token_after_send: false,
             dm_phash: None,
@@ -2410,6 +2431,10 @@ impl Client {
             distribution_guard: None,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             dm_phash: prepared.phash,
+            // Either namespace resolves to both: `invalidate_device_cache`
+            // looks the user up through `resolve_lookup_keys`, which returns the
+            // PN and LID keys for whichever one it is handed.
+            dm_stale_device_user: prepared.had_unregistered_device.then(|| to.user.clone()),
         })
     }
 
@@ -5543,6 +5568,7 @@ mod tests {
             node: NodeBuilder::new("message").build(),
             phash: None,
             message_secret: Some(result.message_secret),
+            had_unregistered_device: false,
         };
         assert_eq!(prepared.message_secret.as_ref().unwrap().len(), 32);
     }

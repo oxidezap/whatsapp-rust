@@ -4509,6 +4509,134 @@ mod local_identity_change_on_send {
             );
         }
 
+        /// A `406` while fetching prekeys means the server no longer knows a
+        /// device our cached list still names, so the list is stale. The group
+        /// path already acts on that; the DM path used to drop the signal, and
+        /// the next send to the same chat would fan out to the same absent
+        /// device and collect the same 406.
+        #[tokio::test]
+        async fn a_dm_reports_the_stale_device_list_behind_a_406() {
+            let own_jid: Jid = "5511900000020:0@s.whatsapp.net".parse().unwrap();
+            let warm: Jid = "5511900000021:0@s.whatsapp.net".parse().unwrap();
+            let cold: Jid = "5511900000021:1@s.whatsapp.net".parse().unwrap();
+
+            // Only `warm` has a session, so `cold` is what sends the fan-out to
+            // the prekey fetch that answers 406.
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_prekey_error(406);
+            let devices = ResolvedDmDevices::new(
+                vec![warm.clone(), cold.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+            let to = warm.to_non_ad();
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let prepared = prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    account: None,
+                    to: &to,
+                    message: &message,
+                    message_id: "DM_406_1",
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("the warm device still encrypts, so the send goes out");
+
+            assert!(
+                prepared.had_unregistered_device,
+                "the 406 must reach the caller so it can invalidate the device cache"
+            );
+            // The send is not failed by it: the devices that do have sessions
+            // still receive the message, which is what WA Web does too.
+            let participants = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node");
+            assert_eq!(
+                participants.children().expect("children").len(),
+                1,
+                "the warm device is encrypted for, the 406 device is skipped"
+            );
+        }
+
+        /// The counterpart, so the flag cannot simply be hardcoded true: a
+        /// fan-out where every device has a session never fetches a prekey and
+        /// therefore never sees a 406.
+        #[tokio::test]
+        async fn a_dm_with_every_session_warm_reports_no_stale_device() {
+            let own_jid: Jid = "5511900000030:0@s.whatsapp.net".parse().unwrap();
+            let warm: Jid = "5511900000031:0@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            // Armed with the same failure, and never reached.
+            let resolver = MockSendContextResolver::new().with_prekey_error(406);
+            let devices =
+                ResolvedDmDevices::new(vec![warm.clone(), own_jid.clone()], &own_jid, None);
+            let to = warm.to_non_ad();
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let prepared = prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    account: None,
+                    to: &to,
+                    message: &message,
+                    message_id: "DM_406_2",
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("dm stanza");
+
+            assert!(
+                !prepared.had_unregistered_device,
+                "no prekey fetch happened, so nothing can have reported a 406"
+            );
+        }
+
         /// End to end through `prepare_dm_stanza`: recipient devices and own
         /// companion devices are two separate fan-outs but one participant
         /// list, recipients first.
