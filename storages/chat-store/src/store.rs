@@ -598,15 +598,13 @@ async fn writer_loop(
 
         if !batch.is_empty() {
             // The deferred acks move into the blocking closure, so keep the
-            // pre-image here. It is the correct state for EVERY way this batch
-            // can fail: a rolled-back transaction applied none of the acks it
-            // consumed, and a pool or task failure never returns the queue at
-            // all. Without it, an ack consumed by an insert that did not
-            // survive would leave the re-recorded row pending forever — the
-            // exact loss this queue exists to prevent. Deferred acks are rare,
-            // so the usual clone is of an empty queue.
+            // pre-batch state here: it is what a failure has to fold back onto,
+            // whether the transaction rolled back or the pool/task never
+            // returned the queue at all. Deferred acks are rare, so the usual
+            // clone is of an empty queue.
+            deferred_acks.begin_batch();
             let carried = std::mem::take(&mut deferred_acks);
-            let pre_image = carried.clone();
+            let pre_batch = carried.clone();
             let result = db
                 .run(move |conn| {
                     let mut deferred = carried;
@@ -627,12 +625,19 @@ async fn writer_loop(
                     deferred_acks = carried;
                     emit_changes(&changes, cs);
                 }
-                // Nothing committed — whether the transaction rolled back or
-                // the pool/task failed outright. State stays consistent
-                // (previous commit) but this slice of history is lost;
-                // surfacing beats crashing the writer.
-                Ok((Err(e), _)) | Err(e) => {
-                    deferred_acks = pre_image;
+                // The transaction rolled back: nothing committed, but the queue
+                // came back, so its additions can be replayed onto the
+                // pre-batch state.
+                Ok((Err(e), carried)) => {
+                    deferred_acks = carried.rolled_back(pre_batch);
+                    warn!("chat-store: dropping write batch: {e}");
+                    pending_error = Some(e.to_string());
+                }
+                // The pool or the blocking task failed, so the queue never came
+                // back. The pre-batch state is all that is recoverable; acks
+                // this batch deferred die with it.
+                Err(e) => {
+                    deferred_acks = pre_batch;
                     warn!("chat-store: dropping write batch: {e}");
                     pending_error = Some(e.to_string());
                 }
@@ -1904,6 +1909,18 @@ pub(crate) struct DeferredAcks {
     /// Oldest first — pushes append, so the queue is sorted by age and expiry
     /// is a prefix drain.
     entries: std::collections::VecDeque<DeferredAck>,
+    /// Everything [`defer`](Self::defer) added since [`begin_batch`], kept even
+    /// after `take_matching` consumes it.
+    ///
+    /// A batch's two kinds of mutation roll back in opposite directions. A
+    /// consumption must be undone — the insert that took the ack did not
+    /// survive, so the ack is still owed a row. An addition must NOT be undone:
+    /// its `ServerAck` event is already off the writer channel and there is no
+    /// redelivery for it, so this queue is the only remaining record. Losing it
+    /// is precisely the silent, permanent drop the queue exists to prevent.
+    ///
+    /// [`begin_batch`]: Self::begin_batch
+    added_this_batch: Vec<DeferredAck>,
 }
 
 #[derive(Clone)]
@@ -1935,8 +1952,8 @@ impl DeferredAcks {
         }
     }
 
-    fn defer(&mut self, ack: &wacore::types::events::ServerAck, chat: Option<String>, now_ms: i64) {
-        self.expire(now_ms);
+    /// Append within the cap, evicting the oldest waiter to make room.
+    fn push_bounded(&mut self, entry: DeferredAck) {
         if self.entries.len() >= DEFERRED_ACK_CAP
             && let Some(evicted) = self.entries.pop_front()
         {
@@ -1946,11 +1963,36 @@ impl DeferredAcks {
                 evicted.ack.id
             );
         }
-        self.entries.push_back(DeferredAck {
+        self.entries.push_back(entry);
+    }
+
+    /// Open a writer batch: the previous batch's additions are settled and no
+    /// longer need replaying.
+    fn begin_batch(&mut self) {
+        self.added_this_batch.clear();
+    }
+
+    /// Fold a batch that did not commit back onto the state it started from.
+    ///
+    /// The pre-batch queue is the truth for consumptions — the inserts that
+    /// took those acks rolled back, so they are still owed rows. The batch's
+    /// additions ride along on top, because nothing will deliver them again.
+    fn rolled_back(self, mut pre_batch: Self) -> Self {
+        for entry in self.added_this_batch {
+            pre_batch.push_bounded(entry);
+        }
+        pre_batch
+    }
+
+    fn defer(&mut self, ack: &wacore::types::events::ServerAck, chat: Option<String>, now_ms: i64) {
+        self.expire(now_ms);
+        let entry = DeferredAck {
             deferred_at_ms: now_ms,
             chat,
             ack: ack.clone(),
-        });
+        };
+        self.added_this_batch.push(entry.clone());
+        self.push_bounded(entry);
     }
 
     fn take_matching(
@@ -2790,19 +2832,81 @@ mod deferred_ack_tests {
         );
     }
 
-    /// A batch that rolls back must leave the queue as it found it: the ack an
-    /// insert consumed was never applied, so re-recording the row has to find
-    /// it still waiting. `writer_loop` restores this snapshot on error.
+    /// A rolled-back batch undoes what it consumed: the insert that took the
+    /// ack did not survive, so the ack is still owed a row.
     #[test]
-    fn a_snapshot_restores_a_consumed_ack() {
+    fn rollback_gives_back_a_consumed_ack() {
         let mut acks = DeferredAcks::default();
         acks.defer(&ack("OUT-1"), None, 0);
 
-        let snapshot = acks.clone();
+        acks.begin_batch();
+        let pre_batch = acks.clone();
         assert_eq!(acks.take_matching("OUT-1", CHAT, 0).unwrap().id, "OUT-1");
         assert!(acks.take_matching("OUT-1", CHAT, 0).is_none());
 
-        acks = snapshot;
+        acks = acks.rolled_back(pre_batch);
         assert_eq!(acks.take_matching("OUT-1", CHAT, 0).unwrap().id, "OUT-1");
+    }
+
+    /// ...but it must NOT undo what it added. A `ServerAck` event is off the
+    /// writer channel by then and never redelivered, so dropping the deferral
+    /// is the silent permanent loss this whole queue exists to prevent.
+    #[test]
+    fn rollback_keeps_an_ack_the_batch_deferred() {
+        let mut acks = DeferredAcks::default();
+
+        acks.begin_batch();
+        let pre_batch = acks.clone();
+        acks.defer(&ack("OUT-NEW"), None, 0);
+
+        acks = acks.rolled_back(pre_batch);
+        assert_eq!(
+            acks.take_matching("OUT-NEW", CHAT, 0).unwrap().id,
+            "OUT-NEW"
+        );
+    }
+
+    /// An ack deferred AND consumed inside the same failed batch loses both
+    /// mutations, so it is owed a row again.
+    #[test]
+    fn rollback_keeps_an_ack_the_batch_deferred_then_consumed() {
+        let mut acks = DeferredAcks::default();
+
+        acks.begin_batch();
+        let pre_batch = acks.clone();
+        acks.defer(&ack("OUT-BOTH"), None, 0);
+        assert_eq!(
+            acks.take_matching("OUT-BOTH", CHAT, 0).unwrap().id,
+            "OUT-BOTH"
+        );
+
+        acks = acks.rolled_back(pre_batch);
+        assert_eq!(
+            acks.take_matching("OUT-BOTH", CHAT, 0).unwrap().id,
+            "OUT-BOTH"
+        );
+    }
+
+    /// A committed batch settles its additions; the next rollback must not
+    /// resurrect them.
+    #[test]
+    fn a_new_batch_forgets_the_previous_batch_additions() {
+        let mut acks = DeferredAcks::default();
+        acks.begin_batch();
+        acks.defer(&ack("OUT-OLD"), None, 0);
+        assert_eq!(
+            acks.take_matching("OUT-OLD", CHAT, 0).unwrap().id,
+            "OUT-OLD"
+        );
+
+        // Next batch commits nothing of its own and rolls back.
+        acks.begin_batch();
+        let pre_batch = acks.clone();
+        acks = acks.rolled_back(pre_batch);
+
+        assert!(
+            acks.take_matching("OUT-OLD", CHAT, 0).is_none(),
+            "the previous batch committed that consumption"
+        );
     }
 }
