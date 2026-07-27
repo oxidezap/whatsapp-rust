@@ -39,7 +39,7 @@ danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
 # Activates getrandom's wasm_js backend so rand works in the browser.
 js = ["getrandom/wasm_js"]
 # VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default.
-voip = ["dep:aes-gcm", "dep:zerocopy"]
+voip = ["dep:aes-gcm", "dep:zeroize", "dep:zerocopy"]
 # Built-in PCM/MLOW adapter. Encoded audio transport needs only `voip`.
 voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
@@ -88,7 +88,7 @@ tracing = { workspace = true, optional = true }
 typed-builder = "0.23"
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }
-zeroize = { workspace = true }
+zeroize = { workspace = true, optional = true }
 wacore-derive = { workspace = true }
 wacore-libsignal = { workspace = true }
 wacore-noise = { workspace = true }

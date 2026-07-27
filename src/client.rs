@@ -306,6 +306,9 @@ pub struct MemoryReport {
     /// Admission snapshots retained while a call-link join ACK is in flight.
     #[cfg(feature = "voip-runtime")]
     pub pending_call_link_updates: CollectionStats,
+    /// Active/ringing call registry entries, including authoritative group snapshots and queues.
+    #[cfg(feature = "voip-runtime")]
+    pub active_calls: CollectionStats,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -352,7 +355,9 @@ impl MemoryReport {
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
         #[cfg(feature = "voip-runtime")]
-        let total = total.saturating_add(self.pending_call_link_updates.bytes);
+        let total = total
+            .saturating_add(self.pending_call_link_updates.bytes)
+            .saturating_add(self.active_calls.bytes);
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -430,8 +435,9 @@ impl std::fmt::Display for MemoryReport {
         }
         #[cfg(feature = "voip-runtime")]
         {
-            writeln!(f, "--- In-flight VoIP signaling ---")?;
+            writeln!(f, "--- VoIP state ---")?;
             line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
+            line(f, "active_calls:", &self.active_calls)?;
         }
         writeln!(f, "--- In-flight history sync ---")?;
         line(

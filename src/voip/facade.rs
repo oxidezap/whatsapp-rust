@@ -221,7 +221,7 @@ impl<'a> AcceptCall<'a> {
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
         session.audio_format = Some(audio_config.format);
         session.is_video = has_video;
-        session.group = group;
+        session.group = group.clone();
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
         // a call that has already ended.
@@ -242,7 +242,7 @@ impl<'a> AcceptCall<'a> {
             &registration,
             &mut teardown,
             preaccept,
-            self.build_engine(has_video, audio_config),
+            self.build_engine(has_video, audio_config, group),
         )
         .await?;
         debug_assert_eq!(built_call_id, registration.call_id);
@@ -292,6 +292,7 @@ impl<'a> AcceptCall<'a> {
         &self,
         enable_video: bool,
         audio: AudioConfig,
+        group: Option<GroupCallUpdate>,
     ) -> Result<(CallEngine, String, SocketAddr), CallError> {
         let CallAction::Offer {
             call_id,
@@ -308,13 +309,7 @@ impl<'a> AcceptCall<'a> {
         // Our own device LID: used both to pick the callKey enc for THIS device (a multi-device
         // offer lists one per `<destination><to jid>`) and as the send-side SRTP participant id.
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
-        let latest_group = self
-            .client
-            .call_registry()
-            .group_state(call_id)
-            .and_then(|state| state.snapshot().cloned())
-            .or_else(|| self.incoming.group.as_deref().cloned());
-        if let Some(group) = latest_group.as_ref()
+        if let Some(group) = group.as_ref()
             && let Some(relay) = group.relay.as_ref()
         {
             let self_lid = own_lid.to_string();
@@ -736,7 +731,7 @@ impl<'a> OutgoingGroupCall<'a> {
         let mut registration = RegisteredCall::new(self.client, session).await;
         // Sending is delivery-ambiguous: cancellation can drop this future after the server has
         // accepted the bytes but before send_node returns. Arm cleanup before crossing that await.
-        let mut teardown = GroupOfferTeardown::new(self.client, &call_id, &own_lid);
+        let mut teardown = GroupOfferTeardown::new(self.client, &mut registration);
         if let Err(error) = self.client.send_node(offer).await {
             return Err(error.into());
         }
@@ -980,9 +975,8 @@ impl<'a> CallLinkCall<'a> {
                 // Admission has committed this endpoint server-side even when relay material is
                 // delivered by a later snapshot. Arm cleanup at that transition, not after relay,
                 // so cancellation cannot strand the admitted endpoint in the remote roster.
-                teardown.get_or_insert_with(|| {
-                    GroupOfferTeardown::new(self.client, &join.call_id, &join.call_creator)
-                });
+                teardown
+                    .get_or_insert_with(|| GroupOfferTeardown::new(self.client, &mut registration));
                 if update.relay.is_some() {
                     break update;
                 }
@@ -2058,8 +2052,10 @@ struct AnswerTeardown {
 
 struct GroupOfferTeardown {
     client: std::sync::Weak<Client>,
+    registry: Arc<wacore::voip::CallRegistry>,
     call_id: String,
     call_creator: Jid,
+    generation: u64,
     armed: bool,
 }
 
@@ -2127,13 +2123,19 @@ impl Drop for GroupRekeyTeardown {
 }
 
 impl GroupOfferTeardown {
-    fn new(client: &Client, call_id: &str, call_creator: &Jid) -> Self {
-        Self {
+    fn new(client: &Client, registration: &mut RegisteredCall) -> Self {
+        let teardown = Self {
             client: client_weak(client),
-            call_id: call_id.to_string(),
-            call_creator: call_creator.clone(),
+            registry: registration.registry.clone(),
+            call_id: registration.call_id.clone(),
+            call_creator: registration.call_creator.clone(),
+            generation: registration.generation,
             armed: true,
-        }
+        };
+        // Transfer setup cleanup ownership before this guard can be dropped. Its async teardown
+        // must remain able to claim the generation after the surrounding future is cancelled.
+        registration.disarm();
+        teardown
     }
 
     fn disarm(&mut self) {
@@ -2149,11 +2151,20 @@ impl Drop for GroupOfferTeardown {
         let Some(client) = self.client.upgrade() else {
             return;
         };
+        let registry = self.registry.clone();
         let call_id = self.call_id.clone();
         let call_creator = self.call_creator.clone();
+        let generation = self.generation;
         let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
+                // Claim this exact setup while holding the call-id transition lane through the
+                // terminal send. A replacement either wins first (and suppresses this stale
+                // terminate) or waits until the old call-scoped terminate is on the wire.
+                let _transition = client.lock_answer_transition(&call_id).await;
+                if !registry.remove_if_current(&call_id, generation) {
+                    return;
+                }
                 let target = Jid::new(&call_id, Server::Call);
                 send_answer_terminate(&client, &call_id, &target, &call_creator).await;
             }))
@@ -3696,7 +3707,7 @@ mod tests {
             )))
             .await;
         let targets = (0..=GROUP_CALL_MAX_REMOTE_PARTICIPANTS)
-            .map(|index| Jid::new(format!("1555000{index:04}"), Server::Pn))
+            .map(|index| Jid::new(format!("1202555{:04}", 100 + index), Server::Pn))
             .collect::<Vec<_>>();
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
@@ -5905,8 +5916,15 @@ mod tests {
         let (client, _sent_count) = make_sending_client().await;
         let call_id = "GROUP-OFFER-FAILED";
         let creator = Jid::new("111111111111111", Server::Lid);
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator,
+        );
+        let _ = session.transition_to(CallPhase::Calling);
+        let mut registration = RegisteredCall::new(&client, session).await;
         let terminate_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
-        drop(GroupOfferTeardown::new(&client, call_id, &creator));
+        drop(GroupOfferTeardown::new(&client, &mut registration));
 
         let terminate = tokio::time::timeout(Duration::from_secs(2), terminate_waiter)
             .await
@@ -5922,6 +5940,41 @@ mod tests {
         assert_eq!(
             action.attrs().optional_string("call-id").as_deref(),
             Some(call_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn group_offer_teardown_serializes_reoffer_until_terminate_is_sent() {
+        let client = make_client().await;
+        let (transport, entered_rx, release_tx) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let mut registration = RegisteredCall::new(&client, mk_session()).await;
+        let stale_generation = registration.generation;
+        drop(GroupOfferTeardown::new(&client, &mut registration));
+
+        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("terminate transport attempt")
+            .expect("send gate");
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            None,
+            "the failed generation is claimed before its terminal send"
+        );
+
+        let mut replacement = Box::pin(RegisteredCall::new(&client, mk_session()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), replacement.as_mut())
+                .await
+                .is_err(),
+            "a same-call-id re-offer must wait while group termination is in flight"
+        );
+        release_tx.send(()).await.expect("release terminate send");
+        let replacement = replacement.await;
+        assert_ne!(replacement.generation, stale_generation);
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            Some(replacement.generation)
         );
     }
 

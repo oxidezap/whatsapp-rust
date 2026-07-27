@@ -140,6 +140,29 @@ impl CallSession {
     }
 }
 
+impl crate::stats::HeapSize for CallSession {
+    fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        self.call_id.heap_bytes()
+            + self.peer_jid.heap_bytes()
+            + self.call_creator.heap_bytes()
+            + self.ring_devices.capacity() * size_of::<Jid>()
+            + self
+                .ring_devices
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+            + self
+                .answering_device
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
 /// Lifecycle ordinal for the forward-progress check in [`CallSession::transition_to`] (higher =
 /// later in the call). `Ended` is handled separately, so its rank is never compared.
 fn phase_rank(p: CallPhase) -> u8 {
@@ -324,6 +347,11 @@ pub struct MediaPipeline {
     recv_srtcp_replay: SrtcpReplayState,
 }
 
+pub(crate) struct SendRekey {
+    rtp: E2eSrtpKeys,
+    rtcp: E2eSrtpKeys,
+}
+
 /// Borrowed inputs for [`MediaPipeline::new`]. `self_lid`/`peer_lid` are the E2E-SRTP
 /// participant JIDs (normalized inside `new`).
 #[derive(Clone, Copy)]
@@ -432,16 +460,24 @@ impl MediaPipeline {
     ///
     /// RTP sequence/timestamp/ROC and SRTCP index/CNAME/statistics are preserved.
     pub fn rekey_send_from_raw(&mut self, raw_epoch: &[u8], self_lid: &str) -> bool {
-        let participant_id = format_e2e_srtp_participant_id(self_lid);
-        let Some(send_keys) = derive_e2e_keys_from_raw(raw_epoch, &participant_id) else {
+        let Some(rekey) = Self::prepare_send_rekey(raw_epoch, self_lid) else {
             return false;
         };
-        let Some(srtcp_keys) = derive_srtcp_keys_from_raw(raw_epoch, &participant_id) else {
-            return false;
-        };
-        self.send_keys = send_keys;
-        self.srtcp.replace_keys(srtcp_keys);
+        self.commit_send_rekey(rekey);
         true
+    }
+
+    pub(crate) fn prepare_send_rekey(raw_epoch: &[u8], self_lid: &str) -> Option<SendRekey> {
+        let participant_id = format_e2e_srtp_participant_id(self_lid);
+        Some(SendRekey {
+            rtp: derive_e2e_keys_from_raw(raw_epoch, &participant_id)?,
+            rtcp: derive_srtcp_keys_from_raw(raw_epoch, &participant_id)?,
+        })
+    }
+
+    pub(crate) fn commit_send_rekey(&mut self, rekey: SendRekey) {
+        self.send_keys = rekey.rtp;
+        self.srtcp.replace_keys(rekey.rtcp);
     }
 
     /// Install a transaction-wide group epoch for one peer without resetting
@@ -643,16 +679,24 @@ impl VideoPipeline {
 
     /// Rotate outbound video RTP/SRTCP keys while preserving stream counters.
     pub fn rekey_send_from_raw(&mut self, raw_epoch: &[u8], self_lid: &str) -> bool {
-        let participant_id = format_e2e_srtp_participant_id(self_lid);
-        let Some(send_keys) = derive_e2e_keys_from_raw(raw_epoch, &participant_id) else {
+        let Some(rekey) = Self::prepare_send_rekey(raw_epoch, self_lid) else {
             return false;
         };
-        let Some(srtcp_keys) = derive_srtcp_keys_from_raw(raw_epoch, &participant_id) else {
-            return false;
-        };
-        self.send_keys = send_keys;
-        self.srtcp.replace_keys(srtcp_keys);
+        self.commit_send_rekey(rekey);
         true
+    }
+
+    pub(crate) fn prepare_send_rekey(raw_epoch: &[u8], self_lid: &str) -> Option<SendRekey> {
+        let participant_id = format_e2e_srtp_participant_id(self_lid);
+        Some(SendRekey {
+            rtp: derive_e2e_keys_from_raw(raw_epoch, &participant_id)?,
+            rtcp: derive_srtcp_keys_from_raw(raw_epoch, &participant_id)?,
+        })
+    }
+
+    pub(crate) fn commit_send_rekey(&mut self, rekey: SendRekey) {
+        self.send_keys = rekey.rtp;
+        self.srtcp.replace_keys(rekey.rtcp);
     }
 
     /// Rotate inbound video keys while preserving the peer's RTP ROC and

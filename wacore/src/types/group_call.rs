@@ -90,6 +90,11 @@ impl GroupCallParticipant {
             devices,
         }
     }
+
+    /// Whether this participant belongs to the authoritative active roster.
+    pub fn is_connected(&self) -> bool {
+        self.state.as_deref() == Some("connected")
+    }
 }
 
 impl crate::stats::HeapSize for GroupCallParticipant {
@@ -316,6 +321,16 @@ pub struct WaitingRoomUser {
     pub state: String,
 }
 
+impl crate::stats::HeapSize for WaitingRoomUser {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        self.jid.heap_bytes()
+            + self.pn.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.state.heap_bytes()
+    }
+}
+
 /// Authoritative waiting-room state for a call-link call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -329,6 +344,18 @@ pub struct WaitingRoom {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_id: Option<u32>,
     pub users: Vec<WaitingRoomUser>,
+}
+
+impl crate::stats::HeapSize for WaitingRoom {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        self.call_id.heap_bytes()
+            + self.call_creator.heap_bytes()
+            + self.link_token.heap_bytes()
+            + self.users.capacity() * size_of::<WaitingRoomUser>()
+            + self.users.iter().map(HeapSize::heap_bytes).sum::<usize>()
+    }
 }
 
 /// Admission state returned after joining a reusable call link.

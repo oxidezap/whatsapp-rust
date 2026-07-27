@@ -22,8 +22,8 @@ pub const APP_DATA_SSRC_SLOT_WORD: u32 = 6;
 pub const HBH_FEC_TX_SSRC_SLOT_WORD: u32 = 7;
 pub const HBH_FEC_RX_SSRC_SLOT_WORD: u32 = 8;
 
-/// Relay stream order: audio media/FEC/NACK, primary-video media/FEC/NACK,
-/// secondary-video media/FEC/NACK.
+/// Relay stream order: audio media/FEC/NACK, video media/FEC/NACK,
+/// hop-by-hop FEC transmit/receive, app-data.
 pub const WASM_RELAY_STREAM_SLOT_WORDS: [u32; 9] = [0, 1, 4, 2, 3, 5, 7, 8, 6];
 
 /// Video-stream SSRC for a participant: same HKDF as audio, video slot word.

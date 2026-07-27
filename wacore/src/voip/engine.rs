@@ -171,7 +171,14 @@ pub struct GroupEngineConfig {
     pub initial_update: GroupCallUpdate,
     /// Present when a live direct call is upgraded in place. The existing
     /// authenticated receiver stays active until a PID-bearing roster arrives.
-    pub direct_peer: Option<(Jid, Jid, Vec<u8>)>,
+    pub direct_peer: Option<DirectPeer>,
+}
+
+/// Authenticated direct-call participant retained during an in-place group promotion.
+pub struct DirectPeer {
+    pub user_jid: Jid,
+    pub device_jid: Jid,
+    pub call_key: Vec<u8>,
 }
 
 // Manual Debug so a stray `{:?}` can't leak the SRTP callKey, the STUN integrity key, or the relay
@@ -888,7 +895,12 @@ impl CallEngine {
             VIDEO_TS_STRIDE_15FPS,
         )?;
         let direct_fallback_active = config.direct_peer.is_some();
-        if let Some((user_jid, device_jid, mut call_key)) = config.direct_peer {
+        if let Some(DirectPeer {
+            user_jid,
+            device_jid,
+            mut call_key,
+        }) = config.direct_peer
+        {
             registry.seed_direct_peer(
                 &call_key,
                 &user_jid,
@@ -983,7 +995,11 @@ impl CallEngine {
                     call_creator: update.call_creator.clone(),
                     self_jid,
                     initial_update: update.clone(),
-                    direct_peer: Some((peer_device.to_non_ad(), peer_device, call_key)),
+                    direct_peer: Some(DirectPeer {
+                        user_jid: peer_device.to_non_ad(),
+                        device_jid: peer_device,
+                        call_key,
+                    }),
                 },
             )?;
             return Ok(GroupRosterApply::Applied);
@@ -1167,20 +1183,31 @@ impl CallEngine {
             epoch.zeroize();
             return Err(GroupMediaError::Pipeline);
         };
-        if !media.pipe.rekey_send_from_raw(&epoch, &media.self_lid) {
+        let Some(audio_rekey) = MediaPipeline::prepare_send_rekey(&epoch, &media.self_lid) else {
             epoch.zeroize();
             return Err(GroupMediaError::InvalidEpoch);
-        }
-        if let Some(video) = media.video.as_mut()
-            && !video.pipe.rekey_send_from_raw(&epoch, &media.self_lid)
-        {
+        };
+        let video_rekey = match media.video.as_ref() {
+            Some(_) => {
+                let Some(rekey) = VideoPipeline::prepare_send_rekey(&epoch, &media.self_lid) else {
+                    epoch.zeroize();
+                    return Err(GroupMediaError::InvalidEpoch);
+                };
+                Some(rekey)
+            }
+            None => None,
+        };
+        let Some(app_data_rekey) = MediaPipeline::prepare_send_rekey(&epoch, &media.self_lid)
+        else {
             epoch.zeroize();
             return Err(GroupMediaError::InvalidEpoch);
+        };
+        // All derivations are complete before any live send pipeline changes epoch.
+        media.pipe.commit_send_rekey(audio_rekey);
+        if let (Some(video), Some(rekey)) = (media.video.as_mut(), video_rekey) {
+            video.pipe.commit_send_rekey(rekey);
         }
-        if !group.app_data.rekey_send_from_raw(&epoch, &media.self_lid) {
-            epoch.zeroize();
-            return Err(GroupMediaError::InvalidEpoch);
-        }
+        group.app_data.commit_send_rekey(app_data_rekey);
         media.call_key.zeroize();
         media.call_key.clear();
         media.call_key.extend_from_slice(&epoch);
@@ -1348,6 +1375,8 @@ impl CallEngine {
         self.started = true;
         self.rtcp_monotonic_origin = now;
         self.rtcp_wallclock_origin_ms = wallclock_ms;
+        // `configure_group` may already have committed a group Allocate containing stream SSRCs
+        // and participant subscriptions. Never replace it with the 1:1 request below.
         if self.allocate.is_empty() {
             let tx = self.tx_ids.next_tx_id();
             // Built once here; the 1s keepalive re-sends it, so store it as Bytes and refcount-clone

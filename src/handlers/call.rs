@@ -75,20 +75,47 @@ impl StanzaHandler for CallHandler {
         match parse_call_stanza(nr) {
             Ok(Some(call)) => {
                 #[cfg(feature = "voip-runtime")]
-                let group_transition = matches!(
-                    call.action,
+                let is_group_transition = matches!(
+                    &call.action,
                     CallAction::GroupUpdate { .. }
                         | CallAction::EncRekey { .. }
                         | CallAction::WaitingRoomUpdate { .. }
                         | CallAction::RaiseHand { .. }
                         | CallAction::ScreenShare { .. }
-                )
-                .then(|| {
-                    client
-                        .call_registry()
-                        .current_group_transition(call.action.call_id())
-                })
-                .flatten();
+                );
+                #[cfg(feature = "voip-runtime")]
+                let group_transition = if is_group_transition {
+                    let registry = client.call_registry();
+                    let call_id = call.action.call_id();
+                    match registry.current_group_transition(call_id) {
+                        Some(transition) => Some(transition),
+                        None if matches!(
+                            &call.action,
+                            CallAction::GroupUpdate { .. } | CallAction::EncRekey { .. }
+                        ) =>
+                        {
+                            // Offer and control stanzas are dispatched concurrently. Listen before
+                            // rechecking so an immediately following epoch cannot miss the ringing
+                            // generation inserted by its preceding offer.
+                            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                                loop {
+                                    let listener = registry.listen_registration();
+                                    if let Some(transition) =
+                                        registry.current_group_transition(call_id)
+                                    {
+                                        break transition;
+                                    }
+                                    listener.await;
+                                }
+                            })
+                            .await
+                            .ok()
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 #[cfg(feature = "voip-runtime")]
                 let group_transition_generation =
                     group_transition.as_ref().map(|(generation, _)| *generation);
@@ -118,7 +145,7 @@ impl StanzaHandler for CallHandler {
                 {
                     debug!(
                         "call: discarded stale {} after call generation changed for {}",
-                        call.action.action_kind(),
+                        call.action.wire_tag(),
                         call.action.call_id()
                     );
                     return true;
@@ -128,7 +155,7 @@ impl StanzaHandler for CallHandler {
                 // peer device's <accept> (which drives the sibling dismiss).
                 debug!(
                     "call: received {} for {} from {}",
-                    call.action.action_kind(),
+                    call.action.wire_tag(),
                     call.action.call_id(),
                     call.from.observe()
                 );
@@ -1152,7 +1179,7 @@ mod tests {
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
         let participant = Jid::new("222222222222222", Server::Lid);
-        let participant_pn = Jid::new("15550000002", Server::Pn);
+        let participant_pn = Jid::new("12025550112", Server::Pn);
         let registry = client.call_registry();
         let mut session = CallSession::new_outgoing(
             "GROUP-CALL",

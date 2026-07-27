@@ -53,6 +53,10 @@ impl GroupRawEpoch {
     fn as_bytes(&self) -> &[u8] {
         &self.raw_epoch
     }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.raw_epoch.capacity()
+    }
 }
 
 impl core::fmt::Debug for GroupRawEpoch {
@@ -136,6 +140,10 @@ impl VideoControlSender {
             }
             state => self.state.try_send(state).is_ok(),
         }
+    }
+
+    pub(crate) fn retained_len(&self) -> usize {
+        self.state.len().saturating_add(self.orientation.len())
     }
 }
 
@@ -348,6 +356,18 @@ fn purge_group_transition_media(
         (epoch_advanced && batch.kind != SendBatchKind::Control)
             || (audio_only && batch.kind == SendBatchKind::Video)
     })
+}
+
+fn prepare_relay_reconnect(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+) {
+    queue.clear();
+    pending_video.clear();
+    // Discarding access units leaves remote decoders with a hole. Reopen the replacement path on
+    // an IDR rather than forwarding a delta that references frames lost with the retired relay.
+    *awaiting_video_keyframe = true;
 }
 
 fn discard_video_until_keyframe(
@@ -621,9 +641,11 @@ async fn run_call_with_clock_and_wallclock(
                 Output::ReconnectRelay(endpoint) => {
                     // Anything queued before this intent targets the retired relay. Later outputs in
                     // the same drain include the fresh Allocate and are retained for the new channel.
-                    send_queue.clear();
-                    pending_video.clear();
-                    awaiting_video_keyframe = false;
+                    prepare_relay_reconnect(
+                        &mut send_queue,
+                        &mut pending_video,
+                        &mut awaiting_video_keyframe,
+                    );
                     reconnect_to = Some(endpoint);
                 }
                 Output::Timeout(_) => {
@@ -1176,6 +1198,34 @@ mod tests {
             pending_video.is_empty(),
             "a new epoch must not leave a partial old-key access unit"
         );
+    }
+
+    #[test]
+    fn relay_reconnect_drops_deltas_until_a_fresh_keyframe() {
+        let video = |keyframe| SendBatch {
+            packets: VecDeque::from([Bytes::from_static(b"video")]),
+            bytes: 5,
+            kind: SendBatchKind::Video,
+            started: false,
+            video_keyframe: keyframe,
+        };
+        let mut queue = VecDeque::from([video(false)]);
+        let mut pending_video = vec![Bytes::from_static(b"fragment")];
+        let mut awaiting_keyframe = false;
+
+        prepare_relay_reconnect(&mut queue, &mut pending_video, &mut awaiting_keyframe);
+        assert!(queue.is_empty());
+        assert!(pending_video.is_empty());
+        assert!(awaiting_keyframe);
+
+        let dropped = enqueue_batch(&mut queue, &mut awaiting_keyframe, video(false));
+        assert_eq!(dropped.video_access_units, 1);
+        assert!(queue.is_empty(), "delta frame must not enter the new path");
+
+        let dropped = enqueue_batch(&mut queue, &mut awaiting_keyframe, video(true));
+        assert_eq!(dropped.video_access_units, 0);
+        assert_eq!(queue.len(), 1);
+        assert!(!awaiting_keyframe);
     }
 
     /// CallChannels with idle video plumbing (senders/receivers dropped immediately), for the

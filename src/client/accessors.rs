@@ -203,6 +203,8 @@ impl Client {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .memory_stats();
+        #[cfg(feature = "voip-runtime")]
+        let active_calls = self.call_registry.memory_stats();
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]
@@ -276,6 +278,8 @@ impl Client {
             signal_sender_keys,
             #[cfg(feature = "voip-runtime")]
             pending_call_link_updates,
+            #[cfg(feature = "voip-runtime")]
+            active_calls,
             #[cfg(feature = "plugins")]
             plugins,
             #[cfg(feature = "plugins")]

@@ -82,7 +82,7 @@ impl GroupCallState {
         let connected = update
             .participants
             .iter()
-            .filter(|participant| participant.state.as_deref() == Some("connected"))
+            .filter(|participant| participant.is_connected())
             .flat_map(|participant| {
                 std::iter::once(participant.jid.to_non_ad())
                     .chain(participant.pn.as_ref().map(Jid::to_non_ad))
@@ -143,6 +143,31 @@ impl GroupCallState {
 
     fn matches_identity(&self, call_id: &str, creator: &Jid) -> bool {
         self.call_id == call_id && self.call_creator == *creator
+    }
+}
+
+impl crate::stats::HeapSize for GroupCallState {
+    fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        self.call_id.heap_bytes()
+            + self.call_creator.heap_bytes()
+            + self.snapshot.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.waiting_room.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.raised_hands.capacity() * size_of::<Jid>()
+            + self
+                .raised_hands
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+            + self.screen_shares.capacity() * size_of::<(Jid, ScreenShare)>()
+            + self
+                .screen_shares
+                .keys()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
     }
 }
 
@@ -373,7 +398,7 @@ mod tests {
     fn pn_alias_controls_survive_unrelated_roster_updates() {
         let mut state = GroupCallState::new("CALL", creator());
         let mut alice = participant("200002", "connected", 2);
-        let alice_pn = Jid::new("15550000002", Server::Pn);
+        let alice_pn = Jid::new("12025550111", Server::Pn);
         alice.pn = Some(alice_pn.clone());
         assert_eq!(
             state.apply_update(update(

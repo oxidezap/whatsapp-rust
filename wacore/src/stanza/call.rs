@@ -11,24 +11,7 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef};
 
 use crate::time::from_secs;
-use crate::types::call::{CallAction, CallAudioCodec, IncomingCall, VideoState};
-
-const KNOWN_ACTIONS: &[&str] = &[
-    "offer",
-    "offer_notice",
-    "preaccept",
-    "accept",
-    "reject",
-    "terminate",
-    "transport",
-    "relaylatency",
-    "video",
-    "group_update",
-    "enc_rekey",
-    "waiting_room_update",
-    "user_action",
-    "screen_share",
-];
+use crate::types::call::{CallAction, CallActionTag, CallAudioCodec, IncomingCall, VideoState};
 
 pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     if node.tag != "call" {
@@ -37,10 +20,11 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     // Find a known action child first so unknown/future actions short-circuit
     // before attr validation (forward-compat, even if stanza attrs also shift).
-    let Some(child) = node
-        .children()
-        .and_then(|cs| cs.iter().find(|c| KNOWN_ACTIONS.contains(&c.tag.as_ref())))
-    else {
+    let Some(child) = node.children().and_then(|children| {
+        children
+            .iter()
+            .find(|child| CallActionTag::try_from(child.tag.as_ref()).is_ok())
+    }) else {
         return Ok(None);
     };
 
@@ -51,7 +35,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     // whatsmeow doesn't require an id on <call>, and the signaling-only actions (transport,
     // relaylatency) can arrive without one. Only the offer-ack consumes stanza_id and real offers
     // always carry it, so default a missing id to empty rather than rejecting the whole stanza --
-    // which would drop these actions right after we added them to KNOWN_ACTIONS to surface them.
+    // which would drop these actions right after the generated tag accepted them.
     let stanza_id = attrs
         .optional_string("id")
         .map(|s| s.into_owned())
@@ -237,6 +221,8 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
 }
 
 fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
+    let action_tag = CallActionTag::try_from(node.tag.as_ref())
+        .map_err(|_| anyhow!("unknown call action <{}>", node.tag))?;
     let mut attrs = node.attrs();
     let call_id = attrs
         .required_string("call-id")
@@ -248,27 +234,27 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
 
     // The group parsers re-read the action identity and finish their own attribute readers because
     // they also own the action-specific attributes.
-    Ok(match node.tag.as_ref() {
-        "group_update" => CallAction::GroupUpdate {
+    Ok(match action_tag {
+        CallActionTag::GroupUpdate => CallAction::GroupUpdate {
             update: super::group_call::parse_group_update(node)?.into(),
         },
-        "enc_rekey" => CallAction::EncRekey {
+        CallActionTag::EncRekey => CallAction::EncRekey {
             rekey: super::group_call::parse_group_enc_rekey(node)?,
         },
-        "waiting_room_update" => CallAction::WaitingRoomUpdate {
+        CallActionTag::WaitingRoomUpdate => CallAction::WaitingRoomUpdate {
             room: super::group_call::parse_waiting_room_update(node)?,
         },
-        "user_action" => CallAction::RaiseHand {
+        CallActionTag::RaiseHand => CallAction::RaiseHand {
             call_id,
             call_creator,
             raised: super::group_call::parse_raise_hand(node)?,
         },
-        "screen_share" => CallAction::ScreenShare {
+        CallActionTag::ScreenShare => CallAction::ScreenShare {
             call_id,
             call_creator,
             screen_share: super::group_call::parse_screen_share(node)?,
         },
-        "offer" => {
+        CallActionTag::Offer => {
             let caller_pn = attrs.optional_jid("caller_pn");
             let caller_country_code = attrs
                 .optional_string("caller_country_code")
@@ -304,7 +290,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 group_jid,
             }
         }
-        "offer_notice" => {
+        CallActionTag::OfferNotice => {
             let is_video = attrs.optional_string("media").is_some_and(|s| s == "video");
             let is_group = attrs.optional_string("type").is_some_and(|s| s == "group");
             attrs
@@ -317,7 +303,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 is_group,
             }
         }
-        "preaccept" => {
+        CallActionTag::PreAccept => {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
@@ -334,7 +320,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio,
             }
         }
-        "transport" => {
+        CallActionTag::Transport => {
             let p2p_cand_round = attrs
                 .optional_string("p2p-cand-round")
                 .map(|s| s.into_owned());
@@ -351,7 +337,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 transport_message_type,
             }
         }
-        "relaylatency" => {
+        CallActionTag::RelayLatency => {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<relaylatency> attrs: {e}"))?;
@@ -360,7 +346,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 call_creator,
             }
         }
-        "accept" => {
+        CallActionTag::Accept => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
             let audio = node
                 .children()
@@ -375,7 +361,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio,
             }
         }
-        "reject" => {
+        CallActionTag::Reject => {
             // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
             // actually declining; dropping it made both look identical and ended calls the peer's
             // other devices were still answering.
@@ -387,7 +373,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 reason,
             }
         }
-        "video" => {
+        CallActionTag::VideoState => {
             let state_raw = attrs
                 .optional_string("state")
                 .and_then(|s| s.parse::<i32>().ok())
@@ -409,7 +395,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 dec,
             }
         }
-        "terminate" => {
+        CallActionTag::Terminate => {
             // WA Web gates the call-log outcome on `reason` (missed vs accepted/rejected-elsewhere),
             // so surface it instead of dropping it.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
@@ -430,7 +416,6 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio_duration,
             }
         }
-        other => return Err(anyhow!("unreachable: unknown action <{other}>")),
     })
 }
 
@@ -1591,7 +1576,7 @@ mod tests {
 
     #[test]
     fn transport_and_relaylatency_are_parsed_not_dropped() {
-        // Regression: these were missing from KNOWN_ACTIONS and silently dropped (Ok(None)).
+        // Regression: these were missing from dispatch and silently dropped (Ok(None)).
         let transport = base_call_builder()
             .children([NodeBuilder::new("transport")
                 .attr("call-creator", fake_caller_lid())
@@ -2324,6 +2309,33 @@ mod tests {
             }
             other => panic!("expected VideoState, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn generated_call_action_tags_drive_dispatch_and_serialization() {
+        assert_eq!(
+            CallActionTag::try_from("group_update").expect("known generated tag"),
+            CallActionTag::GroupUpdate
+        );
+        assert!(CallActionTag::try_from("future_call_action").is_err());
+
+        let action = CallAction::RelayLatency {
+            call_id: "CID".to_string(),
+            call_creator: fake_caller_lid(),
+        };
+        let value = serde_json::to_value(action).expect("serialize call action");
+        assert_eq!(value["type"], "relaylatency");
+
+        let optional = CallAction::Reject {
+            call_id: "CID".to_string(),
+            call_creator: fake_caller_lid(),
+            reason: None,
+        };
+        let value = serde_json::to_value(optional).expect("serialize optional fields");
+        assert!(
+            value.get("reason").is_none(),
+            "tagged WireEnum preserves the frozen omission semantics for None"
+        );
     }
 
     #[test]

@@ -446,6 +446,10 @@ impl Voip<'_> {
         if incoming.group.is_none() {
             return Err(CallError::Media("offer is not an active group invitation"));
         }
+        let registry = self.client.call_registry();
+        let generation = registry
+            .generation_of(call_id)
+            .ok_or(CallError::CallEndedDuringSetup)?;
         let node = build_active_group_accept(
             call_id,
             call_creator,
@@ -454,10 +458,9 @@ impl Voip<'_> {
         )
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.client.send_node(node).await?;
-        self.client.call_registry().take_ringing(call_id);
-        self.client
-            .call_registry()
-            .transition(call_id, CallPhase::Connecting);
+        if !registry.accept_ringing_if_current(call_id, generation) {
+            return Err(CallError::CallEndedDuringSetup);
+        }
         Ok(())
     }
 
@@ -2145,6 +2148,104 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn group_invite_accept_does_not_consume_a_replacement_generation() {
+        struct GatedTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for GatedTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                let _ = self.started.try_send(());
+                self.release.recv().await?;
+                Ok(())
+            }
+
+            async fn disconnect(&self) {}
+        }
+
+        let client = crate::test_utils::create_test_client().await;
+        let creator = call_creator();
+        let call_id = "ACTIVE-GROUP-INVITE";
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        let mut incoming = IncomingCall::new_for_test(
+            creator.clone(),
+            "GROUP-INVITE-STANZA".to_string(),
+            wacore::time::from_secs(1_766_847_151_i64).expect("valid ts"),
+            CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: creator.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            },
+        );
+        incoming.group = Some(Box::new(update.clone()));
+        let mut ringing = CallSession::new_incoming(call_id, creator.clone(), creator.clone());
+        ringing.group = Some(update.clone());
+        let stale = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(ringing)
+            .expect("ringing invitation");
+
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(GatedTransport {
+                started: started_tx,
+                release: release_rx,
+            }),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+
+        let accept = tokio::spawn({
+            let client = client.clone();
+            let incoming = incoming.clone();
+            async move { client.voip().accept_group_invite(&incoming).await }
+        });
+        started_rx.recv().await.expect("accept send entered");
+        let mut replacement = CallSession::new_incoming(call_id, creator.clone(), creator);
+        replacement.group = Some(update);
+        let current = client.call_registry().insert_ringing_group(replacement);
+        assert_ne!(current, stale);
+        release_tx.send(()).await.expect("release accept send");
+
+        assert!(matches!(
+            accept.await.expect("accept task"),
+            Err(CallError::CallEndedDuringSetup)
+        ));
+        assert_eq!(client.call_registry().generation_of(call_id), Some(current));
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, current),
+            Some(CallPhase::Ringing)
+        );
+        assert!(
+            client.call_registry().take_ringing(call_id),
+            "the stale accept must leave the replacement ringing"
+        );
     }
 
     #[cfg(feature = "voip-runtime")]

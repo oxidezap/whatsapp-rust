@@ -8,6 +8,7 @@
 //! the portable core to a specific executor.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -162,6 +163,45 @@ impl CallEntry {
         self.group
             .get_or_insert_with(|| GroupCallState::new(call_id, call_creator))
     }
+
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        let queued_bytes = self
+            .rekey_tx
+            .as_ref()
+            .map_or(0, |tx| tx.len().saturating_mul(size_of::<String>()))
+            .saturating_add(
+                self.event_tx
+                    .as_ref()
+                    .map_or(0, |tx| tx.len().saturating_mul(size_of::<CallEvent>())),
+            )
+            .saturating_add(self.video_ctl_tx.as_ref().map_or(0, |tx| {
+                tx.retained_len().saturating_mul(size_of::<VideoControl>())
+            }))
+            .saturating_add(
+                self.group_ctl_tx
+                    .as_ref()
+                    .map_or(0, |tx| tx.len().saturating_mul(size_of::<GroupControl>())),
+            );
+        self.session.heap_bytes()
+            + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self
+                .pending_group_epoch
+                .as_ref()
+                .map_or(0, GroupRawEpoch::heap_bytes)
+            + self
+                .group_invite_self_device
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self
+                .group_invite_peer_device
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + size_of::<AsyncMutex<()>>() * 2
+            + size_of::<event_listener::Event>()
+            + queued_bytes
+    }
 }
 
 /// Exclusive publication right for an actionable signaling event awaiting its typed ack.
@@ -202,6 +242,8 @@ impl Drop for CallEntry {
 pub struct CallRegistry {
     inner: Mutex<HashMap<String, CallEntry>>,
     next_gen: AtomicU64,
+    /// Wakes controls that arrived just before the corresponding offer registered its generation.
+    registration_event: Arc<event_listener::Event>,
     /// Incoming offers we've rung but not yet answered, keyed by call-id. Mirrors WA Web's
     /// `_ringingCalls`: it is the ONLY signal that distinguishes a genuine missed call (a `<terminate>`
     /// for an offer still ringing) from a `<terminate>` for an answered or outgoing call. Active-call
@@ -212,6 +254,44 @@ pub struct CallRegistry {
 impl CallRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot active registry retention without cloning call state or exposing identifiers.
+    pub fn memory_stats(&self) -> crate::stats::CollectionStats {
+        use crate::stats::HeapSize;
+
+        let (entries, active_bytes) = {
+            let map = self.inner.lock().expect("registry lock poisoned");
+            let bytes = map
+                .iter()
+                .map(|(call_id, entry)| {
+                    size_of::<String>()
+                        + call_id.heap_bytes()
+                        + size_of::<CallEntry>()
+                        + entry.heap_bytes()
+                })
+                .sum::<usize>();
+            (map.len(), bytes)
+        };
+        let ringing_bytes = self
+            .ringing
+            .lock()
+            .expect("registry lock poisoned")
+            .iter()
+            .map(|call_id| size_of::<String>() + call_id.heap_bytes())
+            .sum::<usize>();
+        crate::stats::CollectionStats::new(
+            entries.try_into().unwrap_or(u64::MAX),
+            active_bytes
+                .saturating_add(ringing_bytes)
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Listen for any call registration, then recheck the desired call id.
+    pub fn listen_registration(&self) -> event_listener::EventListener {
+        self.registration_event.listen()
     }
 
     /// Deliver a signaling event through the call's consumer queue.
@@ -491,7 +571,7 @@ impl CallRegistry {
         let snapshot = entry.group.as_ref().and_then(GroupCallState::snapshot)?;
         let sender_user = sender.to_non_ad();
         snapshot.participants.iter().find_map(|participant| {
-            if participant.state.as_deref() != Some("connected") {
+            if !participant.is_connected() {
                 return None;
             }
             let authorized = if sender.device == 0 {
@@ -531,23 +611,36 @@ impl CallRegistry {
     ///
     /// The ringing marker and entry replacement are committed under the same lock pair so a
     /// redelivered offer cannot race an acceptance and supersede the accepted generation.
-    pub fn insert_ringing_group_if_inactive(&self, session: CallSession) -> Option<u64> {
+    pub fn insert_ringing_group_if_inactive(&self, mut session: CallSession) -> Option<u64> {
         let call_id = session.call_id.clone();
-        let (generation, previous) = {
+        let generation = {
             let mut ringing = self.ringing.lock().expect("registry lock poisoned");
             let mut map = self.inner.lock().expect("registry lock poisoned");
-            if map
-                .get(&call_id)
-                .is_some_and(|entry| entry.session.phase() != CallPhase::Ringing)
-            {
-                return None;
+            if let Some(entry) = map.get_mut(&call_id) {
+                if entry.session.phase() != CallPhase::Ringing {
+                    return None;
+                }
+                if let Some(update) = session.group.take() {
+                    let _ = entry.group_mut().apply_update(update);
+                }
+                session.group = entry
+                    .group
+                    .as_ref()
+                    .and_then(GroupCallState::snapshot)
+                    .cloned();
+                entry.video = VideoNegotiation::new(session.is_video);
+                entry.session = session;
+                ringing.insert(call_id);
+                entry.generation
+            } else {
+                let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                let entry = Self::new_entry(session, generation);
+                ringing.insert(call_id.clone());
+                map.insert(call_id, entry);
+                generation
             }
-            let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-            let entry = Self::new_entry(session, generation);
-            ringing.insert(call_id.clone());
-            (generation, map.insert(call_id, entry))
         };
-        drop(previous);
+        self.registration_event.notify(usize::MAX);
         Some(generation)
     }
 
@@ -570,7 +663,25 @@ impl CallRegistry {
         // on_terminal hook fires (the old generation ended). Running those closures off-lock keeps them
         // from re-entering or poisoning the registry mutex.
         drop(prev);
+        self.registration_event.notify(usize::MAX);
         generation
+    }
+
+    /// Accept exactly the ringing generation observed before the signaling await.
+    pub fn accept_ringing_if_current(&self, call_id: &str, generation: u64) -> bool {
+        let mut ringing = self.ringing.lock().expect("registry lock poisoned");
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        if !entry.session.transition_to(CallPhase::Connecting) {
+            return false;
+        }
+        ringing.remove(call_id);
+        true
     }
 
     fn new_entry(session: CallSession, generation: u64) -> CallEntry {
@@ -825,26 +936,26 @@ impl CallRegistry {
         generation: u64,
         tx: async_channel::Sender<GroupControl>,
     ) {
-        let pending = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
-            let Some(entry) = map
-                .get_mut(call_id)
-                .filter(|entry| entry.generation == generation)
-            else {
-                return;
-            };
-            entry.group_ctl_tx = Some(tx.clone());
-            let update = entry
-                .group
-                .as_ref()
-                .and_then(GroupCallState::snapshot)
-                .cloned();
-            (update, entry.pending_group_epoch.take())
+        // Publish and flush under one guard: a concurrent epoch router that observes the sender
+        // cannot enqueue a newer epoch before the buffered startup epoch.
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
         };
-        if let Some(update) = pending.0 {
+        entry.group_ctl_tx = Some(tx.clone());
+        let update = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .cloned();
+        let pending_epoch = entry.pending_group_epoch.take();
+        if let Some(update) = update {
             let _ = Self::force_send_preserving_epoch(&tx, GroupControl::Update(Box::new(update)));
         }
-        if let Some(epoch) = pending.1 {
+        if let Some(epoch) = pending_epoch {
             let _ = Self::force_send_preserving_epoch(&tx, GroupControl::RawEpoch(epoch));
         }
     }
@@ -906,6 +1017,8 @@ impl CallRegistry {
                 GroupControl::RawEpoch(epoch) => Some(epoch.transaction_id),
                 _ => None,
             };
+            // Each retry keeps the newer of the queued and evicted epochs. Because the mailbox is
+            // bounded, it eventually evicts a non-epoch or an older epoch and returns.
             match tx.force_send(command) {
                 Ok(Some(GroupControl::RawEpoch(evicted)))
                     if queued_epoch.is_none_or(|queued| evicted.transaction_id > queued) =>
@@ -1556,6 +1669,7 @@ mod tests {
         GroupCallRelayEndpoint, GroupCallUpdate, ScreenShareState, WaitingRoom,
     };
     use crate::voip::driver::video_control_channel;
+    use futures::FutureExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wacore_binary::{Jid, Server};
@@ -1636,6 +1750,77 @@ mod tests {
     }
 
     #[test]
+    fn redelivered_ringing_group_preserves_roster_epoch_and_generation() {
+        let reg = CallRegistry::new();
+        let incoming = |transaction_id| {
+            let mut session = CallSession::new_incoming(
+                "GROUP-CALL",
+                Jid::new("111111111111111", Server::Lid),
+                Jid::new("111111111111111", Server::Lid),
+            );
+            session.group = Some(group_update(transaction_id));
+            session
+        };
+        let generation = reg
+            .insert_ringing_group_if_inactive(incoming(1))
+            .expect("first offer registers");
+        assert_eq!(
+            reg.apply_group_update(group_update(2)),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 2, vec![2; 32],));
+
+        assert_eq!(
+            reg.insert_ringing_group_if_inactive(incoming(1)),
+            Some(generation),
+            "redelivery refreshes the ringing entry instead of replacing it"
+        );
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(2),
+            "the stale redelivery must not roll back the accumulated roster"
+        );
+
+        let (tx, rx) = async_channel::bounded(2);
+        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 2
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 2
+        ));
+    }
+
+    #[test]
+    fn accepting_a_stale_ringing_generation_leaves_replacement_untouched() {
+        let reg = CallRegistry::new();
+        let incoming = || {
+            CallSession::new_incoming(
+                "GROUP-CALL",
+                Jid::new("222222222222222", Server::Lid),
+                Jid::new("111111111111111", Server::Lid),
+            )
+        };
+        let stale = reg.insert_ringing_group(incoming());
+        let current = reg.insert_ringing_group(incoming());
+        reg.mark_incoming_ringing("GROUP-CALL");
+
+        assert!(!reg.accept_ringing_if_current("GROUP-CALL", stale));
+        assert_eq!(reg.generation_of("GROUP-CALL"), Some(current));
+        assert_eq!(reg.phase("GROUP-CALL"), Some(CallPhase::Ringing));
+        assert!(
+            reg.ringing
+                .lock()
+                .expect("registry lock")
+                .contains("GROUP-CALL"),
+            "a stale accept must not consume the replacement's ringing marker"
+        );
+    }
+
+    #[test]
     fn ringing_group_promotion_preserves_newer_roster_and_latest_pending_epoch() {
         let reg = CallRegistry::new();
         reg.mark_incoming_ringing("GROUP-CALL");
@@ -1687,7 +1872,86 @@ mod tests {
             GroupControl::RawEpoch(epoch) => assert_eq!(epoch.transaction_id, 3),
             _ => panic!("expected buffered group epoch"),
         }
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 4, vec![4; 32],));
+        match rx
+            .try_recv()
+            .expect("new epoch routed after buffered epoch")
+        {
+            GroupControl::RawEpoch(epoch) => assert_eq!(epoch.transaction_id, 4),
+            _ => panic!("expected live group epoch"),
+        }
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn call_link_admission_transitions_wakes_and_releases_heartbeat() {
+        let reg = CallRegistry::new();
+        let mut waiting = session("GROUP-CALL");
+        assert!(waiting.transition_to(CallPhase::Calling));
+        assert!(waiting.transition_to(CallPhase::WaitingRoom));
+        let generation = reg.insert(waiting);
+        let listener = reg
+            .listen_group_update("GROUP-CALL", generation)
+            .expect("live listener");
+
+        let heartbeat_aborted = Arc::new(AtomicBool::new(false));
+        reg.set_waiting_room_task("GROUP-CALL", generation, flag_handle(&heartbeat_aborted));
+        let stale_aborted = Arc::new(AtomicBool::new(false));
+        reg.set_waiting_room_task("GROUP-CALL", generation + 1, flag_handle(&stale_aborted));
+        assert!(
+            stale_aborted.load(Ordering::SeqCst),
+            "a stale generation cannot retain a heartbeat"
+        );
+
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(1), generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(reg.phase("GROUP-CALL"), Some(CallPhase::Connecting));
+        assert!(
+            heartbeat_aborted.load(Ordering::SeqCst),
+            "admission releases the waiting-room heartbeat"
+        );
+        assert!(
+            listener.now_or_never().is_some(),
+            "admission wakes the media attachment waiter"
+        );
+    }
+
+    #[test]
+    fn memory_stats_include_active_group_state_and_clear_on_removal() {
+        let reg = CallRegistry::new();
+        let mut active = session("GROUP-CALL");
+        active.group = Some(group_update(1));
+        let generation = reg.insert(active);
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 1, vec![7; 32],));
+
+        let stats = reg.memory_stats();
+        assert_eq!(stats.entries, 1);
+        assert!(stats.bytes > 32, "session, roster and epoch are retained");
+
+        assert!(reg.remove_if_current("GROUP-CALL", generation));
+        let cleared = reg.memory_stats();
+        assert_eq!(cleared.entries, 0);
+        assert_eq!(cleared.bytes, 0);
+    }
+
+    #[test]
+    fn registration_listener_closes_offer_control_race() {
+        let reg = CallRegistry::new();
+        let listener = reg.listen_registration();
+        assert!(
+            listener.now_or_never().is_none(),
+            "listener must remain pending before registration"
+        );
+
+        let listener = reg.listen_registration();
+        let generation = reg.insert_ringing_group(session("GROUP-CALL"));
+        assert!(
+            listener.now_or_never().is_some(),
+            "control waiters must wake when the offer generation registers"
+        );
+        assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
     }
 
     #[test]
@@ -1739,7 +2003,7 @@ mod tests {
             participant.clone(),
             vec![GroupCallDevice::new(device.clone())],
         );
-        let participant_pn = Jid::new("15550000003", Server::Pn);
+        let participant_pn = Jid::new("12025550113", Server::Pn);
         roster_participant.pn = Some(participant_pn.clone());
         roster_participant.state = Some("connected".to_string());
         update.participants = vec![

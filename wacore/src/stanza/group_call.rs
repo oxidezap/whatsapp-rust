@@ -301,10 +301,10 @@ fn parse_group_snapshot(
         GroupSnapshotEnvelope::Ack => group_info,
     };
     let mut attrs = identity_node.attrs();
-    let call_id = required_string(&mut attrs, "call-id", expected_tag)?;
-    let call_creator = required_jid(&mut attrs, "call-creator", expected_tag)?;
+    let call_id = required_string(&mut attrs, "call-id")?;
+    let call_creator = required_jid(&mut attrs, "call-creator")?;
     if matches!(envelope, GroupSnapshotEnvelope::Update) {
-        finish_attrs(&attrs, expected_tag)?;
+        finish_attrs(&attrs)?;
     }
 
     let mut update = parse_group_info(group_info, call_id, call_creator)?;
@@ -353,9 +353,9 @@ fn parse_group_info(
 ) -> Result<GroupCallUpdate> {
     let mut attrs = node.attrs();
     let group_jid = attrs.optional_jid("group-jid");
-    let media = required_string(&mut attrs, "media", "group_info")?;
-    let transaction_id = required_u32(&mut attrs, "transaction-id", "group_info")?;
-    let connected_limit = required_u32(&mut attrs, "connected-limit", "group_info")?;
+    let media = required_string(&mut attrs, "media")?;
+    let transaction_id = required_u32(&mut attrs, "transaction-id")?;
+    let connected_limit = required_u32(&mut attrs, "connected-limit")?;
     let joinable = attrs.optional_string("joinable").as_deref() == Some("1");
     let rekey_requested = attrs.optional_string("rekey").as_deref() == Some("1");
     let mut participants = Vec::new();
@@ -383,9 +383,12 @@ fn parse_group_info(
 #[inline(never)]
 fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
     let mut attrs = node.attrs();
-    let jid = required_jid(&mut attrs, "jid", "user")?;
+    let jid = required_jid(&mut attrs, "jid")?;
     let pn = attrs.optional_jid("user_pn");
-    let state = Some(required_string(&mut attrs, "state", "user")?);
+    let state = attrs
+        .optional_string("state")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.into_owned());
     let participant_type = attrs
         .optional_string("type")
         .map(|value| value.into_owned());
@@ -408,16 +411,16 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
 #[inline(never)]
 fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
     let mut attrs = node.attrs();
-    let jid = required_jid(&mut attrs, "jid", "device")?;
+    let jid = required_jid(&mut attrs, "jid")?;
     let platform = attrs
         .optional_string("platform")
         .map(|value| value.into_owned());
-    let pid = optional_u32(&mut attrs, "pid", "device")?;
+    let pid = optional_u32(&mut attrs, "pid")?;
     let (capability_version, capability) = match node.get_optional_child("capability") {
         Some(capability) => {
             let mut cap_attrs = capability.attrs();
             (
-                optional_u32(&mut cap_attrs, "ver", "capability")?,
+                optional_u32(&mut cap_attrs, "ver")?,
                 capability.content_bytes().unwrap_or_default().to_vec(),
             )
         }
@@ -436,12 +439,12 @@ fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
 #[inline(never)]
 fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
     let mut attrs = node.attrs();
-    let transaction_id = optional_u32(&mut attrs, "transaction-id", "relay")?;
-    let self_pid = optional_u32(&mut attrs, "self_pid", "relay")?;
-    let uuid = required_string(&mut attrs, "uuid", "relay")?;
-    let participant_uuid = required_string(&mut attrs, "participant_uuid", "relay")?;
+    let transaction_id = optional_u32(&mut attrs, "transaction-id")?;
+    let self_pid = optional_u32(&mut attrs, "self_pid")?;
+    let uuid = required_string(&mut attrs, "uuid")?;
+    let participant_uuid = required_string(&mut attrs, "participant_uuid")?;
     let attribute_padding = attrs.optional_string("attribute_padding").as_deref() == Some("1");
-    let warp_mi_tag_len = optional_u32(&mut attrs, "warp_mi_tag_len", "relay")?;
+    let warp_mi_tag_len = optional_u32(&mut attrs, "warp_mi_tag_len")?;
     let children = node.children().unwrap_or_default();
     let content = |tag: &str| {
         children
@@ -476,14 +479,14 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
 #[inline(never)]
 fn parse_group_relay_endpoint(node: &NodeRef<'_>) -> Result<GroupCallRelayEndpoint> {
     let mut attrs = node.attrs();
-    let relay_id = required_u32(&mut attrs, "relay_id", "te2")?;
-    let token_id = required_u32(&mut attrs, "token_id", "te2")?;
-    let auth_token_id = required_u32(&mut attrs, "auth_token_id", "te2")?;
-    let relay_name = required_string(&mut attrs, "relay_name", "te2")?;
+    let relay_id = required_u32(&mut attrs, "relay_id")?;
+    let token_id = required_u32(&mut attrs, "token_id")?;
+    let auth_token_id = required_u32(&mut attrs, "auth_token_id")?;
+    let relay_name = required_string(&mut attrs, "relay_name")?;
     let domain_name = attrs
         .optional_string("domain_name")
         .map(|value| value.into_owned());
-    let rtt_ms = optional_u32(&mut attrs, "c2r_rtt", "te2")?;
+    let rtt_ms = optional_u32(&mut attrs, "c2r_rtt")?;
     let is_fna = attrs.optional_string("is_fna").as_deref() == Some("1");
     let address = node.content_bytes().unwrap_or_default().to_vec();
     let (ipv4, port) = if let [a, b, c, d, high, low] = address.as_slice() {
@@ -583,10 +586,10 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
         return Err(group_stanza_error("expected an enc_rekey stanza"));
     }
     let mut attrs = node.attrs();
-    let call_id = required_string(&mut attrs, "call-id", "enc_rekey")?;
-    let call_creator = required_jid(&mut attrs, "call-creator", "enc_rekey")?;
-    let transaction_id = required_u32(&mut attrs, "transaction-id", "enc_rekey")?;
-    finish_attrs(&attrs, "enc_rekey")?;
+    let call_id = required_string(&mut attrs, "call-id")?;
+    let call_creator = required_jid(&mut attrs, "call-creator")?;
+    let transaction_id = required_u32(&mut attrs, "transaction-id")?;
+    finish_attrs(&attrs)?;
     let encopt = node
         .get_optional_child("encopt")
         .ok_or_else(|| group_stanza_error("enc_rekey is missing encopt"))?;
@@ -594,10 +597,10 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
         .get_optional_child("enc")
         .ok_or_else(|| group_stanza_error("enc_rekey is missing enc"))?;
     let mut encopt_attrs = encopt.attrs();
-    let key_generation = required_u32(&mut encopt_attrs, "keygen", "encopt")?;
+    let key_generation = required_u32(&mut encopt_attrs, "keygen")?;
     let mut enc_attrs = enc.attrs();
-    let encryption_type = required_string(&mut enc_attrs, "type", "enc")?;
-    let encryption_version = required_u32(&mut enc_attrs, "v", "enc")?;
+    let encryption_type = required_string(&mut enc_attrs, "type")?;
+    let encryption_version = required_u32(&mut enc_attrs, "v")?;
     if key_generation != 2
         || encryption_version != 2
         || !matches!(encryption_type.as_str(), "msg" | "pkmsg")
@@ -706,8 +709,8 @@ fn build_call_service_request(request_id: &str, action: Node) -> Result<Node> {
 pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink> {
     let child = validated_call_ack_child(node, "link_create")?;
     let mut attrs = child.attrs();
-    let token = required_string(&mut attrs, "token", "link_create")?;
-    let media = parse_call_link_media(required_string(&mut attrs, "media", "link_create")?)?;
+    let token = required_string(&mut attrs, "token")?;
+    let media = parse_call_link_media(required_string(&mut attrs, "media")?)?;
     Ok(CallLink { token, media })
 }
 
@@ -716,9 +719,9 @@ pub fn parse_call_link_create_ack(node: &NodeRef<'_>) -> Result<CallLink> {
 pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> {
     let child = validated_call_ack_child(node, "link_query")?;
     let mut attrs = child.attrs();
-    let token = required_string(&mut attrs, "token", "link_query")?;
-    let media = parse_call_link_media(required_string(&mut attrs, "media", "link_query")?)?;
-    let creator = required_jid(&mut attrs, "link_creator", "link_query")?;
+    let token = required_string(&mut attrs, "token")?;
+    let media = parse_call_link_media(required_string(&mut attrs, "media")?)?;
+    let creator = required_jid(&mut attrs, "link_creator")?;
     let creator_pn = attrs.optional_jid("link_creator_pn");
     let waiting = child.get_optional_child("waiting_room");
     let (waiting_room_enabled, is_admin) = waiting.map_or((false, false), |waiting| {
@@ -800,9 +803,9 @@ pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
         return Err(group_stanza_error("expected a waiting_room_update stanza"));
     }
     let mut attrs = node.attrs();
-    let call_id = required_string(&mut attrs, "call-id", "waiting_room_update")?;
-    let creator = required_jid(&mut attrs, "call-creator", "waiting_room_update")?;
-    finish_attrs(&attrs, "waiting_room_update")?;
+    let call_id = required_string(&mut attrs, "call-id")?;
+    let creator = required_jid(&mut attrs, "call-creator")?;
+    finish_attrs(&attrs)?;
     let waiting = node
         .get_optional_child("waiting_room")
         .ok_or_else(|| group_stanza_error("waiting_room_update is missing waiting_room"))?;
@@ -820,13 +823,13 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
         return Err(group_stanza_error("expected a waiting_room stanza"));
     }
     let mut attrs = node.attrs();
-    let call_id = required_string(&mut attrs, "call-id", "waiting_room")?;
-    let call_creator = required_jid(&mut attrs, "call-creator", "waiting_room")?;
-    let link_token = required_string(&mut attrs, "link-token", "waiting_room")?;
-    let media = parse_call_link_media(required_string(&mut attrs, "media", "waiting_room")?)?;
+    let call_id = required_string(&mut attrs, "call-id")?;
+    let call_creator = required_jid(&mut attrs, "call-creator")?;
+    let link_token = required_string(&mut attrs, "link-token")?;
+    let media = parse_call_link_media(required_string(&mut attrs, "media")?)?;
     let enabled = bool_attr(&mut attrs, "enabled");
     let is_admin = bool_attr(&mut attrs, "is_admin");
-    let transaction_id = optional_u32(&mut attrs, "transaction-id", "waiting_room")?;
+    let transaction_id = optional_u32(&mut attrs, "transaction-id")?;
     let mut users = Vec::new();
     for child in node.children().unwrap_or_default() {
         if child.tag != "user" {
@@ -834,9 +837,9 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
         }
         let mut attrs = child.attrs();
         users.push(WaitingRoomUser {
-            jid: required_jid(&mut attrs, "jid", "waiting_room user")?,
+            jid: required_jid(&mut attrs, "jid")?,
             pn: attrs.optional_jid("user_pn"),
-            state: required_string(&mut attrs, "state", "waiting_room user")?,
+            state: required_string(&mut attrs, "state")?,
         });
     }
     Ok(WaitingRoom {
@@ -1005,10 +1008,10 @@ pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
         return Err(group_stanza_error("expected a user_action stanza"));
     }
     let mut attrs = node.attrs();
-    let action = required_string(&mut attrs, "action", "user_action")?;
-    let _ = required_string(&mut attrs, "call-id", "user_action")?;
-    let _ = required_jid(&mut attrs, "call-creator", "user_action")?;
-    finish_attrs(&attrs, "user_action")?;
+    let action = required_string(&mut attrs, "action")?;
+    let _ = required_string(&mut attrs, "call-id")?;
+    let _ = required_jid(&mut attrs, "call-creator")?;
+    finish_attrs(&attrs)?;
     if action != "raise_hand" {
         return Err(group_stanza_error("unsupported group user action"));
     }
@@ -1056,16 +1059,16 @@ pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
         return Err(group_stanza_error("expected a screen_share stanza"));
     }
     let mut attrs = node.attrs();
-    let _ = required_string(&mut attrs, "call-id", "screen_share")?;
-    let _ = required_jid(&mut attrs, "call-creator", "screen_share")?;
-    let state_value = required_u32(&mut attrs, "screenshare_state", "screen_share")?;
+    let _ = required_string(&mut attrs, "call-id")?;
+    let _ = required_jid(&mut attrs, "call-creator")?;
+    let state_value = required_u32(&mut attrs, "screenshare_state")?;
     let state_code = i32::try_from(state_value)
         .map_err(|_| group_stanza_error("unsupported screen-share state"))?;
     let state = ScreenShareState::try_from(state_code)
         .map_err(|_| group_stanza_error("unsupported screen-share state"))?;
-    let version = required_u32(&mut attrs, "version", "screen_share")?;
-    let screen_share_id = optional_u32(&mut attrs, "screen_share_id", "screen_share")?;
-    finish_attrs(&attrs, "screen_share")?;
+    let version = required_u32(&mut attrs, "version")?;
+    let screen_share_id = optional_u32(&mut attrs, "screen_share_id")?;
+    finish_attrs(&attrs)?;
     Ok(ScreenShare {
         state,
         version,
@@ -1122,17 +1125,13 @@ fn bool_attr(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> bool {
 }
 
 #[inline(never)]
-fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>, _tag: &str) -> Result<()> {
+fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>) -> Result<()> {
     attrs
         .finish()
         .map_err(|_| group_stanza_error("unexpected group-call attributes"))
 }
 
-fn required_string(
-    attrs: &mut wacore_binary::AttrParserRef<'_>,
-    name: &str,
-    _tag: &str,
-) -> Result<String> {
+fn required_string(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<String> {
     attrs
         .optional_string(name)
         .filter(|value| !value.is_empty())
@@ -1141,31 +1140,19 @@ fn required_string(
 }
 
 #[inline(never)]
-fn required_jid(
-    attrs: &mut wacore_binary::AttrParserRef<'_>,
-    name: &str,
-    _tag: &str,
-) -> Result<Jid> {
+fn required_jid(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<Jid> {
     attrs
         .optional_jid(name)
         .ok_or_else(|| group_stanza_error("missing or invalid group-call jid"))
 }
 
 #[inline(never)]
-fn required_u32(
-    attrs: &mut wacore_binary::AttrParserRef<'_>,
-    name: &str,
-    tag: &str,
-) -> Result<u32> {
-    optional_u32(attrs, name, tag)?
+fn required_u32(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<u32> {
+    optional_u32(attrs, name)?
         .ok_or_else(|| group_stanza_error("missing group-call integer attribute"))
 }
 
-fn optional_u32(
-    attrs: &mut wacore_binary::AttrParserRef<'_>,
-    name: &str,
-    _tag: &str,
-) -> Result<Option<u32>> {
+fn optional_u32(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> Result<Option<u32>> {
     let Some(raw) = attrs.optional_string(name) else {
         return Ok(None);
     };
@@ -1546,6 +1533,34 @@ mod tests {
         assert_eq!(relay.tokens, [b"token".to_vec()]);
         assert_eq!(relay.endpoints[0].ipv4.as_deref(), Some("1.2.3.4"));
         assert_eq!(relay.endpoints[0].port, Some(8080));
+    }
+
+    #[test]
+    fn group_participant_state_is_optional_and_empty_is_absent() {
+        let creator = jid("100001", 1);
+        for state in [None, Some("")] {
+            let mut user = NodeBuilder::new("user")
+                .attr("jid", Jid::new("200002", Server::Lid))
+                .children([NodeBuilder::new("device")
+                    .attr("jid", jid("200002", 2))
+                    .build()]);
+            if let Some(state) = state {
+                user = user.attr("state", state);
+            }
+            let node = NodeBuilder::new("group_update")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .children([NodeBuilder::new("group_info")
+                    .attr("transaction-id", "7")
+                    .attr("media", "audio")
+                    .attr("connected-limit", "8")
+                    .children([user.build()])
+                    .build()])
+                .build();
+
+            let update = parse_group_update(&node.as_node_ref()).expect("optional state parses");
+            assert_eq!(update.participants[0].state, None);
+        }
     }
 
     #[test]
