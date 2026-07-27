@@ -1777,14 +1777,15 @@ fn apply_receipt(
     // Named by the receipt but held by no chat: the wire key is only a guess
     // for these, resolved once below.
     let mut unowned: Vec<&String> = Vec::new();
-    let counterpart = if receipt.source.chat.is_group() {
+    // Resolved only when something actually missed, so a receipt whose messages
+    // all answered under the key they were addressed by pays nothing extra —
+    // which is the overwhelmingly common case and the one worth keeping free.
+    let counterpart = if missed.is_empty() || receipt.source.chat.is_group() {
         None
     } else {
         crate::lid::counterpart_chat_key(conn, device_id, &chat)?
     };
-    if !missed.is_empty()
-        && let Some(alt) = counterpart.clone()
-    {
+    if let Some(alt) = counterpart.clone() {
         for msg_id in missed {
             if diesel::update(
                 message_row(device_id, &alt, msg_id).filter(
@@ -1805,11 +1806,14 @@ fn apply_receipt(
             // recorded, moves nothing under either key. Which chat owns the
             // receipt is a question about where the message sits, so ask that
             // directly — on the miss path only, where a lookup is already due.
-            if diesel::select(diesel::dsl::exists(
-                message_row(device_id, &alt, msg_id).filter(schema::messages::from_me.eq(true)),
-            ))
-            .get_result::<bool>(conn)?
-            {
+            // The addressed key is asked first and separately from whether it
+            // still has a `chats` row: a delete can retire the chat while its
+            // messages await cleanup, and a receipt for one of those belongs
+            // where the message is, not where the thread went.
+            if message_exists(conn, device_id, &chat, msg_id)? {
+                continue;
+            }
+            if message_exists(conn, device_id, &alt, msg_id)? {
                 relocated.insert(msg_id, alt.clone());
             } else {
                 unowned.push(msg_id);
@@ -1822,13 +1826,17 @@ fn apply_receipt(
         unowned.extend(missed);
     }
 
-    // The thread this receipt belongs to, which is not always the identity it
-    // was addressed by. A 1:1 already keyed by the peer's other identity keeps
-    // that key — `route_chat_key`'s rule, minus its merge, because a receipt
-    // should file itself against a chat rather than reshape one.
+    // The thread the ids nothing holds should wait in, which is not always the
+    // identity they were addressed by: a 1:1 already keyed by the peer's other
+    // identity keeps that key — `route_chat_key`'s rule, minus its merge,
+    // because a receipt should file itself against a chat rather than reshape
+    // one. Resolved only when there is such an id, so the settled path pays
+    // for none of it.
     let thread = match &counterpart {
         Some(alt)
-            if !chat_exists(conn, device_id, &chat)? && chat_exists(conn, device_id, alt)? =>
+            if !unowned.is_empty()
+                && !chat_exists(conn, device_id, &chat)?
+                && chat_exists(conn, device_id, alt)? =>
         {
             alt.clone()
         }
@@ -1850,8 +1858,28 @@ fn apply_receipt(
         record_receipt(conn, device_id, key, msg_id, &user, status, ts_ms)?;
     }
 
+    // Announce every thread actually written to. A row filed under `thread`
+    // while the wire key was announced alone leaves a subscriber watching the
+    // real thread with stale message info until some unrelated event happens
+    // to touch it.
+    if thread != chat {
+        cs.message_chats.insert(thread);
+    }
     cs.message_chats.insert(chat);
     Ok(())
+}
+
+/// Whether this device stores an outgoing message with this id in this chat.
+fn message_exists(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+) -> QueryResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        message_row(device_id, chat, msg_id).filter(schema::messages::from_me.eq(true)),
+    ))
+    .get_result(conn)
 }
 
 /// Whether this device has a chat row keyed exactly `chat`.
@@ -2503,6 +2531,9 @@ fn insert_message(
         .execute(conn)?
         > 0;
     if inserted {
+        if new.from_me {
+            adopt_recorded_receipts(conn, device_id, new.chat_jid, new.msg_id)?;
+        }
         return Ok(StoredRow::Inserted);
     }
     if new.overwrite {
@@ -2525,6 +2556,43 @@ fn insert_message(
         }
     }
     Ok(StoredRow::Skipped)
+}
+
+/// Lift a just-inserted outgoing row to the state its receipts already report.
+///
+/// A receipt can beat the row it belongs to — `Event::Receipt` arrives on the
+/// socket-read path while a host records what it sent whenever it gets around
+/// to it — and those receipts are kept rather than dropped, because nothing
+/// re-sends them. Without this the two halves would then disagree forever:
+/// `receipts()` saying Delivered while `message()` still says Pending, since
+/// the status is only ever advanced by a receipt that arrives *after* the row.
+///
+/// One indexed lookup over the row's own primary-key prefix, and only for
+/// outgoing messages, which are the only ones peers send receipts for.
+fn adopt_recorded_receipts(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+) -> QueryResult<()> {
+    use schema::message_receipts::dsl as r;
+    let reached: Option<i32> = r::message_receipts
+        .filter(
+            r::device_id
+                .eq(device_id)
+                .and(r::chat_jid.eq(chat))
+                .and(r::msg_id.eq(msg_id)),
+        )
+        .select(diesel::dsl::max(r::receipt_type))
+        .first(conn)?;
+    if let Some(status) = reached {
+        diesel::update(
+            message_row(device_id, chat, msg_id).filter(schema::messages::status.lt(status)),
+        )
+        .set(schema::messages::status.eq(status))
+        .execute(conn)?;
+    }
+    Ok(())
 }
 
 /// Refresh a chat's activity row for a message at `ts_ms`: creates the row if

@@ -316,62 +316,69 @@ pub(crate) fn merge_split_chat(
         .bind::<Text, _>(src)
         .execute(conn)?;
 
-    // A 1:1's receipts name the peer, and the peer is what this merge is
-    // reconciling: rows recorded while the thread answered to its other
-    // identity carry that identity in `user_jid`. Nothing else would ever put
-    // the two halves back together — relocation moves only `chat_jid`, and the
-    // collision passes below match `user_jid` exactly — so one person would
-    // stay split across two users forever. Rewrite it first, so a row that is
-    // really a duplicate is recognisable as one by the time collisions are
-    // resolved. Self receipts never reach here, so the peer is the only user a
-    // 1:1 row can name.
-    // Both sides need it, not just the source: the identity a row names is the
-    // one the peer sent from, which is independent of the key the row was
-    // filed under. A receipt addressed to the surviving thread can still carry
-    // the retiring identity.
-    diesel::sql_query(
-        "UPDATE OR IGNORE message_receipts SET user_jid = ?1 \
-         WHERE device_id = ?2 AND chat_jid IN (?1, ?3) AND user_jid = ?3",
-    )
-    .bind::<Text, _>(dest)
-    .bind::<Integer, _>(device_id)
-    .bind::<Text, _>(src)
-    .execute(conn)?;
-
-    // No "keep the furthest state" pass here, unlike reactions: receipts are
-    // keyed per state, so a side holding `read` and a side holding `delivered`
-    // are two facts about one message rather than two candidates for one row.
+    // Receipts, unlike reactions, get no "keep the furthest state" pass: they
+    // are keyed per state, so a side holding `read` and a side holding
+    // `delivered` are two facts about one message rather than two candidates
+    // for one row. What the merge has to settle instead is that both the chat
+    // key and the *peer's identity* are being unified at once — a 1:1's receipt
+    // names whoever the peer sent from, which is independent of the key the row
+    // was filed under, so one person can be spread across four combinations of
+    // (chat, user). Self receipts never reach here, so the peer is the only
+    // user a 1:1 row can name.
     //
-    // Whole-key collisions — same message, user AND state on both sides — are
-    // the one case the move cannot decide for itself. The two rows were
-    // recorded independently under two identities, so neither side is
-    // automatically the earlier one, and `OR IGNORE` below keeps the
-    // destination's. Pull the earlier instant over first, so the survivor is
-    // the first time that state was reported rather than whichever identity
-    // happened to win the merge direction.
+    // Every statement below binds `?1` device_id, `?2` src, `?3` dest.
+    //
+    // Fold the instants first, over all four combinations at once. Doing it
+    // before anything is moved or renamed means the passes that follow are
+    // discarding exact duplicates rather than deciding between them: whichever
+    // row survives already carries the earliest time that state was reported.
+    // Neither identity is automatically the earlier one — the merge direction
+    // is chosen by chat activity, which says nothing about who saw it first.
     diesel::sql_query(
         "UPDATE message_receipts SET ts_ms = (SELECT MIN(s.ts_ms) FROM message_receipts s \
-          WHERE s.device_id = message_receipts.device_id AND s.chat_jid = ?2 \
-            AND s.msg_id = message_receipts.msg_id AND s.user_jid = message_receipts.user_jid \
+          WHERE s.device_id = message_receipts.device_id \
+            AND s.chat_jid IN (?2, ?3) AND s.user_jid IN (?2, ?3) \
+            AND s.msg_id = message_receipts.msg_id \
             AND s.receipt_type = message_receipts.receipt_type) \
-         WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
-         (SELECT 1 FROM message_receipts s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
-           AND s.msg_id = message_receipts.msg_id AND s.user_jid = message_receipts.user_jid \
-           AND s.receipt_type = message_receipts.receipt_type \
-           AND s.ts_ms < message_receipts.ts_ms)",
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND user_jid IN (?2, ?3)",
     )
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)
     .bind::<Text, _>(dest)
     .execute(conn)?;
+
+    // Now the identity, on both sides: a receipt addressed to the surviving
+    // thread can still name the retiring one.
     diesel::sql_query(
-        "UPDATE OR IGNORE message_receipts SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
+        "UPDATE OR IGNORE message_receipts SET user_jid = ?3 \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND user_jid = ?2",
     )
-    .bind::<Text, _>(dest)
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
     .execute(conn)?;
-    diesel::sql_query("DELETE FROM message_receipts WHERE device_id = ? AND chat_jid = ?")
+    // A row already under `dest` whose renamed form collides with an existing
+    // one is skipped by `OR IGNORE` above, and the `chat_jid = src` sweep at
+    // the end cannot reach it. Left alone it would outlive the merge still
+    // naming the retired identity — one peer read back as two users, the exact
+    // failure this reconciliation exists to prevent. Its instant is already
+    // folded in, so it is a pure duplicate by now.
+    diesel::sql_query(
+        "DELETE FROM message_receipts WHERE device_id = ?1 AND chat_jid = ?3 AND user_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+
+    diesel::sql_query(
+        "UPDATE OR IGNORE message_receipts SET chat_jid = ?3 WHERE device_id = ?1 AND chat_jid = ?2",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
+    diesel::sql_query("DELETE FROM message_receipts WHERE device_id = ?1 AND chat_jid = ?2")
         .bind::<Integer, _>(device_id)
         .bind::<Text, _>(src)
         .execute(conn)?;

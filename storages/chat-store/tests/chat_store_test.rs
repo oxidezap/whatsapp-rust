@@ -3862,6 +3862,77 @@ async fn merge_folds_a_split_peer_identity_into_one_user() {
     );
 }
 
+/// The collision the identity rewrite cannot resolve by itself: both
+/// identities recorded the *same* state, and one of the rows already sits
+/// under the surviving key. Renaming it would duplicate the row that is
+/// already there, so it is skipped — and the `chat_jid = src` sweep never
+/// reaches it, because it was never filed under `src`.
+#[tokio::test]
+async fn merge_drops_the_twin_left_by_a_same_state_collision() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-TWIN",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-TWIN",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let read_from = |sender: &str, chat: &str, ts: i64| {
+        Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(chat),
+                    sender: jid(sender),
+                    ..Default::default()
+                })
+                .message_ids(vec!["OUT-TWIN".to_string()])
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .r#type(ReceiptType::Read)
+                .offline(false)
+                .build(),
+        )
+    };
+    // Same state, same surviving chat, two identities — and the retiring
+    // identity is the one that saw it first.
+    feed(
+        &chat_store,
+        [
+            read_from(PEER_LID, PEER, 1_700_000_200),
+            read_from(PEER, PEER, 1_700_000_800),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store.receipts(&jid(PEER), "OUT-TWIN").await.unwrap();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the skipped twin must not outlive the merge: {receipts:?}"
+    );
+    assert_eq!(receipts[0].user_jid, jid(PEER));
+    assert_eq!(
+        receipts[0].timestamp.timestamp(),
+        1_700_000_200,
+        "and it leaves its instant behind"
+    );
+}
+
 /// A reaction addressed by the peer's other identity lands on the stored
 /// message (routing picks the existing thread).
 #[tokio::test]
@@ -4571,6 +4642,16 @@ async fn a_receipt_that_arrives_before_its_message_is_not_lost() {
         vec![(MessageStatus::Delivered, 1_700_000_200)],
         "the early receipt still carries its instant: {receipts:?}"
     );
+
+    // And the row adopts the state that receipt already reported. Nothing
+    // re-sends it, so a message left at Pending here would disagree with its
+    // own receipts for good.
+    let msg = chat_store
+        .message(&peer, "OUT-DM-EARLY")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Delivered);
 }
 
 /// Receipts do not arrive in time order — an offline queue drains after the
@@ -4635,6 +4716,8 @@ async fn an_early_aliased_receipt_files_against_the_existing_thread() {
     chat_store.flush().await.unwrap();
     add_lid_mapping(&store).await;
 
+    let mut changes = chat_store.subscribe();
+
     // A receipt by LID for a message that does not exist yet, anywhere.
     feed(
         &chat_store,
@@ -4646,6 +4729,22 @@ async fn an_early_aliased_receipt_files_against_the_existing_thread() {
         )],
     )
     .await;
+
+    // The thread the row was written to has to be announced, or a subscriber
+    // watching it keeps showing stale message info until something unrelated
+    // touches the thread.
+    let mut announced = Vec::new();
+    while let Ok(Ok(change)) =
+        tokio::time::timeout(Duration::from_millis(500), changes.recv()).await
+    {
+        if let StoreChange::Messages { chat } = change {
+            announced.push(chat.to_string());
+        }
+    }
+    assert!(
+        announced.iter().any(|c| c == PEER),
+        "the written thread must be invalidated, got {announced:?}"
+    );
 
     let stored: Vec<JidRow> = store
         .shared()
