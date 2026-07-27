@@ -2567,8 +2567,17 @@ fn insert_message(
 /// `receipts()` saying Delivered while `message()` still says Pending, since
 /// the status is only ever advanced by a receipt that arrives *after* the row.
 ///
-/// One indexed lookup over the row's own primary-key prefix, and only for
-/// outgoing messages, which are the only ones peers send receipts for.
+/// Waiting rows filed under the peer's other identity are pulled over first.
+/// A receipt can outrun the PN/LID mapping as well as the message, and with no
+/// mapping to consult it can only file under the identity it was addressed by.
+/// This is where that resolves: the row materializing here names the thread the
+/// message truly belongs to, and nothing else would ever reunite them —
+/// `route_chat_key` merges chats, and a receipt creates none, so there is no
+/// second chat for it to notice.
+///
+/// Only for outgoing messages, which are the only ones peers send receipts for,
+/// and only as a message is first stored — a send already costs a round trip
+/// and an encryption, so the lookups here are not on any hot path.
 fn adopt_recorded_receipts(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -2576,6 +2585,44 @@ fn adopt_recorded_receipts(
     msg_id: &str,
 ) -> QueryResult<()> {
     use schema::message_receipts::dsl as r;
+    if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, chat)? {
+        // Fold instants before moving, so what follows discards duplicates
+        // rather than choosing between them — the same rule the chat merge
+        // uses, for the same reason: neither identity is inherently earlier.
+        diesel::sql_query(
+            "UPDATE message_receipts SET ts_ms = (SELECT MIN(s.ts_ms) FROM message_receipts s \
+              WHERE s.device_id = message_receipts.device_id AND s.msg_id = message_receipts.msg_id \
+                AND s.chat_jid IN (?2, ?3) AND s.user_jid = message_receipts.user_jid \
+                AND s.receipt_type = message_receipts.receipt_type) \
+             WHERE device_id = ?1 AND msg_id = ?4 AND chat_jid IN (?2, ?3)",
+        )
+        .bind::<diesel::sql_types::Integer, _>(device_id)
+        .bind::<diesel::sql_types::Text, _>(&alt)
+        .bind::<diesel::sql_types::Text, _>(chat)
+        .bind::<diesel::sql_types::Text, _>(msg_id)
+        .execute(conn)?;
+        // `OR IGNORE`, because a row the destination already holds collides on
+        // the whole key. Its instant is folded in above, so it is a duplicate,
+        // and the sweep below clears whatever the move left behind.
+        diesel::sql_query(
+            "UPDATE OR IGNORE message_receipts SET chat_jid = ?3 \
+             WHERE device_id = ?1 AND chat_jid = ?2 AND msg_id = ?4",
+        )
+        .bind::<diesel::sql_types::Integer, _>(device_id)
+        .bind::<diesel::sql_types::Text, _>(&alt)
+        .bind::<diesel::sql_types::Text, _>(chat)
+        .bind::<diesel::sql_types::Text, _>(msg_id)
+        .execute(conn)?;
+        diesel::delete(
+            r::message_receipts.filter(
+                r::device_id
+                    .eq(device_id)
+                    .and(r::chat_jid.eq(&alt))
+                    .and(r::msg_id.eq(msg_id)),
+            ),
+        )
+        .execute(conn)?;
+    }
     let reached: Option<i32> = r::message_receipts
         .filter(
             r::device_id

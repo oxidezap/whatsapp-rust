@@ -3933,6 +3933,79 @@ async fn merge_drops_the_twin_left_by_a_same_state_collision() {
     );
 }
 
+/// The same collision from the retiring side. Here the skipped row sits under
+/// `src`, so the dedup sweep must reach it before the chat rename does —
+/// otherwise the rename carries it to the surviving thread untouched, still
+/// naming the identity being retired.
+#[tokio::test]
+async fn merge_drops_a_same_state_collision_left_on_the_retiring_side() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-SRC-TWIN",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-SRC-TWIN",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let read_from = |sender: &str, chat: &str, ts: i64| {
+        Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(chat),
+                    sender: jid(sender),
+                    ..Default::default()
+                })
+                .message_ids(vec!["OUT-SRC-TWIN".to_string()])
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .r#type(ReceiptType::Read)
+                .offline(false)
+                .build(),
+        )
+    };
+    // Both identities record the same state under the LID chat — the side that
+    // newer PN activity will retire.
+    feed(
+        &chat_store,
+        [
+            read_from(PEER_LID, PEER_LID, 1_700_000_800),
+            read_from(PEER, PEER_LID, 1_700_000_200),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store
+        .receipts(&jid(PEER), "OUT-SRC-TWIN")
+        .await
+        .unwrap();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the collision survivor must not ride the rename over: {receipts:?}"
+    );
+    assert_eq!(receipts[0].user_jid, jid(PEER));
+    assert_eq!(
+        receipts[0].timestamp.timestamp(),
+        1_700_000_200,
+        "and the earlier instant survives"
+    );
+}
+
 /// A reaction addressed by the peer's other identity lands on the stored
 /// message (routing picks the existing thread).
 #[tokio::test]
@@ -4840,6 +4913,81 @@ async fn clearing_a_chat_collects_a_receipt_still_waiting_for_its_message() {
             .unwrap()
             .is_empty(),
         "the user cleared the chat, so the pending receipt goes with it"
+    );
+}
+
+/// A receipt can outrun the PN/LID mapping as well as its message. With no
+/// mapping to consult it can only file under the identity it was addressed by,
+/// and the message later routes to the thread the peer's other identity keys —
+/// so the two land apart. Nothing else reunites them: the chat merge needs two
+/// chats, and a receipt creates none.
+#[tokio::test]
+async fn a_receipt_predating_the_alias_mapping_is_claimed_when_the_message_lands() {
+    let (store, chat_store) = test_store().await;
+
+    // An established PN thread, so the message will route there later.
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-DM-PRIOR",
+            &wa::Message::text("anterior"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    // No mapping yet, so the LID address is all this receipt has to go on.
+    feed(
+        &chat_store,
+        [peer_receipt(
+            jid(PEER_LID),
+            vec!["OUT-DM-NOMAP"],
+            ReceiptType::Delivered,
+            1_700_000_200,
+        )],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+
+    // The message materializes on the PN side.
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-DM-NOMAP",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let stored: Vec<JidRow> = store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query(
+                "SELECT chat_jid AS jid FROM message_receipts \
+                 WHERE device_id = 1 AND msg_id = 'OUT-DM-NOMAP'",
+            )
+            .load(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.iter().map(|r| r.jid.as_str()).collect::<Vec<_>>(),
+        vec![PEER],
+        "the waiting row follows its message instead of stranding"
+    );
+
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-DM-NOMAP")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        msg.status,
+        MessageStatus::Delivered,
+        "and the message adopts what it already reported"
     );
 }
 

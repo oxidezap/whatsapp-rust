@@ -357,14 +357,18 @@ pub(crate) fn merge_split_chat(
     .bind::<Text, _>(src)
     .bind::<Text, _>(dest)
     .execute(conn)?;
-    // A row already under `dest` whose renamed form collides with an existing
-    // one is skipped by `OR IGNORE` above, and the `chat_jid = src` sweep at
-    // the end cannot reach it. Left alone it would outlive the merge still
-    // naming the retired identity — one peer read back as two users, the exact
-    // failure this reconciliation exists to prevent. Its instant is already
-    // folded in, so it is a pure duplicate by now.
+    // Past that rename, naming `src` is proof of a collision: the only rows
+    // still doing so are the ones `OR IGNORE` skipped because their renamed
+    // form already existed. Their instants are folded in, so every one of them
+    // is a pure duplicate — and both chat keys need sweeping, not just `dest`.
+    // A survivor under `src` would otherwise be carried to `dest` intact by the
+    // chat rename below, and one under `dest` is beyond that rename's reach
+    // entirely. Either way it outlives the merge still naming the retired
+    // identity: one peer read back as two users, the exact failure this
+    // reconciliation exists to prevent.
     diesel::sql_query(
-        "DELETE FROM message_receipts WHERE device_id = ?1 AND chat_jid = ?3 AND user_jid = ?2",
+        "DELETE FROM message_receipts \
+         WHERE device_id = ?1 AND chat_jid IN (?2, ?3) AND user_jid = ?2",
     )
     .bind::<Integer, _>(device_id)
     .bind::<Text, _>(src)
