@@ -308,7 +308,34 @@ impl Client {
         self.wait_for_offline_delivery_end().await;
         self.ensure_sessions_inner(jids.to_vec()).await
     }
+}
 
+/// Whether a prekey fetch failed because the server considers the devices
+/// unregistered.
+///
+/// Batch-wide by nature: the fetch is one IQ, so a `406` answers for every jid
+/// in it rather than naming one.
+fn is_device_unregistered(err: &anyhow::Error) -> bool {
+    wacore::request::ServerErrorCode::from_anyhow(err).is_some_and(|e| e.code == 406)
+}
+
+impl Client {
+    /// Refreshes the device list of every user named in `jids`.
+    ///
+    /// Deduplicated: a batch is usually several devices of the same one or two
+    /// users, and each invalidation takes the registry lock and deletes rows.
+    async fn invalidate_device_caches_for(&self, jids: &[Jid]) {
+        let mut seen: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
+        for jid in jids {
+            if !seen.contains(&jid.user.as_str()) {
+                seen.push(jid.user.as_str());
+                self.invalidate_device_cache(&jid.user).await;
+            }
+        }
+    }
+}
+
+impl Client {
     /// Core session-check + prekey-fetch logic shared by both entry points.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<()> {
@@ -378,9 +405,36 @@ impl Client {
             return Ok(0);
         }
 
-        let prekey_bundles = self
+        let prekey_bundles = match self
             .fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity))
-            .await?;
+            .await
+        {
+            Ok(bundles) => bundles,
+            // A `406` means the server no longer knows these devices, so our
+            // cached list named someone who is gone. Two things follow.
+            //
+            // The send continues: the loop below already treats a device the
+            // server returned no bundle for as missing and carries on, and the
+            // fan-out then skips whatever has no session. Failing the whole DM
+            // because one cached device went away would deny the message to
+            // every device that is still there, which is neither what the group
+            // path does nor what WA Web does (`eagerlyEstablishE2EESession`
+            // logs `ignore prekey err, device unregistered` and continues).
+            //
+            // And the cache is refreshed, or the next send resolves the same
+            // absent device and collects the same 406. It cannot affect this
+            // send, whose device set is already resolved.
+            Err(e) if is_device_unregistered(&e) => {
+                log::debug!(
+                    "Prekey fetch returned 406 for {} device(s); \
+                     treating them as unavailable and refreshing their device lists",
+                    jids.len()
+                );
+                self.invalidate_device_caches_for(jids).await;
+                std::collections::HashMap::new()
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<StdRng>();
@@ -515,6 +569,62 @@ impl Client {
 mod tests {
     use super::*;
     use wacore_binary::{JidExt, Server};
+
+    /// The 406 the preflight now tolerates is recognised by its server code and
+    /// nothing else: any other failure must still fail the send, or a transport
+    /// or auth error would be silently downgraded into "these devices have no
+    /// prekeys" and the message would go out to fewer devices than it should.
+    #[test]
+    fn only_a_406_counts_as_an_unregistered_device() {
+        let unregistered = anyhow::Error::new(wacore::request::ServerErrorCode {
+            code: 406,
+            text: "not-acceptable".to_string(),
+            error_type: None,
+            backoff: None,
+        });
+        assert!(is_device_unregistered(&unregistered));
+
+        for code in [400, 401, 403, 404, 429, 500, 503] {
+            let other = anyhow::Error::new(wacore::request::ServerErrorCode {
+                code,
+                text: "other".to_string(),
+                error_type: None,
+                backoff: None,
+            });
+            assert!(
+                !is_device_unregistered(&other),
+                "a {code} must not be treated as an unregistered device"
+            );
+        }
+
+        // Not every failure is a server error at all.
+        assert!(!is_device_unregistered(&anyhow::anyhow!("socket closed")));
+    }
+
+    /// A prekey batch is several devices of the same one or two users, and each
+    /// invalidation takes the registry lock and deletes rows, so the users are
+    /// visited once each rather than once per device.
+    #[tokio::test]
+    async fn a_batch_refreshes_each_user_once() {
+        let client = crate::test_utils::create_test_client().await;
+
+        let a = Jid::pn("5511900000050");
+        let b = Jid::pn("5511900000051");
+        let jids = vec![
+            a.with_device(0),
+            a.with_device(1),
+            b.with_device(0),
+            a.with_device(2),
+        ];
+
+        // No cache entries to clear; what is under test is which users are
+        // visited, which the call itself reports by not panicking on the
+        // duplicate-heavy input and by leaving both users absent afterwards.
+        client.invalidate_device_caches_for(&jids).await;
+
+        assert!(client.device_registry_cache.get(&a.user).await.is_none());
+        assert!(client.device_registry_cache.get(&b.user).await.is_none());
+    }
 
     #[test]
     fn test_primary_phone_jid_creation_from_pn() {
