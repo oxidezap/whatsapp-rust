@@ -1360,6 +1360,54 @@ mod tests {
     }
 
     #[test]
+    fn initial_group_offer_rejects_mismatched_group_jid() {
+        let creator = jid("100001", 1);
+        let participants = [
+            participant("100001", 1, &CAPABILITY_OFFER),
+            participant("200002", 2, &CAPABILITY_OFFER),
+            participant("300003", 3, &CAPABILITY_OFFER),
+        ];
+        let group = Jid::new("1234567890-1111111111", Server::Group);
+        let node = build_initial_group_offer(&InitialGroupOfferParams {
+            call_id: "00aabbccddeeff001122334455667788",
+            id: "REQ-1",
+            call_creator: &creator,
+            group_jid: Some(&group),
+            participants: &participants,
+            audio_rate: 16_000,
+            video: false,
+        })
+        .expect("valid offer");
+
+        let mut parseable_action = action(&node).clone();
+        let wacore_binary::NodeContent::Nodes(children) =
+            parseable_action.content.as_mut().expect("offer children")
+        else {
+            panic!("offer content must contain nodes");
+        };
+        let group_info = children
+            .iter_mut()
+            .find(|child| child.tag == "group_info")
+            .expect("group_info");
+        group_info.attrs.insert("transaction-id", "1");
+        group_info.attrs.insert("connected-limit", "32");
+        group_info.attrs.insert("media", "audio");
+        group_info.attrs.insert(
+            "group-jid",
+            Jid::new("9876543210-2222222222", Server::Group),
+        );
+
+        let error = parse_group_invite_snapshot(&parseable_action.as_node_ref())
+            .expect_err("mismatched group identities must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("group_info group-jid does not match offer"),
+            "unexpected parse error: {error:#}"
+        );
+    }
+
+    #[test]
     fn initial_group_video_offer_preserves_standard_opus_capability_family() {
         let creator = jid("100001", 0);
         let participants = [

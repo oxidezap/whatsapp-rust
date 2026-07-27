@@ -83,6 +83,8 @@ impl StanzaHandler for CallHandler {
         match parse_call_stanza(nr) {
             Ok(Some(call)) => {
                 #[cfg(feature = "voip-runtime")]
+                let is_terminate = matches!(&call.action, CallAction::Terminate { .. });
+                #[cfg(feature = "voip-runtime")]
                 let is_group_transition = matches!(
                     &call.action,
                     CallAction::GroupUpdate { .. }
@@ -90,7 +92,7 @@ impl StanzaHandler for CallHandler {
                         | CallAction::WaitingRoomUpdate { .. }
                         | CallAction::RaiseHand { .. }
                         | CallAction::ScreenShare { .. }
-                );
+                ) || is_terminate;
                 #[cfg(feature = "voip-runtime")]
                 let group_transition = if is_group_transition {
                     client
@@ -129,6 +131,30 @@ impl StanzaHandler for CallHandler {
                     debug!(
                         "call: discarded stale {} after call generation changed for {}",
                         call.action.wire_tag(),
+                        call.action.call_id()
+                    );
+                    return true;
+                }
+                #[cfg(feature = "voip-runtime")]
+                let is_group_terminate = is_terminate
+                    && group_transition_generation.is_some_and(|generation| {
+                        client
+                            .call_registry()
+                            .is_group_call_if_current(call.action.call_id(), generation)
+                    });
+                #[cfg(feature = "voip-runtime")]
+                if is_group_terminate
+                    && !group_transition_generation.is_some_and(|generation| {
+                        client.call_registry().group_creator_authorized_if_current(
+                            call.action.call_id(),
+                            generation,
+                            call.action.call_creator(),
+                            &routed_call_sender(&call),
+                        )
+                    })
+                {
+                    warn!(
+                        "call: rejected group terminate from non-creator sender for {}",
                         call.action.call_id()
                     );
                     return true;
@@ -367,8 +393,15 @@ impl StanzaHandler for CallHandler {
                     // invited participant. Neither tears down the registered call; authoritative
                     // timeout/terminate or the group roster owns the corresponding final state.
                     #[cfg(feature = "voip-runtime")]
-                    if matches!(&call.action, CallAction::Terminate { .. })
-                        || matches!(&call.action, CallAction::Reject { .. }
+                    if let CallAction::Terminate { .. } = &call.action
+                        && let Some(generation) = group_transition_generation
+                    {
+                        crate::voip::facade::terminate_call_if_current(
+                            &client,
+                            call.action.call_id(),
+                            generation,
+                        );
+                    } else if matches!(&call.action, CallAction::Reject { .. }
                             if !reject_is_device_busy(&call.action)
                                 && !client
                                     .call_registry()
@@ -413,7 +446,7 @@ impl StanzaHandler for CallHandler {
                         }
                         CallAction::WaitingRoomUpdate { room }
                             if !group_transition_generation.is_some_and(|generation| {
-                                client.call_registry().group_sender_authorized_if_current(
+                                client.call_registry().group_creator_authorized_if_current(
                                     &room.call_id,
                                     generation,
                                     &room.call_creator,
@@ -1411,7 +1444,7 @@ mod tests {
         let outsider = Jid::new("999999999999999", Server::Lid).with_device(9);
         let group_update = NodeBuilder::new("call")
             .attr("from", Jid::new("GROUP-CALL", Server::Call))
-            .attr("participant", participant)
+            .attr("participant", participant.clone())
             .attr("id", "UNAUTHORIZED-GROUP-SNAPSHOT")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("group_update")
@@ -1453,7 +1486,7 @@ mod tests {
 
         let waiting_room = NodeBuilder::new("call")
             .attr("from", Jid::new("GROUP-CALL", Server::Call))
-            .attr("participant", outsider)
+            .attr("participant", participant)
             .attr("id", "UNAUTHORIZED-WAITING-SNAPSHOT")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("waiting_room_update")
@@ -1484,7 +1517,7 @@ mod tests {
                 .group_state("GROUP-CALL")
                 .and_then(|state| state.waiting_room().and_then(|room| room.transaction_id)),
             Some(1),
-            "an outsider must not replace the waiting-room state"
+            "a connected non-creator must not replace the waiting-room state"
         );
         assert!(
             global_rx.try_recv().is_err(),
@@ -3068,6 +3101,84 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn only_the_creator_can_terminate_an_active_group_call() {
+        let client = make_client().await;
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let participant = Jid::new("222222222222222", Server::Lid).with_device(2);
+        let call_id = "GROUP-CALL";
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        );
+        session.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        );
+        let generation = client.call_registry().insert(session);
+
+        let participant_terminate = NodeBuilder::new("call")
+            .attr("from", Jid::new(call_id, Server::Call))
+            .attr("participant", participant)
+            .attr("id", "STANZA-PARTICIPANT-TERM")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("terminate")
+                .attr("call-creator", creator.clone())
+                .attr("call-id", call_id)
+                .build()])
+            .build();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&participant_terminate),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            Some(generation),
+            "one participant must not terminate the whole group call"
+        );
+
+        let creator_terminate = NodeBuilder::new("call")
+            .attr("from", Jid::new(call_id, Server::Call))
+            .attr("participant", creator.clone().with_device(1))
+            .attr("id", "STANZA-CREATOR-TERM")
+            .attr("t", "1766847152")
+            .children([NodeBuilder::new("terminate")
+                .attr("call-creator", creator)
+                .attr("call-id", call_id)
+                .build()])
+            .build();
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&creator_terminate),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(
+            client.call_registry().generation_of(call_id).is_none(),
+            "the creator's terminate must still end the group call"
+        );
     }
 
     // A peer <terminate> for our call tears it down: the registry entry (and with it the media task)

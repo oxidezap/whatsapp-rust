@@ -21,8 +21,8 @@ use crate::voip::session::{
     MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
 };
 use crate::voip::ssrc::{
-    derive_video_participant_ssrc, derive_wasm_participant_ssrc, derive_wasm_relay_stream_ssrcs,
-    format_e2e_srtp_participant_id,
+    APP_DATA_SSRC_SLOT_WORD, VIDEO_SSRC_SLOT_WORD, derive_video_participant_ssrc,
+    derive_wasm_participant_ssrc, format_e2e_srtp_participant_id,
 };
 
 const MAX_BUFFERED_EPOCHS: usize = 8;
@@ -359,10 +359,10 @@ impl GroupMediaRegistry {
                 EpochKey::new(raw_epoch).ok_or(GroupMediaError::InvalidEpoch)?,
             );
             if self.pending_epochs.len() > MAX_BUFFERED_EPOCHS {
-                let Some(oldest) = self.pending_epochs.keys().next().copied() else {
+                let Some(farthest) = self.pending_epochs.keys().next_back().copied() else {
                     return Err(GroupMediaError::InvalidEpoch);
                 };
-                self.pending_epochs.remove(&oldest);
+                self.pending_epochs.remove(&farthest);
             }
             return Ok(GroupEpochApply::Buffered);
         }
@@ -474,12 +474,24 @@ impl GroupMediaRegistry {
         let mut rtcp = HashSet::with_capacity(active.len() * RELAY_STREAM_SLOT_COUNT as usize);
         for (_, device) in active {
             let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
-            let routes = derive_wasm_relay_stream_ssrcs(&self.call_id, &participant_id);
-            if !audio.insert(routes[0]) || !video.insert(routes[3]) || !app_data.insert(routes[8]) {
+            let audio_ssrc = derive_wasm_participant_ssrc(&self.call_id, &participant_id, 0);
+            let video_ssrc =
+                derive_wasm_participant_ssrc(&self.call_id, &participant_id, VIDEO_SSRC_SLOT_WORD);
+            let app_data_ssrc = derive_wasm_participant_ssrc(
+                &self.call_id,
+                &participant_id,
+                APP_DATA_SSRC_SLOT_WORD,
+            );
+            if !audio.insert(audio_ssrc)
+                || !video.insert(video_ssrc)
+                || !app_data.insert(app_data_ssrc)
+            {
                 return Err(GroupMediaError::InvalidSnapshot);
             }
-            for route in routes {
-                if !rtcp.insert(route) {
+            for slot_word in 0..RELAY_STREAM_SLOT_COUNT {
+                let rtcp_ssrc =
+                    derive_wasm_participant_ssrc(&self.call_id, &participant_id, slot_word);
+                if !rtcp.insert(rtcp_ssrc) {
                     return Err(GroupMediaError::InvalidSnapshot);
                 }
             }
@@ -561,11 +573,8 @@ impl GroupMediaRegistry {
         let participant_id = format_e2e_srtp_participant_id(&device_jid.to_string());
         let audio_ssrc = derive_wasm_participant_ssrc(&self.call_id, &participant_id, 0);
         let video_ssrc = derive_video_participant_ssrc(&self.call_id, &participant_id);
-        let app_data_ssrc = derive_wasm_participant_ssrc(
-            &self.call_id,
-            &participant_id,
-            crate::voip::ssrc::APP_DATA_SSRC_SLOT_WORD,
-        );
+        let app_data_ssrc =
+            derive_wasm_participant_ssrc(&self.call_id, &participant_id, APP_DATA_SSRC_SLOT_WORD);
         let audio = MediaPipeline::new(&MediaPipelineParams {
             call_key: key,
             self_lid: &self.self_lid,
@@ -631,7 +640,7 @@ impl GroupMediaRegistry {
             app_data_ssrc: derive_wasm_participant_ssrc(
                 &self.call_id,
                 &participant_id,
-                crate::voip::ssrc::APP_DATA_SSRC_SLOT_WORD,
+                APP_DATA_SSRC_SLOT_WORD,
             ),
             participant_id,
             user_jid: user_jid.clone(),
@@ -868,21 +877,45 @@ mod tests {
             .expect("initial epoch");
         let previous_participants = registry.active_participant_ids();
 
-        // These fictitious LIDs collide for CALL's slot-0 HKDF-derived SSRC.
-        let colliding = update(
-            2,
-            vec![
-                device("100001", 1, 1),
-                device("37774", 1, 2),
-                device("53838", 1, 3),
-            ],
-        );
-        assert_eq!(
-            registry.apply_group_update(&colliding),
-            Err(GroupMediaError::InvalidSnapshot)
-        );
-        assert_eq!(registry.roster_transaction(), Some(1));
-        assert_eq!(registry.active_participant_ids(), previous_participants);
+        let collisions = [
+            ("audio", 0, "37774", "53838"),
+            ("video", VIDEO_SSRC_SLOT_WORD, "52371", "59782"),
+            ("app-data", APP_DATA_SSRC_SLOT_WORD, "19671", "43135"),
+            ("RTCP", 1, "25851", "41568"),
+        ];
+        for (route, slot_word, first, second) in collisions {
+            let first_id = format_e2e_srtp_participant_id(
+                &Jid::new(first, Server::Lid).with_device(1).to_string(),
+            );
+            let second_id = format_e2e_srtp_participant_id(
+                &Jid::new(second, Server::Lid).with_device(1).to_string(),
+            );
+            assert_eq!(
+                derive_wasm_participant_ssrc("CALL", &first_id, slot_word),
+                derive_wasm_participant_ssrc("CALL", &second_id, slot_word),
+                "{route} collision fixture no longer exercises the intended route"
+            );
+
+            let colliding = update(
+                2,
+                vec![
+                    device("100001", 1, 1),
+                    device(first, 1, 2),
+                    device(second, 1, 3),
+                ],
+            );
+            assert_eq!(
+                registry.apply_group_update(&colliding),
+                Err(GroupMediaError::InvalidSnapshot),
+                "{route} route collision must reject the snapshot"
+            );
+            assert_eq!(registry.roster_transaction(), Some(1));
+            assert_eq!(
+                registry.active_participant_ids(),
+                previous_participants,
+                "{route} route collision must preserve the active roster"
+            );
+        }
     }
 
     #[test]
@@ -991,9 +1024,9 @@ mod tests {
     }
 
     #[test]
-    fn future_epoch_buffer_retains_the_newest_transactions() {
+    fn future_epoch_buffer_preserves_the_nearest_usable_transaction() {
         let mut registry = registry();
-        for transaction in 1..=(MAX_BUFFERED_EPOCHS as u32 + 2) {
+        for transaction in 100..100 + MAX_BUFFERED_EPOCHS as u32 {
             assert_eq!(
                 registry
                     .apply_raw_epoch(transaction, &[transaction as u8; 32])
@@ -1001,21 +1034,27 @@ mod tests {
                 GroupEpochApply::Buffered
             );
         }
-        assert_eq!(registry.pending_epochs.len(), MAX_BUFFERED_EPOCHS);
         assert_eq!(
-            registry.pending_epochs.keys().copied().collect::<Vec<_>>(),
-            (3..=MAX_BUFFERED_EPOCHS as u32 + 2).collect::<Vec<_>>()
+            registry.apply_raw_epoch(1, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Buffered
+        );
+        assert_eq!(registry.pending_epochs.len(), MAX_BUFFERED_EPOCHS);
+        assert!(
+            registry.pending_epochs.contains_key(&1),
+            "a legitimate next epoch must displace the farthest speculative key"
+        );
+        assert!(
+            !registry
+                .pending_epochs
+                .contains_key(&(100 + MAX_BUFFERED_EPOCHS as u32 - 1))
         );
         registry
-            .apply_group_update(&update(
-                MAX_BUFFERED_EPOCHS as u32 + 2,
-                vec![device("200002", 2, 2)],
-            ))
-            .expect("latest roster");
+            .apply_group_update(&update(1, vec![device("200002", 2, 2)]))
+            .expect("next roster");
         assert_eq!(
             registry.installed_epoch_transaction(),
-            Some(MAX_BUFFERED_EPOCHS as u32 + 2),
-            "the bounded buffer must retain the authoritative newest key"
+            Some(1),
+            "far-future epochs must not suppress the next authoritative key"
         );
     }
 

@@ -684,6 +684,15 @@ impl CallRegistry {
             .is_some_and(|entry| entry.is_group_call)
     }
 
+    /// Whether one exact call generation is registered as group media.
+    pub fn is_group_call_if_current(&self, call_id: &str, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .is_some_and(|entry| entry.generation == generation && entry.is_group_call)
+    }
+
     /// The exact ringing group generation matching its signaling creator.
     pub fn ringing_group_generation(&self, call_id: &str, call_creator: &Jid) -> Option<u64> {
         self.inner

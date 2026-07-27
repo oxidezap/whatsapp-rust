@@ -65,6 +65,32 @@ impl GroupControl {
     }
 }
 
+enum NormalizedGroupControl {
+    Update {
+        update: Box<GroupCallUpdate>,
+        paired_epoch: Option<GroupRawEpoch>,
+    },
+    RawEpoch(GroupRawEpoch),
+    Reaction(String),
+}
+
+impl From<GroupControl> for NormalizedGroupControl {
+    fn from(control: GroupControl) -> Self {
+        match control {
+            GroupControl::Update(update) => Self::Update {
+                update,
+                paired_epoch: None,
+            },
+            GroupControl::Transition { update, epoch } => Self::Update {
+                update,
+                paired_epoch: Some(epoch),
+            },
+            GroupControl::RawEpoch(epoch) => Self::RawEpoch(epoch),
+            GroupControl::Reaction(emoji) => Self::Reaction(emoji),
+        }
+    }
+}
+
 /// One decrypted keygen-v2 epoch. Debug output is deliberately redacted and the bytes are erased
 /// when the command leaves the driver, regardless of whether the engine accepted it.
 pub struct GroupRawEpoch {
@@ -886,14 +912,11 @@ async fn run_call_with_clock_and_wallclock(
                 }
             },
             group = group_ctl_fut => {
-                let (group, paired_epoch) = match group {
-                    Some(GroupControl::Transition { update, epoch }) => {
-                        (Some(GroupControl::Update(update)), Some(epoch))
-                    }
-                    group => (group, None),
-                };
-                match group {
-                    Some(GroupControl::Update(update)) => {
+                match group.map(NormalizedGroupControl::from) {
+                    Some(NormalizedGroupControl::Update {
+                        update,
+                        paired_epoch,
+                    }) => {
                         let previous_epoch = eng.group_epoch_transaction();
                         let update_accepted = match eng.apply_group_update(now_ms(), &update) {
                             Ok(crate::voip::GroupRosterApply::Applied) => {
@@ -947,7 +970,7 @@ async fn run_call_with_clock_and_wallclock(
                             });
                         }
                     }
-                    Some(GroupControl::RawEpoch(epoch)) => {
+                    Some(NormalizedGroupControl::RawEpoch(epoch)) => {
                         apply_group_epoch_control(
                             &mut eng,
                             epoch,
@@ -957,15 +980,12 @@ async fn run_call_with_clock_and_wallclock(
                             &channels.events,
                         );
                     }
-                    Some(GroupControl::Reaction(emoji)) => {
+                    Some(NormalizedGroupControl::Reaction(emoji)) => {
                         if eng.send_group_reaction(now_ms(), &emoji).is_err() {
                             let _ = channels.events.try_send(CallEvent::GroupControlRejected {
                                 control: engine::GroupControlKind::Reaction,
                             });
                         }
-                    }
-                    Some(GroupControl::Transition { .. }) => {
-                        unreachable!("group transitions are normalized before dispatch")
                     }
                     None => group_ctl_open = false,
                 }

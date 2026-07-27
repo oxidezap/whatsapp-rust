@@ -79,6 +79,19 @@ impl GroupCallState {
         {
             return GroupStateApply::Stale;
         }
+        if let Some(current_group_jid) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.group_jid.as_ref())
+        {
+            match update.group_jid.as_ref() {
+                Some(group_jid) if group_jid != current_group_jid => {
+                    return GroupStateApply::IdentityMismatch;
+                }
+                None => update.group_jid = Some(current_group_jid.clone()),
+                Some(_) => {}
+            }
+        }
 
         let connected = update
             .participants
@@ -329,6 +342,41 @@ mod tests {
                 .and_then(|snapshot| snapshot.relay.as_ref()),
             Some(&relay),
             "an omitted relay is a roster-only update, not allocation revocation"
+        );
+    }
+
+    #[test]
+    fn roster_only_updates_retain_group_identity_and_reject_retagging() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let group_jid = Jid::new("1234567890-1111111111", Server::Group);
+        let mut admitted = update(1, vec![participant("100001", "connected", 1)]);
+        admitted.group_jid = Some(group_jid.clone());
+        assert_eq!(state.apply_update(admitted), GroupStateApply::Applied);
+
+        assert_eq!(
+            state.apply_update(update(2, vec![participant("100001", "connected", 1)],)),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .and_then(|snapshot| snapshot.group_jid.as_ref()),
+            Some(&group_jid),
+            "an omitted group_jid is a roster-only update, not an identity change"
+        );
+
+        let mut conflicting = update(3, vec![participant("100001", "connected", 1)]);
+        conflicting.group_jid = Some(Jid::new("9876543210-2222222222", Server::Group));
+        assert_eq!(
+            state.apply_update(conflicting),
+            GroupStateApply::IdentityMismatch
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .map(|snapshot| (snapshot.transaction_id, snapshot.group_jid.as_ref())),
+            Some((2, Some(&group_jid))),
+            "a conflicting group_jid must not consume the transaction or retag the call"
         );
     }
 

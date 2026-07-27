@@ -1895,6 +1895,11 @@ pub(crate) fn terminate_call(client: &Client, call_id: &str) {
     }
 }
 
+/// Tear down only the generation whose terminal stanza was authorized.
+pub(crate) fn terminate_call_if_current(client: &Client, call_id: &str, generation: u64) {
+    fail_pending_outgoing(client, call_id, generation);
+}
+
 /// "00" + 15 random bytes as lowercase hex (WA Web `_e()`): 32 hex chars total.
 fn gen_call_id() -> String {
     format!("00{}", hex::encode(rand::random::<[u8; 15]>()))
@@ -4853,6 +4858,22 @@ mod tests {
         // The live handle still tears it down.
         live.hangup().await;
         assert_eq!(client.call_registry().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_peer_terminate_spares_the_replacement_generation() {
+        let client = make_client().await;
+        let stale = client.call_registry().insert(mk_session());
+        let current = client.call_registry().insert(mk_session());
+
+        terminate_call_if_current(&client, "CID-FACADE", stale);
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            Some(current),
+            "a terminal stanza authorized for an old generation must spare its replacement"
+        );
+
+        terminate_call_if_current(&client, "CID-FACADE", current);
     }
 
     // A stale handle's wait_ended() must resolve (not hang) once a same-call-id replacement aborted
