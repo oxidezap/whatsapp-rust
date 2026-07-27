@@ -1,3 +1,12 @@
+//! Bridges between the persisted `*RecordStructure` protobufs and the record
+//! types.
+//!
+//! Both sides encode `public_key` as the raw 32-byte DJB key (see the
+//! `PreKeyRecord` doc comment), so these conversions are lossless in both
+//! directions and the structure a record produces is byte-identical to the one
+//! it was built from. What they still do is validate: a structure carrying
+//! malformed key bytes is rejected here rather than at some later use.
+
 use crate::protocol::{
     KeyPair, PreKeyRecord, PrivateKey, PublicKey, SignalProtocolError, SignedPreKeyRecord,
     Timestamp,
@@ -87,11 +96,11 @@ pub fn prekey_structure_to_record(
 pub fn prekey_record_to_structure(
     record: &PreKeyRecord,
 ) -> Result<wa::PreKeyRecordStructure, SignalProtocolError> {
-    Ok(wa::PreKeyRecordStructure {
-        id: Some(record.id()?.into()),
-        public_key: Some(record.key_pair()?.public_key.public_key_bytes().to_vec()),
-        private_key: Some(record.key_pair()?.private_key.serialize().to_vec()),
-    })
+    // Re-derived from the parsed key pair rather than copied field-by-field, so
+    // a structure that reached the record with malformed key bytes cannot be
+    // written back out to the store.
+    let key_pair = record.key_pair()?;
+    Ok(new_pre_key_record(record.id()?.into(), &key_pair))
 }
 
 pub fn signed_prekey_structure_to_record(
@@ -209,6 +218,106 @@ mod tests {
             restored_keypair.private_key.serialize()
         );
 
+        Ok(())
+    }
+
+    /// The property the two encodings used to break: bytes written by the store
+    /// path must read back through the record's *own* API, not only through the
+    /// `record_helpers` bridge that production happens to use.
+    #[test]
+    fn store_written_prekey_reads_back_through_record_api() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        let mut stored = Vec::new();
+        encode_pre_key_record_to(7, &key_pair, &mut stored);
+
+        let record = PreKeyRecord::deserialize(&stored)?;
+        assert_eq!(record.id()?, 7u32.into());
+        assert_eq!(
+            record.public_key()?.public_key_bytes(),
+            key_pair.public_key.public_key_bytes()
+        );
+        assert_eq!(
+            record.key_pair()?.private_key.serialize(),
+            key_pair.private_key.serialize()
+        );
+
+        // And the reverse direction: a record built in memory serializes to the
+        // exact bytes the store writer produces for the same key.
+        assert_eq!(
+            PreKeyRecord::new(7u32.into(), &key_pair).serialize()?,
+            stored
+        );
+        Ok(())
+    }
+
+    /// Same property for the signed record, whose getters go through the
+    /// `KeySerde` record encoding rather than `PublicKey::deserialize`.
+    #[test]
+    fn store_written_signed_prekey_reads_back_through_record_api()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        let mut signature = [0u8; 64];
+        rand::rng().fill_bytes(&mut signature);
+        let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("fixed timestamp is in range");
+
+        let structure = new_signed_pre_key_record(9, &key_pair, signature, timestamp);
+        let stored = waproto::codec::signed_pre_key_record_to_vec(&structure);
+
+        let record = <SignedPreKeyRecord as GenericSignedPreKey>::deserialize(&stored)?;
+        assert_eq!(record.id()?, 9u32.into());
+        assert_eq!(
+            record.public_key()?.public_key_bytes(),
+            key_pair.public_key.public_key_bytes()
+        );
+        assert_eq!(
+            record.key_pair()?.private_key.serialize(),
+            key_pair.private_key.serialize()
+        );
+        assert_eq!(record.signature()?, signature.to_vec());
+
+        // `GenericSignedPreKey::new` must agree byte-for-byte with the store helper.
+        let rebuilt = <SignedPreKeyRecord as GenericSignedPreKey>::new(
+            9u32.into(),
+            Timestamp::from_epoch_millis(structure.timestamp.expect("timestamp set")),
+            &key_pair,
+            &signature,
+        );
+        assert_eq!(rebuilt.serialize()?, stored);
+        Ok(())
+    }
+
+    /// Both record constructors write the 32-byte form WhatsApp uploads in
+    /// `<key><value>` / `<skey><value>` and hashes in the key-bundle digest.
+    #[test]
+    fn record_constructors_write_raw_public_keys() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::protocol::PublicKey;
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        let prekey = PreKeyRecord::new(1.into(), &key_pair).serialize()?;
+        assert_eq!(
+            waproto::codec::pre_key_record_decode(&prekey)?
+                .public_key
+                .expect("public key set")
+                .len(),
+            PublicKey::RAW_KEY_LEN
+        );
+
+        let signed = <SignedPreKeyRecord as GenericSignedPreKey>::new(
+            1.into(),
+            Timestamp::from_epoch_millis(0),
+            &key_pair,
+            &[0u8; 64],
+        )
+        .serialize()?;
+        assert_eq!(
+            waproto::codec::signed_pre_key_record_decode(&signed)?
+                .public_key
+                .expect("public key set")
+                .len(),
+            PublicKey::RAW_KEY_LEN
+        );
         Ok(())
     }
 
