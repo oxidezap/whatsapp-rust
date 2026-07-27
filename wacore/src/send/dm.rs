@@ -178,14 +178,12 @@ pub async fn prepare_dm_stanza(
             recipient: MessageUtils::pad_with_context_from_encoded(content, extra_context.as_ref()),
             own_devices: Vec::new(),
         },
-        Some(content) => MessageUtils::dm_plaintexts_from_encoded(
-            content,
-            extra_context.as_ref(),
-            &to_jid.to_string(),
-        ),
-        None => {
-            MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string())
+        // The JID names itself straight into the wire buffer; rendering a
+        // String first existed only to measure it.
+        Some(content) => {
+            MessageUtils::dm_plaintexts_from_encoded(content, extra_context.as_ref(), to_jid)
         }
+        None => MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), to_jid),
     };
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
