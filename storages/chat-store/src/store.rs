@@ -1791,6 +1791,19 @@ fn apply_receipt(
                 > 0
             {
                 relocated.insert(msg_id, alt.clone());
+                continue;
+            }
+            // The status not advancing does not mean the row is elsewhere: a
+            // replayed receipt, or one arriving behind the state already
+            // recorded, moves nothing under either key. Which chat owns the
+            // receipt is a question about where the message sits, so ask that
+            // directly — on the miss path only, where a lookup is already due.
+            if diesel::select(diesel::dsl::exists(
+                message_row(device_id, &alt, msg_id).filter(schema::messages::from_me.eq(true)),
+            ))
+            .get_result::<bool>(conn)?
+            {
+                relocated.insert(msg_id, alt.clone());
             }
         }
         if !relocated.is_empty() {

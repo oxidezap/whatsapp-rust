@@ -3728,6 +3728,74 @@ async fn merge_advances_duplicate_row_status() {
     assert_eq!(msg.status, MessageStatus::Read);
 }
 
+/// Both identities recorded the same state before the mapping reconciled. The
+/// merge direction is decided by chat activity, which says nothing about which
+/// side saw the receipt first, so the earlier instant has to be carried over
+/// rather than left to whichever key wins.
+#[tokio::test]
+async fn merge_keeps_the_earlier_instant_for_a_state_both_sides_recorded() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-TS",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-TS",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    // One sender, addressing the thread by each of its identities in turn —
+    // the shape of a PN/LID transition, and the only way the same
+    // (message, user, state) lands under both chat keys. The LID side saw the
+    // read first; the PN side, which newer activity will make the merge
+    // destination, saw it later.
+    let read_from_lid_addressed_to = |chat: &str, ts: i64| {
+        Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(chat),
+                    sender: jid(PEER_LID),
+                    ..Default::default()
+                })
+                .message_ids(vec!["OUT-TS".to_string()])
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .r#type(ReceiptType::Read)
+                .offline(false)
+                .build(),
+        )
+    };
+    feed(
+        &chat_store,
+        [
+            read_from_lid_addressed_to(PEER_LID, 1_700_000_200),
+            read_from_lid_addressed_to(PEER, 1_700_000_800),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store.receipts(&jid(PEER), "OUT-TS").await.unwrap();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(
+        receipts[0].timestamp.timestamp(),
+        1_700_000_200,
+        "the losing side saw it first, so its instant is the true one"
+    );
+}
+
 /// A reaction addressed by the peer's other identity lands on the stored
 /// message (routing picks the existing thread).
 #[tokio::test]
@@ -4307,6 +4375,80 @@ async fn a_dm_receipt_resolved_by_alias_files_under_the_message_key() {
         stored.iter().map(|r| r.jid.as_str()).collect::<Vec<_>>(),
         vec![PEER],
         "receipt follows the message's key, not the wire key"
+    );
+}
+
+/// A receipt that advances nothing still has to file under the message's key.
+/// The status not moving says the state was already reached, not that the row
+/// lives somewhere else — so ownership cannot be read off the update count.
+#[tokio::test]
+async fn a_dm_receipt_behind_the_current_status_still_files_by_alias() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-DM-BEHIND",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    add_lid_mapping(&store).await;
+
+    // Read first, then a Delivered that arrives late: it advances nothing,
+    // because the message is already further along.
+    feed(
+        &chat_store,
+        [
+            peer_receipt(
+                jid(PEER_LID),
+                vec!["OUT-DM-BEHIND"],
+                ReceiptType::Read,
+                1_700_000_300,
+            ),
+            peer_receipt(
+                jid(PEER_LID),
+                vec!["OUT-DM-BEHIND"],
+                ReceiptType::Delivered,
+                1_700_000_200,
+            ),
+        ],
+    )
+    .await;
+
+    let stored: Vec<JidRow> = store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query(
+                "SELECT DISTINCT chat_jid AS jid FROM message_receipts \
+                 WHERE device_id = 1 AND msg_id = 'OUT-DM-BEHIND'",
+            )
+            .load(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.iter().map(|r| r.jid.as_str()).collect::<Vec<_>>(),
+        vec![PEER],
+        "the late receipt filed under the wire key instead of the message's"
+    );
+
+    let receipts = chat_store
+        .receipts(&jid(PEER), "OUT-DM-BEHIND")
+        .await
+        .unwrap();
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.status, r.timestamp.timestamp()))
+            .collect::<Vec<_>>(),
+        vec![
+            (MessageStatus::Delivered, 1_700_000_200),
+            (MessageStatus::Read, 1_700_000_300),
+        ],
+        "{receipts:?}"
     );
 }
 

@@ -319,9 +319,29 @@ pub(crate) fn merge_split_chat(
     // No "keep the furthest state" pass here, unlike reactions: receipts are
     // keyed per state, so a side holding `read` and a side holding `delivered`
     // are two facts about one message rather than two candidates for one row.
-    // `OR IGNORE` only drops a src row that collides on the whole key — same
-    // message, user AND state — where the destination already records that
-    // state and its instant is the earlier one by the same rule that wrote it.
+    //
+    // Whole-key collisions — same message, user AND state on both sides — are
+    // the one case the move cannot decide for itself. The two rows were
+    // recorded independently under two identities, so neither side is
+    // automatically the earlier one, and `OR IGNORE` below keeps the
+    // destination's. Pull the earlier instant over first, so the survivor is
+    // the first time that state was reported rather than whichever identity
+    // happened to win the merge direction.
+    diesel::sql_query(
+        "UPDATE message_receipts SET ts_ms = (SELECT MIN(s.ts_ms) FROM message_receipts s \
+          WHERE s.device_id = message_receipts.device_id AND s.chat_jid = ?2 \
+            AND s.msg_id = message_receipts.msg_id AND s.user_jid = message_receipts.user_jid \
+            AND s.receipt_type = message_receipts.receipt_type) \
+         WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
+         (SELECT 1 FROM message_receipts s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
+           AND s.msg_id = message_receipts.msg_id AND s.user_jid = message_receipts.user_jid \
+           AND s.receipt_type = message_receipts.receipt_type \
+           AND s.ts_ms < message_receipts.ts_ms)",
+    )
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .bind::<Text, _>(dest)
+    .execute(conn)?;
     diesel::sql_query(
         "UPDATE OR IGNORE message_receipts SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
     )
