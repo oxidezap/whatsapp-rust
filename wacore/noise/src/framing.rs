@@ -544,12 +544,14 @@ mod tests {
 
         // `capacity()` cannot see this: the residue is a two-byte view, so it
         // reports two bytes whether or not 200 KiB sits underneath it. Where it
-        // points is the observable fact. Adjacency to the frame just handed out
-        // means it is still the tail of that same allocation.
+        // points is the observable fact. A residue sitting right where the frame
+        // ends is still the tail of that same allocation, so this asserts the
+        // two are *not* adjacent, i.e. the residue was moved out of it. The
+        // sibling test below asserts the opposite for a residue too long to move.
         assert_ne!(
             decoder.buffer.as_ptr() as usize,
             frame.as_ptr() as usize + frame.len(),
-            "the residue is still a view into the oversized allocation"
+            "the residue was left as a view into the oversized allocation"
         );
         drop(frame);
 
