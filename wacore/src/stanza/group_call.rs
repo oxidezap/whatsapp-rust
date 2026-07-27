@@ -30,6 +30,7 @@ pub struct InitialGroupOfferParams<'a> {
     pub call_creator: &'a Jid,
     pub group_jid: Option<&'a Jid>,
     pub participants: &'a [GroupCallParticipant],
+    pub audio_rate: u32,
     pub video: bool,
 }
 
@@ -109,9 +110,13 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
             params.participants.len()
         );
     }
+    if params.audio_rate == 0 {
+        bail!("group offer audio rate must be non-zero");
+    }
 
     let users = build_group_users(params.participants, Some(params.call_creator), params.video)?;
-    let mut children = vec![audio_opus("8000"), audio_opus("16000")];
+    let audio_rate = params.audio_rate.to_string();
+    let mut children = vec![audio_opus(&audio_rate)];
     if params.video {
         children.push(video_offer_node());
     }
@@ -227,8 +232,8 @@ fn build_group_users(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut builder = NodeBuilder::new("user").attr("jid", &participant.jid);
-            if !participant.state.is_empty() {
-                builder = builder.attr("state", &participant.state);
+            if let Some(state) = participant.state.as_deref() {
+                builder = builder.attr("state", state);
             }
             Ok(builder.children(devices).build())
         })
@@ -346,7 +351,7 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid", "user")?;
     let pn = attrs.optional_jid("user_pn");
-    let state = required_string(&mut attrs, "state", "user")?;
+    let state = Some(required_string(&mut attrs, "state", "user")?);
     let participant_type = attrs
         .optional_string("type")
         .map(|value| value.into_owned());
@@ -1166,7 +1171,7 @@ mod tests {
         GroupCallParticipant {
             jid: Jid::new(user, Server::Lid),
             pn: None,
-            state: String::new(),
+            state: None,
             participant_type: None,
             devices: vec![GroupCallDevice {
                 jid: jid(user, device),
@@ -1212,6 +1217,7 @@ mod tests {
             call_creator: &creator,
             group_jid: Some(&group),
             participants: &participants,
+            audio_rate: 16_000,
             video: true,
         })
         .expect("valid offer");
@@ -1222,9 +1228,13 @@ mod tests {
         );
         assert_eq!(
             child_tags(action(&node)),
-            ["audio", "audio", "video", "net", "group_info"]
+            ["audio", "video", "net", "group_info"]
         );
         let action = action(&node);
+        let action_ref = action.as_node_ref();
+        let action_children = action_ref.children().expect("group offer children");
+        let audio = &action_children[0];
+        assert_eq!(audio.attrs().optional_u64("rate"), Some(16_000));
         assert_eq!(
             action
                 .attrs
@@ -1236,7 +1246,12 @@ mod tests {
         let group_info = action_ref
             .get_optional_child("group_info")
             .expect("group_info");
-        let creator_capability = group_info.children().unwrap()[0].children().unwrap()[0]
+        let group_users = group_info.children().expect("group users");
+        assert!(
+            group_users[0].attrs().optional_string("state").is_none(),
+            "outbound offer participants must omit absent state instead of using a sentinel"
+        );
+        let creator_capability = group_users[0].children().unwrap()[0]
             .get_optional_child("capability")
             .expect("creator capability");
         assert_eq!(
@@ -1259,6 +1274,7 @@ mod tests {
             call_creator: &creator,
             group_jid: None,
             participants: &participants,
+            audio_rate: 16_000,
             video: true,
         })
         .expect("valid offer");
@@ -1292,6 +1308,7 @@ mod tests {
                 call_creator: &creator,
                 group_jid: None,
                 participants: &too_small,
+                audio_rate: 16_000,
                 video: false,
             })
             .is_err()
@@ -1308,6 +1325,7 @@ mod tests {
                 call_creator: &creator,
                 group_jid: Some(&Jid::new("not-a-group", Server::Lid)),
                 participants: &enough,
+                audio_rate: 16_000,
                 video: false,
             })
             .is_err()

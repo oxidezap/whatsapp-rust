@@ -624,6 +624,11 @@ impl<'a> OutgoingGroupCall<'a> {
             }
             candidates.push(target);
         }
+        if candidates.len() > GROUP_CALL_MAX_REMOTE_PARTICIPANTS {
+            return Err(CallError::Setup(format!(
+                "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+            )));
+        }
         let resolved = futures::future::join_all(candidates.into_iter().map(|target| async move {
             match target.server {
                 Server::Lid => Some(target),
@@ -702,6 +707,7 @@ impl<'a> OutgoingGroupCall<'a> {
             call_creator: &own_lid,
             group_jid: self.group_jid.as_ref(),
             participants: &participants,
+            audio_rate: audio.config().format.signaling_rate,
             video: video.is_some(),
         })
         .map_err(|error| CallError::Response(error.to_string()))?;
@@ -716,13 +722,12 @@ impl<'a> OutgoingGroupCall<'a> {
             request_id.clone(),
             cleanup_generation,
         );
+        // Sending is delivery-ambiguous: cancellation can drop this future after the server has
+        // accepted the bytes but before send_node returns. Arm cleanup before crossing that await.
+        let mut teardown = GroupOfferTeardown::new(self.client, &call_id, &own_lid);
         if let Err(error) = self.client.send_node(offer).await {
             return Err(error.into());
         }
-        // From this point the server may have created the call even if the acknowledgement is lost.
-        // Keep teardown armed across the response wait so timeout, cancellation, and malformed acks
-        // explicitly end that server-side call.
-        let mut teardown = GroupOfferTeardown::new(self.client, &call_id, &own_lid);
         let response = match wacore::runtime::timeout(
             &*self.client.runtime,
             OFFER_ACK_RELAY_TIMEOUT,
@@ -1245,7 +1250,7 @@ async fn fanout_group_epoch_for_generation(
     let recipients = update
         .participants
         .iter()
-        .filter(|participant| participant.state == "connected")
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
         .flat_map(|participant| participant.devices.iter())
         .filter(|device| {
             device.pid.is_some()
@@ -2713,7 +2718,7 @@ fn ensure_group_invite_capacity(
     let connected = snapshot
         .participants
         .iter()
-        .filter(|participant| participant.state == "connected")
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
         .count();
     if snapshot.connected_limit != 0 && connected >= snapshot.connected_limit as usize {
         return Err(CallError::Media(
@@ -2792,14 +2797,15 @@ impl CallHandle {
             let participants = if existing_only {
                 let member =
                     member.ok_or(CallError::Media("ring target does not belong to the call"))?;
-                if member.state == "connected" {
+                if member.state.as_deref() == Some("connected") {
                     return Err(CallError::Media("ring target is already connected"));
                 }
                 snapshot
                     .participants
                     .iter()
                     .filter(|participant| {
-                        participant.state == "connected" && participant.jid.to_non_ad() != target
+                        participant.state.as_deref() == Some("connected")
+                            && participant.jid.to_non_ad() != target
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -3451,12 +3457,12 @@ mod tests {
             own_lid.to_non_ad(),
             vec![own_device],
         )];
-        participants[0].state = "connected".to_string();
+        participants[0].state = Some("connected".to_string());
         participants.extend(recipients.iter().enumerate().map(|(index, recipient)| {
             let mut device = GroupCallDevice::new(recipient.clone());
             device.pid = Some(index as u32 + 2);
             let mut participant = GroupCallParticipant::new(recipient.to_non_ad(), vec![device]);
-            participant.state = "connected".to_string();
+            participant.state = Some("connected".to_string());
             participant
         }));
         GroupCallUpdate::builder()
@@ -3595,6 +3601,41 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn oversized_group_targets_are_rejected_before_recipient_resolution() {
+        let client = make_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+        let targets = (0..=GROUP_CALL_MAX_REMOTE_PARTICIPANTS)
+            .map(|index| Jid::new(format!("1555000{index:04}"), Server::Pn))
+            .collect::<Vec<_>>();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client
+                .voip()
+                .group_call(&targets)
+                .audio(mic_rx, speaker_tx)
+                .start(),
+        )
+        .await
+        .expect("oversized input must fail without waiting for recipient IQs");
+        assert!(matches!(
+            result,
+            Err(CallError::Setup(message))
+                if message
+                    == format!(
+                        "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+                    )
+        ));
+    }
+
     #[test]
     fn group_invites_enforce_membership_and_connected_limits() {
         let creator = Jid::new("111111111111111", Server::Lid);
@@ -3603,7 +3644,7 @@ mod tests {
                 Jid::new(format!("200000000000{index:03}"), Server::Lid),
                 Vec::new(),
             );
-            participant.state = state.to_string();
+            participant.state = Some(state.to_string());
             participant
         };
         let mut snapshot = GroupCallUpdate::builder()
@@ -3632,7 +3673,7 @@ mod tests {
 
         snapshot.participants.truncate(2);
         for participant in &mut snapshot.participants {
-            participant.state = "connected".to_string();
+            participant.state = Some("connected".to_string());
         }
         snapshot.connected_limit = 2;
         assert!(matches!(
@@ -5755,6 +5796,100 @@ mod tests {
             action.attrs().optional_string("call-id").as_deref(),
             Some(call_id)
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_group_offer_during_send_terminates_the_call_scope() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        struct CancelAwareTransport {
+            attempts: AtomicUsize,
+            first_started: async_channel::Sender<()>,
+            first_release: async_channel::Receiver<()>,
+            cleanup_sent: async_channel::Sender<()>,
+        }
+
+        #[async_trait]
+        impl crate::transport::Transport for CancelAwareTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = self.first_started.try_send(());
+                    self.first_release
+                        .recv()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("offer release closed"))?;
+                    return Ok(());
+                }
+                let _ = self.cleanup_sent.try_send(());
+                Ok(())
+            }
+
+            async fn disconnect(&self) {}
+        }
+
+        let client = make_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+        let targets = [
+            Jid::new("222222222222222", Server::Lid),
+            Jid::new("333333333333333", Server::Lid),
+        ];
+        for target in &targets {
+            client
+                .update_device_list(DeviceListRecord {
+                    user: target.user.to_string(),
+                    devices: vec![DeviceInfo::new(0, None)],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .expect("seed target device");
+        }
+        let (first_tx, first_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let (cleanup_tx, cleanup_rx) = async_channel::bounded(1);
+        install_noise_transport(
+            &client,
+            Arc::new(CancelAwareTransport {
+                attempts: AtomicUsize::new(0),
+                first_started: first_tx,
+                first_release: release_rx,
+                cleanup_sent: cleanup_tx,
+            }),
+        )
+        .await;
+
+        let start_client = client.clone();
+        let start_targets = targets.clone();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+        let start = tokio::spawn(async move {
+            start_client
+                .voip()
+                .group_call(&start_targets)
+                .audio(mic_rx, speaker_tx)
+                .start()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_rx.recv())
+            .await
+            .expect("group offer send must start")
+            .expect("offer observer");
+        start.abort();
+        match start.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("start must be cancelled"),
+        }
+        release_tx.send(()).await.expect("release ambiguous send");
+        tokio::time::timeout(Duration::from_secs(2), cleanup_rx.recv())
+            .await
+            .expect("cancellation must schedule a terminate send")
+            .expect("terminate observer");
     }
 
     #[tokio::test]

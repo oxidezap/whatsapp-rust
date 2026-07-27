@@ -29,6 +29,7 @@ pub struct GroupCallState {
     call_creator: Jid,
     snapshot: Option<GroupCallUpdate>,
     waiting_room: Option<WaitingRoom>,
+    waiting_room_transaction: Option<u32>,
     raised_hands: HashSet<Jid>,
     screen_shares: HashMap<Jid, ScreenShare>,
 }
@@ -40,6 +41,7 @@ impl GroupCallState {
             call_creator,
             snapshot: None,
             waiting_room: None,
+            waiting_room_transaction: None,
             raised_hands: HashSet::new(),
             screen_shares: HashMap::new(),
         }
@@ -80,8 +82,11 @@ impl GroupCallState {
         let connected = update
             .participants
             .iter()
-            .filter(|participant| participant.state == "connected")
-            .map(|participant| participant.jid.to_non_ad())
+            .filter(|participant| participant.state.as_deref() == Some("connected"))
+            .flat_map(|participant| {
+                std::iter::once(participant.jid.to_non_ad())
+                    .chain(participant.pn.as_ref().map(Jid::to_non_ad))
+            })
             .collect::<HashSet<_>>();
         self.raised_hands
             .retain(|participant| connected.contains(participant));
@@ -96,14 +101,16 @@ impl GroupCallState {
         if !self.matches_identity(&room.call_id, &room.call_creator) {
             return GroupStateApply::IdentityMismatch;
         }
-        if let (Some(current), Some(next)) = (
-            self.waiting_room
-                .as_ref()
-                .and_then(|waiting| waiting.transaction_id),
-            room.transaction_id,
-        ) && next <= current
+        if let (Some(current), Some(next)) = (self.waiting_room_transaction, room.transaction_id)
+            && next <= current
         {
             return GroupStateApply::Stale;
+        }
+        if let Some(transaction_id) = room.transaction_id {
+            self.waiting_room_transaction = Some(
+                self.waiting_room_transaction
+                    .map_or(transaction_id, |current| current.max(transaction_id)),
+            );
         }
         self.waiting_room = Some(room);
         GroupStateApply::Applied
@@ -182,7 +189,7 @@ mod tests {
         GroupCallParticipant {
             jid: Jid::new(user, Server::Lid),
             pn: None,
-            state: state.to_string(),
+            state: Some(state.to_string()),
             participant_type: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new(user, Server::Lid).with_device(1),
@@ -332,6 +339,11 @@ mod tests {
             GroupStateApply::Applied,
             "transaction-less service updates always apply"
         );
+        assert_eq!(
+            state.apply_waiting_room(waiting_room(Some(3))),
+            GroupStateApply::Stale,
+            "transaction-less updates must not erase the numbered watermark"
+        );
 
         let mut wrong_call = waiting_room(Some(5));
         wrong_call.call_id = "OTHER".to_string();
@@ -345,5 +357,39 @@ mod tests {
             state.apply_waiting_room(wrong_creator),
             GroupStateApply::IdentityMismatch
         );
+    }
+
+    #[test]
+    fn pn_alias_controls_survive_unrelated_roster_updates() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut alice = participant("200002", "connected", 2);
+        let alice_pn = Jid::new("15550000002", Server::Pn);
+        alice.pn = Some(alice_pn.clone());
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![participant("100001", "connected", 1), alice.clone()],
+            )),
+            GroupStateApply::Applied
+        );
+        state.set_raised_hand(&alice_pn, true);
+        state.set_screen_share(
+            &alice_pn,
+            ScreenShare {
+                state: ScreenShareState::Started,
+                version: 2,
+                screen_share_id: Some(7),
+            },
+        );
+
+        assert_eq!(
+            state.apply_update(update(
+                2,
+                vec![participant("100001", "connected", 1), alice],
+            )),
+            GroupStateApply::Applied
+        );
+        assert!(state.raised_hands().contains(&alice_pn));
+        assert!(state.screen_shares().contains_key(&alice_pn));
     }
 }

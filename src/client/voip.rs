@@ -414,17 +414,19 @@ impl Voip<'_> {
         let mut registration =
             CallLinkRegistrationGuard::new(registry.clone(), &join.call_id, generation);
 
-        if join.in_waiting_room {
-            let Some(room) = join.pending_waiting_room() else {
-                return Err(CallError::Response(
-                    "call-link join omitted its waiting-room state".to_string(),
-                ));
-            };
+        if let Some(room) = join.waiting_room.clone() {
             if registry.apply_waiting_room(room) != wacore::voip::GroupStateApply::Applied {
                 return Err(CallError::Response(
                     "call-link waiting-room identity was rejected".to_string(),
                 ));
             }
+        } else if join.in_waiting_room {
+            return Err(CallError::Response(
+                "call-link join omitted its waiting-room state".to_string(),
+            ));
+        }
+
+        if join.in_waiting_room {
             self.waiting_room_heartbeat(&join.call_id, &join.call_creator)
                 .await?;
             self.start_waiting_room_heartbeat(
@@ -1795,13 +1797,24 @@ mod tests {
                 .attr("class", "call")
                 .attr("type", "link_join")
                 .attr("id", request_id.as_str())
-                .children([NodeBuilder::new("group_info")
-                    .attr("call-id", "ADMITTED-CALL-ID")
-                    .attr("call-creator", creator)
-                    .attr("transaction-id", "1")
-                    .attr("connected-limit", "32")
-                    .attr("media", "video")
-                    .build()])
+                .children([
+                    NodeBuilder::new("waiting_room")
+                        .attr("call-id", "ADMITTED-CALL-ID")
+                        .attr("call-creator", creator.clone())
+                        .attr("link-token", "REQUESTED-CALL-LINK")
+                        .attr("media", "video")
+                        .attr("enabled", "1")
+                        .attr("is_admin", "1")
+                        .attr("transaction-id", "1")
+                        .build(),
+                    NodeBuilder::new("group_info")
+                        .attr("call-id", "ADMITTED-CALL-ID")
+                        .attr("call-creator", creator)
+                        .attr("transaction-id", "1")
+                        .attr("connected-limit", "32")
+                        .attr("media", "video")
+                        .build(),
+                ])
                 .build(),
         )
         .await;
@@ -1813,6 +1826,14 @@ mod tests {
             .call_registry()
             .generation_of("ADMITTED-CALL-ID")
             .expect("registered admitted call");
+        assert!(
+            client
+                .call_registry()
+                .group_state("ADMITTED-CALL-ID")
+                .and_then(|state| state.waiting_room().cloned())
+                .is_some_and(|room| room.is_admin && room.enabled),
+            "admitted joins must retain waiting-room admin state from the ACK"
+        );
         client
             .call_registry()
             .remove_if_current("ADMITTED-CALL-ID", generation);

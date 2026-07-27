@@ -61,7 +61,8 @@ pub struct GroupCallParticipant {
     pub jid: Jid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pn: Option<Jid>,
-    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_type: Option<String>,
     pub devices: Vec<GroupCallDevice>,
@@ -72,7 +73,7 @@ impl GroupCallParticipant {
         Self {
             jid,
             pn: None,
-            state: String::new(),
+            state: None,
             participant_type: None,
             devices,
         }

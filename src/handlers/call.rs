@@ -141,10 +141,9 @@ impl StanzaHandler for CallHandler {
                     // for this offer racing the await must see the ringing flag (else its missed-call
                     // is lost and we'd set a stale flag after the call already ended).
                     #[cfg(feature = "voip-runtime")]
+                    let mut duplicate_active_group_offer = false;
+                    #[cfg(feature = "voip-runtime")]
                     if is_offer {
-                        client
-                            .call_registry()
-                            .mark_incoming_ringing(call.action.call_id());
                         if let Some(group) = call.group.as_deref() {
                             let mut session = wacore::voip::CallSession::new_incoming(
                                 call.action.call_id(),
@@ -154,7 +153,14 @@ impl StanzaHandler for CallHandler {
                             session.is_video =
                                 matches!(&call.action, CallAction::Offer { is_video: true, .. });
                             session.group = Some(group.clone());
-                            client.call_registry().insert_ringing_group(session);
+                            duplicate_active_group_offer = client
+                                .call_registry()
+                                .insert_ringing_group_if_inactive(session)
+                                .is_none();
+                        } else {
+                            client
+                                .call_registry()
+                                .mark_incoming_ringing(call.action.call_id());
                         }
                     }
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
@@ -307,7 +313,7 @@ impl StanzaHandler for CallHandler {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
                     #[cfg(feature = "voip-runtime")]
-                    let mut dispatch_call = true;
+                    let mut dispatch_call = !duplicate_active_group_offer;
                     #[cfg(not(feature = "voip-runtime"))]
                     let dispatch_call = true;
                     #[cfg(feature = "voip-runtime")]
@@ -485,17 +491,10 @@ impl StanzaHandler for CallHandler {
                             raised,
                         } => {
                             let sender = routed_call_sender(&call);
-                            if !client.call_registry().group_sender_authorized(
-                                call_id,
-                                call_creator,
-                                &sender,
-                            ) {
-                                warn!(
-                                    "call: rejected hand state from unauthorized sender for {call_id}"
-                                );
-                                dispatch_call = false;
-                            } else {
-                                let participant = sender.to_non_ad();
+                            if let Some(participant) = client
+                                .call_registry()
+                                .canonical_group_participant(call_id, call_creator, &sender)
+                            {
                                 client.call_registry().set_raised_hand(
                                     call_id,
                                     &participant,
@@ -508,6 +507,11 @@ impl StanzaHandler for CallHandler {
                                         raised: *raised,
                                     },
                                 );
+                            } else {
+                                warn!(
+                                    "call: rejected hand state from unauthorized sender for {call_id}"
+                                );
+                                dispatch_call = false;
                             }
                         }
                         CallAction::ScreenShare {
@@ -516,17 +520,10 @@ impl StanzaHandler for CallHandler {
                             screen_share,
                         } => {
                             let sender = routed_call_sender(&call);
-                            if !client.call_registry().group_sender_authorized(
-                                call_id,
-                                call_creator,
-                                &sender,
-                            ) {
-                                warn!(
-                                    "call: rejected screen-share state from unauthorized sender for {call_id}"
-                                );
-                                dispatch_call = false;
-                            } else {
-                                let participant = sender.to_non_ad();
+                            if let Some(participant) = client
+                                .call_registry()
+                                .canonical_group_participant(call_id, call_creator, &sender)
+                            {
                                 client.call_registry().set_screen_share(
                                     call_id,
                                     &participant,
@@ -539,6 +536,11 @@ impl StanzaHandler for CallHandler {
                                         screen_share: screen_share.clone(),
                                     },
                                 );
+                            } else {
+                                warn!(
+                                    "call: rejected screen-share state from unauthorized sender for {call_id}"
+                                );
+                                dispatch_call = false;
                             }
                         }
                         _ => {}
@@ -563,20 +565,25 @@ impl StanzaHandler for CallHandler {
                             return true;
                         };
                         let _transition_guard = transition_lock.lock().await;
-                        if registry
+                        let group_participant = if registry
                             .group_state_if_current(call_id, generation)
                             .is_some()
-                            && !registry.group_sender_authorized(
+                        {
+                            let sender = routed_call_sender(&call);
+                            let Some(participant) = registry.canonical_group_participant(
                                 call_id,
                                 call.action.call_creator(),
-                                &routed_call_sender(&call),
-                            )
-                        {
-                            warn!(
-                                "call: rejected video state from unauthorized group sender for {call_id}"
-                            );
-                            return true;
-                        }
+                                &sender,
+                            ) else {
+                                warn!(
+                                    "call: rejected video state from unauthorized group sender for {call_id}"
+                                );
+                                return true;
+                            };
+                            Some(participant)
+                        } else {
+                            None
+                        };
                         let event_permit = registry
                             .is_current(call_id, generation)
                             .then(|| registry.reserve_call_event(call_id))
@@ -712,15 +719,13 @@ impl StanzaHandler for CallHandler {
                         transition_current &= registry.is_current(call_id, generation);
                         if transition_current {
                             if let Some(o) = orientation {
-                                let control =
-                                    if client.call_registry().group_state(call_id).is_some() {
-                                        VideoControl::SetParticipantOrientation {
-                                            participant: routed_call_sender(&call),
-                                            orientation: *o,
-                                        }
-                                    } else {
-                                        VideoControl::SetOrientation(*o)
-                                    };
+                                let control = group_participant.clone().map_or(
+                                    VideoControl::SetOrientation(*o),
+                                    |participant| VideoControl::SetParticipantOrientation {
+                                        participant,
+                                        orientation: *o,
+                                    },
+                                );
                                 registry.send_video_ctl(call_id, generation, control);
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {
@@ -1057,6 +1062,92 @@ mod tests {
             "unauthorized video state must not reach the public event bus"
         );
         registry.remove_if_current("GROUP-CALL", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn routed_group_video_canonicalizes_a_participant_pn_alias() {
+        use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
+        use wacore::voip::{CallEvent, CallSession, GroupStateApply, VideoControl};
+
+        let client = make_sending_client().await;
+        let creator = fake_caller_lid();
+        let participant = Jid::new("222222222222222", Server::Lid);
+        let participant_pn = Jid::new("15550000002", Server::Pn);
+        let registry = client.call_registry();
+        let mut session = CallSession::new_outgoing(
+            "GROUP-CALL",
+            Jid::new("GROUP-CALL", Server::Call),
+            creator.clone(),
+        );
+        session.is_video = true;
+        let generation = registry.insert(session);
+        let mut peer = GroupCallParticipant::new(
+            participant.clone(),
+            vec![GroupCallDevice::new(participant.clone().with_device(2))],
+        );
+        peer.pn = Some(participant_pn.clone());
+        assert_eq!(
+            registry.apply_group_update(
+                GroupCallUpdate::builder()
+                    .call_id("GROUP-CALL".to_string())
+                    .call_creator(creator.clone())
+                    .transaction_id(1)
+                    .media("video".to_string())
+                    .connected_limit(32)
+                    .joinable(true)
+                    .av_upgradable(true)
+                    .rekey_requested(false)
+                    .participants(vec![
+                        GroupCallParticipant::new(
+                            creator.clone(),
+                            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+                        ),
+                        peer,
+                    ])
+                    .build(),
+            ),
+            GroupStateApply::Applied
+        );
+        let (event_tx, _event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "GROUP-CALL",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+        let stanza = NodeBuilder::new("call")
+            .attr("from", Jid::new("GROUP-CALL", Server::Call))
+            .attr("participant", participant_pn)
+            .attr("id", "PN-ORIENTATION")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("video")
+                .attr("call-id", "GROUP-CALL")
+                .attr("call-creator", creator)
+                .attr("state", "1")
+                .attr("device_orientation", "3")
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
+                .await
+        );
+        assert!(cancelled);
+        assert!(
+            std::iter::from_fn(|| control_rx.try_recv().ok()).any(|control| matches!(
+                control,
+                VideoControl::SetParticipantOrientation {
+                    participant: canonical,
+                    orientation: 3,
+                } if canonical == participant
+            )),
+            "video orientation must be keyed by the roster LID, not the routed PN alias"
+        );
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -2192,6 +2283,59 @@ mod tests {
                 ..
             })) if group.transaction_id == 7
         ));
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn duplicate_group_offer_preserves_an_active_generation() {
+        use wacore::voip::CallPhase;
+
+        let client = make_sending_client().await;
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&active_group_offer_stanza()),
+                    &mut cancelled,
+                )
+                .await
+        );
+        let registry = client.call_registry();
+        let generation = registry
+            .generation_of("GROUP-CALL")
+            .expect("first offer generation");
+        assert!(registry.transition("GROUP-CALL", CallPhase::Connecting));
+        assert!(registry.take_ringing("GROUP-CALL"));
+
+        let (event_handler, event_rx) = ChannelEventHandler::new();
+        client.subscribe_handler(event_handler).detach();
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&active_group_offer_stanza()),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert_eq!(registry.generation_of("GROUP-CALL"), Some(generation));
+        assert_eq!(
+            registry
+                .snapshot("GROUP-CALL")
+                .map(|session| session.phase()),
+            Some(CallPhase::Connecting)
+        );
+        assert!(
+            !registry.take_ringing("GROUP-CALL"),
+            "a redelivery must not make an accepted call ring again"
+        );
+        assert!(
+            !std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(&*event, Event::IncomingCall(_))),
+            "a redelivery for the active generation must not publish a second offer"
+        );
     }
 
     #[tokio::test]

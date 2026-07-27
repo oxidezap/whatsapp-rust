@@ -1238,7 +1238,7 @@ mod tests {
         let mut self_device = GroupCallDevice::new(self_jid.clone());
         self_device.pid = Some(1);
         let mut participant = GroupCallParticipant::new(self_jid.to_non_ad(), vec![self_device]);
-        participant.state = "connected".to_string();
+        participant.state = Some("connected".to_string());
         GroupCallUpdate::builder()
             .call_id("00abcdef0123456789abcdef01234567".to_string())
             .call_creator(self_jid)

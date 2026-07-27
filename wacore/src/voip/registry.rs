@@ -244,6 +244,9 @@ impl CallRegistry {
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
     pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
+        if super::engine::validate_group_relay_update(&update).is_err() {
+            return GroupStateApply::InvalidSnapshot;
+        }
         let (applied, waiting_room_task, event) = {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             let Some(entry) = map.get_mut(&update.call_id) else {
@@ -389,22 +392,31 @@ impl CallRegistry {
     /// The creator is the only trusted bootstrap sender before a call-link admission installs its
     /// first authoritative roster. Once a roster exists, its participants are authorized too.
     pub fn group_sender_authorized(&self, call_id: &str, call_creator: &Jid, sender: &Jid) -> bool {
+        self.canonical_group_participant(call_id, call_creator, sender)
+            .is_some()
+    }
+
+    /// Resolve an authenticated routed sender to the roster's stable participant JID.
+    ///
+    /// Bare PN aliases are accepted by signaling but must not become persistent control keys:
+    /// roster and media state are keyed by the authoritative participant LID.
+    pub fn canonical_group_participant(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> Option<Jid> {
         let map = self.inner.lock().expect("registry lock poisoned");
-        let Some(entry) = map
+        let entry = map
             .get(call_id)
-            .filter(|entry| entry.session.call_creator == *call_creator)
-        else {
-            return false;
-        };
+            .filter(|entry| entry.session.call_creator == *call_creator)?;
         if sender.to_non_ad() == call_creator.to_non_ad() {
-            return true;
+            return Some(call_creator.to_non_ad());
         }
-        let Some(snapshot) = entry.group.as_ref().and_then(GroupCallState::snapshot) else {
-            return false;
-        };
+        let snapshot = entry.group.as_ref().and_then(GroupCallState::snapshot)?;
         let sender_user = sender.to_non_ad();
-        snapshot.participants.iter().any(|participant| {
-            if sender.device == 0 {
+        snapshot.participants.iter().find_map(|participant| {
+            let authorized = if sender.device == 0 {
                 participant.jid.to_non_ad() == sender_user
                     || participant
                         .pn
@@ -415,7 +427,8 @@ impl CallRegistry {
                     .devices
                     .iter()
                     .any(|device| device.jid.device_eq(sender))
-            }
+            };
+            authorized.then(|| participant.jid.to_non_ad())
         })
     }
 
@@ -436,15 +449,32 @@ impl CallRegistry {
         self.insert_inner(session, false)
     }
 
+    /// Register an incoming group offer unless this call id already belongs to an active call.
+    ///
+    /// The ringing marker and entry replacement are committed under the same lock pair so a
+    /// redelivered offer cannot race an acceptance and supersede the accepted generation.
+    pub fn insert_ringing_group_if_inactive(&self, session: CallSession) -> Option<u64> {
+        let call_id = session.call_id.clone();
+        let (generation, previous) = {
+            let mut ringing = self.ringing.lock().expect("registry lock poisoned");
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            if map
+                .get(&call_id)
+                .is_some_and(|entry| entry.session.phase() != CallPhase::Ringing)
+            {
+                return None;
+            }
+            let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+            let entry = Self::new_entry(session, generation);
+            ringing.insert(call_id.clone());
+            (generation, map.insert(call_id, entry))
+        };
+        drop(previous);
+        Some(generation)
+    }
+
     fn insert_inner(&self, session: CallSession, consume_ringing: bool) -> u64 {
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-        let video = VideoNegotiation::new(session.is_video);
-        let group = session.group.as_ref().map(|update| {
-            let mut state =
-                GroupCallState::new(session.call_id.clone(), session.call_creator.clone());
-            let _ = state.apply_update(update.clone());
-            state
-        });
         // Registering a call as active answers (accept) or places (outgoing) it: it is no longer
         // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
         // offer this clears the ringing flag so a later `<terminate>` reads as ended, not missed.
@@ -455,27 +485,7 @@ impl CallRegistry {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             map.insert(
                 session.call_id.clone(),
-                CallEntry {
-                    session,
-                    media_task: None,
-                    waiting_room_task: None,
-                    generation,
-                    rekey_tx: None,
-                    event_tx: None,
-                    video_ctl_tx: None,
-                    group_ctl_tx: None,
-                    pending_group_epoch: None,
-                    video_teardown: None,
-                    event_publication_reserved: Arc::new(AtomicBool::new(false)),
-                    video_transition_lock: Arc::new(AsyncMutex::new(())),
-                    group_transition_lock: Arc::new(AsyncMutex::new(())),
-                    group_update_event: Arc::new(event_listener::Event::new()),
-                    video,
-                    group,
-                    group_invite_self_device: None,
-                    group_invite_peer_device: None,
-                    on_terminal: None,
-                },
+                Self::new_entry(session, generation),
             )
         };
         // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
@@ -483,6 +493,37 @@ impl CallRegistry {
         // from re-entering or poisoning the registry mutex.
         drop(prev);
         generation
+    }
+
+    fn new_entry(session: CallSession, generation: u64) -> CallEntry {
+        let video = VideoNegotiation::new(session.is_video);
+        let group = session.group.as_ref().map(|update| {
+            let mut state =
+                GroupCallState::new(session.call_id.clone(), session.call_creator.clone());
+            let _ = state.apply_update(update.clone());
+            state
+        });
+        CallEntry {
+            session,
+            media_task: None,
+            waiting_room_task: None,
+            generation,
+            rekey_tx: None,
+            event_tx: None,
+            video_ctl_tx: None,
+            group_ctl_tx: None,
+            pending_group_epoch: None,
+            video_teardown: None,
+            event_publication_reserved: Arc::new(AtomicBool::new(false)),
+            video_transition_lock: Arc::new(AsyncMutex::new(())),
+            group_transition_lock: Arc::new(AsyncMutex::new(())),
+            group_update_event: Arc::new(event_listener::Event::new()),
+            video,
+            group,
+            group_invite_self_device: None,
+            group_invite_peer_device: None,
+            on_terminal: None,
+        }
     }
 
     /// Promote a previously registered active-group invitation into media setup without replacing
@@ -617,14 +658,14 @@ impl CallRegistry {
             GroupCallParticipant {
                 jid: self_device.jid.to_non_ad(),
                 pn: None,
-                state: "connected".to_string(),
+                state: Some("connected".to_string()),
                 participant_type: None,
                 devices: vec![self_device],
             },
             GroupCallParticipant {
                 jid: peer_device.jid.to_non_ad(),
                 pn: None,
-                state: "connected".to_string(),
+                state: Some("connected".to_string()),
                 participant_type: None,
                 devices: vec![peer_device],
             },
@@ -1409,8 +1450,8 @@ impl CallRegistry {
 mod tests {
     use super::*;
     use crate::types::group_call::{
-        CallLinkMedia, GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
-        WaitingRoom,
+        CallLinkMedia, GroupCallDevice, GroupCallParticipant, GroupCallRelay,
+        GroupCallRelayEndpoint, GroupCallUpdate, ScreenShareState, WaitingRoom,
     };
     use crate::voip::driver::video_control_channel;
     use std::sync::Arc;
@@ -1439,6 +1480,59 @@ mod tests {
             participants: Vec::new(),
             relay: None,
         }
+    }
+
+    fn group_relay(transaction_id: u32) -> GroupCallRelay {
+        GroupCallRelay {
+            transaction_id: Some(transaction_id),
+            self_pid: Some(1),
+            uuid: "TEST-RELAY".to_string(),
+            participant_uuid: "TEST-PARTICIPANT".to_string(),
+            attribute_padding: false,
+            warp_mi_tag_len: Some(4),
+            key: vec![7; 32],
+            hbh_key: Vec::new(),
+            tokens: vec![vec![9; 16]],
+            auth_tokens: Vec::new(),
+            endpoints: vec![GroupCallRelayEndpoint {
+                relay_id: 1,
+                token_id: 0,
+                auth_token_id: 0,
+                relay_name: "test-relay".to_string(),
+                domain_name: None,
+                rtt_ms: None,
+                is_fna: false,
+                address: Vec::new(),
+                ipv4: Some("203.0.113.7".to_string()),
+                port: Some(3478),
+            }],
+        }
+    }
+
+    #[test]
+    fn duplicate_group_offer_cannot_replace_an_active_generation() {
+        let reg = CallRegistry::new();
+        let incoming = || {
+            let mut session = CallSession::new_incoming(
+                "GROUP-CALL",
+                Jid::new("111111111111111", Server::Lid),
+                Jid::new("111111111111111", Server::Lid),
+            );
+            session.group = Some(group_update(1));
+            session
+        };
+        let generation = reg
+            .insert_ringing_group_if_inactive(incoming())
+            .expect("first offer registers");
+        assert!(reg.transition("GROUP-CALL", CallPhase::Connecting));
+        assert!(reg.take_ringing("GROUP-CALL"));
+
+        assert_eq!(reg.insert_ringing_group_if_inactive(incoming()), None);
+        assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
+        assert!(
+            !reg.take_ringing("GROUP-CALL"),
+            "the duplicate must not mark an active call as ringing"
+        );
     }
 
     #[test]
@@ -1541,6 +1635,12 @@ mod tests {
         let participant = Jid::new("333333333333333", Server::Lid);
         let device = participant.clone().with_device(3);
         let mut update = group_update(1);
+        let mut roster_participant = GroupCallParticipant::new(
+            participant.clone(),
+            vec![GroupCallDevice::new(device.clone())],
+        );
+        let participant_pn = Jid::new("15550000003", Server::Pn);
+        roster_participant.pn = Some(participant_pn.clone());
         update.participants = vec![
             GroupCallParticipant::new(
                 update.call_creator.clone(),
@@ -1548,15 +1648,16 @@ mod tests {
                     update.call_creator.clone().with_device(1),
                 )],
             ),
-            GroupCallParticipant::new(
-                participant.clone(),
-                vec![GroupCallDevice::new(device.clone())],
-            ),
+            roster_participant,
         ];
         assert_eq!(reg.apply_group_update(update), GroupStateApply::Applied);
 
         assert!(reg.group_sender_authorized("GROUP-CALL", &creator, &device));
         assert!(reg.group_sender_authorized("GROUP-CALL", &creator, &participant));
+        assert_eq!(
+            reg.canonical_group_participant("GROUP-CALL", &creator, &participant_pn),
+            Some(participant.clone())
+        );
         assert!(!reg.group_sender_authorized("GROUP-CALL", &creator, &participant.with_device(4)));
         assert!(!reg.group_sender_authorized(
             "GROUP-CALL",
@@ -1569,6 +1670,38 @@ mod tests {
             &device
         ));
         assert!(!reg.group_sender_authorized("OTHER-CALL", &creator, &device));
+    }
+
+    #[test]
+    fn invalid_relay_does_not_consume_the_registry_transaction() {
+        let reg = CallRegistry::new();
+        reg.insert(session("GROUP-CALL"));
+        assert_eq!(
+            reg.apply_group_update(group_update(1)),
+            GroupStateApply::Applied
+        );
+
+        let mut invalid = group_update(2);
+        let mut relay = group_relay(2);
+        relay.key.clear();
+        invalid.relay = Some(relay);
+        assert_eq!(
+            reg.apply_group_update(invalid),
+            GroupStateApply::InvalidSnapshot
+        );
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(1)
+        );
+
+        let mut corrected = group_update(2);
+        corrected.relay = Some(group_relay(2));
+        assert_eq!(
+            reg.apply_group_update(corrected),
+            GroupStateApply::Applied,
+            "the corrected resend with the same transaction must remain retryable"
+        );
     }
 
     #[test]

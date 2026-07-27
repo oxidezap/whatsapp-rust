@@ -491,12 +491,13 @@ pub enum CallEvent {
         participant: Jid,
         screen_share: ScreenShare,
     },
-    /// One authenticated, participant-attributed RTC reaction. An empty emoji removes it.
+    /// One authenticated, participant-attributed RTC reaction.
     Reaction {
         participant: Jid,
         device: Jid,
         pid: Option<u32>,
-        emoji: String,
+        /// `None` removes the participant's previous reaction.
+        emoji: Option<String>,
         removed: bool,
     },
     /// Authenticated peer RTCP. A referenced local video SSRC proves the peer built a receiver for
@@ -1003,7 +1004,7 @@ impl CallEngine {
                 .retain(|participant, _| active.contains(participant));
             group.video_orientations.retain(|jid, _| {
                 update.participants.iter().any(|participant| {
-                    participant.state == "connected"
+                    participant.state.as_deref() == Some("connected")
                         && (participant.jid == *jid
                             || participant.devices.iter().any(|device| device.jid == *jid))
                 })
@@ -1914,12 +1915,13 @@ impl CallEngine {
                     continue;
                 }
                 *last_seen = reaction.transaction_id;
+                let emoji = (!reaction.emoji.is_empty()).then_some(reaction.emoji);
                 self.outbox.push_back(Output::Event(CallEvent::Reaction {
                     participant: participant.user_jid.clone(),
                     device: participant.device_jid.clone(),
                     pid: participant.pid,
-                    removed: reaction.emoji.is_empty(),
-                    emoji: reaction.emoji,
+                    removed: emoji.is_none(),
+                    emoji,
                 }));
             }
             return;
@@ -2132,6 +2134,10 @@ fn prepare_group_relay_refresh(
     }))
 }
 
+pub(crate) fn validate_group_relay_update(update: &GroupCallUpdate) -> Result<(), GroupMediaError> {
+    prepare_group_relay_refresh(update).map(drop)
+}
+
 fn get_group_media_relay_endpoint(
     relay: &GroupCallRelay,
 ) -> Option<&crate::types::group_call::GroupCallRelayEndpoint> {
@@ -2193,7 +2199,7 @@ fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec
     let mut pids = update
         .participants
         .iter()
-        .filter(|participant| participant.state == "connected")
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
         .flat_map(|participant| participant.devices.iter())
         .filter(|device| {
             ssrc::format_e2e_srtp_participant_id(&device.jid.to_string()) != self_participant_id
@@ -2320,7 +2326,7 @@ mod encoded_tests {
                 GroupCallParticipant {
                     jid: creator.clone(),
                     pn: None,
-                    state: "connected".to_string(),
+                    state: Some("connected".to_string()),
                     participant_type: None,
                     devices: vec![GroupCallDevice {
                         jid: creator,
@@ -2333,7 +2339,7 @@ mod encoded_tests {
                 GroupCallParticipant {
                     jid: peer.clone(),
                     pn: None,
-                    state: "connected".to_string(),
+                    state: Some("connected".to_string()),
                     participant_type: None,
                     devices: vec![GroupCallDevice {
                         jid: peer,
@@ -2665,7 +2671,7 @@ mod encoded_tests {
         update.participants.push(GroupCallParticipant {
             jid: participant.clone(),
             pn: None,
-            state: "connected".to_string(),
+            state: Some("connected".to_string()),
             participant_type: None,
             devices: vec![GroupCallDevice {
                 jid: participant,
@@ -2829,7 +2835,7 @@ mod encoded_tests {
                 emoji,
                 removed: false,
                 ..
-            }) if *participant == peer_jid.to_non_ad() && emoji == "👏"
+            }) if *participant == peer_jid.to_non_ad() && emoji.as_deref() == Some("👏")
         )));
         engine.handle_input(501, Input::RelayPacket(&inbound));
         assert!(
@@ -2837,6 +2843,17 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::Reaction { .. })))
         );
+        let removal = sender.protect_audio(&app_data::encode_reaction(10, "").unwrap());
+        engine.handle_input(502, Input::RelayPacket(&removal));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Event(CallEvent::Reaction {
+                participant,
+                emoji: None,
+                removed: true,
+                ..
+            }) if *participant == peer_jid.to_non_ad()
+        )));
 
         let mut departed = group_update();
         departed.transaction_id = 8;
@@ -2850,7 +2867,7 @@ mod encoded_tests {
             .apply_group_update(2, &rejoined)
             .expect("rejoin participant");
         let restarted = sender.protect_audio(&app_data::encode_reaction(1, "✅").unwrap());
-        engine.handle_input(502, Input::RelayPacket(&restarted));
+        engine.handle_input(503, Input::RelayPacket(&restarted));
         assert!(drain(&mut engine).iter().any(|output| matches!(
             output,
             Output::Event(CallEvent::Reaction {
@@ -2858,7 +2875,7 @@ mod encoded_tests {
                 emoji,
                 removed: false,
                 ..
-            }) if *participant == peer_jid.to_non_ad() && emoji == "✅"
+            }) if *participant == peer_jid.to_non_ad() && emoji.as_deref() == Some("✅")
         )));
     }
 
@@ -3063,7 +3080,7 @@ mod tests {
                 GroupCallParticipant {
                     jid: self_user,
                     pn: None,
-                    state: "connected".to_string(),
+                    state: Some("connected".to_string()),
                     participant_type: None,
                     devices: vec![GroupCallDevice {
                         jid: self_device,
@@ -3076,7 +3093,7 @@ mod tests {
                 GroupCallParticipant {
                     jid: peer_user,
                     pn: None,
-                    state: "connected".to_string(),
+                    state: Some("connected".to_string()),
                     participant_type: None,
                     devices: vec![GroupCallDevice {
                         jid: peer_device,

@@ -663,7 +663,7 @@ fn active_devices<'a>(
     update
         .participants
         .iter()
-        .filter(|participant| participant.state == "connected")
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
         .flat_map(|participant| {
             participant
                 .devices
@@ -686,7 +686,7 @@ mod tests {
         GroupCallParticipant {
             jid: Jid::new(user, Server::Lid),
             pn: None,
-            state: "connected".to_string(),
+            state: Some("connected".to_string()),
             participant_type: None,
             devices: vec![GroupCallDevice {
                 jid: Jid::new(user, Server::Lid).with_device(device),
