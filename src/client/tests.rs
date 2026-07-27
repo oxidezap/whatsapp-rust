@@ -3532,6 +3532,58 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
     );
 }
 
+/// A burst hands every frame to the sender before awaiting any of them, which
+/// is what lets them coalesce into one transport write. Awaiting each before
+/// enqueueing the next would still deliver all four, in order, and produce four
+/// writes instead of one -- so the write count is the assertion that separates
+/// the two, and the ciphertext order is what pins the counter sequence the peer
+/// will decrypt against.
+#[tokio::test]
+async fn a_multi_frame_burst_stays_one_ordered_write() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    // Distinct lengths, so a reordering is visible in the frame sizes even
+    // though the payloads are encrypted on the way out.
+    let mut frames: Vec<Vec<u8>> = (1..=4).map(|n| vec![n as u8; 16 * n]).collect();
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("installed socket");
+
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|result| result.is_ok()));
+    assert_eq!(
+        transport.write_count(),
+        1,
+        "the whole burst must reach the transport as one write"
+    );
+
+    let sent = transport.sent();
+    assert_eq!(sent.len(), 4, "every frame must reach the wire");
+    // Each wire frame is its plaintext plus the AEAD tag and the length prefix,
+    // a fixed function of the plaintext length, so the sizes identify which
+    // plaintext landed where.
+    const TAG_AND_PREFIX: usize = 16 + wacore::framing::FRAME_LENGTH_SIZE;
+    let lengths: Vec<usize> = sent.iter().map(|frame| frame.len()).collect();
+    assert_eq!(
+        lengths,
+        (1..=4)
+            .map(|n| 16 * n + TAG_AND_PREFIX)
+            .collect::<Vec<usize>>(),
+        "frames must reach the wire in the order they were given"
+    );
+}
+
 #[tokio::test]
 async fn raw_bytes_burst_surfaces_a_closed_sender_per_frame() {
     use crate::socket::error::EncryptSendErrorKind;

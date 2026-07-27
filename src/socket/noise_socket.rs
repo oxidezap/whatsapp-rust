@@ -413,7 +413,21 @@ impl NoiseSocket {
         Ok(out_buf.len() - before)
     }
 
-    pub async fn encrypt_and_send(&self, plaintext: bytes::Bytes) -> SendResult {
+    /// Hands `plaintext` to the sender task and returns the channel its result
+    /// will arrive on, without waiting for it.
+    ///
+    /// Split out of [`Self::encrypt_and_send`] so a burst can enqueue every
+    /// frame before awaiting any of them. The sender coalesces whatever is
+    /// already queued into one transport write, so a caller that awaited each
+    /// frame before enqueueing the next would hand them over one completion
+    /// apart and get one write per frame.
+    ///
+    /// The returned receiver must be awaited, or the result is dropped and the
+    /// caller cannot tell a delivered frame from a failed one.
+    pub(crate) async fn enqueue_send(
+        &self,
+        plaintext: bytes::Bytes,
+    ) -> std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let job = SendJob {
@@ -426,14 +440,23 @@ impl NoiseSocket {
             return Err(EncryptSendError::channel_closed());
         }
 
-        // Wait for the sender task to process our job and return the result
-        match response_rx.await {
+        Ok(response_rx)
+    }
+
+    /// Awaits a receiver handed out by [`Self::enqueue_send`].
+    pub(crate) async fn await_send(receiver: oneshot::Receiver<SendResult>) -> SendResult {
+        match receiver.await {
             Ok(result) => result,
             Err(_) => {
                 // Sender task dropped without sending a response
                 Err(EncryptSendError::channel_closed())
             }
         }
+    }
+
+    pub async fn encrypt_and_send(&self, plaintext: bytes::Bytes) -> SendResult {
+        let receiver = self.enqueue_send(plaintext).await?;
+        Self::await_send(receiver).await
     }
 
     pub fn decrypt_frame(&self, mut ciphertext: BytesMut) -> Result<BytesMut> {

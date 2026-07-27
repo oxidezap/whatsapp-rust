@@ -21,6 +21,11 @@ impl Client {
         Ok(())
     }
 
+    /// Receivers a burst holds without allocating. Both callers cap their batch
+    /// at 4 ([`MAX_ACK_BURST`](Self::MAX_ACK_BURST) and
+    /// [`MAX_RECEIPT_BURST`](Self::MAX_RECEIPT_BURST)), so a real burst fits.
+    pub(crate) const MAX_INLINE_BURST: usize = 4;
+
     /// Send several pre-marshaled stanzas as one burst, returning a result per
     /// stanza in the order given.
     ///
@@ -30,12 +35,7 @@ impl Client {
     /// Handing over the whole burst is what turns batching from incidental into
     /// the normal case.
     ///
-    /// Order is preserved, which the ack worker depends on. The socket is
-    /// resolved once up front, so the only await left inside each send is the
-    /// channel push, and a channel with room resolves that on its first poll:
-    /// polling the joined sends in order therefore queues them in order.
-    /// Resolving the socket per send instead would put a contended mutex
-    /// between the futures and let them queue in any order.
+    /// Order is preserved, which the ack worker depends on.
     ///
     /// Always drains `frames`, including when no socket is installed, while
     /// retaining its outer allocation for the persistent workers to reuse.
@@ -43,6 +43,10 @@ impl Client {
     /// Results land in `results`, which the caller owns and reuses too. A
     /// returned `Vec` would allocate once per burst, and the common burst is a
     /// single frame, so that allocation was the dominant cost of sending one.
+    /// A multi-frame burst holds its receivers inline up to
+    /// [`MAX_INLINE_BURST`](Self::MAX_INLINE_BURST), so it does not allocate
+    /// either; beyond that the spill is one allocation, which is what the
+    /// previous `join_all` cost every time.
     pub(crate) async fn send_raw_bytes_burst(
         &self,
         frames: &mut Vec<Vec<u8>>,
@@ -65,19 +69,39 @@ impl Client {
             );
             return Ok(());
         }
-        // The out-parameter buys nothing here yet: `join_all` allocates its own
-        // storage and a `Vec` for the results, so a multi-frame burst still
-        // pays what it used to, plus this copy. Removing it means enqueueing
-        // every job before awaiting any of them and holding the receivers
-        // inline, which needs `encrypt_and_send` split into enqueue and await;
-        // that is a change to the send path rather than to this function.
-        // Tracked separately. Awaiting in sequence instead is not the fix: the
-        // frames would reach the sender one completion apart and stop batching
-        // into a single write.
-        let sends = frames
-            .drain(..)
-            .map(|plaintext| noise_socket.encrypt_and_send(bytes::Bytes::from(plaintext)));
-        results.extend(futures::future::join_all(sends).await);
+        // Every frame is enqueued before any is awaited, which is what lets the
+        // sender coalesce them into one transport write; awaiting each before
+        // enqueueing the next would hand them over one completion apart. The
+        // receivers live inline for the burst sizes both callers cap at, so
+        // unlike `join_all` this neither allocates storage for the futures nor
+        // a `Vec` for their results.
+        let mut receivers: smallvec::SmallVec<[_; Self::MAX_INLINE_BURST]> =
+            smallvec::SmallVec::new();
+        // An enqueue only fails once the sender task is gone, which no later
+        // frame recovers from. Recording where it happened keeps `results`
+        // aligned with the frames that were drained: a caller reporting a
+        // failure against the wrong frame is worse than the failure.
+        let mut frames_after_enqueue_failed = 0usize;
+        for plaintext in frames.drain(..) {
+            if frames_after_enqueue_failed > 0 {
+                frames_after_enqueue_failed += 1;
+                continue;
+            }
+            match noise_socket
+                .enqueue_send(bytes::Bytes::from(plaintext))
+                .await
+            {
+                Ok(receiver) => receivers.push(receiver),
+                Err(_) => frames_after_enqueue_failed = 1,
+            }
+        }
+
+        for receiver in receivers {
+            results.push(NoiseSocket::await_send(receiver).await);
+        }
+        for _ in 0..frames_after_enqueue_failed {
+            results.push(Err(EncryptSendError::channel_closed()));
+        }
         Ok(())
     }
 
