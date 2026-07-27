@@ -385,6 +385,28 @@ fn parse_database_path(database_url: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// Whether the URI asks SQLite for shared cache.
+///
+/// Only a `file:` URI carries query parameters; a bare path containing `?` is
+/// filename, not configuration. SQLite takes the first occurrence of a repeated
+/// parameter, so this stops at the first `cache=`.
+fn is_shared_cache(database_url: &str) -> bool {
+    let Some((_, query)) = database_url.split_once('?') else {
+        return false;
+    };
+    if !database_url.starts_with("file:") {
+        return false;
+    }
+    query
+        .split('#')
+        .next()
+        .unwrap_or(query)
+        .split('&')
+        .filter_map(|param| param.split_once('='))
+        .find(|(key, _)| *key == "cache")
+        .is_some_and(|(_, value)| value.eq_ignore_ascii_case("shared"))
+}
+
 /// One `ScheduledThreadPool` shared by EVERY store's r2d2 pool. By default r2d2 spawns its
 /// own pool of management threads (connection reaping/creation) per `Pool` — and with one
 /// `SqliteStore` per WhatsApp session that is ~3 idle threads PER SESSION (hundreds of
@@ -447,6 +469,7 @@ impl SqliteStore {
         let pool_size = config.pool_size.max(1);
         let read_pool_size = config.read_pool_size;
         let thread_pool = config.thread_pool.unwrap_or_else(shared_r2d2_thread_pool);
+        let read_thread_pool = Arc::clone(&thread_pool);
 
         let options = ConnectionOptions {
             cache_size_kib: config.cache_size_kib,
@@ -510,24 +533,36 @@ impl SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
 
-        // Reader connections only pay off under WAL. Without it a reader holds a
-        // lock the writer then collides with, so concurrency would trade one
-        // queue for a worse failure; fall back to the single queue instead.
+        // Reader connections only pay off under WAL, and only with a page cache
+        // per connection. Each of the two ways that can fail turns the intended
+        // concurrency into a worse failure than the single queue it replaces, so
+        // decline rather than half-deliver it.
         let wal = journal_mode.eq_ignore_ascii_case("wal");
-        if read_pool_size > 0 && !wal {
-            log::warn!(
-                "sqlite-storage: read_pool_size={read_pool_size} ignored, journal_mode is \
-                 '{journal_mode}' and concurrent readers need WAL"
-            );
+        // Shared cache replaces WAL's snapshot isolation with table-level locks
+        // held for the length of a transaction, so a writer touching a table a
+        // read snapshot has open fails with SQLITE_LOCKED_SHAREDCACHE — which
+        // the busy handler does not retry, so `busy_timeout` cannot absorb it.
+        let shared_cache = is_shared_cache(&db_url);
+        let declined = if !wal {
+            Some(format!("journal_mode is '{journal_mode}', not WAL"))
+        } else if shared_cache {
+            Some("the URI opts into shared cache, whose table locks block the writer".to_string())
+        } else {
+            None
+        };
+        if read_pool_size > 0
+            && let Some(reason) = &declined
+        {
+            log::warn!("sqlite-storage: read_pool_size={read_pool_size} ignored, {reason}");
         }
-        let reads = if read_pool_size > 0 && wal {
+        let reads = if read_pool_size > 0 && declined.is_none() {
             let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
             let pool = tokio::task::spawn_blocking(
                 move || -> std::result::Result<SqlitePool, StoreError> {
                     Pool::builder()
                         .max_size(read_pool_size)
                         .test_on_check_out(false)
-                        .thread_pool(shared_r2d2_thread_pool())
+                        .thread_pool(read_thread_pool)
                         .connection_customizer(Box::new(read_options))
                         .build(manager)
                         .map_err(|e| StoreError::Connection(Box::new(e)))
@@ -3823,6 +3858,10 @@ impl DeviceStore for SqliteStore {
     /// for that session.
     async fn resource_report(&self) -> wacore::stats::StorageResourceReport {
         let pool = self.pool.clone();
+        // Reader connections carry a page cache each, exactly like the write
+        // pool's, so a report that counted only one pool would under-state a
+        // read-enabled store by the whole reader side.
+        let read_pool = self.reads.as_ref().map(|reads| reads.pool.clone());
         tokio::task::spawn_blocking(move || {
             // Non-blocking checkout: this report is best-effort, so contention
             // (e.g. a long write holding the only connection) degrades to "not
@@ -3854,7 +3893,8 @@ impl DeviceStore for SqliteStore {
             // Open connections (idle + the one just checked out), each with its
             // own independent page cache. Defaults to 1 for the single-connection
             // store, so this only widens the bound when pool_size > 1.
-            let open_connections = pool.state().connections.max(1) as u64;
+            let open_connections = pool.state().connections.max(1) as u64
+                + read_pool.map_or(0, |reads| reads.state().connections as u64);
             wacore::stats::StorageResourceReport {
                 memory_bytes: Some(per_conn_cache.saturating_mul(open_connections)),
                 pages: Some(page_count),

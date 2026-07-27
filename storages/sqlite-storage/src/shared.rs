@@ -450,6 +450,93 @@ mod tests {
             .expect("reads fall back to the write permit");
     }
 
+    /// Shared cache reaches WAL, so the journal check alone would let reader
+    /// connections through — into table locks that block the writer outright.
+    #[tokio::test]
+    async fn reader_connections_are_declined_for_shared_cache() {
+        use crate::sqlite_store::SqliteStoreConfig;
+
+        let db = TempDb::new("shared_cache");
+        let store = SqliteStore::with_config(
+            &format!("file:{}?cache=shared", db.url()),
+            SqliteStoreConfig {
+                read_pool_size: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("shared-cache store still opens");
+        assert!(
+            store.reads.is_none(),
+            "shared cache serializes readers against the writer anyway"
+        );
+
+        // The same file without the parameter does get reader connections, so
+        // the decline is about the cache mode and not about the path.
+        let store = SqliteStore::with_config(
+            &db.url(),
+            SqliteStoreConfig {
+                read_pool_size: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("private-cache store opens");
+        assert!(
+            store.reads.is_some(),
+            "private cache under WAL gets readers"
+        );
+    }
+
+    /// Reader connections hold page caches of their own, so the memory bound
+    /// has to count them or a read-enabled store reports the write pool's usage
+    /// as if it were the whole store's.
+    #[tokio::test]
+    async fn resource_report_counts_reader_connections() {
+        use crate::sqlite_store::SqliteStoreConfig;
+        use wacore::store::traits::DeviceStore;
+
+        let db = TempDb::new("report_readers");
+        let config = || SqliteStoreConfig {
+            read_pool_size: 3,
+            ..Default::default()
+        };
+
+        let with_readers = SqliteStore::with_config(&db.url(), config())
+            .await
+            .expect("store opens");
+        assert!(with_readers.reads.is_some(), "readers are configured");
+        // r2d2 opens min_idle connections eagerly; touch the read path so the
+        // reader pool has definitely opened one to account for.
+        with_readers
+            .shared()
+            .read(|conn| {
+                diesel::sql_query("SELECT 1")
+                    .execute(conn)
+                    .map_err(db_err)?;
+                Ok(())
+            })
+            .await
+            .expect("read succeeds");
+
+        let baseline = TempDb::new("report_no_readers");
+        let without = SqliteStore::new(&baseline.url())
+            .await
+            .expect("store opens");
+
+        let (a, b) = (
+            with_readers.resource_report().await,
+            without.resource_report().await,
+        );
+        let (Some(with_mem), Some(without_mem)) = (a.memory_bytes, b.memory_bytes) else {
+            panic!("both stores report a cache estimate");
+        };
+        assert!(
+            with_mem > without_mem,
+            "reader caches must widen the bound: {with_mem} vs {without_mem}"
+        );
+    }
+
     /// Left at its default, `read` is the write path — same queue, same
     /// behaviour as before the knob existed.
     #[tokio::test]
