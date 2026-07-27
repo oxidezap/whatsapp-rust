@@ -1081,6 +1081,16 @@ pub struct Client {
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
     pub(crate) app_state_syncing: Arc<app_state::SyncInFlight>,
+    /// Serializes outgoing app-state patch sends.
+    ///
+    /// `w:sync:app:state` is optimistic-concurrency: a patch names the base
+    /// version it was built on, and only one patch can win per version. Two
+    /// unserialized verbs (two quick `markChatAsRead`s) build on the same base
+    /// and at most one lands. One lock for every collection, rather than one
+    /// per collection, matches whatsmeow's single `appStateSyncLock` and WA Web
+    /// funnelling all collections through one `CollectionsStateMachine`; sends
+    /// are user-paced, so there is nothing to gain from finer granularity.
+    pub(crate) app_state_send_lock: Arc<Mutex<()>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
 

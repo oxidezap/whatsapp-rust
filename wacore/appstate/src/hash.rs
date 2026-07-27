@@ -12,6 +12,22 @@ pub struct HashState {
     #[serde(with = "BigArray")]
     pub hash: [u8; 128],
     pub index_value_map: HashMap<String, Vec<u8>>,
+    /// The collection's aggregate ltHash no longer agrees with the one its peers
+    /// compute, so a patch's `snapshotMac` can never match again and comparing it
+    /// only freezes the collection on a base already proven unusable.
+    ///
+    /// Mirrors WA Web's `isCollectionInMacMismatchFatal`
+    /// (`WAWebGetCollectionVersion`): set the first time a *patch* fails the
+    /// snapshotMac comparison, after which the comparison is skipped entirely
+    /// (`WAWebSyncdAntiTampering`, `if (E && k) return null`). `patchMac` — the
+    /// only MAC that proves authorship, since the server cannot compute it —
+    /// stays enforced on every patch either way.
+    ///
+    /// Unlike WA Web, which merges the flag forward forever, a snapshot resets it:
+    /// a snapshot rebuilds the ltHash from scratch, so the new baseline deserves
+    /// to be trusted again.
+    #[serde(default)]
+    pub mac_mismatch_fatal: bool,
 }
 
 impl Default for HashState {
@@ -20,6 +36,7 @@ impl Default for HashState {
             version: 0,
             hash: [0; 128],
             index_value_map: HashMap::new(),
+            mac_mismatch_fatal: false,
         }
     }
 }
