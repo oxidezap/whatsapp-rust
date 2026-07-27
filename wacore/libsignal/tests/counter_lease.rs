@@ -9,7 +9,9 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use wacore_libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+use wacore_libsignal::protocol::consts::{
+    MAX_RESERVATION_FAST_FORWARD, SENDER_CHAIN_RESERVATION_BATCH,
+};
 use wacore_libsignal::protocol::{
     CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
     IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore,
@@ -308,6 +310,46 @@ fn record_of(peer: &Peer, remote: &ProtocolAddress) -> SessionRecord {
         .clone()
 }
 
+/// Live index of the record's current sender chain.
+fn sender_chain_index(record: &SessionRecord) -> u32 {
+    record
+        .session_state()
+        .expect("current session")
+        .get_sender_chain_key()
+        .expect("sender chain")
+        .index()
+}
+
+/// Send until the lease ceiling passes `target`, mimicking a bot that
+/// monologues at one peer (its own primary device gets a copy of every
+/// outgoing message) without that peer ever replying.
+fn monologue_until_lease_exceeds(alice: &mut Peer, bob: &ProtocolAddress, target: u32) {
+    let mut sends = 0u32;
+    while record_of(alice, bob).reserved_sender_chain_index() <= target {
+        send(alice, bob, b"monologue");
+        sends += 1;
+        assert!(
+            sends < target + 2 * SENDER_CHAIN_RESERVATION_BATCH,
+            "runaway"
+        );
+    }
+}
+
+/// The two incarnations a store hands to the record: the same one for a
+/// reload inside a live cache, a different one after a restart or a lossy
+/// cache reset.
+const LIVE_INCARNATION: [u8; 16] = [0xA1; 16];
+const RESTART_INCARNATION: [u8; 16] = [0xB2; 16];
+
+fn store_roundtrip(
+    record: &SessionRecord,
+    reload_as: &[u8; 16],
+) -> Result<SessionRecord, SignalProtocolError> {
+    let mut bytes = Vec::new();
+    record.serialize_into_for_store(&mut bytes, &LIVE_INCARNATION);
+    SessionRecord::deserialize_for_store(&bytes, reload_as)
+}
+
 /// Simulate the store layer acknowledging a durable flush: take over the wire
 /// gate and return the serialized snapshot that "reached storage".
 fn ack_flush(peer: &mut Peer, remote: &ProtocolAddress) -> Vec<u8> {
@@ -532,4 +574,139 @@ fn lease_round_trips_through_storage_and_legacy_records_load_untouched() {
     let legacy = SessionRecord::new_fresh().serialize().expect("serialize");
     let reloaded = SessionRecord::deserialize(&legacy).expect("legacy deserializes");
     assert_eq!(reloaded.reserved_sender_chain_index(), 0);
+}
+
+// ---- stranded lease after a DH ratchet (issue #1146) ------------------------
+//
+// The lease ceiling is a record-level counter; the sender chain it bounds is
+// per-ratchet-epoch and restarts at zero every time the peer replies. A long
+// monologue followed by one reply used to leave the ceiling stranded thousands
+// of counters above the live index, which no send ever created — and which a
+// recovery reload could neither burn nor accept.
+
+/// The regression itself: after the ratchet the ceiling must describe the
+/// chain that is actually installed, not the one that was retired.
+#[test]
+fn a_dh_ratchet_rebases_the_lease_onto_the_fresh_chain() {
+    let mut alice = Peer::new("alice");
+    let mut bob = Peer::new("bob");
+    establish(&mut alice, &mut bob);
+
+    // Alice monologues past the load-time fast-forward ceiling. A bot that
+    // copies every outgoing message to its own primary device reaches this in
+    // a couple of thousand sends.
+    monologue_until_lease_exceeds(&mut alice, &bob.address, MAX_RESERVATION_FAST_FORWARD);
+    let stranded_ceiling = record_of(&alice, &bob.address).reserved_sender_chain_index();
+    assert!(stranded_ceiling > MAX_RESERVATION_FAST_FORWARD);
+
+    // Bob finally replies: Alice DH-ratchets onto a chain that starts at zero.
+    let ct = send(&mut bob, &alice.address, b"reply");
+    receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
+
+    let record = record_of(&alice, &bob.address);
+    assert_eq!(sender_chain_index(&record), 0, "fresh chain starts at 0");
+    assert!(
+        record.reserved_sender_chain_index() <= SENDER_CHAIN_RESERVATION_BATCH,
+        "the retired chain's ceiling ({}) must not survive onto the fresh chain",
+        record.reserved_sender_chain_index()
+    );
+}
+
+/// The operator-visible symptom: a stranded ceiling turned the stored row
+/// into a hard load failure for every path that touches the address — decrypt,
+/// encrypt, and retry repair alike — and only after a restart or a lossy cache
+/// reset, since a live reload skips the fast-forward entirely.
+#[test]
+fn a_ratcheted_record_still_loads_after_a_restart() {
+    let mut alice = Peer::new("alice");
+    let mut bob = Peer::new("bob");
+    establish(&mut alice, &mut bob);
+    monologue_until_lease_exceeds(&mut alice, &bob.address, MAX_RESERVATION_FAST_FORWARD);
+
+    let ct = send(&mut bob, &alice.address, b"reply");
+    receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
+    let record = record_of(&alice, &bob.address);
+
+    store_roundtrip(&record, &LIVE_INCARNATION).expect("a live reload never fast-forwards");
+    let recovered =
+        store_roundtrip(&record, &RESTART_INCARNATION).expect("a restart must not strand the row");
+    assert!(
+        recovered.reserved_sender_chain_index() - sender_chain_index(&recovered)
+            <= SENDER_CHAIN_RESERVATION_BATCH,
+        "recovery must burn at most one batch"
+    );
+}
+
+/// Performance guard: rebasing must not cost the fresh chain its lease
+/// coverage. Dropping the ceiling to zero instead of one batch would put a
+/// synchronous durability flush in front of every reply in a ping-pong.
+#[test]
+fn the_rebased_lease_still_covers_the_fresh_chain_without_a_flush() {
+    let mut alice = Peer::new("alice");
+    let mut bob = Peer::new("bob");
+    establish(&mut alice, &mut bob);
+    monologue_until_lease_exceeds(&mut alice, &bob.address, MAX_RESERVATION_FAST_FORWARD);
+    ack_flush(&mut alice, &bob.address);
+
+    let ct = send(&mut bob, &alice.address, b"reply");
+    receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
+
+    for counter in 0..SENDER_CHAIN_RESERVATION_BATCH {
+        let ct = send(&mut alice, &bob.address, b"post-ratchet");
+        assert_eq!(wire_counter(&ct), counter);
+        assert!(
+            !record_of(&alice, &bob.address).has_pending_reservation(),
+            "counter {counter} of the fresh chain must ride the rebased lease"
+        );
+    }
+
+    // ...and the batch boundary still re-raises and re-gates as before.
+    let ct = send(&mut alice, &bob.address, b"boundary");
+    assert_eq!(wire_counter(&ct), SENDER_CHAIN_RESERVATION_BATCH);
+    assert!(record_of(&alice, &bob.address).has_pending_reservation());
+}
+
+/// Lowering a ceiling is only safe if it can never uncover a counter that
+/// already reached the wire. Publish across the ratchet and both sides of a
+/// crash, and assert the resumed chain repeats nothing.
+#[test]
+fn a_rebased_lease_never_republishes_a_counter_across_a_crash() {
+    let mut alice = Peer::new("alice");
+    let mut bob = Peer::new("bob");
+    establish(&mut alice, &mut bob);
+    monologue_until_lease_exceeds(&mut alice, &bob.address, MAX_RESERVATION_FAST_FORWARD);
+    ack_flush(&mut alice, &bob.address);
+
+    let ct = send(&mut bob, &alice.address, b"reply");
+    receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
+
+    // Everything below is on the post-ratchet chain, so counters are
+    // comparable across the crash.
+    let mut published = Vec::new();
+    for _ in 0..3 {
+        published.push(wire_counter(&send(
+            &mut alice,
+            &bob.address,
+            b"pre-snapshot",
+        )));
+    }
+    let snapshot = ack_flush(&mut alice, &bob.address);
+    for _ in 0..5 {
+        published.push(wire_counter(&send(&mut alice, &bob.address, b"unflushed")));
+    }
+
+    crash_reload(&mut alice, &bob.address, &snapshot);
+
+    let ct = send(&mut alice, &bob.address, b"after crash");
+    let resumed = wire_counter(&ct);
+    assert!(
+        !published.contains(&resumed),
+        "counter {resumed} was already published before the crash"
+    );
+    assert_eq!(
+        resumed, SENDER_CHAIN_RESERVATION_BATCH,
+        "recovery burns the rebased lease, not the retired chain's ceiling"
+    );
+    let pt = receive(&mut bob, &alice.address, &ct).expect("bob decrypts across the burned gap");
+    assert_eq!(&pt[..], b"after crash");
 }

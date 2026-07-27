@@ -858,6 +858,34 @@ impl SessionRecord {
         self.pending_reservation = true;
     }
 
+    /// Rebase the lease after a DH ratchet replaced the leased sender chain
+    /// in place.
+    ///
+    /// The ceiling bounds counters that a durable snapshot of the *retired*
+    /// chain may already have published. A ratchet derives the replacement
+    /// from a fresh random ephemeral and overwrites the old chain without
+    /// archiving it, so nothing reachable from this record can reissue those
+    /// counters and the inherited ceiling no longer describes anything. Left
+    /// in place it strands the lease arbitrarily far above the new chain's
+    /// index — a monologue of a few thousand sends followed by one peer reply
+    /// is enough to push the gap past `MAX_RESERVATION_FAST_FORWARD`, and a
+    /// recovery reload then refuses the record outright, permanently
+    /// stranding the address.
+    ///
+    /// Lowering is sound only because the swap and the rebase are a single
+    /// mutation of one record: no snapshot can pair the retired chain with
+    /// the rebased ceiling. Keeping one batch (rather than dropping to zero)
+    /// leaves the fresh chain's first counters lease-covered, so steady-state
+    /// ping-pong keeps its write-behind send path.
+    pub fn rebase_lease_after_sender_chain_reset(&mut self) {
+        // Never raises: a counter must not be published under a ceiling that
+        // is not yet durable. An in-chain lease is always within one batch of
+        // the live index, so this is a no-op outside a chain replacement.
+        self.reserved_sender_chain_index = self
+            .reserved_sender_chain_index
+            .min(consts::SENDER_CHAIN_RESERVATION_BATCH);
+    }
+
     pub fn has_pending_reservation(&self) -> bool {
         self.pending_reservation
     }

@@ -19,6 +19,25 @@ previously persisted lease and can use write-behind. A send at the bound raises
 it by `SENDER_CHAIN_RESERVATION_BATCH` and must wait for a successful durable
 flush before its ciphertext is published.
 
+A reservation describes one sender chain, not the address. A DH ratchet
+replaces the chain in place with fresh random key material and drops the old
+one without archiving it, so the inherited ceiling stops describing anything
+reachable: `rebase_lease_after_sender_chain_reset` lowers it back to one batch
+as part of the same mutation. Lowering is sound only there — no snapshot can
+pair the retired chain with the rebased ceiling — and only downward, so a
+counter is never published under a ceiling that is not yet durable. Leave it
+stranded and a long monologue followed by one peer reply puts the gap past
+`MAX_RESERVATION_FAST_FORWARD`, where recovery can neither burn nor accept the
+record. A chain that is *archived* rather than discarded keeps its claim:
+`promote_fresh_state` burns the outgoing state to the ceiling before resetting
+it.
+
+An undecodable session row is reported absent rather than surfaced as a load
+error. Every path that could replace it — the peer's next pre-key message, the
+retry repair — must load it first, so a propagated error strands the address
+permanently. `wa_session_record_quarantined_total` counts these; steady state
+is zero.
+
 The cache takes ownership of transient record gates. A failed write, a checked
 out record skipped by a flush, or a tombstone whose delete failed must remain
 gated. Only the backend operation that persisted that address may release it.

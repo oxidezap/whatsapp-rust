@@ -56,6 +56,7 @@ impl SenderKeyStore for CachedSenderKeyStore<'_> {
 enum Action {
     DmSend { fail_gate: bool },
     GroupSend { fail_gate: bool },
+    DmRatchet,
     DmCancel,
     DeliverGroup { newest: bool },
     Flush,
@@ -88,7 +89,7 @@ impl SplitMix64 {
     }
 
     fn action(&mut self) -> Action {
-        match self.next() % 25 {
+        match self.next() % 26 {
             0 => Action::DmSend { fail_gate: true },
             1..=6 => Action::DmSend { fail_gate: false },
             7 => Action::GroupSend { fail_gate: true },
@@ -106,6 +107,7 @@ impl SplitMix64 {
             22 => Action::DeleteGroup,
             23 => Action::CheckoutDuringFlush,
             24 => Action::RecoverGroup,
+            25 => Action::DmRatchet,
             _ => unreachable!(),
         }
     }
@@ -166,6 +168,7 @@ impl ChaosHarness {
             Action::GroupSend { fail_gate } => {
                 self.group_send(fail_gate).await?;
             }
+            Action::DmRatchet => self.dm_ratchet().await?,
             Action::DmCancel => self.dm_cancel().await?,
             Action::DeliverGroup { newest } => {
                 self.deliver_group(newest).await?;
@@ -227,6 +230,38 @@ impl ChaosHarness {
             );
         }
         Ok(published)
+    }
+
+    /// Inbound peer message that carries a new ratchet key: the sender chain
+    /// is replaced in place with fresh random material at counter zero and the
+    /// retired chain is discarded, not archived. This is a decrypt-side
+    /// advance, so it is dirty but never wire-gated.
+    ///
+    /// The replacement chain restarts the counter the record's lease bounds,
+    /// so without a rebase the ceiling drifts arbitrarily far above the live
+    /// index and recovery can no longer fast-forward it. Every interleaving
+    /// with reload, crash, and clear still has to satisfy `published_dm`.
+    async fn dm_ratchet(&mut self) -> Result<()> {
+        let (record, checkout) = self
+            .cache
+            .checkout_session(&self.dm_address, &self.backend)
+            .await?;
+        let Some(mut record) = record else {
+            self.cache
+                .cancel_session_checkout(&self.dm_address, checkout);
+            return Ok(());
+        };
+        let mut chain = [0; 32];
+        self.crypto_rng.fill(&mut chain);
+        record
+            .session_state_mut()
+            .context("DM session state missing")?
+            .set_sender_chain(
+                &KeyPair::generate(&mut self.crypto_rng),
+                &ChainKey::new(chain, 0),
+            );
+        record.rebase_lease_after_sender_chain_reset();
+        self.commit_dm(record, checkout, true).await
     }
 
     async fn dm_cancel(&mut self) -> Result<()> {

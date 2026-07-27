@@ -851,7 +851,10 @@ fn create_decryption_failure_log(
 }
 
 enum RecordDecryptState {
-    Current(DecryptSnapshot),
+    Current {
+        snapshot: DecryptSnapshot,
+        sender_chain_reset: bool,
+    },
     Previous {
         state: Box<SessionState>,
         effect: StateDecryptEffect,
@@ -920,7 +923,7 @@ impl RecordDecryptTransaction<'_> {
             .as_ref()
             .expect("a live decrypt transaction owns its rollback")
         {
-            RecordDecryptState::Current(_) => self
+            RecordDecryptState::Current { .. } => self
                 .record
                 .session_state()
                 .expect("a current decrypt transaction keeps the current state installed"),
@@ -938,19 +941,35 @@ impl RecordDecryptTransaction<'_> {
             .take()
             .expect("a live decrypt transaction owns its rollback")
         {
-            RecordDecryptState::Current(_) => {
+            RecordDecryptState::Current {
+                sender_chain_reset, ..
+            } => {
                 let state = self
                     .record
                     .session_state_mut()
                     .expect("a current decrypt transaction keeps the current state installed");
                 state.clear_unacknowledged_pre_key_message();
+                if sender_chain_reset {
+                    self.record.rebase_lease_after_sender_chain_reset();
+                }
             }
             RecordDecryptState::Previous {
                 mut state, effect, ..
             } => {
+                let sender_chain_reset = effect.sender_chain_reset();
                 effect.commit(&mut state);
                 state.clear_unacknowledged_pre_key_message();
-                self.record.promote_state(*state);
+                if sender_chain_reset {
+                    // The ratchet gave this state a chain built from a fresh
+                    // random ephemeral: no counter on it can have been spent,
+                    // so it takes the same path as any other fresh ratchet
+                    // rather than having the outgoing chain's lease burned
+                    // into it (which, past the fast-forward ceiling, would
+                    // drop the chain outright).
+                    self.record.promote_fresh_state(*state);
+                } else {
+                    self.record.promote_state(*state);
+                }
             }
         }
         std::mem::take(&mut self.plaintext)
@@ -963,7 +982,7 @@ impl Drop for RecordDecryptTransaction<'_> {
             return;
         };
         match state {
-            RecordDecryptState::Current(snapshot) => self
+            RecordDecryptState::Current { snapshot, .. } => self
                 .record
                 .session_state_mut()
                 .expect("a current decrypt transaction keeps the current state installed")
@@ -1043,13 +1062,17 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                         chain_key,
                         plaintext: result.plaintext,
                     })),
-                    StateDecryptEffect::Applied(snapshot) => {
-                        Ok(RecordDecrypt::Transaction(RecordDecryptTransaction {
-                            record,
-                            state: Some(RecordDecryptState::Current(snapshot)),
-                            plaintext: result.plaintext,
-                        }))
-                    }
+                    StateDecryptEffect::Applied {
+                        snapshot,
+                        sender_chain_reset,
+                    } => Ok(RecordDecrypt::Transaction(RecordDecryptTransaction {
+                        record,
+                        state: Some(RecordDecryptState::Current {
+                            snapshot,
+                            sender_chain_reset,
+                        }),
+                        plaintext: result.plaintext,
+                    })),
                 };
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter))
@@ -1269,10 +1292,26 @@ enum StateDecryptEffect {
         ratchet_key: PublicKey,
         chain_key: ChainKey,
     },
-    Applied(DecryptSnapshot),
+    Applied {
+        snapshot: DecryptSnapshot,
+        /// A DH ratchet replaced this state's sender chain, so the record's
+        /// counter lease no longer describes the chain it is about to gate.
+        sender_chain_reset: bool,
+    },
 }
 
 impl StateDecryptEffect {
+    /// The in-order fast path never ratchets, so only an applied decrypt can
+    /// have retired a sender chain.
+    fn sender_chain_reset(&self) -> bool {
+        match self {
+            Self::DeferredChainKey { .. } => false,
+            Self::Applied {
+                sender_chain_reset, ..
+            } => *sender_chain_reset,
+        }
+    }
+
     fn commit(self, state: &mut SessionState) {
         match self {
             Self::DeferredChainKey {
@@ -1283,14 +1322,14 @@ impl StateDecryptEffect {
                     .set_receiver_chain_key(&ratchet_key, &chain_key)
                     .expect("the deferred in-order receiver chain remains installed");
             }
-            Self::Applied(_) => {}
+            Self::Applied { .. } => {}
         }
     }
 
     fn rollback(self, state: &mut SessionState) {
         match self {
             Self::DeferredChainKey { .. } => {}
-            Self::Applied(snapshot) => state.restore_decrypt_snapshot(snapshot),
+            Self::Applied { snapshot, .. } => state.restore_decrypt_snapshot(snapshot),
         }
     }
 }
@@ -1359,9 +1398,12 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         counter,
     );
     match result {
-        Ok(plaintext) => Ok(StateDecryptResult {
+        Ok((plaintext, sender_chain_reset)) => Ok(StateDecryptResult {
             plaintext,
-            effect: StateDecryptEffect::Applied(snapshot),
+            effect: StateDecryptEffect::Applied {
+                snapshot,
+                sender_chain_reset,
+            },
         }),
         Err(e) => {
             state.restore_decrypt_snapshot(snapshot);
@@ -1381,7 +1423,7 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     their_ephemeral: &PublicKey,
     receiver_chain: Option<ReceiverChainState>,
     counter: u32,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     if let Some(ReceiverChainState::Closed { next_index }) = receiver_chain {
         if counter >= next_index {
             return Err(SignalProtocolError::InvalidSessionStructure(
@@ -1398,7 +1440,8 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
             original_message_type,
             remote_address,
             message_key_gen,
-        );
+        )
+        .map(|plaintext| (plaintext, false));
     }
 
     let (chain_key, deferred_ratchet) =
@@ -1425,11 +1468,14 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     // Generating a new sender ratchet requires fresh entropy and a second DH.
     // Neither can affect inbound MAC verification, so perform them only after
     // the candidate session has authenticated the message.
-    if let Some(deferred_ratchet) = deferred_ratchet {
+    let sender_chain_reset = if let Some(deferred_ratchet) = deferred_ratchet {
         deferred_ratchet.apply(state, their_ephemeral, csprng)?;
-    }
+        true
+    } else {
+        false
+    };
 
-    Ok(plaintext)
+    Ok((plaintext, sender_chain_reset))
 }
 
 fn decrypt_with_message_keys(
