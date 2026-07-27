@@ -2586,15 +2586,49 @@ fn adopt_recorded_receipts(
 ) -> QueryResult<()> {
     use schema::message_receipts::dsl as r;
     if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, chat)? {
-        // Fold instants before moving, so what follows discards duplicates
-        // rather than choosing between them — the same rule the chat merge
-        // uses, for the same reason: neither identity is inherently earlier.
+        // The chat key is not the only thing split across the two identities:
+        // a 1:1's receipt names whoever the peer sent from, so the waiting row
+        // and the settled one can disagree about the person as well as the
+        // thread. Reconciling only the key would land both under this message
+        // as two users — the same failure the chat merge exists to close — so
+        // this follows that function's sequence exactly, scoped to one message.
+        //
+        // Groups never get here: a group JID has no counterpart, so `alt` is
+        // `None` and the whole block is skipped.
+        //
+        // Every statement binds `?1` device_id, `?2` alt, `?3` chat, `?4` msg_id.
+        //
+        // Fold instants first, across both keys and both identities, so what
+        // follows discards duplicates rather than choosing between them.
         diesel::sql_query(
             "UPDATE message_receipts SET ts_ms = (SELECT MIN(s.ts_ms) FROM message_receipts s \
               WHERE s.device_id = message_receipts.device_id AND s.msg_id = message_receipts.msg_id \
-                AND s.chat_jid IN (?2, ?3) AND s.user_jid = message_receipts.user_jid \
+                AND s.chat_jid IN (?2, ?3) AND s.user_jid IN (?2, ?3) \
                 AND s.receipt_type = message_receipts.receipt_type) \
-             WHERE device_id = ?1 AND msg_id = ?4 AND chat_jid IN (?2, ?3)",
+             WHERE device_id = ?1 AND msg_id = ?4 \
+               AND chat_jid IN (?2, ?3) AND user_jid IN (?2, ?3)",
+        )
+        .bind::<diesel::sql_types::Integer, _>(device_id)
+        .bind::<diesel::sql_types::Text, _>(&alt)
+        .bind::<diesel::sql_types::Text, _>(chat)
+        .bind::<diesel::sql_types::Text, _>(msg_id)
+        .execute(conn)?;
+        // Then the identity, canonical to the key this message is stored under.
+        diesel::sql_query(
+            "UPDATE OR IGNORE message_receipts SET user_jid = ?3 \
+             WHERE device_id = ?1 AND msg_id = ?4 AND chat_jid IN (?2, ?3) AND user_jid = ?2",
+        )
+        .bind::<diesel::sql_types::Integer, _>(device_id)
+        .bind::<diesel::sql_types::Text, _>(&alt)
+        .bind::<diesel::sql_types::Text, _>(chat)
+        .bind::<diesel::sql_types::Text, _>(msg_id)
+        .execute(conn)?;
+        // Past that rename, still naming `alt` is proof the rename collided,
+        // so the row is a duplicate — under either key, since one left under
+        // `alt` would otherwise ride the chat move over intact.
+        diesel::sql_query(
+            "DELETE FROM message_receipts WHERE device_id = ?1 AND msg_id = ?4 \
+             AND chat_jid IN (?2, ?3) AND user_jid = ?2",
         )
         .bind::<diesel::sql_types::Integer, _>(device_id)
         .bind::<diesel::sql_types::Text, _>(&alt)

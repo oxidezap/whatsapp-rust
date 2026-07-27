@@ -4991,6 +4991,78 @@ async fn a_receipt_predating_the_alias_mapping_is_claimed_when_the_message_lands
     );
 }
 
+/// Adoption unifies the peer too, not just the thread. A waiting row and a
+/// settled one can name the same person by different identities, and pulling
+/// only the chat key over would land both under this message as two users.
+#[tokio::test]
+async fn adoption_folds_the_peer_identity_as_well_as_the_thread() {
+    let (store, chat_store) = test_store().await;
+
+    // An established PN thread, so the message routes there.
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-ADOPT-PRIOR",
+            &wa::Message::text("anterior"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    // Waiting rows for a message that does not exist yet, arriving under both
+    // of the peer's identities: one addressed by LID, one by PN.
+    feed(
+        &chat_store,
+        [
+            peer_receipt(
+                jid(PEER_LID),
+                vec!["OUT-ADOPT"],
+                ReceiptType::Delivered,
+                1_700_000_200,
+            ),
+            peer_receipt(
+                jid(PEER),
+                vec!["OUT-ADOPT"],
+                ReceiptType::Delivered,
+                1_700_000_800,
+            ),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-ADOPT",
+            &wa::Message::text("novo"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store.receipts(&jid(PEER), "OUT-ADOPT").await.unwrap();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "one peer, one state, one row: {receipts:?}"
+    );
+    assert_eq!(receipts[0].user_jid, jid(PEER));
+    assert_eq!(
+        receipts[0].timestamp.timestamp(),
+        1_700_000_200,
+        "and the earlier instant survives the fold"
+    );
+
+    let msg = chat_store
+        .message(&jid(PEER), "OUT-ADOPT")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Delivered);
+}
+
 /// A self receipt carrying a device must recount the real thread instead of
 /// materializing a twin of it.
 #[tokio::test]
