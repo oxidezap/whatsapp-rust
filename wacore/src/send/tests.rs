@@ -2985,6 +2985,64 @@ mod collect_stale_device_users {
         info
     }
 
+    /// The case that separates a named rejection from an inferred one: one
+    /// device is rejected by name while another simply produced no bundle (an
+    /// absent or malformed one, or a session setup that failed). Only the named
+    /// device's user may be refreshed -- deleting the other user's device
+    /// registry would force a re-resolution over a failure that says nothing
+    /// about the list being stale.
+    #[test]
+    fn only_the_named_device_is_refreshed_when_the_server_named_it() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let named = lid_device("100000000000002", 2);
+        let merely_missing = lid_device("100000000000003", 3);
+        let dist = vec![delivered.clone(), named.clone(), merely_missing.clone()];
+
+        let out = stale_users_for(true, &[named], Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(set.contains("100000000000002"), "the named device's user");
+        assert!(
+            !set.contains("100000000000003"),
+            "a device that merely produced no bundle is not evidence of a stale list"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    /// A batch-wide failure names nobody, so the unencrypted remainder is the
+    /// only signal left -- and every target in it is suspect, because none of
+    /// them got a bundle either.
+    #[test]
+    fn a_batch_wide_failure_falls_back_to_the_unencrypted_remainder() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let missing = lid_device("100000000000002", 2);
+        let dist = vec![delivered.clone(), missing];
+
+        let out = stale_users_for(true, &[], Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(set.contains("100000000000002"));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// No unregistered device at all means nothing to refresh, whatever else
+    /// went unencrypted.
+    #[test]
+    fn nothing_is_refreshed_without_an_unregistered_device() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let dist = vec![lid_device("100000000000001", 1)];
+
+        assert!(stale_users_for(false, &[], Some(&dist), &[], &info).is_empty());
+    }
+
     /// Closes the loop the named rejection opens: the rejected device gets no
     /// bundle, so it is never in the encrypted set, so it surfaces here as a
     /// user to re-resolve. This is the recovery — not the sender-key marking,

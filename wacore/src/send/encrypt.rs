@@ -91,6 +91,9 @@ pub struct EncryptResult {
     pub encrypted_devices: Vec<Jid>,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// The devices the server rejected by name, when it named them. Empty for a
+    /// batch-wide failure, which names nobody.
+    pub rejected_devices: Vec<Jid>,
 }
 
 pub(crate) struct EncryptAttempt {
@@ -115,6 +118,8 @@ pub struct EncryptForDevicesRaw {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// See [`EncryptResult::rejected_devices`].
+    pub rejected_devices: Vec<Jid>,
 }
 
 struct RawEncryptAttempt {
@@ -444,6 +449,16 @@ pub struct SessionPlan {
     /// See [`record_encryption_override`].
     encryption_overrides: Vec<Option<Jid>>,
     pub had_unregistered_device: bool,
+    /// Devices the server rejected *by name*. Empty when the whole batch
+    /// failed, since a batch-wide answer names nobody.
+    ///
+    /// Kept apart from the flag because they call for different recoveries: a
+    /// named set says exactly which device lists are stale, while a batch-wide
+    /// failure leaves the caller to infer it from what went unencrypted -- and
+    /// inferring it when the server did name the devices would sweep in every
+    /// device that merely lacked a bundle or failed session setup, refreshing
+    /// unrelated users for no reason.
+    pub rejected_devices: Vec<Jid>,
     first_error: Option<anyhow::Error>,
 }
 
@@ -457,6 +472,7 @@ impl SessionPlan {
             device_count,
             encryption_overrides: Vec::new(),
             had_unregistered_device: false,
+            rejected_devices: Vec::new(),
             first_error: None,
         }
     }
@@ -508,6 +524,7 @@ pub async fn ensure_sessions_for_devices(
     // Indices into `devices` for those needing prekey fetch.
     let mut indices_needing_prekeys: Vec<usize> = Vec::new();
     let mut had_406 = false;
+    let mut rejected_devices: Vec<Jid> = Vec::new();
     let mut first_error = None;
 
     let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
@@ -582,14 +599,17 @@ pub async fn ensure_sessions_for_devices(
             .await
         {
             Ok(outcome) => {
-                if outcome
-                    .rejected
-                    .iter()
-                    .any(|device| device.code == UNREGISTERED_DEVICE_CODE)
-                {
+                rejected_devices.extend(
+                    outcome
+                        .rejected
+                        .iter()
+                        .filter(|device| device.code == UNREGISTERED_DEVICE_CODE)
+                        .map(|device| device.jid.clone()),
+                );
+                if !rejected_devices.is_empty() {
                     log::debug!(
                         "prekey fetch rejected {} of {} device(s) by name",
-                        outcome.rejected.len(),
+                        rejected_devices.len(),
                         jids_for_fetch.len()
                     );
                     had_406 = true;
@@ -721,6 +741,7 @@ pub async fn ensure_sessions_for_devices(
         device_count: devices.len(),
         encryption_overrides,
         had_unregistered_device: had_406,
+        rejected_devices,
         first_error,
     })
 }
@@ -795,6 +816,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
             includes_prekey_message: raw.includes_prekey_message,
             encrypted_devices,
             had_unregistered_device: raw.had_unregistered_device,
+            rejected_devices: raw.rejected_devices.clone(),
         },
         first_error,
     })
@@ -842,6 +864,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         device_count: _,
         encryption_overrides,
         had_unregistered_device,
+        rejected_devices,
         mut first_error,
     } = plan;
 
@@ -954,6 +977,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             devices: encrypted,
             includes_prekey_message,
             had_unregistered_device,
+            rejected_devices,
         },
         first_error,
     })

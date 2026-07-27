@@ -317,6 +317,8 @@ pub async fn prepare_group_stanza(
     }
 
     let mut had_unregistered_devices = false;
+    // Empty when the failure was batch-wide; see `stale_users_for`.
+    let mut skdm_rejected_devices: Vec<Jid> = Vec::new();
 
     let sender_key_name = make_sender_key_name(to_jid, &own_sending_jid.to_protocol_address());
 
@@ -433,6 +435,7 @@ pub async fn prepare_group_stanza(
                         includes_prekey_message: result_includes_prekey,
                         encrypted_devices,
                         had_unregistered_device,
+                        rejected_devices,
                     } = result;
                     if distribution_policy == SenderKeyDistributionPolicy::Required
                         && (encrypted_devices.len() != distribution_list.len()
@@ -445,15 +448,13 @@ pub async fn prepare_group_stanza(
                                 distribution_list.len()
                             )
                         });
-                        let stale_device_users = if had_unregistered_device {
-                            collect_stale_device_users(
-                                Some(distribution_list),
-                                &encrypted_devices,
-                                group_info,
-                            )
-                        } else {
-                            Vec::new()
-                        };
+                        let stale_device_users = stale_users_for(
+                            had_unregistered_device,
+                            &rejected_devices,
+                            Some(distribution_list),
+                            &encrypted_devices,
+                            group_info,
+                        );
                         return Err(RequiredSenderKeyDistributionError::new(
                             error,
                             stale_device_users,
@@ -464,6 +465,7 @@ pub async fn prepare_group_stanza(
                     includes_prekey_message |= result_includes_prekey;
                     if had_unregistered_device {
                         had_unregistered_devices = true;
+                        skdm_rejected_devices.extend(rejected_devices);
                     }
                     skdm_encrypted_devices = encrypted_devices;
 
@@ -580,15 +582,13 @@ pub async fn prepare_group_stanza(
 
     let stanza = stanza_builder.children(message_children).build();
 
-    let stale_users = if had_unregistered_devices {
-        collect_stale_device_users(
-            distribution_list.as_deref(),
-            &skdm_encrypted_devices,
-            group_info,
-        )
-    } else {
-        Vec::new()
-    };
+    let stale_users = stale_users_for(
+        had_unregistered_devices,
+        &skdm_rejected_devices,
+        distribution_list.as_deref(),
+        &skdm_encrypted_devices,
+        group_info,
+    );
 
     Ok(PreparedGroupStanza {
         node: stanza,
@@ -626,6 +626,32 @@ pub(crate) fn build_group_phash_set(devices: &[Jid], own_sending_jid: &Jid) -> V
 /// emitted when the group knows the mapping — `invalidate_device_cache` needs
 /// both to clean up zombie records that were stored under whichever alias
 /// `update_device_list` canonicalised to at the time of the write.
+/// Which users to re-resolve after a fan-out that hit an unregistered device.
+///
+/// When the server named the devices, those are the answer, and only those: a
+/// target can go unencrypted because its bundle was absent, malformed, or its
+/// session setup failed, and refreshing those users would delete device
+/// registries over failures that say nothing about the list being stale.
+///
+/// A batch-wide failure names nobody, so there the unencrypted remainder is the
+/// only available signal and every target in it is suspect -- which is sound,
+/// because a batch-wide failure means none of them got a bundle either.
+pub(crate) fn stale_users_for(
+    had_unregistered_device: bool,
+    rejected_devices: &[Jid],
+    distribution_list: Option<&[Jid]>,
+    encrypted_devices: &[Jid],
+    group_info: &GroupInfo,
+) -> Vec<String> {
+    if !had_unregistered_device {
+        return Vec::new();
+    }
+    if rejected_devices.is_empty() {
+        return collect_stale_device_users(distribution_list, encrypted_devices, group_info);
+    }
+    collect_stale_device_users(Some(rejected_devices), &[], group_info)
+}
+
 pub(crate) fn collect_stale_device_users(
     distribution_list: Option<&[Jid]>,
     skdm_encrypted_devices: &[Jid],
