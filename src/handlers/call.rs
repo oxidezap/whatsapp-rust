@@ -1516,6 +1516,7 @@ mod tests {
         active_group_offer_stanza_with_limit("32")
     }
 
+    #[cfg(feature = "voip-runtime")]
     fn active_group_offer_stanza_with_limit(connected_limit: &str) -> wacore_binary::Node {
         let caller = fake_caller_lid();
         NodeBuilder::new("call")
