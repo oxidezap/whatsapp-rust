@@ -102,7 +102,7 @@ impl StanzaHandler for CallHandler {
                         );
                         return true;
                     };
-                    if let Err(error) = client.send_node(ack).await {
+                    if let Err(error) = send_node_boxed(&client, ack).await {
                         warn!("call: failed to send typed {action_type} ack: {error}");
                         return true;
                     }
@@ -760,7 +760,7 @@ impl StanzaHandler for CallHandler {
             }
             Ok(None) => {
                 if let Some(ack) = typed_control_ack
-                    && let Err(error) = client.send_node(ack).await
+                    && let Err(error) = send_node_boxed(&client, ack).await
                 {
                     warn!("call: failed to acknowledge unrecognized typed control: {error}");
                 }
@@ -768,7 +768,7 @@ impl StanzaHandler for CallHandler {
             }
             Err(e) => {
                 if let Some(ack) = typed_control_ack
-                    && let Err(error) = client.send_node(ack).await
+                    && let Err(error) = send_node_boxed(&client, ack).await
                 {
                     warn!("call: failed to acknowledge malformed typed control: {error}");
                 }
@@ -777,6 +777,14 @@ impl StanzaHandler for CallHandler {
         }
         true
     }
+}
+
+/// Erase the rare typed-ACK send future so all three handler outcomes share one poll/drop path.
+fn send_node_boxed(
+    client: &Client,
+    node: wacore_binary::Node,
+) -> wacore::runtime::BoxFuture<'_, Result<(), crate::client::ClientError>> {
+    Box::pin(client.send_node(node))
 }
 
 #[cfg(feature = "voip-runtime")]

@@ -941,15 +941,26 @@ pub fn build_call_video_ack(call: &IncomingCall, original: &NodeRef<'_>) -> Opti
     if call.stanza_id.is_empty() {
         return None;
     }
+    build_typed_call_ack(original, "video")
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn build_typed_call_ack(original: &NodeRef<'_>, action_type: &str) -> Option<Node> {
+    if original.tag != "call" || action_type.is_empty() {
+        return None;
+    }
+    let id = original.get_attr("id")?.to_node_value();
+    let from = original.get_attr("from")?.to_node_value();
     let mut ack = NodeBuilder::new("ack")
         .attr("class", "call")
-        .attr("id", call.stanza_id.as_str())
-        .attr("to", &call.from)
-        .attr("type", "video");
-    let from = call.from.to_string();
-    if let Some(participant) = original
-        .get_attr("participant")
-        .filter(|participant| participant.as_str().as_ref() != from)
+        .attr("id", id)
+        .attr("to", from)
+        .attr("type", action_type);
+    if let Some(participant) = original.get_attr("participant")
+        && original
+            .get_attr("from")
+            .is_none_or(|from| participant.as_str() != from.as_str())
     {
         ack = ack.attr("participant", participant.to_node_value());
     }
