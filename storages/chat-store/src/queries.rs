@@ -259,6 +259,16 @@ impl ChatStore {
     /// under. This is the point lookup the primary key always supported —
     /// mapping an addressed JID back to a store key, or folding one chat's
     /// unread count, does not need the whole list.
+    ///
+    /// Returns one stored row, never a synthesized merge of two. While a
+    /// PN/LID pair is still split, sticky metadata (pin, mute, archive, name)
+    /// can sit on the side this does not return, exactly as it can in
+    /// [`chats`](Self::chats), which lists such a pair as two entries. Unioning
+    /// the two is [`merge_chat_metadata`]'s job and it happens on
+    /// reconciliation; doing it again here would put write-path precedence
+    /// rules in a query and make this disagree with the list.
+    ///
+    /// [`merge_chat_metadata`]: ChatStore::reconcile_chat
     pub async fn chat(&self, jid: &Jid) -> Result<Option<ChatEntry>> {
         use schema::chats::dsl;
         let device_id = self.device_id();

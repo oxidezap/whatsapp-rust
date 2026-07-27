@@ -1952,6 +1952,14 @@ struct DeferredAck {
     /// host reusing one id across two threads could see chat A's ack land on
     /// chat B's row. `None` (the server omitted the chat) matches on the id
     /// alone, which is the same basis its own resolution falls back to.
+    ///
+    /// That `None` case stays order-dependent, as the undeferred chatless path
+    /// always has been: it resolves against the rows that exist when it runs,
+    /// so a host that reuses one id across two chats can have the first insert
+    /// take an ack the second would have made ambiguous. Closing that would
+    /// mean holding every ack to the end of the batch, trading the writer's
+    /// in-order application for a case that needs the host to break id
+    /// uniqueness in the first place.
     chat: Option<String>,
     ack: wacore::types::events::ServerAck,
 }
