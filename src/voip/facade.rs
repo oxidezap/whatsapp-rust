@@ -753,6 +753,7 @@ impl<'a> OutgoingGroupCall<'a> {
                 "group offer ack identity mismatch".to_string(),
             ));
         }
+        ensure_group_offer_media(&update, video.is_some())?;
         let mut session = wacore::voip::CallSession::new_outgoing(
             &call_id,
             Jid::new(&call_id, Server::Call),
@@ -1054,6 +1055,20 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
     }
 }
 
+fn ensure_group_offer_media(
+    update: &GroupCallUpdate,
+    requested_video: bool,
+) -> Result<(), CallError> {
+    let requested = if requested_video { "video" } else { "audio" };
+    if update.media == requested {
+        Ok(())
+    } else {
+        Err(CallError::Response(
+            "group offer ack changed the requested media mode".to_string(),
+        ))
+    }
+}
+
 fn answer_preaccept_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
     let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
     match (video, standard_opus) {
@@ -1242,6 +1257,10 @@ async fn fanout_group_epoch_for_generation(
     generation: Option<u64>,
 ) -> Result<GroupEpochFanout, CallError> {
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
+    // The authoritative roster transaction is already committed before this fan-out starts. Any
+    // preparation failure would make an identical redelivery stale, so own teardown from the first
+    // fallible step instead of leaving the generation alive without its requested epoch.
+    let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let self_id = own_lid.to_string();
     let mut seen = std::collections::HashSet::new();
@@ -1283,7 +1302,7 @@ async fn fanout_group_epoch_for_generation(
     if recipients.is_empty() {
         return Ok(GroupEpochFanout {
             raw_epoch,
-            teardown: GroupRekeyTeardown::new(client, update, generation, false),
+            teardown,
         });
     }
     let encrypted = {
@@ -1351,7 +1370,6 @@ async fn fanout_group_epoch_for_generation(
             .map_err(|error| CallError::Response(error.to_string()))?,
         );
     }
-    let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     for node in nodes {
         ensure_group_rekey_generation(client, &update.call_id, generation)?;
         client.send_node(node).await?;
@@ -3721,6 +3739,28 @@ mod tests {
         assert!(ensure_group_invite_capacity(&snapshot, false).is_ok());
     }
 
+    #[test]
+    fn initial_group_offer_ack_must_preserve_requested_media() {
+        let update = |media: &str| {
+            GroupCallUpdate::builder()
+                .call_id("GROUP-CALL".to_string())
+                .call_creator(Jid::new("111111111111111", Server::Lid))
+                .transaction_id(1)
+                .media(media.to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build()
+        };
+
+        assert!(ensure_group_offer_media(&update("audio"), false).is_ok());
+        assert!(ensure_group_offer_media(&update("video"), true).is_ok());
+        assert!(ensure_group_offer_media(&update("audio"), true).is_err());
+        assert!(ensure_group_offer_media(&update("video"), false).is_err());
+    }
+
     #[tokio::test]
     async fn accept_rejects_an_audio_profile_the_peer_did_not_offer() {
         let client = make_client().await;
@@ -4904,6 +4944,26 @@ mod tests {
             sent.load(Ordering::SeqCst),
             0,
             "an empty recipient set must initialize only the local epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepublication_group_rekey_failure_terminates_committed_generation() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let (client, _sent) = make_sending_client_with_backend(backend.clone(), None).await;
+        let recipient = peer_lid();
+        seed_peer_session(&client, &recipient).await;
+        let update = rekey_update(&client, &[recipient]);
+        register_group_update(&client, &update);
+        backend.set_fail_session_writes(true);
+
+        assert!(
+            fanout_group_epoch(&client, &update).await.is_err(),
+            "the pre-wire durability failure must abort epoch publication"
+        );
+        assert!(
+            client.call_registry().snapshot(&update.call_id).is_none(),
+            "a committed rekey request that cannot be retried must terminate its generation"
         );
     }
 

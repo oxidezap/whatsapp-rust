@@ -20,9 +20,9 @@ use wacore::stanza::group_call::{
     parse_call_link_join_ack, parse_call_link_query_ack, parse_waiting_room_admit_ack,
     parse_waiting_room_deny_ack, parse_waiting_room_toggle_ack,
 };
-#[cfg(feature = "voip-runtime")]
-use wacore::types::call::CallAction;
 use wacore::types::call::IncomingCall;
+#[cfg(feature = "voip-runtime")]
+use wacore::types::call::{CallAction, VideoState};
 #[cfg(feature = "voip-runtime")]
 use wacore::types::group_call::{
     CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallUpdate, ScreenShare,
@@ -885,13 +885,22 @@ impl Voip<'_> {
         state: ScreenShareState,
         screen_share_id: Option<u32>,
     ) -> Result<(), CallError> {
-        if self
-            .client
-            .call_registry()
+        let registry = self.client.call_registry();
+        if registry
             .group_state_if_current(call_id, generation)
             .is_none()
         {
             return Err(CallError::Media("call is not an active group call"));
+        }
+        if state == ScreenShareState::Started
+            && !matches!(
+                registry.video_states(call_id, generation),
+                Some((VideoState::Enabled, _))
+            )
+        {
+            return Err(CallError::Media(
+                "screen sharing requires an active local video plane",
+            ));
         }
         let participant = self
             .client
@@ -913,7 +922,6 @@ impl Voip<'_> {
         )
         .await?;
         let screen_share = ScreenShare::new(state, screen_share_id);
-        let registry = self.client.call_registry();
         if registry.set_screen_share_if_current(
             call_id,
             generation,
@@ -1446,6 +1454,21 @@ mod tests {
                 raised: true,
             }) if event_participant == participant
         ));
+
+        assert!(
+            client
+                .voip()
+                .set_screen_share(call_id, &creator, ScreenShareState::Started, Some(7))
+                .await
+                .is_err(),
+            "an audio-only group call must not advertise an unsendable screen share"
+        );
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "the rejected screen-share transition must stay off the wire"
+        );
+        assert!(registry.set_is_video(call_id, generation, true));
 
         client
             .voip()

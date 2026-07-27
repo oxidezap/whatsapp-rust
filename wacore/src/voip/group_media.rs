@@ -320,10 +320,10 @@ impl GroupMediaRegistry {
                 EpochKey::new(raw_epoch).ok_or(GroupMediaError::InvalidEpoch)?,
             );
             if self.pending_epochs.len() > MAX_BUFFERED_EPOCHS {
-                let Some(farthest) = self.pending_epochs.keys().next_back().copied() else {
+                let Some(oldest) = self.pending_epochs.keys().next().copied() else {
                     return Err(GroupMediaError::InvalidEpoch);
                 };
-                self.pending_epochs.remove(&farthest);
+                self.pending_epochs.remove(&oldest);
             }
             return Ok(GroupEpochApply::Buffered);
         }
@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn future_epoch_buffer_evicts_the_farthest_transaction() {
+    fn future_epoch_buffer_retains_the_newest_transactions() {
         let mut registry = registry();
         for transaction in 1..=(MAX_BUFFERED_EPOCHS as u32 + 2) {
             assert_eq!(
@@ -911,7 +911,18 @@ mod tests {
         assert_eq!(registry.pending_epochs.len(), MAX_BUFFERED_EPOCHS);
         assert_eq!(
             registry.pending_epochs.keys().copied().collect::<Vec<_>>(),
-            (1..=MAX_BUFFERED_EPOCHS as u32).collect::<Vec<_>>()
+            (3..=MAX_BUFFERED_EPOCHS as u32 + 2).collect::<Vec<_>>()
+        );
+        registry
+            .apply_group_update(&update(
+                MAX_BUFFERED_EPOCHS as u32 + 2,
+                vec![device("200002", 2, 2)],
+            ))
+            .expect("latest roster");
+        assert_eq!(
+            registry.installed_epoch_transaction(),
+            Some(MAX_BUFFERED_EPOCHS as u32 + 2),
+            "the bounded buffer must retain the authoritative newest key"
         );
     }
 

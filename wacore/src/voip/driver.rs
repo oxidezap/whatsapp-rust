@@ -334,6 +334,22 @@ fn purge_queued(
     dropped
 }
 
+fn purge_group_transition_media(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+    epoch_advanced: bool,
+    audio_only: bool,
+) -> DroppedMedia {
+    if !epoch_advanced && !audio_only {
+        return DroppedMedia::default();
+    }
+    purge_queued(queue, pending_video, awaiting_video_keyframe, |batch| {
+        (epoch_advanced && batch.kind != SendBatchKind::Control)
+            || (audio_only && batch.kind == SendBatchKind::Video)
+    })
+}
+
 fn discard_video_until_keyframe(
     queue: &mut VecDeque<SendBatch>,
     dropped: &mut DroppedMedia,
@@ -781,15 +797,15 @@ async fn run_call_with_clock_and_wallclock(
             group = group_ctl_fut => {
                 match group {
                     Some(GroupControl::Update(update)) => {
+                        let previous_epoch = eng.group_epoch_transaction();
                         match eng.apply_group_update(now_ms(), &update) {
-                            Ok(crate::voip::GroupRosterApply::Applied)
-                                if update.media == "audio" =>
-                            {
-                                let dropped = purge_queued(
+                            Ok(crate::voip::GroupRosterApply::Applied) => {
+                                let dropped = purge_group_transition_media(
                                     &mut send_queue,
                                     &mut pending_video,
                                     &mut awaiting_video_keyframe,
-                                    |batch| batch.kind == SendBatchKind::Video,
+                                    eng.group_epoch_transaction() != previous_epoch,
+                                    update.media == "audio",
                                 );
                                 if dropped.packets != 0 {
                                     let _ = channels.events.try_send(
@@ -1126,11 +1142,12 @@ mod tests {
         ]);
         let mut pending_video = vec![Bytes::from_static(b"fragment")];
         let mut awaiting_keyframe = false;
-        let dropped = purge_queued(
+        let dropped = purge_group_transition_media(
             &mut downgrade_queue,
             &mut pending_video,
             &mut awaiting_keyframe,
-            |batch| batch.kind == SendBatchKind::Video,
+            false,
+            true,
         );
         assert_eq!(dropped.video_access_units, 2);
         assert_eq!(dropped.packets, 3);
@@ -1144,11 +1161,12 @@ mod tests {
 
         downgrade_queue.push_back(batch(SendBatchKind::Video, 2, false));
         pending_video.push(Bytes::from_static(b"fragment"));
-        let dropped = purge_queued(
+        let dropped = purge_group_transition_media(
             &mut downgrade_queue,
             &mut pending_video,
             &mut awaiting_keyframe,
-            |batch| batch.kind != SendBatchKind::Control,
+            true,
+            false,
         );
         assert_eq!(dropped.video_access_units, 2);
         assert_eq!(dropped.packets, 4);

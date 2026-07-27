@@ -854,6 +854,12 @@ impl CallEngine {
         self.group.is_some()
     }
 
+    pub(crate) fn group_epoch_transaction(&self) -> Option<u32> {
+        self.group
+            .as_ref()
+            .and_then(|group| group.local_epoch_transaction)
+    }
+
     /// Enable participant-indexed media before [`start`](Self::start).
     pub fn configure_group(&mut self, config: GroupEngineConfig) -> Result<(), EngineError> {
         self.configure_group_at(0, config)
@@ -2498,6 +2504,32 @@ mod encoded_tests {
                 .apply_group_raw_epoch(7, &[0x42; 32])
                 .expect("install group epoch"),
             GroupEpochApply::Installed
+        );
+    }
+
+    #[test]
+    fn matching_roster_installs_a_buffered_epoch_into_the_send_pipeline() {
+        let mut engine = group_engine();
+        assert_eq!(engine.group_epoch_transaction(), None);
+        assert_eq!(
+            engine
+                .apply_group_raw_epoch(8, &[0x48; 32])
+                .expect("buffer future epoch"),
+            GroupEpochApply::Buffered
+        );
+        let mut update = group_update();
+        update.transaction_id = 8;
+        update.media = "video".to_string();
+        assert_eq!(
+            engine
+                .apply_group_update(1, &update)
+                .expect("apply matching roster"),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(
+            engine.group_epoch_transaction(),
+            Some(8),
+            "the driver must be able to observe and purge on the send-key transition"
         );
     }
 
