@@ -319,18 +319,29 @@ fn is_device_unregistered(err: &anyhow::Error) -> bool {
     wacore::request::ServerErrorCode::from_anyhow(err).is_some_and(|e| e.code == 406)
 }
 
+/// The distinct users named by `jids`, in first-seen order.
+///
+/// A prekey batch is usually several devices of the same one or two users, and
+/// every invalidation takes the registry lock and deletes rows, so visiting a
+/// user once per device would pay that repeatedly for no effect. Split out from
+/// the invalidation so the deduplication is observable on its own: through the
+/// cache it is not, since a user invalidated twice looks exactly like a user
+/// invalidated once.
+fn distinct_users(jids: &[Jid]) -> smallvec::SmallVec<[&str; 4]> {
+    let mut seen: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
+    for jid in jids {
+        if !seen.contains(&jid.user.as_str()) {
+            seen.push(jid.user.as_str());
+        }
+    }
+    seen
+}
+
 impl Client {
-    /// Refreshes the device list of every user named in `jids`.
-    ///
-    /// Deduplicated: a batch is usually several devices of the same one or two
-    /// users, and each invalidation takes the registry lock and deletes rows.
+    /// Refreshes the device list of every user named in `jids`, once each.
     async fn invalidate_device_caches_for(&self, jids: &[Jid]) {
-        let mut seen: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
-        for jid in jids {
-            if !seen.contains(&jid.user.as_str()) {
-                seen.push(jid.user.as_str());
-                self.invalidate_device_cache(&jid.user).await;
-            }
+        for user in distinct_users(jids) {
+            self.invalidate_device_cache(user).await;
         }
     }
 }
@@ -604,10 +615,12 @@ mod tests {
     /// A prekey batch is several devices of the same one or two users, and each
     /// invalidation takes the registry lock and deletes rows, so the users are
     /// visited once each rather than once per device.
-    #[tokio::test]
-    async fn a_batch_refreshes_each_user_once() {
-        let client = crate::test_utils::create_test_client().await;
-
+    ///
+    /// Asserted on the list rather than through the cache: an entry invalidated
+    /// twice is indistinguishable from one invalidated once, so a cache-level
+    /// test would pass no matter how many times each user was visited.
+    #[test]
+    fn a_batch_names_each_user_once_in_order() {
         let a = Jid::pn("5511900000050");
         let b = Jid::pn("5511900000051");
         let jids = vec![
@@ -615,15 +628,20 @@ mod tests {
             a.with_device(1),
             b.with_device(0),
             a.with_device(2),
+            b.with_device(3),
         ];
 
-        // No cache entries to clear; what is under test is which users are
-        // visited, which the call itself reports by not panicking on the
-        // duplicate-heavy input and by leaving both users absent afterwards.
-        client.invalidate_device_caches_for(&jids).await;
+        assert_eq!(
+            distinct_users(&jids).as_slice(),
+            [a.user.as_str(), b.user.as_str()],
+            "each user once, in the order the batch first names them"
+        );
 
-        assert!(client.device_registry_cache.get(&a.user).await.is_none());
-        assert!(client.device_registry_cache.get(&b.user).await.is_none());
+        assert!(distinct_users(&[]).is_empty());
+        assert_eq!(
+            distinct_users(std::slice::from_ref(&a.with_device(7))).as_slice(),
+            [a.user.as_str()]
+        );
     }
 
     #[test]
