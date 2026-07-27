@@ -2985,6 +2985,43 @@ mod collect_stale_device_users {
         info
     }
 
+    /// Closes the loop the named rejection opens: the rejected device gets no
+    /// bundle, so it is never in the encrypted set, so it surfaces here as a
+    /// user to re-resolve. This is the recovery — not the sender-key marking,
+    /// which deliberately covers the whole target set (WA Web
+    /// `markHasSenderKey(x, skDistribList)`).
+    #[test]
+    fn a_device_that_was_never_encrypted_for_is_reported_stale() {
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let rejected = lid_device("100000000000002", 9);
+        let dist = vec![delivered.clone(), rejected.clone()];
+
+        let out = collect_stale_device_users(Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(
+            set.contains("100000000000002"),
+            "the device with no bundle must come back as stale"
+        );
+        assert!(
+            !set.contains("100000000000001"),
+            "a device that did receive the SKDM is not stale"
+        );
+    }
+
+    /// The counterpart: when every target was encrypted for, nothing is stale,
+    /// so an ordinary group send does not invalidate any device list.
+    #[test]
+    fn a_fully_delivered_distribution_reports_nothing_stale() {
+        let info = group_info_lid(&[]);
+        let a = lid_device("100000000000001", 1);
+        let b = lid_device("100000000000002", 2);
+        let dist = vec![a.clone(), b.clone()];
+
+        assert!(collect_stale_device_users(Some(&dist), &[a, b], &info).is_empty());
+    }
+
     #[test]
     fn emits_lid_and_pn_alias_when_mapping_known() {
         let info = group_info_lid(&[("100000000000001", "15550000001")]);
@@ -4563,6 +4600,74 @@ mod local_identity_change_on_send {
                 plan.had_unregistered_device,
                 "the named device must raise the same flag a batch 406 raises"
             );
+        }
+
+        /// Only a `406` means "this device is gone". Another refusal code says
+        /// something else, and refreshing a device list over it costs a usync
+        /// for nothing.
+        #[tokio::test]
+        async fn a_rejection_that_is_not_a_406_leaves_the_device_list_alone() {
+            let warm: Jid = "5511900000071:0@s.whatsapp.net".parse().unwrap();
+            let odd: Jid = "5511900000071:9@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_rejected_device(odd.clone(), 503);
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[warm.clone(), odd.clone()],
+            )
+            .await
+            .expect("a non-406 rejection is still not a fan-out failure");
+
+            assert!(
+                !plan.had_unregistered_device,
+                "a 503 is not the server saying the device is unregistered"
+            );
+        }
+
+        /// A response with nothing rejected must not raise the flag either, or
+        /// every ordinary send would invalidate device lists.
+        #[tokio::test]
+        async fn a_clean_fetch_reports_no_unregistered_device() {
+            let warm: Jid = "5511900000081:0@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &MockSendContextResolver::new(),
+                std::slice::from_ref(&warm),
+            )
+            .await
+            .expect("plan");
+
+            assert!(!plan.had_unregistered_device);
         }
 
         /// End to end through `prepare_dm_stanza`: recipient devices and own

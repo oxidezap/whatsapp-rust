@@ -210,10 +210,14 @@ impl PreKeyUtils {
             if user_node_ref.tag != "user" {
                 continue;
             }
-            let mut jid = user_node_ref
-                .attrs()
-                .jid("jid")
-                .normalize_for_prekey_bundle();
+            // A `<user>` whose jid is missing or unparseable names no device, and
+            // the default would name device 0 of an empty user -- an address a
+            // rejection must never be recorded against.
+            let Some(named) = user_node_ref.attrs().optional_jid("jid") else {
+                log::warn!("prekey response carried a <user> with no usable jid; skipping");
+                continue;
+            };
+            let mut jid = named.normalize_for_prekey_bundle();
             if jid.device == 0
                 && matches!(
                     jid.server,
@@ -233,9 +237,25 @@ impl PreKeyUtils {
             // unaffected. Mirrors WA Web's `FetchKeyBundlesUserError` arm,
             // which collects per-item errors alongside the bundles.
             if let Some(error_node) = user_node_ref.get_optional_child("error") {
-                let code = error_node.attrs().optional_u64("code").unwrap_or(0) as u16;
-                log::debug!("prekey fetch rejected {} with code {code}", jid.observe());
-                outcome.rejected.push(RejectedDevice { jid, code });
+                // Narrowed, not truncated: `65942 as u16` is 406, so a cast
+                // would let an out-of-range code arrive as the one value that
+                // makes us refresh a device list. A code we cannot read names
+                // nothing we can act on, so the entry is dropped rather than
+                // guessed at.
+                match error_node
+                    .attrs()
+                    .optional_u64("code")
+                    .and_then(|raw| u16::try_from(raw).ok())
+                {
+                    Some(code) => {
+                        log::debug!("prekey fetch rejected {} with code {code}", jid.observe());
+                        outcome.rejected.push(RejectedDevice { jid, code });
+                    }
+                    None => log::warn!(
+                        "prekey fetch rejected {} with an unreadable code; ignoring",
+                        jid.observe()
+                    ),
+                }
                 continue;
             }
             let account_identity = account_identities.get(&jid);
@@ -601,6 +621,85 @@ mod tests {
             outcome.rejected[0].code, 406,
             "the code is what separates an unregistered device from another refusal"
         );
+    }
+
+    /// `65942 as u16` is exactly 406, so a truncating cast turns an
+    /// out-of-range code into the one value that makes the caller refresh a
+    /// device list. The rejection is dropped instead of being invented.
+    #[test]
+    fn an_out_of_range_error_code_is_not_narrowed_into_a_406() {
+        let gone_jid = Jid::lid_device("100000087654321", 2);
+        assert_eq!(65942_u64 as u16, 406, "the cast this guards against");
+
+        let gone = NodeBuilder::new("user")
+            .attr("jid", NodeValue::Jid(gone_jid.clone()))
+            .children([NodeBuilder::new("error").attr("code", "65942").build()])
+            .build();
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("list").children([gone]).build()])
+            .build();
+
+        let outcome = PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+            .expect("parse");
+
+        assert!(
+            outcome.rejected.is_empty(),
+            "an unreadable code must not be recorded as a rejection"
+        );
+        assert!(outcome.bundles.is_empty());
+    }
+
+    /// A `<user>` with no usable jid names no device. Defaulting it would record
+    /// the rejection against device 0 of an empty user and refresh whatever
+    /// that resolves to.
+    #[test]
+    fn a_user_without_a_usable_jid_is_skipped_rather_than_defaulted() {
+        for attrs in [None, Some("not a jid")] {
+            let mut builder = NodeBuilder::new("user");
+            if let Some(raw) = attrs {
+                builder = builder.attr("jid", raw);
+            }
+            let user = builder
+                .children([NodeBuilder::new("error").attr("code", "406").build()])
+                .build();
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("list").children([user]).build()])
+                .build();
+
+            let outcome =
+                PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+                    .expect("parse");
+
+            assert!(
+                outcome.rejected.is_empty(),
+                "a rejection with no device to name must not be recorded ({attrs:?})"
+            );
+        }
+    }
+
+    /// The code travels intact for values that do fit, since it is what decides
+    /// whether the caller acts at all.
+    #[test]
+    fn a_rejection_keeps_the_code_the_server_sent() {
+        for code in [400_u16, 406, 503] {
+            let jid = Jid::lid_device("100000011112222", 3);
+            let user = NodeBuilder::new("user")
+                .attr("jid", NodeValue::Jid(jid.clone()))
+                .children([NodeBuilder::new("error")
+                    .attr("code", code.to_string())
+                    .build()])
+                .build();
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("list").children([user]).build()])
+                .build();
+
+            let outcome =
+                PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+                    .expect("parse");
+
+            assert_eq!(outcome.rejected.len(), 1);
+            assert_eq!(outcome.rejected[0].code, code);
+        }
     }
 
     fn parse_one(jid: Jid, device_identity: Option<Vec<u8>>) -> HashMap<Jid, PreKeyBundle> {
