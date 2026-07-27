@@ -316,6 +316,28 @@ pub(crate) fn merge_split_chat(
         .bind::<Text, _>(src)
         .execute(conn)?;
 
+    // A 1:1's receipts name the peer, and the peer is what this merge is
+    // reconciling: rows recorded while the thread answered to its other
+    // identity carry that identity in `user_jid`. Nothing else would ever put
+    // the two halves back together — relocation moves only `chat_jid`, and the
+    // collision passes below match `user_jid` exactly — so one person would
+    // stay split across two users forever. Rewrite it first, so a row that is
+    // really a duplicate is recognisable as one by the time collisions are
+    // resolved. Self receipts never reach here, so the peer is the only user a
+    // 1:1 row can name.
+    // Both sides need it, not just the source: the identity a row names is the
+    // one the peer sent from, which is independent of the key the row was
+    // filed under. A receipt addressed to the surviving thread can still carry
+    // the retiring identity.
+    diesel::sql_query(
+        "UPDATE OR IGNORE message_receipts SET user_jid = ?1 \
+         WHERE device_id = ?2 AND chat_jid IN (?1, ?3) AND user_jid = ?3",
+    )
+    .bind::<Text, _>(dest)
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(src)
+    .execute(conn)?;
+
     // No "keep the furthest state" pass here, unlike reactions: receipts are
     // keyed per state, so a side holding `read` and a side holding `delivered`
     // are two facts about one message rather than two candidates for one row.

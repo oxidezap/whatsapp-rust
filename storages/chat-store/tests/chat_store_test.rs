@@ -3796,6 +3796,72 @@ async fn merge_keeps_the_earlier_instant_for_a_state_both_sides_recorded() {
     );
 }
 
+/// One peer, not two. A 1:1's receipt names whoever the peer sent from, so a
+/// thread that changed identity mid-flight accumulates rows under both — and
+/// the merge is the only place that can put them back together, since moving
+/// `chat_jid` leaves `user_jid` untouched.
+#[tokio::test]
+async fn merge_folds_a_split_peer_identity_into_one_user() {
+    let (store, chat_store) = test_store().await;
+
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-WHO",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store
+        .record_outgoing(
+            &jid(PEER_LID),
+            "OUT-WHO",
+            &wa::Message::text("dup"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    // Delivered reported from the LID identity, read from the PN one.
+    feed(
+        &chat_store,
+        [
+            peer_receipt(
+                jid(PEER_LID),
+                vec!["OUT-WHO"],
+                ReceiptType::Delivered,
+                1_700_000_200,
+            ),
+            peer_receipt(jid(PEER), vec!["OUT-WHO"], ReceiptType::Read, 1_700_000_300),
+        ],
+    )
+    .await;
+
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store.receipts(&jid(PEER), "OUT-WHO").await.unwrap();
+    let mut users: Vec<String> = receipts.iter().map(|r| r.user_jid.to_string()).collect();
+    users.dedup();
+    assert_eq!(
+        users,
+        vec![PEER],
+        "both states belong to one peer after the merge: {receipts:?}"
+    );
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.status, r.timestamp.timestamp()))
+            .collect::<Vec<_>>(),
+        vec![
+            (MessageStatus::Delivered, 1_700_000_200),
+            (MessageStatus::Read, 1_700_000_300),
+        ],
+        "and both states survive: {receipts:?}"
+    );
+}
+
 /// A reaction addressed by the peer's other identity lands on the stored
 /// message (routing picks the existing thread).
 #[tokio::test]
@@ -4504,6 +4570,120 @@ async fn a_receipt_that_arrives_before_its_message_is_not_lost() {
             .collect::<Vec<_>>(),
         vec![(MessageStatus::Delivered, 1_700_000_200)],
         "the early receipt still carries its instant: {receipts:?}"
+    );
+}
+
+/// Receipts do not arrive in time order — an offline queue drains after the
+/// live socket — so the state's instant is the earliest reported, not the
+/// first one processed.
+#[tokio::test]
+async fn an_out_of_order_receipt_lowers_the_recorded_instant() {
+    let (_store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &peer,
+            "OUT-DM-ORDER",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    // The live device reports first, then a delayed report of the same state
+    // that actually happened earlier.
+    for ts in [1_700_000_900, 1_700_000_200] {
+        feed(
+            &chat_store,
+            [peer_receipt(
+                peer.clone(),
+                vec!["OUT-DM-ORDER"],
+                ReceiptType::Delivered,
+                ts,
+            )],
+        )
+        .await;
+    }
+
+    let receipts = chat_store.receipts(&peer, "OUT-DM-ORDER").await.unwrap();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(
+        receipts[0].timestamp.timestamp(),
+        1_700_000_200,
+        "the earlier instant wins regardless of arrival order"
+    );
+}
+
+/// An early receipt for a peer whose thread is already keyed by its other
+/// identity files against that thread. The message will route there when it
+/// lands, so filing under the wire key would strand the row on a chat that
+/// never comes into existence.
+#[tokio::test]
+async fn an_early_aliased_receipt_files_against_the_existing_thread() {
+    let (store, chat_store) = test_store().await;
+
+    // An established PN-keyed thread for this peer.
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-DM-PRIOR",
+            &wa::Message::text("anterior"),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    add_lid_mapping(&store).await;
+
+    // A receipt by LID for a message that does not exist yet, anywhere.
+    feed(
+        &chat_store,
+        [peer_receipt(
+            jid(PEER_LID),
+            vec!["OUT-DM-NEW"],
+            ReceiptType::Delivered,
+            1_700_000_200,
+        )],
+    )
+    .await;
+
+    let stored: Vec<JidRow> = store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query(
+                "SELECT chat_jid AS jid FROM message_receipts \
+                 WHERE device_id = 1 AND msg_id = 'OUT-DM-NEW'",
+            )
+            .load(conn)
+            .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.iter().map(|r| r.jid.as_str()).collect::<Vec<_>>(),
+        vec![PEER],
+        "filed against the thread that exists, not the identity it was addressed by"
+    );
+
+    // And the message, when it lands, routes to that same thread and finds it.
+    chat_store
+        .record_outgoing(
+            &jid(PEER),
+            "OUT-DM-NEW",
+            &wa::Message::text("novo"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store.receipts(&jid(PEER), "OUT-DM-NEW").await.unwrap();
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.status, r.timestamp.timestamp()))
+            .collect::<Vec<_>>(),
+        vec![(MessageStatus::Delivered, 1_700_000_200)],
+        "{receipts:?}"
     );
 }
 
