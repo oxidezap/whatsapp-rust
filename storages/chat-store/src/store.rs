@@ -597,20 +597,18 @@ async fn writer_loop(
         }
 
         if !batch.is_empty() {
-            // Hand the deferred acks to the blocking closure and take them
-            // back either way: a rolled-back batch applied none of them, so
-            // they must keep waiting rather than die with it.
+            // The deferred acks move into the blocking closure, so keep the
+            // pre-image here. It is the correct state for EVERY way this batch
+            // can fail: a rolled-back transaction applied none of the acks it
+            // consumed, and a pool or task failure never returns the queue at
+            // all. Without it, an ack consumed by an insert that did not
+            // survive would leave the re-recorded row pending forever — the
+            // exact loss this queue exists to prevent. Deferred acks are rare,
+            // so the usual clone is of an empty queue.
             let carried = std::mem::take(&mut deferred_acks);
+            let pre_image = carried.clone();
             let result = db
                 .run(move |conn| {
-                    // The queue is in-memory, so it does not roll back with the
-                    // transaction that mutated it. An ack consumed by an insert
-                    // that then rolled back was never applied to anything, and
-                    // keeping it consumed would leave the re-recorded row
-                    // pending forever — the exact loss this queue exists to
-                    // prevent. Snapshot and restore instead. Deferred acks are
-                    // rare, so the common snapshot is of an empty queue.
-                    let snapshot = carried.clone();
                     let mut deferred = carried;
                     let outcome = conn
                         .transaction(|conn| {
@@ -621,29 +619,20 @@ async fn writer_loop(
                             Ok(cs)
                         })
                         .map_err(db_err);
-                    if outcome.is_err() {
-                        deferred = snapshot;
-                    }
                     Ok((outcome, deferred))
                 })
                 .await;
             match result {
-                Ok((outcome, carried)) => {
+                Ok((Ok(cs), carried)) => {
                     deferred_acks = carried;
-                    match outcome {
-                        Ok(cs) => emit_changes(&changes, cs),
-                        // The batch rolled back; state stays consistent
-                        // (previous commit) but this slice of history is lost.
-                        // Surfacing beats crashing the writer.
-                        Err(e) => {
-                            warn!("chat-store: dropping write batch: {e}");
-                            pending_error = Some(e.to_string());
-                        }
-                    }
+                    emit_changes(&changes, cs);
                 }
-                // The pool/thread itself failed, so the closure never returned
-                // the deferred acks. Rare, and the batch is lost with them.
-                Err(e) => {
+                // Nothing committed — whether the transaction rolled back or
+                // the pool/task failed outright. State stays consistent
+                // (previous commit) but this slice of history is lost;
+                // surfacing beats crashing the writer.
+                Ok((Err(e), _)) | Err(e) => {
+                    deferred_acks = pre_image;
                     warn!("chat-store: dropping write batch: {e}");
                     pending_error = Some(e.to_string());
                 }
