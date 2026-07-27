@@ -704,7 +704,7 @@ impl SignalStoreCache {
     /// bundle and overwrite it. Nothing is lost: a record we cannot decode can
     /// derive no key material, so it cannot repeat a counter either.
     fn decode_stored_session(
-        address: &ProtocolAddress,
+        key: &str,
         bytes: &[u8],
         incarnation: &StoreIncarnation,
     ) -> Option<SessionRecord> {
@@ -712,8 +712,8 @@ impl SignalStoreCache {
             Ok(record) => Some(record),
             Err(error) => {
                 log::error!(
-                    "discarding unreadable session row for {}: {error} — recovering with a fresh session",
-                    crate::types::jid::observe_protocol_address(address)
+                    "discarding unreadable session row for addr#{:016x}: {error} — recovering with a fresh session",
+                    wacore_binary::jid::observe_token(key)
                 );
                 crate::telemetry::session_record_quarantined();
                 None
@@ -769,7 +769,7 @@ impl SignalStoreCache {
         };
         match backend_result
             .as_deref()
-            .and_then(|bytes| Self::decode_stored_session(address, bytes, &state.incarnation))
+            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
         {
             Some(record) => {
                 state.cache.insert(
@@ -841,7 +841,7 @@ impl SignalStoreCache {
         }
         match backend_result
             .as_deref()
-            .and_then(|bytes| Self::decode_stored_session(address, bytes, &state.incarnation))
+            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
         {
             Some(record) => {
                 let record = Arc::new(record);
@@ -930,7 +930,7 @@ impl SignalStoreCache {
         }
         let entry = match backend_result
             .as_deref()
-            .and_then(|bytes| Self::decode_stored_session(address, bytes, &state.incarnation))
+            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
         {
             Some(record) => SessionEntry::Present(Arc::new(record)),
             None => SessionEntry::Absent,
@@ -1276,7 +1276,26 @@ impl SignalStoreCache {
                         };
                         let durable = match durable {
                             Some(d) => d,
-                            None => backend.has_session(addr.as_ref()).await?,
+                            // Row existence is not enough: a row that does not
+                            // decode is no session at all, and deleting the
+                            // prekey against it is the very outcome this block
+                            // exists to prevent -- a redelivered pkmsg would
+                            // have neither a usable session nor the prekey to
+                            // rebuild one. Decoded under the sessions lock we
+                            // already hold, so the decision stays atomic
+                            // against a decrypt storing its own session.
+                            None => backend
+                                .get_session(addr.as_ref())
+                                .await?
+                                .as_deref()
+                                .and_then(|bytes| {
+                                    Self::decode_stored_session(
+                                        addr.as_ref(),
+                                        bytes,
+                                        &state.incarnation,
+                                    )
+                                })
+                                .is_some(),
                         };
                         if durable {
                             deletable.push(*id);
@@ -2324,6 +2343,47 @@ mod consumed_prekey_atomicity_tests {
         );
     }
 
+    /// The same, for a row that is present but does not decode. Row existence
+    /// alone would call it durable and delete the prekey, leaving a redelivered
+    /// pkmsg with neither a usable session nor the prekey to rebuild one --
+    /// which is the exact outcome the deferral rule exists to prevent.
+    #[tokio::test]
+    async fn prekey_behind_an_unreadable_session_row_survives_flush() {
+        use super::lease_reload_tests::leased_session;
+        use crate::libsignal::protocol::consts::MAX_RESERVATION_FAST_FORWARD;
+
+        let backend = InMemoryBackend::new();
+        let addr = seed(&backend).await;
+
+        // Persist a row that only fails to decode after a restart, so the
+        // backend genuinely holds bytes for this address.
+        let writer = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let mut stranded = leased_session();
+        stranded.reserve_sender_chain_counters(MAX_RESERVATION_FAST_FORWARD);
+        writer.put_session(&addr, stranded).await;
+        writer.flush(&backend).await.unwrap();
+        assert!(
+            backend.get_session(addr.as_str()).await.unwrap().is_some(),
+            "the row is there; what follows is about whether it decodes"
+        );
+
+        // A different incarnation: the reload has to fast-forward, and refuses.
+        let restarted = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        restarted.remove_prekey(PREKEY_ID, addr.as_str()).await;
+        restarted.flush(&backend).await.unwrap();
+
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
+            "a prekey behind a row that does not decode must survive the flush"
+        );
+    }
+
     /// A prekey buffered for a session that is not durable (its volatile session
     /// was dropped before the buffer insert landed, e.g. a disconnect clear()
     /// racing the consume path) must NOT be deleted: removing the durable prekey
@@ -3002,7 +3062,7 @@ mod lease_reload_tests {
         SenderKeyName::from_parts("group@g.us", "15550001000@s.whatsapp.net:0")
     }
 
-    fn leased_session() -> SessionRecord {
+    pub(super) fn leased_session() -> SessionRecord {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
         let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
