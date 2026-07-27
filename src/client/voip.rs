@@ -243,16 +243,21 @@ impl Client {
     /// answer teardown both use this, preventing a replacement generation from being installed
     /// after the old one is claimed but before its terminal stanza reaches the wire.
     #[cfg(feature = "voip-runtime")]
-    pub(crate) async fn lock_answer_transition(
-        &self,
-        call_id: &str,
-    ) -> async_lock::MutexGuardArc<()> {
+    pub(crate) fn answer_transition_lock(&self, call_id: &str) -> Arc<async_lock::Mutex<()>> {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         call_id.hash(&mut hasher);
         let lane = hasher.finish() as usize % self.answer_transition_locks.len();
-        self.answer_transition_locks[lane].clone().lock_arc().await
+        self.answer_transition_locks[lane].clone()
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn lock_answer_transition(
+        &self,
+        call_id: &str,
+    ) -> async_lock::MutexGuardArc<()> {
+        self.answer_transition_lock(call_id).lock_arc().await
     }
 }
 
@@ -356,7 +361,14 @@ impl Voip<'_> {
         // the send would otherwise hit take_ringing first and surface a phantom missed call for a call
         // we already declined (WA Web deletes it from _ringingCalls on reject). No-op if never ringing.
         #[cfg(feature = "voip-runtime")]
-        self.client.call_registry().take_ringing(call_id);
+        {
+            let registry = self.client.call_registry();
+            let generation = registry.ringing_group_generation(call_id, call_creator);
+            registry.take_ringing(call_id);
+            if let Some(generation) = generation {
+                registry.remove_if_current(call_id, generation);
+            }
+        }
         self.client.send_node(stanza).await?;
         Ok(())
     }
@@ -1347,6 +1359,45 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn rejecting_an_incoming_group_offer_removes_its_ringing_generation() {
+        let (client, _count) = make_client_with_count().await;
+        let creator = caller();
+        let call_id = "INCOMING-GROUP-CALL";
+        let mut session = CallSession::new_incoming(call_id, creator.clone(), creator.clone());
+        session.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        );
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing generation");
+
+        client
+            .voip()
+            .reject_call(call_id, &creator, &creator)
+            .await
+            .expect("reject");
+
+        assert_ne!(
+            client.call_registry().generation_of(call_id),
+            Some(generation),
+            "reject must reap the exact eagerly registered group offer"
+        );
+    }
+
     #[tokio::test]
     async fn terminate_sends_stanza() {
         let (client, count) = make_client_with_count().await;
@@ -2321,6 +2372,7 @@ mod tests {
         let stale = client
             .call_registry()
             .insert_ringing_group_if_inactive(ringing)
+            .expect("valid group snapshot")
             .expect("ringing invitation");
 
         let (started_tx, started_rx) = async_channel::bounded(1);

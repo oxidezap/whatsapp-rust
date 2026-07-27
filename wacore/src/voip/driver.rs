@@ -48,6 +48,21 @@ impl GroupControl {
             Self::Update(_) | Self::Reaction(_) => None,
         }
     }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        match self {
+            Self::Update(update) => size_of::<GroupCallUpdate>() + update.heap_bytes(),
+            Self::Transition { update, epoch } => {
+                size_of::<GroupCallUpdate>() + update.heap_bytes() + epoch.heap_bytes()
+            }
+            Self::RawEpoch(epoch) => epoch.heap_bytes(),
+            Self::Reaction(emoji) => emoji.capacity(),
+        }
+    }
 }
 
 /// One decrypted keygen-v2 epoch. Debug output is deliberately redacted and the bytes are erased
@@ -886,7 +901,8 @@ async fn run_call_with_clock_and_wallclock(
                                     &mut send_queue,
                                     &mut pending_video,
                                     &mut awaiting_video_keyframe,
-                                    eng.group_epoch_transaction() != previous_epoch,
+                                    update.rekey_requested
+                                        || eng.group_epoch_transaction() != previous_epoch,
                                     update.media == "audio",
                                 );
                                 if dropped.packets != 0 {

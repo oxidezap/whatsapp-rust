@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use async_lock::Mutex as AsyncMutex;
-use portable_atomic::{AtomicBool, AtomicU64};
+use portable_atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use crate::runtime::AbortHandle;
 use crate::types::call::VideoState;
@@ -114,6 +114,61 @@ impl Drop for EndedNotify {
     }
 }
 
+#[derive(Clone)]
+struct CallEventQueue {
+    tx: async_channel::Sender<CallEvent>,
+    max_payload_bytes: Arc<AtomicUsize>,
+}
+
+impl CallEventQueue {
+    fn new(tx: async_channel::Sender<CallEvent>) -> Self {
+        Self {
+            tx,
+            max_payload_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn force_send(&self, event: CallEvent) -> bool {
+        self.max_payload_bytes
+            .fetch_max(event.heap_bytes(), Ordering::Relaxed);
+        self.tx.force_send(event).is_ok()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.tx.len().saturating_mul(
+            size_of::<CallEvent>().saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct GroupControlQueue {
+    tx: async_channel::Sender<GroupControl>,
+    max_payload_bytes: Arc<AtomicUsize>,
+}
+
+impl GroupControlQueue {
+    fn new(tx: async_channel::Sender<GroupControl>) -> Self {
+        Self {
+            tx,
+            max_payload_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.tx.len().saturating_mul(
+            size_of::<GroupControl>()
+                .saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn try_send(&self, control: GroupControl) -> bool {
+        self.max_payload_bytes
+            .fetch_max(control.heap_bytes(), Ordering::Relaxed);
+        self.tx.try_send(control).is_ok()
+    }
+}
+
 struct CallEntry {
     session: CallSession,
     media_task: Option<AbortHandle>,
@@ -127,11 +182,11 @@ struct CallEntry {
     rekey_tx: Option<async_channel::Sender<String>>,
     /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
     /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
-    event_tx: Option<async_channel::Sender<CallEvent>>,
+    event_tx: Option<CallEventQueue>,
     /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
     video_ctl_tx: Option<VideoControlSender>,
     /// Lossless group roster/key transitions into the media driver.
-    group_ctl_tx: Option<async_channel::Sender<GroupControl>>,
+    group_ctl_tx: Option<GroupControlQueue>,
     /// An epoch may arrive after call-scoped accept but before relay media attaches. Replacing or
     /// dropping this command erases its key bytes through [`GroupRawEpoch`]'s `Drop`.
     pending_group_epoch: Option<GroupRawEpoch>,
@@ -147,6 +202,8 @@ struct CallEntry {
     /// Wakes a pending call-link media builder on admission, replacement, or terminal teardown.
     group_update_event: Arc<event_listener::Event>,
     video: VideoNegotiation,
+    /// Explicit group identity exists before the first authoritative roster arrives.
+    is_group_call: bool,
     group: Option<GroupCallState>,
     /// Active 1:1 devices retained so an established call can become an ad-hoc group call.
     group_invite_self_device: Option<GroupCallDevice>,
@@ -160,6 +217,7 @@ struct CallEntry {
 
 impl CallEntry {
     fn group_mut(&mut self) -> &mut GroupCallState {
+        self.is_group_call = true;
         let call_id = self.session.call_id.clone();
         let call_creator = self.session.call_creator.clone();
         self.group
@@ -176,7 +234,7 @@ impl CallEntry {
             .saturating_add(
                 self.event_tx
                     .as_ref()
-                    .map_or(0, |tx| tx.len().saturating_mul(size_of::<CallEvent>())),
+                    .map_or(0, CallEventQueue::retained_bytes),
             )
             .saturating_add(self.video_ctl_tx.as_ref().map_or(0, |tx| {
                 tx.retained_len().saturating_mul(size_of::<VideoControl>())
@@ -184,7 +242,7 @@ impl CallEntry {
             .saturating_add(
                 self.group_ctl_tx
                     .as_ref()
-                    .map_or(0, |tx| tx.len().saturating_mul(size_of::<GroupControl>())),
+                    .map_or(0, GroupControlQueue::retained_bytes),
             );
         self.session.heap_bytes()
             + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
@@ -208,7 +266,7 @@ impl CallEntry {
 
 /// Exclusive publication right for an actionable signaling event awaiting its typed ack.
 pub struct CallEventPermit {
-    tx: async_channel::Sender<CallEvent>,
+    tx: CallEventQueue,
     reserved: Arc<AtomicBool>,
     generation: u64,
 }
@@ -220,7 +278,7 @@ impl CallEventPermit {
 
     pub fn send(&self, event: CallEvent) -> bool {
         // The latest committed state must remain observable even when its consumer is behind.
-        self.tx.force_send(event).is_ok()
+        self.tx.force_send(event)
     }
 }
 
@@ -304,7 +362,7 @@ impl CallRegistry {
             .expect("registry lock poisoned")
             .get(call_id)
             .and_then(|entry| entry.event_tx.clone());
-        tx.is_some_and(|tx| tx.force_send(event).is_ok())
+        tx.is_some_and(|tx| tx.force_send(event))
     }
 
     /// Deliver an event only while `generation` still owns this call-id.
@@ -321,7 +379,7 @@ impl CallRegistry {
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.event_tx.clone());
-        tx.is_some_and(|tx| tx.force_send(event).is_ok())
+        tx.is_some_and(|tx| tx.force_send(event))
     }
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
@@ -505,7 +563,21 @@ impl CallRegistry {
             .lock()
             .expect("registry lock poisoned")
             .get(call_id)
-            .is_some_and(|entry| entry.group.is_some())
+            .is_some_and(|entry| entry.is_group_call)
+    }
+
+    /// The exact ringing group generation matching its signaling creator.
+    pub fn ringing_group_generation(&self, call_id: &str, call_creator: &Jid) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| {
+                entry.is_group_call
+                    && entry.session.phase() == CallPhase::Ringing
+                    && entry.session.call_creator == *call_creator
+            })
+            .map(|entry| entry.generation)
     }
 
     /// Read group state only when `generation` still owns this call-id.
@@ -607,7 +679,12 @@ impl CallRegistry {
     /// and [`remove_if_current`](Self::remove_if_current) so a finishing task only ever reaps its
     /// OWN entry, never a newer replacement.
     pub fn insert(&self, session: CallSession) -> u64 {
-        self.insert_inner(session, true)
+        self.insert_inner(session, true, false)
+    }
+
+    /// Register a group call before its first authoritative roster is available.
+    pub fn insert_group(&self, session: CallSession) -> u64 {
+        self.insert_inner(session, true, true)
     }
 
     /// Register an active-group invitation without marking it answered.
@@ -615,21 +692,36 @@ impl CallRegistry {
     /// Roster and epoch updates can land while the user decides, while the separate ringing set
     /// still classifies a remote timeout as a missed call.
     pub fn insert_ringing_group(&self, session: CallSession) -> u64 {
-        self.insert_inner(session, false)
+        self.insert_inner(session, false, true)
     }
 
     /// Register an incoming group offer unless this call id already belongs to an active call.
     ///
     /// The ringing marker and entry replacement are committed under the same lock pair so a
     /// redelivered offer cannot race an acceptance and supersede the accepted generation.
-    pub fn insert_ringing_group_if_inactive(&self, mut session: CallSession) -> Option<u64> {
+    pub fn insert_ringing_group_if_inactive(
+        &self,
+        mut session: CallSession,
+    ) -> Result<Option<u64>, GroupStateApply> {
+        let Some(initial_update) = session.group.as_ref() else {
+            return Err(GroupStateApply::InvalidSnapshot);
+        };
+        if super::engine::validate_group_relay_update(initial_update).is_err() {
+            return Err(GroupStateApply::InvalidSnapshot);
+        }
+        let mut initial_state =
+            GroupCallState::new(session.call_id.clone(), session.call_creator.clone());
+        let initial_apply = initial_state.apply_update(initial_update.clone());
+        if initial_apply != GroupStateApply::Applied {
+            return Err(initial_apply);
+        }
         let call_id = session.call_id.clone();
         let generation = {
             let mut ringing = self.ringing.lock().expect("registry lock poisoned");
             let mut map = self.inner.lock().expect("registry lock poisoned");
             if let Some(entry) = map.get_mut(&call_id) {
                 if entry.session.phase() != CallPhase::Ringing {
-                    return None;
+                    return Ok(None);
                 }
                 if let Some(update) = session.group.take() {
                     let _ = entry.group_mut().apply_update(update);
@@ -645,17 +737,17 @@ impl CallRegistry {
                 entry.generation
             } else {
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let entry = Self::new_entry(session, generation);
+                let entry = Self::new_entry(session, generation, true);
                 ringing.insert(call_id.clone());
                 map.insert(call_id, entry);
                 generation
             }
         };
         self.registration_event.notify(usize::MAX);
-        Some(generation)
+        Ok(Some(generation))
     }
 
-    fn insert_inner(&self, session: CallSession, consume_ringing: bool) -> u64 {
+    fn insert_inner(&self, session: CallSession, consume_ringing: bool, force_group: bool) -> u64 {
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
         // Registering a call as active answers (accept) or places (outgoing) it: it is no longer
         // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
@@ -667,7 +759,7 @@ impl CallRegistry {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             map.insert(
                 session.call_id.clone(),
-                Self::new_entry(session, generation),
+                Self::new_entry(session, generation, force_group),
             )
         };
         // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
@@ -695,8 +787,9 @@ impl CallRegistry {
         true
     }
 
-    fn new_entry(session: CallSession, generation: u64) -> CallEntry {
+    fn new_entry(session: CallSession, generation: u64, force_group: bool) -> CallEntry {
         let video = VideoNegotiation::new(session.is_video);
+        let is_group_call = force_group || session.group.is_some();
         let group = session.group.as_ref().map(|update| {
             let mut state =
                 GroupCallState::new(session.call_id.clone(), session.call_creator.clone());
@@ -719,6 +812,7 @@ impl CallRegistry {
             group_transition_lock: Arc::new(AsyncMutex::new(())),
             group_update_event: Arc::new(event_listener::Event::new()),
             video,
+            is_group_call,
             group,
             group_invite_self_device: None,
             group_invite_peer_device: None,
@@ -963,7 +1057,7 @@ impl CallRegistry {
             .get_mut(call_id)
             && entry.generation == generation
         {
-            entry.event_tx = Some(event_tx);
+            entry.event_tx = Some(CallEventQueue::new(event_tx));
             entry.video_ctl_tx = Some(video_ctl_tx);
             entry.video_teardown = Some(video_teardown);
         }
@@ -985,6 +1079,7 @@ impl CallRegistry {
         else {
             return;
         };
+        let tx = GroupControlQueue::new(tx);
         entry.group_ctl_tx = Some(tx.clone());
         let update = entry
             .group
@@ -1083,15 +1178,14 @@ impl CallRegistry {
     /// Keep the newest epoch resident when a bounded group-control mailbox sheds older commands.
     /// Roster updates may be coalesced under backpressure; losing the only pending epoch would leave
     /// the media engine permanently unable to decrypt the latest generation.
-    fn force_send_preserving_epoch(
-        tx: &async_channel::Sender<GroupControl>,
-        mut command: GroupControl,
-    ) -> bool {
+    fn force_send_preserving_epoch(tx: &GroupControlQueue, mut command: GroupControl) -> bool {
         loop {
             let queued_epoch = command.epoch_transaction_id();
+            tx.max_payload_bytes
+                .fetch_max(command.heap_bytes(), Ordering::Relaxed);
             // Each retry keeps the newer of the queued and evicted epochs. Because the mailbox is
             // bounded, it eventually evicts a non-epoch or an older epoch and returns.
-            match tx.force_send(command) {
+            match tx.tx.force_send(command) {
                 Ok(Some(evicted))
                     if evicted
                         .epoch_transaction_id()
@@ -1110,11 +1204,7 @@ impl CallRegistry {
     fn retain_or_route_group_epoch(
         entry: &mut CallEntry,
         epoch: GroupRawEpoch,
-    ) -> Option<(
-        async_channel::Sender<GroupControl>,
-        Option<GroupCallUpdate>,
-        GroupRawEpoch,
-    )> {
+    ) -> Option<(GroupControlQueue, Option<GroupCallUpdate>, GroupRawEpoch)> {
         if let Some(tx) = entry.group_ctl_tx.clone() {
             let update = entry
                 .group
@@ -1145,7 +1235,7 @@ impl CallRegistry {
             .get(call_id)
             .filter(|entry| entry.group.is_some())
             .and_then(|entry| entry.group_ctl_tx.clone());
-        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)).is_ok())
+        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)))
     }
 
     /// Queue one validated reaction only while `generation` owns an active group call.
@@ -1165,7 +1255,7 @@ impl CallRegistry {
             .get(call_id)
             .filter(|entry| entry.generation == generation && entry.group.is_some())
             .and_then(|entry| entry.group_ctl_tx.clone());
-        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)).is_ok())
+        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)))
     }
 
     /// Replace the one-shot endpoint teardown for the current call generation.
@@ -1215,7 +1305,7 @@ impl CallRegistry {
                 entry.generation,
             )
         };
-        if tx.is_closed()
+        if tx.tx.is_closed()
             || reserved
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
@@ -1822,16 +1912,47 @@ mod tests {
         };
         let generation = reg
             .insert_ringing_group_if_inactive(incoming())
+            .expect("valid group snapshot")
             .expect("first offer registers");
         assert!(reg.transition("GROUP-CALL", CallPhase::Connecting));
         assert!(reg.take_ringing("GROUP-CALL"));
 
-        assert_eq!(reg.insert_ringing_group_if_inactive(incoming()), None);
+        assert_eq!(reg.insert_ringing_group_if_inactive(incoming()), Ok(None));
         assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
         assert!(
             !reg.take_ringing("GROUP-CALL"),
             "the duplicate must not mark an active call as ringing"
         );
+    }
+
+    #[test]
+    fn outgoing_group_identity_exists_before_the_first_roster() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert_group(session("GROUP-CALL"));
+
+        assert!(reg.is_group_call("GROUP-CALL"));
+        assert!(reg.group_state("GROUP-CALL").is_none());
+        assert!(reg.remove_if_current("GROUP-CALL", generation));
+    }
+
+    #[test]
+    fn invalid_initial_group_snapshot_is_not_registered() {
+        let reg = CallRegistry::new();
+        let mut incoming = CallSession::new_incoming(
+            "GROUP-CALL",
+            Jid::new("111111111111111", Server::Lid),
+            Jid::new("111111111111111", Server::Lid),
+        );
+        let mut invalid = group_update(1);
+        invalid.connected_limit = 0;
+        incoming.group = Some(invalid);
+
+        assert_eq!(
+            reg.insert_ringing_group_if_inactive(incoming),
+            Err(GroupStateApply::InvalidSnapshot)
+        );
+        assert_eq!(reg.active_count(), 0);
+        assert!(!reg.take_ringing("GROUP-CALL"));
     }
 
     #[test]
@@ -1848,6 +1969,7 @@ mod tests {
         };
         let generation = reg
             .insert_ringing_group_if_inactive(incoming(1))
+            .expect("valid group snapshot")
             .expect("first offer registers");
         assert_eq!(
             reg.apply_group_update(group_update(2)),
@@ -1857,7 +1979,7 @@ mod tests {
 
         assert_eq!(
             reg.insert_ringing_group_if_inactive(incoming(1)),
-            Some(generation),
+            Ok(Some(generation)),
             "redelivery refreshes the ringing entry instead of replacing it"
         );
         assert_eq!(
@@ -2028,6 +2150,43 @@ mod tests {
     }
 
     #[test]
+    fn memory_stats_include_queued_group_payload_allocations() {
+        use crate::stats::HeapSize;
+
+        let reg = CallRegistry::new();
+        let mut active = session("GROUP-CALL");
+        active.group = Some(group_update(1));
+        let generation = reg.insert(active);
+        let (event_tx, _event_rx) = async_channel::bounded(2);
+        let (video_tx, _video_rx) = video_control_channel();
+        reg.set_video_channels(
+            "GROUP-CALL",
+            generation,
+            event_tx,
+            video_tx,
+            Box::new(|| {}),
+        );
+        let (group_tx, group_rx) = async_channel::bounded(2);
+        reg.set_group_control_sender("GROUP-CALL", generation, group_tx);
+        group_rx.try_recv().expect("initial roster");
+
+        let baseline = reg.memory_stats().bytes;
+        let update = group_update(2);
+        let payload_bytes = update.heap_bytes() as u64;
+        assert!(reg.send_group_update_if_current("GROUP-CALL", generation, update.clone()));
+        assert!(reg.send_call_event_if_current(
+            "GROUP-CALL",
+            generation,
+            CallEvent::GroupUpdated(Box::new(update))
+        ));
+
+        assert!(
+            reg.memory_stats().bytes >= baseline + payload_bytes.saturating_mul(2),
+            "both queued boxes must include their retained roster allocations"
+        );
+    }
+
+    #[test]
     fn registration_listener_closes_offer_control_race() {
         let reg = CallRegistry::new();
         let listener = reg.listen_registration();
@@ -2047,7 +2206,8 @@ mod tests {
 
     #[test]
     fn bounded_group_mailbox_preserves_epoch_across_roster_bursts() {
-        let (tx, rx) = async_channel::bounded(2);
+        let (raw_tx, rx) = async_channel::bounded(2);
+        let tx = GroupControlQueue::new(raw_tx);
         assert!(CallRegistry::force_send_preserving_epoch(
             &tx,
             GroupControl::Update(Box::new(group_update(7))),

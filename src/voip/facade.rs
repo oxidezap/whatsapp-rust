@@ -127,6 +127,26 @@ pub struct AcceptCall<'a> {
     video: Option<VideoEndpoints>,
 }
 
+async fn wait_for_group_relay(
+    registry: &wacore::voip::CallRegistry,
+    call_id: &str,
+    generation: u64,
+) -> Result<GroupCallUpdate, CallError> {
+    loop {
+        let listener = registry
+            .listen_group_update(call_id, generation)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        if let Some(update) = registry
+            .group_state_if_current(call_id, generation)
+            .and_then(|state| state.snapshot().cloned())
+            && update.relay.is_some()
+        {
+            return Ok(update);
+        }
+        listener.await;
+    }
+}
+
 impl<'a> AcceptCall<'a> {
     pub(crate) fn new(client: &'a Client, incoming: &'a IncomingCall) -> Self {
         Self {
@@ -197,12 +217,32 @@ impl<'a> AcceptCall<'a> {
         if video.is_some() && !offered_video {
             return Err(CallError::VideoNotOffered);
         }
-        let group = self
-            .client
-            .call_registry()
+        let registry = self.client.call_registry();
+        let mut group = registry
             .group_state(call_id)
             .and_then(|state| state.snapshot().cloned())
             .or_else(|| self.incoming.group.as_deref().cloned());
+        if self.incoming.group.is_some()
+            && self.incoming.media.is_none()
+            && group
+                .as_ref()
+                .and_then(|update| update.relay.as_ref())
+                .is_none()
+            && let Some(generation) = registry.generation_of(call_id)
+        {
+            group = Some(
+                match wacore::runtime::timeout(
+                    &*self.client.runtime,
+                    OFFER_ACK_RELAY_TIMEOUT,
+                    wait_for_group_relay(&registry, call_id, generation),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => return Err(CallError::ResponseTimeout),
+                },
+            );
+        }
         if group
             .as_ref()
             .is_some_and(|group| (group.media == "video") != *offered_video)
@@ -736,7 +776,7 @@ impl<'a> OutgoingGroupCall<'a> {
         // Register before the offer reaches the wire. A creator-authenticated group update can
         // overtake the ACK on the independent call-stanza path, and must have a generation where
         // its roster and first epoch can be retained.
-        let mut registration = RegisteredCall::new(self.client, session).await;
+        let mut registration = RegisteredCall::new_group(self.client, session).await;
         // Sending is delivery-ambiguous: cancellation can drop this future after the server has
         // accepted the bytes but before send_node returns. Arm cleanup before crossing that await.
         let mut teardown = GroupOfferTeardown::new(self.client, &mut registration);
@@ -1320,7 +1360,7 @@ async fn fanout_group_epoch_for_generation(
     // The authoritative roster transaction is already committed before this fan-out starts. Any
     // preparation failure would make an identical redelivery stale, so own teardown from the first
     // fallible step instead of leaving the generation alive without its requested epoch.
-    let teardown = GroupRekeyTeardown::new(client, update, generation, true).await;
+    let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let self_id = own_lid.to_string();
     let mut seen = std::collections::HashSet::new();
@@ -1993,6 +2033,18 @@ struct RegisteredCall {
 
 impl RegisteredCall {
     async fn new(client: &Client, session: wacore::voip::CallSession) -> Self {
+        Self::new_inner(client, session, false).await
+    }
+
+    async fn new_group(client: &Client, session: wacore::voip::CallSession) -> Self {
+        Self::new_inner(client, session, true).await
+    }
+
+    async fn new_inner(
+        client: &Client,
+        session: wacore::voip::CallSession,
+        force_group: bool,
+    ) -> Self {
         let registry = client.call_registry();
         let call_id = session.call_id.clone();
         let peer_jid = session.peer_jid.clone();
@@ -2004,7 +2056,9 @@ impl RegisteredCall {
         let generation = if session.group.is_some() {
             registry
                 .promote_ringing_group(session.clone())
-                .unwrap_or_else(|| registry.insert(session))
+                .unwrap_or_else(|| registry.insert_group(session))
+        } else if force_group {
+            registry.insert_group(session)
         } else {
             registry.insert(session)
         };
@@ -2099,11 +2153,10 @@ struct GroupRekeyTeardown {
     call_creator: Jid,
     generation: Option<u64>,
     armed: bool,
-    transition: Option<async_lock::MutexGuardArc<()>>,
 }
 
 impl GroupRekeyTeardown {
-    async fn new(
+    fn new(
         client: &Client,
         update: &GroupCallUpdate,
         generation: Option<u64>,
@@ -2115,14 +2168,25 @@ impl GroupRekeyTeardown {
             call_creator: update.call_creator.clone(),
             generation,
             armed,
-            transition: Some(client.lock_answer_transition(&update.call_id).await),
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
-        self.transition = None;
     }
+}
+
+fn claim_group_rekey_generation(client: &Client, call_id: &str, generation: Option<u64>) -> bool {
+    generation.is_none_or(|generation| {
+        let pending = take_pending_if_current(&client.pending_outgoing_calls, call_id, generation);
+        let removed = client
+            .call_registry()
+            .remove_if_current(call_id, generation);
+        if let Some(pending) = pending {
+            pending.ended.notify();
+        }
+        removed
+    })
 }
 
 impl Drop for GroupRekeyTeardown {
@@ -2136,25 +2200,27 @@ impl Drop for GroupRekeyTeardown {
         let call_id = self.call_id.clone();
         let call_creator = self.call_creator.clone();
         let generation = self.generation;
-        let transition = self.transition.take();
-        let claimed = generation.is_none_or(|generation| {
-            let pending =
-                take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
-            let removed = client
-                .call_registry()
-                .remove_if_current(&call_id, generation);
-            if let Some(pending) = pending {
-                pending.ended.notify();
+        let transition = client.answer_transition_lock(&call_id);
+        let runtime = client.runtime.clone();
+        if let Some(transition) = transition.try_lock_arc() {
+            if !claim_group_rekey_generation(&client, &call_id, generation) {
+                return;
             }
-            removed
-        });
-        if !claimed {
+            runtime
+                .spawn(Box::pin(async move {
+                    let _transition = transition;
+                    let target = Jid::new(&call_id, Server::Call);
+                    send_answer_terminate(&client, &call_id, &target, &call_creator).await;
+                }))
+                .detach();
             return;
         }
-        let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
-                let _transition = transition;
+                let _transition = transition.lock_arc().await;
+                if !claim_group_rekey_generation(&client, &call_id, generation) {
+                    return;
+                }
                 let target = Jid::new(&call_id, Server::Call);
                 send_answer_terminate(&client, &call_id, &target, &call_creator).await;
             }))
@@ -3581,6 +3647,32 @@ mod tests {
         }
     }
 
+    fn sample_group_relay(transaction_id: u32) -> wacore::types::group_call::GroupCallRelay {
+        use wacore::types::group_call::{GroupCallRelay, GroupCallRelayEndpoint};
+
+        GroupCallRelay::builder()
+            .transaction_id(transaction_id)
+            .self_pid(1)
+            .uuid("TEST-RELAY".to_string())
+            .participant_uuid("TEST-PARTICIPANT".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(vec![7; 32])
+            .tokens(vec![vec![9; 16]])
+            .endpoints(vec![
+                GroupCallRelayEndpoint::builder()
+                    .relay_id(1)
+                    .token_id(0)
+                    .auth_token_id(0)
+                    .relay_name("test-relay".to_string())
+                    .is_fna(false)
+                    .ipv4("203.0.113.7".to_string())
+                    .port(3478)
+                    .build(),
+            ])
+            .build()
+    }
+
     fn mk_session() -> wacore::voip::CallSession {
         wacore::voip::CallSession::new_incoming("CID-FACADE", caller(), caller())
     }
@@ -4025,6 +4117,50 @@ mod tests {
             client.call_registry().active_count(),
             0,
             "conflicting group media must fail before registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_group_invite_waits_for_its_usable_relay_snapshot() {
+        let registry = wacore::voip::CallRegistry::new();
+        let call_id = "ACTIVE-GROUP-INVITE";
+        let creator = caller();
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        let mut session =
+            wacore::voip::CallSession::new_incoming(call_id, creator.clone(), creator);
+        session.group = Some(update.clone());
+        let generation = registry
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing generation");
+        let mut wait = Box::pin(wait_for_group_relay(&registry, call_id, generation));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), wait.as_mut())
+                .await
+                .is_err(),
+            "media attachment must not reject while the invitation relay is still racing in"
+        );
+        let mut admitted = update;
+        admitted.transaction_id = 2;
+        admitted.relay = Some(sample_group_relay(2));
+        assert_eq!(
+            registry.apply_group_update_if_current(admitted, generation),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(
+            wait.await.expect("relay update").relay.is_some(),
+            "the waiter must return the newly committed usable relay"
         );
     }
 
@@ -5228,13 +5364,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_rekey_teardown_does_not_hold_the_answer_lane_during_fanout() {
+        let (client, _) = make_sending_client().await;
+        let update = rekey_update(&client, &[]);
+        let generation = register_group_update(&client, &update);
+        let mut teardown = GroupRekeyTeardown::new(&client, &update, Some(generation), true);
+
+        let transition = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.lock_answer_transition(&update.call_id),
+        )
+        .await
+        .expect("fanout preparation must leave the answer lane available");
+        drop(transition);
+        teardown.disarm();
+        assert!(
+            client
+                .call_registry()
+                .remove_if_current(&update.call_id, generation)
+        );
+    }
+
+    #[tokio::test]
     async fn group_rekey_teardown_serializes_replacement_until_terminate_is_sent() {
         let (client, _) = make_sending_client().await;
         let (transport, entered, release) = gated_send_transport(0, false);
         install_noise_transport(&client, transport).await;
         let update = rekey_update(&client, &[]);
         let stale_generation = register_group_update(&client, &update);
-        drop(GroupRekeyTeardown::new(&client, &update, Some(stale_generation), true).await);
+        drop(GroupRekeyTeardown::new(
+            &client,
+            &update,
+            Some(stale_generation),
+            true,
+        ));
 
         tokio::time::timeout(Duration::from_secs(2), entered.recv())
             .await
@@ -6401,6 +6564,10 @@ mod tests {
             .call_registry()
             .generation_of(&call_id)
             .expect("group call must be registered before awaiting its ACK");
+        assert!(
+            client.call_registry().is_group_call(&call_id),
+            "the pre-ACK generation must already reject direct-call teardown semantics"
+        );
         let overtaking = GroupCallUpdate::builder()
             .call_id(call_id.clone())
             .call_creator(own_lid)

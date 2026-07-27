@@ -94,12 +94,16 @@ fn public_group_call_payloads_are_constructible_with_builders() {
         .call_id("GROUP-CALL".to_string())
         .call_creator(Jid::new("111111111111111", Server::Lid))
         .transaction_id(2)
-        .key_generation(2)
+        .key_generation(3)
         .encryption_type("msg".to_string())
-        .encryption_version(2)
+        .encryption_version(4)
         .ciphertext(vec![1, 2, 3])
         .build();
     assert_eq!(rekey.transaction_id, 2);
+    assert_eq!(rekey.key_generation, 3);
+    assert_eq!(rekey.encryption_type, "msg");
+    assert_eq!(rekey.encryption_version, 4);
+    assert_eq!(rekey.ciphertext, [1, 2, 3]);
 
     let share = ScreenShare::builder()
         .state(ScreenShareState::Started)

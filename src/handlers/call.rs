@@ -199,10 +199,20 @@ impl StanzaHandler for CallHandler {
                             session.is_video =
                                 matches!(&call.action, CallAction::Offer { is_video: true, .. });
                             session.group = Some(group.clone());
-                            duplicate_active_group_offer = client
+                            duplicate_active_group_offer = match client
                                 .call_registry()
                                 .insert_ringing_group_if_inactive(session)
-                                .is_none();
+                            {
+                                Ok(Some(_)) => false,
+                                Ok(None) => true,
+                                Err(reason) => {
+                                    warn!(
+                                        "call: rejected invalid initial group snapshot for {}: {reason:?}",
+                                        call.action.call_id()
+                                    );
+                                    true
+                                }
+                            };
                         } else {
                             client
                                 .call_registry()
@@ -1503,6 +1513,10 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     fn active_group_offer_stanza() -> wacore_binary::Node {
+        active_group_offer_stanza_with_limit("32")
+    }
+
+    fn active_group_offer_stanza_with_limit(connected_limit: &str) -> wacore_binary::Node {
         let caller = fake_caller_lid();
         NodeBuilder::new("call")
             .attr("from", &caller)
@@ -1520,7 +1534,7 @@ mod tests {
                     NodeBuilder::new("net").attr("medium", "2").build(),
                     NodeBuilder::new("group_info")
                         .attr("transaction-id", "7")
-                        .attr("connected-limit", "32")
+                        .attr("connected-limit", connected_limit)
                         .attr("media", "audio")
                         .attr("joinable", "1")
                         .attr("rekey", "0")
@@ -2501,6 +2515,35 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn invalid_initial_group_offer_is_not_registered_or_dispatched() {
+        let client = make_sending_client().await;
+        let (event_handler, event_rx) = ChannelEventHandler::new();
+        client.subscribe_handler(event_handler).detach();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&active_group_offer_stanza_with_limit("0")),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert!(
+            client.call_registry().generation_of("GROUP-CALL").is_none(),
+            "an invalid initial roster must not create a generation"
+        );
+        assert!(
+            !std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(&*event, Event::IncomingCall(_))),
+            "an invalid initial roster must not reach application fallback"
+        );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn duplicate_group_offer_preserves_an_active_generation() {
         use wacore::voip::CallPhase;
 
@@ -2855,6 +2898,45 @@ mod tests {
             client.call_registry().generation_of(call_id),
             Some(generation),
             "one participant declining an invite must not terminate group media"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn participant_reject_keeps_a_pre_ack_outgoing_group_call() {
+        let client = make_client().await;
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let participant = Jid::new("222222222222222", Server::Lid);
+        let call_id = "PRE-ACK-GROUP-CALL";
+        let session = wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        );
+        let generation = client.call_registry().insert_group(session);
+        let reject = NodeBuilder::new("call")
+            .attr("from", participant)
+            .attr("id", "STANZA-PRE-ACK-GROUP-DECLINE")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", creator)
+                .attr("call-id", call_id)
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&reject), &mut cancelled)
+                .await
+        );
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            Some(generation),
+            "the explicit group marker must protect the pre-ACK generation"
         );
         client
             .call_registry()

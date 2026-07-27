@@ -527,6 +527,69 @@ pub enum CallEvent {
     },
 }
 
+impl CallEvent {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        match self {
+            Self::ForeignAudio(data) => data.len(),
+            Self::ForeignGroupAudio(frame) => {
+                frame.data.len()
+                    + frame.sender.as_ref().map_or(0, HeapSize::heap_bytes)
+                    + frame.device.as_ref().map_or(0, HeapSize::heap_bytes)
+            }
+            Self::AudioFormatMismatch { received_rates, .. } => {
+                received_rates.capacity() * size_of::<u32>()
+            }
+            Self::GroupUpdated(update) => size_of::<GroupCallUpdate>() + update.heap_bytes(),
+            Self::WaitingRoomUpdated(room) => size_of::<WaitingRoom>() + room.heap_bytes(),
+            Self::HandRaised { participant, .. } | Self::ScreenShareChanged { participant, .. } => {
+                participant.heap_bytes()
+            }
+            Self::Reaction {
+                participant,
+                device,
+                emoji,
+                ..
+            } => {
+                participant.heap_bytes()
+                    + device.heap_bytes()
+                    + emoji.as_ref().map_or(0, String::capacity)
+            }
+            Self::RtcpReceived {
+                packet_types,
+                referenced_ssrcs,
+                report_blocks,
+                feedback,
+                ..
+            } => {
+                packet_types.capacity()
+                    + referenced_ssrcs.capacity() * size_of::<u32>()
+                    + report_blocks.capacity() * size_of::<RtcpReportBlock>()
+                    + report_blocks
+                        .iter()
+                        .map(|report| report.profile_extension.capacity())
+                        .sum::<usize>()
+                    + feedback.capacity() * size_of::<RtcpFeedback>()
+                    + feedback
+                        .iter()
+                        .map(|item| item.fci.capacity())
+                        .sum::<usize>()
+            }
+            Self::RelayAllocated
+            | Self::RelayAllocateFailed(_)
+            | Self::RelayAllocateTimedOut
+            | Self::VideoStateChanged { .. }
+            | Self::WaitingRoomHeartbeatFailed
+            | Self::GroupControlRejected { .. }
+            | Self::GroupRekeyFailed
+            | Self::OutboundMediaDropped { .. } => 0,
+        }
+    }
+}
+
 /// The optional media plane: the SRTP pipeline, selected audio mode, an optional SFrame session,
 /// and the PCM playout jitter buffer. One `MediaPipeline` serves both directions: protect uses its send
 /// keys/ROC/RTP state, unprotect its recv keys/ROC, and those fields are disjoint.
@@ -652,6 +715,7 @@ fn make_video_plane(
 struct GroupEngineState {
     registry: GroupMediaRegistry,
     local_epoch_transaction: Option<u32>,
+    required_epoch_transaction: Option<u32>,
     direct_fallback_active: bool,
     stream_ssrcs: [u32; 9],
     app_data_ssrc: u32,
@@ -949,6 +1013,10 @@ impl CallEngine {
         let mut group = GroupEngineState {
             registry,
             local_epoch_transaction: None,
+            required_epoch_transaction: config
+                .initial_update
+                .rekey_requested
+                .then_some(config.initial_update.transaction_id),
             direct_fallback_active,
             stream_ssrcs,
             app_data_ssrc,
@@ -1015,6 +1083,15 @@ impl CallEngine {
             .apply_group_update(update)?;
         if result == GroupRosterApply::Applied {
             let group = self.group.as_mut().ok_or(GroupMediaError::Pipeline)?;
+            if update.rekey_requested {
+                group.required_epoch_transaction = Some(
+                    group
+                        .required_epoch_transaction
+                        .map_or(update.transaction_id, |current| {
+                            current.max(update.transaction_id)
+                        }),
+                );
+            }
             let active = group.registry.active_participant_ids();
             group.mixer.retain(active.iter().cloned());
             group
@@ -1224,9 +1301,14 @@ impl CallEngine {
     }
 
     fn group_epoch_ready(&self) -> bool {
-        self.group.as_ref().is_none_or(|group| {
-            group.local_epoch_transaction.is_some() || group.direct_fallback_active
-        })
+        self.group
+            .as_ref()
+            .is_none_or(|group| match group.required_epoch_transaction {
+                Some(required) => group
+                    .local_epoch_transaction
+                    .is_some_and(|installed| installed >= required),
+                None => group.local_epoch_transaction.is_some() || group.direct_fallback_active,
+            })
     }
 
     /// Whether the relay has acknowledged our allocate.
@@ -2719,6 +2801,53 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Transmit(_))),
             "media should resume once an authenticated epoch is installed"
+        );
+    }
+
+    #[test]
+    fn requested_group_rekey_gates_media_until_the_matching_epoch_installs() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        engine.handle_input(1, Input::EncodedAudio(&[0x11; 20]));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Transmit(_))),
+            "the installed epoch must initially admit media"
+        );
+
+        let mut rekey = group_update();
+        rekey.transaction_id = 8;
+        rekey.rekey_requested = true;
+        assert_eq!(
+            engine.apply_group_update(2, &rekey).unwrap(),
+            GroupRosterApply::Applied
+        );
+        let _ = drain(&mut engine);
+        engine.handle_input(3, Input::EncodedAudio(&[0x22; 20]));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Transmit(_))),
+            "media protected by the old key must stop once a newer epoch is requested"
+        );
+
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &[0x48; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.handle_input(4, Input::EncodedAudio(&[0x33; 20]));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Transmit(_))),
+            "media must resume only after the requested epoch is installed"
         );
     }
 
