@@ -14,5 +14,16 @@
 -- directly (index keys carry the rowid as their trailing column), so the new
 -- sort streams from the index with no temp B-tree — the DESC form could not,
 -- because a forward scan of it gives `rowid ASC` within a tie.
+--
+-- That holds for a single chat key. A 1:1 thread addressed by both of a peer's
+-- identities queries `chat_jid IN (pn, lid)`, which SQLite runs as two index
+-- ranges and merge-sorts, so an aliased chat still pays a temp B-tree until
+-- the pair is reconciled onto one key.
+--
+-- On VACUUM: it may renumber rowids, but it rewrites the table in rowid order,
+-- so the RELATIVE order this sort depends on survives. What does not is a
+-- `MessageCursor` held across one — cursors are meant for a live paging
+-- session, not for persisting. (The FTS index maps by rowid too and carries
+-- the same caveat; see `fts.rs`.)
 DROP INDEX IF EXISTS idx_messages_chat_time;
 CREATE INDEX idx_messages_chat_time ON messages (device_id, chat_jid, timestamp_ms);

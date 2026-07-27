@@ -89,25 +89,28 @@ pub struct ChatStore {
     device_id: i32,
     tx: mpsc::UnboundedSender<WriterMsg>,
     changes: broadcast::Sender<StoreChange>,
+    skip_hook_committed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ChatStoreHandler {
     tx: mpsc::UnboundedSender<WriterMsg>,
+    skip_hook_committed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EventHandler for ChatStoreHandler {
     fn handle_event(&self, event: Arc<Event>) {
-        // A batch the host's durability hook already committed is on disk
-        // before this event is dispatched, and re-applying it is not a cheap
-        // no-op: the inbound path overwrites, so the conflicting insert falls
-        // through to a full UPDATE of the proto blob, fires the FTS
-        // delete+insert trigger, re-bumps the chat, and emits a second
-        // Chats + Messages invalidation that makes every subscriber re-query
-        // every surface twice per message. Drop it here rather than in the
-        // writer so it never takes a batch slot either.
-        if event
-            .as_messages()
-            .is_some_and(|batch| batch.hook_committed)
+        // `hook_committed` says a durability hook committed the batch — NOT
+        // that it committed it *here*. A hook that persists somewhere else
+        // entirely is just as common, and for that host this store is the only
+        // materializer; skipping would silently lose acknowledged messages.
+        // Only the host knows which it runs, so the skip is opt-in and this
+        // load is the answer it gave (see `skip_hook_committed_batches`).
+        if self
+            .skip_hook_committed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && event
+                .as_messages()
+                .is_some_and(|batch| batch.hook_committed)
         {
             return;
         }
@@ -161,9 +164,33 @@ impl ChatStore {
             device_id,
             tx,
             changes: changes.clone(),
+            skip_hook_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         tokio::spawn(writer_loop(db, device_id, rx, changes));
         Ok(this)
+    }
+
+    /// Declare that this client's inbound durability hook already materializes
+    /// into THIS store, so batches it committed can be skipped here.
+    ///
+    /// Off by default, and deliberately not inferred: a batch's
+    /// `hook_committed` marker says a hook committed it, not that the hook
+    /// wrote it *here*. A host whose hook persists elsewhere — its own
+    /// database, a queue, an audit log — still needs this store to materialize
+    /// every batch, and skipping on the marker alone would silently drop
+    /// acknowledged messages out of its history, previews and subscriptions.
+    /// Only the host knows which arrangement it runs.
+    ///
+    /// Turn it on when the hook feeds this store and you would otherwise pay
+    /// for every message twice: the inbound path overwrites, so the second
+    /// pass is a full UPDATE of the proto blob plus an FTS delete+insert plus
+    /// another chat bump, and it doubles the `StoreChange` fan-out, so every
+    /// subscriber re-queries every surface twice per message.
+    ///
+    /// Takes effect on the next event; handlers already handed out observe it.
+    pub fn skip_hook_committed_batches(&self, skip: bool) {
+        self.skip_hook_committed
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Event handler to register on the client. The store keeps working if the
@@ -171,6 +198,7 @@ impl ChatStore {
     pub fn handler(&self) -> Arc<dyn EventHandler> {
         Arc::new(ChatStoreHandler {
             tx: self.tx.clone(),
+            skip_hook_committed: Arc::clone(&self.skip_hook_committed),
         })
     }
 
@@ -575,6 +603,14 @@ async fn writer_loop(
             let carried = std::mem::take(&mut deferred_acks);
             let result = db
                 .run(move |conn| {
+                    // The queue is in-memory, so it does not roll back with the
+                    // transaction that mutated it. An ack consumed by an insert
+                    // that then rolled back was never applied to anything, and
+                    // keeping it consumed would leave the re-recorded row
+                    // pending forever — the exact loss this queue exists to
+                    // prevent. Snapshot and restore instead. Deferred acks are
+                    // rare, so the common snapshot is of an empty queue.
+                    let snapshot = carried.clone();
                     let mut deferred = carried;
                     let outcome = conn
                         .transaction(|conn| {
@@ -585,6 +621,9 @@ async fn writer_loop(
                             Ok(cs)
                         })
                         .map_err(db_err);
+                    if outcome.is_err() {
+                        deferred = snapshot;
+                    }
                     Ok((outcome, deferred))
                 })
                 .await;
@@ -696,10 +735,18 @@ fn apply_writer_msg(
                 // The row this send's ack was waiting for now exists. Applying
                 // it here also corrects the optimistic timestamp we just wrote
                 // to the server's, before anything renders the row.
-                if let Some(ack) =
-                    deferred.take_matching(msg_id, wacore::time::now_utc().timestamp_millis())
+                if let Some(ack) = deferred.take_matching(
+                    msg_id,
+                    &chat_str,
+                    wacore::time::now_utc().timestamp_millis(),
+                ) && let AckApplied::Deferrable(_) = apply_server_ack(conn, device_id, &ack, cs)?
                 {
-                    apply_server_ack(conn, device_id, &ack, cs)?;
+                    // The row exists, so this should not happen; say so rather
+                    // than let the ack vanish the way it used to.
+                    warn!(
+                        target: "ChatStore/Ack",
+                        "Held ack for {msg_id} matched no row even after its insert"
+                    );
                 }
             }
             cs.message_chats.insert(chat_str);
@@ -880,8 +927,8 @@ fn apply_event(
         }
         Event::Receipt(receipt) => apply_receipt(conn, device_id, receipt, cs),
         Event::ServerAck(ack) => {
-            if !apply_server_ack(conn, device_id, ack, cs)? {
-                deferred.defer(ack, wacore::time::now_utc().timestamp_millis());
+            if let AckApplied::Deferrable(chat) = apply_server_ack(conn, device_id, ack, cs)? {
+                deferred.defer(ack, chat, wacore::time::now_utc().timestamp_millis());
             }
             Ok(())
         }
@@ -1774,13 +1821,34 @@ fn apply_receipt(
     Ok(())
 }
 
+/// Which outgoing row a server ack belongs to, if one can be named.
+///
+/// [`NotYet`](Self::NotYet) and [`Ambiguous`](Self::Ambiguous) are both "no row
+/// applied", but they must not be treated alike: only the first is answerable
+/// by waiting. Deferring an ambiguous ack would hand it to whichever row next
+/// claims that id — turning a deliberate refusal into a delayed mis-apply.
+enum AckTarget {
+    Resolved {
+        chat: String,
+        timestamp_ms: i64,
+    },
+    /// No outgoing row with this id yet. Carries the storage key the ack named,
+    /// when it named one, so a deferral can be held against that chat instead
+    /// of against the id alone.
+    NotYet {
+        chat: Option<String>,
+    },
+    Ambiguous,
+}
+
 fn resolve_server_ack_message(
     conn: &mut SqliteConnection,
     device_id: i32,
     ack: &wacore::types::events::ServerAck,
     cs: &mut ChangeSet,
-) -> QueryResult<Option<(String, i64)>> {
+) -> QueryResult<AckTarget> {
     use schema::messages::dsl;
+    let mut named_chat = None;
     if let Some(from) = &ack.from {
         let chat = crate::lid::route_chat_key(conn, device_id, &from.to_string(), cs)?;
         let timestamp_ms: Option<i64> = message_row(device_id, &chat, &ack.id)
@@ -1789,13 +1857,14 @@ fn resolve_server_ack_message(
             .first(conn)
             .optional()?;
         if let Some(timestamp_ms) = timestamp_ms {
-            return Ok(Some((chat, timestamp_ms)));
+            return Ok(AckTarget::Resolved { chat, timestamp_ms });
         }
+        named_chat = Some(chat);
     }
 
     // Some server acks omit the chat identity. The id remains safe only when
     // it identifies exactly one outgoing row for this device.
-    let mut matches: Vec<(String, i64)> = dsl::messages
+    let matches: Vec<(String, i64)> = dsl::messages
         .filter(
             dsl::device_id
                 .eq(device_id)
@@ -1805,17 +1874,18 @@ fn resolve_server_ack_message(
         .select((dsl::chat_jid, dsl::timestamp_ms))
         .limit(2)
         .load(conn)?;
-    if matches.len() == 1 {
-        return Ok(matches.pop());
+    match <[(String, i64); 1]>::try_from(matches) {
+        Ok([(chat, timestamp_ms)]) => Ok(AckTarget::Resolved { chat, timestamp_ms }),
+        Err(matches) if matches.is_empty() => Ok(AckTarget::NotYet { chat: named_chat }),
+        Err(_) => {
+            warn!(
+                target: "ChatStore/Ack",
+                "Ignoring ambiguous message ack for reused id {}",
+                ack.id
+            );
+            Ok(AckTarget::Ambiguous)
+        }
     }
-    if matches.len() > 1 {
-        warn!(
-            target: "ChatStore/Ack",
-            "Ignoring ambiguous message ack for reused id {}",
-            ack.id
-        );
-    }
-    Ok(None)
 }
 
 /// How long an unmatched message ack waits for its outgoing row, and how many
@@ -1840,71 +1910,103 @@ const DEFERRED_ACK_CAP: usize = 64;
 /// This is the same materialize-later shape the store already uses for
 /// out-of-order edits and revokes, minus the placeholder row: an ack carries no
 /// content, so there is nothing to show until the real insert arrives.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct DeferredAcks {
-    /// `(deferred_at_ms, ack)`, oldest first — pushes append, so the queue is
-    /// sorted by age and expiry is a prefix drain.
-    entries: std::collections::VecDeque<(i64, wacore::types::events::ServerAck)>,
+    /// Oldest first — pushes append, so the queue is sorted by age and expiry
+    /// is a prefix drain.
+    entries: std::collections::VecDeque<DeferredAck>,
+}
+
+#[derive(Clone)]
+struct DeferredAck {
+    deferred_at_ms: i64,
+    /// Storage key the ack named, when it named one. Message ids are
+    /// sender-chosen and only unique within a chat, so an ack that names its
+    /// chat must only be handed to an insert into that same chat — otherwise a
+    /// host reusing one id across two threads could see chat A's ack land on
+    /// chat B's row. `None` (the server omitted the chat) matches on the id
+    /// alone, which is the same basis its own resolution falls back to.
+    chat: Option<String>,
+    ack: wacore::types::events::ServerAck,
 }
 
 impl DeferredAcks {
     fn expire(&mut self, now_ms: i64) {
-        while let Some((deferred_at, ack)) = self.entries.front() {
-            if now_ms.saturating_sub(*deferred_at) < DEFERRED_ACK_TTL_MS {
+        while let Some(entry) = self.entries.front() {
+            if now_ms.saturating_sub(entry.deferred_at_ms) < DEFERRED_ACK_TTL_MS {
                 break;
             }
             warn!(
                 target: "ChatStore/Ack",
                 "Dropping unmatched message ack for {}: no outgoing row appeared within {}s",
-                ack.id,
+                entry.ack.id,
                 DEFERRED_ACK_TTL_MS / 1000
             );
             self.entries.pop_front();
         }
     }
 
-    fn defer(&mut self, ack: &wacore::types::events::ServerAck, now_ms: i64) {
+    fn defer(&mut self, ack: &wacore::types::events::ServerAck, chat: Option<String>, now_ms: i64) {
         self.expire(now_ms);
         if self.entries.len() >= DEFERRED_ACK_CAP
-            && let Some((_, evicted)) = self.entries.pop_front()
+            && let Some(evicted) = self.entries.pop_front()
         {
             warn!(
                 target: "ChatStore/Ack",
                 "Dropping unmatched message ack for {}: {DEFERRED_ACK_CAP} acks already waiting",
-                evicted.id
+                evicted.ack.id
             );
         }
-        self.entries.push_back((now_ms, ack.clone()));
+        self.entries.push_back(DeferredAck {
+            deferred_at_ms: now_ms,
+            chat,
+            ack: ack.clone(),
+        });
     }
 
     fn take_matching(
         &mut self,
         msg_id: &str,
+        chat: &str,
         now_ms: i64,
     ) -> Option<wacore::types::events::ServerAck> {
         self.expire(now_ms);
-        let at = self.entries.iter().position(|(_, ack)| ack.id == msg_id)?;
-        self.entries.remove(at).map(|(_, ack)| ack)
+        let at = self.entries.iter().position(|entry| {
+            entry.ack.id == msg_id && entry.chat.as_deref().is_none_or(|named| named == chat)
+        })?;
+        self.entries.remove(at).map(|entry| entry.ack)
     }
 }
 
-/// Applies a server ack to its outgoing row. Returns whether a row matched —
-/// `false` means the send has not been recorded (yet), which the caller
-/// answers by deferring the ack rather than dropping it.
+/// What became of a server ack, so the caller knows whether anything is left to
+/// hold on to.
+enum AckApplied {
+    /// Applied to a row, or deliberately dropped — nothing left to hold.
+    Settled,
+    /// The send is not recorded yet. Carries the storage key the ack named, to
+    /// hold the deferral against.
+    Deferrable(Option<String>),
+}
+
 fn apply_server_ack(
     conn: &mut SqliteConnection,
     device_id: i32,
     ack: &wacore::types::events::ServerAck,
     cs: &mut ChangeSet,
-) -> QueryResult<bool> {
+) -> QueryResult<AckApplied> {
     // Acks cover every stanza class; only message acks map to a stored row.
     if ack.class.as_deref() != Some("message") {
-        return Ok(true);
+        return Ok(AckApplied::Settled);
     }
     use schema::messages::dsl;
-    let Some((chat, old_timestamp_ms)) = resolve_server_ack_message(conn, device_id, ack, cs)?
-    else {
-        return Ok(false);
+    let (chat, old_timestamp_ms) = match resolve_server_ack_message(conn, device_id, ack, cs)? {
+        AckTarget::Resolved { chat, timestamp_ms } => (chat, timestamp_ms),
+        // Answerable by waiting: the send may just not be recorded yet.
+        AckTarget::NotYet { chat } => return Ok(AckApplied::Deferrable(chat)),
+        // Not answerable by waiting, and dangerous to hold — report it settled
+        // so the caller drops it instead of arming it for the next row that
+        // reuses the id.
+        AckTarget::Ambiguous => return Ok(AckApplied::Settled),
     };
     let target = message_row(device_id, &chat, &ack.id).filter(dsl::from_me.eq(true));
     let status_updated = if ack.error.is_some() {
@@ -1963,7 +2065,7 @@ fn apply_server_ack(
             cs.message_chats.insert(from.to_string());
         }
     }
-    Ok(true)
+    Ok(AckApplied::Settled)
 }
 
 fn apply_history_sync(
@@ -2614,4 +2716,104 @@ pub(crate) fn message_row<'a>(
             .and(schema::messages::chat_jid.eq(chat))
             .and(schema::messages::msg_id.eq(msg_id)),
     )
+}
+
+#[cfg(test)]
+mod deferred_ack_tests {
+    use super::*;
+
+    fn ack(id: &str) -> wacore::types::events::ServerAck {
+        wacore::types::events::ServerAck::builder()
+            .id(id.to_string())
+            .class("message".to_string())
+            .build()
+    }
+
+    const CHAT: &str = "559900000001@s.whatsapp.net";
+    const OTHER: &str = "559900000002@s.whatsapp.net";
+
+    #[test]
+    fn takes_only_its_own_id() {
+        let mut acks = DeferredAcks::default();
+        acks.defer(&ack("A"), None, 0);
+        acks.defer(&ack("B"), None, 0);
+
+        assert!(acks.take_matching("C", CHAT, 0).is_none());
+        assert_eq!(acks.take_matching("B", CHAT, 0).unwrap().id, "B");
+        // Consumed, not merely read.
+        assert!(acks.take_matching("B", CHAT, 0).is_none());
+        assert_eq!(acks.take_matching("A", CHAT, 0).unwrap().id, "A");
+    }
+
+    /// Message ids are sender-chosen and unique only within a chat, so an ack
+    /// that named its chat must not be handed to an insert into another one.
+    #[test]
+    fn a_chat_scoped_ack_ignores_the_same_id_elsewhere() {
+        let mut acks = DeferredAcks::default();
+        acks.defer(&ack("OUT-DUP"), Some(CHAT.to_string()), 0);
+
+        assert!(
+            acks.take_matching("OUT-DUP", OTHER, 0).is_none(),
+            "another chat's insert must not consume it"
+        );
+        assert!(acks.take_matching("OUT-DUP", CHAT, 0).is_some());
+    }
+
+    /// An ack the server sent without a chat resolves on the id alone, so it
+    /// matches whichever chat records that id.
+    #[test]
+    fn a_chatless_ack_matches_any_chat() {
+        let mut acks = DeferredAcks::default();
+        acks.defer(&ack("OUT-ANY"), None, 0);
+        assert!(acks.take_matching("OUT-ANY", OTHER, 0).is_some());
+    }
+
+    #[test]
+    fn drops_entries_past_the_ttl() {
+        let mut acks = DeferredAcks::default();
+        acks.defer(&ack("STALE"), None, 0);
+
+        assert!(
+            acks.take_matching("STALE", CHAT, DEFERRED_ACK_TTL_MS)
+                .is_none()
+        );
+        // One millisecond inside the window still matches.
+        acks.defer(&ack("FRESH"), None, 0);
+        assert!(
+            acks.take_matching("FRESH", CHAT, DEFERRED_ACK_TTL_MS - 1)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn evicts_the_oldest_at_capacity() {
+        let mut acks = DeferredAcks::default();
+        for i in 0..DEFERRED_ACK_CAP + 1 {
+            acks.defer(&ack(&format!("ACK-{i}")), None, 0);
+        }
+        assert!(
+            acks.take_matching("ACK-0", CHAT, 0).is_none(),
+            "the oldest makes room"
+        );
+        assert!(
+            acks.take_matching(&format!("ACK-{DEFERRED_ACK_CAP}"), CHAT, 0)
+                .is_some()
+        );
+    }
+
+    /// A batch that rolls back must leave the queue as it found it: the ack an
+    /// insert consumed was never applied, so re-recording the row has to find
+    /// it still waiting. `writer_loop` restores this snapshot on error.
+    #[test]
+    fn a_snapshot_restores_a_consumed_ack() {
+        let mut acks = DeferredAcks::default();
+        acks.defer(&ack("OUT-1"), None, 0);
+
+        let snapshot = acks.clone();
+        assert_eq!(acks.take_matching("OUT-1", CHAT, 0).unwrap().id, "OUT-1");
+        assert!(acks.take_matching("OUT-1", CHAT, 0).is_none());
+
+        acks = snapshot;
+        assert_eq!(acks.take_matching("OUT-1", CHAT, 0).unwrap().id, "OUT-1");
+    }
 }

@@ -4658,33 +4658,93 @@ async fn deferred_ack_only_matches_its_own_message() {
     );
 }
 
+/// An ack whose id matches several outgoing rows cannot be attributed to any
+/// of them, and waiting cannot disambiguate it. It must be dropped outright —
+/// deferring it would arm it for whichever row next claims that id, turning a
+/// deliberate refusal into a delayed mis-apply.
+#[tokio::test]
+async fn ambiguous_ack_is_dropped_rather_than_deferred() {
+    let (_store, chat_store) = test_store().await;
+    let other = jid("559900000002@s.whatsapp.net");
+    let third = jid("559900000003@s.whatsapp.net");
+    let sent_at = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+
+    // The same id under two chats: no ack can name one of them.
+    for chat in [&jid(PEER), &other] {
+        chat_store
+            .record_outgoing(chat, "OUT-DUP", &wa::Message::text("dup"), sent_at)
+            .unwrap();
+    }
+    chat_store.flush().await.unwrap();
+
+    // An ack with no chat identity, so resolution falls to the id alone.
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-DUP".to_string())
+                .class("message".to_string())
+                .build(),
+        )],
+    )
+    .await;
+    for chat in [&jid(PEER), &other] {
+        assert_eq!(
+            chat_store
+                .message(chat, "OUT-DUP")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MessageStatus::Pending,
+            "an unattributable ack lifts nothing"
+        );
+    }
+
+    // And it is not waiting in the wings: a later row reusing the id stays
+    // pending too.
+    chat_store
+        .record_outgoing(&third, "OUT-DUP", &wa::Message::text("dup"), sent_at)
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    assert_eq!(
+        chat_store
+            .message(&third, "OUT-DUP")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Pending
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Hook-committed batches (#1140)
 // ---------------------------------------------------------------------------
 
-/// A batch the host's durability hook already committed must not be applied a
-/// second time here — the duplicate pass is a full proto UPDATE plus an FTS
-/// delete+insert plus a doubled invalidation fan-out, not a cheap no-op.
-#[tokio::test]
-async fn hook_committed_batch_is_not_materialized() {
-    let (_store, chat_store) = test_store().await;
-
-    let event = Event::Messages(
+fn hook_committed_event(id: &str) -> Event {
+    Event::Messages(
         MessageBatch::builder()
             .messages(Arc::from([InboundMessage::builder()
                 .message(Arc::new(wa::Message::text("already durable")))
-                .info(Arc::new(incoming_info(
-                    PEER,
-                    PEER,
-                    "MSG-HOOKED",
-                    1_700_000_000,
-                )))
+                .info(Arc::new(incoming_info(PEER, PEER, id, 1_700_000_000)))
                 .build()]))
             .origin(BatchOrigin::Live)
             .hook_committed(true)
             .build(),
-    );
-    feed(&chat_store, [event]).await;
+    )
+}
+
+/// Once the host declares that its hook feeds this store, a batch the hook
+/// committed must not be applied a second time — the duplicate pass is a full
+/// proto UPDATE plus an FTS delete+insert plus a doubled invalidation fan-out,
+/// not a cheap no-op.
+#[tokio::test]
+async fn hook_committed_batch_is_skipped_when_opted_in() {
+    let (_store, chat_store) = test_store().await;
+    chat_store.skip_hook_committed_batches(true);
+
+    feed(&chat_store, [hook_committed_event("MSG-HOOKED")]).await;
 
     assert!(chat_store.chats(false, 10).await.unwrap().is_empty());
     assert!(
@@ -4693,6 +4753,28 @@ async fn hook_committed_batch_is_not_materialized() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+/// The marker alone means "some hook committed this", not "this store already
+/// has it". A host whose hook persists elsewhere still needs every batch, so
+/// the default must materialize it — skipping would lose acknowledged
+/// messages out of history, previews and subscriptions.
+#[tokio::test]
+async fn hook_committed_batch_is_materialized_by_default() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(&chat_store, [hook_committed_event("MSG-OTHER-HOOK")]).await;
+
+    assert_eq!(
+        chat_store
+            .message(&jid(PEER), "MSG-OTHER-HOOK")
+            .await
+            .unwrap()
+            .expect("a hook that writes elsewhere leaves this store the only materializer")
+            .text
+            .as_deref(),
+        Some("already durable")
     );
 }
 

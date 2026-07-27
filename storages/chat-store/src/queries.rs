@@ -196,13 +196,26 @@ impl ChatStore {
                     }
                     if let (Some(pinned_at), Some(cursor)) = (resume_pinned, &after) {
                         query = query.filter(
-                            dsl::pinned_at.lt(pinned_at).or(dsl::pinned_at
-                                .eq(pinned_at)
-                                .and(dsl::jid.lt(cursor.jid.clone()))),
+                            dsl::pinned_at
+                                .lt(pinned_at)
+                                .or(dsl::pinned_at.eq(pinned_at).and(
+                                    dsl::last_message_ts.lt(cursor.last_message_ts).or(
+                                        dsl::last_message_ts
+                                            .eq(cursor.last_message_ts)
+                                            .and(dsl::jid.lt(cursor.jid.clone())),
+                                    ),
+                                )),
                         );
                     }
+                    // Activity still decides between equally-pinned chats —
+                    // history-sync pin times are second-precision and collide,
+                    // and the old combined sort ranked them this way too.
                     rows = query
-                        .order((dsl::pinned_at.desc(), dsl::jid.desc()))
+                        .order((
+                            dsl::pinned_at.desc(),
+                            dsl::last_message_ts.desc(),
+                            dsl::jid.desc(),
+                        ))
                         .limit(limit)
                         .load(conn)
                         .map_err(db_err)?;
@@ -259,8 +272,11 @@ impl ChatStore {
                     .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(keys)))
                     // A split pair (rows under both identities, not yet merged)
                     // would match twice; the active thread is the one with
-                    // activity on it.
-                    .order(dsl::last_message_ts.desc())
+                    // activity on it. Same tiebreak as the list, so the two
+                    // surfaces cannot disagree about which row is the thread
+                    // when both sides carry the same activity time (common
+                    // right after a reconcile, and whenever both are 0).
+                    .order((dsl::last_message_ts.desc(), dsl::jid.desc()))
                     .first(conn)
                     .optional()
                     .map_err(db_err)

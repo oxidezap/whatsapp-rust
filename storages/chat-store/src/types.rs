@@ -172,6 +172,21 @@ pub struct StoredMessage {
     /// two messages exchanged in the same second carry the same `timestamp`
     /// and something has to break the tie — this is the order the socket
     /// delivered them in, which is the order both ends display.
+    ///
+    /// Comparable, not durable: a `VACUUM` preserves the relative order these
+    /// values encode but may renumber the values themselves, so a `seq` (or a
+    /// [`MessageCursor`] built from one) is good for a live paging session and
+    /// must not be persisted across restarts.
+    ///
+    /// It is *store* arrival, not wire arrival. Inbound rows are inserted as
+    /// the socket delivers them, but an outgoing row is inserted when the host
+    /// calls `record_outgoing`, which happens after its send resolves — so a
+    /// peer reply that is decrypted and materialized in that gap, and that
+    /// lands on the same whole second, takes the lower `seq`. That needs a full
+    /// round trip to complete inside one second while a local enqueue is still
+    /// pending, and it is bounded to same-second pairs; the ordering it
+    /// replaced was wrong for roughly three of every four such pairs, in a
+    /// fixed direction.
     pub seq: i64,
 }
 

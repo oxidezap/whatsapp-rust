@@ -21,5 +21,10 @@ CREATE INDEX idx_chats_order ON chats (device_id, last_message_ts DESC, jid DESC
 
 -- Partial: pinning is capped at a handful of chats, so this stays tiny and
 -- costs nothing on the writes that never touch `pinned_at`.
-CREATE INDEX idx_chats_pinned ON chats (device_id, pinned_at DESC, jid DESC)
+--
+-- `last_message_ts` sits between the two because pin times collide in
+-- practice: history sync carries them at second precision, so several chats
+-- can share one. Activity decides between equally-pinned chats, as it did
+-- under the old combined sort; `jid` only settles what activity cannot.
+CREATE INDEX idx_chats_pinned ON chats (device_id, pinned_at DESC, last_message_ts DESC, jid DESC)
     WHERE pinned_at IS NOT NULL;
