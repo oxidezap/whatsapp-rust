@@ -16,6 +16,14 @@ pub struct MessageUtils;
 /// render one into a `String` just to measure it and copy it. A `Jid` can do
 /// both without the intermediate: this is what lets `&Jid` and `&str` share the
 /// same body instead of the format existing in two shapes.
+///
+/// Implemented for `str`, the standard string wrappers, and `Jid`, and carried
+/// through references of any depth. A type outside that set (a string newtype,
+/// say) has two ways in: pass `&*wrapper` to go through the `str`
+/// implementation, or implement this trait for it, which is why the trait is
+/// public. What is deliberately *not* offered is a blanket implementation over
+/// `Deref<Target = str>`: it collides with `Jid` and with the reference
+/// implementations at once, since `&str` derefs to `str` as well.
 pub trait DsmDestination {
     /// Exactly the number of bytes [`Self::write_into`] appends.
     ///
