@@ -81,7 +81,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     };
     #[cfg(feature = "voip")]
     let media = (child.tag.as_ref() == "offer")
-        .then(|| parse_media_offer(node, child, &from))
+        .then(|| parse_media_offer(node, child, participant.as_ref().unwrap_or(&from)))
         .flatten()
         .map(Box::new);
 
@@ -246,7 +246,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
 
     Ok(match node.tag.as_ref() {
         "group_update" => CallAction::GroupUpdate {
-            update: super::group_call::parse_group_update(node)?,
+            update: super::group_call::parse_group_update(node)?.into(),
         },
         "enc_rekey" => CallAction::EncRekey {
             rekey: super::group_call::parse_group_enc_rekey(node)?,

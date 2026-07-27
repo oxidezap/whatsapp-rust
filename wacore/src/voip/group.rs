@@ -210,6 +210,19 @@ mod tests {
         }
     }
 
+    fn waiting_room(transaction_id: Option<u32>) -> WaitingRoom {
+        WaitingRoom {
+            call_id: "CALL".to_string(),
+            call_creator: creator(),
+            link_token: "TEST-CALL-LINK".to_string(),
+            media: crate::types::group_call::CallLinkMedia::Audio,
+            enabled: true,
+            is_admin: false,
+            transaction_id,
+            users: Vec::new(),
+        }
+    }
+
     #[test]
     fn snapshots_are_transaction_ordered_and_clear_departed_controls() {
         let mut state = GroupCallState::new("CALL", creator());
@@ -301,5 +314,36 @@ mod tests {
         );
         assert!(state.raised_hands().is_empty());
         assert!(state.screen_shares().is_empty());
+    }
+
+    #[test]
+    fn waiting_room_identity_and_transaction_order_are_enforced() {
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_waiting_room(waiting_room(Some(4))),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state.apply_waiting_room(waiting_room(Some(3))),
+            GroupStateApply::Stale
+        );
+        assert_eq!(
+            state.apply_waiting_room(waiting_room(None)),
+            GroupStateApply::Applied,
+            "transaction-less service updates always apply"
+        );
+
+        let mut wrong_call = waiting_room(Some(5));
+        wrong_call.call_id = "OTHER".to_string();
+        assert_eq!(
+            state.apply_waiting_room(wrong_call),
+            GroupStateApply::IdentityMismatch
+        );
+        let mut wrong_creator = waiting_room(Some(5));
+        wrong_creator.call_creator = Jid::new("999999", Server::Lid);
+        assert_eq!(
+            state.apply_waiting_room(wrong_creator),
+            GroupStateApply::IdentityMismatch
+        );
     }
 }

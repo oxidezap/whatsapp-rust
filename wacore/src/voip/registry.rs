@@ -155,6 +155,15 @@ struct CallEntry {
     on_terminal: Option<EndedNotify>,
 }
 
+impl CallEntry {
+    fn group_mut(&mut self) -> &mut GroupCallState {
+        let call_id = self.session.call_id.clone();
+        let call_creator = self.session.call_creator.clone();
+        self.group
+            .get_or_insert_with(|| GroupCallState::new(call_id, call_creator))
+    }
+}
+
 /// Exclusive publication right for an actionable signaling event awaiting its typed ack.
 pub struct CallEventPermit {
     tx: async_channel::Sender<CallEvent>,
@@ -216,6 +225,23 @@ impl CallRegistry {
         tx.is_some_and(|tx| tx.force_send(event).is_ok())
     }
 
+    /// Deliver an event only while `generation` still owns this call-id.
+    pub fn send_call_event_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        event: CallEvent,
+    ) -> bool {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.event_tx.clone());
+        tx.is_some_and(|tx| tx.force_send(event).is_ok())
+    }
+
     /// Atomically apply a newer authoritative group snapshot to an active call.
     pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
         let (applied, waiting_room_task, event) = {
@@ -223,12 +249,7 @@ impl CallRegistry {
             let Some(entry) = map.get_mut(&update.call_id) else {
                 return GroupStateApply::UnknownCall;
             };
-            let call_id = entry.session.call_id.clone();
-            let call_creator = entry.session.call_creator.clone();
-            let group = entry
-                .group
-                .get_or_insert_with(|| GroupCallState::new(call_id, call_creator));
-            let applied = group.apply_update(update);
+            let applied = entry.group_mut().apply_update(update);
             let admitted = applied == GroupStateApply::Applied
                 && entry.session.phase() == CallPhase::WaitingRoom;
             if admitted {
@@ -260,12 +281,7 @@ impl CallRegistry {
         let Some(entry) = map.get_mut(&room.call_id) else {
             return GroupStateApply::UnknownCall;
         };
-        let call_id = entry.session.call_id.clone();
-        let call_creator = entry.session.call_creator.clone();
-        let group = entry
-            .group
-            .get_or_insert_with(|| GroupCallState::new(call_id, call_creator));
-        group.apply_waiting_room(room)
+        entry.group_mut().apply_waiting_room(room)
     }
 
     /// Commit a successfully acknowledged local waiting-room approval toggle.
@@ -284,12 +300,26 @@ impl CallRegistry {
         let Some(entry) = map.get_mut(call_id) else {
             return false;
         };
-        let own_call_id = entry.session.call_id.clone();
-        let call_creator = entry.session.call_creator.clone();
-        let group = entry
-            .group
-            .get_or_insert_with(|| GroupCallState::new(own_call_id, call_creator));
-        group.set_raised_hand(participant, raised);
+        entry.group_mut().set_raised_hand(participant, raised);
+        true
+    }
+
+    /// Update local hand state only while `generation` still owns this call-id.
+    pub fn set_raised_hand_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        participant: &Jid,
+        raised: bool,
+    ) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        entry.group_mut().set_raised_hand(participant, raised);
         true
     }
 
@@ -304,12 +334,30 @@ impl CallRegistry {
         let Some(entry) = map.get_mut(call_id) else {
             return false;
         };
-        let own_call_id = entry.session.call_id.clone();
-        let call_creator = entry.session.call_creator.clone();
-        let group = entry
-            .group
-            .get_or_insert_with(|| GroupCallState::new(own_call_id, call_creator));
-        group.set_screen_share(participant, screen_share);
+        entry
+            .group_mut()
+            .set_screen_share(participant, screen_share);
+        true
+    }
+
+    /// Update local screen-share state only while `generation` still owns this call-id.
+    pub fn set_screen_share_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        participant: &Jid,
+        screen_share: ScreenShare,
+    ) -> bool {
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        entry
+            .group_mut()
+            .set_screen_share(participant, screen_share);
         true
     }
 
@@ -526,11 +574,17 @@ impl CallRegistry {
     }
 
     /// Record the peer device and capability selected by preaccept/accept signaling.
-    pub fn set_group_invite_peer_device(&self, call_id: &str, device: GroupCallDevice) -> bool {
+    pub fn set_group_invite_peer_device(
+        &self,
+        call_id: &str,
+        generation: u64,
+        device: GroupCallDevice,
+    ) -> bool {
         self.inner
             .lock()
             .expect("registry lock poisoned")
             .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| {
                 entry.group_invite_peer_device = Some(device);
                 true
@@ -674,7 +728,10 @@ impl CallRegistry {
             .expect("registry lock poisoned")
             .get(call_id)
             .and_then(|entry| entry.group_ctl_tx.clone());
-        tx.is_some_and(|tx| tx.try_send(GroupControl::Update(Box::new(update))).is_ok())
+        tx.is_some_and(|tx| {
+            tx.force_send(GroupControl::Update(Box::new(update)))
+                .is_ok()
+        })
     }
 
     /// Deliver one decrypted shared epoch to the group-media engine.
@@ -686,7 +743,7 @@ impl CallRegistry {
         let epoch = GroupRawEpoch::new(transaction_id, raw_epoch);
         if let Some(tx) = entry.group_ctl_tx.clone() {
             drop(map);
-            tx.try_send(GroupControl::RawEpoch(epoch)).is_ok()
+            tx.force_send(GroupControl::RawEpoch(epoch)).is_ok()
         } else {
             let replace = entry
                 .pending_group_epoch
@@ -701,11 +758,35 @@ impl CallRegistry {
 
     /// Queue one RTC reaction on the active group media stream.
     pub fn send_group_reaction(&self, call_id: &str, emoji: String) -> bool {
+        if crate::voip::app_data::encode_reaction(1, &emoji).is_err() {
+            return false;
+        }
         let tx = self
             .inner
             .lock()
             .expect("registry lock poisoned")
             .get(call_id)
+            .filter(|entry| entry.group.is_some())
+            .and_then(|entry| entry.group_ctl_tx.clone());
+        tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)).is_ok())
+    }
+
+    /// Queue one validated reaction only while `generation` owns an active group call.
+    pub fn send_group_reaction_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        emoji: String,
+    ) -> bool {
+        if crate::voip::app_data::encode_reaction(1, &emoji).is_err() {
+            return false;
+        }
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation && entry.group.is_some())
             .and_then(|entry| entry.group_ctl_tx.clone());
         tx.is_some_and(|tx| tx.try_send(GroupControl::Reaction(emoji)).is_ok())
     }
@@ -1140,6 +1221,16 @@ impl CallRegistry {
             .map(|e| e.session.phase())
     }
 
+    /// Read phase only while `generation` still owns this call-id.
+    pub fn phase_if_current(&self, call_id: &str, generation: u64) -> Option<CallPhase> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.session.phase())
+    }
+
     /// Advance a call's phase; returns false if the call is unknown or the transition is illegal.
     pub fn transition(&self, call_id: &str, next: CallPhase) -> bool {
         self.inner
@@ -1401,6 +1492,86 @@ mod tests {
             "a stale invite handle must not read the replacement roster"
         );
         assert!(reg.snapshot_if_current("GROUP-CALL", replacement).is_some());
+    }
+
+    #[test]
+    fn group_controls_and_invite_devices_reject_stale_generations() {
+        let reg = CallRegistry::new();
+        let stale = reg.insert(session("GROUP-CALL"));
+        let current = reg.insert(session("GROUP-CALL"));
+        let participant = Jid::new("111111111111111", Server::Lid);
+        assert!(!reg.set_raised_hand_if_current("GROUP-CALL", stale, &participant, true,));
+        assert!(reg.set_raised_hand_if_current("GROUP-CALL", current, &participant, true,));
+        assert!(
+            reg.group_state_if_current("GROUP-CALL", current)
+                .expect("current group state")
+                .raised_hands()
+                .contains(&participant)
+        );
+
+        let self_device =
+            GroupCallDevice::new(participant.clone().with_device(1)).with_capability(1, [1]);
+        let peer_device =
+            GroupCallDevice::new(Jid::new("222222222222222", Server::Lid).with_device(2))
+                .with_capability(1, [2]);
+        assert!(reg.set_group_invite_self_device("GROUP-CALL", current, self_device,));
+        assert!(!reg.set_group_invite_peer_device("GROUP-CALL", stale, peer_device.clone(),));
+        assert!(
+            reg.group_invite_fallback_roster("GROUP-CALL", current)
+                .is_none()
+        );
+        assert!(reg.set_group_invite_peer_device("GROUP-CALL", current, peer_device,));
+        assert_eq!(
+            reg.group_invite_fallback_roster("GROUP-CALL", current)
+                .expect("current invite roster")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn reaction_enqueue_rejects_direct_calls_and_oversized_payloads() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let (tx, rx) = async_channel::bounded(2);
+        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        assert!(!reg.send_group_reaction_if_current("GROUP-CALL", generation, "👍".to_string(),));
+
+        assert_eq!(
+            reg.apply_group_update(group_update(1)),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_reaction_if_current("GROUP-CALL", generation, "👍".to_string(),));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Reaction(emoji)) if emoji == "👍"
+        ));
+        assert!(!reg.send_group_reaction_if_current("GROUP-CALL", generation, "x".repeat(257),));
+    }
+
+    #[test]
+    fn newest_group_state_survives_control_queue_backpressure() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        assert_eq!(
+            reg.apply_group_update(group_update(1)),
+            GroupStateApply::Applied
+        );
+        let (tx, rx) = async_channel::bounded(1);
+        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+
+        assert!(reg.send_group_update("GROUP-CALL", group_update(2)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 2
+        ));
+
+        assert!(reg.send_group_update("GROUP-CALL", group_update(3)));
+        assert!(reg.send_group_epoch("GROUP-CALL", 3, vec![3; 32]));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 3
+        ));
     }
 
     #[test]

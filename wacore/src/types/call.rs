@@ -225,7 +225,7 @@ pub enum CallAction {
         dec: Option<String>,
     },
     /// Transaction-ordered authoritative membership and relay snapshot.
-    GroupUpdate { update: GroupCallUpdate },
+    GroupUpdate { update: Box<GroupCallUpdate> },
     /// Signal-encrypted keygen-v2 epoch for a group call.
     EncRekey { rekey: GroupCallEncRekey },
     /// Authoritative admission state for a reusable call-link call.

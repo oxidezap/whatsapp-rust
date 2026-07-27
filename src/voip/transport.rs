@@ -280,6 +280,18 @@ impl RelayTransport for RelayMediaChannel {
             let _ = assoc.close().await;
         }
     }
+
+    async fn reconnect(
+        &self,
+        endpoint: SocketAddr,
+    ) -> Result<(
+        Arc<dyn RelayTransport>,
+        async_channel::Receiver<RelayTransportEvent>,
+    )> {
+        RelayMediaChannelFactory::new(endpoint, self.runtime.clone())
+            .connect()
+            .await
+    }
 }
 
 /// Inbound event-channel depth. VoIP is loss tolerant, so the read pump drops packets rather than

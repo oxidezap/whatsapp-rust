@@ -6,6 +6,8 @@ use std::sync::Arc;
 #[cfg(feature = "voip-runtime")]
 use std::time::Duration;
 
+#[cfg(feature = "voip-runtime")]
+use log::warn;
 use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::group_call::{
@@ -34,6 +36,13 @@ use wacore_binary::Server;
 #[cfg(feature = "voip-runtime")]
 use super::ResponseWaiter;
 use super::{Client, ClientError};
+
+#[cfg(feature = "voip-runtime")]
+const CALL_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "voip-runtime")]
+const WAITING_ROOM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(feature = "voip-runtime")]
+const WAITING_ROOM_HEARTBEAT_MAX_CONSECUTIVE_FAILURES: u8 = 3;
 
 /// Opaque call-control handle obtained via [`Client::voip`]. Borrows the client;
 /// kept as a newtype so the surface can grow without breaking callers.
@@ -287,6 +296,7 @@ impl Voip<'_> {
         let CallAction::Offer {
             call_id,
             call_creator,
+            is_video,
             ..
         } = &incoming.action
         else {
@@ -295,9 +305,13 @@ impl Voip<'_> {
         if incoming.group.is_none() {
             return Err(CallError::Media("offer is not an active group invitation"));
         }
-        let node =
-            build_active_group_accept(call_id, call_creator, &self.client.generate_request_id())
-                .map_err(|error| CallError::Response(error.to_string()))?;
+        let node = build_active_group_accept(
+            call_id,
+            call_creator,
+            &self.client.generate_request_id(),
+            *is_video,
+        )
+        .map_err(|error| CallError::Response(error.to_string()))?;
         self.client.send_node(node).await?;
         self.client.call_registry().take_ringing(call_id);
         self.client
@@ -358,7 +372,8 @@ impl Voip<'_> {
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
         let request_id = self.client.generate_request_id();
-        let capability = crate::voip::facade::offer_capability(false, audio_format);
+        let capability =
+            crate::voip::facade::offer_capability(media == CallLinkMedia::Video, audio_format);
         let request = build_call_link_join_with_capability(&token, media, &request_id, capability)
             .map_err(|error| CallError::Response(error.to_string()))?;
         let mut join = execute_call_service_request(
@@ -375,6 +390,9 @@ impl Voip<'_> {
             return Err(CallError::Response(
                 "call-link response changed the requested media mode".to_string(),
             ));
+        }
+        if join.call_id.is_empty() {
+            return Err(CallError::EmptyCallId);
         }
 
         let mut session = CallSession::new_outgoing(
@@ -398,24 +416,17 @@ impl Voip<'_> {
 
         if join.in_waiting_room {
             let Some(room) = join.pending_waiting_room() else {
-                registry.remove_if_current(&join.call_id, generation);
                 return Err(CallError::Response(
                     "call-link join omitted its waiting-room state".to_string(),
                 ));
             };
             if registry.apply_waiting_room(room) != wacore::voip::GroupStateApply::Applied {
-                registry.remove_if_current(&join.call_id, generation);
                 return Err(CallError::Response(
                     "call-link waiting-room identity was rejected".to_string(),
                 ));
             }
-            if let Err(error) = self
-                .waiting_room_heartbeat(&join.call_id, &join.call_creator)
-                .await
-            {
-                registry.remove_if_current(&join.call_id, generation);
-                return Err(error);
-            }
+            self.waiting_room_heartbeat(&join.call_id, &join.call_creator)
+                .await?;
             self.start_waiting_room_heartbeat(
                 join.call_id.clone(),
                 join.call_creator.clone(),
@@ -424,20 +435,16 @@ impl Voip<'_> {
         } else if let Some(update) = join.group.as_ref()
             && update.rekey_requested
         {
-            let raw_epoch = match crate::voip::facade::fanout_group_epoch(self.client, update).await
-            {
-                Ok(raw_epoch) => raw_epoch,
-                Err(error) => {
-                    registry.remove_if_current(&join.call_id, generation);
-                    return Err(error);
-                }
-            };
-            if !registry.send_group_epoch(&join.call_id, update.transaction_id, raw_epoch) {
-                registry.remove_if_current(&join.call_id, generation);
-                return Err(CallError::Media(
-                    "call-link group epoch could not be retained",
-                ));
-            }
+            crate::voip::facade::fanout_group_epoch(self.client, update)
+                .await?
+                .commit(|epoch| {
+                    registry
+                        .send_group_epoch(&join.call_id, update.transaction_id, epoch.to_vec())
+                        .then_some(())
+                        .ok_or(CallError::Media(
+                            "call-link group epoch could not be retained",
+                        ))
+                })?;
         }
 
         registry.set_group_invite_self_device(
@@ -462,7 +469,8 @@ impl Voip<'_> {
         execute_call_service_request(
             self.client,
             &request_id,
-            build_waiting_room_toggle(call_id, call_creator, enabled, &request_id),
+            build_waiting_room_toggle(call_id, call_creator, enabled, &request_id)
+                .map_err(|error| CallError::Response(error.to_string()))?,
             parse_waiting_room_toggle_ack,
         )
         .await?;
@@ -481,7 +489,8 @@ impl Voip<'_> {
     ) -> Result<(), CallError> {
         self.send_group_control(
             call_id,
-            build_waiting_room_heartbeat(call_id, call_creator, &self.client.generate_request_id()),
+            build_waiting_room_heartbeat(call_id, call_creator, &self.client.generate_request_id())
+                .map_err(|error| CallError::Response(error.to_string()))?,
         )
         .await
     }
@@ -499,7 +508,8 @@ impl Voip<'_> {
         execute_call_service_request(
             self.client,
             &request_id,
-            build_waiting_room_admit(call_id, call_creator, user, &request_id),
+            build_waiting_room_admit(call_id, call_creator, user, &request_id)
+                .map_err(|error| CallError::Response(error.to_string()))?,
             parse_waiting_room_admit_ack,
         )
         .await
@@ -518,7 +528,8 @@ impl Voip<'_> {
         execute_call_service_request(
             self.client,
             &request_id,
-            build_waiting_room_deny(call_id, call_creator, user, &request_id),
+            build_waiting_room_deny(call_id, call_creator, user, &request_id)
+                .map_err(|error| CallError::Response(error.to_string()))?,
             parse_waiting_room_deny_ack,
         )
         .await
@@ -530,6 +541,23 @@ impl Voip<'_> {
         &self,
         call_id: &str,
         call_creator: &Jid,
+        raised: bool,
+    ) -> Result<(), CallError> {
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.set_hand_raised_for_generation(call_id, call_creator, generation, raised)
+            .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn set_hand_raised_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
         raised: bool,
     ) -> Result<(), CallError> {
         let participant = self
@@ -546,20 +574,26 @@ impl Voip<'_> {
                 call_creator,
                 &self.client.generate_request_id(),
                 raised,
-            ),
+            )
+            .map_err(|error| CallError::Response(error.to_string()))?,
         )
         .await?;
         let registry = self.client.call_registry();
-        if registry.set_raised_hand(call_id, &participant, raised) {
-            registry.send_call_event(
+        if registry.set_raised_hand_if_current(call_id, generation, &participant, raised) {
+            registry.send_call_event_if_current(
                 call_id,
+                generation,
                 CallEvent::HandRaised {
                     participant,
                     raised,
                 },
             );
+            Ok(())
+        } else {
+            Err(CallError::Media(
+                "call was replaced while applying group control",
+            ))
         }
-        Ok(())
     }
 
     /// Publish a screen-share start/stop transition.
@@ -568,6 +602,30 @@ impl Voip<'_> {
         &self,
         call_id: &str,
         call_creator: &Jid,
+        state: ScreenShareState,
+        screen_share_id: Option<u32>,
+    ) -> Result<(), CallError> {
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.set_screen_share_for_generation(
+            call_id,
+            call_creator,
+            generation,
+            state,
+            screen_share_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn set_screen_share_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
         state: ScreenShareState,
         screen_share_id: Option<u32>,
     ) -> Result<(), CallError> {
@@ -586,23 +644,32 @@ impl Voip<'_> {
                 &self.client.generate_request_id(),
                 state,
                 screen_share_id,
-            ),
+            )
+            .map_err(|error| CallError::Response(error.to_string()))?,
         )
         .await?;
         let screen_share = ScreenShare::new(state, screen_share_id);
         let registry = self.client.call_registry();
-        if registry.set_screen_share(call_id, &participant, screen_share.clone()) {
-            registry.send_call_event(
+        if registry.set_screen_share_if_current(
+            call_id,
+            generation,
+            &participant,
+            screen_share.clone(),
+        ) {
+            registry.send_call_event_if_current(
                 call_id,
+                generation,
                 CallEvent::ScreenShareChanged {
                     participant,
                     screen_share,
                 },
             );
+        } else {
+            return Err(CallError::Media(
+                "call was replaced while applying group control",
+            ));
         }
-        if state == ScreenShareState::Started
-            && let Some(generation) = registry.generation_of(call_id)
-        {
+        if state == ScreenShareState::Started {
             registry.send_video_ctl(call_id, generation, VideoControl::RequireKeyframe);
         }
         Ok(())
@@ -640,27 +707,57 @@ impl Voip<'_> {
         let sleeper = runtime.clone();
         let heartbeat_call_id = call_id.clone();
         let task = runtime.spawn(Box::pin(async move {
+            let mut consecutive_failures = 0;
             loop {
-                sleeper.sleep(Duration::from_secs(10)).await;
+                sleeper.sleep(WAITING_ROOM_HEARTBEAT_INTERVAL).await;
                 let Some(client) = weak_client.upgrade() else {
                     break;
                 };
-                if client.call_registry().phase(&heartbeat_call_id) != Some(CallPhase::WaitingRoom)
+                if client
+                    .call_registry()
+                    .phase_if_current(&heartbeat_call_id, generation)
+                    != Some(CallPhase::WaitingRoom)
                 {
                     break;
                 }
                 let request_id = client.generate_request_id();
-                if client
-                    .send_node(build_waiting_room_heartbeat(
-                        &heartbeat_call_id,
-                        &call_creator,
-                        &request_id,
-                    ))
+                let heartbeat = match build_waiting_room_heartbeat(
+                    &heartbeat_call_id,
+                    &call_creator,
+                    &request_id,
+                ) {
+                    Ok(heartbeat) => heartbeat,
+                    Err(error) => {
+                        warn!(
+                            "voip: invalid waiting-room heartbeat for call {}: {error}",
+                            heartbeat_call_id
+                        );
+                        break;
+                    }
+                };
+                if let Err(error) = client
+                    .send_node(heartbeat)
                     .await
-                    .is_err()
                 {
-                    break;
+                    consecutive_failures += 1;
+                    warn!(
+                        "voip: waiting-room heartbeat failed for call {} ({consecutive_failures}/{WAITING_ROOM_HEARTBEAT_MAX_CONSECUTIVE_FAILURES}): {error}",
+                        heartbeat_call_id,
+                    );
+                    if consecutive_failures >= WAITING_ROOM_HEARTBEAT_MAX_CONSECUTIVE_FAILURES {
+                        client.call_registry().send_call_event_if_current(
+                            &heartbeat_call_id,
+                            generation,
+                            CallEvent::WaitingRoomHeartbeatFailed,
+                        );
+                        client
+                            .call_registry()
+                            .remove_if_current(&heartbeat_call_id, generation);
+                        break;
+                    }
+                    continue;
                 }
+                consecutive_failures = 0;
             }
         }));
         self.client
@@ -711,18 +808,20 @@ fn normalize_call_link_token(
     }
     const PREFIX: &str = "https://call.whatsapp.com/";
     if let Some(path) = value.strip_prefix(PREFIX) {
+        let path = path.split_once(['?', '#']).map_or(path, |(path, _)| path);
         let mut parts = path.split('/');
         let media = parts.next();
-        let token = parts.next();
-        if parts.next().is_some()
-            || token.is_none_or(str::is_empty)
-            || media != Some(expected_media.as_str())
-        {
+        let Some(token) = parts.next().filter(|token| !token.is_empty()) else {
+            return Err(CallError::Response(
+                "invalid call-link URL or media mode".to_string(),
+            ));
+        };
+        if parts.next().is_some() || media != Some(expected_media.as_str()) {
             return Err(CallError::Response(
                 "invalid call-link URL or media mode".to_string(),
             ));
         }
-        return Ok(token.unwrap_or_default().to_string());
+        return Ok(token.to_string());
     }
     if value.contains("://") || value.contains('/') {
         return Err(CallError::Response("invalid call-link token".to_string()));
@@ -747,11 +846,11 @@ async fn execute_call_service_request<T>(
         request_id.to_string(),
         cleanup_generation,
     );
-    if let Err(error) = client.send_node(request).await {
-        return Err(error.into());
-    }
+    client.send_node(request).await?;
     let response =
-        match wacore::runtime::timeout(&*client.runtime, Duration::from_secs(10), response).await {
+        match wacore::runtime::timeout(&*client.runtime, CALL_SERVICE_REQUEST_TIMEOUT, response)
+            .await
+        {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => return Err(CallError::Response("response channel closed".to_string())),
             Err(_) => return Err(CallError::ResponseTimeout),
@@ -781,6 +880,33 @@ mod tests {
     use wacore_binary::{Jid, Server};
 
     use crate::client::Client;
+
+    #[cfg(feature = "voip-runtime")]
+    #[test]
+    fn call_link_urls_strip_query_and_fragment_without_relaxing_validation() {
+        assert_eq!(
+            super::normalize_call_link_token(
+                "https://call.whatsapp.com/video/TEST-TOKEN?utm_source=test#join",
+                CallLinkMedia::Video,
+            )
+            .unwrap(),
+            "TEST-TOKEN"
+        );
+        assert!(
+            super::normalize_call_link_token(
+                "https://call.whatsapp.com/audio/TEST-TOKEN?x=1",
+                CallLinkMedia::Video,
+            )
+            .is_err()
+        );
+        assert!(
+            super::normalize_call_link_token(
+                "https://call.whatsapp.com/video/?x=1",
+                CallLinkMedia::Video,
+            )
+            .is_err()
+        );
+    }
 
     struct CountingTransport {
         count: Arc<AtomicUsize>,
@@ -1206,7 +1332,7 @@ mod tests {
                 .get_optional_child("capability")
                 .expect("join capability")
                 .content_bytes(),
-            Some(wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER.as_slice())
+            Some(wacore::stanza::call::CAPABILITY_STANDARD_OPUS_VIDEO_OFFER.as_slice())
         );
         let request_id = request
             .as_node_ref()

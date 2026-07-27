@@ -16,6 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
+use zeroize::Zeroize;
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
@@ -65,7 +66,7 @@ impl core::fmt::Debug for GroupRawEpoch {
 
 impl Drop for GroupRawEpoch {
     fn drop(&mut self) {
-        self.raw_epoch.fill(0);
+        self.raw_epoch.zeroize();
     }
 }
 
@@ -493,8 +494,8 @@ async fn run_call_with_clock(
 
 async fn run_call_with_clock_and_wallclock(
     rt: Arc<dyn Runtime>,
-    transport: Arc<dyn RelayTransport>,
-    relay_events: async_channel::Receiver<RelayTransportEvent>,
+    mut transport: Arc<dyn RelayTransport>,
+    mut relay_events: async_channel::Receiver<RelayTransportEvent>,
     channels: CallChannels,
     mut eng: CallEngine,
     now_ms: impl Fn() -> engine::Millis,
@@ -542,6 +543,7 @@ async fn run_call_with_clock_and_wallclock(
     'drive: loop {
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
         let mut pending_video = Vec::new();
+        let mut reconnect_to = None;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -573,6 +575,14 @@ async fn run_call_with_clock_and_wallclock(
                 Output::Event(ev) => {
                     let _ = channels.events.try_send(ev);
                 }
+                Output::ReconnectRelay(endpoint) => {
+                    // Anything queued before this intent targets the retired relay. Later outputs in
+                    // the same drain include the fresh Allocate and are retained for the new channel.
+                    send_queue.clear();
+                    pending_video.clear();
+                    awaiting_video_keyframe = false;
+                    reconnect_to = Some(endpoint);
+                }
                 Output::Timeout(_) => {
                     if !pending_video.is_empty() {
                         let dropped = enqueue_batch(
@@ -595,6 +605,18 @@ async fn run_call_with_clock_and_wallclock(
         // The terminal event above must reach the consumer before transport teardown.
         if eng.is_terminated() {
             break 'drive;
+        }
+
+        if let Some(endpoint) = reconnect_to {
+            // An in-flight write belongs to the retired channel and is delivery-ambiguous. Drop it;
+            // the fresh Allocate emitted after ReconnectRelay establishes the replacement path.
+            sending = Fuse::terminated();
+            let Ok((replacement, replacement_events)) = transport.reconnect(endpoint).await else {
+                break 'drive;
+            };
+            let retired = std::mem::replace(&mut transport, replacement);
+            relay_events = replacement_events;
+            retired.disconnect().await;
         }
 
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
@@ -732,21 +754,43 @@ async fn run_call_with_clock_and_wallclock(
             group = group_ctl_fut => {
                 match group {
                     Some(GroupControl::Update(update)) => {
-                        if eng.apply_group_update(&update).is_err() {
-                            break 'drive;
+                        if let Err(error) = eng.apply_group_update(&update) {
+                            if matches!(
+                                error,
+                                engine::EngineError::GroupMedia(
+                                    crate::voip::GroupMediaError::IdentityMismatch
+                                        | crate::voip::GroupMediaError::InvalidSnapshot
+                                        | crate::voip::GroupMediaError::InvalidEpoch
+                                        | crate::voip::GroupMediaError::ConflictingEpoch
+                                )
+                            ) {
+                                let _ = channels.events.try_send(
+                                    CallEvent::GroupControlRejected {
+                                        control: engine::GroupControlKind::Update,
+                                    },
+                                );
+                            } else {
+                                break 'drive;
+                            }
                         }
                     }
                     Some(GroupControl::RawEpoch(epoch)) => {
-                        if eng
+                        if let Err(error) = eng
                             .apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes())
-                            .is_err()
                         {
-                            break 'drive;
+                            if matches!(error, crate::voip::GroupMediaError::Pipeline) {
+                                break 'drive;
+                            }
+                            let _ = channels.events.try_send(CallEvent::GroupControlRejected {
+                                control: engine::GroupControlKind::Epoch,
+                            });
                         }
                     }
                     Some(GroupControl::Reaction(emoji)) => {
                         if eng.send_group_reaction(now_ms(), &emoji).is_err() {
-                            break 'drive;
+                            let _ = channels.events.try_send(CallEvent::GroupControlRejected {
+                                control: engine::GroupControlKind::Reaction,
+                            });
                         }
                     }
                     None => group_ctl_open = false,
@@ -891,8 +935,12 @@ async fn run_call_with_clock_and_wallclock(
 mod tests {
     use super::*;
     use crate::runtime::AbortHandle;
+    use crate::types::group_call::{
+        GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
+        GroupCallUpdate,
+    };
     use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
-    use crate::voip::engine::{CallConfig, SequentialTxIds};
+    use crate::voip::engine::{CallConfig, GroupEngineConfig, SequentialTxIds};
     use crate::voip::mlow::MlowEncoder;
     use crate::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
     use crate::voip::{RelayDisconnectReason, stun};
@@ -903,6 +951,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use wacore_binary::{Jid, Server};
 
     /// Runtime whose `sleep` never resolves, so the driver is exercised purely by the relay-event
     /// stream (the timer arm stays pending). `spawn` is unused: the shell spawns `run_call`, not the
@@ -938,6 +987,42 @@ mod tests {
             Ok(())
         }
         async fn disconnect(&self) {}
+    }
+
+    type ReplacementRelay = (
+        Arc<dyn RelayTransport>,
+        async_channel::Receiver<RelayTransportEvent>,
+    );
+
+    struct ReconnectTransport {
+        sent: Mutex<Vec<Bytes>>,
+        reconnects: Mutex<Vec<std::net::SocketAddr>>,
+        replacement: Mutex<Option<ReplacementRelay>>,
+    }
+
+    #[async_trait]
+    impl RelayTransport for ReconnectTransport {
+        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn disconnect(&self) {}
+
+        async fn reconnect(
+            &self,
+            endpoint: std::net::SocketAddr,
+        ) -> anyhow::Result<(
+            Arc<dyn RelayTransport>,
+            async_channel::Receiver<RelayTransportEvent>,
+        )> {
+            self.reconnects.lock().unwrap().push(endpoint);
+            self.replacement
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("replacement already consumed"))
+        }
     }
 
     #[test]
@@ -1001,6 +1086,185 @@ mod tests {
             enable_video: false,
             enable_sframe: false,
         }
+    }
+
+    fn group_relay(transaction_id: u32, ip: &str, port: u16) -> GroupCallRelay {
+        GroupCallRelay {
+            transaction_id: Some(transaction_id),
+            self_pid: Some(1),
+            uuid: "relay".to_string(),
+            participant_uuid: "participant".to_string(),
+            attribute_padding: false,
+            warp_mi_tag_len: Some(4),
+            key: b"relay-key".to_vec(),
+            hbh_key: Vec::new(),
+            tokens: vec![vec![0x47]],
+            auth_tokens: vec![vec![0x57]],
+            endpoints: vec![GroupCallRelayEndpoint {
+                relay_id: 1,
+                token_id: 0,
+                auth_token_id: 0,
+                relay_name: "relay-1".to_string(),
+                domain_name: None,
+                rtt_ms: None,
+                is_fna: false,
+                address: Vec::new(),
+                ipv4: Some(ip.to_string()),
+                port: Some(port),
+            }],
+        }
+    }
+
+    fn group_update(transaction_id: u32, ip: &str, port: u16) -> GroupCallUpdate {
+        let self_jid = Jid::new("111111111111111", Server::Lid);
+        let mut self_device = GroupCallDevice::new(self_jid.clone());
+        self_device.pid = Some(1);
+        let mut participant = GroupCallParticipant::new(self_jid.to_non_ad(), vec![self_device]);
+        participant.state = "connected".to_string();
+        GroupCallUpdate::builder()
+            .call_id("00abcdef0123456789abcdef01234567".to_string())
+            .call_creator(self_jid)
+            .transaction_id(transaction_id)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .relay(group_relay(transaction_id, ip, port))
+            .build()
+    }
+
+    fn group_engine() -> CallEngine {
+        let update = group_update(7, "203.0.113.7", 3478);
+        let mut config = CallConfig::for_group(
+            CallDirection::Outgoing,
+            &update.call_id,
+            "111111111111111@lid",
+            "111111111111111@lid",
+            update.relay.as_ref().expect("relay"),
+        )
+        .expect("group config");
+        config.audio = crate::voip::AudioConfig::MLOW_PCM;
+        let mut engine =
+            CallEngine::new(config, Box::new(SequentialTxIds::new())).expect("group engine");
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: update.call_creator.clone(),
+                initial_update: update,
+                direct_peer: None,
+            })
+            .expect("configure group");
+        engine
+    }
+
+    #[test]
+    fn group_relay_migration_redials_transport_before_reallocation() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let replacement = Arc::new(RecordingTransport::default());
+        let (replacement_tx, replacement_rx) = async_channel::unbounded();
+        replacement_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let transport = Arc::new(ReconnectTransport {
+            sent: Mutex::new(Vec::new()),
+            reconnects: Mutex::new(Vec::new()),
+            replacement: Mutex::new(Some((
+                replacement.clone() as Arc<dyn RelayTransport>,
+                replacement_rx,
+            ))),
+        });
+        let (_initial_tx, initial_rx) = async_channel::unbounded();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::Update(Box::new(group_update(
+                8,
+                "203.0.113.8",
+                3481,
+            ))))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            initial_rx,
+            channels,
+            group_engine(),
+        ));
+
+        assert_eq!(
+            *transport.reconnects.lock().unwrap(),
+            ["203.0.113.8:3481".parse().unwrap()]
+        );
+        assert!(
+            replacement
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_ALLOCATE_REQUEST)),
+            "the replacement transport must carry the fresh allocate"
+        );
+    }
+
+    #[test]
+    fn rejected_group_control_does_not_terminate_the_driver() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let binding =
+            stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[9u8; 12], &[], None, false);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(binding)))
+            .unwrap();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::Reaction("x".repeat(1024)))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            group_engine(),
+        ));
+
+        assert!(
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_BINDING_SUCCESS)),
+            "the driver must keep processing relay traffic after rejecting a control"
+        );
+        assert!(
+            std::iter::from_fn(|| ev_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                CallEvent::GroupControlRejected {
+                    control: engine::GroupControlKind::Reaction
+                }
+            ))
+        );
     }
 
     // The driver wiring: start sends the allocate, an inbound binding request gets a binding-success

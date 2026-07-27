@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use subtle::ConstantTimeEq;
 use wacore_binary::Jid;
+use zeroize::Zeroize;
 
 use crate::types::group_call::{
     GROUP_CALL_MAX_PARTICIPANTS, GroupCallDevice, GroupCallParticipant, GroupCallUpdate,
@@ -43,7 +44,7 @@ impl EpochKey {
 
 impl Drop for EpochKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -249,6 +250,7 @@ impl GroupMediaRegistry {
                         true,
                     )?;
                     rebuilt.audio = existing.audio.take();
+                    rebuilt.app_data = existing.app_data.take();
                     rebuilt
                 } else {
                     existing
@@ -312,16 +314,16 @@ impl GroupMediaRegistry {
             .roster_transaction
             .is_none_or(|roster| transaction_id > roster)
         {
-            if self.pending_epochs.len() >= MAX_BUFFERED_EPOCHS {
-                let Some(oldest) = self.pending_epochs.keys().next().copied() else {
-                    return Err(GroupMediaError::InvalidEpoch);
-                };
-                self.pending_epochs.remove(&oldest);
-            }
             self.pending_epochs.insert(
                 transaction_id,
                 EpochKey::new(raw_epoch).ok_or(GroupMediaError::InvalidEpoch)?,
             );
+            if self.pending_epochs.len() > MAX_BUFFERED_EPOCHS {
+                let Some(farthest) = self.pending_epochs.keys().next_back().copied() else {
+                    return Err(GroupMediaError::InvalidEpoch);
+                };
+                self.pending_epochs.remove(&farthest);
+            }
             return Ok(GroupEpochApply::Buffered);
         }
 
@@ -529,7 +531,7 @@ impl GroupMediaRegistry {
                     call_key: key,
                     self_lid: &self.self_lid,
                     peer_lid: &participant_id,
-                    ssrc: derive_video_participant_ssrc(&self.call_id, &self.self_lid),
+                    ssrc: video_ssrc,
                     ts_stride: self.video_ts_stride,
                     warp_mi_tag_len: self.warp_mi_tag_len,
                 })
@@ -892,5 +894,53 @@ mod tests {
             registry.apply_raw_epoch(4, &[0x33; 32]).unwrap(),
             GroupEpochApply::Stale
         );
+    }
+
+    #[test]
+    fn future_epoch_buffer_evicts_the_farthest_transaction() {
+        let mut registry = registry();
+        for transaction in 1..=(MAX_BUFFERED_EPOCHS as u32 + 2) {
+            assert_eq!(
+                registry
+                    .apply_raw_epoch(transaction, &[transaction as u8; 32])
+                    .unwrap(),
+                GroupEpochApply::Buffered
+            );
+        }
+        assert_eq!(registry.pending_epochs.len(), MAX_BUFFERED_EPOCHS);
+        assert_eq!(
+            registry.pending_epochs.keys().copied().collect::<Vec<_>>(),
+            (1..=MAX_BUFFERED_EPOCHS as u32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn video_routes_are_participant_specific_for_multiple_devices() {
+        let epoch = [0x57; 32];
+        let alice = Jid::new("200002", Server::Lid).with_device(2);
+        let bob = Jid::new("300003", Server::Lid).with_device(3);
+        let mut registry = registry();
+        registry
+            .apply_group_update(&update(
+                1,
+                vec![
+                    device("100001", 1, 1),
+                    device("200002", 2, 2),
+                    device("300003", 3, 3),
+                ],
+            ))
+            .unwrap();
+        registry.apply_raw_epoch(1, &epoch).unwrap();
+
+        let access_unit = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21];
+        for peer in [&alice, &bob] {
+            let packets = peer_video_sender(&epoch, peer).protect_video(&access_unit);
+            let decoded = packets
+                .iter()
+                .find_map(|packet| registry.unprotect_video(packet))
+                .expect("participant video packet");
+            assert_eq!(decoded.device_jid, *peer);
+            assert_eq!(decoded.access_units, [access_unit.to_vec()]);
+        }
     }
 }

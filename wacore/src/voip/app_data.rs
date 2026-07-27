@@ -211,5 +211,44 @@ mod tests {
             encode_reaction(0, "x").unwrap_err(),
             AppDataError::MissingTransaction
         );
+
+        assert_eq!(
+            encode_reaction(1, &"x".repeat(MAX_REACTION_BYTES + 1)).unwrap_err(),
+            AppDataError::TooLarge
+        );
+        assert_eq!(
+            decode_reactions(&vec![0; MAX_APP_DATA_BYTES + 1]).unwrap_err(),
+            AppDataError::TooLarge
+        );
+
+        let wrap_reaction = |emoji: &[u8]| {
+            let mut reaction = Vec::new();
+            append_varint_field(&mut reaction, 1, 1);
+            append_bytes_field(&mut reaction, 2, emoji);
+            let mut message = Vec::new();
+            append_bytes_field(&mut message, 1, &reaction);
+            let mut payload = Vec::new();
+            append_bytes_field(&mut payload, 1, &message);
+            payload
+        };
+        assert_eq!(
+            decode_reactions(&wrap_reaction(&vec![b'x'; MAX_REACTION_BYTES + 1])).unwrap_err(),
+            AppDataError::TooLarge
+        );
+        assert_eq!(
+            decode_reactions(&wrap_reaction(&[0xff])).unwrap_err(),
+            AppDataError::InvalidUtf8
+        );
+
+        let mut oversized_length = vec![0x0a];
+        append_varint(&mut oversized_length, u64::MAX);
+        assert_eq!(
+            decode_reactions(&oversized_length).unwrap_err(),
+            AppDataError::TooLarge
+        );
+        assert_eq!(
+            decode_reactions(&[0x80; 10]).unwrap_err(),
+            AppDataError::Malformed
+        );
     }
 }

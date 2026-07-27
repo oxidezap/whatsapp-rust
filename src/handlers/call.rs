@@ -27,7 +27,11 @@ use wacore::voip::{CallEvent, PeerVideoTransition, VideoControl};
 #[cfg(feature = "voip-runtime")]
 use wacore_binary::Jid;
 use wacore_binary::{OwnedNodeRef, Server};
+#[cfg(feature = "voip-runtime")]
+use zeroize::Zeroize;
 
+#[cfg(feature = "voip-runtime")]
+use crate::client::CallError;
 use crate::client::Client;
 
 use super::traits::StanzaHandler;
@@ -200,10 +204,12 @@ impl StanzaHandler for CallHandler {
                     if matches!(
                         &call.action,
                         CallAction::PreAccept { .. } | CallAction::Accept { .. }
-                    ) && let Some(capability) = nr
-                        .children()
-                        .and_then(|children| children.first())
-                        .and_then(|action| action.get_optional_child("capability"))
+                    ) && let Some(generation) =
+                        client.call_registry().generation_of(call.action.call_id())
+                        && let Some(capability) = nr
+                            .children()
+                            .and_then(|children| children.first())
+                            .and_then(|action| action.get_optional_child("capability"))
                         && let Some(bytes) =
                             capability.content_bytes().filter(|bytes| !bytes.is_empty())
                     {
@@ -214,6 +220,7 @@ impl StanzaHandler for CallHandler {
                             .unwrap_or(1);
                         client.call_registry().set_group_invite_peer_device(
                             call.action.call_id(),
+                            generation,
                             GroupCallDevice::new(call.from.clone())
                                 .with_capability(version, bytes.to_vec()),
                         );
@@ -302,27 +309,40 @@ impl StanzaHandler for CallHandler {
                         CallAction::GroupUpdate { update } => {
                             dispatch_call = match client
                                 .call_registry()
-                                .apply_group_update(update.clone())
+                                .apply_group_update(update.as_ref().clone())
                             {
                                 GroupStateApply::Applied => {
-                                    client
-                                        .call_registry()
-                                        .send_group_update(&update.call_id, update.clone());
+                                    client.call_registry().send_group_update(
+                                        &update.call_id,
+                                        update.as_ref().clone(),
+                                    );
                                     if update.rekey_requested {
                                         match crate::voip::facade::fanout_group_epoch(
                                             &client, update,
                                         )
                                         .await
                                         {
-                                            Ok(raw_epoch) => {
-                                                if !client.call_registry().send_group_epoch(
-                                                    &update.call_id,
-                                                    update.transaction_id,
-                                                    raw_epoch,
-                                                ) {
+                                            Ok(fanout) => {
+                                                if let Err(error) = fanout.commit(|epoch| {
+                                                    client
+                                                        .call_registry()
+                                                        .send_group_epoch(
+                                                            &update.call_id,
+                                                            update.transaction_id,
+                                                            epoch.to_vec(),
+                                                        )
+                                                        .then_some(())
+                                                        .ok_or(CallError::Media(
+                                                            "local group epoch consumer closed",
+                                                        ))
+                                                }) {
                                                     warn!(
-                                                        "call: local group epoch consumer closed for {}",
+                                                        "call: failed to commit requested group epoch for {}: {error}",
                                                         update.call_id
+                                                    );
+                                                    client.call_registry().send_call_event(
+                                                        &update.call_id,
+                                                        CallEvent::GroupRekeyFailed,
                                                     );
                                                 }
                                             }
@@ -331,12 +351,16 @@ impl StanzaHandler for CallHandler {
                                                     "call: failed to distribute requested group epoch for {}: {error}",
                                                     update.call_id
                                                 );
+                                                client.call_registry().send_call_event(
+                                                    &update.call_id,
+                                                    CallEvent::GroupRekeyFailed,
+                                                );
                                             }
                                         }
                                     }
                                     client.call_registry().send_call_event(
                                         &update.call_id,
-                                        CallEvent::GroupUpdated(Box::new(update.clone())),
+                                        CallEvent::GroupUpdated(update.clone()),
                                     );
                                     true
                                 }
@@ -703,14 +727,14 @@ async fn decrypt_group_epoch(
         waproto::codec::message_decode(unpadded)
             .map_err(|error| anyhow::anyhow!("message decode failed: {error}"))
     });
-    plaintext.fill(0);
+    plaintext.zeroize();
     let mut raw_epoch = decoded?
         .call
         .into_option()
         .and_then(|call| call.call_key)
         .ok_or_else(|| anyhow::anyhow!("message has no call key"))?;
     if raw_epoch.len() < 32 {
-        raw_epoch.fill(0);
+        raw_epoch.zeroize();
         anyhow::bail!("call key is shorter than 32 bytes");
     }
     Ok(raw_epoch)

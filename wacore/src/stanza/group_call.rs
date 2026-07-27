@@ -78,6 +78,7 @@ pub fn build_active_group_accept(
     call_id: &str,
     call_creator: &Jid,
     request_id: &str,
+    video: bool,
 ) -> Result<Node> {
     validate_call_identity(call_id, request_id, call_creator)?;
     Ok(build_accept(&AcceptParams {
@@ -90,7 +91,7 @@ pub fn build_active_group_accept(
         rte: None,
         voip_settings: None,
         capability: None,
-        video: false,
+        video,
         peer_abtest_bucket: None,
         peer_abtest_bucket_id_list: None,
     }))
@@ -200,7 +201,10 @@ fn build_group_users(
                     }
                     let mut builder = NodeBuilder::new("device").attr("jid", &device.jid);
                     if !device.capability.is_empty() {
-                        let capability = if video && video_creator == Some(&device.jid) {
+                        let capability = if video
+                            && video_creator.is_some_and(|creator| {
+                                creator.to_non_ad() == device.jid.to_non_ad()
+                            }) {
                             if device.capability == CAPABILITY_OFFER {
                                 CAPABILITY_VIDEO_OFFER.to_vec()
                             } else if device.capability == CAPABILITY_STANDARD_OPUS_OFFER {
@@ -468,7 +472,9 @@ fn parse_indexed_tokens(children: &[NodeRef<'_>], tag: &str) -> Vec<Vec<u8>> {
         if index >= MAX_RELAY_TOKENS {
             continue;
         }
-        values.resize_with(index + 1, Vec::new);
+        if values.len() <= index {
+            values.resize_with(index + 1, Vec::new);
+        }
         values[index] = value.to_vec();
     }
     values
@@ -651,17 +657,21 @@ pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> 
     let media = parse_call_link_media(required_string(&mut attrs, "media", "link_query")?)?;
     let creator = required_jid(&mut attrs, "link_creator", "link_query")?;
     let creator_pn = attrs.optional_jid("link_creator_pn");
-    let waiting = child
-        .get_optional_child("waiting_room")
-        .ok_or_else(|| anyhow!("<link_query> ack missing <waiting_room>"))?;
-    let mut waiting_attrs = waiting.attrs();
+    let waiting = child.get_optional_child("waiting_room");
+    let (waiting_room_enabled, is_admin) = waiting.map_or((false, false), |waiting| {
+        let mut attrs = waiting.attrs();
+        (
+            bool_attr(&mut attrs, "enabled"),
+            bool_attr(&mut attrs, "is_admin"),
+        )
+    });
     Ok(CallLinkPreview {
         token,
         media,
         creator,
         creator_pn,
-        waiting_room_enabled: bool_attr(&mut waiting_attrs, "enabled"),
-        is_admin: bool_attr(&mut waiting_attrs, "is_admin"),
+        waiting_room_enabled,
+        is_admin,
     })
 }
 
@@ -673,31 +683,29 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>) -> Result<CallLinkJoin> {
         .map(parse_waiting_room)
         .transpose()?;
     let group = parse_initial_group_call_ack(node)?;
-    if waiting.is_none() && group.is_none() {
-        bail!("<link_join> ack has neither waiting_room nor group_info");
-    }
-
     let (token, media, call_id, call_creator, waiting_room_enabled, is_admin) =
-        if let Some(waiting) = &waiting {
-            (
+        match (&waiting, &group) {
+            (Some(waiting), _) => (
                 waiting.link_token.clone(),
                 waiting.media,
                 waiting.call_id.clone(),
                 waiting.call_creator.clone(),
                 waiting.enabled,
                 waiting.is_admin,
-            )
-        } else {
-            let group = group.as_ref().expect("checked above");
-            (
+            ),
+            (None, Some(group)) => (
                 String::new(),
                 parse_call_link_media(group.media.clone())?,
                 group.call_id.clone(),
                 group.call_creator.clone(),
                 false,
                 false,
-            )
+            ),
+            (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
         };
+    if group.is_none() && !waiting_room_enabled {
+        bail!("<link_join> waiting-room-only ack is not enabled");
+    }
     if let Some(group) = &group
         && (group.call_id != call_id || group.call_creator != call_creator)
     {
@@ -778,27 +786,33 @@ pub fn build_waiting_room_toggle(
     creator: &Jid,
     enabled: bool,
     request_id: &str,
-) -> Node {
-    build_waiting_room_request(
+) -> Result<Node> {
+    validate_call_identity(call_id, request_id, creator)?;
+    Ok(build_waiting_room_request(
         "waiting_room_toggle",
         call_id,
         creator,
         request_id,
         [("enabled", if enabled { "1" } else { "0" })],
         Vec::new(),
-    )
+    ))
 }
 
 /// Keep a pending call-link join alive.
-pub fn build_waiting_room_heartbeat(call_id: &str, creator: &Jid, request_id: &str) -> Node {
-    build_waiting_room_request(
+pub fn build_waiting_room_heartbeat(
+    call_id: &str,
+    creator: &Jid,
+    request_id: &str,
+) -> Result<Node> {
+    validate_call_identity(call_id, request_id, creator)?;
+    Ok(build_waiting_room_request(
         "heartbeat",
         call_id,
         creator,
         request_id,
         [("type", "waiting_room")],
         Vec::new(),
-    )
+    ))
 }
 
 /// Admit one pending waiting-room user.
@@ -807,12 +821,19 @@ pub fn build_waiting_room_admit(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Node {
+) -> Result<Node> {
+    validate_call_identity(call_id, request_id, creator)?;
     build_waiting_room_user_action("waiting_room_admit", call_id, creator, user, request_id)
 }
 
 /// Deny one pending waiting-room user.
-pub fn build_waiting_room_deny(call_id: &str, creator: &Jid, user: &Jid, request_id: &str) -> Node {
+pub fn build_waiting_room_deny(
+    call_id: &str,
+    creator: &Jid,
+    user: &Jid,
+    request_id: &str,
+) -> Result<Node> {
+    validate_call_identity(call_id, request_id, creator)?;
     build_waiting_room_user_action("waiting_room_deny", call_id, creator, user, request_id)
 }
 
@@ -837,15 +858,18 @@ fn build_waiting_room_user_action(
     creator: &Jid,
     user: &Jid,
     request_id: &str,
-) -> Node {
-    build_waiting_room_request(
+) -> Result<Node> {
+    if user.user.is_empty() {
+        bail!("waiting-room user is required");
+    }
+    Ok(build_waiting_room_request(
         tag,
         call_id,
         creator,
         request_id,
         [],
         vec![NodeBuilder::new("user").attr("jid", user).build()],
-    )
+    ))
 }
 
 fn build_waiting_room_request<const N: usize>(
@@ -875,8 +899,12 @@ pub fn build_raise_hand(
     creator: &Jid,
     request_id: &str,
     raised: bool,
-) -> Node {
-    call_wrap(
+) -> Result<Node> {
+    validate_call_identity(call_id, request_id, creator)?;
+    if to.user.is_empty() {
+        bail!("raise-hand target is required");
+    }
+    Ok(call_wrap(
         to,
         request_id,
         NodeBuilder::new("user_action")
@@ -887,7 +915,7 @@ pub fn build_raise_hand(
                 .attr("raise-hand-state", if raised { "1" } else { "0" })
                 .build()])
             .build(),
-    )
+    ))
 }
 
 /// Parse a persistent raise/lower-hand transition.
@@ -922,7 +950,11 @@ pub fn build_screen_share(
     request_id: &str,
     state: ScreenShareState,
     screen_share_id: Option<u32>,
-) -> Node {
+) -> Result<Node> {
+    validate_call_identity(call_id, request_id, creator)?;
+    if to.user.is_empty() {
+        bail!("screen-share target is required");
+    }
     let mut action = NodeBuilder::new("screen_share")
         .attr("call-id", call_id)
         .attr("call-creator", creator)
@@ -931,7 +963,7 @@ pub fn build_screen_share(
     if let Some(id) = screen_share_id {
         action = action.attr("screen_share_id", id.to_string());
     }
-    call_wrap(to, request_id, action.build())
+    Ok(call_wrap(to, request_id, action.build()))
 }
 
 /// Parse one versioned screen-share transition.
@@ -1196,7 +1228,7 @@ mod tests {
 
     #[test]
     fn initial_group_video_offer_preserves_standard_opus_capability_family() {
-        let creator = jid("100001", 1);
+        let creator = jid("100001", 0);
         let participants = [
             participant("100001", 1, &CAPABILITY_STANDARD_OPUS_OFFER),
             participant("200002", 2, &CAPABILITY_OFFER),
@@ -1312,12 +1344,15 @@ mod tests {
             ["audio", "video", "encopt", "capability"]
         );
 
-        let accept = build_active_group_accept("ACTIVE-CALL", &creator, "ACCEPT-ID").unwrap();
+        let accept = build_active_group_accept("ACTIVE-CALL", &creator, "ACCEPT-ID", true).unwrap();
         assert_eq!(
             accept.as_node_ref().attrs().optional_jid("to").unwrap(),
             Jid::new("ACTIVE-CALL", Server::Call)
         );
-        assert_eq!(child_tags(action(&accept)), ["audio", "net", "encopt"]);
+        assert_eq!(
+            child_tags(action(&accept)),
+            ["audio", "video", "net", "encopt"]
+        );
         assert!(
             action(&accept)
                 .as_node_ref()
@@ -1526,6 +1561,15 @@ mod tests {
             child_tags(action(&join)),
             ["audio", "video", "net", "capability"]
         );
+        let query = build_call_link_query("TOKEN", CallLinkMedia::Audio, "REQ-QUERY").unwrap();
+        assert_eq!(
+            action(&query)
+                .attrs
+                .get("token")
+                .map(|value| value.as_str().into_owned())
+                .as_deref(),
+            Some("TOKEN")
+        );
         let standard_join = build_call_link_join_with_capability(
             "TOKEN",
             CallLinkMedia::Audio,
@@ -1549,11 +1593,63 @@ mod tests {
             build_waiting_room_admit("CID", &creator, &user, "REQ-4"),
             build_waiting_room_deny("CID", &creator, &user, "REQ-5"),
         ] {
+            let node = node.expect("valid waiting-room request");
             assert_eq!(
                 node.attrs.get("to").and_then(|value| value.to_jid()),
                 Some(Jid::new("CID", Server::Call))
             );
         }
+        assert!(build_waiting_room_heartbeat("", &creator, "REQ-6").is_err());
+        assert!(
+            build_raise_hand("CID", &Jid::new("", Server::Call), &creator, "REQ-7", true,).is_err()
+        );
+        assert!(
+            build_screen_share(
+                "CID",
+                &Jid::new("CID", Server::Call),
+                &creator,
+                "",
+                ScreenShareState::Started,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn call_link_query_ack_allows_missing_waiting_room() {
+        let creator = jid("100001", 1);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "link_query")
+            .children([NodeBuilder::new("link_query")
+                .attr("token", "TOKEN")
+                .attr("media", "audio")
+                .attr("link_creator", &creator)
+                .build()])
+            .build();
+        let preview = parse_call_link_query_ack(&ack.as_node_ref()).expect("valid query ack");
+        assert!(!preview.waiting_room_enabled);
+        assert!(!preview.is_admin);
+    }
+
+    #[test]
+    fn relay_tokens_preserve_out_of_order_entries() {
+        let children = [
+            NodeBuilder::new("token")
+                .attr("id", "2")
+                .bytes(b"two".to_vec())
+                .build(),
+            NodeBuilder::new("token")
+                .attr("id", "0")
+                .bytes(b"zero".to_vec())
+                .build(),
+        ];
+        let refs = children.iter().map(Node::as_node_ref).collect::<Vec<_>>();
+        assert_eq!(
+            parse_indexed_tokens(&refs, "token"),
+            [b"zero".to_vec(), Vec::new(), b"two".to_vec()]
+        );
     }
 
     #[test]
@@ -1590,6 +1686,20 @@ mod tests {
         let result = parse_call_link_join_ack(&admitted.as_node_ref()).unwrap();
         assert!(!result.in_waiting_room);
         assert_eq!(result.group.unwrap().transaction_id, 5);
+
+        let disabled_waiting_only = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "link_join")
+            .children([NodeBuilder::new("waiting_room")
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .attr("link-token", "TOKEN")
+                .attr("media", "video")
+                .attr("enabled", "0")
+                .attr("is_admin", "0")
+                .build()])
+            .build();
+        assert!(parse_call_link_join_ack(&disabled_waiting_only.as_node_ref()).is_err());
     }
 
     #[test]
@@ -1613,7 +1723,7 @@ mod tests {
     fn participant_controls_round_trip_and_ack_preserves_routing() {
         let creator = jid("100001", 1);
         let target = Jid::new("CID", Server::Call);
-        let raised = build_raise_hand("CID", &target, &creator, "REQ-1", true);
+        let raised = build_raise_hand("CID", &target, &creator, "REQ-1", true).unwrap();
         assert!(parse_raise_hand(&action(&raised).as_node_ref()).unwrap());
 
         let share = build_screen_share(
@@ -1623,7 +1733,8 @@ mod tests {
             "REQ-2",
             ScreenShareState::Started,
             Some(7),
-        );
+        )
+        .unwrap();
         let parsed = parse_screen_share(&action(&share).as_node_ref()).unwrap();
         assert_eq!(parsed.state, ScreenShareState::Started);
         assert_eq!(parsed.version, 2);

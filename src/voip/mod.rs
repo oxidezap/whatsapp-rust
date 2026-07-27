@@ -39,6 +39,8 @@ pub use wacore::voip::{CallEvent, GroupCallState, GroupStateApply, VideoUpgradeT
 // `CallEvent::VideoStateChanged` carries this; surface it next to CallEvent (it lives in wacore).
 pub use wacore::types::call::VideoState;
 pub use wacore::types::group_call::{
-    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallDevice, GroupCallParticipant,
-    GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom, WaitingRoomUser,
+    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GROUP_CALL_MAX_PARTICIPANTS,
+    GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
+    GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
+    WaitingRoomUser,
 };

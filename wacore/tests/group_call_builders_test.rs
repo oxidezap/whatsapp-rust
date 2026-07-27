@@ -11,6 +11,9 @@ fn public_group_call_payloads_are_constructible_with_builders() {
     let device = GroupCallDevice::builder()
         .jid(creator.clone().with_device(1))
         .build();
+    assert!(device.platform.is_none());
+    assert!(device.pid.is_none());
+    assert!(device.capability_version.is_none());
     let participant = GroupCallParticipant::builder()
         .jid(creator.clone())
         .state("connected".to_string())
@@ -85,4 +88,5 @@ fn public_group_call_payloads_are_constructible_with_builders() {
         .version(2)
         .build();
     assert_eq!(share.version, 2);
+    assert!(share.screen_share_id.is_none());
 }

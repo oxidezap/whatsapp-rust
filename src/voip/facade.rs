@@ -39,6 +39,7 @@ use wacore::voip::{
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::client::{CallError, Client, ResponseWaiter};
 use crate::voip::audio::{
@@ -73,6 +74,48 @@ impl AudioEndpoints {
     }
 }
 
+macro_rules! impl_media_builder_methods {
+    () => {
+        /// Provide the microphone source and speaker sink for the call. Channel senders and
+        /// receivers implementing the corresponding endpoint traits can be passed directly.
+        pub fn audio<S, K>(mut self, source: S, sink: K) -> Self
+        where
+            S: AudioSource,
+            K: AudioSink,
+        {
+            self.audio = Some(AudioEndpoints::Pcm {
+                source: Arc::new(source),
+                sink: Arc::new(sink),
+            });
+            self
+        }
+
+        /// Send and receive complete codec payloads instead of using the built-in PCM adapter.
+        pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
+        where
+            S: EncodedAudioSource,
+            K: EncodedAudioSink,
+        {
+            self.audio = Some(AudioEndpoints::Encoded {
+                format,
+                source: Arc::new(source),
+                sink: Arc::new(sink),
+            });
+            self
+        }
+
+        /// Enable video media with an encoded H.264 source and sink.
+        pub fn video<S, K>(mut self, source: S, sink: K) -> Self
+        where
+            S: VideoSource,
+            K: VideoSink,
+        {
+            self.video = Some(VideoEndpoints::new(source, sink));
+            self
+        }
+    };
+}
+
 /// Builder returned by [`Voip::accept`](crate::Voip::accept). Holds the offer and, once
 /// [`audio`](Self::audio) is called, the source/sink; [`start`](Self::start) prepares the engine,
 /// sends the callee's `<preaccept>` then `<accept>`, and starts the media plane. Borrows the
@@ -94,46 +137,7 @@ impl<'a> AcceptCall<'a> {
         }
     }
 
-    /// Provide the microphone source and speaker sink for the call. A bare
-    /// `async_channel::Receiver<Vec<i16>>` / `Sender<Vec<i16>>` works directly (blanket impls).
-    pub fn audio<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: AudioSource,
-        K: AudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Pcm {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    /// Use complete codec payloads instead of the built-in PCM/MLOW adapter. `Bytes` ownership is
-    /// preserved at the external Opus or MLOW boundary; the engine only adds media framing.
-    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
-    where
-        S: EncodedAudioSource,
-        K: EncodedAudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Encoded {
-            format,
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    /// Answer with VIDEO media as well: `source` supplies our encoded H.264 AUs, `sink` receives
-    /// the peer's. Use for a video-from-the-start offer (`CallAction::Offer { is_video: true }`);
-    /// an audio-only call can upgrade later via [`CallHandle::start_video`].
-    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: VideoSource,
-        K: VideoSink,
-    {
-        self.video = Some(VideoEndpoints::new(source, sink));
-        self
-    }
+    impl_media_builder_methods!();
 
     /// Send `<preaccept>`, decrypt the callKey, send `<accept>`, then connect the relay and spawn and
     /// register the call driver. The returned [`CallHandle`] controls the live call. The
@@ -199,6 +203,7 @@ impl<'a> AcceptCall<'a> {
             .group_state(call_id)
             .and_then(|state| state.snapshot().cloned())
             .or_else(|| self.incoming.group.as_deref().cloned());
+        let is_group = group.is_some();
         if self.incoming.media.is_none()
             && group
                 .as_ref()
@@ -207,8 +212,7 @@ impl<'a> AcceptCall<'a> {
         {
             return Err(CallError::Media("offer carried no media block"));
         }
-        let answer_with_video = video.is_some();
-        let peer_jid = if group.is_some() {
+        let peer_jid = if is_group {
             Jid::new(call_id, Server::Call)
         } else {
             self.incoming.from.clone()
@@ -216,7 +220,7 @@ impl<'a> AcceptCall<'a> {
         let mut session =
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
         session.audio_format = Some(audio_config.format);
-        session.is_video = answer_with_video;
+        session.is_video = has_video;
         session.group = group;
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
@@ -228,7 +232,8 @@ impl<'a> AcceptCall<'a> {
         let (preaccept, accept) = build_answer_signaling(
             self.incoming,
             audio_config.format,
-            answer_with_video,
+            has_video,
+            is_group,
             &preaccept_id,
             &accept_id,
         )?;
@@ -237,7 +242,7 @@ impl<'a> AcceptCall<'a> {
             &registration,
             &mut teardown,
             preaccept,
-            self.build_engine(answer_with_video, audio_config),
+            self.build_engine(has_video, audio_config),
         )
         .await?;
         debug_assert_eq!(built_call_id, registration.call_id);
@@ -262,9 +267,7 @@ impl<'a> AcceptCall<'a> {
             video,
         )
         .await?;
-        if self.incoming.group.is_none()
-            && let Some(own_lid) = self.client.lid()
-        {
+        if !is_group && let Some(own_lid) = self.client.lid() {
             self.client.call_registry().set_group_invite_self_device(
                 &handle.call_id,
                 handle.generation,
@@ -272,9 +275,11 @@ impl<'a> AcceptCall<'a> {
                     .with_capability(1, offer_capability(has_video, audio_config.format)),
             );
             if let Some(peer_device) = peer_invite_device {
-                self.client
-                    .call_registry()
-                    .set_group_invite_peer_device(&handle.call_id, peer_device);
+                self.client.call_registry().set_group_invite_peer_device(
+                    &handle.call_id,
+                    handle.generation,
+                    peer_device,
+                );
             }
         }
         Ok(handle)
@@ -406,46 +411,7 @@ impl<'a> OutgoingCall<'a> {
         }
     }
 
-    /// Provide the microphone source and speaker sink for the call. A bare
-    /// `async_channel::Receiver<Vec<i16>>` / `Sender<Vec<i16>>` works directly (blanket impls).
-    pub fn audio<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: AudioSource,
-        K: AudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Pcm {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    /// Send and receive complete codec payloads. The selected format also controls the outgoing
-    /// offer's single audio rate and the engine's RTP payload type/clock.
-    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
-    where
-        S: EncodedAudioSource,
-        K: EncodedAudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Encoded {
-            format,
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    /// Place a VIDEO call: the offer advertises `<video>` and the media plane carries H.264 both
-    /// ways once the call connects. An audio-only call can upgrade later via
-    /// [`CallHandle::start_video`].
-    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: VideoSource,
-        K: VideoSink,
-    {
-        self.video = Some(VideoEndpoints::new(source, sink));
-        self
-    }
+    impl_media_builder_methods!();
 
     /// Resolve a PN callee to its LID, querying the server when the local cache misses so a first-ever
     /// call to a never-messaged contact still works. The cache-only `get_current_lid` returns `None`
@@ -618,39 +584,7 @@ impl<'a> OutgoingGroupCall<'a> {
         self
     }
 
-    pub fn audio<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: AudioSource,
-        K: AudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Pcm {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
-    where
-        S: EncodedAudioSource,
-        K: EncodedAudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Encoded {
-            format,
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: VideoSource,
-        K: VideoSink,
-    {
-        self.video = Some(VideoEndpoints::new(source, sink));
-        self
-    }
+    impl_media_builder_methods!();
 
     /// Resolve all selected users/devices, send one call-scoped offer, wait for the authoritative
     /// relay snapshot, install a requested shared epoch, and start the group media driver.
@@ -677,8 +611,7 @@ impl<'a> OutgoingGroupCall<'a> {
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let own_user = own_lid.to_non_ad();
         let own_pn = self.client.pn().map(|jid| jid.to_non_ad());
-        let mut seen = std::collections::HashSet::new();
-        let mut targets = Vec::with_capacity(self.targets.len());
+        let mut candidates = Vec::with_capacity(self.targets.len());
         for target in self.targets {
             let target = target.to_non_ad();
             if target == own_user || own_pn.as_ref() == Some(&target) {
@@ -689,15 +622,23 @@ impl<'a> OutgoingGroupCall<'a> {
                     "group call target cannot be the local user".to_string(),
                 ));
             }
-            let resolved = match target.server {
-                Server::Lid => target,
+            candidates.push(target);
+        }
+        let resolved = futures::future::join_all(candidates.into_iter().map(|target| async move {
+            match target.server {
+                Server::Lid => Some(target),
                 _ => self
                     .client
                     .resolve_recipient_to_lid(&target)
                     .await
-                    .ok_or(CallError::NoDevices)?
-                    .to_non_ad(),
-            };
+                    .map(|jid| jid.to_non_ad()),
+            }
+        }))
+        .await;
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::with_capacity(resolved.len());
+        for resolved in resolved {
+            let resolved = resolved.ok_or(CallError::NoDevices)?;
             if resolved == own_user {
                 if self.exclude_local_user {
                     continue;
@@ -778,6 +719,10 @@ impl<'a> OutgoingGroupCall<'a> {
         if let Err(error) = self.client.send_node(offer).await {
             return Err(error.into());
         }
+        // From this point the server may have created the call even if the acknowledgement is lost.
+        // Keep teardown armed across the response wait so timeout, cancellation, and malformed acks
+        // explicitly end that server-side call.
+        let mut teardown = GroupOfferTeardown::new(self.client, &call_id, &own_lid);
         let response = match wacore::runtime::timeout(
             &*self.client.runtime,
             OFFER_ACK_RELAY_TIMEOUT,
@@ -793,7 +738,6 @@ impl<'a> OutgoingGroupCall<'a> {
             }
             Err(_) => return Err(CallError::ResponseTimeout),
         };
-        let mut teardown = GroupOfferTeardown::new(self.client, &call_id, &own_lid);
         let update = parse_initial_group_call_ack(response.get())
             .map_err(|error| CallError::Response(error.to_string()))?
             .ok_or_else(|| {
@@ -830,10 +774,13 @@ impl<'a> OutgoingGroupCall<'a> {
             })
             .map_err(|error| CallError::Setup(error.to_string()))?;
         if update.rekey_requested {
-            let mut epoch = fanout_group_epoch(self.client, &update).await?;
-            let applied = engine.apply_group_raw_epoch(update.transaction_id, &epoch);
-            epoch.fill(0);
-            applied.map_err(|error| CallError::Setup(error.to_string()))?;
+            fanout_group_epoch(self.client, &update)
+                .await?
+                .commit(|epoch| {
+                    engine
+                        .apply_group_raw_epoch(update.transaction_id, epoch)
+                        .map_err(|error| CallError::Setup(error.to_string()))
+                })?;
         }
 
         if !self.client.is_connected() {
@@ -874,39 +821,7 @@ impl<'a> GroupBoundCall<'a> {
         }
     }
 
-    pub fn audio<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: AudioSource,
-        K: AudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Pcm {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
-    where
-        S: EncodedAudioSource,
-        K: EncodedAudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Encoded {
-            format,
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: VideoSource,
-        K: VideoSink,
-    {
-        self.video = Some(VideoEndpoints::new(source, sink));
-        self
-    }
+    impl_media_builder_methods!();
 
     /// Resolve the current group roster, exclude this account, and place one group-bound call.
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
@@ -961,39 +876,7 @@ impl<'a> CallLinkCall<'a> {
         }
     }
 
-    pub fn audio<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: AudioSource,
-        K: AudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Pcm {
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
-    where
-        S: EncodedAudioSource,
-        K: EncodedAudioSink,
-    {
-        self.audio = Some(AudioEndpoints::Encoded {
-            format,
-            source: Arc::new(source),
-            sink: Arc::new(sink),
-        });
-        self
-    }
-
-    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
-    where
-        S: VideoSource,
-        K: VideoSink,
-    {
-        self.video = Some(VideoEndpoints::new(source, sink));
-        self
-    }
+    impl_media_builder_methods!();
 
     /// Join, wait for admission when required, and attach the shared relay media engine.
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
@@ -1045,7 +928,7 @@ impl<'a> CallLinkCall<'a> {
                 .listen_group_update(&join.call_id, generation)
                 .ok_or(CallError::Media("call-link ended before admission"))?;
             if let Some(update) = registry
-                .group_state(&join.call_id)
+                .group_state_if_current(&join.call_id, generation)
                 .and_then(|state| state.snapshot().cloned())
                 .filter(|update| update.relay.is_some())
             {
@@ -1172,6 +1055,7 @@ fn build_answer_signaling(
     incoming: &IncomingCall,
     audio: AudioFormat,
     video: bool,
+    is_group: bool,
     preaccept_id: &str,
     accept_id: &str,
 ) -> Result<(wacore_binary::Node, wacore_binary::Node), CallError> {
@@ -1186,7 +1070,7 @@ fn build_answer_signaling(
     let audio_rate = audio.signaling_rate.to_string();
     let audio_rates = [audio_rate.as_str()];
     let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
-    let target = if incoming.group.is_some() {
+    let target = if is_group {
         Jid::new(call_id, Server::Call)
     } else {
         incoming.from.clone()
@@ -1243,7 +1127,14 @@ async fn send_answer_signaling_with_ids(
     teardown: &mut AnswerTeardown,
     ids: (&str, &str),
 ) -> Result<(), CallError> {
-    let (preaccept, accept) = build_answer_signaling(incoming, audio, video, ids.0, ids.1)?;
+    let (preaccept, accept) = build_answer_signaling(
+        incoming,
+        audio,
+        video,
+        incoming.group.is_some(),
+        ids.0,
+        ids.1,
+    )?;
     send_answer_node(client, registration, teardown, preaccept).await?;
     send_answer_node(client, registration, teardown, accept).await
 }
@@ -1288,10 +1179,29 @@ async fn send_preaccept_then_prepare<T>(
 /// Generate one shared group epoch, Signal-encrypt it independently to every connected remote
 /// PID-bearing device, and send every direct `enc_rekey`. The caller installs the returned root
 /// locally only after the complete fan-out succeeds.
+pub(crate) struct GroupEpochFanout {
+    raw_epoch: Zeroizing<Vec<u8>>,
+    teardown: GroupRekeyTeardown,
+}
+
+impl GroupEpochFanout {
+    /// Commit the local epoch before disarming partial-fanout teardown. If `apply` fails or this
+    /// future's caller is cancelled before calling `commit`, dropping the guard terminates the call.
+    pub(crate) fn commit<T>(
+        mut self,
+        apply: impl FnOnce(&[u8]) -> Result<T, CallError>,
+    ) -> Result<T, CallError> {
+        let result = apply(&self.raw_epoch)?;
+        self.teardown.disarm();
+        Ok(result)
+    }
+}
+
 pub(crate) async fn fanout_group_epoch(
     client: &Client,
     update: &GroupCallUpdate,
-) -> Result<Vec<u8>, CallError> {
+) -> Result<GroupEpochFanout, CallError> {
+    let generation = client.call_registry().generation_of(&update.call_id);
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let self_id = own_lid.to_string();
     let mut seen = std::collections::HashSet::new();
@@ -1307,32 +1217,37 @@ pub(crate) async fn fanout_group_epoch(
         })
         .map(|device| device.jid.clone())
         .collect::<Vec<_>>();
-    if recipients.is_empty() {
-        return Err(CallError::Media(
-            "group rekey has no connected remote devices",
-        ));
+    if !recipients.is_empty() {
+        client
+            .signal()
+            .assert_sessions(&recipients)
+            .await
+            .map_err(|error| CallError::Setup(error.to_string()))?;
     }
-    client
-        .signal()
-        .assert_sessions(&recipients)
-        .await
-        .map_err(|error| CallError::Setup(error.to_string()))?;
 
-    let mut raw_epoch = rand::random::<[u8; 32]>().to_vec();
-    let mut padded = MessageUtils::encode_and_pad(&wa::Message {
+    let raw_epoch = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
+    let mut message = wa::Message {
         call: buffa::MessageField::some(wa::message::Call {
-            call_key: Some(raw_epoch.clone()),
+            call_key: Some(raw_epoch.to_vec()),
             ..Default::default()
         }),
         ..Default::default()
-    });
+    };
+    let padded = Zeroizing::new(MessageUtils::encode_and_pad(&message));
+    if let Some(call) = message.call.as_option_mut()
+        && let Some(call_key) = call.call_key.as_mut()
+    {
+        call_key.zeroize();
+    }
+    if recipients.is_empty() {
+        return Ok(GroupEpochFanout {
+            raw_epoch,
+            teardown: GroupRekeyTeardown::new(client, update, generation, false),
+        });
+    }
     let encrypted = {
         let lock_jids = client.build_session_lock_keys(&recipients).await;
-        let session_mutexes = client.session_mutexes_for(&lock_jids).await;
-        let mut session_guards = Vec::with_capacity(session_mutexes.len());
-        for mutex in &session_mutexes {
-            session_guards.push(mutex.lock().await);
-        }
+        let session_guards = client.session_guards_for(&lock_jids).await;
         let plan = wacore::send::SessionPlan::assume_ready(recipients.len());
         let mut adapter = client.signal_adapter().await;
         let mut stores = adapter.as_signal_stores();
@@ -1348,32 +1263,18 @@ pub(crate) async fn fanout_group_epoch(
         drop(session_guards);
         encrypted
     };
-    padded.fill(0);
-    let encrypted = match encrypted {
-        Ok(encrypted) => encrypted,
-        Err(error) => {
-            raw_epoch.fill(0);
-            return Err(error);
-        }
-    };
+    let encrypted = encrypted?;
     let device = client.persistence_manager().get_device_snapshot();
     let device_identity = wacore::send::needs_device_identity(
         encrypted.includes_prekey_message,
         device.account.as_deref(),
     )
-    .map_err(|_| {
-        raw_epoch.fill(0);
-        CallError::MissingDeviceIdentity
-    })?;
+    .map_err(|_| CallError::MissingDeviceIdentity)?;
     client
         .persist_signal_state_pre_wire()
         .await
-        .map_err(|error| {
-            raw_epoch.fill(0);
-            CallError::Setup(error.to_string())
-        })?;
+        .map_err(|error| CallError::Setup(error.to_string()))?;
     if encrypted.devices.len() != recipients.len() {
-        raw_epoch.fill(0);
         return Err(CallError::Media(
             "group epoch encryption did not cover every recipient",
         ));
@@ -1385,10 +1286,9 @@ pub(crate) async fn fanout_group_epoch(
             .devices
             .iter()
             .find(|encrypted| encrypted.device_jid == *recipient)
-            .ok_or_else(|| {
-                raw_epoch.fill(0);
-                CallError::Media("group epoch encryption omitted a recipient")
-            })?;
+            .ok_or(CallError::Media(
+                "group epoch encryption omitted a recipient",
+            ))?;
         nodes.push(
             wacore::stanza::group_call::build_group_enc_rekey(
                 &wacore::stanza::group_call::GroupEncRekeyParams {
@@ -1405,19 +1305,17 @@ pub(crate) async fn fanout_group_epoch(
                     device_identity: device_identity.as_deref(),
                 },
             )
-            .map_err(|error| {
-                raw_epoch.fill(0);
-                CallError::Response(error.to_string())
-            })?,
+            .map_err(|error| CallError::Response(error.to_string()))?,
         );
     }
+    let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     for node in nodes {
-        if let Err(error) = client.send_node(node).await {
-            raw_epoch.fill(0);
-            return Err(error.into());
-        }
+        client.send_node(node).await?;
     }
-    Ok(raw_epoch)
+    Ok(GroupEpochFanout {
+        raw_epoch,
+        teardown,
+    })
 }
 
 /// Drain every dormant outgoing call (relay never arrived) and notify each one's `ended` so any
@@ -1718,6 +1616,8 @@ const MIC_CHANNEL_CAPACITY: usize = 3;
 /// Lifecycle events (RelayAllocated/Failed/TimedOut) are emitted before media flows, so they are
 /// never dropped, and call teardown is driven by the `ended` flag, not this channel.
 const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
+/// Signaling controls are rare, but the queue stays bounded against a stalled media task.
+const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
 
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
@@ -2047,6 +1947,69 @@ struct GroupOfferTeardown {
     armed: bool,
 }
 
+struct GroupRekeyTeardown {
+    client: std::sync::Weak<Client>,
+    call_id: String,
+    call_creator: Jid,
+    generation: Option<u64>,
+    armed: bool,
+}
+
+impl GroupRekeyTeardown {
+    fn new(
+        client: &Client,
+        update: &GroupCallUpdate,
+        generation: Option<u64>,
+        armed: bool,
+    ) -> Self {
+        Self {
+            client: client_weak(client),
+            call_id: update.call_id.clone(),
+            call_creator: update.call_creator.clone(),
+            generation,
+            armed,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupRekeyTeardown {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let call_id = self.call_id.clone();
+        let call_creator = self.call_creator.clone();
+        let claimed = self.generation.is_none_or(|generation| {
+            let pending =
+                take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
+            let removed = client
+                .call_registry()
+                .remove_if_current(&call_id, generation);
+            if let Some(pending) = pending {
+                pending.ended.notify();
+            }
+            removed
+        });
+        if !claimed {
+            return;
+        }
+        let runtime = client.runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                let target = Jid::new(&call_id, Server::Call);
+                send_answer_terminate(&client, &call_id, &target, &call_creator).await;
+            }))
+            .detach();
+    }
+}
+
 impl GroupOfferTeardown {
     fn new(client: &Client, call_id: &str, call_creator: &Jid) -> Self {
         Self {
@@ -2295,7 +2258,7 @@ async fn attach_engine(
     // self LID and never rekeys).
     rekey_rx: Option<async_channel::Receiver<String>>,
 ) -> Result<(), CallError> {
-    let (group_tx, group_rx) = async_channel::unbounded();
+    let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
     client
         .call_registry()
         .set_group_control_sender(call_id, generation, group_tx);
@@ -2852,17 +2815,23 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         client
             .voip()
-            .set_hand_raised(&self.call_id, &self.call_creator, raised)
+            .set_hand_raised_for_generation(
+                &self.call_id,
+                &self.call_creator,
+                self.generation,
+                raised,
+            )
             .await
     }
 
     /// Send an RTC reaction; an empty string removes the local participant's previous reaction.
     pub fn send_reaction(&self, emoji: impl Into<String>) -> Result<(), CallError> {
         self.ensure_current()?;
-        if self
-            .client_registry
-            .send_group_reaction(&self.call_id, emoji.into())
-        {
+        if self.client_registry.send_group_reaction_if_current(
+            &self.call_id,
+            self.generation,
+            emoji.into(),
+        ) {
             Ok(())
         } else {
             Err(CallError::Media("group app-data stream is unavailable"))
@@ -2875,9 +2844,10 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         client
             .voip()
-            .set_screen_share(
+            .set_screen_share_for_generation(
                 &self.call_id,
                 &self.call_creator,
+                self.generation,
                 ScreenShareState::Started,
                 screen_share_id,
             )
@@ -2890,9 +2860,10 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         client
             .voip()
-            .set_screen_share(
+            .set_screen_share_for_generation(
                 &self.call_id,
                 &self.call_creator,
+                self.generation,
                 ScreenShareState::Stopped,
                 None,
             )
@@ -3423,6 +3394,45 @@ mod tests {
         wacore::voip::CallSession::new_incoming("CID-FACADE", caller(), caller())
     }
 
+    fn rekey_update(client: &Client, recipients: &[Jid]) -> GroupCallUpdate {
+        let own_lid = client.lid().expect("own lid");
+        let mut own_device = GroupCallDevice::new(own_lid.clone());
+        own_device.pid = Some(1);
+        let mut participants = vec![GroupCallParticipant::new(
+            own_lid.to_non_ad(),
+            vec![own_device],
+        )];
+        participants[0].state = "connected".to_string();
+        participants.extend(recipients.iter().enumerate().map(|(index, recipient)| {
+            let mut device = GroupCallDevice::new(recipient.clone());
+            device.pid = Some(index as u32 + 2);
+            let mut participant = GroupCallParticipant::new(recipient.to_non_ad(), vec![device]);
+            participant.state = "connected".to_string();
+            participant
+        }));
+        GroupCallUpdate::builder()
+            .call_id("00abcdef0123456789abcdef01234567".to_string())
+            .call_creator(own_lid)
+            .transaction_id(7)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(true)
+            .participants(participants)
+            .build()
+    }
+
+    fn register_group_update(client: &Client, update: &GroupCallUpdate) {
+        let mut session = wacore::voip::CallSession::new_incoming(
+            &update.call_id,
+            update.call_creator.clone(),
+            update.call_creator.clone(),
+        );
+        session.group = Some(update.clone());
+        client.call_registry().insert(session);
+    }
+
     fn pcm_audio(source: Arc<dyn AudioSource>, sink: Arc<dyn AudioSink>) -> AudioEndpoints {
         AudioEndpoints::Pcm { source, sink }
     }
@@ -3739,6 +3749,7 @@ mod tests {
             &incoming_offer(false),
             AudioFormat::MLOW_16KHZ_60MS,
             false,
+            false,
             "PREACCEPT-ID",
             "ACCEPT-ID",
         )
@@ -3801,6 +3812,7 @@ mod tests {
             &incoming,
             AudioFormat::MLOW_16KHZ_60MS,
             false,
+            true,
             "PREACCEPT-GROUP-ID",
             "ACCEPT-GROUP-ID",
         )
@@ -3891,6 +3903,7 @@ mod tests {
             &incoming,
             AudioFormat::MLOW_16KHZ_60MS,
             false,
+            false,
             "PREACCEPT-EARLY-ID",
             "ACCEPT-AFTER-PREPARE-ID",
         )
@@ -3934,6 +3947,7 @@ mod tests {
         let (preaccept, accept) = build_answer_signaling(
             &incoming,
             AudioFormat::MLOW_16KHZ_60MS,
+            false,
             false,
             "PREACCEPT-PEER-END-ID",
             "ACCEPT-PEER-END-ID",
@@ -4024,6 +4038,7 @@ mod tests {
             &incoming_offer(true),
             AudioFormat::OPUS_RFC7587_16KHZ_60MS,
             true,
+            false,
             "PREACCEPT-VIDEO-ID",
             "ACCEPT-VIDEO-ID",
         )
@@ -4562,6 +4577,7 @@ mod tests {
         });
         install_noise_transport(&client, socket_transport).await;
         client.set_connected_for_test(true);
+        client.enter_live_mode_for_tests();
         (client, count)
     }
 
@@ -4724,6 +4740,125 @@ mod tests {
         client
             .signal_flush_test_block
             .store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn empty_group_rekey_fanout_still_commits_a_local_epoch() {
+        let (client, sent) = make_sending_client().await;
+        let update = rekey_update(&client, &[]);
+
+        let epoch_len = fanout_group_epoch(&client, &update)
+            .await
+            .expect("empty fanout")
+            .commit(|epoch| Ok(epoch.len()))
+            .expect("local epoch commit");
+
+        assert_eq!(epoch_len, 32);
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            0,
+            "an empty recipient set must initialize only the local epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_group_rekey_send_terminates_instead_of_splitting_the_epoch() {
+        let (client, sent) = make_sending_client_with_failure_after(Some(1)).await;
+        let recipients = [
+            peer_lid(),
+            Jid::new("444444444444444", Server::Lid).with_device(0),
+        ];
+        for recipient in &recipients {
+            seed_peer_session(&client, recipient).await;
+        }
+        let update = rekey_update(&client, &recipients);
+        register_group_update(&client, &update);
+
+        assert!(fanout_group_epoch(&client, &update).await.is_err());
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            2,
+            "the second direct rekey send must exercise the partial-fanout path"
+        );
+        assert!(
+            client.call_registry().snapshot(&update.call_id).is_none(),
+            "a partial fanout must tear down the local generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_rekey_fanout_terminates_the_local_generation() {
+        let (client, _) = make_sending_client().await;
+        let (transport, entered, _release) = gated_send_transport(1, false);
+        install_noise_transport(&client, transport).await;
+        let recipients = [
+            peer_lid(),
+            Jid::new("444444444444444", Server::Lid).with_device(0),
+        ];
+        for recipient in &recipients {
+            seed_peer_session(&client, recipient).await;
+        }
+        let update = rekey_update(&client, &recipients);
+        register_group_update(&client, &update);
+
+        let task = tokio::spawn({
+            let client = client.clone();
+            let update = update.clone();
+            async move { fanout_group_epoch(&client, &update).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("second rekey send must block")
+            .expect("send gate");
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(
+            client.call_registry().snapshot(&update.call_id).is_none(),
+            "cancelling after one direct send must tear down the local generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_stale_group_rekey_fanout_spares_a_replacement_generation() {
+        let (client, _) = make_sending_client().await;
+        let (transport, entered, _release) = gated_send_transport(1, false);
+        install_noise_transport(&client, transport).await;
+        let recipients = [
+            peer_lid(),
+            Jid::new("444444444444444", Server::Lid).with_device(0),
+        ];
+        for recipient in &recipients {
+            seed_peer_session(&client, recipient).await;
+        }
+        let update = rekey_update(&client, &recipients);
+        register_group_update(&client, &update);
+
+        let task = tokio::spawn({
+            let client = client.clone();
+            let update = update.clone();
+            async move { fanout_group_epoch(&client, &update).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("second rekey send must block")
+            .expect("send gate");
+        let replacement_generation = {
+            let mut replacement = wacore::voip::CallSession::new_incoming(
+                &update.call_id,
+                update.call_creator.clone(),
+                update.call_creator.clone(),
+            );
+            replacement.group = Some(update.clone());
+            client.call_registry().insert(replacement)
+        };
+
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            client.call_registry().generation_of(&update.call_id),
+            Some(replacement_generation),
+            "a stale rekey guard must not reap a same-call-id replacement"
+        );
     }
 
     #[tokio::test]

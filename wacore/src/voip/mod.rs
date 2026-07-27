@@ -50,8 +50,8 @@ pub use driver::{
     VideoControlSender, run_call, video_control_channel,
 };
 pub use engine::{
-    CallConfig, CallEngine, CallEvent, EngineError, GroupEngineConfig, Input, Millis, NEVER,
-    Output, SetupError, TxIdSource,
+    CallConfig, CallEngine, CallEvent, EngineError, GroupControlKind, GroupEngineConfig, Input,
+    Millis, NEVER, Output, SetupError, TxIdSource,
 };
 pub use group::{GroupCallState, GroupStateApply};
 pub use group_audio::{
