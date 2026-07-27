@@ -4566,8 +4566,12 @@ mod local_identity_change_on_send {
             .expect("the warm device still encrypts, so the send goes out");
 
             assert!(
-                prepared.had_unregistered_device,
+                prepared.recipient_had_unregistered_device,
                 "the 406 must reach the caller so it can invalidate the device cache"
+            );
+            assert!(
+                !prepared.own_had_unregistered_device,
+                "the 406 came from the recipient's fan-out, not ours"
             );
             // The send is not failed by it: the devices that do have sessions
             // still receive the message, which is what WA Web does too.
@@ -4579,6 +4583,71 @@ mod local_identity_change_on_send {
                 participants.children().expect("children").len(),
                 1,
                 "the warm device is encrypted for, the 406 device is skipped"
+            );
+        }
+
+        /// The recipient's devices and our own companions are two fan-outs over
+        /// two cache entries. A 406 for one of our companions that refreshed the
+        /// recipient would leave our own stale list exactly where it was, and
+        /// the next send would fetch the same absent companion again.
+        #[tokio::test]
+        async fn an_own_companion_406_is_not_blamed_on_the_recipient() {
+            let own_jid: Jid = "5511900000040:0@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "5511900000041:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000040:2@s.whatsapp.net".parse().unwrap();
+
+            // The recipient is warm, so its fan-out never fetches a prekey; the
+            // 406 can only come from our own companion.
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&recipient)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_prekey_error(406);
+            let devices = ResolvedDmDevices::new(
+                vec![recipient.clone(), own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+            let to = recipient.to_non_ad();
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let prepared = prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    account: None,
+                    to: &to,
+                    message: &message,
+                    message_id: "DM_406_3",
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("the recipient still encrypts");
+
+            assert!(
+                prepared.own_had_unregistered_device,
+                "our own companion is the one the server no longer knows"
+            );
+            assert!(
+                !prepared.recipient_had_unregistered_device,
+                "the recipient's fan-out never fetched a prekey, so it cannot have 406'd"
             );
         }
 
@@ -4632,7 +4701,8 @@ mod local_identity_change_on_send {
             .expect("dm stanza");
 
             assert!(
-                !prepared.had_unregistered_device,
+                !prepared.recipient_had_unregistered_device
+                    && !prepared.own_had_unregistered_device,
                 "no prekey fetch happened, so nothing can have reported a 406"
             );
         }
