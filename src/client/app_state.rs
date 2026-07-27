@@ -1260,6 +1260,12 @@ impl Client {
                     )));
                 }
             };
+            if Some(list.name) != patch_name {
+                return Err(anyhow::anyhow!(
+                    "app-state patch response collection mismatch: requested {collection_name}, got {}",
+                    list.name.as_str()
+                ));
+            }
 
             match list.error {
                 None => {
@@ -1722,6 +1728,7 @@ mod send_patch_response_tests {
         client: &Arc<Client>,
         transport: &Arc<crate::transport::mock::CapturingMockTransport>,
         patch_attempts: &AtomicUsize,
+        response_collection: &str,
         mut reply: impl FnMut(usize) -> Option<&'static str>,
     ) {
         let mut frame = 0usize;
@@ -1742,8 +1749,8 @@ mod send_patch_response_tests {
                 0
             };
             let response = match reply(attempt) {
-                Some(code) => collection_error_result(&id, COLLECTION, code),
-                None => empty_sync_result(&id, COLLECTION),
+                Some(code) => collection_error_result(&id, response_collection, code),
+                None => empty_sync_result(&id, response_collection),
             };
             crate::test_utils::answer_iq(client, &id, &response).await;
             frame += 1;
@@ -1753,6 +1760,13 @@ mod send_patch_response_tests {
     /// Drives one `send_app_state_patch` to completion against `reply`, and
     /// reports how many patch IQs reached the wire.
     async fn send_against(reply: impl FnMut(usize) -> Option<&'static str>) -> (Result<()>, usize) {
+        send_against_collection(COLLECTION, reply).await
+    }
+
+    async fn send_against_collection(
+        response_collection: &'static str,
+        reply: impl FnMut(usize) -> Option<&'static str>,
+    ) -> (Result<()>, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         seed_collection(&client, COLLECTION).await;
 
@@ -1766,7 +1780,13 @@ mod send_patch_response_tests {
         };
 
         let patch_attempts = AtomicUsize::new(0);
-        let server = serve_iqs(&client, &transport, &patch_attempts, reply);
+        let server = serve_iqs(
+            &client,
+            &transport,
+            &patch_attempts,
+            response_collection,
+            reply,
+        );
         futures::pin_mut!(server);
         let result = futures::select! {
             result = (&mut send).fuse() => result.expect("the send task should not panic"),
@@ -1774,6 +1794,21 @@ mod send_patch_response_tests {
         };
 
         (result, patch_attempts.load(Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn response_for_a_different_collection_is_rejected() {
+        for error in [None, Some("409")] {
+            let (result, patches) = send_against_collection("regular_high", move |_| error).await;
+            assert!(
+                result.is_err(),
+                "a response for another collection must not accept or absorb this send"
+            );
+            assert_eq!(
+                patches, 1,
+                "a mismatched response must fail before retrying the mutation"
+            );
+        }
     }
 
     /// A 409 means the patch was built on a stale base and did NOT land. A
