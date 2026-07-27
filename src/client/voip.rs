@@ -928,7 +928,9 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
 
-    use crate::client::{CallError, Client};
+    #[cfg(feature = "voip-runtime")]
+    use crate::client::CallError;
+    use crate::client::Client;
 
     #[cfg(feature = "voip-runtime")]
     #[test]
