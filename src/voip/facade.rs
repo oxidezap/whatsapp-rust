@@ -1216,6 +1216,29 @@ pub(crate) async fn fanout_group_epoch(
     update: &GroupCallUpdate,
 ) -> Result<GroupEpochFanout, CallError> {
     let generation = client.call_registry().generation_of(&update.call_id);
+    fanout_group_epoch_for_generation(client, update, generation).await
+}
+
+fn ensure_group_rekey_generation(
+    client: &Client,
+    call_id: &str,
+    generation: Option<u64>,
+) -> Result<(), CallError> {
+    if generation
+        .is_some_and(|generation| client.call_registry().generation_of(call_id) != Some(generation))
+    {
+        Err(CallError::CallEndedDuringSetup)
+    } else {
+        Ok(())
+    }
+}
+
+async fn fanout_group_epoch_for_generation(
+    client: &Client,
+    update: &GroupCallUpdate,
+    generation: Option<u64>,
+) -> Result<GroupEpochFanout, CallError> {
+    ensure_group_rekey_generation(client, &update.call_id, generation)?;
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let self_id = own_lid.to_string();
     let mut seen = std::collections::HashSet::new();
@@ -1238,6 +1261,7 @@ pub(crate) async fn fanout_group_epoch(
             .await
             .map_err(|error| CallError::Setup(error.to_string()))?;
     }
+    ensure_group_rekey_generation(client, &update.call_id, generation)?;
 
     let raw_epoch = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
     let mut message = wa::Message {
@@ -1278,6 +1302,7 @@ pub(crate) async fn fanout_group_epoch(
         encrypted
     };
     let encrypted = encrypted?;
+    ensure_group_rekey_generation(client, &update.call_id, generation)?;
     let device = client.persistence_manager().get_device_snapshot();
     let device_identity = wacore::send::needs_device_identity(
         encrypted.includes_prekey_message,
@@ -1288,6 +1313,7 @@ pub(crate) async fn fanout_group_epoch(
         .persist_signal_state_pre_wire()
         .await
         .map_err(|error| CallError::Setup(error.to_string()))?;
+    ensure_group_rekey_generation(client, &update.call_id, generation)?;
     if encrypted.devices.len() != recipients.len() {
         return Err(CallError::Media(
             "group epoch encryption did not cover every recipient",
@@ -1324,7 +1350,9 @@ pub(crate) async fn fanout_group_epoch(
     }
     let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     for node in nodes {
+        ensure_group_rekey_generation(client, &update.call_id, generation)?;
         client.send_node(node).await?;
+        ensure_group_rekey_generation(client, &update.call_id, generation)?;
     }
     Ok(GroupEpochFanout {
         raw_epoch,
@@ -3444,14 +3472,14 @@ mod tests {
             .build()
     }
 
-    fn register_group_update(client: &Client, update: &GroupCallUpdate) {
+    fn register_group_update(client: &Client, update: &GroupCallUpdate) -> u64 {
         let mut session = wacore::voip::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
         );
         session.group = Some(update.clone());
-        client.call_registry().insert(session);
+        client.call_registry().insert(session)
     }
 
     fn pcm_audio(source: Arc<dyn AudioSource>, sink: Arc<dyn AudioSink>) -> AudioEndpoints {
@@ -4825,6 +4853,37 @@ mod tests {
         assert!(
             client.call_registry().snapshot(&update.call_id).is_none(),
             "a partial fanout must tear down the local generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_group_rekey_generation_sends_nothing_and_spares_replacement() {
+        let (client, sent) = make_sending_client().await;
+        let recipient = peer_lid();
+        seed_peer_session(&client, &recipient).await;
+        let update = rekey_update(&client, &[recipient]);
+        let stale_generation = register_group_update(&client, &update);
+        let mut replacement = wacore::voip::CallSession::new_incoming(
+            &update.call_id,
+            update.call_creator.clone(),
+            update.call_creator.clone(),
+        );
+        replacement.group = Some(update.clone());
+        let replacement_generation = client.call_registry().insert(replacement);
+
+        assert!(matches!(
+            fanout_group_epoch_for_generation(&client, &update, Some(stale_generation)).await,
+            Err(CallError::CallEndedDuringSetup)
+        ));
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            0,
+            "a superseded generation must publish no stale rekey stanza"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&update.call_id),
+            Some(replacement_generation),
+            "stale fanout validation must spare the replacement generation"
         );
     }
 

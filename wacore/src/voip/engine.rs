@@ -863,6 +863,9 @@ impl CallEngine {
         now: Millis,
         config: GroupEngineConfig,
     ) -> Result<(), EngineError> {
+        // Validate relay material before constructing or publishing group state. In particular, a
+        // failed direct-to-group promotion must remain retryable with the same roster transaction.
+        let relay_refresh = prepare_group_relay_refresh(&config.initial_update)?;
         let audio = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?.audio;
         let mut registry = GroupMediaRegistry::new(
             self.call_id.clone(),
@@ -942,7 +945,7 @@ impl CallEngine {
         };
         group.mixer.retain(group.registry.active_participant_ids());
         self.group = Some(group);
-        self.refresh_group_allocate(now, &config.initial_update)?;
+        self.commit_group_allocate(now, &config.initial_update, relay_refresh)?;
         self.sync_group_epoch()?;
         Ok(())
     }
@@ -1077,15 +1080,6 @@ impl CallEngine {
         Ok(stream_ssrcs)
     }
 
-    fn refresh_group_allocate(
-        &mut self,
-        now: Millis,
-        update: &GroupCallUpdate,
-    ) -> Result<(), GroupMediaError> {
-        let relay_refresh = prepare_group_relay_refresh(update)?;
-        self.commit_group_allocate(now, update, relay_refresh)
-    }
-
     fn commit_group_allocate(
         &mut self,
         now: Millis,
@@ -1183,6 +1177,9 @@ impl CallEngine {
         media.call_key.extend_from_slice(&epoch);
         group.local_epoch_transaction = Some(transaction_id);
         group.direct_fallback_active = false;
+        // The roster arrives before its authenticated epoch during normal startup. Installing that
+        // epoch creates the receiver pipelines, so refresh the allowlist at the same commit point.
+        group.mixer.retain(group.registry.active_participant_ids());
         epoch.zeroize();
         if self.allocated {
             self.announce_audio_rtcp_session();
@@ -2537,6 +2534,33 @@ mod encoded_tests {
     }
 
     #[test]
+    fn invalid_initial_relay_does_not_commit_direct_promotion() {
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+        let mut update = group_update();
+        let mut relay = group_relay();
+        relay.tokens.clear();
+        update.relay = Some(relay);
+
+        assert!(matches!(
+            engine.apply_group_update(1, &update),
+            Err(EngineError::GroupMedia(GroupMediaError::InvalidSnapshot))
+        ));
+        assert!(
+            !engine.is_group(),
+            "a rejected initial relay must not partially promote the direct call"
+        );
+
+        update.relay = Some(group_relay());
+        assert_eq!(
+            engine.apply_group_update(2, &update).unwrap(),
+            GroupRosterApply::Applied,
+            "a corrected resend with the same transaction must still promote"
+        );
+        assert!(engine.is_group());
+    }
+
+    #[test]
     fn audio_only_group_update_disables_and_purges_outbound_video() {
         let mut engine = group_engine();
         assert_eq!(
@@ -3813,6 +3837,30 @@ mod tests {
         let summary = summarize_rtcp(&plain).expect("RTCP summary");
         assert_eq!(summary.referenced_ssrcs, [peer_ssrc]);
         assert_eq!(summary.report_blocks.len(), 1);
+    }
+
+    #[test]
+    fn installing_first_group_epoch_admits_roster_audio_to_mixer() {
+        let (mut eng, epoch) = group_engine(false);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let mut peer = group_peer_audio(&epoch);
+        let mut encoder = MlowEncoder::new();
+
+        for frame in 0..2u32 {
+            let tone = (0..SAMPLES as usize)
+                .map(|sample| 0.3 * ((sample as f32 + (frame * SAMPLES) as f32) * 0.07).sin())
+                .collect::<Vec<_>>();
+            let packet = peer.protect_audio(&encoder.encode(&tone).expect("MLOW frame"));
+            eng.handle_input(1, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+
+        eng.handle_input(PLAYOUT_MS, Input::Timeout);
+        let (outputs, _) = drain(&mut eng);
+        assert!(outputs.iter().any(|output| {
+            matches!(output, Output::Playout(frame) if frame.iter().any(|sample| *sample != 0))
+        }));
     }
 
     #[test]
