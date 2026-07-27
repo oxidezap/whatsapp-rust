@@ -380,7 +380,10 @@ impl CallRegistry {
             .and_then(|entry| entry.group.clone())
     }
 
-    /// Whether a routed signaling sender belongs to this exact active group call.
+    /// Whether a routed signaling sender is the creator or belongs to this exact active group call.
+    ///
+    /// The creator is the only trusted bootstrap sender before a call-link admission installs its
+    /// first authoritative roster. Once a roster exists, its participants are authorized too.
     pub fn group_sender_authorized(&self, call_id: &str, call_creator: &Jid, sender: &Jid) -> bool {
         let map = self.inner.lock().expect("registry lock poisoned");
         let Some(entry) = map
@@ -389,6 +392,9 @@ impl CallRegistry {
         else {
             return false;
         };
+        if sender.to_non_ad() == call_creator.to_non_ad() {
+            return true;
+        }
         let Some(snapshot) = entry.group.as_ref().and_then(GroupCallState::snapshot) else {
             return false;
         };
@@ -1437,6 +1443,17 @@ mod tests {
     fn group_sender_authorization_is_bound_to_creator_and_active_roster() {
         let reg = CallRegistry::new();
         reg.insert(session("GROUP-CALL"));
+        let creator = Jid::new("111111111111111", Server::Lid);
+        assert!(
+            reg.group_sender_authorized("GROUP-CALL", &creator, &creator.clone().with_device(7)),
+            "the creator must be able to install the first call-link admission snapshot"
+        );
+        assert!(!reg.group_sender_authorized(
+            "GROUP-CALL",
+            &creator,
+            &Jid::new("333333333333333", Server::Lid)
+        ));
+
         let participant = Jid::new("333333333333333", Server::Lid);
         let device = participant.clone().with_device(3);
         let mut update = group_update(1);
@@ -1454,7 +1471,6 @@ mod tests {
         ];
         assert_eq!(reg.apply_group_update(update), GroupStateApply::Applied);
 
-        let creator = Jid::new("111111111111111", Server::Lid);
         assert!(reg.group_sender_authorized("GROUP-CALL", &creator, &device));
         assert!(reg.group_sender_authorized("GROUP-CALL", &creator, &participant));
         assert!(!reg.group_sender_authorized("GROUP-CALL", &creator, &participant.with_device(4)));

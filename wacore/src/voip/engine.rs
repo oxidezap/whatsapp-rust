@@ -1921,6 +1921,7 @@ impl CallEngine {
                     device: Some(participant.device_jid),
                     pid: participant.pid,
                 }));
+            #[cfg(feature = "voip-mlow")]
             return;
         }
         #[cfg(feature = "voip-mlow")]

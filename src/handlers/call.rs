@@ -306,6 +306,19 @@ impl StanzaHandler for CallHandler {
                     let dispatch_call = true;
                     #[cfg(feature = "voip-runtime")]
                     match &call.action {
+                        CallAction::GroupUpdate { update }
+                            if !client.call_registry().group_sender_authorized(
+                                &update.call_id,
+                                &update.call_creator,
+                                &routed_call_sender(&call),
+                            ) =>
+                        {
+                            warn!(
+                                "call: rejected group snapshot from unauthorized sender for {}",
+                                update.call_id
+                            );
+                            dispatch_call = false;
+                        }
                         CallAction::GroupUpdate { update } => {
                             dispatch_call = match client
                                 .call_registry()
@@ -410,6 +423,19 @@ impl StanzaHandler for CallHandler {
                                     }
                                 }
                             }
+                        }
+                        CallAction::WaitingRoomUpdate { room }
+                            if !client.call_registry().group_sender_authorized(
+                                &room.call_id,
+                                &room.call_creator,
+                                &routed_call_sender(&call),
+                            ) =>
+                        {
+                            warn!(
+                                "call: rejected waiting-room snapshot from unauthorized sender for {}",
+                                room.call_id
+                            );
+                            dispatch_call = false;
                         }
                         CallAction::WaitingRoomUpdate { room } => {
                             dispatch_call =
@@ -964,6 +990,143 @@ mod tests {
         assert!(
             global_rx.try_recv().is_err(),
             "an unauthorized control must not reach the public event bus"
+        );
+        registry.remove_if_current("GROUP-CALL", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn routed_group_snapshots_reject_sender_outside_authoritative_roster() {
+        use wacore::types::group_call::{
+            CallLinkMedia, GroupCallParticipant, GroupCallUpdate, WaitingRoom,
+        };
+        use wacore::voip::{CallSession, GroupStateApply};
+
+        let client = make_sending_client().await;
+        let creator = fake_caller_lid();
+        let registry = client.call_registry();
+        let generation = registry.insert(CallSession::new_outgoing(
+            "GROUP-CALL",
+            Jid::new("GROUP-CALL", Server::Call),
+            creator.clone(),
+        ));
+        let update = GroupCallUpdate::builder()
+            .call_id("GROUP-CALL".to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                creator.clone(),
+                vec![GroupCallDevice::new(creator.clone().with_device(1))],
+            )])
+            .build();
+        assert_eq!(
+            registry.apply_group_update(update),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            registry.apply_waiting_room(
+                WaitingRoom::builder()
+                    .call_id("GROUP-CALL".to_string())
+                    .call_creator(creator.clone())
+                    .link_token("TEST-CALL-LINK".to_string())
+                    .media(CallLinkMedia::Audio)
+                    .enabled(true)
+                    .is_admin(true)
+                    .transaction_id(1)
+                    .users(Vec::new())
+                    .build(),
+            ),
+            GroupStateApply::Applied
+        );
+
+        let (handler, global_rx) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let outsider = Jid::new("999999999999999", Server::Lid).with_device(9);
+        let group_update = NodeBuilder::new("call")
+            .attr("from", Jid::new("GROUP-CALL", Server::Call))
+            .attr("participant", outsider.clone())
+            .attr("id", "UNAUTHORIZED-GROUP-SNAPSHOT")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("group_update")
+                .attr("call-id", "GROUP-CALL")
+                .attr("call-creator", creator.clone())
+                .children([NodeBuilder::new("group_info")
+                    .attr("transaction-id", "2")
+                    .attr("media", "audio")
+                    .attr("connected-limit", "32")
+                    .attr("joinable", "1")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", outsider.to_non_ad())
+                        .attr("state", "connected")
+                        .children([NodeBuilder::new("device")
+                            .attr("jid", outsider.clone())
+                            .attr("pid", "9")
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&group_update),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert_eq!(
+            registry
+                .group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(1),
+            "an outsider must not replace the authoritative roster"
+        );
+
+        let waiting_room = NodeBuilder::new("call")
+            .attr("from", Jid::new("GROUP-CALL", Server::Call))
+            .attr("participant", outsider)
+            .attr("id", "UNAUTHORIZED-WAITING-SNAPSHOT")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("waiting_room_update")
+                .attr("call-id", "GROUP-CALL")
+                .attr("call-creator", creator.clone())
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "GROUP-CALL")
+                    .attr("call-creator", creator)
+                    .attr("link-token", "TEST-CALL-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "1")
+                    .attr("transaction-id", "2")
+                    .build()])
+                .build()])
+            .build();
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&waiting_room),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert_eq!(
+            registry
+                .group_state("GROUP-CALL")
+                .and_then(|state| state.waiting_room().and_then(|room| room.transaction_id)),
+            Some(1),
+            "an outsider must not replace the waiting-room state"
+        );
+        assert!(
+            global_rx.try_recv().is_err(),
+            "unauthorized snapshots must not reach the public event bus"
         );
         registry.remove_if_current("GROUP-CALL", generation);
     }
