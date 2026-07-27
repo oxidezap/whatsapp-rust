@@ -1744,21 +1744,10 @@ fn apply_receipt(
     let user = receipt.source.sender.to_non_ad_string();
     let mut missed: Vec<&String> = Vec::new();
     for msg_id in &receipt.message_ids {
-        // Peer receipts only ever advance the delivery state of our own
-        // messages, and never backwards.
-        let updated = diesel::update(
-            message_row(device_id, &chat, msg_id).filter(
-                schema::messages::from_me
-                    .eq(true)
-                    .and(schema::messages::status.lt(status)),
-            ),
-        )
-        .set(schema::messages::status.eq(status))
-        .execute(conn)?;
         // Zero rows covers both the real PN/LID miss and a replay against a
         // row already at/past the target; the alt retry stays harmless for
         // the latter (advance-only) and still heals a lagging split copy.
-        if updated == 0 {
+        if !advance_status(conn, device_id, &chat, msg_id, status)? {
             missed.push(msg_id);
         }
     }
@@ -1787,16 +1776,7 @@ fn apply_receipt(
     };
     for msg_id in missed {
         if let Some(alt) = &counterpart
-            && diesel::update(
-                message_row(device_id, alt, msg_id).filter(
-                    schema::messages::from_me
-                        .eq(true)
-                        .and(schema::messages::status.lt(status)),
-                ),
-            )
-            .set(schema::messages::status.eq(status))
-            .execute(conn)?
-                > 0
+            && advance_status(conn, device_id, alt, msg_id, status)?
         {
             relocated.insert(msg_id, alt.clone());
             continue;
@@ -1855,6 +1835,30 @@ fn apply_receipt(
     Ok(())
 }
 
+/// Move one of our messages forward to `status`, reporting whether it moved.
+///
+/// Peer receipts only ever advance the delivery state of our own messages, and
+/// never backwards — so a replay, or one arriving behind the state already
+/// recorded, moves nothing and says so.
+fn advance_status(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+    status: i32,
+) -> QueryResult<bool> {
+    let updated = diesel::update(
+        message_row(device_id, chat, msg_id).filter(
+            schema::messages::from_me
+                .eq(true)
+                .and(schema::messages::status.lt(status)),
+        ),
+    )
+    .set(schema::messages::status.eq(status))
+    .execute(conn)?;
+    Ok(updated > 0)
+}
+
 /// Whether this device stores an outgoing message with this id in this chat.
 fn message_exists(
     conn: &mut SqliteConnection,
@@ -1896,7 +1900,7 @@ fn record_receipt(
                 .and(dsl::receipt_type.eq(status)),
         )
     };
-    diesel::insert_into(dsl::message_receipts)
+    let inserted = diesel::insert_into(dsl::message_receipts)
         .values((
             dsl::device_id.eq(device_id),
             dsl::chat_jid.eq(chat),
@@ -1907,9 +1911,14 @@ fn record_receipt(
         ))
         .on_conflict_do_nothing()
         .execute(conn)?;
-    diesel::update(row().filter(dsl::ts_ms.gt(ts_ms)))
-        .set(dsl::ts_ms.eq(ts_ms))
-        .execute(conn)?;
+    // Only a conflict leaves an instant to reconsider: a row this call created
+    // already holds `ts_ms`, and the first report of a state is the common
+    // case on a path that runs for every receipt.
+    if inserted == 0 {
+        diesel::update(row().filter(dsl::ts_ms.gt(ts_ms)))
+            .set(dsl::ts_ms.eq(ts_ms))
+            .execute(conn)?;
+    }
     Ok(())
 }
 
