@@ -135,6 +135,15 @@ const CHUNK_SIZE: usize = 1024;
 /// pin its buffer for the rest of the connection.
 const MAX_IDLE_CAPACITY: usize = 64 * 1024;
 
+/// Most the decoder will reserve for a frame whose bytes have not arrived.
+///
+/// The length prefix is the peer's claim, not evidence. Reserving the whole
+/// declared frame lets anyone who sends three bytes announcing 16 MiB, and then
+/// nothing, pin 16 MiB until the connection dies. Capping the eager reserve
+/// keeps the growth of a genuinely large frame to a handful of steps while
+/// making that claim cost only what has actually been received.
+const MAX_EAGER_RESERVE: usize = 64 * 1024;
+
 /// A frame decoder that buffers incoming data and extracts complete frames.
 ///
 /// Transport reads accumulate in one long-lived buffer and each frame is split
@@ -146,6 +155,15 @@ const MAX_IDLE_CAPACITY: usize = 64 * 1024;
 /// fresh `Shared` allocation.
 pub struct FrameDecoder {
     buffer: BytesMut,
+    /// Whether the buffer has ever grown past [`MAX_IDLE_CAPACITY`].
+    ///
+    /// Splitting a frame out hands it the capacity, so a frame that consumed
+    /// the whole buffer leaves `capacity() == 0` behind and the size check
+    /// alone cannot see that a multi-megabyte allocation is still underneath.
+    /// Once the frame is dropped the decoder is its sole owner and the next
+    /// `reserve` reclaims it rather than freeing it, which is the leak this
+    /// remembers to prevent.
+    grew_oversized: bool,
 }
 
 impl FrameDecoder {
@@ -156,6 +174,7 @@ impl FrameDecoder {
             // because a live frame still references the current one, which is
             // the steady-state path here.
             buffer: BytesMut::with_capacity(CHUNK_SIZE),
+            grew_oversized: false,
         }
     }
 
@@ -173,6 +192,7 @@ impl FrameDecoder {
     fn reserve_for(&mut self, incoming: usize) {
         if self.buffer.capacity() - self.buffer.len() < incoming {
             self.buffer.reserve(incoming.max(CHUNK_SIZE));
+            self.grew_oversized |= self.buffer.capacity() > MAX_IDLE_CAPACITY;
         }
     }
 
@@ -192,10 +212,13 @@ impl FrameDecoder {
             | (self.buffer[2] as usize);
 
         if self.buffer.len() < FRAME_LENGTH_SIZE + frame_len {
-            // The length prefix is known before the payload is, so an outsized
-            // frame sizes the buffer once here instead of growing geometrically
-            // across the transport reads that carry it.
-            self.reserve_for(FRAME_LENGTH_SIZE + frame_len - self.buffer.len());
+            // The length prefix is known before the payload is, so a large frame
+            // sizes the buffer ahead instead of growing geometrically across the
+            // reads that carry it. Capped, because the prefix is only the peer's
+            // claim: honouring it in full would let three bytes reserve 16 MiB
+            // that never arrives.
+            let missing = FRAME_LENGTH_SIZE + frame_len - self.buffer.len();
+            self.reserve_for(missing.min(MAX_EAGER_RESERVE));
             return None;
         }
 
@@ -203,11 +226,20 @@ impl FrameDecoder {
         let frame_data = self.buffer.split_to(frame_len);
         trace!("<-- Decoded frame: {} bytes", frame_data.len());
 
-        if self.buffer.is_empty() && self.buffer.capacity() > MAX_IDLE_CAPACITY {
+        if self.buffer.is_empty()
+            && (self.grew_oversized || self.buffer.capacity() > MAX_IDLE_CAPACITY)
+        {
             self.buffer = BytesMut::with_capacity(CHUNK_SIZE);
+            self.grew_oversized = false;
         }
 
         Some(frame_data)
+    }
+
+    /// The accumulation buffer's capacity, for retention assertions.
+    #[cfg(test)]
+    pub fn capacity_for_test(&self) -> usize {
+        self.buffer.capacity()
     }
 
     /// Returns the number of bytes currently buffered waiting for more data.
@@ -429,6 +461,62 @@ mod tests {
 
     /// A frame big enough to have grown the buffer must not leave that
     /// allocation attached to the decoder for the rest of the connection.
+    /// A length prefix is a claim, not evidence. Three bytes announcing a
+    /// near-16 MiB frame, with nothing behind them, must not make the decoder
+    /// reserve 16 MiB: that turns one packet into a memory-exhaustion lever
+    /// held open until the connection dies.
+    #[test]
+    fn a_declared_frame_cannot_reserve_more_than_it_has_sent() {
+        let mut decoder = FrameDecoder::new();
+
+        // 0xFFFFFF, the largest length the 3-byte prefix can express.
+        decoder.feed(&[0xFF, 0xFF, 0xFF]);
+        assert!(
+            decoder.decode_frame().is_none(),
+            "the payload has not arrived, so no frame can come out"
+        );
+
+        assert!(
+            decoder.buffered_len() < 16 * 1024 * 1024,
+            "precondition: nothing was actually received"
+        );
+        assert!(
+            decoder.capacity_for_test() <= MAX_EAGER_RESERVE + CHUNK_SIZE,
+            "a declared but unsent frame reserved {} bytes",
+            decoder.capacity_for_test()
+        );
+    }
+
+    /// A frame that consumes the whole buffer hands its capacity away, so the
+    /// decoder is left reading `capacity() == 0` while a multi-megabyte
+    /// allocation still sits underneath it. Once the frame drops, the next
+    /// `reserve` reclaims that allocation rather than freeing it, and the
+    /// decoder holds it for the rest of the connection.
+    #[test]
+    fn an_exactly_consumed_oversized_buffer_is_still_released() {
+        let mut decoder = FrameDecoder::new();
+        let payload_len = 200 * 1024;
+
+        let mut wire = Vec::with_capacity(FRAME_LENGTH_SIZE + payload_len);
+        wire.push((payload_len >> 16) as u8);
+        wire.push((payload_len >> 8) as u8);
+        wire.push(payload_len as u8);
+        wire.extend(std::iter::repeat_n(0xAB, payload_len));
+
+        decoder.feed(&wire);
+        let frame = decoder.decode_frame().expect("the whole frame arrived");
+        assert_eq!(frame.len(), payload_len);
+        drop(frame);
+
+        // The next read must not re-adopt the large allocation.
+        decoder.feed(&[0x00, 0x00, 0x01, 0x7F]);
+        assert!(
+            decoder.capacity_for_test() <= MAX_IDLE_CAPACITY,
+            "decoder still holds {} bytes after an exactly consumed frame",
+            decoder.capacity_for_test()
+        );
+    }
+
     #[test]
     fn an_oversized_buffer_is_released_once_drained() {
         let big = payload(200 * 1024, 0x33);
