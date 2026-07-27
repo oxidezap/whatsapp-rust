@@ -25,10 +25,9 @@ impl SendContextResolver for Client {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         self.fetch_pre_keys(jids, Some(PreKeyFetchReason::Identity))
             .await
-            .map(|o| o.bundles)
             .map_err(|e| {
                 // Re-wrap server errors as wacore::ServerErrorCode so
                 // encrypt_for_devices can downcast across crate boundaries

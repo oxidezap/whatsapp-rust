@@ -77,8 +77,12 @@ pub struct SignalStores<'a> {
 /// Check if an anyhow error is a 406 "not-acceptable" server error (device unregistered).
 /// Uses typed downcast to `ServerErrorCode` — the shared error type that the
 /// `SendContextResolver` impl wraps server errors in.
+/// The `<error code>` the server attaches to a device it no longer knows.
+pub(crate) const UNREGISTERED_DEVICE_CODE: u16 = 406;
+
 pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
-    crate::request::ServerErrorCode::from_anyhow(err).is_some_and(|e| e.code == 406)
+    crate::request::ServerErrorCode::from_anyhow(err)
+        .is_some_and(|e| e.code == UNREGISTERED_DEVICE_CODE)
 }
 
 pub struct EncryptResult {
@@ -565,15 +569,33 @@ pub async fn ensure_sessions_for_devices(
             .iter()
             .map(|&i| devices[i].clone())
             .collect();
-        // 406 on this batch is all-or-nothing — per-device retries just wasted
+        // A batch-wide 406 is all-or-nothing — per-device retries just wasted
         // N·RTT with the same failure. Mark `had_406` so the caller invalidates
         // the users and the next send re-fetches. Matches WA Web's
         // `GroupSkmsgJob`: log, continue without those devices.
+        //
+        // A per-device rejection is the better-informed case: the server names
+        // the device in its own `<user>`, so it sets the same flag without
+        // condemning the rest of the batch.
         let prekey_bundles = match resolver
             .fetch_prekeys_for_identity_check(&jids_for_fetch)
             .await
         {
-            Ok(bundles) => bundles,
+            Ok(outcome) => {
+                if outcome
+                    .rejected
+                    .iter()
+                    .any(|device| device.code == UNREGISTERED_DEVICE_CODE)
+                {
+                    log::debug!(
+                        "prekey fetch rejected {} of {} device(s) by name",
+                        outcome.rejected.len(),
+                        jids_for_fetch.len()
+                    );
+                    had_406 = true;
+                }
+                outcome.bundles
+            }
             Err(e) if is_device_unregistered_error(&e) => {
                 // No server prekeys for these devices this round; the next send
                 // re-fetches. Debug, not warn — a batch 406 would otherwise flood the log.

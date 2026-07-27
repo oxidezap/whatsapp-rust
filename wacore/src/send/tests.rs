@@ -423,6 +423,8 @@ struct MockSendContextResolver {
     identity_changes: std::sync::Mutex<Vec<Jid>>,
     chain_lock_probe: Option<ChainLockProbe>,
     prekey_error_code: Option<u16>,
+    /// Devices the server names as rejected inside an otherwise fine response.
+    rejected_devices: Vec<crate::prekeys::RejectedDevice>,
 }
 
 impl MockSendContextResolver {
@@ -434,6 +436,7 @@ impl MockSendContextResolver {
             identity_changes: std::sync::Mutex::new(Vec::new()),
             chain_lock_probe: None,
             prekey_error_code: None,
+            rejected_devices: Vec::new(),
         }
     }
 
@@ -466,6 +469,14 @@ impl MockSendContextResolver {
         self
     }
 
+    /// The server answers with bundles for the rest of the batch and an
+    /// `<error>` for `jid`, which is how it names one absent device.
+    fn with_rejected_device(mut self, jid: Jid, code: u16) -> Self {
+        self.rejected_devices
+            .push(crate::prekeys::RejectedDevice { jid, code });
+        self
+    }
+
     fn with_prekey_error(mut self, code: u16) -> Self {
         self.prekey_error_code = Some(code);
         self
@@ -493,7 +504,7 @@ impl SendContextResolver for MockSendContextResolver {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>> {
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome> {
         if let Some(code) = self.prekey_error_code {
             return Err(anyhow::Error::new(crate::request::ServerErrorCode {
                 code,
@@ -527,7 +538,10 @@ impl SendContextResolver for MockSendContextResolver {
             }
             // If None, we intentionally omit it from the result (simulating server not returning it)
         }
-        Ok(result)
+        Ok(crate::prekeys::PreKeyFetchOutcome {
+            bundles: result,
+            rejected: self.rejected_devices.clone(),
+        })
     }
 
     async fn resolve_group_info(&self, _jid: &Jid) -> Result<std::sync::Arc<GroupInfo>> {
@@ -4506,6 +4520,48 @@ mod local_identity_change_on_send {
                 participant_jids(&nodes[1..]),
                 vec![good.to_string()],
                 "only the device that could encrypt is in the participant list"
+            );
+        }
+
+        /// The server names one device inside an otherwise fine response, and
+        /// that naming has to survive the resolver boundary: the fan-out sets
+        /// the same stale-device flag a batch-wide 406 would, so the group path
+        /// still refreshes the list after the send. Flattening the rejection
+        /// into "no bundle" loses it, and the stale device is kept forever.
+        #[tokio::test]
+        async fn a_named_rejection_reaches_the_fan_out_like_a_batch_failure() {
+            let warm: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+            let gone: Jid = "5511900000061:9@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+
+            // Not `with_prekey_error`: the batch succeeds, and the server names
+            // the one device it will not hand a bundle for.
+            let resolver = MockSendContextResolver::new().with_rejected_device(gone.clone(), 406);
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[warm.clone(), gone.clone()],
+            )
+            .await
+            .expect("a named rejection must not fail the fan-out");
+
+            assert!(
+                plan.had_unregistered_device,
+                "the named device must raise the same flag a batch 406 raises"
             );
         }
 

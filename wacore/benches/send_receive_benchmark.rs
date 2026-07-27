@@ -441,8 +441,8 @@ impl SendContextResolver for MockResolver {
     async fn fetch_prekeys_for_identity_check(
         &self,
         _: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
-        Ok(HashMap::new())
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+        Ok(wacore::prekeys::PreKeyFetchOutcome::default())
     }
     async fn resolve_group_info(
         &self,

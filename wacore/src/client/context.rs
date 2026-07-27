@@ -220,10 +220,13 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error>;
 
+    /// Returns the bundles alongside the devices the server rejected by name,
+    /// so a per-device rejection is not flattened into "no bundle" before the
+    /// fan-out can tell the two apart.
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error>;
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome, anyhow::Error>;
 
     async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error>;
 
