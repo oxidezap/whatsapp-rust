@@ -4452,6 +4452,61 @@ async fn a_dm_receipt_behind_the_current_status_still_files_by_alias() {
     );
 }
 
+/// A receipt can beat its own outgoing row: `Event::Receipt` is dispatched on
+/// the socket-read path, while a host records the message it sent whenever it
+/// gets around to it — the same ordering #1142 had to handle for server acks.
+///
+/// So a receipt naming an id no chat holds yet is recorded rather than
+/// dropped. The alternative loses the instant permanently, because nothing
+/// re-sends it once the row appears; keeping it means the row is already
+/// correct the moment the message lands.
+#[tokio::test]
+async fn a_receipt_that_arrives_before_its_message_is_not_lost() {
+    let (_store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+
+    feed(
+        &chat_store,
+        [peer_receipt(
+            peer.clone(),
+            vec!["OUT-DM-EARLY"],
+            ReceiptType::Delivered,
+            1_700_000_200,
+        )],
+    )
+    .await;
+
+    // Nothing to attach to yet.
+    assert!(
+        chat_store
+            .message(&peer, "OUT-DM-EARLY")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The host catches up.
+    chat_store
+        .record_outgoing(
+            &peer,
+            "OUT-DM-EARLY",
+            &wa::Message::text("olá"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let receipts = chat_store.receipts(&peer, "OUT-DM-EARLY").await.unwrap();
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.status, r.timestamp.timestamp()))
+            .collect::<Vec<_>>(),
+        vec![(MessageStatus::Delivered, 1_700_000_200)],
+        "the early receipt still carries its instant: {receipts:?}"
+    );
+}
+
 /// A self receipt carrying a device must recount the real thread instead of
 /// materializing a twin of it.
 #[tokio::test]
