@@ -530,10 +530,16 @@ impl Piece {
 ///
 /// # Returns
 /// Concatenated bytes of all extracted fields, or None if no fields match
-pub fn extract_reporting_token_content(
+/// The whitelisted pieces, in the order the token concatenates them.
+///
+/// Split out from [`extract_reporting_token_content`] so the HMAC can consume
+/// them directly: the token is `HMAC(key, concat(pieces))` and `Mac::update` is
+/// associative over its input, so feeding the pieces one by one gives the same
+/// bytes without building the concatenation at all.
+fn collect_reporting_token_pieces(
     data: &[u8],
     whitelist: &[ReportingField],
-) -> Option<Vec<u8>> {
+) -> Option<SmallVec<[(u32, Piece); 4]>> {
     // The token's bytes are contract: fields are concatenated in ascending
     // field-number order, ties in wire order (`sort_by_key` is stable). Only
     // where the bytes come from changed -- a flat field is named by its range
@@ -649,11 +655,46 @@ pub fn extract_reporting_token_content(
         return None;
     }
 
+    // The token's bytes are contract: ascending field number, ties in wire
+    // order, which `sort_by_key` preserves because it is stable.
     extracted.sort_by_key(|(num, _)| *num);
+    Some(extracted)
+}
 
-    let total_len: usize = extracted.iter().map(|(_, piece)| piece.len()).sum();
+/// Calls `visit` with each whitelisted piece, in token order.
+///
+/// Returns `false` when the message has nothing to report, which is the same
+/// condition under which [`extract_reporting_token_content`] returns `None`.
+fn for_each_reporting_token_piece(
+    data: &[u8],
+    whitelist: &[ReportingField],
+    mut visit: impl FnMut(&[u8]),
+) -> bool {
+    let Some(pieces) = collect_reporting_token_pieces(data, whitelist) else {
+        return false;
+    };
+    for (_, piece) in &pieces {
+        match piece {
+            Piece::Borrowed(range) => visit(&data[range.clone()]),
+            Piece::Owned(bytes) => visit(bytes),
+        }
+    }
+    true
+}
+
+/// Extract reporting token content from encoded protobuf message bytes.
+///
+/// Builds the concatenation. The send path does not need it: it feeds the
+/// pieces straight to the HMAC instead.
+pub fn extract_reporting_token_content(
+    data: &[u8],
+    whitelist: &[ReportingField],
+) -> Option<Vec<u8>> {
+    let pieces = collect_reporting_token_pieces(data, whitelist)?;
+
+    let total_len: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
     let mut result = Vec::with_capacity(total_len);
-    for (_, piece) in extracted {
+    for (_, piece) in pieces {
         match piece {
             Piece::Borrowed(range) => result.extend_from_slice(&data[range]),
             Piece::Owned(bytes) => result.extend_from_slice(&bytes),
@@ -704,6 +745,28 @@ pub fn calculate_reporting_token(
     token.copy_from_slice(&result[..REPORTING_TOKEN_SIZE]);
 
     Ok(token)
+}
+
+/// Same token as [`calculate_reporting_token`] over the concatenated content,
+/// without building that concatenation.
+///
+/// `Mac::update` is associative over its input, so feeding each whitelisted
+/// piece in token order hashes exactly the bytes the concatenation would have
+/// held. Returns `None` when the message has nothing to report.
+fn calculate_reporting_token_streaming(
+    reporting_token_key: &[u8; REPORTING_TOKEN_KEY_SIZE],
+    data: &[u8],
+    whitelist: &[ReportingField],
+) -> Option<[u8; REPORTING_TOKEN_SIZE]> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(reporting_token_key).ok()?;
+    if !for_each_reporting_token_piece(data, whitelist, |piece| mac.update(piece)) {
+        return None;
+    }
+
+    let result = mac.finalize().into_bytes();
+    let mut token = [0u8; REPORTING_TOKEN_SIZE];
+    token.copy_from_slice(&result[..REPORTING_TOKEN_SIZE]);
+    Some(token)
 }
 
 /// Result of generating a reporting token for a message
@@ -762,7 +825,11 @@ pub fn generate_reporting_token_from_encoded(
     if !should_include_reporting_token(message) {
         return None;
     }
-    let content = extract_reporting_token_content(encoded_message, REPORTING_FIELDS)?;
+    // Only the presence of content is needed here; the bytes go straight to
+    // the HMAC further down without ever being concatenated.
+    if collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS).is_none() {
+        return None;
+    }
 
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
         if secret.len() != MESSAGE_SECRET_SIZE {
@@ -779,7 +846,7 @@ pub fn generate_reporting_token_from_encoded(
         derive_reporting_token_key_for_jids(&message_secret, stanza_id, sender_jid, remote_jid)
             .ok()?;
 
-    let token = calculate_reporting_token(&key, &content).ok()?;
+    let token = calculate_reporting_token_streaming(&key, encoded_message, REPORTING_FIELDS)?;
 
     Some(ReportingTokenResult {
         message_secret,
@@ -841,6 +908,71 @@ pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The streaming HMAC must hash exactly the bytes the concatenation would
+    /// have held. The token goes on the wire and is verified by the server, so
+    /// a divergence here is not a performance bug, it is a message the peer
+    /// rejects.
+    #[test]
+    fn streaming_and_concatenating_produce_the_same_token() {
+        let key = [0x5au8; REPORTING_TOKEN_KEY_SIZE];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("flat text field", {
+                let mut m = wa::Message::default();
+                m.conversation = Some("hello reporting".to_string());
+                waproto::codec::message_to_vec(&m)
+            }),
+            ("nested field", {
+                let mut m = wa::Message::default();
+                m.extended_text_message =
+                    buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                        text: Some("nested body".to_string()),
+                        ..Default::default()
+                    });
+                waproto::codec::message_to_vec(&m)
+            }),
+            // Two whitelisted fields, so the pieces have an order to get wrong.
+            // With a single piece the concatenation is trivially the same
+            // whatever order it is fed in, and this test would prove nothing.
+            ("two fields, so order matters", {
+                let mut m = wa::Message::default();
+                m.conversation = Some("first by field number".to_string());
+                m.extended_text_message =
+                    buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                        text: Some("sixth by field number".to_string()),
+                        ..Default::default()
+                    });
+                waproto::codec::message_to_vec(&m)
+            }),
+            ("multibyte payload", {
+                let mut m = wa::Message::default();
+                m.conversation = Some("olá 🌍 ünïcode".repeat(4));
+                waproto::codec::message_to_vec(&m)
+            }),
+        ];
+
+        for (name, encoded) in cases {
+            let concatenated = extract_reporting_token_content(&encoded, REPORTING_FIELDS)
+                .unwrap_or_else(|| panic!("{name}: the case must extract something"));
+            let expected = calculate_reporting_token(&key, &concatenated)
+                .unwrap_or_else(|_| panic!("{name}: hmac over the concatenation"));
+            let streamed = calculate_reporting_token_streaming(&key, &encoded, REPORTING_FIELDS)
+                .unwrap_or_else(|| panic!("{name}: hmac over the pieces"));
+            assert_eq!(streamed, expected, "{name}: the token bytes are contract");
+        }
+    }
+
+    /// Bad path: a message with nothing whitelisted must decline in both
+    /// spellings rather than hashing an empty input, which would produce a
+    /// perfectly valid token for no content.
+    #[test]
+    fn a_message_with_nothing_to_report_produces_no_token() {
+        let key = [0x5au8; REPORTING_TOKEN_KEY_SIZE];
+        let encoded = waproto::codec::message_to_vec(&wa::Message::default());
+
+        assert!(extract_reporting_token_content(&encoded, REPORTING_FIELDS).is_none());
+        assert!(calculate_reporting_token_streaming(&key, &encoded, REPORTING_FIELDS).is_none());
+    }
     use super::*;
 
     #[test]
