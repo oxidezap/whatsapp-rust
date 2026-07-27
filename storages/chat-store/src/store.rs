@@ -570,8 +570,11 @@ async fn writer_loop(
     // several transactions). Consumed when delivered.
     let mut pending_error: Option<String> = None;
     // Outlives every batch: the insert that answers a deferred ack is by
-    // definition in a later one.
-    let mut deferred_acks = DeferredAcks::default();
+    // definition in a later one. Shared with the blocking closure rather than
+    // moved into it, so a panic inside the transaction cannot carry the queue
+    // off with it — the acks a dying batch deferred are exactly the ones with
+    // no other record left.
+    let deferred_acks = Arc::new(std::sync::Mutex::new(DeferredAcks::default()));
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
@@ -597,47 +600,36 @@ async fn writer_loop(
         }
 
         if !batch.is_empty() {
-            // The deferred acks move into the blocking closure, so keep the
-            // pre-batch state here: it is what a failure has to fold back onto,
-            // whether the transaction rolled back or the pool/task never
-            // returned the queue at all. Deferred acks are rare, so the usual
-            // clone is of an empty queue.
-            deferred_acks.begin_batch();
-            let carried = std::mem::take(&mut deferred_acks);
-            let pre_batch = carried.clone();
+            // Snapshot what a failure has to fold back onto. Deferred acks are
+            // rare, so the usual clone is of an empty queue.
+            let pre_batch = {
+                let mut acks = lock_deferred_acks(&deferred_acks);
+                acks.begin_batch();
+                acks.clone()
+            };
+            let shared = Arc::clone(&deferred_acks);
             let result = db
                 .run(move |conn| {
-                    let mut deferred = carried;
-                    let outcome = conn
-                        .transaction(|conn| {
-                            let mut cs = ChangeSet::default();
-                            for msg in &batch {
-                                apply_writer_msg(conn, device_id, msg, &mut cs, &mut deferred)?;
-                            }
-                            Ok(cs)
-                        })
-                        .map_err(db_err);
-                    Ok((outcome, deferred))
+                    let mut deferred = lock_deferred_acks(&shared);
+                    conn.transaction(|conn| {
+                        let mut cs = ChangeSet::default();
+                        for msg in &batch {
+                            apply_writer_msg(conn, device_id, msg, &mut cs, &mut deferred)?;
+                        }
+                        Ok(cs)
+                    })
+                    .map_err(db_err)
                 })
                 .await;
             match result {
-                Ok((Ok(cs), carried)) => {
-                    deferred_acks = carried;
-                    emit_changes(&changes, cs);
-                }
-                // The transaction rolled back: nothing committed, but the queue
-                // came back, so its additions can be replayed onto the
-                // pre-batch state.
-                Ok((Err(e), carried)) => {
-                    deferred_acks = carried.rolled_back(pre_batch);
-                    warn!("chat-store: dropping write batch: {e}");
-                    pending_error = Some(e.to_string());
-                }
-                // The pool or the blocking task failed, so the queue never came
-                // back. The pre-batch state is all that is recoverable; acks
-                // this batch deferred die with it.
+                Ok(cs) => emit_changes(&changes, cs),
+                // Nothing committed, by any route: the transaction rolled back,
+                // or the pool/task failed before or during it. The queue is
+                // reachable either way, so fold it back the same way — undoing
+                // what the batch consumed, keeping what it deferred.
                 Err(e) => {
-                    deferred_acks = pre_batch;
+                    let mut acks = lock_deferred_acks(&deferred_acks);
+                    *acks = std::mem::take(&mut *acks).rolled_back(pre_batch);
                     warn!("chat-store: dropping write batch: {e}");
                     pending_error = Some(e.to_string());
                 }
@@ -654,6 +646,18 @@ async fn writer_loop(
             let _ = done.send(outcome.clone());
         }
     }
+}
+
+/// Take the deferred-ack queue, poisoned or not.
+///
+/// Poisoning here means the writer's transaction panicked mid-batch, and the
+/// contents are precisely what has to be recovered in that case — the acks it
+/// had deferred have no other record. Refusing to read them would turn the
+/// panic into the silent loss the queue exists to prevent.
+fn lock_deferred_acks(
+    acks: &std::sync::Mutex<DeferredAcks>,
+) -> std::sync::MutexGuard<'_, DeferredAcks> {
+    acks.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn emit_changes(changes: &broadcast::Sender<StoreChange>, cs: ChangeSet) {
@@ -2912,6 +2916,32 @@ mod deferred_ack_tests {
         assert_eq!(
             acks.take_matching("OUT-BOTH", CHAT, 0).unwrap().id,
             "OUT-BOTH"
+        );
+    }
+
+    /// A transaction that panics poisons the queue's lock while holding acks
+    /// that have no other record. Reading through the poison is the whole
+    /// point: refusing would turn the panic into the silent loss.
+    #[test]
+    fn a_poisoned_queue_still_yields_its_acks() {
+        let acks = Arc::new(std::sync::Mutex::new(DeferredAcks::default()));
+        lock_deferred_acks(&acks).defer(&ack("OUT-PANIC"), None, 0);
+
+        let poisoner = Arc::clone(&acks);
+        let panicked = std::thread::spawn(move || {
+            let _guard = lock_deferred_acks(&poisoner);
+            panic!("writer transaction blew up mid-batch");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread must actually panic");
+        assert!(acks.is_poisoned());
+
+        assert_eq!(
+            lock_deferred_acks(&acks)
+                .take_matching("OUT-PANIC", CHAT, 0)
+                .unwrap()
+                .id,
+            "OUT-PANIC"
         );
     }
 
