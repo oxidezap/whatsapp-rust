@@ -1159,7 +1159,10 @@ impl Client {
         // Held across the whole build-send-resolve cycle: the base version is
         // read at build time and only stops being valid once the send lands, so
         // releasing earlier would let a second verb build on a base this one is
-        // about to consume.
+        // about to consume. Deliberately held over the trailing re-sync too —
+        // dropping it there would let the next send start from a base the
+        // re-sync is about to move, trading a short wait for the 409s this
+        // whole path exists to avoid.
         let _send_guard = self.app_state_send_lock.lock().await;
         let proc = self.get_app_state_processor().await;
 
@@ -1584,9 +1587,11 @@ mod tests {
 // re-sent on the winner's base instead of being dropped. `400`/`404` map to
 // `ErrorFatal`, anything else to `ErrorRetry`.
 //
-// `send_app_state_patch` discards the response node entirely, so all of that is
-// invisible: a 409 is indistinguishable from success and the mutation is lost
-// with no error anywhere. These tests pin the two shapes; both fail today.
+// These tests pin what the send path must make of each response shape: a 409 it
+// can resolve (rebuild and resend), a 409 it cannot (an error, after exhausting
+// the rebuild attempts), a fatal code (an error, not retried), and a response
+// carrying no collection verdict at all (accepted). Discarding the response —
+// which is what made a 409 indistinguishable from success — fails all four.
 #[cfg(test)]
 mod send_patch_response_tests {
     use super::*;

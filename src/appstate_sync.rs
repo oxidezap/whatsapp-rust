@@ -1004,9 +1004,10 @@ mod tests {
     // comparison entirely. Only a mismatch raised from a SNAPSHOT is fatal
     // (it escalates to peer snapshot recovery).
     //
-    // These two tests pin that behaviour. They fail today: the mismatch
-    // propagates out of `process_patch_list` with `?`, so the collection is
-    // stuck at the same base that has already been proven unusable.
+    // These two tests pin the whole-pipeline half of that: a divergent patch
+    // reaches `process_patch_list`, applies, advances the persisted version,
+    // and leaves the latch on disk. The pure-validation half is pinned in
+    // `wacore-appstate`'s own tests.
 
     /// Sign `patch` the way a diverged peer signs one: a correct `patchMac`
     /// (the patch really is authentic), over a `snapshotMac` computed from
@@ -1141,14 +1142,18 @@ mod tests {
 
             assert_eq!(mutations.len(), 1, "v{version} mutation must be dispatched");
             assert_eq!(state.version, version);
+            let persisted = backend
+                .get_version(name.as_str())
+                .await
+                .expect("version readable");
             assert_eq!(
-                backend
-                    .get_version(name.as_str())
-                    .await
-                    .expect("version readable")
-                    .version,
-                version,
+                persisted.version, version,
                 "the collection must advance, or the next sync re-requests the same patch"
+            );
+            assert!(
+                persisted.mac_mismatch_fatal,
+                "the latch must be persisted with the version, or a restart re-detects \
+                 the divergence on v{version} and every patch after it"
             );
         }
     }
