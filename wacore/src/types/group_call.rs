@@ -253,7 +253,7 @@ impl crate::stats::HeapSize for GroupCallUpdate {
 }
 
 /// One encrypted keygen-v2 epoch delivered to a participant device.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct GroupCallEncRekey {
     pub call_id: String,

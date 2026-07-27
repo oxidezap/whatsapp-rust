@@ -1,7 +1,7 @@
 use wacore::types::group_call::{
-    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallDevice, GroupCallParticipant,
-    GroupCallRelay, GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare, ScreenShareState,
-    WaitingRoom, WaitingRoomUser,
+    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallDevice, GroupCallEncRekey,
+    GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare,
+    ScreenShareState, WaitingRoom, WaitingRoomUser,
 };
 use wacore_binary::{Jid, Server};
 
@@ -89,6 +89,17 @@ fn public_group_call_payloads_are_constructible_with_builders() {
         .is_admin(false)
         .build();
     assert!(!join.in_waiting_room);
+
+    let rekey = GroupCallEncRekey::builder()
+        .call_id("GROUP-CALL".to_string())
+        .call_creator(Jid::new("111111111111111", Server::Lid))
+        .transaction_id(2)
+        .key_generation(2)
+        .encryption_type("msg".to_string())
+        .encryption_version(2)
+        .ciphertext(vec![1, 2, 3])
+        .build();
+    assert_eq!(rekey.transaction_id, 2);
 
     let share = ScreenShare::builder()
         .state(ScreenShareState::Started)

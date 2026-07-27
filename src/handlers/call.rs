@@ -364,14 +364,16 @@ impl StanzaHandler for CallHandler {
                             client.core.event_bus.dispatch(outcome);
                         }
                     }
-                    // A `busy` reject speaks for the responding DEVICE only, not the callee, so it
-                    // must not tear the call down while the peer's other devices are still ringing.
-                    // If every device is busy the call still ends, via the server's
-                    // `<terminate reason="timeout">` handled above.
+                    // A `busy` reject speaks for one device, and a group reject speaks for one
+                    // invited participant. Neither tears down the registered call; authoritative
+                    // timeout/terminate or the group roster owns the corresponding final state.
                     #[cfg(feature = "voip-runtime")]
                     if matches!(&call.action, CallAction::Terminate { .. })
                         || matches!(&call.action, CallAction::Reject { .. }
-                            if !reject_is_device_busy(&call.action))
+                            if !reject_is_device_busy(&call.action)
+                                && !client
+                                    .call_registry()
+                                    .is_group_call(call.action.call_id()))
                     {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
@@ -1045,6 +1047,8 @@ mod tests {
     use crate::test_utils::node_to_owned_ref;
     use std::sync::Arc;
     use wacore::types::events::{ChannelEventHandler, Event};
+    #[cfg(feature = "voip-runtime")]
+    use wacore::types::group_call::GroupCallUpdate;
     #[cfg(feature = "voip-runtime")]
     use wacore::voip::video_control_channel;
     use wacore_binary::builder::NodeBuilder;
@@ -2803,6 +2807,58 @@ mod tests {
                 .is_none(),
             "an explicit decline must still end the call"
         );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn participant_reject_keeps_the_active_group_call() {
+        let client = make_client().await;
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let participant = Jid::new("222222222222222", Server::Lid);
+        let call_id = "GROUP-CALL";
+        let mut session = wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        );
+        session.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        );
+        let generation = client.call_registry().insert(session);
+        let reject = NodeBuilder::new("call")
+            .attr("from", participant)
+            .attr("id", "STANZA-GROUP-DECLINE")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", creator)
+                .attr("call-id", call_id)
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&reject), &mut cancelled)
+                .await
+        );
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            Some(generation),
+            "one participant declining an invite must not terminate group media"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
     }
 
     // A peer <terminate> for our call tears it down: the registry entry (and with it the media task)

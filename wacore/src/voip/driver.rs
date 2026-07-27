@@ -40,6 +40,16 @@ pub enum GroupControl {
     Reaction(String),
 }
 
+impl GroupControl {
+    /// The transaction this control carries key material for, if any.
+    pub(crate) fn epoch_transaction_id(&self) -> Option<u32> {
+        match self {
+            Self::Transition { epoch, .. } | Self::RawEpoch(epoch) => Some(epoch.transaction_id),
+            Self::Update(_) | Self::Reaction(_) => None,
+        }
+    }
+}
+
 /// One decrypted keygen-v2 epoch. Debug output is deliberately redacted and the bytes are erased
 /// when the command leaves the driver, regardless of whether the engine accepted it.
 pub struct GroupRawEpoch {
@@ -396,6 +406,10 @@ fn apply_group_epoch_control(
             });
         }
     }
+}
+
+fn is_fatal_group_update_error(error: &engine::EngineError) -> bool {
+    !matches!(error, engine::EngineError::GroupMedia(_))
 }
 
 fn prepare_relay_reconnect(
@@ -887,24 +901,15 @@ async fn run_call_with_clock_and_wallclock(
                             }
                             Ok(_) => true,
                             Err(error) => {
-                                if matches!(
-                                    error,
-                                    engine::EngineError::GroupMedia(
-                                        crate::voip::GroupMediaError::IdentityMismatch
-                                            | crate::voip::GroupMediaError::InvalidSnapshot
-                                            | crate::voip::GroupMediaError::InvalidEpoch
-                                            | crate::voip::GroupMediaError::ConflictingEpoch
-                                    )
-                                ) {
-                                    let _ = channels.events.try_send(
-                                        CallEvent::GroupControlRejected {
-                                            control: engine::GroupControlKind::Update,
-                                        },
-                                    );
-                                    false
-                                } else {
+                                if is_fatal_group_update_error(&error) {
                                     break 'drive;
                                 }
+                                let _ = channels.events.try_send(
+                                    CallEvent::GroupControlRejected {
+                                        control: engine::GroupControlKind::Update,
+                                    },
+                                );
+                                false
                             }
                         };
                         if update_accepted
@@ -1548,6 +1553,70 @@ mod tests {
                 }
             )),
             "the pre-roster epoch is rejected explicitly instead of terminating the call"
+        );
+    }
+
+    #[test]
+    fn group_update_pipeline_error_does_not_terminate_the_driver() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let binding =
+            stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[7u8; 12], &[], None, false);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(binding)))
+            .unwrap();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        let update = group_update(1, "203.0.113.7", 3478);
+        group_tx
+            .try_send(GroupControl::Update(Box::new(update.clone())))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+        let mut direct_config = config();
+        direct_config.enable_media = false;
+        let mut engine = CallEngine::new(direct_config, Box::new(SequentialTxIds::new()))
+            .expect("control-only engine");
+        assert!(matches!(
+            engine.apply_group_update(0, &update),
+            Err(engine::EngineError::GroupMedia(
+                crate::voip::GroupMediaError::Pipeline
+            ))
+        ));
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            engine,
+        ));
+
+        assert!(
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_BINDING_SUCCESS)),
+            "a failed roster refresh must not stop subsequent relay processing"
+        );
+        assert!(
+            std::iter::from_fn(|| ev_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                CallEvent::GroupControlRejected {
+                    control: engine::GroupControlKind::Update
+                }
+            )),
+            "the non-fatal engine error must be surfaced as a rejected update"
         );
     }
 

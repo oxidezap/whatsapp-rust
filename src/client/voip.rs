@@ -534,16 +534,11 @@ impl Voip<'_> {
         let request = build_call_link_join_with_capability(&token, media, &request_id, capability)
             .map_err(|error| CallError::Response(error.to_string()))?;
         let _pending_join = self.client.begin_call_link_join();
-        let mut join = execute_call_service_request(
-            self.client,
-            &request_id,
-            request,
-            parse_call_link_join_ack,
-        )
-        .await?;
-        if join.token.is_empty() {
-            join.token.clone_from(&token);
-        }
+        let mut join =
+            execute_call_service_request(self.client, &request_id, request, |response| {
+                parse_call_link_join_ack(response, &token)
+            })
+            .await?;
         if join.media != media {
             return Err(CallError::Response(
                 "call-link response changed the requested media mode".to_string(),
@@ -1133,7 +1128,7 @@ async fn execute_call_service_request<T>(
     client: &Client,
     request_id: &str,
     request: Node,
-    parse: fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<T>,
+    parse: impl FnOnce(&wacore_binary::NodeRef<'_>) -> anyhow::Result<T>,
 ) -> Result<T, CallError> {
     let (tx, response) = futures::channel::oneshot::channel();
     let cleanup_generation = client

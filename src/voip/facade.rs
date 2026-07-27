@@ -786,7 +786,6 @@ impl<'a> OutgoingGroupCall<'a> {
         {
             return Err(CallError::CallEndedDuringSetup);
         }
-        let ack_applied = applied == wacore::voip::GroupStateApply::Applied;
         let relay = update
             .relay
             .as_ref()
@@ -813,14 +812,17 @@ impl<'a> OutgoingGroupCall<'a> {
                 direct_peer: None,
             })
             .map_err(|error| CallError::Setup(error.to_string()))?;
-        // A newer pre-ACK update was already rekeyed by the serialized signaling handler and left
-        // its epoch in the registry. Only the ACK transaction itself still needs startup fan-out.
-        if ack_applied && update.rekey_requested {
-            fanout_group_epoch(self.client, &update)
+        // A newer pre-ACK update may have overtaken this ACK without requesting its own rekey.
+        // Honor the ACK request unless the serialized signaling handler retained an equal/newer
+        // epoch; fan out against the current roster so newly arrived participants receive it too.
+        let retained_epoch =
+            registry.pending_group_epoch_transaction_if_current(&call_id, registration.generation);
+        if let Some(rekey_update) = group_offer_epoch_update(&ack_update, &update, retained_epoch) {
+            fanout_group_epoch(self.client, rekey_update)
                 .await?
                 .commit(|epoch| {
                     engine
-                        .apply_group_raw_epoch(update.transaction_id, epoch)
+                        .apply_group_raw_epoch(rekey_update.transaction_id, epoch)
                         .map_err(|error| CallError::Setup(error.to_string()))
                 })?;
         }
@@ -1094,6 +1096,16 @@ fn ensure_group_offer_media(
             "group offer ack changed the requested media mode".to_string(),
         ))
     }
+}
+
+fn group_offer_epoch_update<'a>(
+    ack_update: &GroupCallUpdate,
+    current_update: &'a GroupCallUpdate,
+    retained_epoch: Option<u32>,
+) -> Option<&'a GroupCallUpdate> {
+    (ack_update.rekey_requested
+        && retained_epoch.is_none_or(|transaction| transaction < ack_update.transaction_id))
+    .then_some(current_update)
 }
 
 fn ensure_call_link_admitted_media(
@@ -3816,6 +3828,33 @@ mod tests {
         assert!(ensure_group_offer_media(&update("video"), true).is_ok());
         assert!(ensure_group_offer_media(&update("audio"), true).is_err());
         assert!(ensure_group_offer_media(&update("video"), false).is_err());
+    }
+
+    #[test]
+    fn overtaken_group_offer_ack_keeps_its_unfulfilled_rekey_request() {
+        let ack = GroupCallUpdate::builder()
+            .call_id("GROUP-CALL".to_string())
+            .call_creator(Jid::new("111111111111111", Server::Lid))
+            .transaction_id(5)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(true)
+            .participants(Vec::new())
+            .build();
+        let mut current = ack.clone();
+        current.transaction_id = 6;
+        current.rekey_requested = false;
+
+        assert_eq!(
+            group_offer_epoch_update(&ack, &current, None).map(|update| update.transaction_id),
+            Some(6),
+            "the ACK request must fan out against the authoritative overtaking roster"
+        );
+        assert!(group_offer_epoch_update(&ack, &current, Some(4)).is_some());
+        assert!(group_offer_epoch_update(&ack, &current, Some(5)).is_none());
+        assert!(group_offer_epoch_update(&ack, &current, Some(6)).is_none());
     }
 
     #[test]

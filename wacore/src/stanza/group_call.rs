@@ -612,15 +612,15 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| group_stanza_error("enc_rekey has no ciphertext"))?
         .to_vec();
-    Ok(GroupCallEncRekey {
-        call_id,
-        call_creator,
-        transaction_id,
-        key_generation,
-        encryption_type,
-        encryption_version,
-        ciphertext,
-    })
+    Ok(GroupCallEncRekey::builder()
+        .call_id(call_id)
+        .call_creator(call_creator)
+        .transaction_id(transaction_id)
+        .key_generation(key_generation)
+        .encryption_type(encryption_type)
+        .encryption_version(encryption_version)
+        .ciphertext(ciphertext)
+        .build())
 }
 
 /// Build a call-link creation request.
@@ -743,33 +743,39 @@ pub fn parse_call_link_query_ack(node: &NodeRef<'_>) -> Result<CallLinkPreview> 
 
 /// Parse a link join that either admitted this endpoint or placed it in a waiting room.
 #[cold]
-pub fn parse_call_link_join_ack(node: &NodeRef<'_>) -> Result<CallLinkJoin> {
+pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Result<CallLinkJoin> {
+    if requested_token.is_empty() {
+        bail!("requested call-link token is empty");
+    }
     validate_call_ack(node, "link_join")?;
     let waiting = node
         .get_optional_child("waiting_room")
         .map(parse_waiting_room)
         .transpose()?;
     let group = parse_initial_group_call_ack(node)?;
-    let (token, media, call_id, call_creator, waiting_room_enabled, is_admin) =
-        match (&waiting, &group) {
-            (Some(waiting), _) => (
-                waiting.link_token.clone(),
-                waiting.media,
-                waiting.call_id.clone(),
-                waiting.call_creator.clone(),
-                waiting.enabled,
-                waiting.is_admin,
-            ),
-            (None, Some(group)) => (
-                String::new(),
-                parse_call_link_media(group.media.clone())?,
-                group.call_id.clone(),
-                group.call_creator.clone(),
-                false,
-                false,
-            ),
-            (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
-        };
+    let (media, call_id, call_creator, waiting_room_enabled, is_admin) = match (&waiting, &group) {
+        (Some(waiting), _) => (
+            waiting.media,
+            waiting.call_id.clone(),
+            waiting.call_creator.clone(),
+            waiting.enabled,
+            waiting.is_admin,
+        ),
+        (None, Some(group)) => (
+            parse_call_link_media(group.media.clone())?,
+            group.call_id.clone(),
+            group.call_creator.clone(),
+            false,
+            false,
+        ),
+        (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
+    };
+    if waiting
+        .as_ref()
+        .is_some_and(|waiting| waiting.link_token != requested_token)
+    {
+        bail!("waiting-room token differs from the requested call link");
+    }
     if group.is_none() && !waiting_room_enabled {
         bail!("<link_join> waiting-room-only ack is not enabled");
     }
@@ -784,7 +790,7 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>) -> Result<CallLinkJoin> {
         bail!("waiting-room and admitted group media modes differ");
     }
     Ok(CallLinkJoin {
-        token,
+        token: requested_token.to_string(),
         media,
         call_id,
         call_creator,
@@ -1812,9 +1818,10 @@ mod tests {
                 .attr("transaction-id", "4")
                 .build()])
             .build();
-        let result = parse_call_link_join_ack(&waiting.as_node_ref()).unwrap();
+        let result = parse_call_link_join_ack(&waiting.as_node_ref(), "TOKEN").unwrap();
         assert!(result.in_waiting_room);
         assert!(result.group.is_none());
+        assert_eq!(result.token, "TOKEN");
 
         let admitted = NodeBuilder::new("ack")
             .attr("class", "call")
@@ -1827,8 +1834,9 @@ mod tests {
                 .attr("connected-limit", "8")
                 .build()])
             .build();
-        let result = parse_call_link_join_ack(&admitted.as_node_ref()).unwrap();
+        let result = parse_call_link_join_ack(&admitted.as_node_ref(), "TOKEN").unwrap();
         assert!(!result.in_waiting_room);
+        assert_eq!(result.token, "TOKEN");
         assert_eq!(result.group.unwrap().transaction_id, 5);
 
         let conflicting_media = NodeBuilder::new("ack")
@@ -1854,7 +1862,7 @@ mod tests {
             ])
             .build();
         assert!(
-            parse_call_link_join_ack(&conflicting_media.as_node_ref()).is_err(),
+            parse_call_link_join_ack(&conflicting_media.as_node_ref(), "TOKEN").is_err(),
             "one admitted ACK cannot describe two authoritative media modes"
         );
 
@@ -1870,7 +1878,11 @@ mod tests {
                 .attr("is_admin", "0")
                 .build()])
             .build();
-        assert!(parse_call_link_join_ack(&disabled_waiting_only.as_node_ref()).is_err());
+        assert!(parse_call_link_join_ack(&disabled_waiting_only.as_node_ref(), "TOKEN").is_err());
+        assert!(
+            parse_call_link_join_ack(&waiting.as_node_ref(), "DIFFERENT-TOKEN").is_err(),
+            "the parsed admission state must remain bound to the requested call link"
+        );
     }
 
     #[test]

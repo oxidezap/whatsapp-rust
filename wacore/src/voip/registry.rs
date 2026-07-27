@@ -499,6 +499,15 @@ impl CallRegistry {
             .and_then(|entry| entry.group.clone())
     }
 
+    /// Whether the registered call-id belongs to a group-call generation.
+    pub fn is_group_call(&self, call_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .is_some_and(|entry| entry.group.is_some())
+    }
+
     /// Read group state only when `generation` still owns this call-id.
     pub fn group_state_if_current(&self, call_id: &str, generation: u64) -> Option<GroupCallState> {
         self.inner
@@ -1056,6 +1065,21 @@ impl CallRegistry {
         }
     }
 
+    /// The retained epoch transaction for one call generation before its media driver attaches.
+    pub fn pending_group_epoch_transaction_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<u32> {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.pending_group_epoch.as_ref())
+            .map(|epoch| epoch.transaction_id)
+    }
+
     /// Keep the newest epoch resident when a bounded group-control mailbox sheds older commands.
     /// Roster updates may be coalesced under backpressure; losing the only pending epoch would leave
     /// the media engine permanently unable to decrypt the latest generation.
@@ -1064,25 +1088,16 @@ impl CallRegistry {
         mut command: GroupControl,
     ) -> bool {
         loop {
-            let queued_epoch = match &command {
-                GroupControl::RawEpoch(epoch) => Some(epoch.transaction_id),
-                GroupControl::Transition { epoch, .. } => Some(epoch.transaction_id),
-                _ => None,
-            };
+            let queued_epoch = command.epoch_transaction_id();
             // Each retry keeps the newer of the queued and evicted epochs. Because the mailbox is
             // bounded, it eventually evicts a non-epoch or an older epoch and returns.
             match tx.force_send(command) {
-                Ok(Some(
-                    evicted @ (GroupControl::RawEpoch(_) | GroupControl::Transition { .. }),
-                )) if queued_epoch.is_none_or(|queued| {
-                    let evicted_transaction = match &evicted {
-                        GroupControl::RawEpoch(epoch) | GroupControl::Transition { epoch, .. } => {
-                            epoch.transaction_id
-                        }
-                        _ => unreachable!("guard restricts evicted control"),
-                    };
-                    evicted_transaction > queued
-                }) =>
+                Ok(Some(evicted))
+                    if evicted
+                        .epoch_transaction_id()
+                        .is_some_and(|evicted_transaction| {
+                            queued_epoch.is_none_or(|queued| evicted_transaction > queued)
+                        }) =>
                 {
                     command = evicted;
                 }
