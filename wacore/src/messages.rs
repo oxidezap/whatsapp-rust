@@ -30,30 +30,22 @@ pub trait DsmDestination {
     fn write_into(&self, out: &mut Vec<u8>);
 }
 
-/// So every caller that relied on deref coercion keeps compiling: a generic
-/// parameter does not coerce the way the old `&str` argument did, so each
-/// wrapper a destination can arrive in needs to be named.
+/// A generic parameter does not deref-coerce the way the old `&str` argument
+/// did, so every shape a caller could previously pass has to be reachable by
+/// an implementation instead.
 ///
-/// A blanket `impl<T: Deref<Target = str>>` would cover them in one line but
-/// collides with the `&Jid` implementation below: coherence cannot rule out
-/// `Jid` gaining that `Deref`, so the two overlap as far as the compiler is
-/// concerned. Hence the list, and the mutable form of each: `&mut String`
-/// coerced to `&str` just as `&String` did.
+/// The trait is therefore implemented on the *owned* types, and the two blanket
+/// implementations below carry it through references. That covers a reference
+/// of any depth and mutability (`&String`, `&mut String`, `&&str`) without
+/// naming each one, which a finite list cannot do.
+///
+/// Recorded so it is not attempted again: a blanket
+/// `impl<T: Deref<Target = str>>` over the *reference* types instead would
+/// collide with the `Jid` implementation, because coherence cannot rule out
+/// `Jid` gaining that `Deref`.
 macro_rules! dsm_destination_via_str {
     ($($ty:ty),+ $(,)?) => {$(
-        impl DsmDestination for &$ty {
-            #[inline]
-            fn encoded_len(&self) -> usize {
-                str::len(self)
-            }
-
-            #[inline]
-            fn write_into(&self, out: &mut Vec<u8>) {
-                out.extend_from_slice(str::as_bytes(self));
-            }
-        }
-
-        impl DsmDestination for &mut $ty {
+        impl DsmDestination for $ty {
             #[inline]
             fn encoded_len(&self) -> usize {
                 str::len(self)
@@ -76,7 +68,31 @@ dsm_destination_via_str!(
     std::borrow::Cow<'_, str>,
 );
 
-impl DsmDestination for &wacore_binary::jid::Jid {
+impl<T: DsmDestination + ?Sized> DsmDestination for &T {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    #[inline]
+    fn write_into(&self, out: &mut Vec<u8>) {
+        (**self).write_into(out);
+    }
+}
+
+impl<T: DsmDestination + ?Sized> DsmDestination for &mut T {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    #[inline]
+    fn write_into(&self, out: &mut Vec<u8>) {
+        (**self).write_into(out);
+    }
+}
+
+impl DsmDestination for wacore_binary::jid::Jid {
     #[inline]
     fn encoded_len(&self) -> usize {
         let mut counter = DisplayLen(0);
@@ -1973,10 +1989,10 @@ mod device_sent_tests {
         for case in cases {
             let jid: Jid = case.parse().unwrap_or_else(|e| panic!("parse {case}: {e}"));
             let mut written = Vec::new();
-            (&jid).write_into(&mut written);
+            jid.write_into(&mut written);
 
             assert_eq!(
-                (&jid).encoded_len(),
+                jid.encoded_len(),
                 written.len(),
                 "{case}: the counted length must equal the bytes written"
             );
@@ -2055,7 +2071,23 @@ mod device_sent_tests {
         let by_mut_through_encode =
             MessageUtils::encode_dm_plaintexts(&message, None, &mut owned_mut);
 
+        // Nested references coerced too, and a finite list of implementations
+        // could never cover every depth. These pin that the blanket ones do, so
+        // the extra borrows clippy offers to remove are the whole point here.
+        #[allow(
+            clippy::needless_borrows_for_generic_args,
+            reason = "the nested reference is what this asserts is accepted"
+        )]
+        let (by_double, by_triple, by_ref_to_owned) = (
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &dest),
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &&dest),
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &&owned),
+        );
+
         for (name, produced) in [
+            ("&&str", by_double),
+            ("&&&str", by_triple),
+            ("&&String", by_ref_to_owned),
             ("&mut String", by_mut_string),
             ("&mut str", by_mut_str),
             (
