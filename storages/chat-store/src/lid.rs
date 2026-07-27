@@ -316,16 +316,12 @@ pub(crate) fn merge_split_chat(
         .bind::<Text, _>(src)
         .execute(conn)?;
 
-    diesel::sql_query(
-        "DELETE FROM message_receipts WHERE device_id = ?1 AND chat_jid = ?3 AND EXISTS \
-         (SELECT 1 FROM message_receipts s WHERE s.device_id = ?1 AND s.chat_jid = ?2 \
-          AND s.msg_id = message_receipts.msg_id AND s.user_jid = message_receipts.user_jid \
-          AND s.receipt_type > message_receipts.receipt_type)",
-    )
-    .bind::<Integer, _>(device_id)
-    .bind::<Text, _>(src)
-    .bind::<Text, _>(dest)
-    .execute(conn)?;
+    // No "keep the furthest state" pass here, unlike reactions: receipts are
+    // keyed per state, so a side holding `read` and a side holding `delivered`
+    // are two facts about one message rather than two candidates for one row.
+    // `OR IGNORE` only drops a src row that collides on the whole key — same
+    // message, user AND state — where the destination already records that
+    // state and its instant is the earlier one by the same rule that wrote it.
     diesel::sql_query(
         "UPDATE OR IGNORE message_receipts SET chat_jid = ? WHERE device_id = ? AND chat_jid = ?",
     )

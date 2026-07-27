@@ -62,7 +62,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    message_receipts (device_id, chat_jid, msg_id, user_jid) {
+    message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type) {
         device_id -> Integer,
         chat_jid -> Text,
         msg_id -> Text,

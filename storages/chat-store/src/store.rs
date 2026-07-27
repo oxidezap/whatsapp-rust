@@ -1761,49 +1761,25 @@ fn apply_receipt(
         if updated == 0 {
             missed.push(msg_id);
         }
-
-        // Derived from the JID: the library's receipt parser leaves
-        // `source.is_group` defaulted, so the flag can't be trusted here.
-        if receipt.source.chat.is_group() {
-            use schema::message_receipts::dsl;
-            diesel::insert_into(dsl::message_receipts)
-                .values((
-                    dsl::device_id.eq(device_id),
-                    dsl::chat_jid.eq(&chat),
-                    dsl::msg_id.eq(msg_id),
-                    dsl::user_jid.eq(&user),
-                    dsl::receipt_type.eq(status),
-                    dsl::ts_ms.eq(ts_ms),
-                ))
-                .on_conflict_do_nothing()
-                .execute(conn)?;
-            // Existing row: advance only (a late "delivered" must not undo "read").
-            diesel::update(
-                dsl::message_receipts.filter(
-                    dsl::device_id
-                        .eq(device_id)
-                        .and(dsl::chat_jid.eq(&chat))
-                        .and(dsl::msg_id.eq(msg_id))
-                        .and(dsl::user_jid.eq(&user))
-                        .and(dsl::receipt_type.lt(status)),
-                ),
-            )
-            .set((dsl::receipt_type.eq(status), dsl::ts_ms.eq(ts_ms)))
-            .execute(conn)?;
-        }
     }
     // A modern peer addresses the receipt by whichever identity it has for
     // the thread — LID receipts for PN-keyed rows or vice versa. Retry the
     // misses under the mapped counterpart key (WA Web's alternate-key
     // fallback, `fixMsgKeysWithPnMapping`); costs one indexed lookup and only
     // on the miss path, so the already-consistent case stays free.
+    //
+    // Where a message answers under the counterpart key, its receipt belongs
+    // there too: the satellite prune is per chat and drops receipt rows whose
+    // `msg_id` is absent from *that* chat, so a row left under the wire key
+    // would be collected as an orphan.
+    let mut relocated: std::collections::HashMap<&String, String> =
+        std::collections::HashMap::new();
     if !missed.is_empty()
         && !receipt.source.chat.is_group()
         && let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &chat)?
     {
-        let mut matched_alt = false;
         for msg_id in missed {
-            matched_alt |= diesel::update(
+            if diesel::update(
                 message_row(device_id, &alt, msg_id).filter(
                     schema::messages::from_me
                         .eq(true)
@@ -1812,13 +1788,55 @@ fn apply_receipt(
             )
             .set(schema::messages::status.eq(status))
             .execute(conn)?
-                > 0;
+                > 0
+            {
+                relocated.insert(msg_id, alt.clone());
+            }
         }
-        if matched_alt {
+        if !relocated.is_empty() {
             cs.message_chats.insert(alt);
         }
     }
+
+    // Both chat kinds record the per-state rows. A group needs them to say who
+    // has read; a 1:1 needs them because the message's own `status` keeps only
+    // the state it reached, not the instant it got there — which is the half
+    // WA Web's "Delivered hh:mm / Read hh:mm" is made of.
+    for msg_id in &receipt.message_ids {
+        let key = relocated.get(msg_id).unwrap_or(&chat);
+        record_receipt(conn, device_id, key, msg_id, &user, status, ts_ms)?;
+    }
+
     cs.message_chats.insert(chat);
+    Ok(())
+}
+
+/// Record that `user` reached `status` on one message, at `ts_ms`.
+///
+/// Insert-only, so the stored instant is the *first* report of that state. A
+/// receipt replay is a duplicate rather than a new event, and a peer's second
+/// device acking later does not mean the user got it later.
+fn record_receipt(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    msg_id: &str,
+    user: &str,
+    status: i32,
+    ts_ms: i64,
+) -> QueryResult<()> {
+    use schema::message_receipts::dsl;
+    diesel::insert_into(dsl::message_receipts)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::chat_jid.eq(chat),
+            dsl::msg_id.eq(msg_id),
+            dsl::user_jid.eq(user),
+            dsl::receipt_type.eq(status),
+            dsl::ts_ms.eq(ts_ms),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?;
     Ok(())
 }
 
