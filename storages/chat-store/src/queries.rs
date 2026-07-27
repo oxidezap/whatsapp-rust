@@ -13,8 +13,8 @@ use crate::error::{Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
-    ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind, MessageStatus, ReactionEntry,
-    ReceiptEntry, StoredMessage,
+    ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind, MessageStatus,
+    ReactionEntry, ReceiptEntry, StoredMessage,
 };
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
@@ -107,6 +107,7 @@ struct MessageRow {
     starred: bool,
     edited_at_ms: Option<i64>,
     revoked: bool,
+    rowid: i64,
 }
 
 impl From<MessageRow> for StoredMessage {
@@ -137,6 +138,7 @@ impl From<MessageRow> for StoredMessage {
             starred: row.starred,
             edited_at: row.edited_at_ms.and_then(ms_to_utc),
             revoked: row.revoked,
+            seq: row.rowid,
         }
     }
 }
@@ -146,7 +148,27 @@ impl ChatStore {
     /// activity). Purely a default: every ordering input (`pinned_at`,
     /// `last_message_at`, `archived`, ...) is on [`ChatEntry`], so a frontend
     /// with different needs re-sorts freely.
+    ///
+    /// Equivalent to [`chats_page`](Self::chats_page) with no cursor.
     pub async fn chats(&self, include_archived: bool, limit: i64) -> Result<Vec<ChatEntry>> {
+        self.chats_page(include_archived, None, limit).await
+    }
+
+    /// One page of the chat list. Pass the cursor of the last chat you already
+    /// have to get the page after it.
+    ///
+    /// The list is two ordered runs concatenated — pinned chats by pin time,
+    /// then everything else by activity — because SQLite cannot serve the
+    /// combined `(pinned_at IS NULL, pinned_at DESC, last_message_ts DESC)`
+    /// sort from any column index, and paying a full scan plus a temp B-tree
+    /// per call is what this shape avoids. Each run is a plain ordered range
+    /// scan that stops at `limit`.
+    pub async fn chats_page(
+        &self,
+        include_archived: bool,
+        after: Option<ChatCursor>,
+        limit: i64,
+    ) -> Result<Vec<ChatEntry>> {
         use schema::chats::dsl;
         // A negative LIMIT means "unbounded" to SQLite; never let that happen.
         let limit = limit.max(0);
@@ -154,22 +176,97 @@ impl ChatStore {
         let rows: Vec<ChatRow> = self
             .db()
             .run(move |conn| {
-                let mut query = dsl::chats.filter(dsl::device_id.eq(device_id)).into_boxed();
-                if !include_archived {
-                    query = query.filter(dsl::archived.eq(false));
+                // A cursor in the activity run has already passed every pinned
+                // chat, so that run is skipped entirely rather than re-read.
+                let resume_pinned = match &after {
+                    Some(cursor) => cursor.pinned_at_ms,
+                    None => None,
+                };
+                let start_in_activity_run =
+                    matches!(&after, Some(cursor) if cursor.pinned_at_ms.is_none());
+
+                let mut rows: Vec<ChatRow> = Vec::new();
+                if !start_in_activity_run {
+                    let mut query = dsl::chats
+                        .filter(dsl::device_id.eq(device_id))
+                        .filter(dsl::pinned_at.is_not_null())
+                        .into_boxed();
+                    if !include_archived {
+                        query = query.filter(dsl::archived.eq(false));
+                    }
+                    if let (Some(pinned_at), Some(cursor)) = (resume_pinned, &after) {
+                        query = query.filter(
+                            dsl::pinned_at.lt(pinned_at).or(dsl::pinned_at
+                                .eq(pinned_at)
+                                .and(dsl::jid.lt(cursor.jid.clone()))),
+                        );
+                    }
+                    rows = query
+                        .order((dsl::pinned_at.desc(), dsl::jid.desc()))
+                        .limit(limit)
+                        .load(conn)
+                        .map_err(db_err)?;
                 }
-                query
-                    .order((
-                        diesel::dsl::sql::<diesel::sql_types::Bool>("pinned_at IS NULL"),
-                        dsl::pinned_at.desc(),
-                        dsl::last_message_ts.desc(),
-                    ))
-                    .limit(limit)
-                    .load(conn)
-                    .map_err(db_err)
+
+                let remaining = limit - rows.len() as i64;
+                if remaining > 0 {
+                    let mut query = dsl::chats
+                        .filter(dsl::device_id.eq(device_id))
+                        .filter(dsl::pinned_at.is_null())
+                        .into_boxed();
+                    if !include_archived {
+                        query = query.filter(dsl::archived.eq(false));
+                    }
+                    if start_in_activity_run && let Some(cursor) = &after {
+                        query = query.filter(
+                            dsl::last_message_ts.lt(cursor.last_message_ts).or(
+                                dsl::last_message_ts
+                                    .eq(cursor.last_message_ts)
+                                    .and(dsl::jid.lt(cursor.jid.clone())),
+                            ),
+                        );
+                    }
+                    let tail: Vec<ChatRow> = query
+                        .order((dsl::last_message_ts.desc(), dsl::jid.desc()))
+                        .limit(remaining)
+                        .load(conn)
+                        .map_err(db_err)?;
+                    rows.extend(tail);
+                }
+                Ok(rows)
             })
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// One chat by key, or `None` if the store has never seen it.
+    ///
+    /// A 1:1 chat may be addressed by either of the peer's identities (phone
+    /// number or LID); both resolve to the row the thread is actually stored
+    /// under. This is the point lookup the primary key always supported —
+    /// mapping an addressed JID back to a store key, or folding one chat's
+    /// unread count, does not need the whole list.
+    pub async fn chat(&self, jid: &Jid) -> Result<Option<ChatEntry>> {
+        use schema::chats::dsl;
+        let device_id = self.device_id();
+        let jid = jid.to_string();
+        let row: Option<ChatRow> = self
+            .db()
+            .run(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &jid).map_err(db_err)?;
+                dsl::chats
+                    .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(keys)))
+                    // A split pair (rows under both identities, not yet merged)
+                    // would match twice; the active thread is the one with
+                    // activity on it.
+                    .order(dsl::last_message_ts.desc())
+                    .first(conn)
+                    .optional()
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(row.map(Into::into))
     }
 
     /// One page of a chat's messages, newest first. Pass the cursor of the
@@ -196,16 +293,18 @@ impl ChatStore {
                     .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq_any(keys)))
                     .into_boxed();
                 if let Some(cursor) = &before {
+                    // Mirrors the sort exactly; anything looser skips or
+                    // repeats rows at a page boundary inside a same-second run.
                     query = query.filter(
                         dsl::timestamp_ms
                             .lt(cursor.timestamp_ms)
                             .or(dsl::timestamp_ms
                                 .eq(cursor.timestamp_ms)
-                                .and(dsl::msg_id.lt(&cursor.msg_id))),
+                                .and(dsl::rowid.lt(cursor.seq))),
                     );
                 }
                 query
-                    .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+                    .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
                     .limit(limit)
                     .load(conn)
                     .map_err(db_err)

@@ -567,16 +567,39 @@ const BIZ_PRIVACY_MODE_TS_OFFSET: u64 = 77_980_457;
 
 enum BizCategory<'a> {
     /// `<biz actual_actors host_storage privacy_mode_ts native_flow_name=X/>` — no children.
+    /// The one shape WA Web also emits attrs-only: `createFanoutMsgStanza`
+    /// builds exactly these four attrs (and never a child) when the peer
+    /// contact carries a `privacyMode`.
     PaymentSimple(&'a str),
-    /// Nested form preserving the button's flow name.
-    NestedNamed(&'a str),
-    /// Nested form with `name="mixed"`. Fallback for buttons the server
-    /// silently drops when sent under their literal name.
+    /// Nested form with `name="mixed"`.
     Mixed,
 }
 
+/// Pick the `<biz>` shape for a native-flow message from its first button.
+///
+/// Only the payment family keeps a literal flow name. Every other name routes
+/// through `mixed`, because live probes (issue #1132: fifteen sends from a
+/// Business account to a consumer handset) found that every one of the named
+/// nested shapes is refused — `cta_url`, `call_permission_request` and
+/// `payment_info` with a 473, `open_webview` and `galaxy_message` with a 405 —
+/// while `mixed` delivered on all ten of its attempts. Leading an otherwise
+/// byte-identical message with a `quick_reply` re-classified it to `mixed` and
+/// it went through, so the name is the only variable.
+///
+/// The name is very likely not the whole story, and the rest is worth a live
+/// probe before anyone reinstates the named form. The WA Web bundle
+/// (`WAWebSendMsgFanout.createFanoutMsgStanza`) builds a `<biz>` in exactly one
+/// of three mutually exclusive shapes, and our nested form matches none of
+/// them: it merges the privacy attrs with the nested child, stamps a `v="9"` on
+/// `<native_flow>` that WA Web never emits (all three of its builders pass
+/// `name` alone), and adds a `<quality_control>` child that appears in the
+/// bundle only in the INCOMING parser. `mixed` may simply be the one name the
+/// server does not validate strictly enough to notice.
 fn classify_button(button_name: &str) -> BizCategory<'_> {
     match button_name {
+        // Untouched by the collapse: #1132 probed only `payment_info` of the
+        // six, and a merchant-provisioned account on real payment rails may
+        // legitimately answer differently than the test account did.
         "payment_info" => BizCategory::PaymentSimple("payment_info"),
         "review_and_pay" => BizCategory::PaymentSimple("order_details"),
         "review_order" | "order_status" => BizCategory::PaymentSimple("order_status"),
@@ -584,44 +607,69 @@ fn classify_button(button_name: &str) -> BizCategory<'_> {
         "payment_method" => BizCategory::PaymentSimple("payment_method"),
         "payment_reminder" => BizCategory::PaymentSimple("payment_reminder"),
 
-        "cta_url" => BizCategory::NestedNamed("cta_url"),
-        "cta_catalog" => BizCategory::NestedNamed("cta_catalog"),
-        "catalog_message" => BizCategory::NestedNamed("catalog_message"),
-        "galaxy_message" => BizCategory::NestedNamed("galaxy_message"),
-        "booking_confirmation" => BizCategory::NestedNamed("booking_confirmation"),
-        "call_permission_request" => BizCategory::NestedNamed("call_permission_request"),
-        "open_webview" => BizCategory::NestedNamed("message_with_link"),
-        "message_with_link_status" => BizCategory::NestedNamed("message_with_link_status"),
-
-        // quick_reply / cta_copy / cta_call / single_select / send_location
-        // and every other unknown name go through the mixed fallback. The
-        // server silently drops messages sent under the literal name for
-        // these buttons.
         _ => BizCategory::Mixed,
     }
 }
 
-/// Derive the `<biz>` stanza child for native-flow interactive messages.
+/// Does this interactive message carry something a client can render on its
+/// own, independent of native-flow buttons?
 ///
-/// Returns `None` when the message has no native-flow interactive payload.
-/// Otherwise returns the assembled `<biz>` node. The caller is responsible
-/// for prepending `<bot biz_bot="1"/>` for DM-bound sends (see
-/// `build_extra_stanza_nodes`).
+/// WA Web's rule verbatim (the `f` term of `getNativeFlowNameFromMsg`): a body,
+/// a header title, a footer, or a header image. `hasMediaAttachment` and the
+/// non-image header media are deliberately not part of it.
+fn has_renderable_envelope(im: &wa::message::InteractiveMessage) -> bool {
+    let non_empty = |text: Option<&str>| text.is_some_and(|t| !t.is_empty());
+
+    if non_empty(im.body.as_option().and_then(|b| b.text.as_deref()))
+        || non_empty(im.footer.as_option().and_then(|f| f.text.as_deref()))
+    {
+        return true;
+    }
+    let Some(header) = im.header.as_option() else {
+        return false;
+    };
+    non_empty(header.title.as_deref())
+        || matches!(
+            header.media,
+            Some(wa::message::interactive_message::header::Media::ImageMessage(_))
+        )
+}
+
+/// Classify an interactive payload into the `<biz>` shape it should carry,
+/// mirroring WA Web's `getNativeFlowNameFromMsg`: the first native-flow
+/// button's name decides when there is one, otherwise a payload that renders
+/// on its own is announced as `mixed`.
+///
+/// That second arm is what makes a carousel work (issue #1133): its buttons
+/// live on the cards, not at the top level, so the button rule never fires and
+/// the message used to leave without a `<biz>` at all — accepted, acked, and
+/// then invisible on the handset. A `shopStorefrontMessage` is excluded, as it
+/// is in WA Web.
+fn classify_interactive(im: &wa::message::InteractiveMessage) -> Option<BizCategory<'_>> {
+    use wa::message::interactive_message::InteractiveMessage as Payload;
+    match im.interactive_message.as_ref()? {
+        Payload::NativeFlowMessage(nf) if !nf.buttons.is_empty() => {
+            nf.buttons.first()?.name.as_deref().map(classify_button)
+        }
+        Payload::ShopStorefrontMessage(_) => None,
+        _ => has_renderable_envelope(im).then_some(BizCategory::Mixed),
+    }
+}
+
+/// Derive the `<biz>` stanza child for interactive messages.
+///
+/// Returns `None` when the message has no interactive payload, or one that
+/// announces nothing (a storefront, or a payload with neither buttons nor any
+/// renderable envelope). Otherwise returns the assembled `<biz>` node. The
+/// caller is responsible for prepending `<bot biz_bot="1"/>` for DM-bound
+/// sends (see `build_extra_stanza_nodes`).
 ///
 /// `now_unix_secs` is the current wall-clock time in unix seconds. Taking it
 /// as a parameter keeps the function pure and lets tests pin the resulting
 /// `privacy_mode_ts` deterministically without touching the global time
 /// provider.
 fn infer_biz_node(msg: &wa::Message, now_unix_secs: u64) -> Option<Node> {
-    let interactive = extract_interactive_message(msg)?;
-    let wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(nf) =
-        interactive.interactive_message.as_ref()?
-    else {
-        return None;
-    };
-
-    let first_button_name = nf.buttons.first()?.name.as_deref()?;
-    let category = classify_button(first_button_name);
+    let category = classify_interactive(extract_interactive_message(msg)?)?;
     let privacy_mode_ts = now_unix_secs
         .saturating_sub(BIZ_PRIVACY_MODE_TS_OFFSET)
         .to_string();
@@ -633,7 +681,6 @@ fn infer_biz_node(msg: &wa::Message, now_unix_secs: u64) -> Option<Node> {
             .attr("privacy_mode_ts", &privacy_mode_ts)
             .attr("native_flow_name", flow_name)
             .build(),
-        BizCategory::NestedNamed(flow_name) => build_nested_biz(&privacy_mode_ts, flow_name),
         BizCategory::Mixed => build_nested_biz(&privacy_mode_ts, "mixed"),
     })
 }
@@ -4142,24 +4189,26 @@ mod tests {
             }
         }
 
-        /// Named-nested buttons keep their flow name and gain the new
-        /// privacy attrs plus `<quality_control>`.
+        /// Every non-payment button name announces itself as `mixed`. The
+        /// eight names that used to keep their own flow name are the ones
+        /// #1132 measured as universally refused (473/405), so they must not
+        /// regain a bespoke shape without fresh live evidence.
         #[test]
-        fn nested_named_form() {
-            let cases: &[(&str, &str)] = &[
-                ("cta_url", "cta_url"),
-                ("cta_catalog", "cta_catalog"),
-                ("catalog_message", "catalog_message"),
-                ("galaxy_message", "galaxy_message"),
-                ("booking_confirmation", "booking_confirmation"),
-                ("call_permission_request", "call_permission_request"),
-                ("open_webview", "message_with_link"),
-                ("message_with_link_status", "message_with_link_status"),
+        fn formerly_named_buttons_now_route_through_mixed() {
+            let cases: &[&str] = &[
+                "cta_url",
+                "cta_catalog",
+                "catalog_message",
+                "galaxy_message",
+                "booking_confirmation",
+                "call_permission_request",
+                "open_webview",
+                "message_with_link_status",
             ];
-            for (button, expected_flow) in cases {
+            for button in cases {
                 let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
                     .unwrap_or_else(|| panic!("{button}: should produce biz"));
-                assert_nested_biz(&biz, expected_flow, button);
+                assert_nested_biz(&biz, "mixed", button);
             }
         }
 
@@ -4188,6 +4237,118 @@ mod tests {
         fn no_interactive_returns_none() {
             let msg = wa::Message {
                 conversation: Some("hello".into()),
+                ..Default::default()
+            };
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
+        }
+
+        fn carousel_msg(im: wa::message::InteractiveMessage) -> wa::Message {
+            wa::Message {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactive_message: Some(
+                        interactive_message::InteractiveMessage::CarouselMessage(Default::default()),
+                    ),
+                    ..im
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn body(text: &str) -> buffa::MessageField<interactive_message::Body> {
+            buffa::MessageField::some(interactive_message::Body {
+                text: Some(text.to_string()),
+            })
+        }
+
+        /// #1133: a carousel's buttons live on its cards, so the button rule
+        /// never fires. Without this the message left with no `<biz>` at all —
+        /// accepted, acked, and then invisible on the recipient's handset.
+        #[test]
+        fn carousel_with_body_emits_mixed_biz() {
+            let msg = carousel_msg(wa::message::InteractiveMessage {
+                body: body("pick a plan"),
+                ..Default::default()
+            });
+            let biz = infer_biz_node(&msg, FIXED_NOW).expect("carousel should produce biz");
+            assert_nested_biz(&biz, "mixed", "carousel");
+        }
+
+        /// A header title alone is enough, and so is a footer — WA Web's rule
+        /// is a disjunction over body / title / footer / header image.
+        #[test]
+        fn carousel_envelope_variants_emit_mixed_biz() {
+            let title = carousel_msg(wa::message::InteractiveMessage {
+                header: buffa::MessageField::some(interactive_message::Header {
+                    title: Some("Our menu".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_nested_biz(
+                &infer_biz_node(&title, FIXED_NOW).expect("title should produce biz"),
+                "mixed",
+                "header title",
+            );
+
+            let footer = carousel_msg(wa::message::InteractiveMessage {
+                footer: buffa::MessageField::some(interactive_message::Footer {
+                    text: Some("tap to order".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_nested_biz(
+                &infer_biz_node(&footer, FIXED_NOW).expect("footer should produce biz"),
+                "mixed",
+                "footer",
+            );
+
+            let image = carousel_msg(wa::message::InteractiveMessage {
+                header: buffa::MessageField::some(interactive_message::Header {
+                    media: Some(interactive_message::header::Media::ImageMessage(
+                        Default::default(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_nested_biz(
+                &infer_biz_node(&image, FIXED_NOW).expect("header image should produce biz"),
+                "mixed",
+                "header image",
+            );
+        }
+
+        /// An empty envelope announces nothing, so there is nothing to mark.
+        #[test]
+        fn carousel_without_envelope_returns_none() {
+            assert!(infer_biz_node(&carousel_msg(Default::default()), FIXED_NOW).is_none());
+        }
+
+        /// An empty-string body is not an envelope: WA Web tests `length > 0`,
+        /// not presence.
+        #[test]
+        fn empty_body_text_is_not_an_envelope() {
+            let msg = carousel_msg(wa::message::InteractiveMessage {
+                body: body(""),
+                ..Default::default()
+            });
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
+        }
+
+        /// Storefronts are excluded from the envelope rule, as in WA Web.
+        #[test]
+        fn shop_storefront_returns_none() {
+            let msg = wa::Message {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    body: body("visit our shop"),
+                    interactive_message: Some(
+                        interactive_message::InteractiveMessage::ShopStorefrontMessage(
+                            Default::default(),
+                        ),
+                    ),
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());

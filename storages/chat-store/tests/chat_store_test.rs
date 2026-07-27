@@ -2316,20 +2316,21 @@ async fn recompute_does_not_resurrect_tombstone_kind() {
 }
 
 #[tokio::test]
-async fn same_millisecond_insert_order_does_not_hijack_preview() {
+async fn same_millisecond_preview_follows_arrival_not_id() {
     let (_store, chat_store) = test_store().await;
 
-    // Applied in REVERSE msg_id order within the same millisecond: the row
-    // that is newest by (timestamp_ms, msg_id) must own the preview.
+    // Two rows on the same millisecond, applied in an order that reverses
+    // their msg_id order. The preview belongs to the one that arrived last —
+    // the id sorts higher but says nothing about time.
     feed(
         &chat_store,
         [
             message_event(
-                wa::Message::text("newest by id"),
+                wa::Message::text("higher id, arrived first"),
                 incoming_info(PEER, PEER, "MSG-Z9", 1_700_000_000),
             ),
             message_event(
-                wa::Message::text("older by id, applied later"),
+                wa::Message::text("lower id, arrived last"),
                 incoming_info(PEER, PEER, "MSG-A1", 1_700_000_000),
             ),
         ],
@@ -2338,8 +2339,32 @@ async fn same_millisecond_insert_order_does_not_hijack_preview() {
     let chats = chat_store.chats(false, 10).await.unwrap();
     assert_eq!(
         chats[0].last_message_preview.as_deref(),
-        Some("newest by id")
+        Some("lower id, arrived last")
     );
+}
+
+/// Arrival only breaks ties. A genuinely older message materialized late
+/// (offline drain, history backfill) still must not take the preview.
+#[tokio::test]
+async fn late_but_older_message_does_not_hijack_preview() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("newest"),
+                incoming_info(PEER, PEER, "MSG-NEW", 1_700_000_100),
+            ),
+            message_event(
+                wa::Message::text("older, applied later"),
+                incoming_info(PEER, PEER, "MSG-OLD", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("newest"));
 }
 
 #[tokio::test]
@@ -4299,5 +4324,401 @@ async fn migration_folds_device_suffixed_rows() {
             .map(|r| (r.user_jid.as_str(), r.receipt_type))
             .collect::<Vec<_>>(),
         [("111000011112222@lid", 4), ("222000011112222@lid", 4)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Arrival ordering (#1134)
+// ---------------------------------------------------------------------------
+
+/// The server's `t` is whole seconds, so a live back-and-forth lands several
+/// messages on the same `timestamp_ms`. The tiebreak used to be `msg_id`, which
+/// encodes nothing about time and is biased: this library stamps a constant
+/// `3EB0` prefix on the ids it generates, while a peer's ids are effectively
+/// uniform hex, so descending id order put the peer's message on top for ~75%
+/// of ties — a reply rendering above the message it answers, every time.
+#[tokio::test]
+async fn same_second_messages_order_by_arrival_not_id() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let second = 1_785_101_675;
+
+    // Inbound first. Its id sorts ABOVE an outgoing `3EB0…` id, which is
+    // exactly the case that used to inverted the pair.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("1st"),
+            incoming_info(PEER, PEER, "AAF59A7CB022679C9C44060A10C25026", second),
+        )],
+    )
+    .await;
+    chat_store
+        .record_outgoing(
+            &chat,
+            "3EB025E0465016A858A333",
+            &wa::Message::text("2nd"),
+            Utc.timestamp_opt(second, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let messages = chat_store.messages(&chat, None, 10).await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| m.text.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["2nd", "1st"],
+        "the reply is the newer message and must render below nothing"
+    );
+    assert!(
+        messages[0].seq > messages[1].seq,
+        "the arrival counter is what breaks the tie"
+    );
+
+    // The same tie decides the chat-list preview.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("2nd"));
+}
+
+/// A page boundary landing inside a same-second run must neither skip nor
+/// repeat: the keyset filter has to mirror the sort's tiebreak exactly.
+#[tokio::test]
+async fn pagination_is_exact_across_a_same_second_run() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // Six messages sharing one second, ids deliberately out of arrival order.
+    let ids = ["F1", "A2", "3EB003", "B4", "3EB005", "C6"];
+    let events: Vec<Event> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            message_event(
+                wa::Message::text(format!("m{i}")),
+                incoming_info(PEER, PEER, id, 1_700_000_000),
+            )
+        })
+        .collect();
+    feed(&chat_store, events).await;
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = chat_store.messages(&chat, cursor.take(), 2).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(Into::into);
+        seen.extend(page.into_iter().map(|m| m.text.unwrap()));
+    }
+    assert_eq!(seen, ["m5", "m4", "m3", "m2", "m1", "m0"]);
+}
+
+// ---------------------------------------------------------------------------
+// Chat list: point lookup and keyset paging (#1141)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_point_lookup_resolves_either_identity() {
+    let (store, chat_store) = test_store().await;
+    add_lid_mapping(&store).await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("olá"),
+            incoming_info(PEER, PEER, "MSG-PT-1", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let by_pn = chat_store.chat(&jid(PEER)).await.unwrap().expect("by pn");
+    assert_eq!(by_pn.last_message_preview.as_deref(), Some("olá"));
+    assert_eq!(by_pn.unread_count, 1);
+
+    // The peer's other identity addresses the same thread.
+    let by_lid = chat_store
+        .chat(&jid(PEER_LID))
+        .await
+        .unwrap()
+        .expect("by lid");
+    assert_eq!(by_lid.jid, by_pn.jid);
+
+    assert!(
+        chat_store
+            .chat(&jid("559900009999@s.whatsapp.net"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn chat_list_pages_across_the_pinned_boundary() {
+    let (_store, chat_store) = test_store().await;
+
+    // Four chats, newest last, with the two oldest pinned so they lead.
+    let peers: Vec<String> = (1..=4)
+        .map(|i| format!("55990000000{i}@s.whatsapp.net"))
+        .collect();
+    let mut events = Vec::new();
+    for (i, peer) in peers.iter().enumerate() {
+        events.push(message_event(
+            wa::Message::text(format!("m{i}")),
+            incoming_info(peer, peer, &format!("MSG-PG-{i}"), 1_700_000_000 + i as i64),
+        ));
+    }
+    // Pin peer 0 then peer 1, so peer 1 (pinned later) sorts first.
+    for (i, peer) in peers.iter().take(2).enumerate() {
+        events.push(Event::PinUpdate(
+            wacore::types::events::PinUpdate::builder()
+                .jid(jid(peer))
+                .timestamp(Utc.timestamp_opt(1_700_000_500 + i as i64, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::PinAction {
+                    pinned: Some(true),
+                }))
+                .from_full_sync(false)
+                .build(),
+        ));
+    }
+    feed(&chat_store, events).await;
+
+    let whole = chat_store.chats(false, 10).await.unwrap();
+    let expected: Vec<String> = whole.iter().map(|c| c.jid.to_string()).collect();
+    assert_eq!(
+        expected,
+        vec![
+            peers[1].clone(), // pinned last -> first
+            peers[0].clone(),
+            peers[3].clone(), // then by activity, newest first
+            peers[2].clone(),
+        ]
+    );
+
+    // Paging one at a time reproduces that order exactly, crossing from the
+    // pinned run into the activity run without skipping or repeating.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = chat_store
+            .chats_page(false, cursor.take(), 1)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(Into::into);
+        seen.extend(page.iter().map(|c| c.jid.to_string()));
+    }
+    assert_eq!(seen, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Server ack racing its own outgoing row (#1142)
+// ---------------------------------------------------------------------------
+
+/// `Event::ServerAck` is dispatched on the socket-read path while
+/// `send_message` returns at the stanza write, so a host that records its
+/// outgoing message after the send resolves can see the ack first. That ack
+/// used to be dropped silently, leaving the row on a `pending` clock forever
+/// and never applying the server's authoritative timestamp.
+#[tokio::test]
+async fn server_ack_arriving_before_its_outgoing_row_is_applied_on_insert() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+    let server_timestamp = Utc.timestamp_opt(1_700_000_222, 0).unwrap();
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-RACE".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .timestamp(server_timestamp)
+                .build(),
+        )],
+    )
+    .await;
+    // Nothing to apply it to yet.
+    assert!(
+        chat_store
+            .message(&chat, "OUT-RACE")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-RACE",
+            &wa::Message::text("beat me to it"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&chat, "OUT-RACE")
+        .await
+        .unwrap()
+        .expect("row");
+    assert_eq!(msg.status, MessageStatus::ServerAck);
+    assert_eq!(
+        msg.timestamp, server_timestamp,
+        "the held ack also carries the server's send clock"
+    );
+}
+
+/// A nack that beats its row must land as ERROR, not as a silent pending row.
+#[tokio::test]
+async fn deferred_nack_marks_the_row_as_error() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-NACK-RACE".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .error("473".to_string())
+                .build(),
+        )],
+    )
+    .await;
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-NACK-RACE",
+            &wa::Message::text("refused"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    let msg = chat_store
+        .message(&chat, "OUT-NACK-RACE")
+        .await
+        .unwrap()
+        .expect("row");
+    assert_eq!(msg.status, MessageStatus::Error);
+}
+
+/// A held ack belongs to one id only; an unrelated send must not consume it.
+#[tokio::test]
+async fn deferred_ack_only_matches_its_own_message() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-WAITING".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .build(),
+        )],
+    )
+    .await;
+    for id in ["OUT-OTHER", "OUT-WAITING"] {
+        chat_store
+            .record_outgoing(
+                &chat,
+                id,
+                &wa::Message::text(id),
+                Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+            )
+            .unwrap();
+    }
+    chat_store.flush().await.unwrap();
+
+    assert_eq!(
+        chat_store
+            .message(&chat, "OUT-OTHER")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::Pending
+    );
+    assert_eq!(
+        chat_store
+            .message(&chat, "OUT-WAITING")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MessageStatus::ServerAck
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hook-committed batches (#1140)
+// ---------------------------------------------------------------------------
+
+/// A batch the host's durability hook already committed must not be applied a
+/// second time here — the duplicate pass is a full proto UPDATE plus an FTS
+/// delete+insert plus a doubled invalidation fan-out, not a cheap no-op.
+#[tokio::test]
+async fn hook_committed_batch_is_not_materialized() {
+    let (_store, chat_store) = test_store().await;
+
+    let event = Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from([InboundMessage::builder()
+                .message(Arc::new(wa::Message::text("already durable")))
+                .info(Arc::new(incoming_info(
+                    PEER,
+                    PEER,
+                    "MSG-HOOKED",
+                    1_700_000_000,
+                )))
+                .build()]))
+            .origin(BatchOrigin::Live)
+            .hook_committed(true)
+            .build(),
+    );
+    feed(&chat_store, [event]).await;
+
+    assert!(chat_store.chats(false, 10).await.unwrap().is_empty());
+    assert!(
+        chat_store
+            .message(&jid(PEER), "MSG-HOOKED")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The producers that bypass the commit pipeline (newsletters, PDO recovery)
+/// leave the marker unset, and this handler stays their only materializer.
+#[tokio::test]
+async fn unmarked_batch_is_still_materialized() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("only copy"),
+            incoming_info(PEER, PEER, "MSG-UNHOOKED", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        chat_store
+            .message(&jid(PEER), "MSG-UNHOOKED")
+            .await
+            .unwrap()
+            .expect("row")
+            .text
+            .as_deref(),
+        Some("only copy")
     );
 }

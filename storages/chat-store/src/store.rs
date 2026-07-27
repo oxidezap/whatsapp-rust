@@ -97,6 +97,20 @@ struct ChatStoreHandler {
 
 impl EventHandler for ChatStoreHandler {
     fn handle_event(&self, event: Arc<Event>) {
+        // A batch the host's durability hook already committed is on disk
+        // before this event is dispatched, and re-applying it is not a cheap
+        // no-op: the inbound path overwrites, so the conflicting insert falls
+        // through to a full UPDATE of the proto blob, fires the FTS
+        // delete+insert trigger, re-bumps the chat, and emits a second
+        // Chats + Messages invalidation that makes every subscriber re-query
+        // every surface twice per message. Drop it here rather than in the
+        // writer so it never takes a batch slot either.
+        if event
+            .as_messages()
+            .is_some_and(|batch| batch.hook_committed)
+        {
+            return;
+        }
         // Writer gone (store dropped): nothing to record into, drop silently.
         let _ = self.tx.send(WriterMsg::Event(event));
     }
@@ -527,6 +541,9 @@ async fn writer_loop(
     // own must still be reported to the NEXT flush (a >BATCH_MAX backlog spans
     // several transactions). Consumed when delivered.
     let mut pending_error: Option<String> = None;
+    // Outlives every batch: the insert that answers a deferred ack is by
+    // definition in a later one.
+    let mut deferred_acks = DeferredAcks::default();
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
@@ -552,23 +569,41 @@ async fn writer_loop(
         }
 
         if !batch.is_empty() {
+            // Hand the deferred acks to the blocking closure and take them
+            // back either way: a rolled-back batch applied none of them, so
+            // they must keep waiting rather than die with it.
+            let carried = std::mem::take(&mut deferred_acks);
             let result = db
                 .run(move |conn| {
-                    conn.transaction(|conn| {
-                        let mut cs = ChangeSet::default();
-                        for msg in &batch {
-                            apply_writer_msg(conn, device_id, msg, &mut cs)?;
-                        }
-                        Ok(cs)
-                    })
-                    .map_err(db_err)
+                    let mut deferred = carried;
+                    let outcome = conn
+                        .transaction(|conn| {
+                            let mut cs = ChangeSet::default();
+                            for msg in &batch {
+                                apply_writer_msg(conn, device_id, msg, &mut cs, &mut deferred)?;
+                            }
+                            Ok(cs)
+                        })
+                        .map_err(db_err);
+                    Ok((outcome, deferred))
                 })
                 .await;
             match result {
-                Ok(cs) => emit_changes(&changes, cs),
-                // The batch rolled back; state stays consistent (previous
-                // commit) but this slice of history is lost. Surfacing beats
-                // crashing the writer.
+                Ok((outcome, carried)) => {
+                    deferred_acks = carried;
+                    match outcome {
+                        Ok(cs) => emit_changes(&changes, cs),
+                        // The batch rolled back; state stays consistent
+                        // (previous commit) but this slice of history is lost.
+                        // Surfacing beats crashing the writer.
+                        Err(e) => {
+                            warn!("chat-store: dropping write batch: {e}");
+                            pending_error = Some(e.to_string());
+                        }
+                    }
+                }
+                // The pool/thread itself failed, so the closure never returned
+                // the deferred acks. Rare, and the batch is lost with them.
                 Err(e) => {
                     warn!("chat-store: dropping write batch: {e}");
                     pending_error = Some(e.to_string());
@@ -607,9 +642,10 @@ fn apply_writer_msg(
     device_id: i32,
     msg: &WriterMsg,
     cs: &mut ChangeSet,
+    deferred: &mut DeferredAcks,
 ) -> QueryResult<()> {
     match msg {
-        WriterMsg::Event(event) => apply_event(conn, device_id, event, cs),
+        WriterMsg::Event(event) => apply_event(conn, device_id, event, cs, deferred),
         WriterMsg::Reconcile(chat) => {
             let wire = chat.to_string();
             if let Some(alt) = crate::lid::counterpart_chat_key(conn, device_id, &wire)? {
@@ -657,6 +693,14 @@ fn apply_writer_msg(
                     },
                 )?;
                 cs.chats = true;
+                // The row this send's ack was waiting for now exists. Applying
+                // it here also corrects the optimistic timestamp we just wrote
+                // to the server's, before anything renders the row.
+                if let Some(ack) =
+                    deferred.take_matching(msg_id, wacore::time::now_utc().timestamp_millis())
+                {
+                    apply_server_ack(conn, device_id, &ack, cs)?;
+                }
             }
             cs.message_chats.insert(chat_str);
             Ok(())
@@ -825,6 +869,7 @@ fn apply_event(
     device_id: i32,
     event: &Event,
     cs: &mut ChangeSet,
+    deferred: &mut DeferredAcks,
 ) -> QueryResult<()> {
     match event {
         Event::Messages(batch) => {
@@ -834,7 +879,12 @@ fn apply_event(
             Ok(())
         }
         Event::Receipt(receipt) => apply_receipt(conn, device_id, receipt, cs),
-        Event::ServerAck(ack) => apply_server_ack(conn, device_id, ack, cs),
+        Event::ServerAck(ack) => {
+            if !apply_server_ack(conn, device_id, ack, cs)? {
+                deferred.defer(ack, wacore::time::now_utc().timestamp_millis());
+            }
+            Ok(())
+        }
         Event::UndecryptableMessage(undec) => {
             let wire = undec.info.source.chat.to_string();
             let chat = crate::lid::route_chat_key(conn, device_id, &wire, cs)?;
@@ -1387,7 +1437,7 @@ fn apply_revoke(
 /// When `msg_id` is the chat's most recent message, replace the denormalized
 /// chat-list preview (an edit/revoke of an older message leaves it alone).
 /// "Most recent" uses the same total order as `messages()` — `(timestamp_ms,
-/// msg_id)` — so a same-millisecond sibling can't hijack the preview.
+/// rowid)` — so a same-second sibling can't hijack the preview.
 fn refresh_preview_if_latest(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1399,7 +1449,7 @@ fn refresh_preview_if_latest(
     use schema::messages::dsl;
     let newest: Option<String> = dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
-        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
         .select(dsl::msg_id)
         .first(conn)
         .optional()?;
@@ -1429,7 +1479,7 @@ fn newest_chat_head(
     use schema::messages::dsl;
     let newest: Option<(i64, Option<String>, String, bool)> = dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
-        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
         .select((
             dsl::timestamp_ms,
             dsl::text_content,
@@ -1768,20 +1818,93 @@ fn resolve_server_ack_message(
     Ok(None)
 }
 
+/// How long an unmatched message ack waits for its outgoing row, and how many
+/// may wait at once. Both are generous relative to the window they cover (a
+/// local enqueue losing to a network round trip) and small enough that a
+/// pathological stream of unmatchable ids cannot grow the writer's footprint.
+const DEFERRED_ACK_TTL_MS: i64 = 60_000;
+const DEFERRED_ACK_CAP: usize = 64;
+
+/// Message-class acks that arrived before their outgoing row existed.
+///
+/// `Event::ServerAck` is dispatched synchronously on the socket-read path,
+/// while `send_message` returns at the stanza write. A host that records its
+/// outgoing message *after* the send resolves — the safe order, since
+/// recording first leaves a forever-pending ghost row when the send fails and
+/// the store has no row delete — therefore races the ack. The window is narrow,
+/// needing the local enqueue to lose to a full round trip, but the loss used to
+/// be silent and permanent: the row kept its `pending` clock until some
+/// delivery receipt happened to lift it (never, for an offline recipient) and
+/// never picked up the server's authoritative send timestamp.
+///
+/// This is the same materialize-later shape the store already uses for
+/// out-of-order edits and revokes, minus the placeholder row: an ack carries no
+/// content, so there is nothing to show until the real insert arrives.
+#[derive(Default)]
+pub(crate) struct DeferredAcks {
+    /// `(deferred_at_ms, ack)`, oldest first — pushes append, so the queue is
+    /// sorted by age and expiry is a prefix drain.
+    entries: std::collections::VecDeque<(i64, wacore::types::events::ServerAck)>,
+}
+
+impl DeferredAcks {
+    fn expire(&mut self, now_ms: i64) {
+        while let Some((deferred_at, ack)) = self.entries.front() {
+            if now_ms.saturating_sub(*deferred_at) < DEFERRED_ACK_TTL_MS {
+                break;
+            }
+            warn!(
+                target: "ChatStore/Ack",
+                "Dropping unmatched message ack for {}: no outgoing row appeared within {}s",
+                ack.id,
+                DEFERRED_ACK_TTL_MS / 1000
+            );
+            self.entries.pop_front();
+        }
+    }
+
+    fn defer(&mut self, ack: &wacore::types::events::ServerAck, now_ms: i64) {
+        self.expire(now_ms);
+        if self.entries.len() >= DEFERRED_ACK_CAP
+            && let Some((_, evicted)) = self.entries.pop_front()
+        {
+            warn!(
+                target: "ChatStore/Ack",
+                "Dropping unmatched message ack for {}: {DEFERRED_ACK_CAP} acks already waiting",
+                evicted.id
+            );
+        }
+        self.entries.push_back((now_ms, ack.clone()));
+    }
+
+    fn take_matching(
+        &mut self,
+        msg_id: &str,
+        now_ms: i64,
+    ) -> Option<wacore::types::events::ServerAck> {
+        self.expire(now_ms);
+        let at = self.entries.iter().position(|(_, ack)| ack.id == msg_id)?;
+        self.entries.remove(at).map(|(_, ack)| ack)
+    }
+}
+
+/// Applies a server ack to its outgoing row. Returns whether a row matched —
+/// `false` means the send has not been recorded (yet), which the caller
+/// answers by deferring the ack rather than dropping it.
 fn apply_server_ack(
     conn: &mut SqliteConnection,
     device_id: i32,
     ack: &wacore::types::events::ServerAck,
     cs: &mut ChangeSet,
-) -> QueryResult<()> {
+) -> QueryResult<bool> {
     // Acks cover every stanza class; only message acks map to a stored row.
     if ack.class.as_deref() != Some("message") {
-        return Ok(());
+        return Ok(true);
     }
     use schema::messages::dsl;
     let Some((chat, old_timestamp_ms)) = resolve_server_ack_message(conn, device_id, ack, cs)?
     else {
-        return Ok(());
+        return Ok(false);
     };
     let target = message_row(device_id, &chat, &ack.id).filter(dsl::from_me.eq(true));
     let status_updated = if ack.error.is_some() {
@@ -1840,7 +1963,7 @@ fn apply_server_ack(
             cs.message_chats.insert(from.to_string());
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn apply_history_sync(

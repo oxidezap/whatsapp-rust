@@ -1101,6 +1101,21 @@ pub enum BatchOrigin {
 pub struct MessageBatch {
     pub messages: Arc<[InboundMessage]>,
     pub origin: BatchOrigin,
+    /// Whether an inbound durability hook already committed these messages
+    /// before this event was dispatched.
+    ///
+    /// Orthogonal to [`origin`](Self::origin), which describes delivery shape:
+    /// a hook commits live batches and drain batches alike. What this answers
+    /// is whether the consumer's own durable copy already exists, so a
+    /// materializer that the hook feeds can skip the batch instead of
+    /// rewriting every row (and re-firing every invalidation) a second time.
+    ///
+    /// `false` for the producers that dispatch `Event::Messages` while
+    /// deliberately bypassing the commit pipeline — newsletters and
+    /// PDO-recovered messages — because for those the materialization on this
+    /// event is the only one there is.
+    #[builder(default)]
+    pub hook_committed: bool,
 }
 
 impl MessageBatch {

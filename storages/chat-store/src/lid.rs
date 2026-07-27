@@ -155,7 +155,7 @@ fn newest_message_ts(
     use schema::messages::dsl;
     dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
-        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+        .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
         .select(dsl::timestamp_ms)
         .first(conn)
         .optional()
