@@ -27,6 +27,9 @@ const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
 pub(crate) struct SyncInFlight {
     entries: std::sync::Mutex<HashMap<WAPatchName, u64>>,
     next_token: AtomicU64,
+    /// Notified whenever a reservation is released, so [`SyncInFlight::begin`]
+    /// can wait for one instead of spinning.
+    released: event_listener::Event,
 }
 
 impl SyncInFlight {
@@ -34,6 +37,7 @@ impl SyncInFlight {
         Arc::new(Self {
             entries: std::sync::Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(0),
+            released: event_listener::Event::new(),
         })
     }
 
@@ -52,10 +56,31 @@ impl SyncInFlight {
         })
     }
 
+    /// Reserve `name`, waiting for the current holder to finish.
+    ///
+    /// [`try_begin`](Self::try_begin) is right for a sync, where an in-flight
+    /// one already does the work and skipping is free. A patch send cannot
+    /// skip: it must not write the collection's version and mutation MACs while
+    /// a sync is writing them, and it needs the base a concurrent sync is about
+    /// to move. Cancelling this future simply stops waiting; nothing is
+    /// reserved until the guard is returned.
+    pub(crate) async fn begin(self: &Arc<Self>, name: WAPatchName) -> SyncInFlightGuard {
+        loop {
+            // Register the listener before re-checking, so a release landing
+            // between the check and the wait cannot be missed.
+            let released = self.released.listen();
+            if let Some(guard) = self.try_begin(name) {
+                return guard;
+            }
+            released.await;
+        }
+    }
+
     /// Drop every reservation, releasing backing storage. Guards from before
     /// the clear become no-ops thanks to the token check.
     pub(crate) fn clear(&self) {
         *self.entries.lock().unwrap_or_else(|p| p.into_inner()) = HashMap::new();
+        self.released.notify(usize::MAX);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -79,6 +104,10 @@ impl Drop for SyncInFlightGuard {
         if entries.get(&self.name) == Some(&self.token) {
             entries.remove(&self.name);
         }
+        drop(entries);
+        // Waiters are keyed by nothing, so wake all of them and let each
+        // re-check its own collection.
+        self.registry.released.notify(usize::MAX);
     }
 }
 
@@ -405,20 +434,14 @@ impl Client {
         }
     }
 
+    /// Sync one collection, retrying a missing decode key and a locked DB.
+    ///
+    /// Takes no in-flight reservation of its own: the only caller is the patch
+    /// send, which already holds the collection's reservation for the whole
+    /// build-send-resolve cycle and would deadlock on its own guard. The
+    /// batched path reserves its collections in
+    /// [`sync_collections_batched`](Self::sync_collections_batched).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> Result<()> {
-        // In-flight dedup: skip if this collection is already being synced.
-        // Matches WA Web's WAWebSyncdCollectionsStateMachine which tracks in-flight syncs
-        // and queues new requests to a pending set. The guard releases on every
-        // exit path, including cancellation.
-        let Some(_guard) = self.app_state_syncing.try_begin(name) else {
-            debug!(target: "Client/AppState", "Skipping sync for {:?}: already in flight", name);
-            return Ok(());
-        };
-
-        self.fetch_app_state_with_retry_inner(name).await
-    }
-
     async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<()> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
@@ -1164,6 +1187,18 @@ impl Client {
         // re-sync is about to move, trading a short wait for the 409s this
         // whole path exists to avoid.
         let _send_guard = self.app_state_send_lock.lock().await;
+        // The send lock only orders sends against each other. This one orders
+        // the send against the sync worker, which writes the same version and
+        // mutation-MAC rows: without it, a conflict response for vN could be
+        // absorbed while a sync is persisting vN+1, and the interleaved writes
+        // would leave the ltHash disagreeing with the MAC store — the very
+        // divergence #1156 is about. Waits rather than skipping, and the
+        // re-syncs below go through `_inner` because this task already holds
+        // the reservation they would otherwise take.
+        let _collection_guard = match patch_name {
+            Some(name) => Some(self.app_state_syncing.begin(name).await),
+            None => None,
+        };
         let proc = self.get_app_state_processor().await;
 
         for attempt in 1..=APP_STATE_PATCH_SEND_ATTEMPTS {
@@ -1191,13 +1226,21 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
-            // A response with no `<sync><collection>` at all carries no
-            // per-collection verdict to read — a transport-level failure would
-            // have come back as `<iq type="error">` and been raised by send_iq
-            // already — so it is an accepted patch, as before this loop existed.
-            let list = match wacore::appstate::patch_decode::parse_patch_list_ref(resp.get()) {
+            let resp = resp.get().to_owned();
+            // Absence and malformation are different answers. A response with no
+            // `<sync><collection>` at all carries no per-collection verdict —
+            // a transport-level failure would have come back as
+            // `<iq type="error">` and been raised by send_iq already — so it is
+            // an accepted patch. A collection that IS present but does not parse
+            // may well be carrying the rejection, and manufacturing an empty
+            // success from it would drop the mutation exactly as before.
+            let list = match wacore::appstate::patch_decode::parse_patch_list(&resp) {
                 Ok(list) => list,
-                Err(e) => {
+                Err(e)
+                    if resp
+                        .get_optional_child_by_tag(&["sync", "collection"])
+                        .is_none() =>
+                {
                     debug!(
                         target: "Client/AppState",
                         "Patch response for {collection_name} carried no collection verdict ({e}); treating as accepted"
@@ -1211,6 +1254,11 @@ impl Client {
                         error: None,
                     }
                 }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "unreadable app-state patch response for {collection_name}"
+                    )));
+                }
             };
 
             match list.error {
@@ -1218,7 +1266,7 @@ impl Client {
                     // Re-sync to pick up whatever else moved while we were sending.
                     // Matches whatsmeow's fetchAppState after a successful send.
                     if let Some(patch_name) = patch_name
-                        && let Err(e) = self.fetch_app_state_with_retry(patch_name).await
+                        && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
                     {
                         log::warn!("Failed to re-sync {collection_name} after patch send: {e}");
                     }
@@ -1305,7 +1353,7 @@ impl Client {
         // leaves the base short of the head.
         if (!applied || has_more)
             && let Some(patch_name) = patch_name
-            && let Err(e) = self.fetch_app_state_with_retry(patch_name).await
+            && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
         {
             warn!(
                 target: "Client/AppState",
@@ -1807,6 +1855,64 @@ mod send_patch_response_tests {
         result.expect("a terse but successful response must not read as a rejection");
     }
 
+    /// A `<collection>` that IS present but does not parse may be carrying the
+    /// rejection. Manufacturing an empty success from it would drop the
+    /// mutation exactly as discarding the response did.
+    #[tokio::test]
+    async fn unreadable_collection_is_not_mistaken_for_an_absent_one() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        seed_collection(&client, COLLECTION).await;
+
+        let mut send = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .await
+            })
+        };
+
+        let malformed = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let id = node
+                    .get()
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                // A collection with no `name`: present, unreadable.
+                crate::test_utils::answer_iq(
+                    &client,
+                    &id,
+                    &NodeBuilder::new("iq")
+                        .attr("type", "result")
+                        .attr("id", &id)
+                        .attr("from", "s.whatsapp.net")
+                        .children([NodeBuilder::new("sync")
+                            .children([NodeBuilder::new("collection")
+                                .attr("type", "error")
+                                .build()])
+                            .build()])
+                        .build(),
+                )
+                .await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(malformed);
+
+        let result = futures::select! {
+            result = (&mut send).fuse() => result.expect("the send task should not panic"),
+            () = malformed.as_mut().fuse() => unreachable!("the responder never completes"),
+        };
+        assert!(
+            result.is_err(),
+            "a collection we cannot read may be the rejection; it must not read as success"
+        );
+    }
+
     /// 400/404 are `ErrorFatal` in WA Web and `ErrAppStateUpdate` in whatsmeow —
     /// never success, and never retried.
     #[tokio::test]
@@ -1867,6 +1973,48 @@ mod sync_in_flight_tests {
         );
 
         drop(fresh);
+        assert!(registry.try_begin(WAPatchName::Regular).is_some());
+    }
+
+    /// A patch send cannot treat "already in flight" as "nothing to do": it has
+    /// to write the same version and mutation-MAC rows the sync writes, so it
+    /// waits for the holder instead of skipping.
+    #[tokio::test]
+    async fn begin_waits_for_the_holder_instead_of_skipping() {
+        let registry = SyncInFlight::new();
+        let held = registry
+            .try_begin(WAPatchName::Regular)
+            .expect("first reserve");
+
+        let (reserved_tx, mut reserved_rx) = tokio::sync::oneshot::channel();
+        let waiter = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                let guard = registry.begin(WAPatchName::Regular).await;
+                let _ = reserved_tx.send(());
+                guard
+            })
+        };
+
+        // A parked listener is proof the waiter reached its await point — the
+        // observable a "still waiting" assertion needs instead of a sleep.
+        crate::test_utils::poll_until("the waiter to park on the registry", || {
+            registry.released.total_listeners() >= 1
+        })
+        .await;
+        assert!(
+            reserved_rx.try_recv().is_err(),
+            "begin must not resolve while the collection is held"
+        );
+
+        drop(held);
+        let guard = waiter.await.expect("the waiter should not panic");
+        assert!(
+            registry.try_begin(WAPatchName::Regular).is_none(),
+            "the waiter must now hold the reservation, not merely have observed it free"
+        );
+
+        drop(guard);
         assert!(registry.try_begin(WAPatchName::Regular).is_some());
     }
 }
