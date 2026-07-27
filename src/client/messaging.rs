@@ -39,10 +39,16 @@ impl Client {
     ///
     /// Always drains `frames`, including when no socket is installed, while
     /// retaining its outer allocation for the persistent workers to reuse.
+    ///
+    /// Results land in `results`, which the caller owns and reuses too. A
+    /// returned `Vec` would allocate once per burst, and the common burst is a
+    /// single frame, so that allocation was the dominant cost of sending one.
     pub(crate) async fn send_raw_bytes_burst(
         &self,
         frames: &mut Vec<Vec<u8>>,
-    ) -> Result<Vec<crate::socket::error::EncryptSendResult>, ClientError> {
+        results: &mut Vec<crate::socket::error::EncryptSendResult>,
+    ) -> Result<(), ClientError> {
+        results.clear();
         let noise_socket = match self.get_noise_socket().await {
             Ok(socket) => socket,
             Err(error) => {
@@ -52,16 +58,18 @@ impl Client {
         };
         if frames.len() == 1 {
             let plaintext = frames.pop().expect("length checked");
-            return Ok(vec![
+            results.push(
                 noise_socket
                     .encrypt_and_send(bytes::Bytes::from(plaintext))
                     .await,
-            ]);
+            );
+            return Ok(());
         }
         let sends = frames
             .drain(..)
             .map(|plaintext| noise_socket.encrypt_and_send(bytes::Bytes::from(plaintext)));
-        Ok(futures::future::join_all(sends).await)
+        results.extend(futures::future::join_all(sends).await);
+        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]

@@ -158,6 +158,7 @@ impl Client {
                 let mut batch = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
                 let mut frames = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
                 let mut guards = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                let mut results = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
                 while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
@@ -198,9 +199,9 @@ impl Client {
                     // single-receipt path, which this one does not use.
                     let frame_count = frames.len();
                     let send_and_report = async {
-                        match client.send_raw_bytes_burst(&mut frames).await {
-                            Ok(results) => {
-                                for result in results {
+                        match client.send_raw_bytes_burst(&mut frames, &mut results).await {
+                            Ok(()) => {
+                                for result in results.drain(..) {
                                     if let Some(error) = delivery_receipt_burst_warning(&result) {
                                         log::warn!(target: "Client/Receipt", "Failed to send delivery receipt: {error:?}");
                                     }

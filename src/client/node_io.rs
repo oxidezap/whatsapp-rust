@@ -697,6 +697,7 @@ impl Client {
             let mut batch = Vec::with_capacity(Self::MAX_ACK_BURST);
             let mut frames = Vec::with_capacity(Self::MAX_ACK_BURST);
             let mut guards = Vec::with_capacity(Self::MAX_ACK_BURST);
+            let mut results = Vec::with_capacity(Self::MAX_ACK_BURST);
             while let Ok(first) = rx.recv().await {
                 let Some(client) = client.upgrade() else {
                     break;
@@ -752,9 +753,9 @@ impl Client {
                 // EnteredSpan is not Send and cannot cross the await.
                 let frame_count = frames.len();
                 let send_and_report = async {
-                    match client.send_raw_bytes_burst(&mut frames).await {
-                        Ok(results) => {
-                            for result in results {
+                    match client.send_raw_bytes_burst(&mut frames, &mut results).await {
+                        Ok(()) => {
+                            for result in results.drain(..) {
                                 if let Err(e) = result
                                     && !e.is_transport_unavailable()
                                 {

@@ -3409,22 +3409,30 @@ async fn raw_bytes_burst_drains_and_reuses_input_on_happy_paths() {
     let mut frames = Vec::with_capacity(4);
     let retained_capacity = frames.capacity();
     frames.push(vec![0x11; 32]);
-    let single = client
-        .send_raw_bytes_burst(&mut frames)
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("installed socket");
-    assert_eq!(single.len(), 1);
-    assert!(single.into_iter().all(|result| result.is_ok()));
+    assert_eq!(results.len(), 1);
+    assert!(results.iter().all(|result| result.is_ok()));
+    let results_capacity = results.capacity();
     assert!(frames.is_empty(), "the single-frame fast path must drain");
     assert_eq!(frames.capacity(), retained_capacity);
 
     frames.extend((0..4).map(|index| vec![index; 32]));
-    let burst = client
-        .send_raw_bytes_burst(&mut frames)
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("installed socket");
-    assert_eq!(burst.len(), 4);
-    assert!(burst.into_iter().all(|result| result.is_ok()));
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|result| result.is_ok()));
+    // The results buffer belongs to the caller and is reused across bursts,
+    // which is the whole point of taking it as an out-parameter.
+    assert!(
+        results.capacity() >= results_capacity,
+        "the caller's results buffer must be reused, not replaced"
+    );
     assert!(frames.is_empty(), "the joined path must drain");
     assert_eq!(frames.capacity(), retained_capacity);
     assert_eq!(transport.sent_count(), 5, "every frame must reach the wire");
@@ -3442,7 +3450,8 @@ async fn raw_bytes_burst_drains_input_when_disconnected() {
     let retained_capacity = frames.capacity();
     frames.extend([vec![0x21; 32], vec![0x22; 32]]);
 
-    let result = client.send_raw_bytes_burst(&mut frames).await;
+    let mut results = Vec::new();
+    let result = client.send_raw_bytes_burst(&mut frames, &mut results).await;
     assert!(
         matches!(result, Err(ClientError::NotConnected)),
         "a missing socket must remain an outer NotConnected error: {result:?}"
@@ -3469,11 +3478,12 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
     let mut frames = Vec::with_capacity(4);
     let retained_capacity = frames.capacity();
     frames.push(vec![0x31; 32]);
-    let mut failed = client
-        .send_raw_bytes_burst(&mut frames)
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("the socket lookup itself succeeds");
-    let transport_error = failed
+    let transport_error = results
         .pop()
         .expect("one result")
         .expect_err("the transport is configured to fail");
@@ -3486,11 +3496,11 @@ async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
     assert_eq!(frames.capacity(), retained_capacity);
 
     frames.push(vec![0x32; 32]);
-    let mut poisoned = client
-        .send_raw_bytes_burst(&mut frames)
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("the installed socket remains reachable");
-    let poisoned_error = poisoned
+    let poisoned_error = results
         .pop()
         .expect("one result")
         .expect_err("the sender must reject work after an ambiguous write");
@@ -3524,8 +3534,9 @@ async fn raw_bytes_burst_surfaces_a_closed_sender_per_frame() {
     let mut frames = Vec::with_capacity(4);
     let retained_capacity = frames.capacity();
     frames.push(vec![0x41; 32]);
-    let mut results = client
-        .send_raw_bytes_burst(&mut frames)
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("the installed socket remains reachable");
     let error = results
