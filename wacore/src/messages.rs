@@ -17,8 +17,32 @@ pub struct MessageUtils;
 /// both without the intermediate: this is what lets `&Jid` and `&str` share the
 /// same body instead of the format existing in two shapes.
 pub trait DsmDestination {
+    /// Exactly the number of bytes [`Self::write_into`] appends.
+    ///
+    /// The DSM field writes this as a length prefix before the bytes, so an
+    /// implementation that disagrees with itself puts a prefix on the wire that
+    /// points past its own payload, and the peer reads the next protobuf field
+    /// from the wrong offset.
     fn encoded_len(&self) -> usize;
+
+    /// Appends the destination's wire form, whose length must equal
+    /// [`Self::encoded_len`].
     fn write_into(&self, out: &mut Vec<u8>);
+}
+
+/// So a caller holding an owned string keeps compiling: a generic parameter
+/// does not deref-coerce `&String` to `&str` the way the old `&str` argument
+/// did.
+impl DsmDestination for &String {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn write_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.as_bytes());
+    }
 }
 
 impl DsmDestination for &str {

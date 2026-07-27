@@ -519,17 +519,14 @@ impl Piece {
     }
 }
 
-/// Extract reporting token content from encoded protobuf message bytes.
-///
-/// This function parses raw protobuf bytes and extracts only the fields
-/// specified in the whitelist, matching WhatsApp Web's behavior.
-///
-/// # Arguments
-/// * `data` - Raw protobuf-encoded message bytes
-/// * `whitelist` - List of fields to extract
-///
-/// # Returns
-/// Concatenated bytes of all extracted fields, or None if no fields match
+#[cfg(test)]
+thread_local! {
+    /// Counts collector runs so a test can pin that generating a token parses
+    /// the message once. A nested field owns its bytes, so a second collection
+    /// is not just a second parse, it is a second set of buffers.
+    static COLLECT_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// The whitelisted pieces, in the order the token concatenates them.
 ///
 /// Split out from [`extract_reporting_token_content`] so the HMAC can consume
@@ -540,6 +537,9 @@ fn collect_reporting_token_pieces(
     data: &[u8],
     whitelist: &[ReportingField],
 ) -> Option<SmallVec<[(u32, Piece); 4]>> {
+    #[cfg(test)]
+    COLLECT_CALLS.with(|c| c.set(c.get() + 1));
+
     // The token's bytes are contract: fields are concatenated in ascending
     // field-number order, ties in wire order (`sort_by_key` is stable). Only
     // where the bytes come from changed -- a flat field is named by its range
@@ -661,27 +661,6 @@ fn collect_reporting_token_pieces(
     Some(extracted)
 }
 
-/// Calls `visit` with each whitelisted piece, in token order.
-///
-/// Returns `false` when the message has nothing to report, which is the same
-/// condition under which [`extract_reporting_token_content`] returns `None`.
-fn for_each_reporting_token_piece(
-    data: &[u8],
-    whitelist: &[ReportingField],
-    mut visit: impl FnMut(&[u8]),
-) -> bool {
-    let Some(pieces) = collect_reporting_token_pieces(data, whitelist) else {
-        return false;
-    };
-    for (_, piece) in &pieces {
-        match piece {
-            Piece::Borrowed(range) => visit(&data[range.clone()]),
-            Piece::Owned(bytes) => visit(bytes),
-        }
-    }
-    true
-}
-
 /// Extract reporting token content from encoded protobuf message bytes.
 ///
 /// Builds the concatenation. The send path does not need it: it feeds the
@@ -752,15 +731,23 @@ pub fn calculate_reporting_token(
 ///
 /// `Mac::update` is associative over its input, so feeding each whitelisted
 /// piece in token order hashes exactly the bytes the concatenation would have
-/// held. Returns `None` when the message has nothing to report.
-fn calculate_reporting_token_streaming(
+/// held.
+///
+/// Takes the pieces rather than collecting them: a nested field owns its
+/// re-framed bytes, so collecting twice would materialise those buffers twice
+/// and parse the message twice, which costs more than the concatenation this
+/// avoids.
+fn calculate_reporting_token_over_pieces(
     reporting_token_key: &[u8; REPORTING_TOKEN_KEY_SIZE],
     data: &[u8],
-    whitelist: &[ReportingField],
+    pieces: &[(u32, Piece)],
 ) -> Option<[u8; REPORTING_TOKEN_SIZE]> {
     let mut mac = Hmac::<Sha256>::new_from_slice(reporting_token_key).ok()?;
-    if !for_each_reporting_token_piece(data, whitelist, |piece| mac.update(piece)) {
-        return None;
+    for (_, piece) in pieces {
+        match piece {
+            Piece::Borrowed(range) => mac.update(&data[range.clone()]),
+            Piece::Owned(bytes) => mac.update(bytes),
+        }
     }
 
     let result = mac.finalize().into_bytes();
@@ -825,9 +812,10 @@ pub fn generate_reporting_token_from_encoded(
     if !should_include_reporting_token(message) {
         return None;
     }
-    // Only the presence of content is needed here; the bytes go straight to
-    // the HMAC further down without ever being concatenated.
-    collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS)?;
+    // Collected once and reused for the HMAC below: a nested field owns its
+    // bytes, so collecting again to hash them would materialise those buffers
+    // a second time.
+    let pieces = collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS)?;
 
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
         if secret.len() != MESSAGE_SECRET_SIZE {
@@ -844,7 +832,7 @@ pub fn generate_reporting_token_from_encoded(
         derive_reporting_token_key_for_jids(&message_secret, stanza_id, sender_jid, remote_jid)
             .ok()?;
 
-    let token = calculate_reporting_token_streaming(&key, encoded_message, REPORTING_FIELDS)?;
+    let token = calculate_reporting_token_over_pieces(&key, encoded_message, &pieces)?;
 
     Some(ReportingTokenResult {
         message_secret,
@@ -907,6 +895,44 @@ pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
 
+    /// Generating a token must parse the message once. Collecting twice would
+    /// re-materialise every nested field's owned buffer, which costs more than
+    /// the concatenation this change removes: the streaming path would then be
+    /// slower than what it replaced for exactly the messages that carry media
+    /// or quoted text.
+    #[test]
+    fn generating_a_token_collects_the_pieces_once() {
+        let message = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("nested content owns its bytes".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = waproto::codec::message_to_vec(&message);
+        let sender: Jid = "5511987650001@s.whatsapp.net".parse().expect("sender");
+        let remote: Jid = "5511987650002@s.whatsapp.net".parse().expect("remote");
+
+        COLLECT_CALLS.with(|c| c.set(0));
+        let result = generate_reporting_token_from_encoded(
+            &message,
+            &encoded,
+            "3EB0ABCDEF",
+            &sender,
+            &remote,
+            None,
+        );
+        assert!(result.is_some(), "the message must produce a token");
+        // Two: once for the message, once for the nested field, which the
+        // collector re-frames through the same path. What must not happen is
+        // four, which is what collecting again to feed the hmac would cost.
+        assert_eq!(
+            COLLECT_CALLS.with(|c| c.get()),
+            2,
+            "the pieces must be collected once and reused for the hmac"
+        );
+    }
+
     /// The streaming HMAC must hash exactly the bytes the concatenation would
     /// have held. The token goes on the wire and is verified by the server, so
     /// a divergence here is not a performance bug, it is a message the peer
@@ -964,7 +990,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: the case must extract something"));
             let expected = calculate_reporting_token(&key, &concatenated)
                 .unwrap_or_else(|_| panic!("{name}: hmac over the concatenation"));
-            let streamed = calculate_reporting_token_streaming(&key, &encoded, REPORTING_FIELDS)
+            let pieces = collect_reporting_token_pieces(&encoded, REPORTING_FIELDS)
+                .unwrap_or_else(|| panic!("{name}: the case must collect something"));
+            let streamed = calculate_reporting_token_over_pieces(&key, &encoded, &pieces)
                 .unwrap_or_else(|| panic!("{name}: hmac over the pieces"));
             assert_eq!(streamed, expected, "{name}: the token bytes are contract");
         }
@@ -979,7 +1007,8 @@ mod tests {
         let encoded = waproto::codec::message_to_vec(&wa::Message::default());
 
         assert!(extract_reporting_token_content(&encoded, REPORTING_FIELDS).is_none());
-        assert!(calculate_reporting_token_streaming(&key, &encoded, REPORTING_FIELDS).is_none());
+        assert!(collect_reporting_token_pieces(&encoded, REPORTING_FIELDS).is_none());
+        let _ = &key;
     }
     use super::*;
 

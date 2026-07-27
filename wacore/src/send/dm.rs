@@ -166,10 +166,10 @@ pub async fn prepare_dm_stanza(
     let phash = resolved_devices.phash();
 
     // Splice the shared content into the recipient plaintext and, when present, the
-    // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an
-    // account with nothing else linked), the DSM plaintext — and the destination-jid
-    // stringify it needs — would be built only to go unused, so encode just the recipient.
-    // The mci-hoist path re-encodes via `encode_dm_plaintexts` (see `shared_content`).
+    // own-device DeviceSentMessage plaintext. With no own companion devices (an
+    // account with nothing else linked), the DSM plaintext would be built only to
+    // go unused, so encode just the recipient. The mci-hoist path re-encodes via
+    // `encode_dm_plaintexts` (see `shared_content`).
     let crate::messages::DmPlaintexts {
         recipient: recipient_plaintext,
         own_devices: own_devices_plaintext,
@@ -178,8 +178,6 @@ pub async fn prepare_dm_stanza(
             recipient: MessageUtils::pad_with_context_from_encoded(content, extra_context.as_ref()),
             own_devices: Vec::new(),
         },
-        // The JID names itself straight into the wire buffer; rendering a
-        // String first existed only to measure it.
         Some(content) => {
             MessageUtils::dm_plaintexts_from_encoded(content, extra_context.as_ref(), to_jid)
         }

@@ -3409,14 +3409,16 @@ async fn raw_bytes_burst_drains_and_reuses_input_on_happy_paths() {
     let mut frames = Vec::with_capacity(4);
     let retained_capacity = frames.capacity();
     frames.push(vec![0x11; 32]);
-    let mut results = Vec::new();
+    // Sized for the largest burst below, so a reallocation here would mean the
+    // callee replaced the buffer rather than filling it.
+    let mut results = Vec::with_capacity(4);
     client
         .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("installed socket");
     assert_eq!(results.len(), 1);
     assert!(results.iter().all(|result| result.is_ok()));
-    let results_capacity = results.capacity();
+    let results_ptr = results.as_ptr();
     assert!(frames.is_empty(), "the single-frame fast path must drain");
     assert_eq!(frames.capacity(), retained_capacity);
 
@@ -3427,11 +3429,14 @@ async fn raw_bytes_burst_drains_and_reuses_input_on_happy_paths() {
         .expect("installed socket");
     assert_eq!(results.len(), 4);
     assert!(results.iter().all(|result| result.is_ok()));
-    // The results buffer belongs to the caller and is reused across bursts,
-    // which is the whole point of taking it as an out-parameter.
-    assert!(
-        results.capacity() >= results_capacity,
-        "the caller's results buffer must be reused, not replaced"
+    // Identity, not capacity: a fresh Vec of the same capacity would satisfy a
+    // capacity check while defeating the whole point of the out-parameter. The
+    // buffer is preallocated above so the second burst cannot legitimately
+    // reallocate it.
+    assert_eq!(
+        results.as_ptr(),
+        results_ptr,
+        "the caller's results buffer must be the same allocation, not an equal one"
     );
     assert!(frames.is_empty(), "the joined path must drain");
     assert_eq!(frames.capacity(), retained_capacity);
