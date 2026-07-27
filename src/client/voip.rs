@@ -826,9 +826,12 @@ impl Voip<'_> {
         generation: u64,
         raised: bool,
     ) -> Result<(), CallError> {
-        if self
-            .client
-            .call_registry()
+        let registry = self.client.call_registry();
+        let transition_lock = registry
+            .group_transition_lock(call_id, generation)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        if registry
             .group_state_if_current(call_id, generation)
             .is_none()
         {
@@ -852,7 +855,6 @@ impl Voip<'_> {
             .map_err(|error| CallError::Response(error.to_string()))?,
         )
         .await?;
-        let registry = self.client.call_registry();
         if registry.set_raised_hand_if_current(call_id, generation, &participant, raised) {
             registry.send_call_event_if_current(
                 call_id,
@@ -904,17 +906,21 @@ impl Voip<'_> {
         screen_share_id: Option<u32>,
     ) -> Result<(), CallError> {
         let registry = self.client.call_registry();
-        if registry
+        let transition_lock = registry
+            .group_transition_lock(call_id, generation)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        let group = registry
             .group_state_if_current(call_id, generation)
-            .is_none()
-        {
-            return Err(CallError::Media("call is not an active group call"));
-        }
+            .ok_or(CallError::Media("call is not an active group call"))?;
         if state == ScreenShareState::Started
-            && !matches!(
-                registry.video_states(call_id, generation),
-                Some((VideoState::Enabled, _))
-            )
+            && (group
+                .snapshot()
+                .is_none_or(|snapshot| snapshot.media != "video")
+                || !matches!(
+                    registry.video_states(call_id, generation),
+                    Some((VideoState::Enabled, _))
+                ))
         {
             return Err(CallError::Media(
                 "screen sharing requires an active local video plane",
@@ -1437,7 +1443,7 @@ mod tests {
                 .call_id(call_id.to_string())
                 .call_creator(creator.clone())
                 .transaction_id(1)
-                .media("audio".to_string())
+                .media("video".to_string())
                 .connected_limit(32)
                 .joinable(true)
                 .av_upgradable(true)
@@ -1479,7 +1485,7 @@ mod tests {
                 .set_screen_share(call_id, &creator, ScreenShareState::Started, Some(7))
                 .await
                 .is_err(),
-            "an audio-only group call must not advertise an unsendable screen share"
+            "a call without a local video plane must not advertise an unsendable screen share"
         );
         assert_eq!(
             transport.sent_count(),
@@ -1542,6 +1548,120 @@ mod tests {
             "returning to the camera must re-arm the H.264 recovery gate"
         );
         assert_eq!(transport.sent_count(), 3);
+
+        let mut audio_only = registry
+            .group_state_if_current(call_id, generation)
+            .and_then(|state| state.snapshot().cloned())
+            .expect("authoritative roster");
+        audio_only.transaction_id = 2;
+        audio_only.media = "audio".to_string();
+        assert_eq!(
+            registry.apply_group_update_if_current(audio_only, generation),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(
+            client
+                .voip()
+                .set_screen_share(call_id, &creator, ScreenShareState::Started, Some(8))
+                .await
+                .is_err(),
+            "an authoritative audio downgrade must disable screen sharing even if local video was negotiated"
+        );
+        assert_eq!(
+            transport.sent_count(),
+            3,
+            "the rejected post-downgrade transition must stay off the wire"
+        );
+        registry.remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn local_group_controls_wait_for_the_authoritative_transition_lane() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let own_device = Jid::new("111111111111111", Server::Lid).with_device(1);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_device,
+            )))
+            .await;
+        let participant = Jid::new("111111111111111", Server::Lid);
+        let creator = participant.clone();
+        let call_id = "TEST-GROUP-CONTROL-SERIALIZATION";
+        let registry = client.call_registry();
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator.clone());
+        session.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("video".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(vec![GroupCallParticipant::new(
+                    participant,
+                    vec![GroupCallDevice::new(
+                        Jid::new("111111111111111", Server::Lid).with_device(1),
+                    )],
+                )])
+                .build(),
+        );
+        let generation = registry.insert(session);
+        assert!(registry.set_is_video(call_id, generation, true));
+        let transition_lock = registry
+            .group_transition_lock(call_id, generation)
+            .expect("group transition lane");
+
+        let guard = transition_lock.lock().await;
+        let hand_client = client.clone();
+        let hand_creator = creator.clone();
+        let hand = tokio::spawn(async move {
+            hand_client
+                .voip()
+                .set_hand_raised_for_generation(call_id, &hand_creator, generation, true)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.sent_count(),
+            0,
+            "raise-hand signaling must wait for an authoritative transition"
+        );
+        drop(guard);
+        hand.await
+            .expect("raise-hand task")
+            .expect("raise-hand transition");
+
+        let guard = transition_lock.lock().await;
+        let screen_client = client.clone();
+        let screen = tokio::spawn(async move {
+            screen_client
+                .voip()
+                .set_screen_share_for_generation(
+                    call_id,
+                    &creator,
+                    generation,
+                    ScreenShareState::Started,
+                    Some(7),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "screen-share signaling must wait for an authoritative transition"
+        );
+        drop(guard);
+        screen
+            .await
+            .expect("screen-share task")
+            .expect("screen-share transition");
+        assert_eq!(transport.sent_count(), 2);
         registry.remove_if_current(call_id, generation);
     }
 

@@ -1115,11 +1115,11 @@ impl CallEngine {
         if let Some(refresh) = relay_refresh {
             if refresh.relay_addr != self.relay_addr {
                 self.relay_addr = refresh.relay_addr;
-                self.allocated = false;
-                if self.started {
-                    self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
-                }
                 reconnect = Some(refresh.relay_addr);
+            }
+            self.allocated = false;
+            if self.started {
+                self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
             }
             self.relay_token = refresh.relay_token;
             self.endpoint_xor = refresh.endpoint_xor;
@@ -2820,6 +2820,56 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
             "a replacement relay must retain the initial allocation timeout safety net"
+        );
+    }
+
+    #[test]
+    fn group_relay_credential_refresh_rearms_allocation_on_the_same_endpoint() {
+        let mut engine = group_engine();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let allocate_success =
+            stun::encode_stun_request(stun::MSG_ALLOCATE_SUCCESS, &[1u8; 12], &[], None, false);
+        engine.handle_input(1, Input::RelayPacket(&allocate_success));
+        let _ = drain(&mut engine);
+        assert!(engine.is_allocated());
+
+        let mut update = group_update();
+        update.transaction_id = 8;
+        let mut relay = group_relay();
+        relay.transaction_id = Some(8);
+        relay.key = b"rotated-relay-key".to_vec();
+        relay.tokens[0] = vec![0x48];
+        relay.auth_tokens[0] = vec![0x58];
+        update.relay = Some(relay);
+        engine
+            .apply_group_update(2_000, &update)
+            .expect("credential refresh");
+
+        assert!(
+            !engine.is_allocated(),
+            "new credentials require a fresh allocation acknowledgement"
+        );
+        let outputs = drain(&mut engine);
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, Output::Transmit(_))),
+            "the credential refresh must emit a replacement allocation"
+        );
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, Output::ReconnectRelay(_))),
+            "unchanged relay coordinates must not reconnect the socket"
+        );
+
+        engine.handle_input(2_000 + ALLOCATE_TIMEOUT_MS, Input::Timeout);
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
+            "the replacement allocation must retain the timeout safety net"
         );
     }
 

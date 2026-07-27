@@ -203,6 +203,14 @@ impl<'a> AcceptCall<'a> {
             .group_state(call_id)
             .and_then(|state| state.snapshot().cloned())
             .or_else(|| self.incoming.group.as_deref().cloned());
+        if group
+            .as_ref()
+            .is_some_and(|group| (group.media == "video") != *offered_video)
+        {
+            return Err(CallError::Response(
+                "group offer signaling and roster media modes differ".to_string(),
+            ));
+        }
         let is_group = group.is_some();
         if self.incoming.media.is_none()
             && group
@@ -1312,7 +1320,7 @@ async fn fanout_group_epoch_for_generation(
     // The authoritative roster transaction is already committed before this fan-out starts. Any
     // preparation failure would make an identical redelivery stale, so own teardown from the first
     // fallible step instead of leaving the generation alive without its requested epoch.
-    let teardown = GroupRekeyTeardown::new(client, update, generation, true);
+    let teardown = GroupRekeyTeardown::new(client, update, generation, true).await;
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let self_id = own_lid.to_string();
     let mut seen = std::collections::HashSet::new();
@@ -2091,10 +2099,11 @@ struct GroupRekeyTeardown {
     call_creator: Jid,
     generation: Option<u64>,
     armed: bool,
+    transition: Option<async_lock::MutexGuardArc<()>>,
 }
 
 impl GroupRekeyTeardown {
-    fn new(
+    async fn new(
         client: &Client,
         update: &GroupCallUpdate,
         generation: Option<u64>,
@@ -2106,11 +2115,13 @@ impl GroupRekeyTeardown {
             call_creator: update.call_creator.clone(),
             generation,
             armed,
+            transition: Some(client.lock_answer_transition(&update.call_id).await),
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+        self.transition = None;
     }
 }
 
@@ -2124,7 +2135,9 @@ impl Drop for GroupRekeyTeardown {
         };
         let call_id = self.call_id.clone();
         let call_creator = self.call_creator.clone();
-        let claimed = self.generation.is_none_or(|generation| {
+        let generation = self.generation;
+        let transition = self.transition.take();
+        let claimed = generation.is_none_or(|generation| {
             let pending =
                 take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
             let removed = client
@@ -2141,6 +2154,7 @@ impl Drop for GroupRekeyTeardown {
         let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
+                let _transition = transition;
                 let target = Jid::new(&call_id, Server::Call);
                 send_answer_terminate(&client, &call_id, &target, &call_creator).await;
             }))
@@ -3975,6 +3989,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_group_offer_rejects_conflicting_roster_media() {
+        let client = make_client().await;
+        let mut incoming = incoming_offer(true);
+        let call_id = incoming.action.call_id().to_string();
+        incoming.group = Some(Box::new(
+            GroupCallUpdate::builder()
+                .call_id(call_id)
+                .call_creator(caller())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        ));
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CallError::Response(message))
+                if message == "group offer signaling and roster media modes differ"
+        ));
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "conflicting group media must fail before registration"
+        );
+    }
+
+    #[tokio::test]
     async fn offer_without_media_reports_media_error() {
         let client = make_client().await;
         let incoming = incoming_offer(false);
@@ -5170,6 +5224,48 @@ mod tests {
         assert!(
             client.call_registry().snapshot(&update.call_id).is_none(),
             "cancelling after one direct send must tear down the local generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_rekey_teardown_serializes_replacement_until_terminate_is_sent() {
+        let (client, _) = make_sending_client().await;
+        let (transport, entered, release) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let update = rekey_update(&client, &[]);
+        let stale_generation = register_group_update(&client, &update);
+        drop(GroupRekeyTeardown::new(&client, &update, Some(stale_generation), true).await);
+
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("terminate transport attempt")
+            .expect("send gate");
+        assert_eq!(
+            client.call_registry().generation_of(&update.call_id),
+            None,
+            "the failed generation is claimed before its terminal send"
+        );
+
+        let mut replacement_session = wacore::voip::CallSession::new_incoming(
+            &update.call_id,
+            update.call_creator.clone(),
+            update.call_creator.clone(),
+        );
+        replacement_session.group = Some(update.clone());
+        let mut replacement = Box::pin(RegisteredCall::new(&client, replacement_session));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), replacement.as_mut())
+                .await
+                .is_err(),
+            "a same-call-id replacement must wait while rekey termination is in flight"
+        );
+
+        release.send(()).await.expect("release terminate send");
+        let replacement = replacement.await;
+        assert_ne!(replacement.generation, stale_generation);
+        assert_eq!(
+            client.call_registry().generation_of(&update.call_id),
+            Some(replacement.generation)
         );
     }
 

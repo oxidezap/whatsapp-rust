@@ -1126,7 +1126,7 @@ impl CallRegistry {
         let replace = entry
             .pending_group_epoch
             .as_ref()
-            .is_none_or(|pending| epoch.transaction_id >= pending.transaction_id);
+            .is_none_or(|pending| epoch.transaction_id > pending.transaction_id);
         if replace {
             entry.pending_group_epoch = Some(epoch);
         }
@@ -1928,6 +1928,7 @@ mod tests {
         );
         assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 2, vec![2; 32]));
         assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 3, vec![3; 32]));
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 3, vec![9; 32]));
         assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 2, vec![9; 32]));
         assert!(reg.transition("GROUP-CALL", CallPhase::Connecting));
 
@@ -1951,6 +1952,11 @@ mod tests {
             GroupControl::Transition { update, epoch } => {
                 assert_eq!(update.transaction_id, 2);
                 assert_eq!(epoch.transaction_id, 3);
+                assert_eq!(
+                    epoch.as_bytes(),
+                    [3; 32],
+                    "a duplicate transaction must preserve the first authenticated epoch"
+                );
             }
             _ => panic!("expected buffered group transition"),
         }
