@@ -901,8 +901,15 @@ impl SignalStoreCache {
     }
 
     /// Non-destructive existence check; an empty checkout remains absent.
-    /// Backend misses are negative-cached; hits are not cached to skip
-    /// deserialization (the subsequent `get_session` will cache on demand).
+    ///
+    /// A cold probe reads and decodes the row rather than asking the backend
+    /// whether it exists. Row existence alone would report a quarantined
+    /// session as present, and this is the probe that decides whether a send
+    /// fetches a pre-key bundle: answering `true` for a row that
+    /// [`Self::checkout_session`] will then discard skips the recovery, and the
+    /// send fails or silently drops that recipient from the fan-out. The decode
+    /// is not wasted work either, since the record it produces is cached for
+    /// the checkout that follows.
     pub async fn has_session(
         &self,
         address: &ProtocolAddress,
@@ -916,15 +923,21 @@ impl SignalStoreCache {
             }
         }
         // Backend I/O outside the lock
-        let exists = backend.has_session(key).await?;
+        let backend_result = backend.get_session(key).await?;
         let mut state = self.lock_sessions().await;
         if let Some(entry) = state.cache.get(key) {
             return Ok(entry.exists());
         }
-        if !exists {
-            state.cache.insert(Arc::from(key), SessionEntry::Absent);
-            state.evict_if_needed(self.max_entries);
-        }
+        let entry = match backend_result
+            .as_deref()
+            .and_then(|bytes| Self::decode_stored_session(address, bytes, &state.incarnation))
+        {
+            Some(record) => SessionEntry::Present(Arc::new(record)),
+            None => SessionEntry::Absent,
+        };
+        let exists = entry.exists();
+        state.cache.insert(Arc::from(key), entry);
+        state.evict_if_needed(self.max_entries);
         Ok(exists)
     }
 
@@ -3130,6 +3143,56 @@ mod lease_reload_tests {
                 .await
                 .expect("has_session"),
             "the quarantined address must look session-less so ensure_e2e_sessions rebuilds it"
+        );
+    }
+
+    /// The existence probe on a cold cache is what decides whether a send
+    /// fetches a pre-key bundle, and it runs before anything loads the record.
+    /// Asking the backend whether the row exists answers `true` for a row the
+    /// very next checkout will discard, so the recovery is skipped and the send
+    /// either fails or drops that recipient from the fan-out.
+    ///
+    /// Distinct from the test above, which reaches `has_session` only after a
+    /// `get_session` has already negative-cached the address: that one passes
+    /// against the backend-existence probe too.
+    #[tokio::test]
+    async fn a_cold_existence_probe_does_not_report_a_quarantined_row_as_present() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = ProtocolAddress::new("15550001010", 1.into());
+
+        let mut stranded = leased_session();
+        stranded.reserve_sender_chain_counters(
+            crate::libsignal::protocol::consts::MAX_RESERVATION_FAST_FORWARD,
+        );
+        cache.put_session(&address, stranded).await;
+        cache.flush(&backend).await.expect("flush");
+
+        // Nothing has touched this address in this incarnation: the probe is
+        // the first thing to reach the row, exactly as it is on a real restart.
+        let restarted = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        assert!(
+            !restarted
+                .has_session(&address, &backend)
+                .await
+                .expect("a quarantined row must not fail the probe"),
+            "a row the next checkout would discard must not be reported present"
+        );
+
+        // And the negative answer is cached, so the send that follows keeps
+        // seeing it session-less rather than re-reading the same row.
+        assert!(
+            restarted
+                .get_session(&address, &backend)
+                .await
+                .expect("checkout")
+                .is_none()
         );
     }
 
