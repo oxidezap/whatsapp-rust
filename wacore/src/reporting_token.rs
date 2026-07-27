@@ -742,6 +742,14 @@ fn calculate_reporting_token_over_pieces(
     data: &[u8],
     pieces: &[(u32, Piece)],
 ) -> Option<[u8; REPORTING_TOKEN_SIZE]> {
+    // Both callers reach here through `collect_reporting_token_pieces`, which
+    // already returns `None` for a message with nothing whitelisted. Repeated
+    // here because the alternative is minting a perfectly valid token over no
+    // content at all, and that must not depend on a caller remembering to check.
+    if pieces.is_empty() {
+        return None;
+    }
+
     let mut mac = Hmac::<Sha256>::new_from_slice(reporting_token_key).ok()?;
     for (_, piece) in pieces {
         match piece {
@@ -812,9 +820,6 @@ pub fn generate_reporting_token_from_encoded(
     if !should_include_reporting_token(message) {
         return None;
     }
-    // Collected once and reused for the HMAC below: a nested field owns its
-    // bytes, so collecting again to hash them would materialise those buffers
-    // a second time.
     let pieces = collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS)?;
 
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
@@ -1008,7 +1013,14 @@ mod tests {
 
         assert!(extract_reporting_token_content(&encoded, REPORTING_FIELDS).is_none());
         assert!(collect_reporting_token_pieces(&encoded, REPORTING_FIELDS).is_none());
-        let _ = &key;
+
+        // The collector is what stops the HMAC from ever seeing an empty list,
+        // so the HMAC is asked directly: a token over no content is a token
+        // that says nothing, and it would still verify.
+        assert!(
+            calculate_reporting_token_over_pieces(&key, &encoded, &[]).is_none(),
+            "hashing no pieces must not mint a token"
+        );
     }
     use super::*;
 

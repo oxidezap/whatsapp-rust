@@ -3412,13 +3412,21 @@ async fn raw_bytes_burst_drains_and_reuses_input_on_happy_paths() {
     // Sized for the largest burst below, so a reallocation here would mean the
     // callee replaced the buffer rather than filling it.
     let mut results = Vec::with_capacity(4);
+    // Captured before the first call, not between the two: taken after it, a
+    // replacement made on the single-frame path would already be the buffer
+    // this compares against and would go unnoticed.
+    let results_ptr = results.as_ptr();
     client
         .send_raw_bytes_burst(&mut frames, &mut results)
         .await
         .expect("installed socket");
     assert_eq!(results.len(), 1);
     assert!(results.iter().all(|result| result.is_ok()));
-    let results_ptr = results.as_ptr();
+    assert_eq!(
+        results.as_ptr(),
+        results_ptr,
+        "the single-frame path must fill the caller's buffer, not replace it"
+    );
     assert!(frames.is_empty(), "the single-frame fast path must drain");
     assert_eq!(frames.capacity(), retained_capacity);
 
