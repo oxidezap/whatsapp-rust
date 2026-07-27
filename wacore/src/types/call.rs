@@ -225,10 +225,10 @@ pub enum CallAction {
     GroupUpdate { update: Box<GroupCallUpdate> },
     /// Signal-encrypted keygen-v2 epoch for a group call.
     #[wire = "enc_rekey"]
-    EncRekey { rekey: GroupCallEncRekey },
+    EncRekey { rekey: Box<GroupCallEncRekey> },
     /// Authoritative admission state for a reusable call-link call.
     #[wire = "waiting_room_update"]
-    WaitingRoomUpdate { room: WaitingRoom },
+    WaitingRoomUpdate { room: Box<WaitingRoom> },
     /// Persistent raise/lower-hand state for one participant.
     #[wire = "user_action"]
     RaiseHand {

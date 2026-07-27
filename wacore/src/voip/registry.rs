@@ -151,6 +151,8 @@ struct CallEntry {
     /// Active 1:1 devices retained so an established call can become an ad-hoc group call.
     group_invite_self_device: Option<GroupCallDevice>,
     group_invite_peer_device: Option<GroupCallDevice>,
+    /// Once an `<accept>` selects a device, delayed sibling preaccepts cannot replace it.
+    group_invite_peer_selected: bool,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -711,6 +713,7 @@ impl CallRegistry {
             group,
             group_invite_self_device: None,
             group_invite_peer_device: None,
+            group_invite_peer_selected: false,
             on_terminal: None,
         }
     }
@@ -826,7 +829,35 @@ impl CallRegistry {
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| {
+                if entry.group_invite_peer_selected {
+                    return false;
+                }
                 entry.group_invite_peer_device = Some(device);
+                true
+            })
+    }
+
+    /// Select the device that actually accepted the 1:1 call for later group promotion.
+    ///
+    /// The first accept wins. It replaces (or clears) capability learned from an earlier sibling
+    /// preaccept, and subsequent accepts or delayed preaccepts cannot replace that decision.
+    pub fn select_group_invite_peer_device(
+        &self,
+        call_id: &str,
+        generation: u64,
+        device: Option<GroupCallDevice>,
+    ) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .is_some_and(|entry| {
+                if entry.group_invite_peer_selected {
+                    return false;
+                }
+                entry.group_invite_peer_device = device;
+                entry.group_invite_peer_selected = true;
                 true
             })
     }
@@ -952,11 +983,24 @@ impl CallRegistry {
             .and_then(GroupCallState::snapshot)
             .cloned();
         let pending_epoch = entry.pending_group_epoch.take();
-        if let Some(update) = update {
-            let _ = Self::force_send_preserving_epoch(&tx, GroupControl::Update(Box::new(update)));
-        }
-        if let Some(epoch) = pending_epoch {
-            let _ = Self::force_send_preserving_epoch(&tx, GroupControl::RawEpoch(epoch));
+        match (update, pending_epoch) {
+            (Some(update), Some(epoch)) => {
+                let _ = Self::force_send_preserving_epoch(
+                    &tx,
+                    GroupControl::Transition {
+                        update: Box::new(update),
+                        epoch,
+                    },
+                );
+            }
+            (Some(update), None) => {
+                let _ =
+                    Self::force_send_preserving_epoch(&tx, GroupControl::Update(Box::new(update)));
+            }
+            (None, Some(epoch)) => {
+                let _ = Self::force_send_preserving_epoch(&tx, GroupControl::RawEpoch(epoch));
+            }
+            (None, None) => {}
         }
     }
 
@@ -998,8 +1042,15 @@ impl CallRegistry {
             };
             Self::retain_or_route_group_epoch(entry, epoch)
         };
-        if let Some((tx, epoch)) = delivery {
-            Self::force_send_preserving_epoch(&tx, GroupControl::RawEpoch(epoch))
+        if let Some((tx, update, epoch)) = delivery {
+            let command = match update {
+                Some(update) => GroupControl::Transition {
+                    update: Box::new(update),
+                    epoch,
+                },
+                None => GroupControl::RawEpoch(epoch),
+            };
+            Self::force_send_preserving_epoch(&tx, command)
         } else {
             true
         }
@@ -1015,15 +1066,25 @@ impl CallRegistry {
         loop {
             let queued_epoch = match &command {
                 GroupControl::RawEpoch(epoch) => Some(epoch.transaction_id),
+                GroupControl::Transition { epoch, .. } => Some(epoch.transaction_id),
                 _ => None,
             };
             // Each retry keeps the newer of the queued and evicted epochs. Because the mailbox is
             // bounded, it eventually evicts a non-epoch or an older epoch and returns.
             match tx.force_send(command) {
-                Ok(Some(GroupControl::RawEpoch(evicted)))
-                    if queued_epoch.is_none_or(|queued| evicted.transaction_id > queued) =>
+                Ok(Some(
+                    evicted @ (GroupControl::RawEpoch(_) | GroupControl::Transition { .. }),
+                )) if queued_epoch.is_none_or(|queued| {
+                    let evicted_transaction = match &evicted {
+                        GroupControl::RawEpoch(epoch) | GroupControl::Transition { epoch, .. } => {
+                            epoch.transaction_id
+                        }
+                        _ => unreachable!("guard restricts evicted control"),
+                    };
+                    evicted_transaction > queued
+                }) =>
                 {
-                    command = GroupControl::RawEpoch(evicted);
+                    command = evicted;
                 }
                 Ok(_) => return true,
                 Err(_) => return false,
@@ -1034,9 +1095,18 @@ impl CallRegistry {
     fn retain_or_route_group_epoch(
         entry: &mut CallEntry,
         epoch: GroupRawEpoch,
-    ) -> Option<(async_channel::Sender<GroupControl>, GroupRawEpoch)> {
+    ) -> Option<(
+        async_channel::Sender<GroupControl>,
+        Option<GroupCallUpdate>,
+        GroupRawEpoch,
+    )> {
         if let Some(tx) = entry.group_ctl_tx.clone() {
-            return Some((tx, epoch));
+            let update = entry
+                .group
+                .as_ref()
+                .and_then(GroupCallState::snapshot)
+                .cloned();
+            return Some((tx, update, epoch));
         }
         let replace = entry
             .pending_group_epoch
@@ -1786,12 +1856,10 @@ mod tests {
         reg.set_group_control_sender("GROUP-CALL", generation, tx);
         assert!(matches!(
             rx.try_recv(),
-            Ok(GroupControl::Update(update)) if update.transaction_id == 2
+            Ok(GroupControl::Transition { update, epoch })
+                if update.transaction_id == 2 && epoch.transaction_id == 2
         ));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 2
-        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1864,21 +1932,23 @@ mod tests {
 
         let (tx, rx) = async_channel::unbounded();
         reg.set_group_control_sender("GROUP-CALL", generation, tx);
-        match rx.try_recv().expect("latest roster") {
-            GroupControl::Update(update) => assert_eq!(update.transaction_id, 2),
-            _ => panic!("expected buffered group update"),
-        }
-        match rx.try_recv().expect("latest epoch") {
-            GroupControl::RawEpoch(epoch) => assert_eq!(epoch.transaction_id, 3),
-            _ => panic!("expected buffered group epoch"),
+        match rx.try_recv().expect("latest roster and epoch") {
+            GroupControl::Transition { update, epoch } => {
+                assert_eq!(update.transaction_id, 2);
+                assert_eq!(epoch.transaction_id, 3);
+            }
+            _ => panic!("expected buffered group transition"),
         }
         assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 4, vec![4; 32],));
         match rx
             .try_recv()
             .expect("new epoch routed after buffered epoch")
         {
-            GroupControl::RawEpoch(epoch) => assert_eq!(epoch.transaction_id, 4),
-            _ => panic!("expected live group epoch"),
+            GroupControl::Transition { update, epoch } => {
+                assert_eq!(update.transaction_id, 2);
+                assert_eq!(epoch.transaction_id, 4);
+            }
+            _ => panic!("expected live group transition"),
         }
         assert!(rx.try_recv().is_err());
     }
@@ -1959,13 +2029,20 @@ mod tests {
         let (tx, rx) = async_channel::bounded(2);
         assert!(CallRegistry::force_send_preserving_epoch(
             &tx,
-            GroupControl::Update(Box::new(group_update(1))),
+            GroupControl::Update(Box::new(group_update(7))),
         ));
         assert!(CallRegistry::force_send_preserving_epoch(
             &tx,
-            GroupControl::RawEpoch(GroupRawEpoch::new(7, vec![7; 32])),
+            GroupControl::Reaction("queued".to_string()),
         ));
-        for transaction_id in 2..=3 {
+        assert!(CallRegistry::force_send_preserving_epoch(
+            &tx,
+            GroupControl::Transition {
+                update: Box::new(group_update(7)),
+                epoch: GroupRawEpoch::new(7, vec![7; 32]),
+            },
+        ));
+        for transaction_id in 8..=9 {
             assert!(CallRegistry::force_send_preserving_epoch(
                 &tx,
                 GroupControl::Update(Box::new(group_update(transaction_id))),
@@ -1974,10 +2051,18 @@ mod tests {
 
         let controls = [rx.try_recv().unwrap(), rx.try_recv().unwrap()];
         assert!(
+            controls.iter().any(|control| matches!(
+                control,
+                GroupControl::Transition { update, epoch }
+                    if update.transaction_id == 7 && epoch.transaction_id == 7
+            )),
+            "the epoch and the roster required to install it must remain indivisible"
+        );
+        assert!(
             controls.iter().any(
-                |control| matches!(control, GroupControl::RawEpoch(epoch) if epoch.transaction_id == 7)
+                |control| matches!(control, GroupControl::Update(update) if update.transaction_id == 9)
             ),
-            "roster coalescing must not evict the only pending epoch"
+            "roster coalescing must retain the newest independent update"
         );
     }
 
@@ -2158,6 +2243,47 @@ mod tests {
     }
 
     #[test]
+    fn accepted_peer_capability_survives_delayed_sibling_preaccept() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let self_device =
+            GroupCallDevice::new(Jid::new("111111111111111", Server::Lid).with_device(1))
+                .with_capability(1, [1]);
+        assert!(reg.set_group_invite_self_device("GROUP-CALL", generation, self_device,));
+
+        let early_sibling =
+            GroupCallDevice::new(Jid::new("222222222222222", Server::Lid).with_device(2))
+                .with_capability(1, [2]);
+        assert!(reg.set_group_invite_peer_device("GROUP-CALL", generation, early_sibling,));
+
+        let accepted =
+            GroupCallDevice::new(Jid::new("222222222222222", Server::Lid).with_device(3))
+                .with_capability(1, [3]);
+        assert!(reg.select_group_invite_peer_device(
+            "GROUP-CALL",
+            generation,
+            Some(accepted.clone()),
+        ));
+
+        let delayed_sibling =
+            GroupCallDevice::new(Jid::new("222222222222222", Server::Lid).with_device(4))
+                .with_capability(1, [4]);
+        assert!(!reg.set_group_invite_peer_device("GROUP-CALL", generation, delayed_sibling,));
+        assert!(!reg.select_group_invite_peer_device(
+            "GROUP-CALL",
+            generation,
+            Some(GroupCallDevice::new(
+                Jid::new("222222222222222", Server::Lid).with_device(5),
+            )),
+        ));
+
+        let roster = reg
+            .group_invite_fallback_roster("GROUP-CALL", generation)
+            .expect("promotion roster");
+        assert_eq!(roster[1].devices, vec![accepted]);
+    }
+
+    #[test]
     fn direct_calls_reject_group_state_mutations() {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("DIRECT-CALL"));
@@ -2211,6 +2337,10 @@ mod tests {
         assert!(!reg.send_group_update_if_current("GROUP-CALL", stale, group_update(2),));
         assert!(!reg.send_group_epoch_if_current("GROUP-CALL", stale, 2, vec![2; 32],));
         assert!(rx.try_recv().is_err());
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(2), current),
+            GroupStateApply::Applied
+        );
         assert!(reg.send_group_update_if_current("GROUP-CALL", current, group_update(2),));
         assert!(reg.send_group_epoch_if_current("GROUP-CALL", current, 2, vec![2; 32],));
         assert!(matches!(
@@ -2219,7 +2349,8 @@ mod tests {
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 2
+            Ok(GroupControl::Transition { update, epoch })
+                if update.transaction_id == 2 && epoch.transaction_id == 2
         ));
     }
 
@@ -2251,20 +2382,37 @@ mod tests {
             reg.apply_group_update(group_update(1)),
             GroupStateApply::Applied
         );
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = async_channel::bounded(2);
         reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 1
+        ));
 
+        assert_eq!(
+            reg.apply_group_update(group_update(2)),
+            GroupStateApply::Applied
+        );
         assert!(reg.send_group_update_if_current("GROUP-CALL", generation, group_update(2)));
         assert!(matches!(
             rx.try_recv(),
             Ok(GroupControl::Update(update)) if update.transaction_id == 2
         ));
 
+        assert_eq!(
+            reg.apply_group_update(group_update(3)),
+            GroupStateApply::Applied
+        );
         assert!(reg.send_group_update_if_current("GROUP-CALL", generation, group_update(3)));
         assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 3, vec![3; 32]));
         assert!(matches!(
             rx.try_recv(),
-            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 3
+            Ok(GroupControl::Update(update)) if update.transaction_id == 3
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Transition { update, epoch })
+                if update.transaction_id == 3 && epoch.transaction_id == 3
         ));
     }
 

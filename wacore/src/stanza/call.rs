@@ -239,10 +239,10 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             update: super::group_call::parse_group_update(node)?.into(),
         },
         CallActionTag::EncRekey => CallAction::EncRekey {
-            rekey: super::group_call::parse_group_enc_rekey(node)?,
+            rekey: super::group_call::parse_group_enc_rekey(node)?.into(),
         },
         CallActionTag::WaitingRoomUpdate => CallAction::WaitingRoomUpdate {
-            room: super::group_call::parse_waiting_room_update(node)?,
+            room: super::group_call::parse_waiting_room_update(node)?.into(),
         },
         CallActionTag::RaiseHand => CallAction::RaiseHand {
             call_id,

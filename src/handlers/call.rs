@@ -42,6 +42,9 @@ use super::traits::StanzaHandler;
 #[derive(Default)]
 pub struct CallHandler;
 
+#[cfg(feature = "voip-runtime")]
+const GROUP_REGISTRATION_RACE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for CallHandler {
@@ -97,7 +100,7 @@ impl StanzaHandler for CallHandler {
                             // Offer and control stanzas are dispatched concurrently. Listen before
                             // rechecking so an immediately following epoch cannot miss the ringing
                             // generation inserted by its preceding offer.
-                            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                            tokio::time::timeout(GROUP_REGISTRATION_RACE_WAIT, async {
                                 loop {
                                     let listener = registry.listen_registration();
                                     if let Some(transition) =
@@ -255,28 +258,45 @@ impl StanzaHandler for CallHandler {
                         CallAction::PreAccept { .. } | CallAction::Accept { .. }
                     ) && let Some(generation) =
                         client.call_registry().generation_of(call.action.call_id())
-                        && let Some(capability) = nr
+                    {
+                        let capability = nr
                             .children()
                             .and_then(|children| children.first())
-                            .and_then(|action| action.get_optional_child("capability"))
-                        && let Some(bytes) =
-                            capability.content_bytes().filter(|bytes| !bytes.is_empty())
-                    {
-                        let version = match capability.get_attr("ver") {
-                            None => Some(1),
-                            Some(version) => version.as_str().parse::<u32>().ok(),
+                            .and_then(|action| action.get_optional_child("capability"));
+                        let device = if let Some(capability) = capability
+                            && let Some(bytes) =
+                                capability.content_bytes().filter(|bytes| !bytes.is_empty())
+                        {
+                            let version = match capability.get_attr("ver") {
+                                None => Some(1),
+                                Some(version) => version.as_str().parse::<u32>().ok(),
+                            };
+                            if let Some(version) = version {
+                                Some(
+                                    GroupCallDevice::new(routed_call_sender(&call))
+                                        .with_capability(version, bytes.to_vec()),
+                                )
+                            } else {
+                                warn!(
+                                    "call: ignored invalid peer capability version for {}",
+                                    call.action.call_id()
+                                );
+                                None
+                            }
+                        } else {
+                            None
                         };
-                        if let Some(version) = version {
+                        if matches!(&call.action, CallAction::Accept { .. }) {
+                            client.call_registry().select_group_invite_peer_device(
+                                call.action.call_id(),
+                                generation,
+                                device,
+                            );
+                        } else if let Some(device) = device {
                             client.call_registry().set_group_invite_peer_device(
                                 call.action.call_id(),
                                 generation,
-                                GroupCallDevice::new(routed_call_sender(&call))
-                                    .with_capability(version, bytes.to_vec()),
-                            );
-                        } else {
-                            warn!(
-                                "call: ignored invalid peer capability version for {}",
-                                call.action.call_id()
+                                device,
                             );
                         }
                     }
@@ -537,13 +557,15 @@ impl StanzaHandler for CallHandler {
                             dispatch_call = match group_transition_generation {
                                 Some(generation) => match client
                                     .call_registry()
-                                    .apply_waiting_room_if_current(room.clone(), generation)
-                                {
+                                    .apply_waiting_room_if_current(
+                                        room.as_ref().clone(),
+                                        generation,
+                                    ) {
                                     GroupStateApply::Applied => {
                                         client.call_registry().send_call_event_if_current(
                                             &room.call_id,
                                             generation,
-                                            CallEvent::WaitingRoomUpdated(Box::new(room.clone())),
+                                            CallEvent::WaitingRoomUpdated(room.clone()),
                                         );
                                         true
                                     }
@@ -1046,6 +1068,15 @@ mod tests {
                     .build()])
                 .build()])
             .build()
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[test]
+    fn missing_group_registration_wait_is_tightly_bounded() {
+        assert!(
+            GROUP_REGISTRATION_RACE_WAIT <= std::time::Duration::from_millis(50),
+            "fabricated call IDs must not retain a handler task for a network-scale timeout"
+        );
     }
 
     #[cfg(feature = "voip-runtime")]

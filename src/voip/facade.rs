@@ -972,6 +972,7 @@ impl<'a> CallLinkCall<'a> {
                         "call-link admitted snapshot changed call identity".to_string(),
                     ));
                 }
+                ensure_call_link_admitted_media(&update, self.media)?;
                 // Admission has committed this endpoint server-side even when relay material is
                 // delivered by a later snapshot. Arm cleanup at that transition, not after relay,
                 // so cancellation cannot strand the admitted endpoint in the remote roster.
@@ -1091,6 +1092,19 @@ fn ensure_group_offer_media(
     } else {
         Err(CallError::Response(
             "group offer ack changed the requested media mode".to_string(),
+        ))
+    }
+}
+
+fn ensure_call_link_admitted_media(
+    update: &GroupCallUpdate,
+    requested: CallLinkMedia,
+) -> Result<(), CallError> {
+    if update.media == requested.as_str() {
+        Ok(())
+    } else {
+        Err(CallError::Response(
+            "call-link admitted snapshot changed the requested media mode".to_string(),
         ))
     }
 }
@@ -3804,6 +3818,28 @@ mod tests {
         assert!(ensure_group_offer_media(&update("video"), false).is_err());
     }
 
+    #[test]
+    fn delayed_call_link_admission_must_preserve_requested_media() {
+        let update = |media: &str| {
+            GroupCallUpdate::builder()
+                .call_id("GROUP-CALL".to_string())
+                .call_creator(Jid::new("111111111111111", Server::Lid))
+                .transaction_id(1)
+                .media(media.to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build()
+        };
+
+        assert!(ensure_call_link_admitted_media(&update("audio"), CallLinkMedia::Audio).is_ok());
+        assert!(ensure_call_link_admitted_media(&update("video"), CallLinkMedia::Video).is_ok());
+        assert!(ensure_call_link_admitted_media(&update("audio"), CallLinkMedia::Video).is_err());
+        assert!(ensure_call_link_admitted_media(&update("video"), CallLinkMedia::Audio).is_err());
+    }
+
     #[tokio::test]
     async fn accept_rejects_an_audio_profile_the_peer_did_not_offer() {
         let client = make_client().await;
@@ -6376,12 +6412,10 @@ mod tests {
         registry.set_group_control_sender(call_id, generation, tx);
         assert!(matches!(
             rx.try_recv(),
-            Ok(GroupControl::Update(update)) if update.transaction_id == 7
+            Ok(GroupControl::Transition { update, epoch })
+                if update.transaction_id == 7 && epoch.transaction_id == 7
         ));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 7
-        ));
+        assert!(rx.try_recv().is_err());
         registration.disarm();
         registry.remove_if_current(call_id, generation);
     }

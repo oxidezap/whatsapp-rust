@@ -31,6 +31,11 @@ use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 /// Lossless, ordered signaling mutations consumed by the sans-I/O group-media engine.
 pub enum GroupControl {
     Update(Box<GroupCallUpdate>),
+    /// One roster snapshot and its decrypted epoch, kept indivisible under mailbox backpressure.
+    Transition {
+        update: Box<GroupCallUpdate>,
+        epoch: GroupRawEpoch,
+    },
     RawEpoch(GroupRawEpoch),
     Reaction(String),
 }
@@ -356,6 +361,41 @@ fn purge_group_transition_media(
         (epoch_advanced && batch.kind != SendBatchKind::Control)
             || (audio_only && batch.kind == SendBatchKind::Video)
     })
+}
+
+fn apply_group_epoch_control(
+    engine: &mut CallEngine,
+    epoch: GroupRawEpoch,
+    send_queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+    events: &async_channel::Sender<CallEvent>,
+) {
+    match engine.apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes()) {
+        Ok(crate::voip::GroupEpochApply::Installed) => {
+            let dropped = purge_queued(
+                send_queue,
+                pending_video,
+                awaiting_video_keyframe,
+                |batch| batch.kind != SendBatchKind::Control,
+            );
+            if dropped.packets != 0 {
+                let _ = events.try_send(CallEvent::OutboundMediaDropped {
+                    video_access_units: dropped.video_access_units,
+                    packets: dropped.packets,
+                });
+            }
+        }
+        Ok(_) => {}
+        Err(_) => {
+            // A decrypted epoch may overtake initial roster configuration. Rejecting the control
+            // keeps the driver alive; registry-originated epochs are paired with their roster and
+            // therefore retry through the transition path instead of relying on this fallback.
+            let _ = events.try_send(CallEvent::GroupControlRejected {
+                control: engine::GroupControlKind::Epoch,
+            });
+        }
+    }
 }
 
 fn prepare_relay_reconnect(
@@ -817,10 +857,16 @@ async fn run_call_with_clock_and_wallclock(
                 }
             },
             group = group_ctl_fut => {
+                let (group, paired_epoch) = match group {
+                    Some(GroupControl::Transition { update, epoch }) => {
+                        (Some(GroupControl::Update(update)), Some(epoch))
+                    }
+                    group => (group, None),
+                };
                 match group {
                     Some(GroupControl::Update(update)) => {
                         let previous_epoch = eng.group_epoch_transaction();
-                        match eng.apply_group_update(now_ms(), &update) {
+                        let update_accepted = match eng.apply_group_update(now_ms(), &update) {
                             Ok(crate::voip::GroupRosterApply::Applied) => {
                                 let dropped = purge_group_transition_media(
                                     &mut send_queue,
@@ -837,8 +883,9 @@ async fn run_call_with_clock_and_wallclock(
                                         },
                                     );
                                 }
+                                true
                             }
-                            Ok(_) => {}
+                            Ok(_) => true,
                             Err(error) => {
                                 if matches!(
                                     error,
@@ -854,40 +901,34 @@ async fn run_call_with_clock_and_wallclock(
                                             control: engine::GroupControlKind::Update,
                                         },
                                     );
+                                    false
                                 } else {
                                     break 'drive;
                                 }
                             }
+                        };
+                        if update_accepted
+                            && let Some(epoch) = paired_epoch
+                        {
+                            apply_group_epoch_control(
+                                &mut eng,
+                                epoch,
+                                &mut send_queue,
+                                &mut pending_video,
+                                &mut awaiting_video_keyframe,
+                                &channels.events,
+                            );
                         }
                     }
                     Some(GroupControl::RawEpoch(epoch)) => {
-                        match eng.apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes()) {
-                            Ok(crate::voip::GroupEpochApply::Installed) => {
-                                let dropped = purge_queued(
-                                    &mut send_queue,
-                                    &mut pending_video,
-                                    &mut awaiting_video_keyframe,
-                                    |batch| batch.kind != SendBatchKind::Control,
-                                );
-                                if dropped.packets != 0 {
-                                    let _ = channels.events.try_send(
-                                        CallEvent::OutboundMediaDropped {
-                                            video_access_units: dropped.video_access_units,
-                                            packets: dropped.packets,
-                                        },
-                                    );
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                if matches!(error, crate::voip::GroupMediaError::Pipeline) {
-                                    break 'drive;
-                                }
-                                let _ = channels.events.try_send(CallEvent::GroupControlRejected {
-                                    control: engine::GroupControlKind::Epoch,
-                                });
-                            }
-                        }
+                        apply_group_epoch_control(
+                            &mut eng,
+                            epoch,
+                            &mut send_queue,
+                            &mut pending_video,
+                            &mut awaiting_video_keyframe,
+                            &channels.events,
+                        );
                     }
                     Some(GroupControl::Reaction(emoji)) => {
                         if eng.send_group_reaction(now_ms(), &emoji).is_err() {
@@ -895,6 +936,9 @@ async fn run_call_with_clock_and_wallclock(
                                 control: engine::GroupControlKind::Reaction,
                             });
                         }
+                    }
+                    Some(GroupControl::Transition { .. }) => {
+                        unreachable!("group transitions are normalized before dispatch")
                     }
                     None => group_ctl_open = false,
                 }
@@ -1449,6 +1493,61 @@ mod tests {
                     control: engine::GroupControlKind::Reaction
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn epoch_before_group_configuration_does_not_terminate_the_driver() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let binding =
+            stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[8u8; 12], &[], None, false);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(binding)))
+            .unwrap();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::RawEpoch(GroupRawEpoch::new(1, vec![1; 32])))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+        let engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            engine,
+        ));
+
+        assert!(
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_BINDING_SUCCESS)),
+            "a racing epoch must not stop subsequent relay processing"
+        );
+        assert!(
+            std::iter::from_fn(|| ev_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                CallEvent::GroupControlRejected {
+                    control: engine::GroupControlKind::Epoch
+                }
+            )),
+            "the pre-roster epoch is rejected explicitly instead of terminating the call"
         );
     }
 

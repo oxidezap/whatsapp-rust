@@ -1,7 +1,8 @@
 //! Runtime state machine for group-call membership and participant controls.
 //!
-//! The server owns the roster. Updates are transaction ordered and never merge
-//! incrementally: an accepted snapshot replaces the previous one atomically.
+//! The server owns the roster. Updates are transaction ordered and membership never merges
+//! incrementally: an accepted roster replaces the previous one atomically. Optional relay omission
+//! means no allocation refresh, so the last usable relay is carried across roster-only updates.
 
 use std::collections::{HashMap, HashSet};
 
@@ -64,7 +65,7 @@ impl GroupCallState {
     }
 
     /// Replace the current authoritative snapshot when its transaction is newer.
-    pub fn apply_update(&mut self, update: GroupCallUpdate) -> GroupStateApply {
+    pub fn apply_update(&mut self, mut update: GroupCallUpdate) -> GroupStateApply {
         if !self.matches_identity(&update.call_id, &update.call_creator) {
             return GroupStateApply::IdentityMismatch;
         }
@@ -92,6 +93,15 @@ impl GroupCallState {
             .retain(|participant| connected.contains(participant));
         self.screen_shares
             .retain(|participant, _| connected.contains(participant));
+        if update.relay.is_none() {
+            // Roster-only updates do not revoke the relay allocation. The media engine follows the
+            // same absent-means-no-refresh rule, so the durable snapshot must retain the last usable
+            // relay for builders that attach after this transaction commits.
+            update.relay = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.relay.clone());
+        }
         self.snapshot = Some(update);
         GroupStateApply::Applied
     }
@@ -204,7 +214,7 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::group_call::{GroupCallDevice, GroupCallParticipant};
+    use crate::types::group_call::{GroupCallDevice, GroupCallParticipant, GroupCallRelay};
     use wacore_binary::Server;
 
     fn creator() -> Jid {
@@ -291,6 +301,35 @@ mod tests {
         );
         assert!(state.raised_hands().is_empty());
         assert!(state.screen_shares().is_empty());
+    }
+
+    #[test]
+    fn roster_only_updates_retain_the_last_usable_relay() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let relay = GroupCallRelay::builder()
+            .transaction_id(1)
+            .self_pid(7)
+            .uuid("RELAY-UUID".to_string())
+            .participant_uuid("PARTICIPANT-UUID".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(16)
+            .endpoints(Vec::new())
+            .build();
+        let mut admitted = update(1, vec![participant("100001", "connected", 1)]);
+        admitted.relay = Some(relay.clone());
+        assert_eq!(state.apply_update(admitted), GroupStateApply::Applied);
+
+        assert_eq!(
+            state.apply_update(update(2, vec![participant("100001", "connected", 1)],)),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .and_then(|snapshot| snapshot.relay.as_ref()),
+            Some(&relay),
+            "an omitted relay is a roster-only update, not allocation revocation"
+        );
     }
 
     #[test]
