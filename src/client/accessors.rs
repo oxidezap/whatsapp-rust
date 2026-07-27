@@ -197,6 +197,12 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
+        #[cfg(feature = "voip-runtime")]
+        let pending_call_link_updates = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .memory_stats();
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]
@@ -268,6 +274,8 @@ impl Client {
             signal_sessions,
             signal_identities,
             signal_sender_keys,
+            #[cfg(feature = "voip-runtime")]
+            pending_call_link_updates,
             #[cfg(feature = "plugins")]
             plugins,
             #[cfg(feature = "plugins")]

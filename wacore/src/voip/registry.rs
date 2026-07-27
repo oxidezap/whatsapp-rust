@@ -416,6 +416,9 @@ impl CallRegistry {
         let snapshot = entry.group.as_ref().and_then(GroupCallState::snapshot)?;
         let sender_user = sender.to_non_ad();
         snapshot.participants.iter().find_map(|participant| {
+            if participant.state.as_deref() != Some("connected") {
+                return None;
+            }
             let authorized = if sender.device == 0 {
                 participant.jid.to_non_ad() == sender_user
                     || participant
@@ -1641,13 +1644,18 @@ mod tests {
         );
         let participant_pn = Jid::new("15550000003", Server::Pn);
         roster_participant.pn = Some(participant_pn.clone());
+        roster_participant.state = Some("connected".to_string());
         update.participants = vec![
-            GroupCallParticipant::new(
-                update.call_creator.clone(),
-                vec![GroupCallDevice::new(
-                    update.call_creator.clone().with_device(1),
-                )],
-            ),
+            {
+                let mut creator = GroupCallParticipant::new(
+                    update.call_creator.clone(),
+                    vec![GroupCallDevice::new(
+                        update.call_creator.clone().with_device(1),
+                    )],
+                );
+                creator.state = Some("connected".to_string());
+                creator
+            },
             roster_participant,
         ];
         assert_eq!(reg.apply_group_update(update), GroupStateApply::Applied);
@@ -1670,6 +1678,28 @@ mod tests {
             &device
         ));
         assert!(!reg.group_sender_authorized("OTHER-CALL", &creator, &device));
+
+        let mut departed = group_update(2);
+        let mut departed_participant = GroupCallParticipant::new(
+            participant.clone(),
+            vec![GroupCallDevice::new(device.clone())],
+        );
+        departed_participant.pn = Some(participant_pn.clone());
+        departed_participant.state = Some("disconnected".to_string());
+        departed.participants = vec![departed_participant];
+        assert_eq!(reg.apply_group_update(departed), GroupStateApply::Applied);
+        assert!(
+            !reg.group_sender_authorized("GROUP-CALL", &creator, &device),
+            "a retained but disconnected device must lose control authorization"
+        );
+        assert!(
+            !reg.group_sender_authorized("GROUP-CALL", &creator, &participant_pn),
+            "a disconnected participant's PN alias must lose control authorization"
+        );
+        assert!(
+            reg.group_sender_authorized("GROUP-CALL", &creator, &creator.clone().with_device(7)),
+            "the explicit creator bootstrap exception remains valid"
+        );
     }
 
     #[test]

@@ -188,56 +188,50 @@ fn build_group_users(
     video_creator: Option<&Jid>,
     video: bool,
 ) -> Result<Vec<Node>> {
-    participants
-        .iter()
-        .enumerate()
-        .map(|(participant_index, participant)| {
-            if participant.jid.user.is_empty() {
-                bail!("participant {participant_index} has no jid");
+    let mut users = Vec::with_capacity(participants.len());
+    for (participant_index, participant) in participants.iter().enumerate() {
+        if participant.jid.user.is_empty() {
+            bail!("participant {participant_index} has no jid");
+        }
+        if participant.devices.is_empty() {
+            bail!("participant {participant_index} has no devices");
+        }
+        let mut devices = Vec::with_capacity(participant.devices.len());
+        for (device_index, device) in participant.devices.iter().enumerate() {
+            if device.jid.user.is_empty() {
+                bail!("participant {participant_index} device {device_index} has no jid");
             }
-            if participant.devices.is_empty() {
-                bail!("participant {participant_index} has no devices");
-            }
-            let devices = participant
-                .devices
-                .iter()
-                .enumerate()
-                .map(|(device_index, device)| {
-                    if device.jid.user.is_empty() {
-                        bail!("participant {participant_index} device {device_index} has no jid");
+            let mut builder = NodeBuilder::new("device").attr("jid", &device.jid);
+            if !device.capability.is_empty() {
+                let capability = if video
+                    && video_creator
+                        .is_some_and(|creator| creator.to_non_ad() == device.jid.to_non_ad())
+                {
+                    if device.capability == CAPABILITY_OFFER {
+                        CAPABILITY_VIDEO_OFFER.to_vec()
+                    } else if device.capability == CAPABILITY_STANDARD_OPUS_OFFER {
+                        CAPABILITY_STANDARD_OPUS_VIDEO_OFFER.to_vec()
+                    } else {
+                        device.capability.clone()
                     }
-                    let mut builder = NodeBuilder::new("device").attr("jid", &device.jid);
-                    if !device.capability.is_empty() {
-                        let capability = if video
-                            && video_creator.is_some_and(|creator| {
-                                creator.to_non_ad() == device.jid.to_non_ad()
-                            }) {
-                            if device.capability == CAPABILITY_OFFER {
-                                CAPABILITY_VIDEO_OFFER.to_vec()
-                            } else if device.capability == CAPABILITY_STANDARD_OPUS_OFFER {
-                                CAPABILITY_STANDARD_OPUS_VIDEO_OFFER.to_vec()
-                            } else {
-                                device.capability.clone()
-                            }
-                        } else {
-                            device.capability.clone()
-                        };
-                        let mut cap = NodeBuilder::new("capability");
-                        if let Some(version) = device.capability_version {
-                            cap = cap.attr("ver", version.to_string());
-                        }
-                        builder = builder.children([cap.bytes(capability).build()]);
-                    }
-                    Ok(builder.build())
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut builder = NodeBuilder::new("user").attr("jid", &participant.jid);
-            if let Some(state) = participant.state.as_deref() {
-                builder = builder.attr("state", state);
+                } else {
+                    device.capability.clone()
+                };
+                let mut cap = NodeBuilder::new("capability");
+                if let Some(version) = device.capability_version {
+                    cap = cap.attr("ver", version.to_string());
+                }
+                builder = builder.children([cap.bytes(capability).build()]);
             }
-            Ok(builder.children(devices).build())
-        })
-        .collect()
+            devices.push(builder.build());
+        }
+        let mut builder = NodeBuilder::new("user").attr("jid", &participant.jid);
+        if let Some(state) = participant.state.as_deref() {
+            builder = builder.attr("state", state);
+        }
+        users.push(builder.children(devices).build());
+    }
+    Ok(users)
 }
 
 /// Parse the group snapshot embedded in an active-call invitation.
@@ -277,9 +271,7 @@ pub fn parse_group_update(node: &NodeRef<'_>) -> Result<GroupCallUpdate> {
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id", "group_update")?;
     let creator = required_jid(&mut attrs, "call-creator", "group_update")?;
-    attrs
-        .finish()
-        .map_err(|error| anyhow!("<group_update> attrs: {error}"))?;
+    finish_attrs(&attrs, "group_update")?;
     let group_info = node
         .get_optional_child("group_info")
         .ok_or_else(|| anyhow!("<group_update> missing <group_info>"))?;
@@ -313,6 +305,9 @@ pub fn parse_initial_group_call_ack(node: &NodeRef<'_>) -> Result<Option<GroupCa
     Ok(Some(update))
 }
 
+// These parsers run only on group-control stanzas. Keeping their validation
+// paths out of callers avoids duplicating them under fat LTO.
+#[inline(never)]
 fn parse_group_info(
     node: &NodeRef<'_>,
     call_id: String,
@@ -325,13 +320,12 @@ fn parse_group_info(
     let connected_limit = required_u32(&mut attrs, "connected-limit", "group_info")?;
     let joinable = attrs.optional_string("joinable").as_deref() == Some("1");
     let rekey_requested = attrs.optional_string("rekey").as_deref() == Some("1");
-    let participants = node
-        .children()
-        .unwrap_or_default()
-        .iter()
-        .filter(|child| child.tag.as_ref() == "user")
-        .map(parse_group_participant)
-        .collect::<Result<Vec<_>>>()?;
+    let mut participants = Vec::new();
+    for child in node.children().unwrap_or_default() {
+        if child.tag == "user" {
+            participants.push(parse_group_participant(child)?);
+        }
+    }
     Ok(GroupCallUpdate {
         call_id,
         call_creator,
@@ -347,6 +341,7 @@ fn parse_group_info(
     })
 }
 
+#[inline(never)]
 fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid", "user")?;
@@ -355,13 +350,12 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
     let participant_type = attrs
         .optional_string("type")
         .map(|value| value.into_owned());
-    let devices = node
-        .children()
-        .unwrap_or_default()
-        .iter()
-        .filter(|child| child.tag.as_ref() == "device")
-        .map(parse_group_device)
-        .collect::<Result<Vec<_>>>()?;
+    let mut devices = Vec::new();
+    for child in node.children().unwrap_or_default() {
+        if child.tag == "device" {
+            devices.push(parse_group_device(child)?);
+        }
+    }
     Ok(GroupCallParticipant {
         jid,
         pn,
@@ -371,6 +365,7 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
     })
 }
 
+#[inline(never)]
 fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
     let mut attrs = node.attrs();
     let jid = required_jid(&mut attrs, "jid", "device")?;
@@ -397,6 +392,7 @@ fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
     })
 }
 
+#[inline(never)]
 fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
     let mut attrs = node.attrs();
     let transaction_id = optional_u32(&mut attrs, "transaction-id", "relay")?;
@@ -414,11 +410,12 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
             .unwrap_or_default()
             .to_vec()
     };
-    let endpoints = children
-        .iter()
-        .filter(|child| child.tag.as_ref() == "te2")
-        .map(parse_group_relay_endpoint)
-        .collect::<Result<Vec<_>>>()?;
+    let mut endpoints = Vec::new();
+    for child in children {
+        if child.tag == "te2" {
+            endpoints.push(parse_group_relay_endpoint(child)?);
+        }
+    }
     Ok(GroupCallRelay {
         transaction_id,
         self_pid,
@@ -434,6 +431,7 @@ fn parse_group_relay(node: &NodeRef<'_>) -> Result<GroupCallRelay> {
     })
 }
 
+#[inline(never)]
 fn parse_group_relay_endpoint(node: &NodeRef<'_>) -> Result<GroupCallRelayEndpoint> {
     let mut attrs = node.attrs();
     let relay_id = optional_u32(&mut attrs, "relay_id", "te2")?.unwrap_or_default();
@@ -542,9 +540,7 @@ pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
     let call_id = required_string(&mut attrs, "call-id", "enc_rekey")?;
     let call_creator = required_jid(&mut attrs, "call-creator", "enc_rekey")?;
     let transaction_id = required_u32(&mut attrs, "transaction-id", "enc_rekey")?;
-    attrs
-        .finish()
-        .map_err(|error| anyhow!("<enc_rekey> attrs: {error}"))?;
+    finish_attrs(&attrs, "enc_rekey")?;
     let encopt = node
         .get_optional_child("encopt")
         .ok_or_else(|| anyhow!("<enc_rekey> missing <encopt>"))?;
@@ -745,9 +741,7 @@ pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     let mut attrs = node.attrs();
     let call_id = required_string(&mut attrs, "call-id", "waiting_room_update")?;
     let creator = required_jid(&mut attrs, "call-creator", "waiting_room_update")?;
-    attrs
-        .finish()
-        .map_err(|error| anyhow!("<waiting_room_update> attrs: {error}"))?;
+    finish_attrs(&attrs, "waiting_room_update")?;
     let waiting = node
         .get_optional_child("waiting_room")
         .ok_or_else(|| anyhow!("<waiting_room_update> missing <waiting_room>"))?;
@@ -758,6 +752,7 @@ pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     Ok(room)
 }
 
+#[inline(never)]
 fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     if node.tag != "waiting_room" {
         bail!("expected <waiting_room>, got <{}>", node.tag);
@@ -770,20 +765,18 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     let enabled = bool_attr(&mut attrs, "enabled");
     let is_admin = bool_attr(&mut attrs, "is_admin");
     let transaction_id = optional_u32(&mut attrs, "transaction-id", "waiting_room")?;
-    let users = node
-        .children()
-        .unwrap_or_default()
-        .iter()
-        .filter(|child| child.tag.as_ref() == "user")
-        .map(|child| {
-            let mut attrs = child.attrs();
-            Ok(WaitingRoomUser {
-                jid: required_jid(&mut attrs, "jid", "waiting_room user")?,
-                pn: attrs.optional_jid("user_pn"),
-                state: required_string(&mut attrs, "state", "waiting_room user")?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut users = Vec::new();
+    for child in node.children().unwrap_or_default() {
+        if child.tag != "user" {
+            continue;
+        }
+        let mut attrs = child.attrs();
+        users.push(WaitingRoomUser {
+            jid: required_jid(&mut attrs, "jid", "waiting_room user")?,
+            pn: attrs.optional_jid("user_pn"),
+            state: required_string(&mut attrs, "state", "waiting_room user")?,
+        });
+    }
     Ok(WaitingRoom {
         call_id,
         call_creator,
@@ -809,7 +802,7 @@ pub fn build_waiting_room_toggle(
         call_id,
         creator,
         request_id,
-        [("enabled", if enabled { "1" } else { "0" })],
+        &[("enabled", if enabled { "1" } else { "0" })],
         Vec::new(),
     ))
 }
@@ -826,7 +819,7 @@ pub fn build_waiting_room_heartbeat(
         call_id,
         creator,
         request_id,
-        [("type", "waiting_room")],
+        &[("type", "waiting_room")],
         Vec::new(),
     ))
 }
@@ -883,23 +876,23 @@ fn build_waiting_room_user_action(
         call_id,
         creator,
         request_id,
-        [],
+        &[],
         vec![NodeBuilder::new("user").attr("jid", user).build()],
     ))
 }
 
-fn build_waiting_room_request<const N: usize>(
+fn build_waiting_room_request(
     tag: &'static str,
     call_id: &str,
     creator: &Jid,
     request_id: &str,
-    extra_attrs: [(&'static str, &'static str); N],
+    extra_attrs: &[(&'static str, &'static str)],
     children: Vec<Node>,
 ) -> Node {
     let mut action = NodeBuilder::new(tag)
         .attr("call-id", call_id)
         .attr("call-creator", creator);
-    for (name, value) in extra_attrs {
+    for &(name, value) in extra_attrs {
         action = action.attr(name, value);
     }
     if !children.is_empty() {
@@ -943,9 +936,7 @@ pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
     let action = required_string(&mut attrs, "action", "user_action")?;
     let _ = required_string(&mut attrs, "call-id", "user_action")?;
     let _ = required_jid(&mut attrs, "call-creator", "user_action")?;
-    attrs
-        .finish()
-        .map_err(|error| anyhow!("<user_action> attrs: {error}"))?;
+    finish_attrs(&attrs, "user_action")?;
     if action != "raise_hand" {
         bail!("unsupported user action {action:?}");
     }
@@ -1000,9 +991,7 @@ pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
         .map_err(|_| anyhow!("unsupported screen-share state {state_value}"))?;
     let version = required_u32(&mut attrs, "version", "screen_share")?;
     let screen_share_id = optional_u32(&mut attrs, "screen_share_id", "screen_share")?;
-    attrs
-        .finish()
-        .map_err(|error| anyhow!("<screen_share> attrs: {error}"))?;
+    finish_attrs(&attrs, "screen_share")?;
     Ok(ScreenShare {
         state,
         version,
@@ -1070,6 +1059,13 @@ fn parse_call_link_media(value: String) -> Result<CallLinkMedia> {
 
 fn bool_attr(attrs: &mut wacore_binary::AttrParserRef<'_>, name: &str) -> bool {
     attrs.optional_string(name).as_deref() == Some("1")
+}
+
+#[inline(never)]
+fn finish_attrs(attrs: &wacore_binary::AttrParserRef<'_>, tag: &str) -> Result<()> {
+    attrs
+        .finish()
+        .map_err(|error| anyhow!("<{tag}> attrs: {error}"))
 }
 
 fn required_string(

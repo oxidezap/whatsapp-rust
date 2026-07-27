@@ -319,6 +319,16 @@ impl StanzaHandler for CallHandler {
                     #[cfg(feature = "voip-runtime")]
                     match &call.action {
                         CallAction::GroupUpdate { update }
+                            if client.buffer_pending_call_link_update(
+                                update,
+                                &routed_call_sender(&call),
+                            ) =>
+                        {
+                            // A call-link admission can overtake the join task after its ACK wakes.
+                            // Registration consumes this creator-authenticated snapshot atomically.
+                            dispatch_call = false;
+                        }
+                        CallAction::GroupUpdate { update }
                             if !client.call_registry().group_sender_authorized(
                                 &update.call_id,
                                 &update.call_creator,
@@ -1087,6 +1097,7 @@ mod tests {
             vec![GroupCallDevice::new(participant.clone().with_device(2))],
         );
         peer.pn = Some(participant_pn.clone());
+        peer.state = Some("connected".to_string());
         assert_eq!(
             registry.apply_group_update(
                 GroupCallUpdate::builder()

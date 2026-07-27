@@ -3,6 +3,8 @@
 //! Relay credentials and encrypted key payloads are intentionally excluded from
 //! serde output. They are runtime material, not part of the public event surface.
 
+use core::mem::size_of;
+
 use serde::Serialize;
 use wacore_binary::Jid;
 
@@ -54,6 +56,16 @@ impl GroupCallDevice {
     }
 }
 
+impl crate::stats::HeapSize for GroupCallDevice {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        self.jid.heap_bytes()
+            + self.platform.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.capability.heap_bytes()
+    }
+}
+
 /// One user in an authoritative group-call roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -80,6 +92,22 @@ impl GroupCallParticipant {
     }
 }
 
+impl crate::stats::HeapSize for GroupCallParticipant {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        self.jid.heap_bytes()
+            + self.pn.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.state.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self
+                .participant_type
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.devices.capacity() * size_of::<GroupCallDevice>()
+            + self.devices.iter().map(HeapSize::heap_bytes).sum::<usize>()
+    }
+}
+
 /// One address advertised by the shared group relay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -100,6 +128,17 @@ pub struct GroupCallRelayEndpoint {
     pub ipv4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+}
+
+impl crate::stats::HeapSize for GroupCallRelayEndpoint {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        self.relay_name.heap_bytes()
+            + self.domain_name.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.address.heap_bytes()
+            + self.ipv4.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
 }
 
 /// Shared relay allocation embedded in a group snapshot.
@@ -144,6 +183,29 @@ impl core::fmt::Debug for GroupCallRelay {
     }
 }
 
+impl crate::stats::HeapSize for GroupCallRelay {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        fn nested_bytes(values: &[Vec<u8>], capacity: usize) -> usize {
+            capacity * size_of::<Vec<u8>>() + values.iter().map(Vec::capacity).sum::<usize>()
+        }
+
+        self.uuid.heap_bytes()
+            + self.participant_uuid.heap_bytes()
+            + self.key.heap_bytes()
+            + self.hbh_key.heap_bytes()
+            + nested_bytes(&self.tokens, self.tokens.capacity())
+            + nested_bytes(&self.auth_tokens, self.auth_tokens.capacity())
+            + self.endpoints.capacity() * size_of::<GroupCallRelayEndpoint>()
+            + self
+                .endpoints
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+    }
+}
+
 /// One transaction-ordered authoritative group-call snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -161,6 +223,24 @@ pub struct GroupCallUpdate {
     pub participants: Vec<GroupCallParticipant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<GroupCallRelay>,
+}
+
+impl crate::stats::HeapSize for GroupCallUpdate {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+
+        self.call_id.heap_bytes()
+            + self.call_creator.heap_bytes()
+            + self.group_jid.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.media.heap_bytes()
+            + self.participants.capacity() * size_of::<GroupCallParticipant>()
+            + self
+                .participants
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+            + self.relay.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
 }
 
 /// One encrypted keygen-v2 epoch delivered to a participant device.

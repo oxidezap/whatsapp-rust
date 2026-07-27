@@ -934,6 +934,7 @@ impl<'a> CallLinkCall<'a> {
             },
         );
 
+        let mut teardown = None;
         let update = loop {
             let listener = registry
                 .listen_group_update(&join.call_id, generation)
@@ -941,20 +942,29 @@ impl<'a> CallLinkCall<'a> {
             if let Some(update) = registry
                 .group_state_if_current(&join.call_id, generation)
                 .and_then(|state| state.snapshot().cloned())
-                .filter(|update| update.relay.is_some())
             {
-                break update;
+                if update.call_creator != join.call_creator {
+                    return Err(CallError::Response(
+                        "call-link admitted snapshot changed call identity".to_string(),
+                    ));
+                }
+                // Admission has committed this endpoint server-side even when relay material is
+                // delivered by a later snapshot. Arm cleanup at that transition, not after relay,
+                // so cancellation cannot strand the admitted endpoint in the remote roster.
+                teardown.get_or_insert_with(|| {
+                    GroupOfferTeardown::new(self.client, &join.call_id, &join.call_creator)
+                });
+                if update.relay.is_some() {
+                    break update;
+                }
             }
             listener.await;
         };
-        // Admission has committed this endpoint server-side. Keep a call-scoped terminate armed
-        // until the relay driver owns the join, covering setup errors and cancellation.
-        let mut teardown = GroupOfferTeardown::new(self.client, &join.call_id, &join.call_creator);
-        if update.call_creator != join.call_creator {
-            return Err(CallError::Response(
-                "call-link admitted snapshot changed call identity".to_string(),
+        let Some(mut teardown) = teardown else {
+            return Err(CallError::Media(
+                "call-link admission cleanup was not armed",
             ));
-        }
+        };
         let relay = update
             .relay
             .as_ref()
@@ -2931,7 +2941,12 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         client
             .voip()
-            .set_approval_required(&self.call_id, &self.call_creator, enabled)
+            .set_approval_required_for_generation(
+                &self.call_id,
+                &self.call_creator,
+                self.generation,
+                enabled,
+            )
             .await
     }
 
@@ -2941,7 +2956,12 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         client
             .voip()
-            .admit_waiting_user(&self.call_id, &self.call_creator, user)
+            .admit_waiting_user_for_generation(
+                &self.call_id,
+                &self.call_creator,
+                self.generation,
+                user,
+            )
             .await
     }
 
@@ -2951,7 +2971,12 @@ impl CallHandle {
         let client = self.upgrade_client()?;
         client
             .voip()
-            .deny_waiting_user(&self.call_id, &self.call_creator, user)
+            .deny_waiting_user_for_generation(
+                &self.call_id,
+                &self.call_creator,
+                self.generation,
+                user,
+            )
             .await
     }
 
@@ -5796,6 +5821,111 @@ mod tests {
             action.attrs().optional_string("call-id").as_deref(),
             Some(call_id)
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_call_link_after_relayless_admission_terminates_the_call_scope() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+        let call_id = "RELAYLESS-ADMISSION";
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let join_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let start_client = client.clone();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+        let start = tokio::spawn(async move {
+            start_client
+                .voip()
+                .call_link("TEST-CALL-LINK", CallLinkMedia::Audio)
+                .audio(mic_rx, speaker_tx)
+                .start()
+                .await
+        });
+        let request = join_sent.await.expect("call-link join request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &wacore_binary::builder::NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .attr("id", request_id.as_str())
+                .children([wacore_binary::builder::NodeBuilder::new("waiting_room")
+                    .attr("call-id", call_id)
+                    .attr("call-creator", creator.clone())
+                    .attr("link-token", "TEST-CALL-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "1")
+                    .build()])
+                .build(),
+        )
+        .await;
+
+        let generation = loop {
+            if let Some(generation) = client.call_registry().generation_of(call_id) {
+                break generation;
+            }
+            tokio::task::yield_now().await;
+        };
+        let mut participant = GroupCallParticipant::new(
+            creator.clone(),
+            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        );
+        participant.state = Some("connected".to_string());
+        assert_eq!(
+            client.call_registry().apply_group_update(
+                GroupCallUpdate::builder()
+                    .call_id(call_id.to_string())
+                    .call_creator(creator.clone())
+                    .transaction_id(2)
+                    .media("audio".to_string())
+                    .connected_limit(32)
+                    .joinable(true)
+                    .av_upgradable(true)
+                    .rekey_requested(false)
+                    .participants(vec![participant])
+                    .build(),
+            ),
+            wacore::voip::GroupStateApply::Applied
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, generation),
+            Some(CallPhase::Connecting)
+        );
+
+        let terminate_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        start.abort();
+        match start.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("call-link start must be cancelled"),
+        }
+        let terminate = tokio::time::timeout(Duration::from_secs(2), terminate_sent)
+            .await
+            .expect("admitted cancellation must send terminate")
+            .expect("terminate stanza");
+        let terminate_ref = terminate.as_node_ref();
+        let action = &terminate_ref.children().expect("terminate action")[0];
+        assert_eq!(action.tag.as_ref(), "terminate");
+        assert_eq!(
+            action.attrs().optional_string("call-id").as_deref(),
+            Some(call_id)
+        );
+        assert_eq!(client.call_registry().generation_of(call_id), None);
     }
 
     #[tokio::test]

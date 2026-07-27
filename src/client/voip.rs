@@ -2,6 +2,8 @@
 //! core; the high-level call/accept flows, including their signaling, need the `voip` feature.
 
 #[cfg(feature = "voip-runtime")]
+use std::mem::size_of;
+#[cfg(feature = "voip-runtime")]
 use std::sync::Arc;
 #[cfg(feature = "voip-runtime")]
 use std::time::Duration;
@@ -23,7 +25,8 @@ use wacore::types::call::CallAction;
 use wacore::types::call::IncomingCall;
 #[cfg(feature = "voip-runtime")]
 use wacore::types::group_call::{
-    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, ScreenShare, ScreenShareState,
+    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallUpdate, ScreenShare,
+    ScreenShareState,
 };
 #[cfg(feature = "voip-runtime")]
 use wacore::voip::{AudioFormat, CallEvent, CallPhase, CallSession, VideoControl};
@@ -56,6 +59,61 @@ struct CallLinkRegistrationGuard {
     call_id: String,
     generation: u64,
     armed: bool,
+}
+
+#[cfg(feature = "voip-runtime")]
+#[derive(Clone, Copy)]
+enum WaitingRoomUserAction {
+    Admit,
+    Deny,
+}
+
+#[cfg(feature = "voip-runtime")]
+#[derive(Default)]
+pub(super) struct PendingCallLinkJoins {
+    active: usize,
+    updates: std::collections::HashMap<String, GroupCallUpdate>,
+}
+
+#[cfg(feature = "voip-runtime")]
+impl PendingCallLinkJoins {
+    pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
+        use wacore::stats::HeapSize;
+
+        let bytes = self
+            .updates
+            .iter()
+            .map(|(call_id, update)| {
+                size_of::<String>()
+                    + call_id.heap_bytes()
+                    + size_of::<GroupCallUpdate>()
+                    + update.heap_bytes()
+            })
+            .sum::<usize>();
+        wacore::stats::CollectionStats::new(
+            self.updates.len().try_into().unwrap_or(u64::MAX),
+            bytes.try_into().unwrap_or(u64::MAX),
+        )
+    }
+}
+
+#[cfg(feature = "voip-runtime")]
+struct PendingCallLinkJoinGuard {
+    state: Arc<std::sync::Mutex<PendingCallLinkJoins>>,
+}
+
+#[cfg(feature = "voip-runtime")]
+impl Drop for PendingCallLinkJoinGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            state.updates.clear();
+        }
+    }
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -96,6 +154,83 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
         self.call_registry.clone()
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn begin_call_link_join(&self) -> PendingCallLinkJoinGuard {
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = state.active.saturating_add(1);
+        drop(state);
+        PendingCallLinkJoinGuard {
+            state: self.pending_call_link_joins.clone(),
+        }
+    }
+
+    /// Buffer a creator-authenticated admission snapshot while its link-join ACK is being
+    /// registered. The pending-state lock is shared with registration, closing both orderings of
+    /// the ACK/update race without accepting arbitrary unknown calls.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) fn buffer_pending_call_link_update(
+        &self,
+        update: &GroupCallUpdate,
+        sender: &Jid,
+    ) -> bool {
+        const MAX_BUFFERED_UPDATES: usize = 32;
+
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .call_registry
+            .group_sender_authorized(&update.call_id, &update.call_creator, sender)
+        {
+            return false;
+        }
+        if state.active == 0
+            || update.call_id.is_empty()
+            || sender.to_non_ad() != update.call_creator.to_non_ad()
+        {
+            return false;
+        }
+        if let Some(current) = state.updates.get(&update.call_id)
+            && current.transaction_id >= update.transaction_id
+        {
+            return true;
+        }
+        if state.updates.len() >= MAX_BUFFERED_UPDATES
+            && !state.updates.contains_key(&update.call_id)
+        {
+            return false;
+        }
+        state.updates.insert(update.call_id.clone(), update.clone());
+        true
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn register_call_link_session(
+        &self,
+        session: CallSession,
+        expected_media: CallLinkMedia,
+    ) -> u64 {
+        let call_id = session.call_id.clone();
+        let call_creator = session.call_creator.clone();
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = self.call_registry.insert(session);
+        let staged = state.updates.remove(&call_id).filter(|update| {
+            update.call_creator == call_creator && update.media == expected_media.as_str()
+        });
+        drop(state);
+        if let Some(update) = staged {
+            self.call_registry.apply_group_update(update);
+        }
+        generation
     }
 
     /// Lock the striped answer-transition lane for `call_id`. Incoming answer registration and
@@ -376,6 +511,7 @@ impl Voip<'_> {
             crate::voip::facade::offer_capability(media == CallLinkMedia::Video, audio_format);
         let request = build_call_link_join_with_capability(&token, media, &request_id, capability)
             .map_err(|error| CallError::Response(error.to_string()))?;
+        let _pending_join = self.client.begin_call_link_join();
         let mut join = execute_call_service_request(
             self.client,
             &request_id,
@@ -410,7 +546,7 @@ impl Voip<'_> {
             CallPhase::Connecting
         });
         let registry = self.client.call_registry();
-        let generation = registry.insert(session);
+        let generation = self.client.register_call_link_session(session, media);
         let mut registration =
             CallLinkRegistrationGuard::new(registry.clone(), &join.call_id, generation);
 
@@ -426,7 +562,19 @@ impl Voip<'_> {
             ));
         }
 
-        if join.in_waiting_room {
+        let still_waiting =
+            registry.phase_if_current(&join.call_id, generation) == Some(CallPhase::WaitingRoom);
+        let current_update = registry
+            .group_state_if_current(&join.call_id, generation)
+            .and_then(|state| state.snapshot().cloned());
+        if !still_waiting {
+            join.in_waiting_room = false;
+            if current_update.is_some() {
+                join.group.clone_from(&current_update);
+            }
+        }
+
+        if still_waiting {
             self.waiting_room_heartbeat(&join.call_id, &join.call_creator)
                 .await?;
             self.start_waiting_room_heartbeat(
@@ -434,7 +582,7 @@ impl Voip<'_> {
                 join.call_creator.clone(),
                 generation,
             );
-        } else if let Some(update) = join.group.as_ref()
+        } else if let Some(update) = current_update.as_ref()
             && update.rekey_requested
         {
             crate::voip::facade::fanout_group_epoch(self.client, update)
@@ -476,6 +624,18 @@ impl Voip<'_> {
             .call_registry()
             .generation_of(call_id)
             .ok_or(CallError::Media("call is no longer active"))?;
+        self.set_approval_required_for_generation(call_id, call_creator, generation, enabled)
+            .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn set_approval_required_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
+        enabled: bool,
+    ) -> Result<(), CallError> {
         self.ensure_waiting_room_admin_if_current(call_id, generation)?;
         let request_id = self.client.generate_request_id();
         execute_call_service_request(
@@ -522,14 +682,29 @@ impl Voip<'_> {
         call_creator: &Jid,
         user: &Jid,
     ) -> Result<(), CallError> {
-        self.ensure_waiting_room_admin(call_id)?;
-        let request_id = self.client.generate_request_id();
-        execute_call_service_request(
-            self.client,
-            &request_id,
-            build_waiting_room_admit(call_id, call_creator, user, &request_id)
-                .map_err(|error| CallError::Response(error.to_string()))?,
-            parse_waiting_room_admit_ack,
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.admit_waiting_user_for_generation(call_id, call_creator, generation, user)
+            .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn admit_waiting_user_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
+        user: &Jid,
+    ) -> Result<(), CallError> {
+        self.waiting_room_user_action_for_generation(
+            call_id,
+            call_creator,
+            generation,
+            user,
+            WaitingRoomUserAction::Admit,
         )
         .await
     }
@@ -542,16 +717,70 @@ impl Voip<'_> {
         call_creator: &Jid,
         user: &Jid,
     ) -> Result<(), CallError> {
-        self.ensure_waiting_room_admin(call_id)?;
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.deny_waiting_user_for_generation(call_id, call_creator, generation, user)
+            .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn deny_waiting_user_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
+        user: &Jid,
+    ) -> Result<(), CallError> {
+        self.waiting_room_user_action_for_generation(
+            call_id,
+            call_creator,
+            generation,
+            user,
+            WaitingRoomUserAction::Deny,
+        )
+        .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    async fn waiting_room_user_action_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
+        user: &Jid,
+        action: WaitingRoomUserAction,
+    ) -> Result<(), CallError> {
+        self.ensure_waiting_room_admin_if_current(call_id, generation)?;
         let request_id = self.client.generate_request_id();
+        let (request, parse) = match action {
+            WaitingRoomUserAction::Admit => (
+                build_waiting_room_admit(call_id, call_creator, user, &request_id),
+                parse_waiting_room_admit_ack
+                    as fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<()>,
+            ),
+            WaitingRoomUserAction::Deny => (
+                build_waiting_room_deny(call_id, call_creator, user, &request_id),
+                parse_waiting_room_deny_ack
+                    as fn(&wacore_binary::NodeRef<'_>) -> anyhow::Result<()>,
+            ),
+        };
         execute_call_service_request(
             self.client,
             &request_id,
-            build_waiting_room_deny(call_id, call_creator, user, &request_id)
-                .map_err(|error| CallError::Response(error.to_string()))?,
-            parse_waiting_room_deny_ack,
+            request.map_err(|error| CallError::Response(error.to_string()))?,
+            parse,
         )
-        .await
+        .await?;
+        if self.client.call_registry().is_current(call_id, generation) {
+            Ok(())
+        } else {
+            Err(CallError::Media(
+                "call was replaced while applying group control",
+            ))
+        }
     }
 
     /// Publish the local persistent raise/lower-hand state.
@@ -717,16 +946,6 @@ impl Voip<'_> {
         }
         self.client.send_node(node).await?;
         Ok(())
-    }
-
-    #[cfg(feature = "voip-runtime")]
-    fn ensure_waiting_room_admin(&self, call_id: &str) -> Result<(), CallError> {
-        let generation = self
-            .client
-            .call_registry()
-            .generation_of(call_id)
-            .ok_or(CallError::Media("call is no longer active"))?;
-        self.ensure_waiting_room_admin_if_current(call_id, generation)
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -930,6 +1149,8 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
 
+    #[cfg(feature = "voip-runtime")]
+    use super::WaitingRoomUserAction;
     #[cfg(feature = "voip-runtime")]
     use crate::client::CallError;
     use crate::client::Client;
@@ -1621,6 +1842,180 @@ mod tests {
             "the stale ACK must not synthesize waiting-room state on the replacement"
         );
         registry.remove_if_current(call_id, replacement);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn waiting_room_user_acks_are_bound_to_the_originating_generation() {
+        let user = Jid::new("444444444444444", Server::Lid);
+        for (index, action) in [WaitingRoomUserAction::Admit, WaitingRoomUserAction::Deny]
+            .into_iter()
+            .enumerate()
+        {
+            let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+            let call_id = format!("TEST-WAITING-ACTION-{index}");
+            let creator = Jid::new("333333333333333", Server::Lid);
+            let registry = client.call_registry();
+            let first = registry.insert(CallSession::new_outgoing(
+                &call_id,
+                Jid::new(&call_id, Server::Call),
+                creator.clone(),
+            ));
+            assert_eq!(
+                registry.apply_waiting_room(
+                    wacore::types::group_call::WaitingRoom::builder()
+                        .call_id(call_id.clone())
+                        .call_creator(creator.clone())
+                        .link_token("TEST-CALL-LINK".to_string())
+                        .media(CallLinkMedia::Audio)
+                        .enabled(true)
+                        .is_admin(true)
+                        .transaction_id(1)
+                        .users(Vec::new())
+                        .build(),
+                ),
+                wacore::voip::GroupStateApply::Applied
+            );
+
+            let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+            let request_client = client.clone();
+            let request_call_id = call_id.clone();
+            let request_creator = creator.clone();
+            let request_user = user.clone();
+            let control = tokio::spawn(async move {
+                match action {
+                    WaitingRoomUserAction::Admit => {
+                        request_client
+                            .voip()
+                            .admit_waiting_user_for_generation(
+                                &request_call_id,
+                                &request_creator,
+                                first,
+                                &request_user,
+                            )
+                            .await
+                    }
+                    WaitingRoomUserAction::Deny => {
+                        request_client
+                            .voip()
+                            .deny_waiting_user_for_generation(
+                                &request_call_id,
+                                &request_creator,
+                                first,
+                                &request_user,
+                            )
+                            .await
+                    }
+                }
+            });
+            let request = sent.await.expect("waiting-room user request");
+            let request_id = request
+                .as_node_ref()
+                .attrs()
+                .optional_string("id")
+                .expect("request id")
+                .into_owned();
+
+            let replacement = registry.insert(CallSession::new_outgoing(
+                &call_id,
+                Jid::new(&call_id, Server::Call),
+                creator,
+            ));
+            assert_ne!(replacement, first);
+            let action_type = match action {
+                WaitingRoomUserAction::Admit => "waiting_room_admit",
+                WaitingRoomUserAction::Deny => "waiting_room_deny",
+            };
+            crate::test_utils::answer_iq(
+                &client,
+                &request_id,
+                &NodeBuilder::new("ack")
+                    .attr("class", "call")
+                    .attr("type", action_type)
+                    .attr("id", request_id.as_str())
+                    .build(),
+            )
+            .await;
+
+            assert!(matches!(
+                control.await.expect("waiting-room control task"),
+                Err(CallError::Media(
+                    "call was replaced while applying group control"
+                ))
+            ));
+            registry.remove_if_current(&call_id, replacement);
+        }
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_admission_is_buffered_until_ack_registration() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "BUFFERED-ADMISSION";
+        let mut participant = GroupCallParticipant::new(
+            creator.clone(),
+            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        );
+        participant.state = Some("connected".to_string());
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(8)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .build();
+
+        let pending = client.begin_call_link_join();
+        assert!(
+            client.buffer_pending_call_link_update(&update, &creator.clone().with_device(1)),
+            "the creator's admission update must survive until the ACK registers its call id"
+        );
+        assert!(
+            !client.buffer_pending_call_link_update(
+                &update,
+                &Jid::new("999999999999999", Server::Lid)
+            ),
+            "an unrelated sender cannot populate the pre-registration buffer"
+        );
+        let pending_memory = client.memory_report().await.pending_call_link_updates;
+        assert_eq!(pending_memory.entries, 1);
+        assert!(pending_memory.bytes > 0);
+
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::WaitingRoom);
+        let generation = client.register_call_link_session(session, CallLinkMedia::Audio);
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, generation),
+            Some(CallPhase::Connecting),
+            "consuming the buffered admission must perform the waiting-room transition"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| { state.snapshot().map(|snapshot| snapshot.transaction_id) }),
+            Some(8)
+        );
+        assert_eq!(
+            client
+                .memory_report()
+                .await
+                .pending_call_link_updates
+                .entries,
+            0
+        );
+
+        drop(pending);
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-runtime")]

@@ -303,6 +303,9 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
+    /// Admission snapshots retained while a call-link join ACK is in flight.
+    #[cfg(feature = "voip-runtime")]
+    pub pending_call_link_updates: CollectionStats,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -348,6 +351,8 @@ impl MemoryReport {
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
+        #[cfg(feature = "voip-runtime")]
+        let total = total.saturating_add(self.pending_call_link_updates.bytes);
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -422,6 +427,11 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Signal store caches ---")?;
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
+        }
+        #[cfg(feature = "voip-runtime")]
+        {
+            writeln!(f, "--- In-flight VoIP signaling ---")?;
+            line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
         }
         writeln!(f, "--- In-flight history sync ---")?;
         line(
@@ -1333,6 +1343,11 @@ pub struct Client {
     /// `voip` feature: it is populated only by the `voip` media facade.
     #[cfg(feature = "voip-runtime")]
     pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
+
+    /// Admission snapshots that can race a call-link join ACK before its call id is registered.
+    /// Kept beside the client-side join lifecycle so `wacore` does not authorize unknown calls.
+    #[cfg(feature = "voip-runtime")]
+    pending_call_link_joins: Arc<std::sync::Mutex<voip::PendingCallLinkJoins>>,
 
     /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
     /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
