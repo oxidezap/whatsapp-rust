@@ -4687,6 +4687,63 @@ async fn an_early_aliased_receipt_files_against_the_existing_thread() {
     );
 }
 
+/// The other half of the waiting receipt's lifecycle. Satellite pruning has
+/// exactly two triggers, `DeleteChatUpdate` and `ClearChatUpdate` — both the
+/// user removing the conversation, and neither periodic — so a receipt waiting
+/// for its message is only collected when the user throws the chat away, which
+/// is the one case where dropping it is right.
+#[tokio::test]
+async fn clearing_a_chat_collects_a_receipt_still_waiting_for_its_message() {
+    let (_store, chat_store) = test_store().await;
+    let peer = jid(PEER);
+
+    feed(
+        &chat_store,
+        [peer_receipt(
+            peer.clone(),
+            vec!["OUT-DM-PENDING"],
+            ReceiptType::Delivered,
+            1_700_000_200,
+        )],
+    )
+    .await;
+    assert_eq!(
+        chat_store
+            .receipts(&peer, "OUT-DM-PENDING")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "waiting for its message"
+    );
+
+    feed(
+        &chat_store,
+        [Event::ClearChatUpdate(
+            wacore::types::events::ClearChatUpdate::builder()
+                .jid(peer.clone())
+                .delete_starred(true)
+                .delete_media(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::ClearChatAction {
+                    message_range: None.into(),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    assert!(
+        chat_store
+            .receipts(&peer, "OUT-DM-PENDING")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the user cleared the chat, so the pending receipt goes with it"
+    );
+}
+
 /// A self receipt carrying a device must recount the real thread instead of
 /// materializing a twin of it.
 #[tokio::test]
