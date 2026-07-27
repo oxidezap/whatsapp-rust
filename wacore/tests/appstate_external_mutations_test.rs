@@ -238,8 +238,11 @@ fn test_external_mutations_decode_from_syncd_mutations() {
     );
 }
 
+/// `has_missing_remove` is telemetry about the ltHash arithmetic, not a licence
+/// to skip a comparison. A `snapshotMac` mismatch is reported as divergence
+/// either way — the flag must not change the verdict in either direction.
 #[test]
-fn test_validate_patch_macs_rejects_on_has_missing_remove() {
+fn test_validate_patch_macs_reports_divergence_regardless_of_has_missing_remove() {
     let master_key = [7u8; 32];
     let keys = expand_app_state_keys(&master_key);
     let key_id = b"test_key";
@@ -262,18 +265,21 @@ fn test_validate_patch_macs_rejects_on_has_missing_remove() {
         ..Default::default()
     };
 
-    let result_without_flag =
-        validate_patch_macs(&patch, &state, &keys, collection_name, false, false);
-    assert!(
-        result_without_flag.is_err(),
-        "Should fail MAC validation without has_missing_remove"
-    );
-
-    let result_with_flag = validate_patch_macs(&patch, &state, &keys, collection_name, false, true);
-    assert!(
-        result_with_flag.is_err(),
-        "Should reject MAC mismatch even with has_missing_remove=true"
-    );
+    for has_missing_remove in [false, true] {
+        let verdict = validate_patch_macs(
+            &patch,
+            &state,
+            &keys,
+            collection_name,
+            false,
+            has_missing_remove,
+        )
+        .expect("a snapshotMAC mismatch is divergence, not a rejected patch");
+        assert!(
+            verdict.snapshot_mac_diverged,
+            "divergence must be reported with has_missing_remove={has_missing_remove}"
+        );
+    }
 }
 
 #[test]
