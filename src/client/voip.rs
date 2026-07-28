@@ -203,6 +203,21 @@ impl PendingCallLinkJoins {
             .retain(|retained| *retained == fingerprint);
     }
 
+    fn prepare_bound_retry(&mut self, call_id: &str) -> bool {
+        if !self.untracked_saturation || self.bound_call_id.as_deref() != Some(call_id) {
+            return false;
+        }
+        // The first ACK gives the provisional buffer an exact identity. When unrelated traffic
+        // exhausted even the overflow fingerprints, retry the join from that bound state instead
+        // of either failing the valid call or silently ignoring a possibly dropped transition.
+        // The refreshed ACK is the new authoritative floor; controls racing the retry are retained
+        // only for this call id and replayed after it.
+        self.transitions.clear();
+        self.saturation_fingerprints.clear();
+        self.untracked_saturation = false;
+        true
+    }
+
     fn is_saturated(&self, call_id: &str) -> bool {
         self.untracked_saturation
             || self
@@ -243,8 +258,9 @@ impl PendingCallLinkJoins {
             // admission state was dropped without letting unrelated saturation poison it.
             self.saturation_fingerprints.push(fingerprint);
         } else {
-            // If even the bounded fingerprint reserve is exhausted, fail closed. Silently
-            // registering without a potentially dropped admission/rekey transition is unsafe.
+            // If even the bounded fingerprint reserve is exhausted, remember that exact
+            // membership is ambiguous. Once the ACK binds a call id, the join path refreshes its
+            // authoritative state before registration instead of guessing or failing another id.
             self.untracked_saturation = true;
         }
     }
@@ -395,6 +411,15 @@ impl Client {
         if state.active != 0 {
             state.bind_call_id(&call_id);
         }
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn prepare_pending_call_link_join_retry(&self, call_id: &str) -> bool {
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.prepare_bound_retry(call_id)
     }
 
     /// Buffer a creator-authenticated admission snapshot while its link-join ACK is being
@@ -1099,17 +1124,11 @@ impl Voip<'_> {
         let _pending_join_lane = self.client.pending_call_link_join_lane.lock().await;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
-        let request_id = self.client.generate_request_id();
         let capability =
             crate::voip::facade::offer_capability(media == CallLinkMedia::Video, audio_format);
-        let request = build_call_link_join_with_capability(&token, media, &request_id, capability)
-            .map_err(|error| CallError::Response(error.to_string()))?;
         let _pending_join = self.client.begin_call_link_join();
         let mut join =
-            execute_call_service_request(self.client, &request_id, request, |response| {
-                parse_call_link_join_ack(response, &token)
-            })
-            .await?;
+            execute_call_link_join_request(self.client, &token, media, capability).await?;
         if join.media != media {
             return Err(CallError::Response(
                 "call-link response changed the requested media mode".to_string(),
@@ -1117,6 +1136,24 @@ impl Voip<'_> {
         }
         if join.call_id.is_empty() {
             return Err(CallError::EmptyCallId);
+        }
+        if self
+            .client
+            .prepare_pending_call_link_join_retry(&join.call_id)
+        {
+            let first_call_id = join.call_id.clone();
+            let first_call_creator = join.call_creator.clone();
+            let refreshed =
+                execute_call_link_join_request(self.client, &token, media, capability).await?;
+            if refreshed.media != media
+                || refreshed.call_id != first_call_id
+                || refreshed.call_creator != first_call_creator
+            {
+                return Err(CallError::Response(
+                    "call-link identity changed while refreshing admission state".to_string(),
+                ));
+            }
+            join = refreshed;
         }
 
         let mut session = CallSession::new_outgoing(
@@ -1753,6 +1790,23 @@ fn normalize_call_link_token(
 }
 
 #[cfg(feature = "voip-runtime")]
+#[inline(never)]
+async fn execute_call_link_join_request(
+    client: &Client,
+    token: &str,
+    media: CallLinkMedia,
+    capability: &[u8],
+) -> Result<CallLinkJoin, CallError> {
+    let request_id = client.generate_request_id();
+    let request = build_call_link_join_with_capability(token, media, &request_id, capability)
+        .map_err(|error| CallError::Response(error.to_string()))?;
+    execute_call_service_request(client, &request_id, request, |response| {
+        parse_call_link_join_ack(response, token)
+    })
+    .await
+}
+
+#[cfg(feature = "voip-runtime")]
 async fn execute_call_service_request<T>(
     client: &Client,
     request_id: &str,
@@ -1811,8 +1865,8 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     use super::{
-        MAX_PENDING_CALL_LINK_TRANSITION_BYTES, MAX_PENDING_CALL_LINK_TRANSITIONS,
-        WaitingRoomUserAction,
+        MAX_PENDING_CALL_LINK_SATURATION_FINGERPRINTS, MAX_PENDING_CALL_LINK_TRANSITION_BYTES,
+        MAX_PENDING_CALL_LINK_TRANSITIONS, WaitingRoomUserAction,
     };
     use crate::client::Client;
     #[cfg(feature = "voip-runtime")]
@@ -3471,8 +3525,19 @@ mod tests {
         let unrelated_creator = Jid::new("333333333333333", Server::Lid);
         let unrelated_sender = unrelated_creator.clone().with_device(1);
         let _pending = client.begin_call_link_join();
-        let oversized = GroupCallUpdate::builder()
-            .call_id("UNRELATED-SATURATED-CALL".to_string())
+        for index in 0..MAX_PENDING_CALL_LINK_TRANSITIONS {
+            assert!(
+                client
+                    .buffer_pending_call_link_terminate(
+                        &format!("UNRELATED-{index}"),
+                        &unrelated_creator,
+                        &unrelated_sender,
+                    )
+                    .suppresses_dispatch()
+            );
+        }
+        let mut oversized = GroupCallUpdate::builder()
+            .call_id("UNRELATED-SATURATED-CALL-0".to_string())
             .call_creator(unrelated_creator.clone())
             .transaction_id(1)
             .media("audio".to_string())
@@ -3488,21 +3553,12 @@ mod tests {
                 ],
             )])
             .build();
-        assert_eq!(
-            client.buffer_pending_call_link_update(&oversized, &unrelated_sender),
-            PendingCallLinkBuffer::Saturated
-        );
-        for index in 0..MAX_PENDING_CALL_LINK_TRANSITIONS {
-            let creator = Jid::new(format!("55555555555{index:04}"), Server::Lid);
-            let sender = creator.clone().with_device(1);
-            assert!(
-                client
-                    .buffer_pending_call_link_terminate(
-                        &format!("UNRELATED-{index}"),
-                        &creator,
-                        &sender,
-                    )
-                    .suppresses_dispatch()
+        for index in 0..=MAX_PENDING_CALL_LINK_SATURATION_FINGERPRINTS {
+            oversized.call_id = format!("UNRELATED-SATURATED-CALL-{index}");
+            assert_eq!(
+                client.buffer_pending_call_link_update(&oversized, &unrelated_sender),
+                PendingCallLinkBuffer::Saturated,
+                "every oversized unrelated identity must remain handled locally"
             );
         }
 
@@ -3516,6 +3572,10 @@ mod tests {
                 .build()])
             .build();
         client.bind_pending_call_link_join_ack(&ack.as_node_ref());
+        assert!(
+            client.prepare_pending_call_link_join_retry(call_id),
+            "exhausted pre-ACK identity metadata requires one exact-call refresh"
+        );
         assert_eq!(
             client
                 .memory_report()
@@ -3577,6 +3637,142 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn ambiguous_pre_ack_saturation_retries_after_binding_the_exact_call_id() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let sender = creator.clone().with_device(1);
+        let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let join_client = client.clone();
+        let join = tokio::spawn(async move {
+            join_client
+                .voip()
+                .join_call_link_registration_with_audio(
+                    "RETRIED-CALL-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        let first_request = sent.await.expect("initial link_join request");
+
+        for index in 0..MAX_PENDING_CALL_LINK_TRANSITIONS {
+            assert_eq!(
+                client.buffer_pending_call_link_terminate(
+                    &format!("UNRELATED-FILLED-{index}"),
+                    &creator,
+                    &sender,
+                ),
+                PendingCallLinkBuffer::Buffered
+            );
+        }
+        let mut oversized = GroupCallUpdate::builder()
+            .call_id("UNRELATED-OVERFLOW-0".to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                creator.clone(),
+                vec![
+                    GroupCallDevice::new(sender.clone())
+                        .with_capability(1, vec![7; MAX_PENDING_CALL_LINK_TRANSITION_BYTES]),
+                ],
+            )])
+            .build();
+        for index in 0..=MAX_PENDING_CALL_LINK_SATURATION_FINGERPRINTS {
+            oversized.call_id = format!("UNRELATED-OVERFLOW-{index}");
+            assert_eq!(
+                client.buffer_pending_call_link_update(&oversized, &sender),
+                PendingCallLinkBuffer::Saturated
+            );
+        }
+
+        let first_request_id = first_request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("initial request id")
+            .into_owned();
+        let refreshed_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        crate::test_utils::answer_iq(
+            &client,
+            &first_request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .attr("id", first_request_id.as_str())
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "RETRIED-CALL-ID")
+                    .attr("call-creator", creator.clone())
+                    .attr("link-token", "RETRIED-CALL-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "1")
+                    .build()])
+                .build(),
+        )
+        .await;
+        let refreshed_request = refreshed_sent.await.expect("refreshed link_join request");
+        assert_eq!(
+            refreshed_request
+                .as_node_ref()
+                .children()
+                .expect("refreshed request action")[0]
+                .tag,
+            "link_join"
+        );
+        let refreshed_request_id = refreshed_request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("refreshed request id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &refreshed_request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .attr("id", refreshed_request_id.as_str())
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "RETRIED-CALL-ID")
+                    .attr("call-creator", creator)
+                    .attr("link-token", "RETRIED-CALL-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "2")
+                    .build()])
+                .build(),
+        )
+        .await;
+        let registration = join
+            .await
+            .expect("join task")
+            .expect("an unrelated overflow must recover through the bound retry");
+        assert_eq!(registration.join.call_id, "RETRIED-CALL-ID");
+        assert!(
+            client
+                .call_registry()
+                .is_current("RETRIED-CALL-ID", registration.generation)
+        );
+        client
+            .call_registry()
+            .remove_if_current("RETRIED-CALL-ID", registration.generation);
     }
 
     #[cfg(feature = "voip-runtime")]
