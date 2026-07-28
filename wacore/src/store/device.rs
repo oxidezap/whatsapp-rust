@@ -234,12 +234,21 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
 /// The four fields are one decision over there — a single variable drives
 /// `require_full_sync` and the days limit, and the same `isWindows` picks the
 /// platform type and `on_demand_ready` — so they may not be set independently
-/// here without producing a shape neither row can explain.
+/// here without producing a sync shape neither row can explain.
 ///
-/// The default mirrors the browser row: a companion that always asks for a full
-/// backfill is asking for more than the client it claims to be, and it does so
-/// in the registration payload. Embedders that genuinely want the backfill opt
-/// in through [`DevicePropsOverride::with_require_full_sync`].
+/// The sync fields below take the browser row: a companion that always asks for
+/// a full backfill is asking for more than the client it claims to be, and it
+/// does so in the registration payload. Embedders who genuinely want the
+/// backfill opt in through [`DevicePropsOverride::with_require_full_sync`],
+/// which rebuilds the `win_hybrid` row.
+///
+/// The identity fields do *not* follow either row: `os` is `"rust"` and
+/// `platform_type` is `UNKNOWN`, which is neither a browser nor `UWP`. That is
+/// deliberate — the library does not impersonate a specific client by default,
+/// and an embedder that wants one sets both through
+/// [`DevicePropsOverride`]. Pairing a real identity with the sync row that
+/// belongs to it is the embedder's call; the table is what makes the pairs
+/// legible.
 pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
     os: Some("rust".to_string()),
     version: buffa::MessageField::some(wa::device_props::AppVersion {
