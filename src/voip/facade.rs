@@ -6609,10 +6609,11 @@ mod tests {
     #[tokio::test]
     async fn cancelling_call_link_after_relayless_admission_terminates_the_call_scope() {
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
         client
             .persistence_manager()
             .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
-                Jid::new("111111111111111", Server::Lid).with_device(1),
+                own_lid.clone(),
             )))
             .await;
         let call_id = "RELAYLESS-ADMISSION";
@@ -6662,10 +6663,8 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
-        let mut participant = GroupCallParticipant::new(
-            creator.clone(),
-            vec![GroupCallDevice::new(creator.clone().with_device(1))],
-        );
+        let mut participant =
+            GroupCallParticipant::new(own_lid.to_non_ad(), vec![GroupCallDevice::new(own_lid)]);
         participant.state = Some("connected".to_string());
         assert_eq!(
             client.call_registry().apply_group_update(

@@ -637,9 +637,17 @@ impl CallRegistry {
             else {
                 return GroupStateApply::UnknownCall;
             };
+            let local_member = entry
+                .group_invite_self_device
+                .as_ref()
+                .is_some_and(|device| {
+                    Self::group_update_contains_connected_device(&update, &device.jid)
+                });
             let applied = entry.group_mut().apply_update(update);
             let admitted = applied == GroupStateApply::Applied
-                && entry.session.phase() == CallPhase::WaitingRoom;
+                && entry.is_call_link
+                && entry.session.phase() == CallPhase::WaitingRoom
+                && local_member;
             if admitted {
                 let _ = entry.session.transition_to(CallPhase::Connecting);
             }
@@ -661,6 +669,16 @@ impl CallRegistry {
             event.notify(usize::MAX);
         }
         applied
+    }
+
+    fn group_update_contains_connected_device(update: &GroupCallUpdate, device: &Jid) -> bool {
+        update.participants.iter().any(|participant| {
+            participant.is_connected()
+                && participant
+                    .devices
+                    .iter()
+                    .any(|candidate| candidate.jid.device_eq(device))
+        })
     }
 
     /// Atomically apply a newer waiting-room snapshot to an active call-link call.
@@ -1242,22 +1260,46 @@ impl CallRegistry {
             .map(|entry| entry.group_update_event.listen())
     }
 
-    /// Seed the local active device used when an established 1:1 call becomes ad-hoc group media.
+    /// Seed the local active device used for group media and call-link admission.
     pub fn set_group_invite_self_device(
         &self,
         call_id: &str,
         generation: u64,
         device: GroupCallDevice,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get_mut(call_id)
-            .filter(|entry| entry.generation == generation)
-            .is_some_and(|entry| {
-                entry.group_invite_self_device = Some(device);
-                true
-            })
+        let (waiting_room_task, event) = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let Some(entry) = map
+                .get_mut(call_id)
+                .filter(|entry| entry.generation == generation)
+            else {
+                return false;
+            };
+            let admitted = entry.is_call_link
+                && entry.session.phase() == CallPhase::WaitingRoom
+                && entry.group.as_ref().is_some_and(|state| {
+                    state.snapshot().is_some_and(|update| {
+                        Self::group_update_contains_connected_device(update, &device.jid)
+                    })
+                });
+            entry.group_invite_self_device = Some(device);
+            if admitted {
+                let _ = entry.session.transition_to(CallPhase::Connecting);
+            }
+            (
+                if admitted {
+                    entry.waiting_room_task.take()
+                } else {
+                    None
+                },
+                admitted.then(|| entry.group_update_event.clone()),
+            )
+        };
+        drop(waiting_room_task);
+        if let Some(event) = event {
+            event.notify(usize::MAX);
+        }
+        true
     }
 
     /// Record the peer device and capability selected by preaccept/accept signaling.
@@ -1301,6 +1343,38 @@ impl CallRegistry {
                     return false;
                 }
                 entry.group_invite_peer_device = device;
+                entry.group_invite_peer_selected = true;
+                true
+            })
+    }
+
+    /// Select an accepting device that omitted capability signaling.
+    ///
+    /// Capability retained from a preaccept belongs to the accepting device only when their exact
+    /// device JIDs match. A sibling accept clears it so promotion cannot borrow another device's
+    /// keys or feature advertisement.
+    pub fn select_group_invite_peer_without_capability(
+        &self,
+        call_id: &str,
+        generation: u64,
+        accepting_device: &Jid,
+    ) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .is_some_and(|entry| {
+                if entry.group_invite_peer_selected {
+                    return false;
+                }
+                if !entry
+                    .group_invite_peer_device
+                    .as_ref()
+                    .is_some_and(|device| device.jid.device_eq(accepting_device))
+                {
+                    entry.group_invite_peer_device = None;
+                }
                 entry.group_invite_peer_selected = true;
                 true
             })
@@ -2742,9 +2816,6 @@ mod tests {
         let generation = reg
             .insert_call_link_checked(waiting)
             .expect("valid call-link registration");
-        let listener = reg
-            .listen_group_update("GROUP-CALL", generation)
-            .expect("live listener");
 
         let heartbeat_aborted = Arc::new(AtomicBool::new(false));
         reg.set_waiting_room_task("GROUP-CALL", generation, flag_handle(&heartbeat_aborted));
@@ -2755,8 +2826,65 @@ mod tests {
             "a stale generation cannot retain a heartbeat"
         );
 
+        let local_device = Jid::new("222222222222222", Server::Lid).with_device(1);
+        let mut without_local = group_update(1);
+        let mut creator = GroupCallParticipant::new(
+            Jid::new("111111111111111", Server::Lid),
+            vec![GroupCallDevice::new(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )],
+        );
+        creator.state = Some("connected".to_string());
+        without_local.participants = vec![creator];
         assert_eq!(
-            reg.apply_group_update_if_current(group_update(1), generation),
+            reg.apply_group_update_if_current(without_local, generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(reg.phase("GROUP-CALL"), Some(CallPhase::WaitingRoom));
+        assert!(
+            !heartbeat_aborted.load(Ordering::SeqCst),
+            "a roster that omits the local device cannot admit the call link"
+        );
+        assert!(reg.set_group_invite_self_device(
+            "GROUP-CALL",
+            generation,
+            GroupCallDevice::new(local_device.clone()).with_capability(1, [1]),
+        ));
+        assert_eq!(
+            reg.phase("GROUP-CALL"),
+            Some(CallPhase::WaitingRoom),
+            "recording a local device absent from the roster must not admit it"
+        );
+
+        let mut wrong_device = group_update(2);
+        let mut local_participant = GroupCallParticipant::new(
+            local_device.to_non_ad(),
+            vec![GroupCallDevice::new(local_device.clone().with_device(2))],
+        );
+        local_participant.state = Some("connected".to_string());
+        wrong_device.participants = vec![local_participant];
+        assert_eq!(
+            reg.apply_group_update_if_current(wrong_device, generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            reg.phase("GROUP-CALL"),
+            Some(CallPhase::WaitingRoom),
+            "a sibling device is not proof that this device was admitted"
+        );
+
+        let listener = reg
+            .listen_group_update("GROUP-CALL", generation)
+            .expect("live listener");
+        let mut admitted = group_update(3);
+        let mut local_participant = GroupCallParticipant::new(
+            local_device.to_non_ad(),
+            vec![GroupCallDevice::new(local_device)],
+        );
+        local_participant.state = Some("connected".to_string());
+        admitted.participants = vec![local_participant];
+        assert_eq!(
+            reg.apply_group_update_if_current(admitted, generation),
             GroupStateApply::Applied
         );
         assert_eq!(reg.phase("GROUP-CALL"), Some(CallPhase::Connecting));
@@ -2767,6 +2895,45 @@ mod tests {
         assert!(
             listener.now_or_never().is_some(),
             "admission wakes the media attachment waiter"
+        );
+    }
+
+    #[test]
+    fn recording_the_local_device_rechecks_a_retained_admission_roster() {
+        let reg = CallRegistry::new();
+        let mut waiting = session("GROUP-CALL");
+        assert!(waiting.transition_to(CallPhase::Calling));
+        assert!(waiting.transition_to(CallPhase::WaitingRoom));
+        let generation = reg
+            .insert_call_link_checked(waiting)
+            .expect("valid call-link registration");
+        let local_device = Jid::new("222222222222222", Server::Lid).with_device(1);
+        let mut local_participant = GroupCallParticipant::new(
+            local_device.to_non_ad(),
+            vec![GroupCallDevice::new(local_device.clone())],
+        );
+        local_participant.state = Some("connected".to_string());
+        let mut update = group_update(1);
+        update.participants = vec![local_participant];
+
+        assert_eq!(
+            reg.apply_group_update_if_current(update, generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            reg.phase("GROUP-CALL"),
+            Some(CallPhase::WaitingRoom),
+            "the registry cannot trust membership before the local device is known"
+        );
+        assert!(reg.set_group_invite_self_device(
+            "GROUP-CALL",
+            generation,
+            GroupCallDevice::new(local_device).with_capability(1, [1]),
+        ));
+        assert_eq!(
+            reg.phase("GROUP-CALL"),
+            Some(CallPhase::Connecting),
+            "recording the exact retained roster member completes admission"
         );
     }
 
@@ -3167,6 +3334,62 @@ mod tests {
             .group_invite_fallback_roster("GROUP-CALL", generation)
             .expect("promotion roster");
         assert_eq!(roster[1].devices, vec![accepted]);
+    }
+
+    #[test]
+    fn capabilityless_accept_retains_only_the_same_devices_preaccept() {
+        let reg = CallRegistry::new();
+        let self_device =
+            GroupCallDevice::new(Jid::new("111111111111111", Server::Lid).with_device(1))
+                .with_capability(1, [1]);
+        let preaccepted =
+            GroupCallDevice::new(Jid::new("222222222222222", Server::Lid).with_device(2))
+                .with_capability(7, [2, 3]);
+
+        let same_generation = reg.insert(session("SAME-DEVICE"));
+        assert!(reg.set_group_invite_self_device(
+            "SAME-DEVICE",
+            same_generation,
+            self_device.clone(),
+        ));
+        assert!(reg.set_group_invite_peer_device(
+            "SAME-DEVICE",
+            same_generation,
+            preaccepted.clone(),
+        ));
+        assert!(reg.select_group_invite_peer_without_capability(
+            "SAME-DEVICE",
+            same_generation,
+            &preaccepted.jid,
+        ));
+        assert_eq!(
+            reg.group_invite_fallback_roster("SAME-DEVICE", same_generation)
+                .expect("same-device preaccept remains usable")[1]
+                .devices,
+            vec![preaccepted.clone()]
+        );
+
+        let sibling_generation = reg.insert(session("SIBLING-DEVICE"));
+        assert!(reg.set_group_invite_self_device(
+            "SIBLING-DEVICE",
+            sibling_generation,
+            self_device,
+        ));
+        assert!(reg.set_group_invite_peer_device(
+            "SIBLING-DEVICE",
+            sibling_generation,
+            preaccepted,
+        ));
+        assert!(reg.select_group_invite_peer_without_capability(
+            "SIBLING-DEVICE",
+            sibling_generation,
+            &Jid::new("222222222222222", Server::Lid).with_device(3),
+        ));
+        assert!(
+            reg.group_invite_fallback_roster("SIBLING-DEVICE", sibling_generation)
+                .is_none(),
+            "a sibling accept cannot borrow another device's capability"
+        );
     }
 
     #[test]

@@ -20,10 +20,12 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     // Find a known action child first so unknown/future actions short-circuit
     // before attr validation (forward-compat, even if stanza attrs also shift).
-    let Some(child) = node.children().and_then(|children| {
-        children
-            .iter()
-            .find(|child| CallActionTag::try_from(child.tag.as_ref()).is_ok())
+    let Some((child, action_tag)) = node.children().and_then(|children| {
+        children.iter().find_map(|child| {
+            CallActionTag::try_from(child.tag.as_ref())
+                .ok()
+                .map(|action_tag| (child, action_tag))
+        })
     }) else {
         return Ok(None);
     };
@@ -57,14 +59,15 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
-    let action = parse_action(child)?;
-    let group = if child.tag.as_ref() == "offer" {
+    let is_offer = action_tag == CallActionTag::Offer;
+    let action = parse_action(child, action_tag)?;
+    let group = if is_offer {
         super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
     } else {
         None
     };
     #[cfg(feature = "voip")]
-    let media = (child.tag.as_ref() == "offer")
+    let media = is_offer
         .then(|| parse_media_offer(node, child, participant.as_ref().unwrap_or(&from)))
         .flatten()
         .map(Box::new);
@@ -220,9 +223,7 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
     Ok(CallAudioCodec { enc, rate })
 }
 
-fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
-    let action_tag = CallActionTag::try_from(node.tag.as_ref())
-        .map_err(|_| anyhow!("unknown call action <{}>", node.tag))?;
+fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAction> {
     let mut attrs = node.attrs();
     let call_id = attrs
         .required_string("call-id")

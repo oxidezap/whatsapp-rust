@@ -1111,6 +1111,11 @@ impl Voip<'_> {
             ));
         }
 
+        registry.set_group_invite_self_device(
+            &join.call_id,
+            generation,
+            wacore::types::group_call::GroupCallDevice::new(own_lid).with_capability(1, capability),
+        );
         let rekey_required = join
             .group
             .as_ref()
@@ -1140,11 +1145,6 @@ impl Voip<'_> {
             );
         }
 
-        registry.set_group_invite_self_device(
-            &join.call_id,
-            generation,
-            wacore::types::group_call::GroupCallDevice::new(own_lid).with_capability(1, capability),
-        );
         registration.disarm();
         Ok(CallLinkJoinRegistration { join, generation })
     }
@@ -2353,10 +2353,11 @@ mod tests {
         }
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
         client
             .persistence_manager()
             .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
-                Jid::new("111111111111111", Server::Lid).with_device(1),
+                own_lid.clone(),
             )))
             .await;
         let creator = Jid::new("333333333333333", Server::Lid);
@@ -2528,6 +2529,11 @@ mod tests {
                 .attr("transaction-id", "8")
                 .attr("connected-limit", "32")
                 .attr("media", "video")
+                .children([NodeBuilder::new("user")
+                    .attr("jid", own_lid.to_non_ad())
+                    .attr("state", "connected")
+                    .children([NodeBuilder::new("device").attr("jid", own_lid).build()])
+                    .build()])
                 .build()])
             .build();
         let update = wacore::stanza::group_call::parse_group_update(&admitted.as_node_ref())
@@ -2919,9 +2925,10 @@ mod tests {
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
         let creator = Jid::new("333333333333333", Server::Lid);
         let call_id = "BUFFERED-ADMISSION";
+        let local_device = Jid::new("111111111111111", Server::Lid).with_device(1);
         let mut participant = GroupCallParticipant::new(
-            creator.clone(),
-            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+            local_device.to_non_ad(),
+            vec![GroupCallDevice::new(local_device.clone())],
         );
         participant.state = Some("connected".to_string());
         let update = GroupCallUpdate::builder()
@@ -2962,6 +2969,11 @@ mod tests {
             .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
             .await
             .expect("valid buffered admission");
+        assert!(client.call_registry().set_group_invite_self_device(
+            call_id,
+            generation,
+            GroupCallDevice::new(local_device).with_capability(1, [1]),
+        ));
         assert_eq!(
             client.call_registry().phase_if_current(call_id, generation),
             Some(CallPhase::Connecting),
@@ -3505,10 +3517,12 @@ mod tests {
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
         let creator = Jid::new("333333333333333", Server::Lid);
         let call_id = "ORDERED-CALL-LINK";
-        let participant = GroupCallParticipant::new(
-            creator.clone(),
-            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        let local_device = Jid::new("111111111111111", Server::Lid).with_device(1);
+        let mut participant = GroupCallParticipant::new(
+            local_device.to_non_ad(),
+            vec![GroupCallDevice::new(local_device.clone())],
         );
+        participant.state = Some("connected".to_string());
         let relay = GroupCallRelay::builder()
             .transaction_id(8)
             .self_pid(1)
@@ -3624,6 +3638,11 @@ mod tests {
             .await
             .expect("registration task")
             .expect("valid staged transitions");
+        assert!(client.call_registry().set_group_invite_self_device(
+            call_id,
+            generation,
+            GroupCallDevice::new(local_device).with_capability(1, [1]),
+        ));
         let state = client
             .call_registry()
             .group_state_if_current(call_id, generation)
@@ -4271,11 +4290,10 @@ mod tests {
             registry.apply_group_update_if_current(admitted, generation),
             wacore::voip::GroupStateApply::Applied
         );
-        assert!(registry.transition_if_current(
-            "ADMISSION-RACE-CALL",
-            generation,
-            CallPhase::Connecting
-        ));
+        assert_eq!(
+            registry.phase_if_current("ADMISSION-RACE-CALL", generation),
+            Some(CallPhase::Connecting)
+        );
         drop(transition_guard);
         release_tx.send(()).await.expect("release heartbeat send");
 
