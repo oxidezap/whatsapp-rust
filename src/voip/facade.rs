@@ -2525,9 +2525,22 @@ async fn attach_engine(
     rekey_rx: Option<async_channel::Receiver<String>>,
 ) -> Result<(), CallError> {
     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
-    client
-        .call_registry()
-        .set_group_control_sender(call_id, generation, group_tx);
+    if !client.call_registry().set_group_control_sender(
+        call_id,
+        generation,
+        engine.media_warp_mi_tag_len(),
+        group_tx,
+    ) {
+        if failure_cleanup == FailureCleanup::Here {
+            client
+                .call_registry()
+                .remove_if_current(call_id, generation);
+        }
+        ended.notify();
+        return Err(CallError::Setup(
+            "group relay WARP tag length changed during media attachment".to_string(),
+        ));
+    }
     let group_ctl = Some(group_rx);
     // The registry entry already exists. Re-check is_connected NOW (after insert, before connect) so a
     // disconnect that clears is_connected before abort_all can't slip through the gap between an
@@ -6936,9 +6949,12 @@ mod tests {
             "the older ACK snapshot must not replace an overtaking group update"
         );
         let (tx, rx) = async_channel::bounded(4);
-        client
-            .call_registry()
-            .set_group_control_sender(call_id, registration.generation, tx);
+        client.call_registry().set_group_control_sender(
+            call_id,
+            registration.generation,
+            Some(4),
+            tx,
+        );
         match rx.try_recv().expect("latest roster reaches attached media") {
             GroupControl::Update(update) => assert_eq!(update.transaction_id, 2),
             _ => panic!("expected the retained roster"),
@@ -7006,7 +7022,7 @@ mod tests {
         );
 
         let (tx, rx) = async_channel::bounded(4);
-        registry.set_group_control_sender(call_id, generation, tx);
+        registry.set_group_control_sender(call_id, generation, Some(4), tx);
         assert!(matches!(
             rx.try_recv(),
             Ok(GroupControl::Transition { update, epoch })

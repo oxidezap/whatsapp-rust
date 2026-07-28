@@ -218,6 +218,9 @@ struct CallEntry {
     video_ctl_tx: Option<VideoControlSender>,
     /// Lossless group roster/key transitions into the media driver.
     group_ctl_tx: Option<GroupControlQueue>,
+    /// WARP authentication-tag width baked into the attached media pipelines. A relay refresh
+    /// cannot change this packet boundary without rebuilding every sender and receiver atomically.
+    group_warp_mi_tag_len: Option<usize>,
     /// An epoch may arrive after call-scoped accept but before relay media attaches. Replacing or
     /// dropping this command erases its key bytes through [`GroupRawEpoch`]'s `Drop`.
     pending_group_epoch: Option<GroupRawEpoch>,
@@ -647,6 +650,15 @@ impl CallRegistry {
             else {
                 return GroupStateApply::UnknownCall;
             };
+            if let (Some(established), Some(relay)) =
+                (entry.group_warp_mi_tag_len, update.relay.as_ref())
+                && relay.warp_mi_tag_len.unwrap_or(4) as usize != established
+            {
+                // Reject before GroupCallState consumes the transaction. The media pipelines retain
+                // their original packet boundary, so a corrected same-transaction refresh must
+                // remain admissible instead of splitting registry and driver state.
+                return GroupStateApply::InvalidSnapshot;
+            }
             if let Some(group_ctl_tx) = entry.group_ctl_tx.as_ref() {
                 let mut preview = entry.group.clone().unwrap_or_else(|| {
                     GroupCallState::new(
@@ -1218,6 +1230,7 @@ impl CallRegistry {
             event_tx: None,
             video_ctl_tx: None,
             group_ctl_tx: None,
+            group_warp_mi_tag_len: None,
             pending_group_epoch: None,
             video_teardown: None,
             event_publication_reserved: Arc::new(AtomicBool::new(false)),
@@ -1572,8 +1585,9 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
+        warp_mi_tag_len: Option<usize>,
         tx: async_channel::Sender<GroupControl>,
-    ) {
+    ) -> bool {
         // Publish and flush under one guard: a concurrent epoch router that observes the sender
         // cannot enqueue a newer epoch before the buffered startup epoch.
         let mut map = self.inner.lock().expect("registry lock poisoned");
@@ -1581,10 +1595,22 @@ impl CallRegistry {
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
         else {
-            return;
+            return false;
         };
+        if let (Some(established), Some(relay)) = (
+            warp_mi_tag_len,
+            entry
+                .group
+                .as_ref()
+                .and_then(GroupCallState::snapshot)
+                .and_then(|snapshot| snapshot.relay.as_ref()),
+        ) && relay.warp_mi_tag_len.unwrap_or(4) as usize != established
+        {
+            return false;
+        }
         let tx = GroupControlQueue::new(tx);
         entry.group_ctl_tx = Some(tx.clone());
+        entry.group_warp_mi_tag_len = warp_mi_tag_len;
         let update = entry
             .group
             .as_ref()
@@ -1610,6 +1636,7 @@ impl CallRegistry {
             }
             (None, None) => {}
         }
+        true
     }
 
     /// Deliver an authoritative roster only while `generation` owns this call-id. Before media
@@ -2796,7 +2823,7 @@ mod tests {
         );
 
         let (tx, rx) = async_channel::bounded(2);
-        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx);
         assert!(matches!(
             rx.try_recv(),
             Ok(GroupControl::Transition { update, epoch })
@@ -2875,7 +2902,7 @@ mod tests {
         );
 
         let (tx, rx) = async_channel::unbounded();
-        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx);
         match rx.try_recv().expect("latest roster and epoch") {
             GroupControl::Transition { update, epoch } => {
                 assert_eq!(update.transaction_id, 2);
@@ -3068,7 +3095,7 @@ mod tests {
             Box::new(|| {}),
         );
         let (group_tx, group_rx) = async_channel::bounded(2);
-        reg.set_group_control_sender("GROUP-CALL", generation, group_tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), group_tx);
         group_rx.try_recv().expect("initial roster");
 
         let baseline = reg.memory_stats().bytes;
@@ -3158,7 +3185,7 @@ mod tests {
             GroupStateApply::Applied
         );
         let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
-        reg.set_group_control_sender("GROUP-CALL", generation, control_tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), control_tx);
         control_rx.try_recv().expect("initial roster");
 
         let mut oversized = group_update(2);
@@ -3414,6 +3441,58 @@ mod tests {
     }
 
     #[test]
+    fn relay_tag_change_does_not_consume_the_registry_transaction() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let mut initial = group_update(1);
+        initial.relay = Some(group_relay(1));
+        assert_eq!(reg.apply_group_update(initial), GroupStateApply::Applied);
+        let (tx, rx) = async_channel::bounded(4);
+        assert!(reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx));
+        let _ = rx.try_recv().expect("initial roster");
+
+        let mut incompatible = group_update(2);
+        let mut relay = group_relay(2);
+        relay.warp_mi_tag_len = Some(6);
+        incompatible.relay = Some(relay);
+        assert_eq!(
+            reg.apply_group_update_if_current(incompatible, generation),
+            GroupStateApply::InvalidSnapshot
+        );
+        assert_eq!(
+            reg.group_state_if_current("GROUP-CALL", generation)
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(1),
+            "an unsupported media-boundary change must not advance registry state"
+        );
+
+        let mut corrected = group_update(2);
+        corrected.relay = Some(group_relay(2));
+        assert_eq!(
+            reg.apply_group_update_if_current(corrected, generation),
+            GroupStateApply::Applied,
+            "the corrected same-transaction refresh must remain retryable"
+        );
+    }
+
+    #[test]
+    fn group_media_attachment_rejects_a_retained_relay_tag_mismatch() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let mut update = group_update(1);
+        let mut relay = group_relay(1);
+        relay.warp_mi_tag_len = Some(6);
+        update.relay = Some(relay);
+        assert_eq!(reg.apply_group_update(update), GroupStateApply::Applied);
+
+        let (tx, _rx) = async_channel::bounded(4);
+        assert!(
+            !reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx),
+            "a snapshot that overtook media attachment cannot be replayed into incompatible pipelines"
+        );
+    }
+
+    #[test]
     fn session_and_group_snapshots_are_generation_scoped() {
         let reg = CallRegistry::new();
         let first = reg.insert(session("GROUP-CALL"));
@@ -3648,7 +3727,7 @@ mod tests {
         assert!(reg.set_waiting_room_enabled_if_current("GROUP-CALL", current, true));
 
         let (tx, rx) = async_channel::bounded(4);
-        reg.set_group_control_sender("GROUP-CALL", current, tx);
+        reg.set_group_control_sender("GROUP-CALL", current, Some(4), tx);
         let _ = rx.try_recv(); // initial authoritative snapshot
         assert!(!reg.send_group_update_if_current("GROUP-CALL", stale, group_update(2),));
         assert!(!reg.send_group_epoch_if_current("GROUP-CALL", stale, 2, vec![2; 32],));
@@ -3675,7 +3754,7 @@ mod tests {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("GROUP-CALL"));
         let (tx, rx) = async_channel::bounded(2);
-        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx);
         assert!(!reg.send_group_reaction_if_current("GROUP-CALL", generation, "👍".to_string(),));
 
         assert_eq!(
@@ -3699,7 +3778,7 @@ mod tests {
             GroupStateApply::Applied
         );
         let (tx, rx) = async_channel::bounded(2);
-        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx);
         assert!(matches!(
             rx.try_recv(),
             Ok(GroupControl::Update(update)) if update.transaction_id == 1
@@ -3740,7 +3819,7 @@ mod tests {
         initial.relay = Some(group_relay(1));
         assert_eq!(reg.apply_group_update(initial), GroupStateApply::Applied);
         let (tx, rx) = async_channel::bounded(1);
-        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        reg.set_group_control_sender("GROUP-CALL", generation, Some(4), tx);
         let _ = rx.try_recv().expect("initial authoritative snapshot");
 
         let mut relay_refresh = group_update(2);

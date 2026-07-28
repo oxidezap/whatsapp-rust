@@ -924,6 +924,11 @@ impl CallEngine {
         &self.call_id
     }
 
+    /// WARP authentication-tag width baked into the active media pipelines.
+    pub fn media_warp_mi_tag_len(&self) -> Option<usize> {
+        self.media.as_ref().map(|media| media.warp_mi_tag_len)
+    }
+
     pub fn direction(&self) -> CallDirection {
         self.direction
     }
