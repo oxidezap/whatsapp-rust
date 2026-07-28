@@ -9,18 +9,19 @@
 //! and arm the next timer from `poll_timeout()`. The monotonic clock is `crate::time::Instant`
 //! (native `std::time::Instant`; wasm `performance.now`), so no wall clock leaks into the engine.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
+use portable_atomic::{AtomicBool, Ordering};
 use zeroize::Zeroize;
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
-use crate::types::group_call::GroupCallUpdate;
+use crate::types::group_call::{GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate};
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
@@ -159,30 +160,48 @@ pub enum VideoControl {
 
 /// State changes stay FIFO so `Disable` performs its purge before a later `Enable`; only the latest
 /// orientation matters while the driver is busy.
+enum VideoControlMessage {
+    State(VideoControl),
+    ParticipantOrientationsReady,
+}
+
+#[derive(Default)]
+struct PendingParticipantOrientations {
+    values: Mutex<HashMap<wacore_binary::Jid, u8>>,
+    marker_queued: AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct VideoControlSender {
-    state: async_channel::Sender<VideoControl>,
+    state: async_channel::Sender<VideoControlMessage>,
     orientation: async_channel::Sender<u8>,
+    participant_orientations: Arc<PendingParticipantOrientations>,
 }
 
 /// Receiving half of [`video_control_channel`].
 pub struct VideoControlReceiver {
-    state: async_channel::Receiver<VideoControl>,
+    state: async_channel::Receiver<VideoControlMessage>,
     orientation: async_channel::Receiver<u8>,
+    participant_orientations: Arc<PendingParticipantOrientations>,
+    ready_participant_orientations: Mutex<VecDeque<(wacore_binary::Jid, u8)>>,
 }
 
 /// Build the control mailbox used by one call driver.
 pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
     let (state_tx, state_rx) = async_channel::unbounded();
     let (orientation_tx, orientation_rx) = async_channel::bounded(1);
+    let participant_orientations = Arc::new(PendingParticipantOrientations::default());
     (
         VideoControlSender {
             state: state_tx,
             orientation: orientation_tx,
+            participant_orientations: participant_orientations.clone(),
         },
         VideoControlReceiver {
             state: state_rx,
             orientation: orientation_rx,
+            participant_orientations,
+            ready_participant_orientations: Mutex::new(VecDeque::new()),
         },
     )
 }
@@ -194,12 +213,90 @@ impl VideoControlSender {
             VideoControl::SetOrientation(orientation) => {
                 self.orientation.force_send(orientation).is_ok()
             }
-            state => self.state.try_send(state).is_ok(),
+            VideoControl::SetParticipantOrientation {
+                participant,
+                orientation,
+            } => {
+                let needs_marker = {
+                    let mut pending = self
+                        .participant_orientations
+                        .values
+                        .lock()
+                        .expect("participant orientation lock poisoned");
+                    if !pending.contains_key(&participant)
+                        && pending.len() == GROUP_CALL_MAX_PARTICIPANTS
+                        && let Some(evicted) = pending.keys().next().cloned()
+                    {
+                        pending.remove(&evicted);
+                    }
+                    pending.insert(participant, orientation);
+                    !self
+                        .participant_orientations
+                        .marker_queued
+                        .swap(true, Ordering::Relaxed)
+                };
+                if !needs_marker {
+                    return true;
+                }
+                if self
+                    .state
+                    .try_send(VideoControlMessage::ParticipantOrientationsReady)
+                    .is_ok()
+                {
+                    true
+                } else {
+                    self.participant_orientations
+                        .values
+                        .lock()
+                        .expect("participant orientation lock poisoned")
+                        .clear();
+                    self.participant_orientations
+                        .marker_queued
+                        .store(false, Ordering::Relaxed);
+                    false
+                }
+            }
+            state => self
+                .state
+                .try_send(VideoControlMessage::State(state))
+                .is_ok(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn retained_len(&self) -> usize {
-        self.state.len().saturating_add(self.orientation.len())
+        self.state
+            .len()
+            .saturating_add(self.orientation.len())
+            .saturating_add(
+                self.participant_orientations
+                    .values
+                    .lock()
+                    .expect("participant orientation lock poisoned")
+                    .len(),
+            )
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        let pending = self
+            .participant_orientations
+            .values
+            .lock()
+            .expect("participant orientation lock poisoned");
+        self.state
+            .len()
+            .saturating_mul(size_of::<VideoControlMessage>())
+            .saturating_add(self.orientation.len().saturating_mul(size_of::<u8>()))
+            .saturating_add(
+                pending
+                    .capacity()
+                    .saturating_mul(size_of::<(wacore_binary::Jid, u8)>()),
+            )
+            .saturating_add(pending.keys().map(HeapSize::heap_bytes).sum::<usize>())
     }
 }
 
@@ -209,12 +306,46 @@ impl VideoControlReceiver {
         self.state.is_closed() && self.orientation.is_closed()
     }
 
+    fn take_participant_orientation(&self) -> Option<VideoControl> {
+        let mut ready = self
+            .ready_participant_orientations
+            .lock()
+            .expect("participant orientation lock poisoned");
+        if ready.is_empty() {
+            let mut pending = self
+                .participant_orientations
+                .values
+                .lock()
+                .expect("participant orientation lock poisoned");
+            ready.extend(pending.drain());
+            self.participant_orientations
+                .marker_queued
+                .store(false, Ordering::Relaxed);
+        }
+        ready.pop_front().map(|(participant, orientation)| {
+            VideoControl::SetParticipantOrientation {
+                participant,
+                orientation,
+            }
+        })
+    }
+
     /// Receive a ready state first, otherwise the latest orientation.
     pub fn try_recv(&self) -> Result<VideoControl, async_channel::TryRecvError> {
-        let state_error = match self.state.try_recv() {
-            Ok(state) => return Ok(state),
-            Err(error) => error,
+        let state_error = loop {
+            match self.state.try_recv() {
+                Ok(VideoControlMessage::State(state)) => return Ok(state),
+                Ok(VideoControlMessage::ParticipantOrientationsReady) => {
+                    if let Some(orientation) = self.take_participant_orientation() {
+                        return Ok(orientation);
+                    }
+                }
+                Err(error) => break error,
+            }
         };
+        if let Some(orientation) = self.take_participant_orientation() {
+            return Ok(orientation);
+        }
         match self.orientation.try_recv() {
             Ok(orientation) => Ok(VideoControl::SetOrientation(orientation)),
             Err(async_channel::TryRecvError::Closed)
@@ -226,17 +357,30 @@ impl VideoControlReceiver {
         }
     }
 
+    async fn recv_state(&self) -> Result<VideoControl, async_channel::RecvError> {
+        loop {
+            match self.state.recv().await? {
+                VideoControlMessage::State(state) => return Ok(state),
+                VideoControlMessage::ParticipantOrientationsReady => {
+                    if let Some(orientation) = self.take_participant_orientation() {
+                        return Ok(orientation);
+                    }
+                }
+            }
+        }
+    }
+
     /// Wait for a state or orientation until every sender is gone.
     pub async fn recv(&self) -> Result<VideoControl, async_channel::RecvError> {
         loop {
             match self.try_recv() {
                 Ok(control) => return Ok(control),
-                Err(async_channel::TryRecvError::Closed) => return self.state.recv().await,
+                Err(async_channel::TryRecvError::Closed) => return self.recv_state().await,
                 Err(async_channel::TryRecvError::Empty) => {}
             }
 
             match (self.state.is_closed(), self.orientation.is_closed()) {
-                (false, true) => return self.state.recv().await,
+                (false, true) => return self.recv_state().await,
                 (true, false) => {
                     return self
                         .orientation
@@ -244,14 +388,19 @@ impl VideoControlReceiver {
                         .await
                         .map(VideoControl::SetOrientation);
                 }
-                (true, true) => return self.state.recv().await,
+                (true, true) => return self.recv_state().await,
                 (false, false) => {
                     let state = self.state.recv().fuse();
                     let orientation = self.orientation.recv().fuse();
                     futures::pin_mut!(state, orientation);
                     futures::select_biased! {
                         state = state => match state {
-                            Ok(state) => return Ok(state),
+                            Ok(VideoControlMessage::State(state)) => return Ok(state),
+                            Ok(VideoControlMessage::ParticipantOrientationsReady) => {
+                                if let Some(orientation) = self.take_participant_orientation() {
+                                    return Ok(orientation);
+                                }
+                            }
                             Err(_) => continue,
                         },
                         orientation = orientation => match orientation {
@@ -1233,6 +1382,30 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(VideoControl::Enable));
         assert_eq!(rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn video_control_channel_coalesces_group_orientation_per_participant() {
+        let (tx, rx) = video_control_channel();
+        let participant = Jid::new("200002", Server::Lid).with_device(3);
+        for orientation in 0..100u8 {
+            assert!(tx.send(VideoControl::SetParticipantOrientation {
+                participant: participant.clone(),
+                orientation: orientation % 4,
+            }));
+        }
+        assert!(
+            tx.retained_len() <= 2,
+            "one participant must retain at most one value and one wake marker"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant,
+                orientation: 3,
+            })
+        );
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 

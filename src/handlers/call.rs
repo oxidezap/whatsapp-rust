@@ -286,7 +286,11 @@ impl StanzaHandler for CallHandler {
                     {
                         let capability = nr
                             .children()
-                            .and_then(|children| children.first())
+                            .and_then(|children| {
+                                children.iter().find(|action| {
+                                    CallActionTag::try_from(action.tag.as_ref()).is_ok()
+                                })
+                            })
                             .and_then(|action| action.get_optional_child("capability"));
                         let device = if let Some(capability) = capability
                             && let Some(bytes) =
@@ -1948,11 +1952,16 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     fn audio_selection_stanza(rate: &str) -> wacore_binary::Node {
-        NodeBuilder::new("call")
-            .attr("from", fake_caller_lid())
-            .attr("id", "STANZA-ID-AUDIO")
-            .attr("t", "1766847151")
-            .children([NodeBuilder::new("accept")
+        audio_selection_stanza_with_leading_children(rate, Vec::new())
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn audio_selection_stanza_with_leading_children(
+        rate: &str,
+        mut leading: Vec<wacore_binary::Node>,
+    ) -> wacore_binary::Node {
+        leading.push(
+            NodeBuilder::new("accept")
                 .attr("call-creator", fake_caller_lid())
                 .attr("call-id", "CALL-ID-0001")
                 .children([
@@ -1965,7 +1974,13 @@ mod tests {
                         .bytes(wacore::stanza::call::CAPABILITY_OFFER.to_vec())
                         .build(),
                 ])
-                .build()])
+                .build(),
+        );
+        NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "STANZA-ID-AUDIO")
+            .attr("t", "1766847151")
+            .children(leading)
             .build()
     }
 
@@ -2074,6 +2089,36 @@ mod tests {
             }))
         ));
         assert!(!cancelled);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn accept_capability_follows_the_forward_compatible_typed_action() {
+        let client = make_sending_client().await;
+        let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
+        let stanza = audio_selection_stanza_with_leading_children(
+            "16000",
+            vec![NodeBuilder::new("future_call_action").build()],
+        );
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&stanza), &mut cancelled)
+                .await
+        );
+        let fallback = client
+            .call_registry()
+            .group_invite_fallback_roster("CALL-ID-0001", generation)
+            .expect("the accepted device keeps its parsed capability");
+        assert_eq!(
+            fallback[1].devices[0].capability_version,
+            Some(1),
+            "a leading unknown child cannot hide the typed accept capability"
+        );
+        client
+            .call_registry()
+            .remove_if_current("CALL-ID-0001", generation);
     }
 
     #[cfg(feature = "voip-runtime")]

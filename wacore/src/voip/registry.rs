@@ -241,9 +241,11 @@ impl CallEntry {
                     .as_ref()
                     .map_or(0, CallEventQueue::retained_bytes),
             )
-            .saturating_add(self.video_ctl_tx.as_ref().map_or(0, |tx| {
-                tx.retained_len().saturating_mul(size_of::<VideoControl>())
-            }))
+            .saturating_add(
+                self.video_ctl_tx
+                    .as_ref()
+                    .map_or(0, VideoControlSender::retained_bytes),
+            )
             .saturating_add(
                 self.group_ctl_tx
                     .as_ref()

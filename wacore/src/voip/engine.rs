@@ -758,6 +758,9 @@ pub struct CallEngine {
     rtcp_wallclock_origin_ms: u64,
     /// Deadline by which the allocate must be acked; NEVER once it is (or after firing the timeout).
     allocate_deadline: Millis,
+    /// The current Allocate transaction still requires a matching success or error response.
+    /// Subscription-only refreshes keep `allocated` true so established media remains live.
+    allocate_pending: bool,
     allocated: bool,
     started: bool,
     /// A terminal relay-allocate failure was surfaced; the engine goes inert (no keepalive, no
@@ -905,6 +908,7 @@ impl CallEngine {
             rtcp_monotonic_origin: 0,
             rtcp_wallclock_origin_ms: 0,
             allocate_deadline: 0,
+            allocate_pending: false,
             allocated: false,
             started: false,
             terminated: false,
@@ -1222,7 +1226,8 @@ impl CallEngine {
             // checks would leave the fresh token/key without an acknowledgement or timeout.
             self.allocated = false;
         }
-        if self.started && !self.allocated {
+        self.allocate_pending = true;
+        if self.started {
             self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
         }
         let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
@@ -1500,6 +1505,7 @@ impl CallEngine {
         self.outbox
             .push_back(Output::Transmit(self.allocate.clone()));
         self.keepalive_deadline = now + KEEPALIVE_MS;
+        self.allocate_pending = true;
         self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
         if let Some(m) = &mut self.media
             && m.audio.io == AudioIo::Pcm
@@ -1539,7 +1545,7 @@ impl CallEngine {
         }
         let mut next = self.keepalive_deadline;
         // The allocate timeout only matters while the allocate is still outstanding.
-        if !self.allocated && self.allocate_deadline != NEVER {
+        if self.allocate_pending && self.allocate_deadline != NEVER {
             next = next.min(self.allocate_deadline);
         }
         if let Some(m) = &self.media {
@@ -1569,12 +1575,14 @@ impl CallEngine {
 
     fn on_timeout(&mut self, now: Millis) {
         // The relay never acked the allocate: surface a terminal timeout exactly once, then go inert.
-        if !self.allocated
+        if self.allocate_pending
             && self.started
             && self.allocate_deadline != NEVER
             && now >= self.allocate_deadline
         {
             self.allocate_deadline = NEVER;
+            self.allocate_pending = false;
+            self.allocated = false;
             self.terminated = true;
             #[cfg(feature = "tracing")]
             tracing::debug!(call_id = %self.call_id, "voip relay allocate timed out");
@@ -1871,28 +1879,35 @@ impl CallEngine {
             .is_some_and(|expected| stun::stun_transaction_id(pkt) == Some(expected.as_slice()));
         // The relay acknowledged the current allocate; stale replies from a superseded credential
         // generation must not cancel its timeout or terminate the call.
-        if !self.allocated && matches_allocation && stun::is_allocate_or_binding_success(pkt) {
+        if self.allocate_pending && matches_allocation && stun::is_allocate_or_binding_success(pkt)
+        {
+            let was_allocated = self.allocated;
+            self.allocate_pending = false;
             self.allocated = true;
             self.allocate_deadline = NEVER;
             #[cfg(feature = "tracing")]
             tracing::debug!(call_id = %self.call_id, "voip relay allocated");
-            self.outbox
-                .push_back(Output::Event(CallEvent::RelayAllocated));
-            if self.media.is_some() {
-                self.rtcp_deadline = now + RTCP_MS;
-                self.announce_audio_rtcp_session();
+            if !was_allocated {
+                self.outbox
+                    .push_back(Output::Event(CallEvent::RelayAllocated));
+                if self.media.is_some() {
+                    self.rtcp_deadline = now + RTCP_MS;
+                    self.announce_audio_rtcp_session();
+                }
             }
             return;
         }
         // A complete allocate-error (a parsed ERROR-CODE) terminates the call; STUN-typed garbage
         // whose error code cannot be parsed is ignored rather than hanging up.
-        if !self.allocated
+        if self.allocate_pending
             && matches_allocation
             && self.allocate_deadline != NEVER
             && stun::is_allocate_error(pkt)
             && let Some(code) = stun::parse_stun_error_code(pkt)
         {
             self.allocate_deadline = NEVER;
+            self.allocate_pending = false;
+            self.allocated = false;
             self.terminated = true;
             #[cfg(feature = "tracing")]
             tracing::debug!(call_id = %self.call_id, code, "voip relay allocate failed");
@@ -3093,7 +3108,7 @@ mod encoded_tests {
     }
 
     #[test]
-    fn roster_only_pid_change_refreshes_subscriptions_without_rearming_allocation() {
+    fn roster_only_pid_change_tracks_subscription_refresh_ack_and_timeout() {
         let mut engine = group_engine();
         engine.start(0, 1_700_000_000_000);
         let _ = drain(&mut engine);
@@ -3127,7 +3142,7 @@ mod encoded_tests {
 
         assert!(
             engine.is_allocated(),
-            "subscription changes must preserve the healthy relay allocation"
+            "subscription refreshes must not gate an already healthy media allocation"
         );
         assert!(
             drain(&mut engine)
@@ -3135,11 +3150,53 @@ mod encoded_tests {
                 .any(|output| matches!(output, Output::Transmit(_))),
             "new remote PIDs still require an updated group Allocate"
         );
+        let refresh_success = allocation_success(&engine);
+        engine.handle_input(2_001, Input::RelayPacket(&refresh_success));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Event(CallEvent::RelayAllocated))),
+            "a subscription-only ACK must not re-announce the already active allocation"
+        );
         engine.handle_input(2_000 + ALLOCATE_TIMEOUT_MS, Input::Timeout);
         assert!(
             drain(&mut engine)
                 .iter()
-                .all(|output| !matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut)))
+                .all(|output| !matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
+            "the matching subscription refresh ACK clears its deadline"
+        );
+
+        let mut unacked = update;
+        unacked.transaction_id = 9;
+        let next_peer = Jid::new("15550004444", Server::Lid);
+        unacked.participants.push(GroupCallParticipant {
+            jid: next_peer.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: next_peer,
+                platform: None,
+                pid: Some(4),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        unacked
+            .relay
+            .as_mut()
+            .expect("relay snapshot")
+            .transaction_id = Some(9);
+        engine
+            .apply_group_update(3_000, &unacked)
+            .expect("second PID refresh");
+        let _ = drain(&mut engine);
+        engine.handle_input(3_000 + ALLOCATE_TIMEOUT_MS, Input::Timeout);
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
+            "a lost subscription refresh must retain the allocation timeout safety net"
         );
     }
 

@@ -46,6 +46,10 @@ const CALL_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const WAITING_ROOM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(feature = "voip-runtime")]
 const WAITING_ROOM_HEARTBEAT_MAX_CONSECUTIVE_FAILURES: u8 = 3;
+#[cfg(feature = "voip-runtime")]
+const MAX_PENDING_CALL_LINK_TRANSITIONS: usize = 32;
+#[cfg(feature = "voip-runtime")]
+const MAX_PENDING_CALL_LINK_TRANSITION_BYTES: usize = 1024 * 1024;
 
 /// Opaque call-control handle obtained via [`Client::voip`]. Borrows the client;
 /// kept as a newtype so the surface can grow without breaking callers.
@@ -82,12 +86,22 @@ enum PendingCallLinkTransition {
 
 #[cfg(feature = "voip-runtime")]
 impl PendingCallLinkTransition {
-    fn heap_bytes(&self) -> usize {
+    fn group_heap_bytes(update: &GroupCallUpdate) -> usize {
         use wacore::stats::HeapSize;
 
+        size_of::<GroupCallUpdate>() + update.heap_bytes()
+    }
+
+    fn waiting_room_heap_bytes(room: &WaitingRoom) -> usize {
+        use wacore::stats::HeapSize;
+
+        room.heap_bytes()
+    }
+
+    fn heap_bytes(&self) -> usize {
         match self {
-            Self::Group(update) => size_of::<GroupCallUpdate>() + update.heap_bytes(),
-            Self::WaitingRoom(room) => room.heap_bytes(),
+            Self::Group(update) => Self::group_heap_bytes(update),
+            Self::WaitingRoom(room) => Self::waiting_room_heap_bytes(room),
         }
     }
 }
@@ -101,10 +115,26 @@ pub(super) struct PendingCallLinkJoins {
 
 #[cfg(feature = "voip-runtime")]
 impl PendingCallLinkJoins {
-    fn can_buffer_transition(&self) -> bool {
-        const MAX_BUFFERED_TRANSITIONS: usize = 32;
+    fn can_buffer_transition(&self, call_id: &str, payload_bytes: usize) -> bool {
+        use wacore::stats::HeapSize;
 
-        self.transitions.values().map(Vec::len).sum::<usize>() < MAX_BUFFERED_TRANSITIONS
+        let entries = self.transitions.values().map(Vec::len).sum::<usize>();
+        if entries >= MAX_PENDING_CALL_LINK_TRANSITIONS {
+            return false;
+        }
+        let new_key_bytes = if self.transitions.contains_key(call_id) {
+            0
+        } else {
+            size_of::<String>() + call_id.heap_bytes()
+        };
+        let structural_reserve = MAX_PENDING_CALL_LINK_TRANSITIONS
+            .saturating_mul(size_of::<PendingCallLinkTransition>());
+        self.memory_stats()
+            .bytes
+            .saturating_add(payload_bytes.try_into().unwrap_or(u64::MAX))
+            .saturating_add(new_key_bytes.try_into().unwrap_or(u64::MAX))
+            .saturating_add(structural_reserve.try_into().unwrap_or(u64::MAX))
+            <= MAX_PENDING_CALL_LINK_TRANSITION_BYTES as u64
     }
 
     pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
@@ -246,7 +276,10 @@ impl Client {
         {
             return true;
         }
-        if !state.can_buffer_transition() {
+        if !state.can_buffer_transition(
+            &update.call_id,
+            PendingCallLinkTransition::group_heap_bytes(update),
+        ) {
             return false;
         }
         state
@@ -274,7 +307,10 @@ impl Client {
             || room.call_id.is_empty()
             || room.link_token.is_empty()
             || sender.to_non_ad() != room.call_creator.to_non_ad()
-            || !state.can_buffer_transition()
+            || !state.can_buffer_transition(
+                &room.call_id,
+                PendingCallLinkTransition::waiting_room_heap_bytes(room),
+            )
         {
             return false;
         }
@@ -287,7 +323,7 @@ impl Client {
     }
 
     #[cfg(feature = "voip-runtime")]
-    fn register_call_link_session(
+    async fn register_call_link_session(
         &self,
         session: CallSession,
         waiting_room: Option<WaitingRoom>,
@@ -300,6 +336,10 @@ impl Client {
             .group
             .as_ref()
             .is_some_and(|update| update.rekey_requested);
+        // Share the stable call-id lane with every competing call registration. Once this join
+        // inserts its generation, no re-offer can replace it until all staged admission state has
+        // either committed to that generation or caused registration to fail.
+        let _answer_transition = self.lock_answer_transition(&call_id).await;
         let mut state = self
             .pending_call_link_joins
             .lock()
@@ -324,10 +364,15 @@ impl Client {
                     let mut update = *update;
                     update.rekey_requested |= rekey_pending;
                     let staged_rekey = update.rekey_requested;
-                    if self.apply_pending_call_link_update(update, generation)
-                        == wacore::voip::GroupStateApply::Applied
-                    {
-                        rekey_pending = staged_rekey;
+                    match self.apply_pending_call_link_update(update, generation) {
+                        wacore::voip::GroupStateApply::Applied => {
+                            rekey_pending = staged_rekey;
+                        }
+                        wacore::voip::GroupStateApply::Stale => {}
+                        rejected => {
+                            self.call_registry.remove_if_current(&call_id, generation);
+                            return Err(rejected);
+                        }
                     }
                 }
                 PendingCallLinkTransition::WaitingRoom(room)
@@ -335,9 +380,17 @@ impl Client {
                         && room.media == expected_media
                         && room.link_token == expected_token =>
                 {
-                    let _ = self
+                    let applied = self
                         .call_registry
                         .apply_waiting_room_if_current(room, generation);
+                    if !matches!(
+                        applied,
+                        wacore::voip::GroupStateApply::Applied
+                            | wacore::voip::GroupStateApply::Stale
+                    ) {
+                        self.call_registry.remove_if_current(&call_id, generation);
+                        return Err(applied);
+                    }
                 }
                 _ => {}
             }
@@ -711,6 +764,7 @@ impl Voip<'_> {
         let generation = self
             .client
             .register_call_link_session(session, join.waiting_room.clone(), media, &token)
+            .await
             .map_err(|_| {
                 CallError::Response("call-link admission snapshot was rejected".to_string())
             })?;
@@ -1335,7 +1389,7 @@ mod tests {
     use wacore_binary::{Jid, Server};
 
     #[cfg(feature = "voip-runtime")]
-    use super::WaitingRoomUserAction;
+    use super::{MAX_PENDING_CALL_LINK_TRANSITION_BYTES, WaitingRoomUserAction};
     #[cfg(feature = "voip-runtime")]
     use crate::client::CallError;
     use crate::client::Client;
@@ -2517,6 +2571,7 @@ mod tests {
         let _ = session.transition_to(CallPhase::WaitingRoom);
         let generation = client
             .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+            .await
             .expect("valid buffered admission");
         assert_eq!(
             client.call_registry().phase_if_current(call_id, generation),
@@ -2543,6 +2598,66 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn pending_call_link_transitions_are_bounded_by_retained_bytes() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let sender = creator.clone().with_device(1);
+        let _pending = client.begin_call_link_join();
+        let chunk = MAX_PENDING_CALL_LINK_TRANSITION_BYTES / 3;
+        let mut accepted = 0;
+        for index in 0..4 {
+            let participant = GroupCallParticipant::new(
+                creator.clone(),
+                vec![GroupCallDevice::new(sender.clone()).with_capability(1, vec![7; chunk])],
+            );
+            let update = GroupCallUpdate::builder()
+                .call_id(format!("BUFFERED-BYTES-{index}"))
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(vec![participant])
+                .build();
+            accepted += usize::from(client.buffer_pending_call_link_update(&update, &sender));
+        }
+        let stats = client.memory_report().await.pending_call_link_updates;
+        assert!(
+            accepted < 4,
+            "the aggregate byte budget must reject excess staged snapshots"
+        );
+        assert!(
+            stats.bytes <= MAX_PENDING_CALL_LINK_TRANSITION_BYTES as u64,
+            "retained staged snapshots must stay within the aggregate byte budget"
+        );
+
+        let oversized = GroupCallUpdate::builder()
+            .call_id("BUFFERED-OVERSIZED".to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                creator,
+                vec![
+                    GroupCallDevice::new(sender.clone())
+                        .with_capability(1, vec![7; MAX_PENDING_CALL_LINK_TRANSITION_BYTES]),
+                ],
+            )])
+            .build();
+        assert!(
+            !client.buffer_pending_call_link_update(&oversized, &sender),
+            "one staged snapshot cannot consume the entire retained-byte budget"
+        );
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -2638,13 +2753,28 @@ mod tests {
             CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
         let _ = session.transition_to(CallPhase::Calling);
         let _ = session.transition_to(CallPhase::WaitingRoom);
-        let generation = client
-            .register_call_link_session(
-                session,
-                Some(initial_room),
-                CallLinkMedia::Audio,
-                "TEST-CALL-LINK",
-            )
+        let registration_lane = client.lock_answer_transition(call_id).await;
+        let register_client = client.clone();
+        let registration = tokio::spawn(async move {
+            register_client
+                .register_call_link_session(
+                    session,
+                    Some(initial_room),
+                    CallLinkMedia::Audio,
+                    "TEST-CALL-LINK",
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            None,
+            "call-link insertion must share the call-id registration lane"
+        );
+        drop(registration_lane);
+        let generation = registration
+            .await
+            .expect("registration task")
             .expect("valid staged transitions");
         let state = client
             .call_registry()
@@ -2704,12 +2834,9 @@ mod tests {
         session.group = Some(invalid);
 
         assert_eq!(
-            client.register_call_link_session(
-                session,
-                None,
-                CallLinkMedia::Audio,
-                "TEST-CALL-LINK",
-            ),
+            client
+                .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK",)
+                .await,
             Err(wacore::voip::GroupStateApply::InvalidSnapshot)
         );
         assert_eq!(client.call_registry().generation_of(call_id), None);
