@@ -938,7 +938,9 @@ impl Voip<'_> {
         {
             let registry = self.client.call_registry();
             if let Some(generation) = _ringing_generation {
-                registry.reject_ringing_if_current(call_id, generation);
+                if !registry.reject_ringing_if_current(call_id, generation) {
+                    return Err(CallError::CallEndedDuringSetup);
+                }
             } else {
                 let generation = registry.ringing_group_generation(call_id, call_creator);
                 registry.take_ringing(call_id);
@@ -2093,7 +2095,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn rejecting_a_stale_group_offer_event_preserves_the_replacement_generation() {
-        let (client, _count) = make_client_with_count().await;
+        let (client, count) = make_client_with_count().await;
         let creator = caller();
         let call_id = "REPLACED-INCOMING-GROUP-CALL";
         let update = GroupCallUpdate::builder()
@@ -2137,7 +2139,15 @@ mod tests {
         replacement.group = Some(update);
         let replacement = client.call_registry().insert_ringing_group(replacement);
 
-        client.voip().reject(&incoming).await.expect("reject");
+        assert!(matches!(
+            client.voip().reject(&incoming).await,
+            Err(CallError::CallEndedDuringSetup)
+        ));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a stale application event must not reject the replacement on the wire"
+        );
 
         assert_eq!(
             client.call_registry().generation_of(call_id),

@@ -246,6 +246,44 @@ impl SrtcpReplayState {
     }
 }
 
+const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
+
+#[derive(Default)]
+struct SrtpReplayWindow {
+    highest: Option<u64>,
+    seen: u64,
+}
+
+impl SrtpReplayWindow {
+    fn accept(&mut self, index: u64) -> bool {
+        let Some(highest) = self.highest else {
+            self.highest = Some(index);
+            self.seen = 1;
+            return true;
+        };
+        if index > highest {
+            let forward = index - highest;
+            self.seen = if forward >= SRTP_REPLAY_WINDOW_BITS {
+                1
+            } else {
+                (self.seen << forward) | 1
+            };
+            self.highest = Some(index);
+            return true;
+        }
+        let behind = highest - index;
+        if behind >= SRTP_REPLAY_WINDOW_BITS {
+            return false;
+        }
+        let bit = 1u64 << behind;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+}
+
 /// Per-stream RTCP Sender-Report state.
 struct SrtcpSender {
     keys: E2eSrtpKeys,
@@ -342,6 +380,7 @@ pub struct MediaPipeline {
     rtp: RtpStream,
     send_roc: RocTracker,
     recv_roc: RecvRocTracker,
+    recv_rtp_replay: SrtpReplayWindow,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -396,6 +435,7 @@ impl MediaPipeline {
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
+            recv_rtp_replay: SrtpReplayWindow::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -452,6 +492,7 @@ impl MediaPipeline {
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_roc = RecvRocTracker::default();
+        self.recv_rtp_replay = SrtpReplayWindow::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -528,6 +569,7 @@ impl MediaPipeline {
         unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
+            &mut self.recv_rtp_replay,
             self.warp_mi_tag_len,
             packet,
         )
@@ -551,6 +593,7 @@ impl MediaPipeline {
 fn unprotect_srtp_packet(
     recv_keys: &E2eSrtpKeys,
     recv_roc: &mut RecvRocTracker,
+    recv_replay: &mut SrtpReplayWindow,
     warp_mi_tag_len: usize,
     packet: &[u8],
 ) -> Option<(RtpHeader, Vec<u8>)> {
@@ -575,6 +618,10 @@ fn unprotect_srtp_packet(
     ) {
         return None;
     }
+    let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
+    if !recv_replay.accept(index) {
+        return None;
+    }
     // Authenticated: now it's safe to advance the rollover counter.
     recv_roc.commit_roc(roc, header.sequence_number);
     let cipher = &without_tag[header_len..];
@@ -593,6 +640,7 @@ pub struct VideoPipeline {
     rtp: VideoRtpStream,
     send_roc: RocTracker,
     recv_roc: RecvRocTracker,
+    recv_rtp_replay: SrtpReplayWindow,
     depacketizer: H264Depacketizer,
     pkt_scratch: Vec<Vec<u8>>,
     srtcp: SrtcpSender,
@@ -636,6 +684,7 @@ impl VideoPipeline {
             rtp: VideoRtpStream::new(p.ssrc, p.ts_stride)?,
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
+            recv_rtp_replay: SrtpReplayWindow::default(),
             depacketizer: H264Depacketizer::default(),
             pkt_scratch: Vec::new(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
@@ -673,6 +722,7 @@ impl VideoPipeline {
         };
         self.recv_keys = keys;
         self.recv_roc = RecvRocTracker::default();
+        self.recv_rtp_replay = SrtpReplayWindow::default();
         self.depacketizer.reset();
         true
     }
@@ -768,6 +818,7 @@ impl VideoPipeline {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
+            &mut self.recv_rtp_replay,
             self.warp_mi_tag_len,
             packet,
         )?;
@@ -1312,6 +1363,10 @@ mod tests {
         let before = tx.protect_audio(&payload);
         let before_header = parse_rtp_header(&before).unwrap();
         assert_eq!(rx.unprotect_audio(&before).unwrap().1, payload);
+        assert!(
+            rx.unprotect_audio(&before).is_none(),
+            "an authenticated RTP packet must be delivered only once"
+        );
         let first_rtcp = tx.audio_sender_report(1_000, None);
         assert!(rx.unprotect_rtcp(&first_rtcp).is_some());
         let first_index = u32::from_be_bytes(
@@ -1323,6 +1378,12 @@ mod tests {
 
         assert!(tx.rekey_send_from_raw(&new_epoch, alice));
         assert!(rx.rekey_recv_from_raw_preserving_roc(&new_epoch, alice));
+        let mut reset_sender = MediaPipeline::new(&params(&new_epoch, alice, bob)).unwrap();
+        assert!(
+            rx.unprotect_audio(&reset_sender.protect_audio(&[0x51; 8]))
+                .is_none(),
+            "an ordinary epoch rekey must preserve the authenticated RTP replay window"
+        );
         let after = tx.protect_audio(&payload);
         let after_header = parse_rtp_header(&after).unwrap();
         assert_eq!(
@@ -1475,6 +1536,10 @@ mod tests {
             }
         }
         assert_eq!(got, Some(vec![au]), "AU must reassemble byte-identical");
+        assert!(
+            rx.unprotect_video(packets.last().unwrap()).is_none(),
+            "replaying the marker packet must not redeliver the completed access unit"
+        );
 
         // Second AU keeps flowing (sequencer + ROC state stay consistent).
         let au2 = video_au(100);

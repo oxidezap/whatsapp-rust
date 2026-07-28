@@ -663,7 +663,12 @@ pub fn build_call_link_query(token: &str, media: CallLinkMedia, request_id: &str
 /// Build a call-link join request with the media capabilities of this client.
 #[cold]
 pub fn build_call_link_join(token: &str, media: CallLinkMedia, request_id: &str) -> Result<Node> {
-    build_call_link_join_with_capability(token, media, request_id, &CAPABILITY_OFFER)
+    let capability = if media == CallLinkMedia::Video {
+        &CAPABILITY_VIDEO_OFFER
+    } else {
+        &CAPABILITY_OFFER
+    };
+    build_call_link_join_with_capability(token, media, request_id, capability)
 }
 
 /// Build a call-link join request with an explicit version-1 audio capability.
@@ -1796,6 +1801,14 @@ mod tests {
         assert_eq!(
             child_tags(action(&join)),
             ["audio", "video", "net", "capability"]
+        );
+        assert_eq!(
+            action(&join)
+                .as_node_ref()
+                .get_optional_child("capability")
+                .expect("video capability")
+                .content_bytes(),
+            Some(CAPABILITY_VIDEO_OFFER.as_slice())
         );
         let query = build_call_link_query("TOKEN", CallLinkMedia::Audio, "REQ-QUERY").unwrap();
         assert_eq!(

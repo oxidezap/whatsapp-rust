@@ -219,11 +219,14 @@ impl<'a> AcceptCall<'a> {
         }
         let registry = self.client.call_registry();
         let group_generation = if self.incoming.group.is_some() {
-            Some(
-                registry
-                    .ringing_group_generation(call_id, call_creator)
-                    .ok_or(CallError::CallEndedDuringSetup)?,
-            )
+            let generation = self
+                .incoming
+                .ringing_generation()
+                .ok_or(CallError::CallEndedDuringSetup)?;
+            if registry.ringing_group_generation(call_id, call_creator) != Some(generation) {
+                return Err(CallError::CallEndedDuringSetup);
+            }
+            Some(generation)
         } else {
             if registry.is_group_call(call_id) {
                 // The application retained a direct offer past a same-id group replacement. It
@@ -4388,6 +4391,7 @@ mod tests {
             .insert_ringing_group_if_inactive(session)
             .expect("valid group snapshot")
             .expect("ringing group generation");
+        incoming.set_ringing_generation(generation);
         let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
         let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
 
@@ -4454,6 +4458,59 @@ mod tests {
         assert!(
             client.call_registry().is_current(&call_id, generation),
             "the newer ringing group generation must survive a stale direct accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_group_accept_cannot_borrow_the_replacement_generation() {
+        let client = make_client().await;
+        let mut incoming = incoming_offer(false);
+        let call_id = incoming.action.call_id().to_string();
+        let creator = incoming.action.call_creator().clone();
+        let mut update = GroupCallUpdate::builder()
+            .call_id(call_id.clone())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        update.relay = Some(sample_group_relay(1));
+        incoming.group = Some(Box::new(update.clone()));
+
+        let mut stale_session =
+            wacore::voip::CallSession::new_incoming(&call_id, creator.clone(), creator.clone());
+        stale_session.group = Some(update.clone());
+        let stale = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(stale_session)
+            .expect("valid group snapshot")
+            .expect("ringing group generation");
+        incoming.set_ringing_generation(stale);
+
+        let mut replacement_session =
+            wacore::voip::CallSession::new_incoming(&call_id, creator.clone(), creator);
+        replacement_session.group = Some(update);
+        let replacement = client
+            .call_registry()
+            .insert_ringing_group(replacement_session);
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        assert!(matches!(result, Err(CallError::CallEndedDuringSetup)));
+        assert!(
+            client.call_registry().is_current(&call_id, replacement),
+            "a retained offer event must not claim a newer same-id group generation"
         );
     }
 

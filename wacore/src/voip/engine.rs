@@ -1115,6 +1115,12 @@ impl CallEngine {
             .ok_or(GroupMediaError::Pipeline)?
             .registry
             .active_pids();
+        let previous_devices = self
+            .group
+            .as_ref()
+            .ok_or(GroupMediaError::Pipeline)?
+            .registry
+            .active_device_ids();
         let result = self
             .group
             .as_mut()
@@ -1167,8 +1173,11 @@ impl CallEngine {
                 .retain(|participant, _| active.contains(participant));
             let current_pids = group.registry.active_pids();
             let subscriptions_changed = current_pids != previous_pids;
+            let current_devices = group.registry.active_device_ids();
             let participant_added = update.media == "video"
-                && current_pids.iter().any(|pid| !previous_pids.contains(pid));
+                && current_devices
+                    .iter()
+                    .any(|device| !previous_devices.contains(device));
             if update.media == "audio" {
                 self.disable_video();
                 self.purge_queued_video_outputs();
@@ -2920,6 +2929,46 @@ mod encoded_tests {
     }
 
     #[test]
+    fn group_device_replacement_reuses_pid_but_still_requires_an_idr() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        let delta = [0, 0, 0, 1, 0x41, 4, 5, 6];
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let _ = drain(&mut engine);
+
+        let mut replaced = group_update();
+        replaced.transaction_id = 8;
+        replaced.media = "video".to_string();
+        replaced.relay = Some(group_relay());
+        let replacement = Jid::new("15550004444", Server::Lid);
+        replaced.participants[1].jid = replacement.clone();
+        replaced.participants[1].devices[0].jid = replacement;
+        assert_eq!(
+            engine.apply_group_update(2, &replaced).unwrap(),
+            GroupRosterApply::Applied
+        );
+        let _ = drain(&mut engine);
+
+        engine.handle_input(3, Input::VideoFrame(&delta));
+        assert!(
+            drain(&mut engine).iter().all(|output| !matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "a different device on the same relay PID must receive an IDR first"
+        );
+    }
+
+    #[test]
     fn authoritative_roster_removal_terminates_local_group_media() {
         let mut engine = group_engine();
         assert_eq!(
@@ -3215,8 +3264,8 @@ mod encoded_tests {
             engine.apply_group_raw_epoch(8, &new_epoch).unwrap(),
             GroupEpochApply::Installed
         );
-        let mut new_sender = sender(&new_epoch);
-        let resumed = new_sender.protect_audio(&[0x08, 7, 8, 9]);
+        assert!(old_sender.rekey_send_from_raw(&new_epoch, &peer_jid.to_string()));
+        let resumed = old_sender.protect_audio(&[0x08, 7, 8, 9]);
         engine.handle_input(4, Input::RelayPacket(&resumed));
         assert!(
             drain(&mut engine)

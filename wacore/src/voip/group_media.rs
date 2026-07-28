@@ -227,6 +227,12 @@ impl GroupMediaRegistry {
         pids
     }
 
+    pub(crate) fn active_device_ids(&self) -> Vec<String> {
+        let mut ids = self.receivers.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     pub(crate) fn sender_report_stream(
         &self,
         participant_id: &str,
@@ -278,7 +284,22 @@ impl GroupMediaRegistry {
         for (participant, device) in active {
             let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
             let mut receiver = if let Some(mut existing) = previous.remove(&participant_id) {
-                if update.media == "video"
+                if existing.pid != device.pid {
+                    // A PID identifies one relay media session. Reusing its authenticated ROC,
+                    // replay, and depacketizer state across a PID migration can reject the new
+                    // stream's first packets or combine fragments from two different sessions.
+                    if let Some((_, epoch)) = self.installed_epoch.as_ref() {
+                        self.build_receiver(
+                            epoch.as_slice(),
+                            &participant.jid,
+                            &device.jid,
+                            device.pid,
+                            update.media == "video",
+                        )?
+                    } else {
+                        self.receiver_without_keys(&participant.jid, &device.jid, device.pid)
+                    }
+                } else if update.media == "video"
                     && existing.video.is_none()
                     && let Some((_, epoch)) = self.installed_epoch.as_ref()
                 {
@@ -984,6 +1005,39 @@ mod tests {
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x52; 20]))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn device_pid_change_rebuilds_its_receive_session() {
+        let epoch = [0x25; 32];
+        let alice = Jid::new("200002", Server::Lid).with_device(2);
+        let participants = vec![device("100001", 1, 1), device("200002", 2, 2)];
+        let mut registry = registry();
+        registry
+            .apply_group_update(&update(1, participants.clone()))
+            .expect("initial roster");
+        registry.apply_raw_epoch(1, &epoch).expect("initial epoch");
+
+        let mut first_session = peer_sender(&epoch, &alice);
+        assert!(
+            registry
+                .unprotect_audio(&first_session.protect_audio(&[0x50; 20]))
+                .is_some()
+        );
+
+        let mut migrated = participants;
+        migrated[1].devices[0].pid = Some(9);
+        registry
+            .apply_group_update(&update(2, migrated))
+            .expect("PID migration");
+
+        let mut replacement_session = peer_sender(&epoch, &alice);
+        assert!(
+            registry
+                .unprotect_audio(&replacement_session.protect_audio(&[0x51; 20]))
+                .is_some(),
+            "a new PID must start with fresh ROC, replay, and depacketization state"
         );
     }
 
