@@ -581,7 +581,7 @@ pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
                 .build(),
         );
     }
-    let action = NodeBuilder::new("enc_rekey")
+    let action = NodeBuilder::new(CallActionTag::EncRekey.as_str())
         .attr("call-id", params.call_id)
         .attr("call-creator", params.call_creator)
         .attr("transaction-id", params.transaction_id.to_string())
@@ -593,7 +593,7 @@ pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
 /// Parse one keygen-v2 group epoch delivery.
 #[cold]
 pub fn parse_group_enc_rekey(node: &NodeRef<'_>) -> Result<GroupCallEncRekey> {
-    if node.tag != "enc_rekey" {
+    if node.tag.as_ref() != CallActionTag::EncRekey.as_str() {
         return Err(group_stanza_error("expected an enc_rekey stanza"));
     }
     let mut attrs = node.attrs();
@@ -839,7 +839,7 @@ pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String> {
 /// Parse one authoritative waiting-room update action.
 #[cold]
 pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {
-    if node.tag != "waiting_room_update" {
+    if node.tag.as_ref() != CallActionTag::WaitingRoomUpdate.as_str() {
         return Err(group_stanza_error("expected a waiting_room_update stanza"));
     }
     let mut attrs = node.attrs();
@@ -1030,7 +1030,7 @@ pub fn build_raise_hand(
     Ok(call_wrap(
         to,
         request_id,
-        NodeBuilder::new("user_action")
+        NodeBuilder::new(CallActionTag::RaiseHand.as_str())
             .attr("call-id", call_id)
             .attr("call-creator", creator)
             .attr("action", "raise_hand")
@@ -1044,7 +1044,7 @@ pub fn build_raise_hand(
 /// Parse a persistent raise/lower-hand transition.
 #[cold]
 pub fn parse_raise_hand(node: &NodeRef<'_>) -> Result<bool> {
-    if node.tag != "user_action" {
+    if node.tag.as_ref() != CallActionTag::RaiseHand.as_str() {
         return Err(group_stanza_error("expected a user_action stanza"));
     }
     let mut attrs = node.attrs();
@@ -1081,7 +1081,7 @@ pub fn build_screen_share(
     if to.user.is_empty() {
         bail!("screen-share target is required");
     }
-    let mut action = NodeBuilder::new("screen_share")
+    let mut action = NodeBuilder::new(CallActionTag::ScreenShare.as_str())
         .attr("call-id", call_id)
         .attr("call-creator", creator)
         .attr("screenshare_state", state.code().to_string())
@@ -1095,7 +1095,7 @@ pub fn build_screen_share(
 /// Parse one versioned screen-share transition.
 #[cold]
 pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
-    if node.tag != "screen_share" {
+    if node.tag.as_ref() != CallActionTag::ScreenShare.as_str() {
         return Err(group_stanza_error("expected a screen_share stanza"));
     }
     let mut attrs = node.attrs();
@@ -2025,7 +2025,7 @@ mod tests {
         assert_eq!(parsed.state, ScreenShareState::Started);
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.screen_share_id, Some(7));
-        let overflow = NodeBuilder::new("screen_share")
+        let overflow = NodeBuilder::new(CallActionTag::ScreenShare.as_str())
             .attr("call-id", "CID")
             .attr("call-creator", &creator)
             .attr("screenshare_state", u32::MAX.to_string())
