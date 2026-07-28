@@ -1003,9 +1003,12 @@ impl JidStackWriter {
 
     #[inline]
     fn as_str(&self) -> &str {
-        // Whole `&str` fragments are appended, never split, so the bytes
-        // stay valid UTF-8.
-        std::str::from_utf8(&self.buf[..self.len]).expect("concatenated str fragments")
+        // SAFETY: `write_str` below is the only writer, and it is all-or-nothing
+        // — it returns `Err` before copying anything that would not fit, so it
+        // can never leave a partial code point behind. `buf[..len]` is therefore
+        // always a concatenation of whole `&str` fragments. Anything that writes
+        // raw bytes here instead of going through `write_str` breaks this.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
     }
 }
 
@@ -1243,6 +1246,40 @@ mod tests {
         assert!(!Jid::from_str("0@lid").unwrap().is_psa());
         assert!(!Jid::from_str("status@broadcast").unwrap().is_psa());
         assert!(!Jid::from_str("0@g.us").unwrap().is_psa());
+    }
+
+    /// `JidStackWriter::as_str` reads its buffer back as UTF-8 without
+    /// validating it, so every shape that reaches it has to be exercised
+    /// somewhere Miri can see: multi-byte users, a user that fills the buffer
+    /// exactly, and one that overflows it into the fallback path.
+    #[test]
+    fn display_reads_back_every_stack_buffer_shape() {
+        // Multi-byte code points in the user part: a byte-wise buffer must not
+        // be able to split one, and the readback must reproduce them exactly.
+        let emoji = Jid::new("héllo→世界", Server::Lid);
+        assert_eq!(emoji.to_string(), "héllo→世界@lid");
+        assert_eq!(format!("{}", emoji.observe()), "héllo→世界@lid");
+
+        // Exactly at the 64-byte stack buffer: "@lid" is 4 bytes, so a 60-byte
+        // user is the longest that still renders through it.
+        let full = Jid::new("9".repeat(60), Server::Lid);
+        let rendered = full.to_string();
+        assert_eq!(rendered.len(), 64);
+        assert!(rendered.ends_with("@lid"));
+
+        // One byte past it: `write_str` errors and Display falls back to
+        // fragment writes, which must produce the same string.
+        let over = Jid::new("9".repeat(61), Server::Lid);
+        assert_eq!(over.to_string(), format!("{}@lid", "9".repeat(61)));
+
+        // The borrowed formatter and the Arc<str> builder share the writer.
+        let borrowed = parse_jid_ref("12025550111:7@s.whatsapp.net").unwrap();
+        assert_eq!(borrowed.to_string(), "12025550111:7@s.whatsapp.net");
+        assert_eq!(&*emoji.to_non_ad_arc_str(), "héllo→世界@lid");
+        assert_eq!(
+            &*over.to_non_ad_arc_str(),
+            &*format!("{}@lid", "9".repeat(61))
+        );
     }
 
     #[test]
