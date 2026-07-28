@@ -803,7 +803,6 @@ impl<'a> NodeRef<'a> {
     where
         'a: 'b,
     {
-        // See the owned `get_children_by_tag` for why this is not `flatten`.
         self.children()
             .unwrap_or_default()
             .iter()
