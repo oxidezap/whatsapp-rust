@@ -124,6 +124,11 @@ impl GroupCallState {
         if !self.matches_identity(&room.call_id, &room.call_creator) {
             return GroupStateApply::IdentityMismatch;
         }
+        if self.waiting_room.as_ref().is_some_and(|current| {
+            current.link_token != room.link_token || current.media != room.media
+        }) {
+            return GroupStateApply::IdentityMismatch;
+        }
         if let (Some(current), Some(next)) = (self.waiting_room_transaction, room.transaction_id)
             && next <= current
         {
@@ -478,6 +483,23 @@ mod tests {
         assert_eq!(
             state.apply_waiting_room(wrong_creator),
             GroupStateApply::IdentityMismatch
+        );
+        let mut wrong_link = waiting_room(Some(5));
+        wrong_link.link_token = "OTHER-CALL-LINK".to_string();
+        assert_eq!(
+            state.apply_waiting_room(wrong_link),
+            GroupStateApply::IdentityMismatch
+        );
+        let mut wrong_media = waiting_room(Some(5));
+        wrong_media.media = crate::types::group_call::CallLinkMedia::Video;
+        assert_eq!(
+            state.apply_waiting_room(wrong_media),
+            GroupStateApply::IdentityMismatch
+        );
+        assert_eq!(
+            state.apply_waiting_room(waiting_room(Some(5))),
+            GroupStateApply::Applied,
+            "conflicting link identities must not consume the transaction watermark"
         );
     }
 

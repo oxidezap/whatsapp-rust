@@ -27,6 +27,9 @@ use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
 
 const MAX_PENDING_INITIAL_GROUP_CONTROLS: usize = 64;
+/// Bootstrap controls only bridge the short offer-registration race. One MiB leaves ample room for
+/// a legitimate full roster plus rekey while bounding unauthenticated call-id retention.
+const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
 
 /// Identifies one peer video-upgrade request within one call generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -329,6 +332,10 @@ fn pending_initial_group_control_heap_bytes(call: &IncomingCall) -> usize {
         }
 }
 
+fn pending_initial_group_control_retained_bytes(call: &IncomingCall) -> usize {
+    size_of::<IncomingCall>().saturating_add(pending_initial_group_control_heap_bytes(call))
+}
+
 /// Thread-safe map of active calls keyed by call-id.
 #[derive(Default)]
 pub struct CallRegistry {
@@ -375,22 +382,22 @@ impl CallRegistry {
                 .expect("registry lock poisoned");
             let bytes = pending
                 .iter()
-                .map(|call| {
-                    size_of::<IncomingCall>() + pending_initial_group_control_heap_bytes(call)
-                })
+                .map(pending_initial_group_control_retained_bytes)
                 .sum::<usize>();
             (pending.len(), bytes)
         };
-        let ringing_bytes = self
-            .ringing
-            .lock()
-            .expect("registry lock poisoned")
-            .iter()
-            .map(|call_id| size_of::<String>() + call_id.heap_bytes())
-            .sum::<usize>();
+        let (ringing_entries, ringing_bytes) = {
+            let ringing = self.ringing.lock().expect("registry lock poisoned");
+            let bytes = ringing
+                .iter()
+                .map(|call_id| size_of::<String>() + call_id.heap_bytes())
+                .sum::<usize>();
+            (ringing.len(), bytes)
+        };
         crate::stats::CollectionStats::new(
             active_entries
                 .saturating_add(pending_entries)
+                .saturating_add(ringing_entries)
                 .try_into()
                 .unwrap_or(u64::MAX),
             active_bytes
@@ -435,8 +442,23 @@ impl CallRegistry {
         {
             return true;
         }
-        if pending.len() == MAX_PENDING_INITIAL_GROUP_CONTROLS {
-            pending.pop_front();
+        let retained_bytes = pending_initial_group_control_retained_bytes(&call);
+        if retained_bytes > MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES {
+            return false;
+        }
+        let mut pending_bytes = pending
+            .iter()
+            .map(pending_initial_group_control_retained_bytes)
+            .sum::<usize>();
+        while pending.len() >= MAX_PENDING_INITIAL_GROUP_CONTROLS
+            || pending_bytes.saturating_add(retained_bytes)
+                > MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES
+        {
+            let Some(evicted) = pending.pop_front() else {
+                break;
+            };
+            pending_bytes = pending_bytes
+                .saturating_sub(pending_initial_group_control_retained_bytes(&evicted));
         }
         pending.push_back(call);
         true
@@ -2057,6 +2079,32 @@ mod tests {
         )
     }
 
+    fn initial_group_rekey(
+        call_id: &str,
+        stanza_id: &str,
+        sender: Jid,
+        ciphertext_len: usize,
+    ) -> IncomingCall {
+        IncomingCall::new_for_test(
+            sender,
+            stanza_id.to_string(),
+            crate::time::from_secs(1).expect("valid timestamp"),
+            CallAction::EncRekey {
+                rekey: Box::new(
+                    GroupCallEncRekey::builder()
+                        .call_id(call_id.to_string())
+                        .call_creator(Jid::new("111111111111111", Server::Lid))
+                        .transaction_id(1)
+                        .key_generation(1)
+                        .encryption_type("msg".to_string())
+                        .encryption_version(2)
+                        .ciphertext(vec![7; ciphertext_len])
+                        .build(),
+                ),
+            },
+        )
+    }
+
     #[test]
     fn initial_group_control_buffer_is_authenticated_bounded_and_drained_by_identity() {
         let reg = CallRegistry::new();
@@ -2131,6 +2179,42 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert!(matches!(drained[0].action, CallAction::GroupUpdate { .. }));
         assert!(matches!(drained[1].action, CallAction::EncRekey { .. }));
+    }
+
+    #[test]
+    fn initial_group_control_buffer_is_bounded_by_retained_bytes() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let chunk = MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES / 3;
+        for index in 0..4 {
+            assert!(reg.buffer_initial_group_control(initial_group_rekey(
+                &format!("GROUP-{index}"),
+                &format!("EPOCH-{index}"),
+                creator.clone().with_device(1),
+                chunk,
+            )));
+        }
+        let stats = reg.memory_stats();
+        assert!(stats.entries < 4, "the byte cap must evict older controls");
+        assert!(
+            stats.bytes <= MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES as u64,
+            "retained bootstrap controls must stay within the aggregate byte budget"
+        );
+        assert!(
+            reg.take_initial_group_controls("GROUP-0", &creator)
+                .is_empty(),
+            "byte-pressure eviction removes the oldest control first"
+        );
+
+        assert!(
+            !reg.buffer_initial_group_control(initial_group_rekey(
+                "OVERSIZED",
+                "OVERSIZED-EPOCH",
+                creator.with_device(1),
+                MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES,
+            )),
+            "one oversized control cannot consume the entire bootstrap budget"
+        );
     }
 
     fn group_relay(transaction_id: u32) -> GroupCallRelay {
@@ -3270,6 +3354,21 @@ mod tests {
         );
         // A call we never rang (outgoing, or a terminate with no preceding offer) is never missed.
         assert!(!reg.take_ringing("NEVER"));
+    }
+
+    #[test]
+    fn memory_stats_include_ringing_entries() {
+        let reg = CallRegistry::new();
+        reg.mark_incoming_ringing("FIRST-RING");
+        reg.mark_incoming_ringing("SECOND-RING");
+        let stats = reg.memory_stats();
+        assert_eq!(stats.entries, 2);
+        assert!(stats.bytes > 0);
+
+        assert!(reg.take_ringing("FIRST-RING"));
+        assert_eq!(reg.memory_stats().entries, 1);
+        reg.abort_all();
+        assert_eq!(reg.memory_stats().entries, 0);
     }
 
     #[test]

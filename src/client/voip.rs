@@ -598,13 +598,19 @@ impl Voip<'_> {
         let request_id = self.client.generate_request_id();
         let request = build_call_link_create(media, &request_id)
             .map_err(|error| CallError::Response(error.to_string()))?;
-        execute_call_service_request(
+        let link = execute_call_service_request(
             self.client,
             &request_id,
             request,
             parse_call_link_create_ack,
         )
-        .await
+        .await?;
+        if link.media != media {
+            return Err(CallError::Response(
+                "call-link creation changed the requested media mode".to_string(),
+            ));
+        }
+        Ok(link)
     }
 
     /// Inspect a call link without joining it.
@@ -2160,6 +2166,46 @@ mod tests {
                     if message == "call-link preview changed the requested link identity"
             ));
         }
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_creation_rejects_a_changed_media_mode() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let create_client = client.clone();
+        let create = tokio::spawn(async move {
+            create_client
+                .voip()
+                .create_call_link(CallLinkMedia::Video)
+                .await
+        });
+        let request = sent.await.expect("link_create request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_create")
+                .attr("id", request_id.as_str())
+                .children([NodeBuilder::new("link_create")
+                    .attr("token", "TEST-CALL-LINK")
+                    .attr("media", "audio")
+                    .build()])
+                .build(),
+        )
+        .await;
+        assert!(matches!(
+            create.await.expect("create task"),
+            Err(CallError::Response(message))
+                if message == "call-link creation changed the requested media mode"
+        ));
     }
 
     #[cfg(feature = "voip-runtime")]
