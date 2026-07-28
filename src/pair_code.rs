@@ -216,8 +216,15 @@ impl Client {
                 claim,
             };
         }
-        // From here on every failing exit path has to hand the claim back, or
-        // the client refuses to ever issue another code.
+        // Every path out has to hand the claim back, including a caller who
+        // drops this future (a `timeout` shorter than the IQ's, say) — an
+        // orphaned claim rejects every later request for the rest of the
+        // validity window. Disarmed only once the flow is installed.
+        let mut claim_guard = ClaimGuard {
+            client: Arc::clone(self),
+            claim,
+            armed: true,
+        };
 
         info!(
             target: "Client/PairCode",
@@ -305,17 +312,21 @@ impl Client {
             timeout: Some(std::time::Duration::from_secs(30)),
         };
 
+        // The PBKDF2 above takes long enough for a `cancel_pair_code` to land.
+        // Sending anyway would put a second `companion_hello` on the server for
+        // this number, which then routes `primary_hello` to whichever it likes
+        // — the overlap the claim exists to prevent.
+        if !self.owns_code_claim(claim).await {
+            return Err(PairCodeError::Cancelled.into());
+        }
+
         let response = match self.send_iq(query).await {
             Ok(response) => response,
-            Err(e) => {
-                self.release_code_claim(claim).await;
-                return Err(e.into());
-            }
+            Err(e) => return Err(e.into()),
         };
 
         let Some(pairing_ref) = PairCodeUtils::parse_companion_hello_response(response.get())
         else {
-            self.release_code_claim(claim).await;
             return Err(PairCodeError::MissingPairingRef.into());
         };
 
@@ -342,6 +353,7 @@ impl Client {
                 code_generation_ts,
                 primary_hello_attempt_count: 0,
             };
+            claim_guard.armed = false;
         }
 
         // Dispatch event for the user to display the code. The validity clock
@@ -368,6 +380,10 @@ impl Client {
     ///
     /// Identified by its token, so a claim already superseded — by a
     /// cancellation, or by the replacement that followed one — is left alone.
+    async fn owns_code_claim(self: &Arc<Self>, claim: wacore::pair_code::PairCodeClaim) -> bool {
+        matches!(&*self.pair_code_state.lock().await, PairCodeState::RequestingCode { claim: c, .. } if *c == claim)
+    }
+
     async fn release_code_claim(self: &Arc<Self>, claim: wacore::pair_code::PairCodeClaim) {
         let mut state = self.pair_code_state.lock().await;
         if matches!(&*state, PairCodeState::RequestingCode { claim: c, .. } if *c == claim) {
@@ -382,10 +398,38 @@ impl Client {
     /// the previous code can no longer complete: a `primary_hello` for it is
     /// dropped rather than answered with a bundle its holder cannot open.
     pub async fn cancel_pair_code(self: &Arc<Self>) {
-        let mut state = self.pair_code_state.lock().await;
-        if !matches!(&*state, PairCodeState::Idle) {
+        {
+            let mut state = self.pair_code_state.lock().await;
+            if matches!(&*state, PairCodeState::Idle) {
+                return;
+            }
             *state = PairCodeState::Idle;
         }
+        crate::handlers::notification::apply_pending_reg_refresh(self).await;
+    }
+}
+
+/// Releases a stage-1 claim unless the flow it belongs to was installed.
+///
+/// `Drop` cannot await, so the release is spawned; the claim is identified by
+/// its token, which makes a late release harmless once something else has taken
+/// the slot.
+struct ClaimGuard {
+    client: Arc<Client>,
+    claim: wacore::pair_code::PairCodeClaim,
+    armed: bool,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let claim = self.claim;
+        client.clone().runtime.spawn_detached(Box::pin(async move {
+            client.release_code_claim(claim).await;
+        }));
     }
 }
 
@@ -718,6 +762,9 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
             target: "Client/PairCode",
             "No pair-success within {timeout:?} of companion_finish; the code will not complete"
         );
+        // Nothing depends on the adv secret any more, so a registration refresh
+        // this flow held up can finally happen.
+        crate::handlers::notification::apply_pending_reg_refresh(&client).await;
         client.core.event_bus.dispatch(Event::PairingCodeRefresh(
             crate::types::events::PairingCodeRefresh::builder()
                 .force_manual(false)
@@ -1481,6 +1528,90 @@ mod tests {
             matches!(&*client.pair_code_state.lock().await, PairCodeState::Idle),
             "a flow scoped to a dead connection must not outlive it"
         );
+    }
+
+    /// Regression: a caller that gives up on the request — a `timeout` shorter
+    /// than the IQ's own, say — used to leave its claim behind, and an orphaned
+    /// claim rejects every later request for the rest of the validity window.
+    #[tokio::test]
+    async fn dropping_the_request_hands_the_claim_back() {
+        let (client, transport) = create_iq_test_client().await;
+
+        {
+            let client = client.clone();
+            let task = tokio::spawn(async move { client.pair_with_code(options()).await });
+            poll_until("the companion_hello to be on the wire", || {
+                !transport.sent().is_empty()
+            })
+            .await;
+            task.abort();
+        }
+
+        poll_until("the abandoned claim to be released", || {
+            matches!(
+                client.pair_code_state.try_lock().as_deref(),
+                Some(PairCodeState::Idle)
+            )
+        })
+        .await;
+    }
+
+    /// The predicate stage 1 rechecks before putting `companion_hello` on the
+    /// wire. Sending after a withdrawal registers a second flow for this number
+    /// on the server, which then routes `primary_hello` to whichever it likes —
+    /// the overlap the claim exists to prevent. (The race itself has no
+    /// deterministic test: the derivation it runs against is real CPU work.)
+    #[tokio::test]
+    async fn a_withdrawn_claim_stops_being_owned() {
+        let (client, _transport) = create_iq_test_client().await;
+        let claim = wacore::pair_code::PairCodeClaim::next();
+        *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
+            code_generation_ts: wacore::time::now_secs(),
+            claim,
+        };
+
+        assert!(client.owns_code_claim(claim).await);
+        client.cancel_pair_code().await;
+        assert!(
+            !client.owns_code_claim(claim).await,
+            "a cancelled request must not reach the wire"
+        );
+
+        // Nor does a replacement's claim answer for the one it superseded.
+        *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
+            code_generation_ts: wacore::time::now_secs(),
+            claim: wacore::pair_code::PairCodeClaim::next(),
+        };
+        assert!(!client.owns_code_claim(claim).await);
+    }
+
+    /// Regression: a registration refresh deferred to a pair-code flow must not
+    /// be dropped when that flow fails. The secret the server asked to retire is
+    /// still the one the QR advertises.
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_registration_refresh_lands_when_the_flow_gives_up() {
+        let (client, transport) = create_iq_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = primary_hello_notif(&pairing_ref);
+        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
+        poll_until("companion_finish to reach the transport", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+        let adv_after_stage_two = adv(&client);
+
+        // The server asks for a refresh while pair-success is still due.
+        client
+            .pending_reg_refresh
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        poll_until("the deferred rotation to be applied", || {
+            adv(&client) != adv_after_stage_two
+        })
+        .await;
     }
 
     // ── Stage-2 liveness (WA Web parity) ─────────────────────────────────────

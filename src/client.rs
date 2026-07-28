@@ -1160,6 +1160,10 @@ pub struct Client {
     pub(crate) connected_notifier: Arc<event_listener::Event>,
     pub(crate) major_sync_task_sender: async_channel::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
+    /// A `companion_reg_refresh` that arrived while a pair-code flow was
+    /// awaiting `pair-success`, and so could not rotate the ADV secret without
+    /// breaking that flow's HMAC. Applied when the flow ends without pairing.
+    pub(crate) pending_reg_refresh: portable_atomic::AtomicBool,
     /// Asks the QR rotation task to re-render the ref it is already showing.
     /// The payload embeds the adv secret, so a rotation has to reach the code
     /// on screen and not just the next one.

@@ -91,6 +91,13 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
 
                     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
                     let (refresh_tx, refresh_rx) = async_channel::bounded::<()>(1);
+                    // Published before the task can run: `spawn` may poll it
+                    // immediately or on another thread, and a refresh arriving
+                    // in that window would find no sender and be dropped —
+                    // leaving the code already on screen keyed to a secret the
+                    // server has retired.
+                    *client.pairing_cancellation_tx.lock().await = Some(stop_tx);
+                    *client.pairing_qr_refresh_tx.lock().await = Some(refresh_tx);
                     let client_clone = client.clone();
 
                     client
@@ -123,60 +130,60 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                 // for a ref change and for an adv-secret change
                                 // (`Link/DeviceQrcode.react.js`).
                                 loop {
-                                let remaining = ttl.saturating_sub(started.elapsed());
-                                let snapshot =
-                                    client_clone.persistence_manager.get_device_snapshot();
-                                let code = PairUtils::make_qr_data(
-                                    &DeviceState {
-                                        identity_key: snapshot.identity_key.clone(),
-                                        noise_key: snapshot.noise_key.clone(),
-                                        adv_secret_key: snapshot.adv_secret_key,
-                                    },
-                                    &pairing_ref,
-                                    companion_web_client_type_for_props(&snapshot.device_props),
-                                );
-                                client_clone.core.event_bus.dispatch(Event::PairingQrCode(
-                                    crate::types::events::PairingQrCode::builder()
-                                        .code(code)
-                                        .timeout(remaining)
-                                        .build(),
-                                ));
+                                    let remaining = ttl.saturating_sub(started.elapsed());
+                                    let snapshot =
+                                        client_clone.persistence_manager.get_device_snapshot();
+                                    let code = PairUtils::make_qr_data(
+                                        &DeviceState {
+                                            identity_key: snapshot.identity_key.clone(),
+                                            noise_key: snapshot.noise_key.clone(),
+                                            adv_secret_key: snapshot.adv_secret_key,
+                                        },
+                                        &pairing_ref,
+                                        companion_web_client_type_for_props(&snapshot.device_props),
+                                    );
+                                    client_clone.core.event_bus.dispatch(Event::PairingQrCode(
+                                        crate::types::events::PairingQrCode::builder()
+                                            .code(code)
+                                            .timeout(remaining)
+                                            .build(),
+                                    ));
 
-                                // The runtime has no `sleep_until`, and the remaining slice is
-                                // what a re-render has to resume against anyway.
-                                let sleep = client_clone.runtime.sleep(remaining);
-                                let stop = stop_rx.recv();
-                                let refresh = refresh_rx.recv();
-                                futures::pin_mut!(sleep);
-                                futures::pin_mut!(stop);
-                                futures::pin_mut!(refresh);
-                                let outcome = futures::future::select(
-                                    sleep,
-                                    futures::future::select(stop, refresh),
-                                )
-                                .await;
-                                match outcome {
-                                    futures::future::Either::Left(_) => {
-                                        if client_clone.is_logged_in() {
-                                            info!(
-                                                "Logged in during QR timeout, stopping rotation."
-                                            );
+                                    // The runtime has no `sleep_until`, and the remaining slice is
+                                    // what a re-render has to resume against anyway.
+                                    let sleep = client_clone.runtime.sleep(remaining);
+                                    let stop = stop_rx.recv();
+                                    let refresh = refresh_rx.recv();
+                                    futures::pin_mut!(sleep);
+                                    futures::pin_mut!(stop);
+                                    futures::pin_mut!(refresh);
+                                    let outcome = futures::future::select(
+                                        sleep,
+                                        futures::future::select(stop, refresh),
+                                    )
+                                    .await;
+                                    match outcome {
+                                        futures::future::Either::Left(_) => {
+                                            if client_clone.is_logged_in() {
+                                                info!(
+                                                    "Logged in during QR timeout, stopping rotation."
+                                                );
+                                                return;
+                                            }
+                                            continue 'refs;
+                                        }
+                                        futures::future::Either::Right((
+                                            futures::future::Either::Left(_),
+                                            _,
+                                        )) => {
+                                            info!("Pairing complete. Stopping QR code rotation.");
                                             return;
                                         }
-                                        continue 'refs;
-                                    }
-                                    futures::future::Either::Right((
-                                        futures::future::Either::Left(_),
-                                        _,
-                                    )) => {
-                                        info!("Pairing complete. Stopping QR code rotation.");
-                                        return;
-                                    }
-                                    // Same ref and deadline, rebuilt payload.
-                                    futures::future::Either::Right((
-                                        futures::future::Either::Right(_),
-                                        _,
-                                    )) => continue,
+                                        // Same ref and deadline, rebuilt payload.
+                                        futures::future::Either::Right((
+                                            futures::future::Either::Right(_),
+                                            _,
+                                        )) => continue,
                                 }
                                 }
                             }
@@ -221,8 +228,6 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                         }))
                         .detach();
 
-                    *client.pairing_cancellation_tx.lock().await = Some(stop_tx);
-                    *client.pairing_qr_refresh_tx.lock().await = Some(refresh_tx);
                     true
                 }
                 "pair-success" => {
@@ -255,9 +260,6 @@ async fn handle_pair_success<'a>(
     } else {
         debug!("QR rotation channel not yet stored — is_logged_in guard will stop the task");
     }
-
-    // Clear pair code state if active
-    *client.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Completed;
 
     client.update_server_time_offset(request_node);
 
@@ -321,6 +323,13 @@ async fn handle_pair_success<'a>(
 
     match result {
         Ok((self_signed_identity_bytes, key_index)) => {
+            // Retired only once the identity and its HMAC check out. A
+            // pair-success that arrives after its own flow was written off can
+            // otherwise cancel the replacement that succeeded it, and then fail
+            // verification against the secret that replacement derived —
+            // leaving neither able to complete.
+            *client.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Completed;
+
             let signed_identity_for_event = match waproto::codec::adv_signed_device_identity_decode(
                 self_signed_identity_bytes.as_slice(),
             ) {
