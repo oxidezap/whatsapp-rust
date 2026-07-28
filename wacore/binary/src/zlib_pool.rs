@@ -390,15 +390,44 @@ mod tests {
             .collect()
     }
 
+    /// A zlib stream carrying `data` verbatim in one stored (uncompressed)
+    /// deflate block, hand-built so the fixture costs no compressor.
+    ///
+    /// `zlib()` above cannot be used under Miri: zlib-rs 0.6.6's *deflate* state
+    /// frees its buffers from `deflate::end` while a `&mut` into them is still
+    /// protected, which Miri rejects. That is the compression half, which this
+    /// crate never runs — inflate is the whole production path — so the fixture
+    /// side steps around it rather than the test being dropped.
+    fn stored_zlib(data: &[u8]) -> Vec<u8> {
+        assert!(data.len() <= u16::MAX as usize, "one stored block only");
+        // 0x78 0x01: deflate, 32 KB window, and (0x78 << 8 | 0x01) % 31 == 0 as
+        // the header check requires.
+        let mut out = vec![0x78, 0x01];
+        let len = data.len() as u16;
+        // BFINAL=1, BTYPE=00 (stored), then the byte-aligned LEN/!LEN pair.
+        out.push(0x01);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&(((b << 16) | a).to_be_bytes()));
+        out
+    }
+
     // Every other test here is sized in hundreds of KB to MB — the only way to
     // reach window refill, the growth projection and shrink-on-return — which
-    // puts a full deflate+inflate cycle hours out of reach of Miri's
-    // interpreter, so they are `#[cfg_attr(miri, ignore)]`. This one keeps the
-    // `set_len` in `inflate_into_spare` under Miri on a fixture it can finish.
+    // puts a full inflate cycle hours out of reach of Miri's interpreter, so
+    // they are `#[cfg_attr(miri, ignore)]`. This one keeps the `set_len` in
+    // `inflate_into_spare` under Miri on a fixture it can finish.
     #[test]
     fn pooled_roundtrip_small_input() {
         let original = varied(1024);
-        let compressed = zlib(&original);
+        let compressed = stored_zlib(&original);
         assert_eq!(
             decompress_zlib_pooled(&compressed, 64 * 1024).unwrap(),
             original
