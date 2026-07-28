@@ -202,16 +202,13 @@ fn regression_a11_history_sync_config_advertises_support_flags() {
     assert_eq!(cfg.support_hatch_history, Some(true));
     assert_eq!(cfg.support_call_log_history, Some(true));
 
-    // Only WA Web's Windows-native branch sends a days limit, and only as 365
-    // alongside `require_full_sync`. The recent-sync default carries none.
+    // Travels with `require_full_sync`; see the branch table on DEVICE_PROPS.
     assert_eq!(cfg.full_sync_days_limit, None);
 }
 
-// A11b. DeviceProps defaults match WA Web's browser branch, not its
-// Windows-native one: a companion that always requests a full backfill asks
-// for more than the client it claims to be, in the payload under the most
-// scrutiny. `requireFullSync` and `fullSyncDaysLimit` move together off one
-// flag over there, so neither may drift alone over here.
+// A11b. DeviceProps defaults stay on the browser row of the branch table
+// documented on `DEVICE_PROPS`. The two fields move off one flag in WA Web,
+// so this pins them together — neither may drift alone.
 
 #[test]
 fn regression_a11b_default_device_props_request_a_recent_sync() {

@@ -150,10 +150,9 @@ impl DevicePropsOverride {
     /// Asks the server for a full history backfill instead of the recent-only
     /// sync the default requests.
     ///
-    /// WA Web never sends this flag on its own — it mirrors the Windows-native
-    /// client (`WAWebEnvironment.isWindows`), and that identity carries three
-    /// other fields with it. Enabling this alone produces a `DeviceProps` shape
-    /// no official client emits; pair it with the rest of the UWP identity:
+    /// This flag belongs to the `win_hybrid` row of the branch table on
+    /// [`DEVICE_PROPS`], and setting it alone leaves the other three fields on
+    /// the browser row. Rebuild the whole row:
     ///
     /// ```rust,ignore
     /// DevicePropsOverride::new()
@@ -197,11 +196,10 @@ impl DevicePropsOverride {
 /// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
 /// hardcoded values.
 ///
-/// `full_sync_days_limit` is one of those: WA Web only sets it (to `365`) on
-/// the branch that also asks for a full sync, so it belongs with
-/// [`DevicePropsOverride::with_require_full_sync`], not in the recent-sync
-/// default. Sending a days limit while asking for a recent sync is a shape no
-/// official client emits, and the limit has nothing to bound anyway.
+/// `full_sync_days_limit` is one of those, for the reason the branch table on
+/// [`DEVICE_PROPS`] gives: it is set only on the row that also asks for a full
+/// sync, so it travels with
+/// [`DevicePropsOverride::with_require_full_sync`] rather than living here.
 ///
 /// `support_*` capability flags are advertised as `true`: they tell the
 /// server which history payload variants the client can ingest, and the
@@ -233,11 +231,15 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
 /// | browser | CHROME/FIREFOX/… | `false` | unset | unset |
 /// | win_hybrid | UWP | `true` | `365` | `true` |
 ///
+/// The four fields are one decision over there — a single variable drives
+/// `require_full_sync` and the days limit, and the same `isWindows` picks the
+/// platform type and `on_demand_ready` — so they may not be set independently
+/// here without producing a shape neither row can explain.
+///
 /// The default mirrors the browser row: a companion that always asks for a full
 /// backfill is asking for more than the client it claims to be, and it does so
 /// in the registration payload. Embedders that genuinely want the backfill opt
-/// in through [`DevicePropsOverride::with_require_full_sync`], which documents
-/// the fields that travel with it.
+/// in through [`DevicePropsOverride::with_require_full_sync`].
 pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
     os: Some("rust".to_string()),
     version: buffa::MessageField::some(wa::device_props::AppVersion {
@@ -708,9 +710,8 @@ mod tests {
         wa::DeviceProps::decode_from_slice(bytes.as_slice()).expect("decode DeviceProps")
     }
 
-    /// The out-of-the-box registration payload matches WA Web's browser branch:
-    /// recent sync, and no days limit tagging along to bound a sync we did not
-    /// ask for.
+    /// Pins the browser row of the [`DEVICE_PROPS`] branch table, end to end
+    /// through the registration payload.
     #[test]
     fn default_props_request_a_recent_sync_without_a_days_limit() {
         let props = registration_device_props(&Device::new());
@@ -726,8 +727,8 @@ mod tests {
         );
     }
 
-    /// The full-sync opt-in reaches the wire, and the fields it travels with
-    /// stay reachable in the same builder chain.
+    /// The `win_hybrid` row is reachable in one builder chain, and every field
+    /// of it lands on the wire.
     #[test]
     fn require_full_sync_override_reaches_registration_payload() {
         let mut device = Device::new();
@@ -758,8 +759,7 @@ mod tests {
         assert_eq!(hsc.complete_on_demand_ready, Some(true));
     }
 
-    /// A `None` on the new field leaves the default alone, like every other
-    /// field on the override.
+    /// `None` preserves the default, like every other field on the override.
     #[test]
     fn require_full_sync_unset_preserves_the_default() {
         let mut device = Device::new();
