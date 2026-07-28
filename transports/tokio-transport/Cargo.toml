@@ -33,5 +33,10 @@ tokio-websockets = { version = "0.13.3", features = [
 wacore = { workspace = true }
 webpki-roots = "1.0.9"
 
+[dev-dependencies]
+# The upgrade-header tests read the request off a local socket. Dev-only, so the
+# release dependency set — and the binary-size gate — are unaffected.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+
 [lints]
 workspace = true

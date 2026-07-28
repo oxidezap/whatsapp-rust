@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use base64::Engine;
 use serde::Deserialize;
 use wacore::download::MediaType;
+use wacore::net::WHATSAPP_WEB_ORIGIN;
 use wacore::sync_marker::MaybeSend;
 
 use crate::client::Client;
@@ -77,7 +78,7 @@ fn build_upload_request(
 
     HttpRequest::post(url)
         .with_header("Content-Type", "application/octet-stream")
-        .with_header("Origin", "https://web.whatsapp.com")
+        .with_header("Origin", WHATSAPP_WEB_ORIGIN)
 }
 
 fn build_resume_check_request(
@@ -87,7 +88,7 @@ fn build_resume_check_request(
     token: &str,
 ) -> HttpRequest {
     let url = format!("https://{hostname}{upload_path}/{token}?auth={auth}&token={token}&resume=1");
-    HttpRequest::post(url).with_header("Origin", "https://web.whatsapp.com")
+    HttpRequest::post(url).with_header("Origin", WHATSAPP_WEB_ORIGIN)
 }
 
 fn upload_error_from_response(response: HttpResponse) -> anyhow::Error {

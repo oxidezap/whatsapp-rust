@@ -7,6 +7,19 @@ use std::sync::Arc;
 /// Default WhatsApp Web websocket endpoint.
 pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
 
+/// `Origin` sent to every WhatsApp Web endpoint — the chat socket and the media
+/// hosts alike.
+///
+/// Constant rather than derived from [`ClientProfile`], because the origin
+/// describes the endpoint and not the client: [`WHATSAPP_WEB_WS_URL`] is the web
+/// companion endpoint whatever platform the `ClientPayload` claims, and the
+/// native apps do not speak to it at all. Omitting it for a non-web profile
+/// would make the connection more anomalous, not less. whatsmeow and Baileys
+/// both send this value unconditionally.
+///
+/// [`ClientProfile`]: crate::client_profile::ClientProfile
+pub const WHATSAPP_WEB_ORIGIN: &str = "https://web.whatsapp.com";
+
 /// Why the transport connection ended. Lets a benign server-initiated stream
 /// recycle (a clean Close frame) be told apart from an abrupt EOF or a real
 /// read error when diagnosing reconnect behavior.
