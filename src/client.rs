@@ -126,7 +126,7 @@ impl NodeFilter {
         node.tag == self.tag.as_str()
             && self.attrs.iter().all(|(k, v)| {
                 node.get_attr(k.as_str())
-                    .is_some_and(|attr| attr.as_str() == v.as_str())
+                    .is_some_and(|attr| attr == v.as_str())
             })
     }
 }

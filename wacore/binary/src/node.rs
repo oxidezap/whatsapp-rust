@@ -1009,6 +1009,77 @@ impl OwnedNodeRef {
 }
 
 #[cfg(test)]
+mod value_ref_compare_tests {
+    use super::*;
+    use crate::jid::Server;
+    use std::str::FromStr;
+
+    /// Callers compare a `ValueRef` against a literal to decide whether a
+    /// stanza came from the server, so `v == needle` has to answer exactly what
+    /// `v.as_str() == needle` answered — including for the server-only shape
+    /// (`s.whatsapp.net`, no user), which is the one those checks actually use.
+    #[test]
+    fn comparing_a_jid_value_matches_comparing_its_rendered_form() {
+        let jids = [
+            "s.whatsapp.net",
+            "5511999998888@s.whatsapp.net",
+            "5511999998888:7@s.whatsapp.net",
+            "5511999998888.2@s.whatsapp.net",
+            "120363012345678901@g.us",
+            "123456789012345@lid",
+            "123456789012345:9@lid",
+            "123456789.4:17@interop",
+            "status@broadcast",
+            "12345.6@hosted.lid",
+        ];
+        let needles = [
+            "s.whatsapp.net",
+            "5511999998888@s.whatsapp.net",
+            "5511999998888:7@s.whatsapp.net",
+            "123456789012345@lid",
+            "",
+            "not-a-jid",
+        ];
+
+        for raw in jids {
+            let owned = Jid::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            let borrowed = ValueRef::Jid(JidRef {
+                user: NodeStr::Borrowed(&owned.user),
+                server: owned.server,
+                agent: owned.agent,
+                device: owned.device,
+                integrator: owned.integrator,
+            });
+            let as_string = ValueRef::String(NodeStr::Borrowed(raw));
+
+            for needle in needles {
+                assert_eq!(
+                    borrowed.as_str() == needle,
+                    borrowed == needle,
+                    "jid value {raw:?} vs {needle:?}"
+                );
+                assert_eq!(
+                    as_string.as_str() == needle,
+                    as_string == needle,
+                    "string value {raw:?} vs {needle:?}"
+                );
+            }
+        }
+
+        // The server-only shape is the one the server checks compare against.
+        let server_only = ValueRef::Jid(JidRef {
+            user: NodeStr::Borrowed(""),
+            server: Server::Pn,
+            agent: 0,
+            device: 0,
+            integrator: 0,
+        });
+        assert!(server_only == "s.whatsapp.net");
+        assert!(server_only != "5511999998888@s.whatsapp.net");
+    }
+}
+
+#[cfg(test)]
 mod owned_node_ref_tests {
     use super::*;
 

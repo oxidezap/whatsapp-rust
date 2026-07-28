@@ -58,10 +58,7 @@ impl Client {
 )]
 pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
     // Server JID is "s.whatsapp.net" (no @ prefix for server-only JIDs)
-    if node
-        .get_attr("from")
-        .is_none_or(|v| v.as_str() != SERVER_JID)
-    {
+    if node.get_attr("from").is_none_or(|v| v != SERVER_JID) {
         return false;
     }
 
