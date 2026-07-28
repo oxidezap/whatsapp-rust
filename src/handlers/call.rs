@@ -264,7 +264,15 @@ impl StanzaHandler for CallHandler {
                                 received_rates,
                             },
                         );
-                        if let Err(e) = client
+                        let registry = client.call_registry();
+                        let is_group = registry.generation_of(call.action.call_id()).is_some_and(
+                            |generation| {
+                                registry.is_group_call_if_current(call.action.call_id(), generation)
+                            },
+                        );
+                        if is_group {
+                            dismiss_incompatible_group_invitee(&client, &call).await;
+                        } else if let Err(e) = client
                             .voip()
                             .terminate(
                                 call.action.call_id(),
@@ -345,14 +353,15 @@ impl StanzaHandler for CallHandler {
                     // no-op for an incoming call or a call we aren't the caller of (no sender registered).
                     #[cfg(feature = "voip-runtime")]
                     if let CallAction::Accept { .. } = &call.action {
+                        let sender = routed_call_sender(&call);
                         // Record the device that answered so a later <terminate> targets it (call
                         // signaling is addressed per device, not to the bare peer the offer rang).
                         client
                             .call_registry()
-                            .set_answering_device(call.action.call_id(), call.from.clone());
+                            .set_answering_device(call.action.call_id(), sender.clone());
                         client
                             .call_registry()
-                            .send_rekey(call.action.call_id(), call.from.to_string());
+                            .send_rekey(call.action.call_id(), sender.to_string());
                     }
                     // Caller-side multi-device dismiss: when one of the callee's devices accepts or
                     // rejects an outbound call of ours, tell the rest to stop ringing.
@@ -722,11 +731,22 @@ impl StanzaHandler for CallHandler {
                             if let (Some(participant), Some(orientation)) =
                                 (participant, orientation)
                             {
+                                let orientation_key = (sender.device != 0)
+                                    .then(|| {
+                                        registry.canonical_group_device_if_current(
+                                            call_id,
+                                            generation,
+                                            call.action.call_creator(),
+                                            &sender,
+                                        )
+                                    })
+                                    .flatten()
+                                    .unwrap_or(participant);
                                 registry.send_video_ctl(
                                     call_id,
                                     generation,
                                     VideoControl::SetParticipantOrientation {
-                                        participant,
+                                        participant: orientation_key,
                                         orientation: *orientation,
                                     },
                                 );
@@ -1256,6 +1276,32 @@ async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     }
 }
 
+#[cfg(feature = "voip-runtime")]
+async fn dismiss_incompatible_group_invitee(client: &Client, call: &IncomingCall) {
+    let target = routed_call_sender(call);
+    if target.server == Server::Call {
+        warn!(
+            "call: ignored codec mismatch without a routed group invitee for {}",
+            call.action.call_id()
+        );
+        return;
+    }
+    let id = client.generate_request_id();
+    let node = build_terminate(&TerminateParams {
+        call_id: call.action.call_id(),
+        to: &target,
+        id: Some(&id),
+        call_creator: call.action.call_creator(),
+        reason: None,
+    });
+    if let Err(error) = client.send_node(node).await {
+        warn!(
+            "call: failed to dismiss codec-incompatible group invitee {}: {error}",
+            target.observe()
+        );
+    }
+}
+
 /// Whether two JIDs name the same device: user + server + device id. Excludes `agent`/`integrator`,
 /// representation details that can differ between the usync device-list and a stanza's `from`.
 #[cfg(feature = "voip-runtime")]
@@ -1428,7 +1474,7 @@ mod tests {
             .call_id("GROUP-CALL".to_string())
             .call_creator(creator.clone())
             .transaction_id(1)
-            .media("audio".to_string())
+            .media("video".to_string())
             .connected_limit(32)
             .joinable(true)
             .av_upgradable(true)
@@ -1530,7 +1576,10 @@ mod tests {
         let generation = registry.insert(session);
         let mut peer = GroupCallParticipant::new(
             participant.clone(),
-            vec![GroupCallDevice::new(participant.clone().with_device(2))],
+            vec![
+                GroupCallDevice::new(participant.clone().with_device(2)),
+                GroupCallDevice::new(participant.clone().with_device(3)),
+            ],
         );
         peer.pn = Some(participant_pn.clone());
         peer.state = Some("connected".to_string());
@@ -1581,7 +1630,7 @@ mod tests {
         let mut cancelled = false;
         assert!(
             CallHandler
-                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
+                .handle(client.clone(), node_to_owned_ref(&stanza), &mut cancelled)
                 .await
         );
         assert!(cancelled);
@@ -1616,6 +1665,36 @@ mod tests {
                 .iter()
                 .any(|control| matches!(control, VideoControl::Disable)),
             "participant signaling cannot disable the call-wide video plane"
+        );
+
+        let routed_device = participant.with_device(3);
+        let stanza = NodeBuilder::new("call")
+            .attr("from", Jid::new("GROUP-CALL", Server::Call))
+            .attr("participant", routed_device.clone())
+            .attr("id", "DEVICE-ORIENTATION")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("video")
+                .attr("call-id", "GROUP-CALL")
+                .attr("call-creator", fake_caller_lid())
+                .attr("state", "0")
+                .attr("device_orientation", "1")
+                .build()])
+            .build();
+        assert!(
+            CallHandler
+                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
+                .await
+        );
+        let device_controls = std::iter::from_fn(|| control_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            device_controls.iter().any(|control| matches!(
+                control,
+                VideoControl::SetParticipantOrientation {
+                    participant,
+                    orientation: 1,
+                } if participant == &routed_device
+            )),
+            "a routed device control must not overwrite its sibling's orientation: {device_controls:?}"
         );
     }
 
@@ -2272,6 +2351,99 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn incompatible_group_invitee_does_not_terminate_the_active_call() {
+        use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
+        use wacore::voip::{CallEvent, GroupStateApply};
+
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
+        let (event_rx, generation) = register_native_opus_call(&client, Vec::new());
+        let creator = fake_caller_lid();
+        assert_eq!(
+            client.call_registry().apply_group_update(
+                GroupCallUpdate::builder()
+                    .call_id("CALL-ID-0001".to_string())
+                    .call_creator(creator.clone())
+                    .transaction_id(1)
+                    .media("audio".to_string())
+                    .connected_limit(32)
+                    .joinable(true)
+                    .av_upgradable(true)
+                    .rekey_requested(false)
+                    .participants(vec![GroupCallParticipant::new(
+                        creator.clone(),
+                        vec![GroupCallDevice::new(creator.with_device(1))],
+                    )])
+                    .build(),
+            ),
+            GroupStateApply::Applied
+        );
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&audio_selection_stanza("8000")),
+                    &mut cancelled,
+                )
+                .await
+        );
+
+        assert_eq!(
+            event_rx.try_recv(),
+            Ok(CallEvent::AudioFormatMismatch {
+                expected_rate: 16_000,
+                received_rates: vec![8_000],
+            })
+        );
+        assert!(
+            client
+                .call_registry()
+                .is_current("CALL-ID-0001", generation),
+            "one incompatible invitee cannot tear down shared group media"
+        );
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the incompatible invitee should receive a terminal stanza"
+        );
+
+        let unrouted = NodeBuilder::new("call")
+            .attr("from", Jid::new("CALL-ID-0001", Server::Call))
+            .attr("id", "UNROUTED-CODEC-MISMATCH")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .children([NodeBuilder::new("audio")
+                    .attr("enc", "opus")
+                    .attr("rate", "8000")
+                    .build()])
+                .build()])
+            .build();
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&unrouted), &mut cancelled)
+                .await
+        );
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unrouted sender must not receive a call-scoped terminate"
+        );
+        assert!(
+            client
+                .call_registry()
+                .is_current("CALL-ID-0001", generation),
+            "an unrouted mismatch cannot end the active group generation"
+        );
+        client
+            .call_registry()
+            .remove_if_current("CALL-ID-0001", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn compatible_audio_selection_keeps_call_active() {
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let (event_rx, generation) = register_native_opus_call(&client, Vec::new());
@@ -2408,6 +2580,10 @@ mod tests {
     async fn call_scoped_accept_records_the_routed_participant_device() {
         let client = make_sending_client().await;
         let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
+        let (rekey_tx, rekey_rx) = async_channel::bounded(1);
+        client
+            .call_registry()
+            .set_rekey_sender("CALL-ID-0001", generation, rekey_tx);
         let participant = fake_caller_lid().with_device(4);
         let accept = NodeBuilder::new("call")
             .attr("from", Jid::new("CALL-ID-0001", Server::Call))
@@ -2447,6 +2623,17 @@ mod tests {
             .group_invite_fallback_roster("CALL-ID-0001", generation)
             .expect("accepted call retains both active device capabilities");
         assert_eq!(fallback[1].devices[0].jid, routed_participant);
+        assert_eq!(
+            client
+                .call_registry()
+                .answering_device_if_current("CALL-ID-0001", generation),
+            Some(routed_participant.clone())
+        );
+        assert_eq!(
+            rekey_rx.try_recv(),
+            Ok(routed_participant.to_string()),
+            "the receive pipeline must rekey to the actual answering device"
+        );
         client
             .call_registry()
             .remove_if_current("CALL-ID-0001", generation);

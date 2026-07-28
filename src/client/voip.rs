@@ -1411,11 +1411,10 @@ impl Voip<'_> {
             .group_transition_lock(call_id, generation)
             .ok_or(CallError::Media("call is no longer active"))?;
         let _transition_guard = transition_lock.lock().await;
-        if registry
-            .group_state_if_current(call_id, generation)
-            .is_none()
-        {
-            return Err(CallError::Media("call is not an active group call"));
+        if !registry.group_creator_matches_if_current(call_id, generation, call_creator) {
+            return Err(CallError::Media(
+                "call creator does not match the active group call",
+            ));
         }
         let participant = self
             .client
@@ -1490,6 +1489,11 @@ impl Voip<'_> {
             .group_transition_lock(call_id, generation)
             .ok_or(CallError::Media("call is no longer active"))?;
         let _transition_guard = transition_lock.lock().await;
+        if !registry.group_creator_matches_if_current(call_id, generation, call_creator) {
+            return Err(CallError::Media(
+                "call creator does not match the active group call",
+            ));
+        }
         let group = registry
             .group_state_if_current(call_id, generation)
             .ok_or(CallError::Media("call is not an active group call"))?;
@@ -2199,7 +2203,46 @@ mod tests {
             3,
             "the rejected post-downgrade transition must stay off the wire"
         );
-        registry.remove_if_current(call_id, generation);
+
+        let replacement_creator = Jid::new("222222222222222", Server::Lid);
+        let mut replacement = CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            replacement_creator.clone(),
+        );
+        replacement.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(replacement_creator)
+                .transaction_id(1)
+                .media("video".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(vec![GroupCallParticipant::new(
+                    participant,
+                    vec![GroupCallDevice::new(
+                        Jid::new("111111111111111", Server::Lid).with_device(1),
+                    )],
+                )])
+                .build(),
+        );
+        let replacement_generation = registry.insert(replacement);
+        assert!(
+            client
+                .voip()
+                .set_hand_raised(call_id, &creator, true)
+                .await
+                .is_err(),
+            "stale creator metadata cannot mutate a replacement generation"
+        );
+        assert_eq!(
+            transport.sent_count(),
+            3,
+            "a stale group identity must be rejected before signaling"
+        );
+        registry.remove_if_current(call_id, replacement_generation);
     }
 
     #[cfg(feature = "voip-runtime")]

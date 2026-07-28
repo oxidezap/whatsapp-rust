@@ -35,6 +35,7 @@ const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
 /// global buffer indefinitely, while controls from an in-flight offer still survive reordering.
 const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
+const MAX_GROUP_CONTROL_QUEUE_BYTES: usize = 1024 * 1024;
 const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// Identifies one peer video-upgrade request within one call generation.
@@ -183,7 +184,16 @@ impl GroupControlQueue {
         )
     }
 
+    fn accepts(&self, control: &GroupControl) -> bool {
+        let queue_capacity = self.tx.capacity().unwrap_or(1).max(1);
+        let max_control_bytes = MAX_GROUP_CONTROL_QUEUE_BYTES / queue_capacity;
+        size_of::<GroupControl>().saturating_add(control.heap_bytes()) <= max_control_bytes
+    }
+
     fn try_send(&self, control: GroupControl) -> bool {
+        if !self.accepts(&control) {
+            return false;
+        }
         self.max_payload_bytes
             .fetch_max(control.heap_bytes(), Ordering::Relaxed);
         self.tx.try_send(control).is_ok()
@@ -629,7 +639,7 @@ impl CallRegistry {
         if super::engine::validate_group_relay_update(&update).is_err() {
             return GroupStateApply::InvalidSnapshot;
         }
-        let (applied, waiting_room_task, event) = {
+        let (applied, waiting_room_task, video_teardown, event) = {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             let Some(entry) = map
                 .get_mut(&update.call_id)
@@ -637,6 +647,13 @@ impl CallRegistry {
             else {
                 return GroupStateApply::UnknownCall;
             };
+            let downgrades_video = update.media == "audio"
+                && (entry.session.is_video
+                    || entry
+                        .group
+                        .as_ref()
+                        .and_then(GroupCallState::snapshot)
+                        .is_some_and(|snapshot| snapshot.media == "video"));
             let local_member = entry
                 .group_invite_self_device
                 .as_ref()
@@ -656,15 +673,26 @@ impl CallRegistry {
             } else {
                 None
             };
+            let video_teardown = if applied == GroupStateApply::Applied && downgrades_video {
+                entry.video = VideoNegotiation::new(false);
+                entry.session.is_video = false;
+                entry.video_teardown.take()
+            } else {
+                None
+            };
             (
                 applied,
                 waiting_room_task,
+                video_teardown,
                 (applied == GroupStateApply::Applied).then(|| entry.group_update_event.clone()),
             )
         };
         // Abort the heartbeat outside the registry lock: executor cancellation is an external
         // callback and must never be able to re-enter while the map is borrowed.
         drop(waiting_room_task);
+        if let Some(video_teardown) = video_teardown {
+            video_teardown();
+        }
         if let Some(event) = event {
             event.notify(usize::MAX);
         }
@@ -850,6 +878,24 @@ impl CallRegistry {
             .and_then(|entry| entry.group.clone())
     }
 
+    /// Whether one exact active group generation carries the supplied signaling creator.
+    pub fn group_creator_matches_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        call_creator: &Jid,
+    ) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .is_some_and(|entry| {
+                entry.generation == generation
+                    && entry.is_group_call
+                    && entry.session.call_creator == *call_creator
+            })
+    }
+
     /// Whether a routed signaling sender is the creator or belongs to this exact active group call.
     ///
     /// The creator is the only trusted bootstrap sender before a call-link admission installs its
@@ -920,6 +966,28 @@ impl CallRegistry {
             entry.generation == generation && entry.session.call_creator == *call_creator
         })?;
         Self::canonical_group_participant_for_entry(entry, call_creator, sender)
+    }
+
+    /// Resolve a routed device to the exact device JID retained by the authoritative roster.
+    pub fn canonical_group_device_if_current(
+        &self,
+        call_id: &str,
+        generation: u64,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> Option<Jid> {
+        let map = self.inner.lock().expect("registry lock poisoned");
+        let entry = map.get(call_id).filter(|entry| {
+            entry.generation == generation && entry.session.call_creator == *call_creator
+        })?;
+        let snapshot = entry.group.as_ref().and_then(GroupCallState::snapshot)?;
+        snapshot
+            .participants
+            .iter()
+            .filter(|participant| participant.is_connected())
+            .flat_map(|participant| participant.devices.iter())
+            .find(|device| device.jid.device_eq(sender))
+            .map(|device| device.jid.clone())
     }
 
     fn canonical_group_participant_for_entry(
@@ -1607,6 +1675,9 @@ impl CallRegistry {
     /// Roster updates may be coalesced under backpressure; losing the only pending epoch would leave
     /// the media engine permanently unable to decrypt the latest generation.
     fn force_send_preserving_epoch(tx: &GroupControlQueue, mut command: GroupControl) -> bool {
+        if !tx.accepts(&command) {
+            return false;
+        }
         let latest_update_transaction = match &command {
             GroupControl::Update(update) | GroupControl::Transition { update, .. } => {
                 Some(update.transaction_id)
@@ -3021,6 +3092,40 @@ mod tests {
     }
 
     #[test]
+    fn group_control_queue_rejects_payloads_that_break_its_total_byte_budget() {
+        let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
+        let queue = GroupControlQueue::new(control_tx);
+        let mut update = group_update(1);
+        update.participants.push(GroupCallParticipant {
+            jid: Jid::new("222222222222222", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(2),
+                capability_version: Some(1),
+                capability: vec![7; MAX_GROUP_CONTROL_QUEUE_BYTES],
+            }],
+        });
+
+        assert!(!CallRegistry::force_send_preserving_epoch(
+            &queue,
+            GroupControl::Update(Box::new(update)),
+        ));
+        assert!(control_rx.is_empty());
+        assert_eq!(queue.retained_bytes(), 0);
+        assert!(
+            CallRegistry::force_send_preserving_epoch(
+                &queue,
+                GroupControl::RawEpoch(GroupRawEpoch::new(1, vec![7; 32])),
+            ),
+            "rejecting an oversized roster must leave capacity for an epoch"
+        );
+    }
+
+    #[test]
     fn registration_listener_closes_offer_control_race() {
         let reg = CallRegistry::new();
         let listener = reg.listen_registration();
@@ -3801,6 +3906,51 @@ mod tests {
         assert!(reg.run_video_teardown("CID", generation));
         assert!(lock_was_free.load(Ordering::SeqCst));
         assert!(!reg.run_video_teardown("CID", generation));
+    }
+
+    #[test]
+    fn authoritative_group_audio_downgrade_runs_video_teardown_after_unlock() {
+        let reg = Arc::new(CallRegistry::new());
+        let mut active = session("GROUP-CALL");
+        active.is_video = true;
+        let generation = reg.insert_group(active);
+        let mut video = group_update(1);
+        video.media = "video".to_string();
+        assert_eq!(
+            reg.apply_group_update_if_current(video, generation),
+            GroupStateApply::Applied
+        );
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        let teardown_calls = Arc::new(AtomicU64::new(0));
+        reg.set_video_channels("GROUP-CALL", generation, event_tx, ctl_tx, {
+            let reg = reg.clone();
+            let teardown_calls = teardown_calls.clone();
+            Box::new(move || {
+                assert!(
+                    reg.inner.try_lock().is_ok(),
+                    "video teardown must run outside the registry lock"
+                );
+                teardown_calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let audio = group_update(2);
+        assert_eq!(
+            reg.apply_group_update_if_current(audio, generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            reg.video_states("GROUP-CALL", generation),
+            Some((VideoState::Disabled, VideoState::Disabled))
+        );
+        assert!(!reg.snapshot("GROUP-CALL").expect("active session").is_video);
+        assert_eq!(teardown_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !reg.run_video_teardown("GROUP-CALL", generation),
+            "the downgrade hook is one-shot until video endpoints are reattached"
+        );
     }
 
     #[test]

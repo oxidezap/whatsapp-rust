@@ -949,6 +949,9 @@ impl CallEngine {
         now: Millis,
         config: GroupEngineConfig,
     ) -> Result<(), EngineError> {
+        if !group_roster_contains_participant(&config.initial_update, &self.self_participant_id) {
+            return Err(GroupMediaError::LocalParticipantRemoved.into());
+        }
         // Validate relay material before constructing or publishing group state. In particular, a
         // failed direct-to-group promotion must remain retryable with the same roster transaction.
         let relay_refresh = prepare_group_relay_refresh(&config.initial_update)?;
@@ -1495,11 +1498,9 @@ impl CallEngine {
         let Some(group) = self.group.as_mut() else {
             return;
         };
-        let orientation = orientation & 0x03;
         group
             .video_orientations
-            .insert(participant.to_non_ad(), orientation);
-        group.video_orientations.insert(participant, orientation);
+            .insert(participant, orientation & 0x03);
     }
 
     /// Begin the media session with separate monotonic and Unix clocks. RTCP scheduling must not
@@ -2645,6 +2646,30 @@ mod encoded_tests {
             })
             .expect("configure group");
         engine
+    }
+
+    #[test]
+    fn initial_group_roster_requires_the_local_device() {
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+        let mut update = group_update();
+        update.participants.remove(0);
+
+        assert!(matches!(
+            engine.configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: Jid::new("15550001111", Server::Lid),
+                initial_update: update,
+                direct_peer: None,
+            }),
+            Err(EngineError::GroupMedia(
+                GroupMediaError::LocalParticipantRemoved
+            ))
+        ));
+        assert!(
+            !engine.is_group(),
+            "a roster that never admitted this device cannot publish group media"
+        );
     }
 
     #[test]
@@ -4636,6 +4661,23 @@ mod tests {
                 ..
             }) if *sender == peer_user && *device == peer_device
         )));
+    }
+
+    #[test]
+    fn group_video_orientation_keeps_sibling_devices_distinct() {
+        let (mut eng, _epoch) = group_engine(true);
+        let first = Jid::new("222222222222222", Server::Lid).with_device(2);
+        let second = first.to_non_ad().with_device(3);
+        eng.set_participant_video_orientation(first.clone(), 1);
+        eng.set_participant_video_orientation(second.clone(), 3);
+
+        let orientations = &eng.group.as_ref().expect("group state").video_orientations;
+        assert_eq!(orientations.get(&first), Some(&1));
+        assert_eq!(orientations.get(&second), Some(&3));
+        assert!(
+            !orientations.contains_key(&first.to_non_ad()),
+            "device controls must not overwrite a user-wide fallback"
+        );
     }
 
     #[test]

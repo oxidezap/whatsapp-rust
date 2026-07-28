@@ -8,6 +8,7 @@ use anyhow::{Result, anyhow, bail};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef, Server};
 
+use crate::types::call::CallActionTag;
 use crate::types::group_call::{
     CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GROUP_CALL_MAX_PARTICIPANTS,
     GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
@@ -278,8 +279,8 @@ fn parse_group_snapshot(
     envelope: GroupSnapshotEnvelope,
 ) -> Result<Option<GroupCallUpdate>> {
     let expected_tag = match envelope {
-        GroupSnapshotEnvelope::Offer => "offer",
-        GroupSnapshotEnvelope::Update => "group_update",
+        GroupSnapshotEnvelope::Offer => CallActionTag::Offer.as_str(),
+        GroupSnapshotEnvelope::Update => CallActionTag::GroupUpdate.as_str(),
         GroupSnapshotEnvelope::Ack => "ack",
     };
     if node.tag != expected_tag {
@@ -1572,7 +1573,7 @@ mod tests {
     fn group_update_preserves_transaction_roster_relay_and_rekey() {
         let creator = jid("100001", 1);
         let device = jid("200002", 2);
-        let node = NodeBuilder::new("group_update")
+        let node = NodeBuilder::new(CallActionTag::GroupUpdate.as_str())
             .attr("call-id", "CID")
             .attr("call-creator", &creator)
             .children([
