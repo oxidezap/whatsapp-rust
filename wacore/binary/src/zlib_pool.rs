@@ -390,7 +390,24 @@ mod tests {
             .collect()
     }
 
+    // Every other test here is sized in hundreds of KB to MB — the only way to
+    // reach window refill, the growth projection and shrink-on-return — which
+    // puts a full deflate+inflate cycle hours out of reach of Miri's
+    // interpreter, so they are `#[cfg_attr(miri, ignore)]`. This one keeps the
+    // `set_len` in `inflate_into_spare` under Miri on a fixture it can finish.
     #[test]
+    fn pooled_roundtrip_small_input() {
+        let original = varied(1024);
+        let compressed = zlib(&original);
+        assert_eq!(
+            decompress_zlib_pooled(&compressed, 64 * 1024).unwrap(),
+            original
+        );
+        assert_eq!(drain_reader(&compressed, original.len()), original);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_roundtrip_across_chunks() {
         // >128 KB so the stream spans multiple 64 KB decompress windows, and read
         // it back in tiny odd steps to exercise refill + compaction.
@@ -408,6 +425,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_ensure_larger_than_chunk() {
         // A single record bigger than the 64 KB window must be fully buffered.
         let original: Vec<u8> = (0..150 * 1024).map(|i| (i % 256) as u8).collect();
@@ -418,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_keeps_one_window_for_smaller_records() {
         INFLATE_POOL.with(|p| p.borrow_mut().clear());
         const RECORD: usize = 30 * 1024;
@@ -440,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_enforces_max() {
         let original = vec![0u8; 1024 * 1024];
         let compressed = zlib(&original);
@@ -448,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn pooled_high_ratio_stream_roundtrips() {
         // ~50x expansion: the 2x up-front guess undershoots badly, so this
         // exercises the ratio-projected growth path end to end.
@@ -470,6 +491,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn pooled_oneshot_matches_streaming() {
         let original = varied(100_000);
         let compressed = zlib(&original);
@@ -490,6 +512,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_reuses_pool_state_correctly() {
         // Back-to-back readers each checkout the pooled Decompress and reset it, so
         // no state may carry over between streams. Verify several sizes in sequence.
@@ -500,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_reuse_after_error() {
         // A reader aborted mid-stream (max exceeded) returns partial zlib state to
         // the pool; the next checkout must reset it and decompress a full stream.
@@ -513,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn drop_shrinks_oversized_buffer_before_pooling() {
         // Buffering a large record grows `buf` to many MB; on return to the pool it
         // must be shrunk back toward the bounded steady-state capacity, not parked
