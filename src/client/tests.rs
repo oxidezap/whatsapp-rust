@@ -1638,6 +1638,146 @@ async fn connect_failure_403_dispatches_account_locked_logout() {
     );
 }
 
+/// An account lock states its enforcement data exactly once: the appeal token is
+/// the only route to contest the lock, and `violation_reason` / `vt` are the
+/// only description of it. WA Web ignores those attributes (its appeal flow is
+/// native), so nothing parses them here either — but dropping them makes them
+/// unrecoverable, so the whole stanza rides on the event.
+#[tokio::test]
+async fn account_lock_logout_preserves_enforcement_attributes() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "403")
+        .attr("location", "rva")
+        .attr("violation_reason", "other_harm")
+        .attr("vt", "1")
+        .attr("appeal_token", "0aFICTITIOUSappealTOKEN00")
+        .attr("logout_message_header", "Conta desconectada")
+        .attr("logout_message_subtext", "Abra o WhatsApp no celular")
+        .attr("logout_message_locale", "pt_BR")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    let evt = events.try_recv().expect("403 dispatches LoggedOut");
+    match &*evt {
+        Event::LoggedOut(lo) => {
+            let raw = lo.raw.as_ref().expect("the <failure> stanza must survive");
+            assert_eq!(
+                raw.attrs.get("appeal_token").map(|v| v.as_str()).as_deref(),
+                Some("0aFICTITIOUSappealTOKEN00"),
+                "the one-time appeal token must reach the embedder"
+            );
+            assert_eq!(
+                raw.attrs
+                    .get("violation_reason")
+                    .map(|v| v.as_str())
+                    .as_deref(),
+                Some("other_harm")
+            );
+            assert_eq!(
+                raw.attrs.get("vt").map(|v| v.as_str()).as_deref(),
+                Some("1")
+            );
+
+            // The localized copy is typed, the way WA Web parses it, with the
+            // locale that decides whether it is safe to render.
+            let msg = lo
+                .logout_message
+                .as_ref()
+                .expect("logout_message_* must be surfaced");
+            assert_eq!(msg.header.as_deref(), Some("Conta desconectada"));
+            assert_eq!(msg.subtext.as_deref(), Some("Abra o WhatsApp no celular"));
+            assert_eq!(msg.locale.as_deref(), Some("pt_BR"));
+        }
+        _ => panic!("expected Event::LoggedOut for reason=403"),
+    }
+}
+
+/// WA Web hands `code`, `expire`, `message` and `url` to its temporary-ban UI —
+/// `url` is the link it opens. All four must survive the dispatch.
+#[tokio::test]
+async fn temporary_ban_carries_message_url_and_stanza() {
+    use wacore::types::events::{ChannelEventHandler, TempBanReason};
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "402")
+        .attr("code", "101")
+        .attr("expire", "3600")
+        .attr("message", "too many messages")
+        .attr("url", "https://faq.example.invalid/ban")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events.try_recv().expect("402 dispatches TemporaryBan") {
+        Event::TemporaryBan(ban) => {
+            assert_eq!(ban.code, TempBanReason::SentToTooManyPeople);
+            assert_eq!(ban.expire, chrono::Duration::seconds(3600));
+            assert_eq!(ban.message.as_deref(), Some("too many messages"));
+            assert_eq!(ban.url.as_deref(), Some("https://faq.example.invalid/ban"));
+            assert!(ban.raw.is_some(), "the <failure> stanza must survive");
+        }
+        _ => panic!("expected Event::TemporaryBan for reason=402"),
+    }
+}
+
+/// A 402 without `expire` is not a ban that lifted at the epoch. WA Web errors
+/// out rather than reporting one, so we surface the raw failure instead of
+/// fabricating a zero duration.
+#[tokio::test]
+async fn temporary_ban_without_expire_falls_back_to_connect_failure() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "402")
+        .attr("code", "101")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events
+        .try_recv()
+        .expect("an incomplete 402 still dispatches")
+    {
+        Event::ConnectFailure(cf) => {
+            assert_eq!(cf.reason, ConnectFailureReason::TempBanned);
+            assert!(cf.raw.is_some(), "the <failure> stanza must survive");
+        }
+        other => panic!("expected Event::ConnectFailure, got {other:?}"),
+    }
+}
+
+/// 405 is the one branch with nothing to parse, which is exactly why it used to
+/// throw the stanza away; the client version the server rejected is in there.
+#[tokio::test]
+async fn client_outdated_carries_the_stanza() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "405")
+        .attr("message", "client too old")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events.try_recv().expect("405 dispatches ClientOutdated") {
+        Event::ClientOutdated(co) => {
+            assert!(co.raw.is_some(), "the <failure> stanza must survive")
+        }
+        _ => panic!("expected Event::ClientOutdated for reason=405"),
+    }
+}
+
 #[tokio::test]
 async fn delivery_receipt_activity_state_machine() {
     let client = create_offline_sync_test_client().await;

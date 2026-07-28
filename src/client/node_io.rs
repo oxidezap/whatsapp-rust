@@ -1614,6 +1614,7 @@ impl Client {
                     crate::types::events::LoggedOut::builder()
                         .on_connect(false)
                         .reason(ConnectFailureReason::LoggedOut)
+                        .raw(node.to_owned())
                         .build(),
                 )
             };
@@ -1636,6 +1637,7 @@ impl Client {
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
                             .reason(ConnectFailureReason::LoggedOut)
+                            .raw(node.to_owned())
                             .build(),
                     ));
                     should_disconnect = true;
@@ -1648,6 +1650,7 @@ impl Client {
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
                             .reason(ConnectFailureReason::LoggedOut)
+                            .raw(node.to_owned())
                             .build(),
                     ));
                     should_disconnect = true;
@@ -1753,9 +1756,12 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.notify_connection_shutdown();
 
-        let mut attrs = node.attrs();
-        let reason_code = attrs.optional_u64("reason").unwrap_or(0) as i32;
-        let reason = ConnectFailureReason::from(reason_code);
+        let failure = wacore::stanza::connect_failure::ConnectFailureStanza::parse(node);
+        // A `<failure>` with no usable `reason` is not a failure we can classify:
+        // treat it as unknown, which stops auto-reconnect rather than looping
+        // against a server that just refused us. (WA Web drops the stanza
+        // outright; it has a UI to fall back on, an embedder does not.)
+        let reason = failure.reason.unwrap_or(ConnectFailureReason::Unknown(0));
 
         if reason.should_reconnect() {
             self.expected_disconnect.store(false, Ordering::Relaxed);
@@ -1763,8 +1769,10 @@ impl Client {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
         }
 
+        // Every branch below keeps the stanza on its event. The server states
+        // things here exactly once — an account lock's one-time `appeal_token`,
+        // a ban's support URL — and a `warn!` line is not a delivery channel.
         if reason.is_logged_out() {
-            // Log the full <failure> so a server-side lock/ban is diagnosable;
             // `location` (e.g. "rva") is a routing token, not the cause.
             warn!(
                 "Got {reason:?} connect failure, logging out: {}",
@@ -1774,11 +1782,14 @@ impl Client {
                 crate::types::events::LoggedOut::builder()
                     .on_connect(true)
                     .reason(reason)
+                    .maybe_logout_message(failure.logout_message())
+                    .raw(node.to_owned())
                     .build(),
             ));
-        } else if let ConnectFailureReason::TempBanned = reason {
-            let ban_code = attrs.optional_u64("code").unwrap_or(0) as i32;
-            let expire_secs = attrs.optional_u64("expire").unwrap_or(0);
+        } else if let ConnectFailureReason::TempBanned = reason
+            && let Some(expire_secs) = failure.expire
+            && let Some(ban_code) = failure.code
+        {
             let expire_duration =
                 chrono::Duration::try_seconds(expire_secs as i64).unwrap_or_default();
             warn!(
@@ -1789,19 +1800,27 @@ impl Client {
                 crate::types::events::TemporaryBan::builder()
                     .code(crate::types::events::TempBanReason::from(ban_code))
                     .expire(expire_duration)
+                    .maybe_message(failure.message.as_deref().map(str::to_owned))
+                    .maybe_url(failure.url.as_deref().map(str::to_owned))
+                    .raw(node.to_owned())
                     .build(),
             ));
         } else if let ConnectFailureReason::ClientOutdated = reason {
             error!("Client is outdated and was rejected by server.");
             self.core.event_bus.dispatch(Event::ClientOutdated(
-                crate::types::events::ClientOutdated::builder().build(),
+                crate::types::events::ClientOutdated::builder()
+                    .raw(node.to_owned())
+                    .build(),
             ));
         } else {
+            // Also the landing spot for a 402 that omitted `code`/`expire`:
+            // WA Web errors out there instead of reporting a ban that lifts at
+            // the epoch, so the raw stanza is all we can honestly hand over.
             warn!("Unknown connect failure: {}", DisplayableNodeRef(node));
             self.core.event_bus.dispatch(Event::ConnectFailure(
                 crate::types::events::ConnectFailure::builder()
                     .reason(reason)
-                    .maybe_message(attrs.optional_string("message").map(|m| m.into_owned()))
+                    .maybe_message(failure.message.as_deref().map(str::to_owned))
                     .raw(node.to_owned())
                     .build(),
             ));
