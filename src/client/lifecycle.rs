@@ -352,7 +352,6 @@ impl Client {
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
-            pending_reg_refresh: portable_atomic::AtomicBool::new(false),
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),

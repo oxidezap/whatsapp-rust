@@ -405,7 +405,6 @@ impl Client {
             }
             *state = PairCodeState::Idle;
         }
-        crate::handlers::notification::apply_pending_reg_refresh(self).await;
     }
 }
 
@@ -762,9 +761,6 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
             target: "Client/PairCode",
             "No pair-success within {timeout:?} of companion_finish; the code will not complete"
         );
-        // Nothing depends on the adv secret any more, so a registration refresh
-        // this flow held up can finally happen.
-        crate::handlers::notification::apply_pending_reg_refresh(&client).await;
         client.core.event_bus.dispatch(Event::PairingCodeRefresh(
             crate::types::events::PairingCodeRefresh::builder()
                 .force_manual(false)
@@ -1583,35 +1579,6 @@ mod tests {
             claim: wacore::pair_code::PairCodeClaim::next(),
         };
         assert!(!client.owns_code_claim(claim).await);
-    }
-
-    /// Regression: a registration refresh deferred to a pair-code flow must not
-    /// be dropped when that flow fails. The secret the server asked to retire is
-    /// still the one the QR advertises.
-    #[tokio::test(start_paused = true)]
-    async fn a_deferred_registration_refresh_lands_when_the_flow_gives_up() {
-        let (client, transport) = create_iq_test_client().await;
-        let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
-
-        let notif = primary_hello_notif(&pairing_ref);
-        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
-        poll_until("companion_finish to reach the transport", || {
-            !transport.sent().is_empty()
-        })
-        .await;
-        let adv_after_stage_two = adv(&client);
-
-        // The server asks for a refresh while pair-success is still due.
-        client
-            .pending_reg_refresh
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
-        poll_until("the deferred rotation to be applied", || {
-            adv(&client) != adv_after_stage_two
-        })
-        .await;
     }
 
     // ── Stage-2 liveness (WA Web parity) ─────────────────────────────────────

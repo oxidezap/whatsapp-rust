@@ -90,7 +90,6 @@ mod groups;
 mod privacy_business;
 mod profile;
 
-pub(crate) use companion_reg::apply_pending_reg_refresh;
 use companion_reg::*;
 // `pub(crate)` re-export keeps `crate::handlers::notification::handle_local_identity_change`
 // resolving for device_registry.rs.
