@@ -710,9 +710,12 @@ impl Node {
     }
 
     pub fn get_children_by_tag<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a Node> {
+        // `unwrap_or_default` and not `into_iter().flatten()`: the absent case is
+        // already an empty slice, so flattening only buys a nested iterator whose
+        // state machine LLVM does not fold away on this hot traversal.
         self.children()
-            .into_iter()
-            .flatten()
+            .unwrap_or_default()
+            .iter()
             .filter(move |c| c.tag == tag)
     }
 
@@ -800,9 +803,10 @@ impl<'a> NodeRef<'a> {
     where
         'a: 'b,
     {
+        // See the owned `get_children_by_tag` for why this is not `flatten`.
         self.children()
-            .into_iter()
-            .flatten()
+            .unwrap_or_default()
+            .iter()
             .filter(move |c| c.tag == tag)
     }
 
