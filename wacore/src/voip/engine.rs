@@ -1271,8 +1271,13 @@ impl CallEngine {
             self.allocated = false;
         }
         self.allocate_pending = true;
-        if self.started {
+        if self.started && reconnect.is_none() {
             self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
+        } else if reconnect.is_some() {
+            // The shell cannot send the replacement Allocate until transport reconnection
+            // completes. Starting its deadline here would charge the network handshake against the
+            // relay response budget.
+            self.allocate_deadline = NEVER;
         }
         let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
         let pids = remote_group_pids(update, &self.self_participant_id);
@@ -1556,6 +1561,13 @@ impl CallEngine {
             && m.audio.io == AudioIo::Pcm
         {
             m.playout_deadline = now + PLAYOUT_MS;
+        }
+    }
+
+    /// Start the deferred allocation-response budget once a replacement relay transport is ready.
+    pub(crate) fn relay_reconnected(&mut self, now: Millis) {
+        if self.started && self.allocate_pending && self.allocate_deadline == NEVER {
+            self.allocate_deadline = now + ALLOCATE_TIMEOUT_MS;
         }
     }
 
@@ -3360,7 +3372,19 @@ mod encoded_tests {
             "the shell must redial before sending the replacement allocate"
         );
 
-        engine.handle_input(12_001, Input::Timeout);
+        assert_eq!(
+            engine.allocate_deadline, NEVER,
+            "the reconnect handshake must not consume the allocation response budget"
+        );
+        engine.relay_reconnected(14_000);
+        engine.handle_input(23_999, Input::Timeout);
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
+            "the replacement allocation retains its full response budget after reconnect"
+        );
+        engine.handle_input(24_000, Input::Timeout);
         assert!(
             drain(&mut engine)
                 .iter()

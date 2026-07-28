@@ -988,6 +988,7 @@ async fn run_call_with_clock_and_wallclock(
             let retired = std::mem::replace(&mut transport, replacement);
             relay_events = replacement_events;
             retired.disconnect().await;
+            eng.relay_reconnected(now_ms());
         }
 
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
