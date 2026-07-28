@@ -35,6 +35,8 @@ use wacore_binary::Jid;
 use wacore_binary::Node;
 #[cfg(feature = "voip-runtime")]
 use wacore_binary::Server;
+#[cfg(feature = "voip-runtime")]
+use zeroize::Zeroizing;
 
 #[cfg(feature = "voip-runtime")]
 use super::ResponseWaiter;
@@ -82,6 +84,11 @@ enum WaitingRoomUserAction {
 enum PendingCallLinkTransition {
     Group(Box<GroupCallUpdate>),
     WaitingRoom(WaitingRoom),
+    RawEpoch {
+        transaction_id: u32,
+        raw_epoch: Zeroizing<Vec<u8>>,
+    },
+    Terminated,
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -117,6 +124,8 @@ impl PendingCallLinkTransition {
         match self {
             Self::Group(update) => Self::group_heap_bytes(update),
             Self::WaitingRoom(room) => Self::waiting_room_heap_bytes(room),
+            Self::RawEpoch { raw_epoch, .. } => raw_epoch.capacity(),
+            Self::Terminated => 0,
         }
     }
 }
@@ -254,6 +263,23 @@ impl Client {
         }
     }
 
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) fn pending_call_link_control_candidate(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> bool {
+        let state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active != 0
+            && !call_id.is_empty()
+            && sender.to_non_ad() == call_creator.to_non_ad()
+            && self.call_registry.generation_of(call_id).is_none()
+    }
+
     /// Buffer a creator-authenticated admission snapshot while its link-join ACK is being
     /// registered. The pending-state lock is shared with registration, closing both orderings of
     /// the ACK/update race without accepting arbitrary unknown calls.
@@ -290,7 +316,9 @@ impl Client {
             .rev()
             .find_map(|transition| match transition {
                 PendingCallLinkTransition::Group(update) => Some(update.transaction_id),
-                PendingCallLinkTransition::WaitingRoom(_) => None,
+                PendingCallLinkTransition::WaitingRoom(_)
+                | PendingCallLinkTransition::RawEpoch { .. }
+                | PendingCallLinkTransition::Terminated => None,
             })
             .is_some_and(|transaction_id| transaction_id >= update.transaction_id)
         {
@@ -309,6 +337,129 @@ impl Client {
             .or_default()
             .push(PendingCallLinkTransition::Group(Box::new(update.clone())));
         PendingCallLinkBuffer::Buffered
+    }
+
+    /// Retain a creator-authenticated epoch that overtook publication of the call-link generation.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) fn buffer_pending_call_link_epoch(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        sender: &Jid,
+        transaction_id: u32,
+        raw_epoch: Zeroizing<Vec<u8>>,
+    ) -> PendingCallLinkBuffer {
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active == 0
+            || call_id.is_empty()
+            || sender.to_non_ad() != call_creator.to_non_ad()
+            || self.call_registry.generation_of(call_id).is_some()
+        {
+            return PendingCallLinkBuffer::NotPending;
+        }
+        if state.saturated {
+            return PendingCallLinkBuffer::Saturated;
+        }
+        if state
+            .transitions
+            .get(call_id)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find_map(|transition| match transition {
+                PendingCallLinkTransition::RawEpoch { transaction_id, .. } => Some(*transaction_id),
+                _ => None,
+            })
+            .is_some_and(|retained| retained >= transaction_id)
+        {
+            return PendingCallLinkBuffer::Buffered;
+        }
+        if !state.can_buffer_transition(call_id, raw_epoch.capacity()) {
+            state.saturated = true;
+            return PendingCallLinkBuffer::Saturated;
+        }
+        state
+            .transitions
+            .entry(call_id.to_string())
+            .or_default()
+            .push(PendingCallLinkTransition::RawEpoch {
+                transaction_id,
+                raw_epoch,
+            });
+        PendingCallLinkBuffer::Buffered
+    }
+
+    /// Mark a creator-authenticated call-link generation as ended before its ACK is registered.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) fn buffer_pending_call_link_terminate(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> PendingCallLinkBuffer {
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active == 0
+            || call_id.is_empty()
+            || sender.to_non_ad() != call_creator.to_non_ad()
+            || self.call_registry.generation_of(call_id).is_some()
+        {
+            return PendingCallLinkBuffer::NotPending;
+        }
+        if state.saturated {
+            return PendingCallLinkBuffer::Saturated;
+        }
+        if state
+            .transitions
+            .get(call_id)
+            .into_iter()
+            .flatten()
+            .any(|transition| matches!(transition, PendingCallLinkTransition::Terminated))
+        {
+            return PendingCallLinkBuffer::Buffered;
+        }
+        if !state.can_buffer_transition(call_id, 0) {
+            state.saturated = true;
+            return PendingCallLinkBuffer::Saturated;
+        }
+        state
+            .transitions
+            .entry(call_id.to_string())
+            .or_default()
+            .push(PendingCallLinkTransition::Terminated);
+        PendingCallLinkBuffer::Buffered
+    }
+
+    /// Serialize a terminal control with publication of the call-link generation it targets.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn retain_or_apply_pending_call_link_terminate(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        sender: &Jid,
+    ) -> bool {
+        let _answer_transition = self.lock_answer_transition(call_id).await;
+        let buffered = self.buffer_pending_call_link_terminate(call_id, call_creator, sender);
+        if buffered.suppresses_dispatch() {
+            return true;
+        }
+        let Some(generation) = self.call_registry.generation_of(call_id) else {
+            return false;
+        };
+        if !self.call_registry.group_creator_authorized_if_current(
+            call_id,
+            generation,
+            call_creator,
+            sender,
+        ) {
+            return false;
+        }
+        self.call_registry.remove_if_current(call_id, generation)
     }
 
     /// Buffer a creator-authenticated waiting-room snapshot in the same ordered call-link
@@ -375,6 +526,12 @@ impl Client {
             return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
         }
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
+        if staged
+            .iter()
+            .any(|transition| matches!(transition, PendingCallLinkTransition::Terminated))
+        {
+            return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
+        }
         let generation = self.call_registry.insert_call_link_checked(session)?;
         if let Some(room) = waiting_room {
             let applied = self
@@ -421,6 +578,24 @@ impl Client {
                         self.call_registry.remove_if_current(&call_id, generation);
                         return Err(applied);
                     }
+                }
+                PendingCallLinkTransition::RawEpoch {
+                    transaction_id,
+                    raw_epoch,
+                } => {
+                    if !self.call_registry.send_group_epoch_if_current(
+                        &call_id,
+                        generation,
+                        transaction_id,
+                        raw_epoch.to_vec(),
+                    ) {
+                        self.call_registry.remove_if_current(&call_id, generation);
+                        return Err(wacore::voip::GroupStateApply::UnknownCall);
+                    }
+                }
+                PendingCallLinkTransition::Terminated => {
+                    self.call_registry.remove_if_current(&call_id, generation);
+                    return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 _ => {}
             }
@@ -1464,6 +1639,8 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
+    #[cfg(feature = "voip-runtime")]
+    use zeroize::Zeroizing;
 
     #[cfg(feature = "voip-runtime")]
     use super::{MAX_PENDING_CALL_LINK_TRANSITION_BYTES, WaitingRoomUserAction};
@@ -2680,6 +2857,114 @@ mod tests {
         );
 
         drop(pending);
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_termination_before_registration_rejects_the_join() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "TERMINATED-CALL-LINK";
+        let _pending = client.begin_call_link_join();
+        assert!(
+            client
+                .retain_or_apply_pending_call_link_terminate(
+                    call_id,
+                    &creator,
+                    &creator.clone().with_device(1),
+                )
+                .await
+        );
+
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::WaitingRoom);
+        assert_eq!(
+            client
+                .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+                .await,
+            Err(wacore::voip::GroupStateApply::InvalidSnapshot)
+        );
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            None,
+            "a terminal control that overtakes registration must prevent publication"
+        );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_termination_removes_a_generation_that_won_registration() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "REGISTERED-THEN-TERMINATED-CALL-LINK";
+        let _pending = client.begin_call_link_join();
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator.clone());
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::WaitingRoom);
+        let generation = client
+            .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+            .await
+            .expect("registration wins the answer-transition lane");
+
+        assert!(
+            client
+                .retain_or_apply_pending_call_link_terminate(
+                    call_id,
+                    &creator,
+                    &creator.with_device(1),
+                )
+                .await
+        );
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            None,
+            "the terminal control must remove the just-published generation"
+        );
+        assert!(
+            !client.call_registry().is_current(call_id, generation),
+            "the removed generation cannot remain active"
+        );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_epoch_before_registration_is_replayed_to_the_generation() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "EPOCH-CALL-LINK";
+        let _pending = client.begin_call_link_join();
+        assert_eq!(
+            client.buffer_pending_call_link_epoch(
+                call_id,
+                &creator,
+                &creator.clone().with_device(1),
+                7,
+                Zeroizing::new(vec![7; 32]),
+            ),
+            PendingCallLinkBuffer::Buffered
+        );
+
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::Connecting);
+        let generation = client
+            .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+            .await
+            .expect("valid call-link generation");
+        assert_eq!(
+            client
+                .call_registry()
+                .pending_group_epoch_transaction_if_current(call_id, generation),
+            Some(7),
+            "the decrypted epoch must survive until the media driver attaches"
+        );
         client
             .call_registry()
             .remove_if_current(call_id, generation);

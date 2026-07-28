@@ -77,6 +77,8 @@ pub enum GroupMediaError {
     InvalidEpoch,
     #[error("group media epoch conflicts with an existing transaction")]
     ConflictingEpoch,
+    #[error("the local participant is no longer connected to the group call")]
+    LocalParticipantRemoved,
     #[error("group media pipeline could not be constructed")]
     Pipeline,
 }

@@ -200,10 +200,16 @@ impl crate::stats::HeapSize for GroupCallState {
 }
 
 fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
+    let connected = update
+        .participants
+        .iter()
+        .filter(|participant| participant.is_connected())
+        .count();
     if update.transaction_id == 0
         || update.connected_limit == 0
         || update.connected_limit as usize > GROUP_CALL_MAX_PARTICIPANTS
         || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
+        || connected > update.connected_limit as usize
         || !matches!(update.media.as_str(), "audio" | "video")
     {
         return false;
@@ -419,6 +425,20 @@ mod tests {
         assert_eq!(
             state.apply_update(oversized),
             GroupStateApply::InvalidSnapshot
+        );
+
+        let mut over_connected_limit = update(
+            1,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 2),
+            ],
+        );
+        over_connected_limit.connected_limit = 1;
+        assert_eq!(
+            state.apply_update(over_connected_limit),
+            GroupStateApply::InvalidSnapshot,
+            "the authoritative roster cannot already exceed its declared connected limit"
         );
     }
 

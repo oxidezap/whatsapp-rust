@@ -358,6 +358,26 @@ impl StanzaHandler for CallHandler {
                     // outgoing call or a duplicate terminate; it still consumes the flag on any reason.
                     // Decided BEFORE terminate_call below.
                     #[cfg(feature = "voip-runtime")]
+                    if let CallAction::Terminate {
+                        call_id,
+                        call_creator,
+                        ..
+                    } = &call.action
+                        && group_transition_generation.is_none()
+                    {
+                        // The ACK can reveal a call-link id before its join task publishes the
+                        // generation. Share its registration lane: either retain the terminal
+                        // control first, or claim and remove the generation registration won.
+                        let sender = routed_call_sender(&call);
+                        let _ = client
+                            .retain_or_apply_pending_call_link_terminate(
+                                call_id,
+                                call_creator,
+                                &sender,
+                            )
+                            .await;
+                    }
+                    #[cfg(feature = "voip-runtime")]
                     if let CallAction::Terminate { reason, .. } = &call.action
                         && client.call_registry().take_ringing(call.action.call_id())
                     {
@@ -427,6 +447,45 @@ impl StanzaHandler for CallHandler {
                             // A call-link admission can overtake the join task after its ACK wakes.
                             // Registration consumes it atomically, or rejects a saturated join.
                             dispatch_call = false;
+                        }
+                        CallAction::EncRekey { rekey }
+                            if group_transition_generation.is_none()
+                                && client.pending_call_link_control_candidate(
+                                    &rekey.call_id,
+                                    &rekey.call_creator,
+                                    &routed_call_sender(&call),
+                                ) =>
+                        {
+                            let sender = routed_call_sender(&call);
+                            dispatch_call = match decrypt_group_epoch(&client, rekey, &sender).await
+                            {
+                                Ok(raw_epoch) => {
+                                    let buffered = client.buffer_pending_call_link_epoch(
+                                        &rekey.call_id,
+                                        &rekey.call_creator,
+                                        &sender,
+                                        rekey.transaction_id,
+                                        raw_epoch,
+                                    );
+                                    if buffered.suppresses_dispatch() {
+                                        false
+                                    } else {
+                                        let registry = client.call_registry();
+                                        if registry.buffer_initial_group_control(call.clone()) {
+                                            false
+                                        } else {
+                                            apply_current_group_control(&client, &call).await
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        "call: rejected encrypted group epoch for {}: {error}",
+                                        rekey.call_id
+                                    );
+                                    false
+                                }
+                            };
                         }
                         CallAction::GroupUpdate { .. } | CallAction::EncRekey { .. }
                             if group_transition_generation.is_none() =>

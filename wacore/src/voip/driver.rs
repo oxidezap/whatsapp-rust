@@ -25,6 +25,7 @@ use crate::types::group_call::{GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate};
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
+use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
 use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
@@ -612,7 +613,10 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
 }
 
 fn is_fatal_group_update_error(error: &engine::EngineError) -> bool {
-    !matches!(error, engine::EngineError::GroupMedia(_))
+    matches!(
+        error,
+        engine::EngineError::GroupMedia(GroupMediaError::LocalParticipantRemoved)
+    ) || !matches!(error, engine::EngineError::GroupMedia(_))
 }
 
 fn prepare_relay_reconnect(
@@ -1309,6 +1313,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wacore_binary::{Jid, Server};
 
+    #[test]
+    fn local_roster_removal_is_the_only_fatal_group_media_update_error() {
+        assert!(is_fatal_group_update_error(
+            &engine::EngineError::GroupMedia(GroupMediaError::LocalParticipantRemoved)
+        ));
+        assert!(!is_fatal_group_update_error(
+            &engine::EngineError::GroupMedia(GroupMediaError::Pipeline)
+        ));
+    }
+
     /// Runtime whose `sleep` never resolves, so the driver is exercised purely by the relay-event
     /// stream (the timer arm stays pending). `spawn` is unused: the shell spawns `run_call`, not the
     /// loop itself.
@@ -1835,9 +1849,7 @@ mod tests {
             .expect("control-only engine");
         assert!(matches!(
             engine.apply_group_update(0, &update),
-            Err(engine::EngineError::GroupMedia(
-                crate::voip::GroupMediaError::Pipeline
-            ))
+            Err(engine::EngineError::GroupMedia(GroupMediaError::Pipeline))
         ));
 
         futures::executor::block_on(run_call(

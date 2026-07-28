@@ -1094,6 +1094,13 @@ impl CallEngine {
             .registry
             .apply_group_update(update)?;
         if result == GroupRosterApply::Applied {
+            if !group_roster_contains_participant(update, &self.self_participant_id) {
+                // A full replacement roster that removes this endpoint is authoritative teardown.
+                // Mark the engine inert before returning the fatal control result so no caller that
+                // observes the error can continue capturing or protecting media.
+                self.terminated = true;
+                return Err(GroupMediaError::LocalParticipantRemoved.into());
+            }
             let group = self.group.as_mut().ok_or(GroupMediaError::Pipeline)?;
             if update.rekey_requested {
                 group.required_epoch_transaction = Some(
@@ -1103,6 +1110,10 @@ impl CallEngine {
                             current.max(update.transaction_id)
                         }),
                 );
+                // Retransmissions were protected under the old app-data key. Discarding them is
+                // safer than leaking removed membership across the epoch boundary, and avoids a
+                // due retry keeping the timer hot while group media is gated.
+                group.pending_reactions.clear();
             }
             let active = group.registry.active_participant_ids();
             group.mixer.retain(active.iter().cloned());
@@ -2382,6 +2393,17 @@ fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec
     pids
 }
 
+fn group_roster_contains_participant(update: &GroupCallUpdate, participant_id: &str) -> bool {
+    update
+        .participants
+        .iter()
+        .filter(|participant| participant.is_connected())
+        .flat_map(|participant| participant.devices.iter())
+        .any(|device| {
+            ssrc::format_e2e_srtp_participant_id(&device.jid.to_string()) == participant_id
+        })
+}
+
 /// Advance a periodic deadline past `now`. Normally one interval; if the shell fell far behind
 /// (more than one interval late) resync to `now + interval` so we emit one tick, not a backlog.
 fn next_tick(deadline: Millis, now: Millis, interval: Millis) -> Millis {
@@ -2719,6 +2741,39 @@ mod encoded_tests {
             engine.group_epoch_transaction(),
             Some(8),
             "the driver must be able to observe and purge on the send-key transition"
+        );
+    }
+
+    #[test]
+    fn authoritative_roster_removal_terminates_local_group_media() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        let mut removed = group_update();
+        removed.transaction_id = 8;
+        removed.participants.remove(0);
+        assert!(matches!(
+            engine.apply_group_update(1, &removed),
+            Err(EngineError::GroupMedia(
+                GroupMediaError::LocalParticipantRemoved
+            ))
+        ));
+        assert!(
+            engine.is_terminated(),
+            "an authoritative roster removal must make the local media engine inert"
+        );
+
+        engine.handle_input(2, Input::EncodedAudio(&[1, 2, 3]));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Transmit(_))),
+            "a removed participant must not emit any later media"
         );
     }
 
@@ -3386,6 +3441,52 @@ mod encoded_tests {
                 ..
             }) if *participant == peer_jid.to_non_ad() && emoji.as_deref() == Some("✅")
         )));
+    }
+
+    #[test]
+    fn group_rekey_discards_reaction_retries_protected_with_the_old_epoch() {
+        let epoch = [0x42; 32];
+        let update = group_update();
+        let self_jid = update.participants[0].devices[0].jid.clone();
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("engine");
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid,
+                initial_update: update,
+                direct_peer: None,
+            })
+            .unwrap();
+        engine.apply_group_raw_epoch(7, &epoch).unwrap();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        engine.send_group_reaction(10, "👍").unwrap();
+        let _ = drain(&mut engine);
+
+        let mut rekey = group_update();
+        rekey.transaction_id = 8;
+        rekey.rekey_requested = true;
+        assert_eq!(
+            engine.apply_group_update(20, &rekey).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert!(
+            engine
+                .group
+                .as_ref()
+                .is_some_and(|group| group.pending_reactions.is_empty()),
+            "retries protected with the old app-data key must not cross the epoch boundary"
+        );
+        let _ = drain(&mut engine);
+
+        engine.handle_input(10 + APP_DATA_RETRANSMIT_MS, Input::Timeout);
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Transmit(_))),
+            "the due old-epoch retry must not be transmitted while rekey is pending"
+        );
     }
 
     #[test]
