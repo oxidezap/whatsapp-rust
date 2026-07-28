@@ -1050,12 +1050,7 @@ impl<'a> CallLinkCall<'a> {
                 .group_state_if_current(&join.call_id, generation)
                 .and_then(|state| state.snapshot().cloned())
             {
-                if update.call_creator != join.call_creator {
-                    return Err(CallError::Response(
-                        "call-link admitted snapshot changed call identity".to_string(),
-                    ));
-                }
-                ensure_call_link_admitted_media(&update, self.media)?;
+                ensure_call_link_admitted_snapshot(&update, &join.call_creator, self.media)?;
                 if update.relay.is_some() {
                     break update;
                 }
@@ -1072,12 +1067,7 @@ impl<'a> CallLinkCall<'a> {
                         Ok(result) => result?,
                         Err(_) => return Err(CallError::ResponseTimeout),
                     };
-                    if update.call_creator != join.call_creator {
-                        return Err(CallError::Response(
-                            "call-link admitted snapshot changed call identity".to_string(),
-                        ));
-                    }
-                    ensure_call_link_admitted_media(&update, self.media)?;
+                    ensure_call_link_admitted_snapshot(&update, &join.call_creator, self.media)?;
                     break update;
                 }
             }
@@ -1211,6 +1201,19 @@ fn ensure_call_link_admitted_media(
             "call-link admitted snapshot changed the requested media mode".to_string(),
         ))
     }
+}
+
+fn ensure_call_link_admitted_snapshot(
+    update: &GroupCallUpdate,
+    expected_creator: &Jid,
+    requested: CallLinkMedia,
+) -> Result<(), CallError> {
+    if update.call_creator != *expected_creator {
+        return Err(CallError::Response(
+            "call-link admitted snapshot changed call identity".to_string(),
+        ));
+    }
+    ensure_call_link_admitted_media(update, requested)
 }
 
 fn answer_preaccept_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
@@ -4272,11 +4275,12 @@ mod tests {
     }
 
     #[test]
-    fn delayed_call_link_admission_must_preserve_requested_media() {
+    fn delayed_call_link_admission_must_preserve_identity_and_requested_media() {
+        let creator = Jid::new("111111111111111", Server::Lid);
         let update = |media: &str| {
             GroupCallUpdate::builder()
                 .call_id("GROUP-CALL".to_string())
-                .call_creator(Jid::new("111111111111111", Server::Lid))
+                .call_creator(creator.clone())
                 .transaction_id(1)
                 .media(media.to_string())
                 .connected_limit(32)
@@ -4291,6 +4295,18 @@ mod tests {
         assert!(ensure_call_link_admitted_media(&update("video"), CallLinkMedia::Video).is_ok());
         assert!(ensure_call_link_admitted_media(&update("audio"), CallLinkMedia::Video).is_err());
         assert!(ensure_call_link_admitted_media(&update("video"), CallLinkMedia::Audio).is_err());
+        assert!(
+            ensure_call_link_admitted_snapshot(&update("audio"), &creator, CallLinkMedia::Audio)
+                .is_ok()
+        );
+        assert!(
+            ensure_call_link_admitted_snapshot(
+                &update("audio"),
+                &Jid::new("222222222222222", Server::Lid),
+                CallLinkMedia::Audio,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -7022,12 +7038,18 @@ mod tests {
             client.call_registry().phase_if_current(call_id, generation),
             Some(CallPhase::Connecting)
         );
-        for _ in 0..10 {
+        let terminate_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let deadline =
+            tokio::time::Instant::now() + OFFER_ACK_RELAY_TIMEOUT + OFFER_ACK_RELAY_TIMEOUT;
+        while !start.is_finished() && tokio::time::Instant::now() < deadline {
+            tokio::time::advance(Duration::from_millis(100)).await;
             tokio::task::yield_now().await;
         }
+        assert!(
+            start.is_finished(),
+            "the bounded relay setup timeout must complete the call-link task"
+        );
 
-        let terminate_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
-        tokio::time::advance(OFFER_ACK_RELAY_TIMEOUT).await;
         let result = start.await.expect("call-link setup task");
         assert!(matches!(result, Err(CallError::ResponseTimeout)));
         let terminate = terminate_sent.await.expect("timeout terminate stanza");

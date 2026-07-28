@@ -193,12 +193,27 @@ impl GroupControlQueue {
     }
 
     fn try_send(&self, control: GroupControl) -> bool {
+        self.try_send_recover(control).is_ok()
+    }
+
+    fn try_send_recover(&self, control: GroupControl) -> Result<(), GroupControl> {
         if !self.accepts(&control) {
-            return false;
+            return Err(control);
         }
+        let payload_bytes = control.heap_bytes();
+        self.tx
+            .try_send(control)
+            .map_err(|error| error.into_inner())?;
         self.max_payload_bytes
-            .fetch_max(control.heap_bytes(), Ordering::Relaxed);
-        self.tx.try_send(control).is_ok()
+            .fetch_max(payload_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn retained_epoch(control: GroupControl) -> Option<GroupRawEpoch> {
+    match control {
+        GroupControl::Transition { epoch, .. } | GroupControl::RawEpoch(epoch) => Some(epoch),
+        GroupControl::Update(_) | GroupControl::Reaction(_) => None,
     }
 }
 
@@ -415,6 +430,50 @@ pub struct CallRegistry {
 impl CallRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn ringing_group_update_fits(
+        ringing: &HashSet<String>,
+        map: &HashMap<String, CallEntry>,
+        call_id: &str,
+        entry: &CallEntry,
+        preview: &GroupCallState,
+        preview_session: &CallSession,
+    ) -> bool {
+        use crate::stats::HeapSize;
+
+        if !ringing.contains(call_id)
+            || !entry.is_group_call
+            || entry.session.phase() != CallPhase::Ringing
+        {
+            return true;
+        }
+        let current_state_bytes = entry
+            .group
+            .as_ref()
+            .map_or(0, HeapSize::heap_bytes)
+            .saturating_add(entry.session.heap_bytes());
+        let preview_state_bytes = preview
+            .heap_bytes()
+            .saturating_add(preview_session.heap_bytes());
+        let prospective_entry_bytes = entry
+            .retained_bytes(call_id)
+            .saturating_sub(current_state_bytes)
+            .saturating_add(preview_state_bytes);
+        let ringing_group_bytes = map
+            .iter()
+            .filter(|(candidate_call_id, candidate)| {
+                ringing.contains(*candidate_call_id)
+                    && candidate.is_group_call
+                    && candidate.session.phase() == CallPhase::Ringing
+            })
+            .fold(0usize, |bytes, (candidate_call_id, candidate)| {
+                bytes.saturating_add(candidate.retained_bytes(candidate_call_id))
+            });
+        ringing_group_bytes
+            .saturating_sub(entry.retained_bytes(call_id))
+            .saturating_add(prospective_entry_bytes)
+            <= MAX_RINGING_GROUP_CALL_BYTES
     }
 
     /// Snapshot active registry retention without cloning call state or exposing identifiers.
@@ -649,14 +708,13 @@ impl CallRegistry {
             return GroupStateApply::InvalidSnapshot;
         }
         let (applied, waiting_room_task, video_teardown, event) = {
+            let ringing = self.ringing.lock().expect("registry lock poisoned");
             let mut map = self.inner.lock().expect("registry lock poisoned");
             if let Some(entry) = map
                 .get(&update.call_id)
                 .filter(|entry| generation.is_none_or(|current| entry.generation == current))
                 .filter(|entry| entry.is_group_call && entry.session.phase() == CallPhase::Ringing)
             {
-                use crate::stats::HeapSize;
-
                 let mut preview = entry.group.clone().unwrap_or_else(|| {
                     GroupCallState::new(
                         entry.session.call_id.clone(),
@@ -666,32 +724,14 @@ impl CallRegistry {
                 if preview.apply_update(update.clone()) == GroupStateApply::Applied {
                     let mut preview_session = entry.session.clone();
                     preview_session.group = preview.snapshot().cloned();
-                    let current_state_bytes = entry
-                        .group
-                        .as_ref()
-                        .map_or(0, HeapSize::heap_bytes)
-                        .saturating_add(entry.session.heap_bytes());
-                    let preview_state_bytes = preview
-                        .heap_bytes()
-                        .saturating_add(preview_session.heap_bytes());
-                    let prospective_entry_bytes = entry
-                        .retained_bytes(&update.call_id)
-                        .saturating_sub(current_state_bytes)
-                        .saturating_add(preview_state_bytes);
-                    let ringing_group_bytes = map
-                        .iter()
-                        .filter(|(_, candidate)| {
-                            candidate.is_group_call
-                                && candidate.session.phase() == CallPhase::Ringing
-                        })
-                        .fold(0usize, |bytes, (call_id, candidate)| {
-                            bytes.saturating_add(candidate.retained_bytes(call_id))
-                        });
-                    if ringing_group_bytes
-                        .saturating_sub(entry.retained_bytes(&update.call_id))
-                        .saturating_add(prospective_entry_bytes)
-                        > MAX_RINGING_GROUP_CALL_BYTES
-                    {
+                    if !Self::ringing_group_update_fits(
+                        &ringing,
+                        &map,
+                        &update.call_id,
+                        entry,
+                        &preview,
+                        &preview_session,
+                    ) {
                         // Preserve the transaction watermark so a corrected same-transaction
                         // snapshot can still be accepted.
                         return GroupStateApply::InvalidSnapshot;
@@ -1212,14 +1252,15 @@ impl CallRegistry {
                         bytes.saturating_add(entry.retained_bytes(call_id)),
                     )
                 });
-            if let Some(entry) = map.get_mut(&call_id) {
+            if map.contains_key(&call_id) {
+                let entry = map.get(&call_id).expect("entry presence checked");
                 if entry.session.phase() != CallPhase::Ringing {
                     return Ok(None);
                 }
                 if entry.session.call_creator != session.call_creator {
                     return Err(GroupStateApply::IdentityMismatch);
                 }
-                if let Some(update) = session.group.take() {
+                let preview = if let Some(update) = session.group.take() {
                     let mut preview = entry.group.clone().unwrap_or_else(|| {
                         GroupCallState::new(
                             entry.session.call_id.clone(),
@@ -1228,34 +1269,30 @@ impl CallRegistry {
                     });
                     match preview.apply_update(update) {
                         GroupStateApply::Applied => {
-                            use crate::stats::HeapSize;
-
                             let mut preview_session = entry.session.clone();
                             preview_session.group = preview.snapshot().cloned();
-                            let current_state_bytes = entry
-                                .group
-                                .as_ref()
-                                .map_or(0, HeapSize::heap_bytes)
-                                .saturating_add(entry.session.heap_bytes());
-                            let preview_state_bytes = preview
-                                .heap_bytes()
-                                .saturating_add(preview_session.heap_bytes());
-                            let prospective_entry_bytes = entry
-                                .retained_bytes(&call_id)
-                                .saturating_sub(current_state_bytes)
-                                .saturating_add(preview_state_bytes);
-                            let prospective_total = ringing_group_bytes
-                                .saturating_sub(entry.retained_bytes(&call_id))
-                                .saturating_add(prospective_entry_bytes);
-                            if prospective_total > MAX_RINGING_GROUP_CALL_BYTES {
+                            if !Self::ringing_group_update_fits(
+                                &ringing,
+                                &map,
+                                &call_id,
+                                entry,
+                                &preview,
+                                &preview_session,
+                            ) {
                                 return Err(GroupStateApply::InvalidSnapshot);
                             }
-                            entry.session.group = preview_session.group;
-                            entry.group = Some(preview);
+                            Some((preview, preview_session.group))
                         }
-                        GroupStateApply::Stale => {}
+                        GroupStateApply::Stale => None,
                         reason => return Err(reason),
                     }
+                } else {
+                    None
+                };
+                let entry = map.get_mut(&call_id).expect("entry presence checked");
+                if let Some((preview, preview_group)) = preview {
+                    entry.session.group = preview_group;
+                    entry.group = Some(preview);
                 }
                 session.group = entry
                     .group
@@ -1757,6 +1794,7 @@ impl CallRegistry {
             .and_then(GroupCallState::snapshot)
             .cloned();
         let pending_epoch = entry.pending_group_epoch.take();
+        let mut unqueued_epoch = None;
         let queued = match (update, pending_epoch) {
             (Some(update), Some(epoch)) => {
                 let transition = GroupControl::Transition {
@@ -1764,15 +1802,31 @@ impl CallRegistry {
                     epoch,
                 };
                 if tx.accepts(&transition) {
-                    tx.try_send(transition)
+                    match tx.try_send_recover(transition) {
+                        Ok(()) => true,
+                        Err(control) => {
+                            unqueued_epoch = retained_epoch(control);
+                            false
+                        }
+                    }
                 } else {
                     // The engine was initialized from the retained roster before this sender is
                     // attached. If adding the epoch tips their indivisible replay over one slot's
                     // byte budget, replay the same roster and epoch in order instead.
                     match transition {
                         GroupControl::Transition { update, epoch } => {
-                            tx.try_send(GroupControl::Update(update))
-                                && tx.try_send(GroupControl::RawEpoch(epoch))
+                            if !tx.try_send(GroupControl::Update(update)) {
+                                unqueued_epoch = Some(epoch);
+                                false
+                            } else {
+                                match tx.try_send_recover(GroupControl::RawEpoch(epoch)) {
+                                    Ok(()) => true,
+                                    Err(control) => {
+                                        unqueued_epoch = retained_epoch(control);
+                                        false
+                                    }
+                                }
+                            }
                         }
                         GroupControl::Update(_)
                         | GroupControl::RawEpoch(_)
@@ -1781,10 +1835,17 @@ impl CallRegistry {
                 }
             }
             (Some(update), None) => tx.try_send(GroupControl::Update(Box::new(update))),
-            (None, Some(epoch)) => tx.try_send(GroupControl::RawEpoch(epoch)),
+            (None, Some(epoch)) => match tx.try_send_recover(GroupControl::RawEpoch(epoch)) {
+                Ok(()) => true,
+                Err(control) => {
+                    unqueued_epoch = retained_epoch(control);
+                    false
+                }
+            },
             (None, None) => true,
         };
         if !queued {
+            entry.pending_group_epoch = unqueued_epoch;
             return false;
         }
         entry.group_ctl_tx = Some(tx);
@@ -3041,6 +3102,11 @@ mod tests {
             .insert_ringing_group_if_inactive(incoming("GROUP-CALL-GENERIC"))
             .expect("valid initial offer")
             .expect("offer registers");
+        let mut unmarked = incoming("GROUP-CALL-UNMARKED");
+        let mut relay = group_relay(1);
+        relay.tokens = vec![vec![9; MAX_RINGING_GROUP_CALL_BYTES]];
+        unmarked.group.as_mut().expect("group snapshot").relay = Some(relay);
+        generic.insert_ringing_group(unmarked);
         let mut oversized_update = incoming("GROUP-CALL-GENERIC")
             .group
             .expect("group snapshot");
@@ -3066,7 +3132,7 @@ mod tests {
         assert_eq!(
             generic.apply_group_update_if_current(corrected, generic_generation),
             GroupStateApply::Applied,
-            "a corrected same-transaction generic update must remain admissible"
+            "a corrected same-transaction update must ignore group entries not in the ringing set"
         );
     }
 
@@ -3571,6 +3637,99 @@ mod tests {
             Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 1
         ));
         assert!(control_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_group_media_attachment_retains_the_pending_epoch() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(1), generation),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 1, vec![1; 32]));
+
+        let (closed_tx, closed_rx) = async_channel::bounded(2);
+        drop(closed_rx);
+        assert!(
+            !reg.set_group_control_sender("GROUP-CALL", generation, Some(4), closed_tx),
+            "a closed driver mailbox must reject attachment"
+        );
+        assert_eq!(
+            reg.pending_group_epoch_transaction_if_current("GROUP-CALL", generation),
+            Some(1),
+            "a failed handoff must leave the epoch available for a later attachment"
+        );
+
+        let (retry_tx, retry_rx) = async_channel::bounded(2);
+        assert!(reg.set_group_control_sender("GROUP-CALL", generation, Some(4), retry_tx));
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Ok(GroupControl::Transition { update, epoch })
+                if update.transaction_id == 1 && epoch.transaction_id == 1
+        ));
+    }
+
+    #[test]
+    fn partial_split_replay_retains_the_pending_epoch() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let mut update = group_update(1);
+        update.participants.push(GroupCallParticipant {
+            jid: Jid::new("222222222222222", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(2),
+                capability_version: Some(1),
+                capability: Vec::new(),
+            }],
+        });
+        let (control_tx, control_rx) = async_channel::bounded(1);
+        let queue = GroupControlQueue::new(control_tx.clone());
+        let base = GroupControl::Update(Box::new(update.clone()));
+        let padding = MAX_GROUP_CONTROL_QUEUE_BYTES
+            .checked_sub(size_of::<GroupControl>() + base.heap_bytes())
+            .expect("fixture leaves room for capability padding");
+        update.participants[0].devices[0].capability = vec![7; padding];
+        assert!(queue.accepts(&GroupControl::Update(Box::new(update.clone()))));
+        assert!(!queue.accepts(&GroupControl::Transition {
+            update: Box::new(update.clone()),
+            epoch: GroupRawEpoch::new(1, vec![1; 32]),
+        }));
+        drop(queue);
+
+        assert_eq!(
+            reg.apply_group_update_if_current(update, generation),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 1, vec![1; 32]));
+        assert!(
+            !reg.set_group_control_sender("GROUP-CALL", generation, Some(4), control_tx),
+            "a one-slot mailbox cannot accept both halves of a split replay"
+        );
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 1
+        ));
+        assert_eq!(
+            reg.pending_group_epoch_transaction_if_current("GROUP-CALL", generation),
+            Some(1)
+        );
+
+        let (retry_tx, retry_rx) = async_channel::unbounded();
+        assert!(reg.set_group_control_sender("GROUP-CALL", generation, Some(4), retry_tx));
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 1
+        ));
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 1
+        ));
     }
 
     #[test]
