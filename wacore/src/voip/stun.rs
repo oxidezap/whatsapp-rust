@@ -845,6 +845,29 @@ mod tests {
             one_attrs[3].value,
             create_wasm_stream_descriptors_from_ssrcs(&stream_ssrcs, &[0, 0])
         );
+
+        let no_pids = build_wasm_group_stun_allocate_request(&WasmGroupStunAllocateRequest {
+            transaction_id: &tx,
+            relay_token: &[1, 2, 3],
+            endpoint_xor: &endpoint,
+            integrity_key: b"0123456789abcdef",
+            stream_ssrcs: &stream_ssrcs,
+            app_data_ssrc: 0xb31d_ed3e,
+            hbh_fec_ssrcs: &[0xc1a1_7938, 0x1bb2_0c84],
+            participant_pids: &[],
+        });
+        assert_eq!(
+            parse_stun_attributes(&no_pids)
+                .iter()
+                .map(|attr| attr.attr_type)
+                .collect::<Vec<_>>(),
+            [
+                ATTR_RELAY_TOKEN,
+                STUN_ATTR_STREAM_DESCRIPTORS,
+                STUN_ATTR_WASM_RELAY_ENDPOINT,
+                ATTR_MESSAGE_INTEGRITY,
+            ]
+        );
     }
 
     #[test]

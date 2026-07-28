@@ -435,16 +435,11 @@ impl Client {
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self
-            .call_registry
-            .group_sender_authorized(&update.call_id, &update.call_creator, sender)
-        {
-            return PendingCallLinkBuffer::NotPending;
-        }
         if state.active == 0
             || update.call_id.is_empty()
             || !state.accepts(&update.call_id)
             || sender.to_non_ad() != update.call_creator.to_non_ad()
+            || self.call_registry.generation_of(&update.call_id).is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -1042,9 +1037,15 @@ impl Voip<'_> {
             return Err(CallError::Media("offer is not an active group invitation"));
         }
         let registry = self.client.call_registry();
+        let Some(retained_generation) = incoming.ringing_generation() else {
+            return Err(CallError::CallEndedDuringSetup);
+        };
         let generation = registry
             .ringing_group_generation(call_id, call_creator)
             .ok_or(CallError::CallEndedDuringSetup)?;
+        if generation != retained_generation {
+            return Err(CallError::CallEndedDuringSetup);
+        }
         let node = build_active_group_accept(
             call_id,
             call_creator,
@@ -3174,10 +3175,11 @@ mod tests {
             .rekey_requested(false)
             .participants(vec![participant])
             .build();
+        let creator_sender = creator.clone().with_device(1);
 
         let pending = client.begin_call_link_join();
         assert_eq!(
-            client.buffer_pending_call_link_update(&update, &creator.clone().with_device(1)),
+            client.buffer_pending_call_link_update(&update, &creator_sender),
             PendingCallLinkBuffer::Buffered,
             "the creator's admission update must survive until the ACK registers its call id"
         );
@@ -3225,6 +3227,13 @@ mod tests {
                 .pending_call_link_updates
                 .entries,
             0
+        );
+        let mut later = update;
+        later.transaction_id = 9;
+        assert_eq!(
+            client.buffer_pending_call_link_update(&later, &creator_sender),
+            PendingCallLinkBuffer::NotPending,
+            "an already registered generation must dispatch instead of entering an orphan buffer"
         );
 
         drop(pending);
@@ -4351,6 +4360,7 @@ mod tests {
             .insert_ringing_group_if_inactive(ringing)
             .expect("valid group snapshot")
             .expect("ringing invitation");
+        incoming.set_ringing_generation(generation);
 
         client
             .voip()
@@ -4377,10 +4387,10 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
-    async fn group_invite_accept_is_bound_to_the_retained_offer_creator() {
+    async fn group_invite_accept_is_bound_to_the_retained_offer_generation() {
         let client = crate::test_utils::create_test_client().await;
         let retained_creator = call_creator();
-        let replacement_creator = Jid::new("333333333333333", Server::Lid);
+        let replacement_creator = retained_creator.clone();
         let call_id = "REPLACED-GROUP-INVITE";
         let group_update = |creator: &Jid| {
             GroupCallUpdate::builder()
@@ -4416,7 +4426,8 @@ mod tests {
         let mut retained =
             CallSession::new_incoming(call_id, retained_creator.clone(), retained_creator);
         retained.group = Some(retained_update);
-        client.call_registry().insert_ringing_group(retained);
+        let stale = client.call_registry().insert_ringing_group(retained);
+        incoming.set_ringing_generation(stale);
 
         let replacement_update = group_update(&replacement_creator);
         let mut replacement =
@@ -4493,6 +4504,7 @@ mod tests {
             .insert_ringing_group_if_inactive(ringing)
             .expect("valid group snapshot")
             .expect("ringing invitation");
+        incoming.set_ringing_generation(stale);
 
         let (started_tx, started_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);

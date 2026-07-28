@@ -2489,6 +2489,19 @@ impl CallRegistry {
     /// task that ended after being superseded can't reap the live replacement. Returns true if this
     /// generation was the current entry and was removed.
     pub fn remove_if_current(&self, call_id: &str, generation: u64) -> bool {
+        self.remove_if_current_with_phase(call_id, generation)
+            .is_some()
+    }
+
+    /// Remove exactly one call generation and return the phase it had at the atomic claim.
+    ///
+    /// Call-link setup uses the returned phase to distinguish local waiting-room cancellation from
+    /// cancellation after server-side admission, which additionally requires a terminal stanza.
+    pub fn remove_if_current_with_phase(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<CallPhase> {
         let removed = {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             if map.get(call_id).is_some_and(|e| e.generation == generation) {
@@ -2499,7 +2512,7 @@ impl CallRegistry {
         };
         // `removed` drops here, off-lock: the media-task abort and on_terminal hook run without the
         // registry mutex held.
-        removed.is_some()
+        removed.map(|entry| entry.session.phase())
     }
 
     /// Abort every call's media task and clear the registry. Returns the number cleared.

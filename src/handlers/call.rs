@@ -1121,11 +1121,17 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                             }
                         }
                     }
-                    client.call_registry().send_call_event_if_current(
-                        &update.call_id,
-                        generation,
-                        CallEvent::GroupUpdated(update.clone()),
-                    );
+                    if let Some(committed) = client
+                        .call_registry()
+                        .group_state_if_current(&update.call_id, generation)
+                        .and_then(|group| group.snapshot().cloned())
+                    {
+                        client.call_registry().send_call_event_if_current(
+                            &update.call_id,
+                            generation,
+                            CallEvent::GroupUpdated(Box::new(committed)),
+                        );
+                    }
                     true
                 }
                 GroupStateApply::Stale | GroupStateApply::UnknownCall => false,
@@ -1360,7 +1366,7 @@ mod tests {
     use std::sync::Arc;
     use wacore::types::events::{ChannelEventHandler, Event};
     #[cfg(feature = "voip-runtime")]
-    use wacore::types::group_call::GroupCallUpdate;
+    use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
     #[cfg(feature = "voip-runtime")]
     use wacore::voip::video_control_channel;
     use wacore_binary::builder::NodeBuilder;
@@ -2356,6 +2362,96 @@ mod tests {
             Some(8),
             "the control that overtook registration must apply after the matching offer"
         );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn group_updated_event_carries_the_committed_inherited_snapshot() {
+        let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let call_id = "COMMITTED-GROUP-EVENT";
+        let creator = fake_caller_lid();
+        let group_jid = Jid::new("120363000000001", Server::Group);
+        let mut creator_participant = GroupCallParticipant::new(
+            creator.to_non_ad(),
+            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        );
+        creator_participant.state = Some("connected".to_string());
+        let relay = wacore::types::group_call::GroupCallRelay::builder()
+            .transaction_id(1)
+            .self_pid(1)
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![1]])
+            .auth_tokens(vec![vec![2]])
+            .endpoints(vec![
+                wacore::types::group_call::GroupCallRelayEndpoint::builder()
+                    .relay_id(1)
+                    .token_id(0)
+                    .auth_token_id(0)
+                    .relay_name("relay-1".to_string())
+                    .is_fna(false)
+                    .ipv4("203.0.113.7".to_string())
+                    .port(3480)
+                    .build(),
+            ])
+            .build();
+        let initial = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .group_jid(group_jid.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![creator_participant.clone()])
+            .relay(relay.clone())
+            .build();
+        let mut session =
+            wacore::voip::CallSession::new_outgoing(call_id, creator.clone(), creator.clone());
+        session.group = Some(initial);
+        let generation = registry
+            .insert_group_checked(session)
+            .expect("group session");
+        let (control_tx, _control_rx) = async_channel::bounded(1);
+        assert!(registry.set_group_control_sender(call_id, generation, Some(4), control_tx));
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (video_tx, _video_rx) = video_control_channel();
+        registry.set_video_channels(call_id, generation, event_tx, video_tx, Box::new(|| {}));
+
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(2)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![creator_participant])
+            .build();
+        let mut call = IncomingCall::new_for_test(
+            creator.clone(),
+            "COMMITTED-GROUP-EVENT-STANZA".to_string(),
+            wacore::time::from_secs(1_766_847_151_i64).expect("valid ts"),
+            CallAction::GroupUpdate {
+                update: Box::new(update),
+            },
+        );
+        call.participant = Some(creator.with_device(1));
+
+        assert!(apply_group_control(&client, &call, generation).await);
+        let CallEvent::GroupUpdated(committed) = event_rx.try_recv().expect("group update event")
+        else {
+            panic!("expected a group update event");
+        };
+        assert_eq!(committed.group_jid, Some(group_jid));
+        assert_eq!(committed.relay, Some(relay));
+        registry.remove_if_current(call_id, generation);
     }
 
     async fn make_client() -> Arc<Client> {

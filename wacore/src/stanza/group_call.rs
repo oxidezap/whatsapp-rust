@@ -4,6 +4,8 @@
 //! transaction ordered: callers must reject snapshots older than the last
 //! accepted `transaction-id`.
 
+use core::mem::size_of;
+
 use anyhow::{Result, anyhow, bail};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef, Server};
@@ -23,6 +25,8 @@ use super::call::{
 };
 
 const MAX_RELAY_TOKENS: usize = 64;
+const MAX_WAITING_ROOM_USERS: usize = GROUP_CALL_MAX_PARTICIPANTS;
+const MAX_WAITING_ROOM_RETAINED_BYTES: usize = 1024 * 1024;
 
 // Group signaling is control-plane traffic. Marking its entry points cold keeps fat LTO from
 // expanding parser and builder error paths into the default call handler.
@@ -332,7 +336,9 @@ fn parse_group_snapshot(
             {
                 bail!("group_info call-creator does not match offer");
             }
-            update.joinable = attrs.optional_string("joinable").as_deref() == Some("1");
+            if let Some(joinable) = attrs.optional_string("joinable") {
+                update.joinable = joinable.as_ref() == "1";
+            }
         }
         GroupSnapshotEnvelope::Update => {
             update.av_upgradable = node.get_optional_child("av_upgrade").is_some_and(|child| {
@@ -876,16 +882,28 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
     let is_admin = bool_attr(&mut attrs, "is_admin");
     let transaction_id = optional_u32(&mut attrs, "transaction-id")?;
     let mut users = Vec::new();
+    let mut retained_bytes = 0usize;
     for child in node.children().unwrap_or_default() {
         if child.tag != "user" {
             continue;
         }
+        if users.len() >= MAX_WAITING_ROOM_USERS {
+            bail!("waiting-room snapshot exceeds the user limit");
+        }
         let mut attrs = child.attrs();
-        users.push(WaitingRoomUser {
+        let user = WaitingRoomUser {
             jid: required_jid(&mut attrs, "jid")?,
             pn: attrs.optional_jid("user_pn"),
             state: required_string(&mut attrs, "state")?,
-        });
+        };
+        use crate::stats::HeapSize;
+        retained_bytes = retained_bytes
+            .saturating_add(size_of::<WaitingRoomUser>())
+            .saturating_add(user.heap_bytes());
+        if retained_bytes > MAX_WAITING_ROOM_RETAINED_BYTES {
+            bail!("waiting-room snapshot exceeds the retained-byte limit");
+        }
+        users.push(user);
     }
     Ok(WaitingRoom {
         call_id,
@@ -1650,6 +1668,26 @@ mod tests {
     }
 
     #[test]
+    fn group_offer_preserves_nested_joinable_when_wrapper_is_silent() {
+        let creator = jid("100001", 1);
+        let offer = NodeBuilder::new(CallActionTag::Offer.as_str())
+            .attr("call-id", "CID")
+            .attr("call-creator", &creator)
+            .children([NodeBuilder::new("group_info")
+                .attr("transaction-id", "7")
+                .attr("media", "audio")
+                .attr("connected-limit", "8")
+                .attr("joinable", "1")
+                .build()])
+            .build();
+
+        let update = parse_group_invite_snapshot(&offer.as_node_ref())
+            .expect("valid offer")
+            .expect("group snapshot");
+        assert!(update.joinable);
+    }
+
+    #[test]
     fn group_participant_state_is_optional_and_empty_is_absent() {
         let creator = jid("100001", 1);
         for state in [None, Some("")] {
@@ -1999,6 +2037,43 @@ mod tests {
             parse_call_link_join_ack(&waiting.as_node_ref(), "DIFFERENT-TOKEN").is_err(),
             "the parsed admission state must remain bound to the requested call link"
         );
+    }
+
+    #[test]
+    fn waiting_room_snapshots_are_bounded_before_retention() {
+        let creator = jid("100001", 1);
+        let user = |index: usize, state: String| {
+            NodeBuilder::new("user")
+                .attr("jid", Jid::new(format!("200{index:03}"), Server::Lid))
+                .attr("state", state)
+                .build()
+        };
+        let room = |users: Vec<Node>| {
+            NodeBuilder::new(CallActionTag::WaitingRoomUpdate.as_str())
+                .attr("call-id", "CID")
+                .attr("call-creator", &creator)
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "CID")
+                    .attr("call-creator", &creator)
+                    .attr("link-token", "TOKEN")
+                    .attr("media", "audio")
+                    .children(users)
+                    .build()])
+                .build()
+        };
+
+        let too_many = room(
+            (0..=MAX_WAITING_ROOM_USERS)
+                .map(|index| user(index, "pending".to_string()))
+                .collect(),
+        );
+        assert!(parse_waiting_room_update(&too_many.as_node_ref()).is_err());
+
+        let oversized = room(vec![user(
+            1,
+            "x".repeat(MAX_WAITING_ROOM_RETAINED_BYTES + 1),
+        )]);
+        assert!(parse_waiting_room_update(&oversized.as_node_ref()).is_err());
     }
 
     #[test]

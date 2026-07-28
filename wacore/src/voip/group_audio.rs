@@ -58,6 +58,11 @@ impl ParticipantAudioMixer {
         self.allowed = Some(allowed);
     }
 
+    /// Drop queued PCM for a participant whose relay media session was replaced.
+    pub fn reset(&mut self, participant: &str) {
+        self.queues.remove(participant);
+    }
+
     /// Queue owned PCM for one participant. Returns false for a departed or
     /// otherwise non-authoritative participant.
     pub fn push(&mut self, participant: &str, pcm: &[i16]) -> bool {

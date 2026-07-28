@@ -45,7 +45,7 @@ use super::session::{
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
 use crate::types::group_call::{GroupCallRelay, GroupCallUpdate, ScreenShare, WaitingRoom};
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt};
 use zeroize::Zeroize;
 
 /// Monotonic milliseconds. The shell supplies it; the engine never reads a clock.
@@ -952,6 +952,9 @@ impl CallEngine {
 
     /// Enable participant-indexed media before [`start`](Self::start).
     pub fn configure_group(&mut self, config: GroupEngineConfig) -> Result<(), EngineError> {
+        if self.started {
+            return Err(GroupMediaError::Pipeline.into());
+        }
         self.configure_group_at(0, config)
     }
 
@@ -1121,6 +1124,12 @@ impl CallEngine {
             .ok_or(GroupMediaError::Pipeline)?
             .registry
             .active_device_ids();
+        let changed_pid_participants = self
+            .group
+            .as_ref()
+            .ok_or(GroupMediaError::Pipeline)?
+            .registry
+            .participants_with_pid_changes(update);
         let result = self
             .group
             .as_mut()
@@ -1150,6 +1159,9 @@ impl CallEngine {
                 group.pending_reactions.clear();
             }
             let active = group.registry.active_participant_ids();
+            for participant in changed_pid_participants {
+                group.mixer.reset(&participant);
+            }
             group.mixer.retain(active.iter().cloned());
             group
                 .audio_reception
@@ -1162,7 +1174,7 @@ impl CallEngine {
                 .retain(|participant, _| active.contains(participant));
             group.video_orientations.retain(|jid, _| {
                 update.participants.iter().any(|participant| {
-                    participant.state.as_deref() == Some("connected")
+                    participant.is_connected()
                         && (participant.jid == *jid
                             || participant.devices.iter().any(|device| device.jid == *jid))
                 })
@@ -2466,7 +2478,7 @@ fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec
     let mut pids = update
         .participants
         .iter()
-        .filter(|participant| participant.state.as_deref() == Some("connected"))
+        .filter(|participant| participant.is_connected())
         .flat_map(|participant| participant.devices.iter())
         .filter(|device| {
             ssrc::format_e2e_srtp_participant_id(&device.jid.to_string()) != self_participant_id
@@ -2479,13 +2491,28 @@ fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec
 }
 
 fn group_roster_contains_participant(update: &GroupCallUpdate, participant_id: &str) -> bool {
+    let Ok(local_device) = participant_id.parse::<Jid>() else {
+        return false;
+    };
     update
         .participants
         .iter()
         .filter(|participant| participant.is_connected())
-        .flat_map(|participant| participant.devices.iter())
-        .any(|device| {
-            ssrc::format_e2e_srtp_participant_id(&device.jid.to_string()) == participant_id
+        .any(|participant| {
+            let owns_local_user = participant.jid.is_same_user_as(&local_device)
+                || participant
+                    .pn
+                    .as_ref()
+                    .is_some_and(|pn| pn.is_same_user_as(&local_device));
+            owns_local_user
+                && participant.devices.iter().any(|device| {
+                    device.jid.device == local_device.device
+                        && (device.jid.is_same_user_as(&participant.jid)
+                            || participant
+                                .pn
+                                .as_ref()
+                                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
+                })
         })
 }
 
@@ -2733,6 +2760,86 @@ mod encoded_tests {
         assert!(
             !engine.is_group(),
             "a roster that never admitted this device cannot publish group media"
+        );
+    }
+
+    #[test]
+    fn initial_group_roster_accepts_the_local_device_through_its_pn_alias() {
+        let relay = group_relay();
+        let mut update = group_update();
+        let local_pn = Jid::new("12025550111", Server::Pn);
+        update.participants[0].pn = Some(local_pn.clone());
+        update.participants[0].devices[0].jid = local_pn;
+        update.relay = Some(relay.clone());
+        let config = CallConfig::for_group(
+            CallDirection::Outgoing,
+            &update.call_id,
+            SELF_LID,
+            SELF_LID,
+            &relay,
+        )
+        .expect("group config");
+        let mut engine = CallEngine::new(config, Box::new(SequentialTxIds::new())).expect("engine");
+
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: Jid::new("15550001111", Server::Lid),
+                initial_update: update,
+                direct_peer: None,
+            })
+            .expect("the local PN device belongs to the local LID participant");
+    }
+
+    #[test]
+    fn configure_group_rejects_a_started_engine() {
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+        engine.start(1, 1_700_000_000_000);
+        let mut update = group_update();
+        update.relay = Some(group_relay());
+        assert!(matches!(
+            engine.configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: Jid::new("15550001111", Server::Lid),
+                initial_update: update,
+                direct_peer: None,
+            }),
+            Err(EngineError::GroupMedia(GroupMediaError::Pipeline))
+        ));
+    }
+
+    #[test]
+    fn participant_pid_change_discards_queued_audio_from_the_old_session() {
+        let mut engine = group_engine();
+        let mut update = group_update();
+        engine
+            .apply_group_raw_epoch(7, &[0x42; 32])
+            .expect("install group epoch");
+        let participant_id = ssrc::format_e2e_srtp_participant_id(
+            &update.participants[1].devices[0].jid.to_string(),
+        );
+        let group = engine.group.as_mut().expect("group state");
+        assert!(group.mixer.push(
+            &participant_id,
+            &vec![7; crate::voip::group_audio::GROUP_MIX_PREFILL_SAMPLES]
+        ));
+
+        update.transaction_id = 8;
+        update.participants[1].devices[0].pid = Some(9);
+        assert_eq!(
+            engine.apply_group_update(1, &update).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert!(
+            engine
+                .group
+                .as_mut()
+                .expect("group state")
+                .mixer
+                .mix_chunk()
+                .is_none(),
+            "queued PCM from the retired PID must not play in the replacement session"
         );
     }
 

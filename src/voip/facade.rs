@@ -752,7 +752,7 @@ impl<'a> OutgoingGroupCall<'a> {
         );
         let mut participants = Vec::with_capacity(targets.len() + 1);
         let self_device = GroupCallDevice::new(own_lid.clone())
-            .with_capability(1, offer_capability(false, audio.config().format));
+            .with_capability(1, offer_capability(video.is_some(), audio.config().format));
         participants.push(GroupCallParticipant::new(own_user, vec![self_device]));
         for target in &targets {
             let target_devices = devices
@@ -1037,8 +1037,11 @@ impl<'a> CallLinkCall<'a> {
         let registry = self.client.call_registry();
         let mut registration =
             RegisteredCall::from_existing(self.client, &join.call_id, generation)?;
+        // Transfer cleanup ownership before admission can race with cancellation. The teardown
+        // atomically inspects the claimed generation's phase: a waiting-room cancellation is local,
+        // while an already admitted endpoint must also receive a terminal stanza.
+        let mut teardown = GroupOfferTeardown::new_call_link(self.client, &mut registration);
 
-        let mut teardown = None;
         let update = loop {
             let listener = registry
                 .listen_group_update(&join.call_id, generation)
@@ -1053,21 +1056,11 @@ impl<'a> CallLinkCall<'a> {
                     ));
                 }
                 ensure_call_link_admitted_media(&update, self.media)?;
-                // Admission has committed this endpoint server-side even when relay material is
-                // delivered by a later snapshot. Arm cleanup at that transition, not after relay,
-                // so cancellation cannot strand the admitted endpoint in the remote roster.
-                teardown
-                    .get_or_insert_with(|| GroupOfferTeardown::new(self.client, &mut registration));
                 if update.relay.is_some() {
                     break update;
                 }
             }
             listener.await;
-        };
-        let Some(mut teardown) = teardown else {
-            return Err(CallError::Media(
-                "call-link admission cleanup was not armed",
-            ));
         };
         let relay = update
             .relay
@@ -2216,6 +2209,7 @@ struct GroupOfferTeardown {
     call_id: String,
     call_creator: Jid,
     generation: u64,
+    terminate_only_if_admitted: bool,
     armed: bool,
 }
 
@@ -2308,11 +2302,18 @@ impl GroupOfferTeardown {
             call_id: registration.call_id.clone(),
             call_creator: registration.call_creator.clone(),
             generation: registration.generation,
+            terminate_only_if_admitted: false,
             armed: true,
         };
         // Transfer setup cleanup ownership before this guard can be dropped. Its async teardown
         // must remain able to claim the generation after the surrounding future is cancelled.
         registration.disarm();
+        teardown
+    }
+
+    fn new_call_link(client: &Client, registration: &mut RegisteredCall) -> Self {
+        let mut teardown = Self::new(client, registration);
+        teardown.terminate_only_if_admitted = true;
         teardown
     }
 
@@ -2333,6 +2334,7 @@ impl Drop for GroupOfferTeardown {
         let call_id = self.call_id.clone();
         let call_creator = self.call_creator.clone();
         let generation = self.generation;
+        let terminate_only_if_admitted = self.terminate_only_if_admitted;
         let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
@@ -2340,7 +2342,11 @@ impl Drop for GroupOfferTeardown {
                 // terminal send. A replacement either wins first (and suppresses this stale
                 // terminate) or waits until the old call-scoped terminate is on the wire.
                 let _transition = client.lock_answer_transition(&call_id).await;
-                if !registry.remove_if_current(&call_id, generation) {
+                let Some(phase) = registry.remove_if_current_with_phase(&call_id, generation)
+                else {
+                    return;
+                };
+                if terminate_only_if_admitted && phase == CallPhase::WaitingRoom {
                     return;
                 }
                 let target = Jid::new(&call_id, Server::Call);
@@ -6875,13 +6881,15 @@ mod tests {
             ),
             wacore::voip::GroupStateApply::Applied
         );
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            client.call_registry().phase_if_current(call_id, generation),
-            Some(CallPhase::Connecting)
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.call_registry().phase_if_current(call_id, generation)
+                != Some(CallPhase::Connecting)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the admitted snapshot must drive the call into Connecting");
 
         let terminate_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         start.abort();
@@ -7078,14 +7086,13 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("start should be cancelled"),
         }
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            client.call_registry().generation_of(&call_id),
-            None,
-            "cancellation must reap the pre-ACK registration"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.call_registry().generation_of(&call_id).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must reap the pre-ACK registration");
     }
 
     #[tokio::test]

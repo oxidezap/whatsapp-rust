@@ -233,6 +233,21 @@ impl GroupMediaRegistry {
         ids
     }
 
+    pub(crate) fn participants_with_pid_changes(&self, update: &GroupCallUpdate) -> Vec<String> {
+        active_devices(update, &self.self_lid)
+            .into_iter()
+            .filter_map(|(_, device)| {
+                let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
+                self.receivers
+                    .get(&participant_id)
+                    .filter(|receiver| {
+                        receiver.pid.is_some() && device.pid.is_some() && receiver.pid != device.pid
+                    })
+                    .map(|_| participant_id)
+            })
+            .collect()
+    }
+
     pub(crate) fn sender_report_stream(
         &self,
         participant_id: &str,
@@ -284,7 +299,7 @@ impl GroupMediaRegistry {
         for (participant, device) in active {
             let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
             let mut receiver = if let Some(mut existing) = previous.remove(&participant_id) {
-                if existing.pid != device.pid {
+                if existing.pid.is_some() && existing.pid != device.pid {
                     // A PID identifies one relay media session. Reusing its authenticated ROC,
                     // replay, and depacketizer state across a PID migration can reject the new
                     // stream's first packets or combine fragments from two different sessions.
@@ -911,6 +926,35 @@ mod tests {
                 .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
                 .is_none(),
             "the first authoritative roster must revoke a departed direct peer"
+        );
+    }
+
+    #[test]
+    fn seeded_direct_peer_keeps_keys_when_adopting_its_first_pid() {
+        let epoch = [0x43; 32];
+        let peer = Jid::new("200002", Server::Lid).with_device(2);
+        let mut sender = peer_sender(&epoch, &peer);
+        let mut registry = registry();
+        registry
+            .seed_direct_peer(&epoch, &peer.to_non_ad(), &peer, true)
+            .expect("direct peer");
+        assert!(
+            registry
+                .unprotect_audio(&sender.protect_audio(&[0x50; 20]))
+                .is_some()
+        );
+
+        registry
+            .apply_group_update(&update(
+                1,
+                vec![device("100001", 1, 1), device("200002", 2, 2)],
+            ))
+            .expect("first PID-bearing roster");
+        assert!(
+            registry
+                .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
+                .is_some(),
+            "None-to-Some PID adoption must retain the authenticated direct receiver"
         );
     }
 

@@ -16,9 +16,15 @@ fn public_group_call_payloads_are_constructible_with_builders() {
     assert!(device.capability_version.is_none());
     let participant = GroupCallParticipant::builder()
         .jid(creator.clone())
+        .pn(Jid::new("12025550123", Server::Pn))
         .state("connected".to_string())
         .devices(vec![device])
         .build();
+    let serialized = serde_json::to_value(&participant).expect("serialize participant");
+    assert!(
+        serialized.get("pn").is_none(),
+        "phone-number aliases are internal routing data"
+    );
     let update = GroupCallUpdate::builder()
         .call_id("GROUP-CALL".to_string())
         .call_creator(creator)

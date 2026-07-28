@@ -93,22 +93,34 @@ impl GroupCallState {
             }
         }
 
-        let connected = update
+        let canonical = update
             .participants
             .iter()
             .filter(|participant| participant.is_connected())
             .flat_map(|participant| {
-                std::iter::once(participant.jid.to_non_ad())
-                    .chain(participant.pn.as_ref().map(Jid::to_non_ad))
+                let jid = participant.jid.to_non_ad();
+                std::iter::once((jid.clone(), jid.clone()))
+                    .chain(participant.pn.as_ref().map(|pn| (pn.to_non_ad(), jid)))
             })
-            .collect::<HashSet<_>>();
-        self.raised_hands
-            .retain(|participant| connected.contains(participant));
+            .collect::<HashMap<_, _>>();
+        self.raised_hands = self
+            .raised_hands
+            .drain()
+            .filter_map(|participant| canonical.get(&participant).cloned())
+            .collect();
         if update.media == "audio" {
             self.screen_shares.clear();
         } else {
-            self.screen_shares
-                .retain(|participant, _| connected.contains(participant));
+            self.screen_shares = self
+                .screen_shares
+                .drain()
+                .filter_map(|(participant, screen_share)| {
+                    canonical
+                        .get(&participant)
+                        .cloned()
+                        .map(|canonical| (canonical, screen_share))
+                })
+                .collect();
         }
         if update.relay.is_none() {
             // Roster-only updates do not revoke the relay allocation. The media engine follows the
@@ -679,15 +691,20 @@ mod tests {
     }
 
     #[test]
-    fn pn_alias_controls_survive_unrelated_roster_updates() {
+    fn pn_alias_controls_are_canonicalized_to_the_current_roster_jid() {
         let mut state = GroupCallState::new("CALL", creator());
         let mut alice = participant("200002", "connected", 2);
+        let alice_jid = alice.jid.clone();
         let alice_pn = Jid::new("12025550111", Server::Pn);
         alice.pn = Some(alice_pn.clone());
+        let mut initial_alice = alice.clone();
+        initial_alice.jid = alice_pn.clone();
+        initial_alice.pn = None;
+        initial_alice.devices[0].jid = alice_pn.clone().with_device(2);
         assert_eq!(
             state.apply_update(update(
                 1,
-                vec![participant("100001", "connected", 1), alice.clone()],
+                vec![participant("100001", "connected", 1), initial_alice],
             )),
             GroupStateApply::Applied
         );
@@ -708,7 +725,9 @@ mod tests {
             )),
             GroupStateApply::Applied
         );
-        assert!(state.raised_hands().contains(&alice_pn));
-        assert!(state.screen_shares().contains_key(&alice_pn));
+        assert!(state.raised_hands().contains(&alice_jid));
+        assert!(!state.raised_hands().contains(&alice_pn));
+        assert!(state.screen_shares().contains_key(&alice_jid));
+        assert!(!state.screen_shares().contains_key(&alice_pn));
     }
 }

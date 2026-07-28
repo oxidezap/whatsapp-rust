@@ -1163,6 +1163,36 @@ mod tests {
         assert_eq!(rd.endpoints[0].relay_name, "gru1c02");
     }
 
+    #[cfg(feature = "voip")]
+    #[test]
+    fn peer_capability_binds_to_the_routed_participant() {
+        let participant = fake_caller_lid().with_device(3);
+        let node = base_call_builder()
+            .attr("participant", &participant)
+            .children([offer_builder_base()
+                .children([
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![1, 2, 3, 4])
+                        .build(),
+                    NodeBuilder::new("capability")
+                        .attr("ver", "1")
+                        .bytes(CAPABILITY_OFFER.to_vec())
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let device = parse_call_stanza(&as_ref(&node))
+            .unwrap()
+            .unwrap()
+            .media
+            .expect("media offer")
+            .peer_device
+            .expect("peer capability");
+        assert_eq!(device.jid, participant);
+    }
+
     // An offer with no <enc> for us (e.g. a different device's destination) yields media=None: there
     // is nothing to decrypt, so the media facade has nothing to drive.
     #[cfg(feature = "voip")]

@@ -7,6 +7,8 @@ use core::mem::size_of;
 
 use serde::Serialize;
 use wacore_binary::Jid;
+#[cfg(feature = "voip")]
+use zeroize::Zeroize;
 
 /// Maximum call membership from WA Web's `group_call_max_participants` AB prop.
 pub const GROUP_CALL_MAX_PARTICIPANTS: usize = 32;
@@ -71,7 +73,8 @@ impl crate::stats::HeapSize for GroupCallDevice {
 #[non_exhaustive]
 pub struct GroupCallParticipant {
     pub jid: Jid,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Phone-number aliases are retained for authenticated routing but never exposed in events.
+    #[serde(skip)]
     pub pn: Option<Jid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
@@ -189,6 +192,16 @@ impl core::fmt::Debug for GroupCallRelay {
             .field("auth_tokens", &"[redacted]")
             .field("endpoints", &self.endpoints)
             .finish()
+    }
+}
+
+#[cfg(feature = "voip")]
+impl Drop for GroupCallRelay {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.hbh_key.zeroize();
+        self.tokens.zeroize();
+        self.auth_tokens.zeroize();
     }
 }
 

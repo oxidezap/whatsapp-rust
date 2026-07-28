@@ -440,6 +440,7 @@ pub struct CallChannels {
 /// Bound slow relay writes without truncating a complete video access unit.
 const SEND_QUEUE_BATCH_CAP: usize = 64;
 const SEND_QUEUE_BYTE_CAP: usize = 2 * 1024 * 1024;
+const RELAY_RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendBatchKind {
@@ -982,7 +983,15 @@ async fn run_call_with_clock_and_wallclock(
             // An in-flight write belongs to the retired channel and is delivery-ambiguous. Drop it;
             // the fresh Allocate emitted after ReconnectRelay establishes the replacement path.
             sending = InFlightSend::default();
-            let Ok((replacement, replacement_events)) = transport.reconnect(endpoint).await else {
+            let current_transport = transport.clone();
+            let reconnect = current_transport.reconnect(endpoint).fuse();
+            let timeout = rt.sleep(RELAY_RECONNECT_TIMEOUT).fuse();
+            futures::pin_mut!(reconnect, timeout);
+            let reconnect_result = futures::select_biased! {
+                result = reconnect => result,
+                () = timeout => break 'drive,
+            };
+            let Ok((replacement, replacement_events)) = reconnect_result else {
                 break 'drive;
             };
             let retired = std::mem::replace(&mut transport, replacement);
@@ -1431,6 +1440,62 @@ mod tests {
         replacement: Mutex<Option<ReplacementRelay>>,
     }
 
+    #[derive(Default)]
+    struct HangingReconnectTransport {
+        reconnects: AtomicUsize,
+        disconnects: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RelayTransport for HangingReconnectTransport {
+        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn reconnect(
+            &self,
+            _endpoint: std::net::SocketAddr,
+        ) -> anyhow::Result<(
+            Arc<dyn RelayTransport>,
+            async_channel::Receiver<RelayTransportEvent>,
+        )> {
+            self.reconnects.fetch_add(1, Ordering::Relaxed);
+            futures::future::pending().await
+        }
+    }
+
+    struct ReconnectTimeoutRuntime;
+
+    #[async_trait]
+    impl Runtime for ReconnectTimeoutRuntime {
+        fn spawn(&self, _f: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            AbortHandle::noop()
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            if duration == RELAY_RECONNECT_TIMEOUT {
+                Box::pin(async {})
+            } else {
+                Box::pin(futures::future::pending())
+            }
+        }
+
+        fn spawn_blocking(
+            &self,
+            _f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
     #[async_trait]
     impl RelayTransport for ReconnectTransport {
         async fn send(&self, data: Bytes) -> anyhow::Result<()> {
@@ -1769,6 +1834,40 @@ mod tests {
                 .iter()
                 .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_ALLOCATE_REQUEST)),
             "the replacement transport must carry the fresh allocate"
+        );
+    }
+
+    #[test]
+    fn group_relay_migration_bounds_a_hung_reconnect() {
+        let transport = Arc::new(HangingReconnectTransport::default());
+        let (_initial_tx, initial_rx) = async_channel::unbounded();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::Update(Box::new(group_update(
+                8,
+                "203.0.113.8",
+                3481,
+            ))))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            Arc::new(ReconnectTimeoutRuntime),
+            transport.clone(),
+            initial_rx,
+            channels,
+            group_engine(),
+        ));
+
+        assert_eq!(transport.reconnects.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            transport.disconnects.load(Ordering::Relaxed),
+            1,
+            "the timed-out driver must tear down the original transport"
         );
     }
 
