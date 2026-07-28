@@ -1008,6 +1008,57 @@ impl OwnedNodeRef {
     }
 }
 
+#[cfg(test)]
+mod owned_node_ref_tests {
+    use super::*;
+
+    /// Raw binary-protocol bytes, as `OwnedNodeRef::new` wants them: `marshal`
+    /// writes a leading format byte that `unmarshal_ref` does not expect.
+    fn encoded(node: &Node) -> Bytes {
+        let bytes = crate::marshal::marshal(node).unwrap();
+        Bytes::from(bytes[1..].to_vec())
+    }
+
+    fn sample() -> Node {
+        Node::new(
+            "iq",
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("abc".into()))].into()),
+            Some(NodeContent::Bytes(b"payload".to_vec())),
+        )
+    }
+
+    #[test]
+    fn borrowed_payloads_survive_moving_the_cart() {
+        let node = sample();
+        let owned = OwnedNodeRef::new(encoded(&node)).unwrap();
+
+        // Move the value twice — through a Box and into a Vec — before reading
+        // anything back. That is the whole `StableDeref` claim: the yoked
+        // `NodeRef` keeps pointing at live bytes even though the wrapper it
+        // borrows from has moved. Nothing but an interpreter notices when it
+        // stops being true, which is why this test exists separately from the
+        // serde one it used to be a side effect of.
+        let mut moved = vec![*Box::new(owned)];
+        let owned = moved.pop().unwrap();
+
+        assert_eq!(owned.tag(), "iq");
+        assert!(owned.get_attr("id").unwrap() == "abc");
+        assert_eq!(owned.content_bytes(), Some(&b"payload"[..]));
+        assert_eq!(owned.to_owned_node(), node);
+    }
+
+    #[test]
+    fn slice_bytes_views_the_backing_buffer_without_copying() {
+        let owned = OwnedNodeRef::new(encoded(&sample())).unwrap();
+        let content = owned.content_bytes().unwrap();
+
+        let view = owned.slice_bytes(content);
+
+        assert_eq!(view.as_ref(), b"payload");
+        assert_eq!(view.as_ptr(), content.as_ptr(), "slice_bytes copied");
+    }
+}
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for OwnedNodeRef {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
