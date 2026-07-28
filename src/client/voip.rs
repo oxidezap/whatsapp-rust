@@ -1771,9 +1771,9 @@ mod tests {
         MAX_PENDING_CALL_LINK_TRANSITION_BYTES, MAX_PENDING_CALL_LINK_TRANSITIONS,
         WaitingRoomUserAction,
     };
-    #[cfg(feature = "voip-runtime")]
-    use crate::client::CallError;
     use crate::client::Client;
+    #[cfg(feature = "voip-runtime")]
+    use crate::client::{CallError, ResponseWaiter};
 
     #[cfg(feature = "voip-runtime")]
     #[test]
@@ -3426,6 +3426,77 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_ack_paths_bind_before_waking_the_waiter() {
+        for owned_fast_path in [false, true] {
+            let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+            let unrelated_creator = Jid::new("333333333333333", Server::Lid);
+            let unrelated_sender = unrelated_creator.clone().with_device(1);
+            let _pending = client.begin_call_link_join();
+            assert_eq!(
+                client.buffer_pending_call_link_terminate(
+                    "UNRELATED-CALL-LINK",
+                    &unrelated_creator,
+                    &unrelated_sender,
+                ),
+                PendingCallLinkBuffer::Buffered
+            );
+
+            let request_id = if owned_fast_path {
+                "OWNED-LINK-JOIN-ACK"
+            } else {
+                "SHARED-LINK-JOIN-ACK"
+            };
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            client
+                .response_waiters_guard()
+                .insert(request_id.to_string(), ResponseWaiter::Iq(sender));
+            let ack = NodeBuilder::new("ack")
+                .attr("id", request_id)
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "ACTUAL-CALL-LINK")
+                    .build()])
+                .build();
+            let node = crate::test_utils::node_to_owned_ref(&ack);
+            let handled = if owned_fast_path {
+                let node = Arc::try_unwrap(node)
+                    .unwrap_or_else(|_| panic!("the test owns the ACK allocation"));
+                client.handle_ack_response_owned(node)
+            } else {
+                client.handle_ack_response_arc(&node)
+            };
+            assert!(handled, "the ACK must resolve its registered waiter");
+            assert_eq!(
+                client
+                    .memory_report()
+                    .await
+                    .pending_call_link_updates
+                    .entries,
+                0,
+                "the ACK call id must be bound before the waiter can observe the response"
+            );
+            assert_eq!(
+                client.buffer_pending_call_link_terminate(
+                    "LATE-UNRELATED-CALL",
+                    &unrelated_creator,
+                    &unrelated_sender,
+                ),
+                PendingCallLinkBuffer::NotPending,
+                "later unrelated controls cannot consume the bound join's budget"
+            );
+            let response = receiver.await.expect("the ACK waiter should be woken");
+            assert!(
+                response
+                    .get()
+                    .get_attr("id")
+                    .is_some_and(|value| value.as_str() == request_id)
+            );
+        }
     }
 
     #[cfg(feature = "voip-runtime")]
