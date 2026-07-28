@@ -123,6 +123,7 @@ pub struct DevicePropsOverride {
     pub os: Option<String>,
     pub version: Option<wa::device_props::AppVersion>,
     pub platform_type: Option<wa::device_props::PlatformType>,
+    pub require_full_sync: Option<bool>,
     pub history_sync_config: Option<wa::device_props::HistorySyncConfig>,
 }
 
@@ -146,6 +147,30 @@ impl DevicePropsOverride {
         self
     }
 
+    /// Asks the server for a full history backfill instead of the recent-only
+    /// sync the default requests.
+    ///
+    /// WA Web never sends this flag on its own — it mirrors the Windows-native
+    /// client (`WAWebEnvironment.isWindows`), and that identity carries three
+    /// other fields with it. Enabling this alone produces a `DeviceProps` shape
+    /// no official client emits; pair it with the rest of the UWP identity:
+    ///
+    /// ```rust,ignore
+    /// DevicePropsOverride::new()
+    ///     .with_platform_type(PlatformType::UWP)
+    ///     .with_require_full_sync(true)
+    ///     .with_history_sync_config(wa::device_props::HistorySyncConfig {
+    ///         full_sync_days_limit: Some(365),
+    ///         on_demand_ready: Some(true),
+    ///         complete_on_demand_ready: Some(true),
+    ///         ..default_history_sync_config()
+    ///     })
+    /// ```
+    pub fn with_require_full_sync(mut self, require_full_sync: bool) -> Self {
+        self.require_full_sync = Some(require_full_sync);
+        self
+    }
+
     /// Replaces the entire `HistorySyncConfig`. Spread [`default_history_sync_config`]
     /// into the literal to patch only specific fields while keeping sane defaults.
     pub fn with_history_sync_config(
@@ -160,6 +185,7 @@ impl DevicePropsOverride {
         self.os.is_none()
             && self.version.is_none()
             && self.platform_type.is_none()
+            && self.require_full_sync.is_none()
             && self.history_sync_config.is_none()
     }
 }
@@ -171,14 +197,17 @@ impl DevicePropsOverride {
 /// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
 /// hardcoded values.
 ///
+/// `full_sync_days_limit` is one of those: WA Web only sets it (to `365`) on
+/// the branch that also asks for a full sync, so it belongs with
+/// [`DevicePropsOverride::with_require_full_sync`], not in the recent-sync
+/// default. Sending a days limit while asking for a recent sync is a shape no
+/// official client emits, and the limit has nothing to bound anyway.
+///
 /// `support_*` capability flags are advertised as `true`: they tell the
 /// server which history payload variants the client can ingest, and the
-/// library either handles them or treats them as opaque (no harm). The
-/// platform-gated `support_call_log_history` is `false` because the call
-/// log history payload is bound to the Windows desktop client.
+/// library either handles them or treats them as opaque (no harm).
 pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
     wa::device_props::HistorySyncConfig {
-        full_sync_days_limit: Some(30),
         inline_initial_payload_in_e2_ee_msg: Some(true),
         support_bot_user_agent_chat_history: Some(true),
         support_cag_reactions_and_polls: Some(true),
@@ -187,7 +216,7 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
         support_biz_hosted_msg: Some(true),
         support_fbid_bot_chat_history: Some(true),
         support_message_association: Some(true),
-        support_call_log_history: Some(false),
+        support_call_log_history: Some(true),
         support_group_history: Some(true),
         support_manus_history: Some(true),
         support_hatch_history: Some(true),
@@ -195,6 +224,20 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
     }
 }
 
+/// WA Web builds exactly two `DeviceProps` shapes, selected by
+/// `WAWebEnvironment.isWindows` (the Windows-native "win_hybrid" client, not a
+/// browser running on Windows):
+///
+/// | | `platform_type` | `require_full_sync` | `full_sync_days_limit` | `on_demand_ready` |
+/// | --- | --- | --- | --- | --- |
+/// | browser | CHROME/FIREFOX/… | `false` | unset | unset |
+/// | win_hybrid | UWP | `true` | `365` | `true` |
+///
+/// The default mirrors the browser row: a companion that always asks for a full
+/// backfill is asking for more than the client it claims to be, and it does so
+/// in the registration payload. Embedders that genuinely want the backfill opt
+/// in through [`DevicePropsOverride::with_require_full_sync`], which documents
+/// the fields that travel with it.
 pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
     os: Some("rust".to_string()),
     version: buffa::MessageField::some(wa::device_props::AppVersion {
@@ -204,7 +247,7 @@ pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::Device
         ..Default::default()
     }),
     platform_type: Some(wa::device_props::PlatformType::UNKNOWN),
-    require_full_sync: Some(true),
+    require_full_sync: Some(false),
     history_sync_config: buffa::MessageField::some(default_history_sync_config()),
 });
 
@@ -436,6 +479,9 @@ impl Device {
         if let Some(platform_type) = o.platform_type {
             props.platform_type = Some(platform_type);
         }
+        if let Some(require_full_sync) = o.require_full_sync {
+            props.require_full_sync = Some(require_full_sync);
+        }
         if let Some(history_sync_config) = o.history_sync_config {
             props.history_sync_config = buffa::MessageField::some(history_sync_config);
         }
@@ -648,6 +694,80 @@ mod tests {
         assert_eq!(
             props.version.as_option(),
             Some(&Device::default_device_props_version())
+        );
+    }
+
+    fn registration_device_props(device: &Device) -> wa::DeviceProps {
+        let bytes = device
+            .get_client_payload()
+            .device_pairing_data
+            .into_option()
+            .expect("device_pairing_data")
+            .device_props
+            .expect("device_props bytes");
+        wa::DeviceProps::decode_from_slice(bytes.as_slice()).expect("decode DeviceProps")
+    }
+
+    /// The out-of-the-box registration payload matches WA Web's browser branch:
+    /// recent sync, and no days limit tagging along to bound a sync we did not
+    /// ask for.
+    #[test]
+    fn default_props_request_a_recent_sync_without_a_days_limit() {
+        let props = registration_device_props(&Device::new());
+
+        assert_eq!(props.require_full_sync, Some(false));
+        assert_eq!(
+            props
+                .history_sync_config
+                .as_option()
+                .expect("history_sync_config")
+                .full_sync_days_limit,
+            None,
+        );
+    }
+
+    /// The full-sync opt-in reaches the wire, and the fields it travels with
+    /// stay reachable in the same builder chain.
+    #[test]
+    fn require_full_sync_override_reaches_registration_payload() {
+        let mut device = Device::new();
+        device.set_device_props(
+            DevicePropsOverride::new()
+                .with_platform_type(wa::device_props::PlatformType::UWP)
+                .with_require_full_sync(true)
+                .with_history_sync_config(wa::device_props::HistorySyncConfig {
+                    full_sync_days_limit: Some(365),
+                    on_demand_ready: Some(true),
+                    complete_on_demand_ready: Some(true),
+                    ..default_history_sync_config()
+                }),
+        );
+
+        let props = registration_device_props(&device);
+        assert_eq!(props.require_full_sync, Some(true));
+        assert_eq!(
+            props.platform_type,
+            Some(wa::device_props::PlatformType::UWP)
+        );
+        let hsc = props
+            .history_sync_config
+            .into_option()
+            .expect("history_sync_config");
+        assert_eq!(hsc.full_sync_days_limit, Some(365));
+        assert_eq!(hsc.on_demand_ready, Some(true));
+        assert_eq!(hsc.complete_on_demand_ready, Some(true));
+    }
+
+    /// A `None` on the new field leaves the default alone, like every other
+    /// field on the override.
+    #[test]
+    fn require_full_sync_unset_preserves_the_default() {
+        let mut device = Device::new();
+        device.set_device_props(DevicePropsOverride::new().with_os("Windows"));
+
+        assert_eq!(
+            registration_device_props(&device).require_full_sync,
+            Some(false)
         );
     }
 

@@ -1309,7 +1309,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             // Field-by-field to avoid Debug-formatting waproto types (keeps their
             // generated Debug impls out of the binary).
             info!(
-                "Applying device props override: os={:?} version={:?} platform_type={:?} history_sync_config={}",
+                "Applying device props override: os={:?} version={:?} platform_type={:?} require_full_sync={:?} history_sync_config={}",
                 override_.os.as_deref(),
                 override_.version.as_ref().map(|v| {
                     format!(
@@ -1320,6 +1320,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
                     )
                 }),
                 override_.platform_type.map(|p| p as i32),
+                override_.require_full_sync,
                 if override_.history_sync_config.is_some() {
                     "overridden"
                 } else {
