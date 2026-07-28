@@ -2976,6 +2976,15 @@ fn current_group_invite_offer_context(
     Ok((participants, session.is_video))
 }
 
+fn group_video_upgrade_allowed(group: &wacore::voip::GroupCallState) -> bool {
+    !group
+        .waiting_room()
+        .is_some_and(|room| room.media == CallLinkMedia::Audio)
+        && group
+            .snapshot()
+            .is_none_or(|snapshot| snapshot.media == "video" || snapshot.av_upgradable)
+}
+
 impl CallHandle {
     /// The call-id this handle controls.
     pub fn call_id(&self) -> &str {
@@ -3327,6 +3336,16 @@ impl CallHandle {
             .ok_or(CallError::Media("call no longer active"))?;
         let transition_guard = transition_lock.lock().await;
         self.ensure_current()?;
+        if matches!(role, VideoUpgradeRole::Initiate)
+            && let Some(group) = self
+                .client_registry
+                .group_state_if_current(&self.call_id, self.generation)
+            && !group_video_upgrade_allowed(&group)
+        {
+            return Err(CallError::Media(
+                "group media mode does not allow a video upgrade",
+            ));
+        }
         let request_epoch = match role {
             VideoUpgradeRole::Initiate => Some(
                 self.client_registry
@@ -7482,6 +7501,66 @@ mod tests {
             "invalid timing must not attach endpoints"
         );
         handle.hangup().await;
+    }
+
+    #[tokio::test]
+    async fn start_video_rejects_non_upgradable_group_before_attaching() {
+        let (client, sent_count, handle, _relay_keepalive) = sending_handle().await;
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(false)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client.call_registry().apply_group_update(update),
+            wacore::voip::GroupStateApply::Applied
+        );
+        let sent_before = sent_count.load(Ordering::SeqCst);
+        let (source, sink) = video_endpoints();
+
+        assert!(matches!(
+            handle.start_video(source, sink).await,
+            Err(CallError::Media(
+                "group media mode does not allow a video upgrade"
+            ))
+        ));
+        assert_eq!(
+            sent_count.load(Ordering::SeqCst),
+            sent_before,
+            "an ineligible group call must not send video signaling"
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "an ineligible group call must not attach video endpoints"
+        );
+        handle.hangup().await;
+    }
+
+    #[test]
+    fn audio_call_links_are_not_video_upgradable() {
+        let mut group = wacore::voip::GroupCallState::new("CALL-LINK", caller());
+        assert_eq!(
+            group.apply_waiting_room(
+                wacore::types::group_call::WaitingRoom::builder()
+                    .call_id("CALL-LINK".to_string())
+                    .call_creator(caller())
+                    .link_token("TEST-CALL-LINK".to_string())
+                    .media(CallLinkMedia::Audio)
+                    .enabled(true)
+                    .is_admin(false)
+                    .transaction_id(1)
+                    .users(Vec::new())
+                    .build(),
+            ),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(!group_video_upgrade_allowed(&group));
     }
 
     // A signaling send failure during an upgrade must roll the local video setup back: endpoints

@@ -420,13 +420,12 @@ impl StanzaHandler for CallHandler {
                     #[cfg(feature = "voip-runtime")]
                     match &call.action {
                         CallAction::GroupUpdate { update }
-                            if client.buffer_pending_call_link_update(
-                                update,
-                                &routed_call_sender(&call),
-                            ) =>
+                            if client
+                                .buffer_pending_call_link_update(update, &routed_call_sender(&call))
+                                .suppresses_dispatch() =>
                         {
                             // A call-link admission can overtake the join task after its ACK wakes.
-                            // Registration consumes this creator-authenticated snapshot atomically.
+                            // Registration consumes it atomically, or rejects a saturated join.
                             dispatch_call = false;
                         }
                         CallAction::GroupUpdate { .. } | CallAction::EncRekey { .. }
@@ -449,13 +448,15 @@ impl StanzaHandler for CallHandler {
                             .await;
                         }
                         CallAction::WaitingRoomUpdate { room }
-                            if client.buffer_pending_call_link_waiting_room(
-                                room,
-                                &routed_call_sender(&call),
-                            ) =>
+                            if client
+                                .buffer_pending_call_link_waiting_room(
+                                    room,
+                                    &routed_call_sender(&call),
+                                )
+                                .suppresses_dispatch() =>
                         {
                             // The ACK can wake the join task before it publishes its generation.
-                            // Registration replays this creator-authenticated snapshot in order.
+                            // Registration replays it in order, or rejects a saturated join.
                             dispatch_call = false;
                         }
                         CallAction::WaitingRoomUpdate { room }
