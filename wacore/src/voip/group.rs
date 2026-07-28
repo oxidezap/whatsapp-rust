@@ -104,8 +104,12 @@ impl GroupCallState {
             .collect::<HashSet<_>>();
         self.raised_hands
             .retain(|participant| connected.contains(participant));
-        self.screen_shares
-            .retain(|participant, _| connected.contains(participant));
+        if update.media == "audio" {
+            self.screen_shares.clear();
+        } else {
+            self.screen_shares
+                .retain(|participant, _| connected.contains(participant));
+        }
         if update.relay.is_none() {
             // Roster-only updates do not revoke the relay allocation. The media engine follows the
             // same absent-means-no-refresh rule, so the durable snapshot must retain the last usable
@@ -205,10 +209,18 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
         .iter()
         .filter(|participant| participant.is_connected())
         .count();
+    let active_devices = update
+        .participants
+        .iter()
+        .filter(|participant| participant.is_connected())
+        .flat_map(|participant| participant.devices.iter())
+        .filter(|device| device.pid.is_some())
+        .count();
     if update.transaction_id == 0
         || update.connected_limit == 0
         || update.connected_limit as usize > GROUP_CALL_MAX_PARTICIPANTS
         || update.participants.len() > GROUP_CALL_MAX_PARTICIPANTS
+        || active_devices > GROUP_CALL_MAX_PARTICIPANTS
         || connected > update.connected_limit as usize
         || !matches!(update.media.as_str(), "audio" | "video")
     {
@@ -329,6 +341,44 @@ mod tests {
     }
 
     #[test]
+    fn audio_downgrade_clears_screen_share_state() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let alice = Jid::new("200002", Server::Lid);
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![
+                    participant("100001", "connected", 1),
+                    participant("200002", "connected", 2),
+                ],
+            )),
+            GroupStateApply::Applied
+        );
+        state.set_screen_share(
+            &alice,
+            ScreenShare {
+                state: ScreenShareState::Started,
+                version: 2,
+                screen_share_id: Some(7),
+            },
+        );
+
+        let mut audio = update(
+            2,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 2),
+            ],
+        );
+        audio.media = "audio".to_string();
+        assert_eq!(state.apply_update(audio), GroupStateApply::Applied);
+        assert!(
+            state.screen_shares().is_empty(),
+            "audio snapshots cannot retain a call-wide screen-share claim"
+        );
+    }
+
+    #[test]
     fn roster_only_updates_retain_the_last_usable_relay() {
         let mut state = GroupCallState::new("CALL", creator());
         let relay = GroupCallRelay::builder()
@@ -439,6 +489,22 @@ mod tests {
             state.apply_update(over_connected_limit),
             GroupStateApply::InvalidSnapshot,
             "the authoritative roster cannot already exceed its declared connected limit"
+        );
+
+        let mut device_fanout = participant("100001", "connected", 1);
+        device_fanout.devices = (1..=GROUP_CALL_MAX_PARTICIPANTS + 1)
+            .map(|index| GroupCallDevice {
+                jid: Jid::new(format!("200{index:03}"), Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(index as u32),
+                capability_version: None,
+                capability: Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            state.apply_update(update(1, vec![device_fanout])),
+            GroupStateApply::InvalidSnapshot,
+            "one connected user cannot expand the active media registry past the call limit"
         );
     }
 

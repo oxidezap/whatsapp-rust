@@ -30,6 +30,8 @@ const MAX_PENDING_INITIAL_GROUP_CONTROLS: usize = 64;
 /// Bootstrap controls only bridge the short offer-registration race. One MiB leaves ample room for
 /// a legitimate full roster plus rekey while bounding unauthenticated call-id retention.
 const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
+const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
+const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// Identifies one peer video-upgrade request within one call generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,8 +136,18 @@ impl CallEventQueue {
     }
 
     fn force_send(&self, event: CallEvent) -> bool {
+        let payload_bytes = event.heap_bytes();
+        let queue_capacity = self
+            .tx
+            .capacity()
+            .unwrap_or(DEFAULT_CALL_EVENT_QUEUE_CAPACITY)
+            .max(1);
+        let max_event_bytes = MAX_CALL_EVENT_QUEUE_BYTES / queue_capacity;
+        if size_of::<CallEvent>().saturating_add(payload_bytes) > max_event_bytes {
+            return false;
+        }
         self.max_payload_bytes
-            .fetch_max(event.heap_bytes(), Ordering::Relaxed);
+            .fetch_max(payload_bytes, Ordering::Relaxed);
         self.tx.force_send(event).is_ok()
     }
 
@@ -2669,6 +2681,34 @@ mod tests {
         assert!(
             reg.memory_stats().bytes >= baseline + payload_bytes.saturating_mul(2),
             "both queued boxes must include their retained roster allocations"
+        );
+    }
+
+    #[test]
+    fn call_event_queue_rejects_payloads_that_break_its_total_byte_budget() {
+        let (event_tx, event_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
+        let queue = CallEventQueue::new(event_tx);
+        let mut update = group_update(1);
+        update.participants.push(GroupCallParticipant {
+            jid: Jid::new("222222222222222", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(2),
+                capability_version: Some(1),
+                capability: vec![7; MAX_CALL_EVENT_QUEUE_BYTES],
+            }],
+        });
+
+        assert!(!queue.force_send(CallEvent::GroupUpdated(Box::new(update))));
+        assert!(event_rx.is_empty());
+        assert_eq!(queue.retained_bytes(), 0);
+        assert!(
+            queue.force_send(CallEvent::RelayAllocated),
+            "rejecting an oversized snapshot must leave capacity for lifecycle events"
         );
     }
 

@@ -17,8 +17,8 @@ use wacore::stanza::group_call::{
     build_call_link_join_with_capability, build_call_link_query, build_raise_hand,
     build_screen_share, build_waiting_room_admit, build_waiting_room_deny,
     build_waiting_room_heartbeat, build_waiting_room_toggle, parse_call_link_create_ack,
-    parse_call_link_join_ack, parse_call_link_query_ack, parse_waiting_room_admit_ack,
-    parse_waiting_room_deny_ack, parse_waiting_room_toggle_ack,
+    parse_call_link_join_ack, parse_call_link_join_call_id, parse_call_link_query_ack,
+    parse_waiting_room_admit_ack, parse_waiting_room_deny_ack, parse_waiting_room_toggle_ack,
 };
 use wacore::types::call::IncomingCall;
 #[cfg(feature = "voip-runtime")]
@@ -156,11 +156,18 @@ impl PendingCallLinkTransition {
 #[derive(Default)]
 pub(super) struct PendingCallLinkJoins {
     active: usize,
+    bound_call_id: Option<String>,
     transitions: std::collections::HashMap<String, Vec<PendingCallLinkTransition>>,
 }
 
 #[cfg(feature = "voip-runtime")]
 impl PendingCallLinkJoins {
+    fn accepts(&self, call_id: &str) -> bool {
+        self.bound_call_id
+            .as_deref()
+            .is_none_or(|bound| bound == call_id)
+    }
+
     fn can_buffer_transition(&self, call_id: &str, payload_bytes: usize) -> bool {
         use wacore::stats::HeapSize;
 
@@ -181,6 +188,11 @@ impl PendingCallLinkJoins {
             .saturating_add(new_key_bytes.try_into().unwrap_or(u64::MAX))
             .saturating_add(structural_reserve.try_into().unwrap_or(u64::MAX))
             <= MAX_PENDING_CALL_LINK_TRANSITION_BYTES as u64
+    }
+
+    fn bind_call_id(&mut self, call_id: &str) {
+        self.bound_call_id = Some(call_id.to_string());
+        self.transitions.retain(|retained, _| retained == call_id);
     }
 
     fn is_saturated(&self, call_id: &str) -> bool {
@@ -246,6 +258,7 @@ impl Drop for PendingCallLinkJoinGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.active = state.active.saturating_sub(1);
         if state.active == 0 {
+            state.bound_call_id = None;
             state.transitions.clear();
         }
     }
@@ -297,6 +310,10 @@ impl Client {
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active == 0 {
+            state.bound_call_id = None;
+            state.transitions.clear();
+        }
         state.active = state.active.saturating_add(1);
         drop(state);
         PendingCallLinkJoinGuard {
@@ -317,8 +334,26 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.active != 0
             && !call_id.is_empty()
+            && state.accepts(call_id)
             && sender.to_non_ad() == call_creator.to_non_ad()
             && self.call_registry.generation_of(call_id).is_none()
+    }
+
+    /// Bind the one serialized pending link join to the ACK's exact call id before the read loop
+    /// wakes the request task. Controls for unrelated unknown calls can no longer consume its
+    /// retained-entry or byte budget during the ACK/registration race.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) fn bind_pending_call_link_join_ack(&self, response: &wacore_binary::NodeRef<'_>) {
+        let Ok(call_id) = parse_call_link_join_call_id(response) else {
+            return;
+        };
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active != 0 {
+            state.bind_call_id(&call_id);
+        }
     }
 
     /// Buffer a creator-authenticated admission snapshot while its link-join ACK is being
@@ -342,6 +377,7 @@ impl Client {
         }
         if state.active == 0
             || update.call_id.is_empty()
+            || !state.accepts(&update.call_id)
             || sender.to_non_ad() != update.call_creator.to_non_ad()
         {
             return PendingCallLinkBuffer::NotPending;
@@ -397,6 +433,7 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.active == 0
             || call_id.is_empty()
+            || !state.accepts(call_id)
             || sender.to_non_ad() != call_creator.to_non_ad()
             || self.call_registry.generation_of(call_id).is_some()
         {
@@ -457,6 +494,7 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.active == 0
             || call_id.is_empty()
+            || !state.accepts(call_id)
             || sender.to_non_ad() != call_creator.to_non_ad()
             || self.call_registry.generation_of(call_id).is_some()
         {
@@ -539,6 +577,7 @@ impl Client {
         if self.call_registry.generation_of(&room.call_id).is_some()
             || state.active == 0
             || room.call_id.is_empty()
+            || !state.accepts(&room.call_id)
             || room.link_token.is_empty()
             || sender.to_non_ad() != room.call_creator.to_non_ad()
         {
@@ -584,6 +623,7 @@ impl Client {
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.bind_call_id(&call_id);
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
         if staged
             .iter()
@@ -918,7 +958,7 @@ impl Voip<'_> {
         }
         let registry = self.client.call_registry();
         let generation = registry
-            .generation_of(call_id)
+            .ringing_group_generation(call_id, call_creator)
             .ok_or(CallError::CallEndedDuringSetup)?;
         let node = build_active_group_accept(
             call_id,
@@ -1727,7 +1767,10 @@ mod tests {
     use zeroize::Zeroizing;
 
     #[cfg(feature = "voip-runtime")]
-    use super::{MAX_PENDING_CALL_LINK_TRANSITION_BYTES, WaitingRoomUserAction};
+    use super::{
+        MAX_PENDING_CALL_LINK_TRANSITION_BYTES, MAX_PENDING_CALL_LINK_TRANSITIONS,
+        WaitingRoomUserAction,
+    };
     #[cfg(feature = "voip-runtime")]
     use crate::client::CallError;
     use crate::client::Client;
@@ -3298,9 +3341,69 @@ mod tests {
             client.buffer_pending_call_link_update(&oversized, &unrelated_sender),
             PendingCallLinkBuffer::Saturated
         );
+        for index in 0..MAX_PENDING_CALL_LINK_TRANSITIONS {
+            let creator = Jid::new(format!("55555555555{index:04}"), Server::Lid);
+            let sender = creator.clone().with_device(1);
+            assert!(
+                client
+                    .buffer_pending_call_link_terminate(
+                        &format!("UNRELATED-{index}"),
+                        &creator,
+                        &sender,
+                    )
+                    .suppresses_dispatch()
+            );
+        }
 
         let call_id = "VALID-CALL-LINK";
         let call_creator = Jid::new("444444444444444", Server::Lid);
+        let ack = NodeBuilder::new("ack")
+            .attr("class", "call")
+            .attr("type", "link_join")
+            .children([NodeBuilder::new("waiting_room")
+                .attr("call-id", call_id)
+                .build()])
+            .build();
+        client.bind_pending_call_link_join_ack(&ack.as_node_ref());
+        assert_eq!(
+            client
+                .memory_report()
+                .await
+                .pending_call_link_updates
+                .entries,
+            0,
+            "binding the ACK must discard every unrelated candidate bucket"
+        );
+        assert_eq!(
+            client.buffer_pending_call_link_terminate(
+                "LATE-UNRELATED",
+                &unrelated_sender.to_non_ad(),
+                &unrelated_sender,
+            ),
+            PendingCallLinkBuffer::NotPending,
+            "later unrelated controls cannot consume the bound join's budget"
+        );
+        let mut participant = GroupCallParticipant::new(
+            call_creator.clone(),
+            vec![GroupCallDevice::new(call_creator.clone().with_device(1))],
+        );
+        participant.state = Some("connected".to_string());
+        let admitted = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(call_creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .build();
+        assert_eq!(
+            client
+                .buffer_pending_call_link_update(&admitted, &call_creator.clone().with_device(1),),
+            PendingCallLinkBuffer::Buffered
+        );
         let mut session =
             CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), call_creator);
         let _ = session.transition_to(CallPhase::Calling);
@@ -3312,6 +3415,13 @@ mod tests {
         assert!(
             client.call_registry().is_current(call_id, generation),
             "the legitimate call-link generation must remain registered"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(1)
         );
         client
             .call_registry()
@@ -3677,6 +3787,66 @@ mod tests {
             "a stale join cannot grant waiting-room admin state to its replacement"
         );
         registry.remove_if_current(call_id, replacement);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn group_invite_accept_is_bound_to_the_retained_offer_creator() {
+        let client = crate::test_utils::create_test_client().await;
+        let retained_creator = call_creator();
+        let replacement_creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "REPLACED-GROUP-INVITE";
+        let group_update = |creator: &Jid| {
+            GroupCallUpdate::builder()
+                .call_id(call_id.to_string())
+                .call_creator(creator.clone())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build()
+        };
+        let retained_update = group_update(&retained_creator);
+        let mut incoming = IncomingCall::new_for_test(
+            retained_creator.clone(),
+            "RETAINED-GROUP-INVITE".to_string(),
+            wacore::time::from_secs(1_766_847_151_i64).expect("valid ts"),
+            CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: retained_creator.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            },
+        );
+        incoming.group = Some(Box::new(retained_update.clone()));
+        let mut retained =
+            CallSession::new_incoming(call_id, retained_creator.clone(), retained_creator);
+        retained.group = Some(retained_update);
+        client.call_registry().insert_ringing_group(retained);
+
+        let replacement_update = group_update(&replacement_creator);
+        let mut replacement =
+            CallSession::new_incoming(call_id, replacement_creator.clone(), replacement_creator);
+        replacement.group = Some(replacement_update);
+        let current = client.call_registry().insert_ringing_group(replacement);
+
+        assert!(matches!(
+            client.voip().accept_group_invite(&incoming).await,
+            Err(CallError::CallEndedDuringSetup)
+        ));
+        assert_eq!(client.call_registry().generation_of(call_id), Some(current));
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, current),
+            Some(CallPhase::Ringing)
+        );
     }
 
     #[cfg(feature = "voip-runtime")]

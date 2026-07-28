@@ -812,6 +812,29 @@ pub fn parse_call_link_join_ack(node: &NodeRef<'_>, requested_token: &str) -> Re
     })
 }
 
+/// Read the call id from a valid link-join ACK before waking its requester.
+///
+/// The read loop uses this to bind pre-registration controls to the exact call while the request
+/// task is still asleep. Full token, media, roster, and creator validation remains in
+/// [`parse_call_link_join_ack`].
+pub fn parse_call_link_join_call_id(node: &NodeRef<'_>) -> Result<String> {
+    validate_call_ack(node, "link_join")?;
+    let waiting_call_id = node
+        .get_optional_child("waiting_room")
+        .map(|waiting| required_string(&mut waiting.attrs(), "call-id"))
+        .transpose()?;
+    let group_call_id = node
+        .get_optional_child("group_info")
+        .map(|group| required_string(&mut group.attrs(), "call-id"))
+        .transpose()?;
+    match (waiting_call_id, group_call_id) {
+        (Some(waiting), Some(group)) if waiting == group => Ok(waiting),
+        (Some(_), Some(_)) => bail!("waiting-room and admitted group identities differ"),
+        (Some(call_id), None) | (None, Some(call_id)) => Ok(call_id),
+        (None, None) => bail!("<link_join> ack has neither waiting_room nor group_info"),
+    }
+}
+
 /// Parse one authoritative waiting-room update action.
 #[cold]
 pub fn parse_waiting_room_update(node: &NodeRef<'_>) -> Result<WaitingRoom> {

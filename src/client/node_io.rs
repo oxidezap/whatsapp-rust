@@ -486,6 +486,8 @@ impl Client {
             // message ids), so a mismatch here means the id space collided.
             match waiter {
                 ResponseWaiter::Iq(sender) => {
+                    #[cfg(feature = "voip-runtime")]
+                    self.bind_pending_call_link_join_ack(nr);
                     if sender.send(Arc::clone(&node)).is_err() {
                         warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
                     }
