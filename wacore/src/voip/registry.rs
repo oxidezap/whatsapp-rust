@@ -1684,33 +1684,44 @@ impl CallRegistry {
             return false;
         }
         let tx = GroupControlQueue::new(tx);
-        entry.group_ctl_tx = Some(tx.clone());
-        entry.group_warp_mi_tag_len = warp_mi_tag_len;
         let update = entry
             .group
             .as_ref()
             .and_then(GroupCallState::snapshot)
             .cloned();
         let pending_epoch = entry.pending_group_epoch.take();
-        match (update, pending_epoch) {
+        let queued = match (update, pending_epoch) {
             (Some(update), Some(epoch)) => {
-                let _ = Self::force_send_preserving_epoch(
-                    &tx,
-                    GroupControl::Transition {
-                        update: Box::new(update),
-                        epoch,
-                    },
-                );
+                let transition = GroupControl::Transition {
+                    update: Box::new(update),
+                    epoch,
+                };
+                if tx.accepts(&transition) {
+                    tx.try_send(transition)
+                } else {
+                    // The engine was initialized from the retained roster before this sender is
+                    // attached. If adding the epoch tips their indivisible replay over one slot's
+                    // byte budget, replay the same roster and epoch in order instead.
+                    match transition {
+                        GroupControl::Transition { update, epoch } => {
+                            tx.try_send(GroupControl::Update(update))
+                                && tx.try_send(GroupControl::RawEpoch(epoch))
+                        }
+                        GroupControl::Update(_)
+                        | GroupControl::RawEpoch(_)
+                        | GroupControl::Reaction(_) => false,
+                    }
+                }
             }
-            (Some(update), None) => {
-                let _ =
-                    Self::force_send_preserving_epoch(&tx, GroupControl::Update(Box::new(update)));
-            }
-            (None, Some(epoch)) => {
-                let _ = Self::force_send_preserving_epoch(&tx, GroupControl::RawEpoch(epoch));
-            }
-            (None, None) => {}
+            (Some(update), None) => tx.try_send(GroupControl::Update(Box::new(update))),
+            (None, Some(epoch)) => tx.try_send(GroupControl::RawEpoch(epoch)),
+            (None, None) => true,
+        };
+        if !queued {
+            return false;
         }
+        entry.group_ctl_tx = Some(tx);
+        entry.group_warp_mi_tag_len = warp_mi_tag_len;
         true
     }
 
@@ -3362,6 +3373,65 @@ mod tests {
             ),
             "rejecting an oversized roster must leave capacity for an epoch"
         );
+    }
+
+    #[test]
+    fn group_media_attachment_splits_an_oversized_startup_transition() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let mut update = group_update(1);
+        update.participants.push(GroupCallParticipant {
+            jid: Jid::new("222222222222222", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(2),
+                capability_version: Some(1),
+                capability: Vec::new(),
+            }],
+        });
+        let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
+        let queue = GroupControlQueue::new(control_tx.clone());
+        let base = GroupControl::Update(Box::new(update.clone()));
+        let max_control_bytes = MAX_GROUP_CONTROL_QUEUE_BYTES / DEFAULT_CALL_EVENT_QUEUE_CAPACITY;
+        let padding = max_control_bytes
+            .checked_sub(size_of::<GroupControl>() + base.heap_bytes())
+            .expect("fixture leaves room for capability padding");
+        update.participants[0].devices[0].capability = vec![7; padding];
+
+        let standalone = GroupControl::Update(Box::new(update.clone()));
+        assert!(queue.accepts(&standalone));
+        let transition = GroupControl::Transition {
+            update: Box::new(update.clone()),
+            epoch: GroupRawEpoch::new(1, vec![1; 32]),
+        };
+        assert!(
+            !queue.accepts(&transition),
+            "the epoch must be what tips the retained roster over one slot's budget"
+        );
+        drop(queue);
+
+        assert_eq!(
+            reg.apply_group_update_if_current(update, generation),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_epoch_if_current("GROUP-CALL", generation, 1, vec![1; 32]));
+        assert!(
+            reg.set_group_control_sender("GROUP-CALL", generation, Some(4), control_tx),
+            "attachment must replay the already-configured roster and its epoch separately"
+        );
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 1
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(GroupControl::RawEpoch(epoch)) if epoch.transaction_id == 1
+        ));
+        assert!(control_rx.try_recv().is_err());
     }
 
     #[test]
