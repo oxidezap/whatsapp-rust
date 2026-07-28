@@ -1755,6 +1755,31 @@ async fn temporary_ban_without_expire_falls_back_to_connect_failure() {
     }
 }
 
+/// An `expire` that cannot be a `Duration` is no better than a missing one: it
+/// must not reach a consumer as a ban of length zero.
+#[tokio::test]
+async fn temporary_ban_with_unrepresentable_expire_falls_back_to_connect_failure() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "402")
+        .attr("code", "101")
+        .attr("expire", u64::MAX.to_string())
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events.try_recv().expect("a garbage 402 still dispatches") {
+        Event::ConnectFailure(cf) => {
+            assert_eq!(cf.reason, ConnectFailureReason::TempBanned);
+            assert!(cf.raw.is_some(), "the <failure> stanza must survive");
+        }
+        other => panic!("expected Event::ConnectFailure, got {other:?}"),
+    }
+}
+
 /// 405 is the one branch with nothing to parse, which is exactly why it used to
 /// throw the stanza away; the client version the server rejected is in there.
 #[tokio::test]

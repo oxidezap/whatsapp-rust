@@ -21,20 +21,27 @@ use wacore_binary::NodeRef;
 /// Borrows from the stanza; nothing is copied until the caller keeps a field.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFailureStanza<'a> {
-    /// `reason`, the failure code. WA Web declares it required and range-checks
-    /// it to 400..=599, dropping the stanza when it is missing or out of range;
-    /// this parser reports absence instead so the caller owns that policy.
+    /// `reason`, the failure code. `None` only when the attribute is absent or
+    /// unparseable — a code outside WA Web's accepted 400..=599 is kept as
+    /// [`ConnectFailureReason::Unknown`], not discarded. WA Web can afford to
+    /// drop such a stanza because it has a UI to fall back on; here the exact
+    /// code is the only thing that would tell an operator what the server
+    /// actually said, and whatsmeow keeps it for the same reason.
     pub reason: Option<ConnectFailureReason>,
     /// `location` — a region routing token (e.g. `"rva"`), never the cause.
     /// Diagnostic only; WA Web parses it and only ever logs it.
     pub location: Option<Cow<'a, str>>,
     /// `code` — the ban sub-reason, present on `reason=402`.
     pub code: Option<i32>,
-    /// `expire` — unix seconds at which a temporary ban lifts.
+    /// `expire` — how long the temporary ban lasts, in seconds. A duration, not
+    /// a timestamp: WA Web's ban screen renders it as
+    /// `moment.duration(expire, "seconds").humanize()` in "You'll be able to
+    /// use WhatsApp again in {duration}".
     pub expire: Option<u64>,
     /// `message` — free-text detail, not localized.
     pub message: Option<Cow<'a, str>>,
-    /// `url` — a support/appeal link the official UI opens for a ban.
+    /// `url` — the link the ban screen's "Learn more" opens. WA Web falls back
+    /// to the generic FAQ URL when the server sends none.
     pub url: Option<Cow<'a, str>>,
     /// `logout_message_header`.
     pub logout_message_header: Option<Cow<'a, str>>,
@@ -99,7 +106,8 @@ mod tests {
             .attr("reason", "402")
             .attr("location", "frc")
             .attr("code", "101")
-            .attr("expire", "1800000000")
+            // A duration, not a deadline: 6 hours of ban.
+            .attr("expire", "21600")
             .attr("message", "banned")
             .attr("url", "https://example.invalid/appeal")
             .attr("logout_message_header", "Conta desconectada")
@@ -113,7 +121,7 @@ mod tests {
         assert_eq!(parsed.reason, Some(ConnectFailureReason::TempBanned));
         assert_eq!(parsed.location.as_deref(), Some("frc"));
         assert_eq!(parsed.code, Some(101));
-        assert_eq!(parsed.expire, Some(1_800_000_000));
+        assert_eq!(parsed.expire, Some(21_600));
         assert_eq!(parsed.message.as_deref(), Some("banned"));
         assert_eq!(
             parsed.url.as_deref(),
@@ -147,6 +155,20 @@ mod tests {
         let node = NodeBuilder::new("failure").attr("location", "rva").build();
         let node_ref = node.as_node_ref();
         assert_eq!(ConnectFailureStanza::parse(&node_ref).reason, None);
+    }
+
+    /// A code outside WA Web's 400..=599 is kept, not dropped. Filtering it to
+    /// `None` would collapse into the same `Unknown(0)` an absent attribute
+    /// produces, and the exact code is the only description of what the server
+    /// refused with — the one thing this whole module exists to preserve.
+    #[test]
+    fn out_of_range_reason_is_preserved_as_unknown() {
+        let node = NodeBuilder::new("failure").attr("reason", "600").build();
+        let node_ref = node.as_node_ref();
+        assert_eq!(
+            ConnectFailureStanza::parse(&node_ref).reason,
+            Some(ConnectFailureReason::Unknown(600))
+        );
     }
 
     /// The locale alone is not a message: WA Web only builds the object when a

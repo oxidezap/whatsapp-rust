@@ -1789,9 +1789,9 @@ impl Client {
         } else if let ConnectFailureReason::TempBanned = reason
             && let Some(expire_secs) = failure.expire
             && let Some(ban_code) = failure.code
+            && let Ok(expire_secs) = i64::try_from(expire_secs)
+            && let Some(expire_duration) = chrono::Duration::try_seconds(expire_secs)
         {
-            let expire_duration =
-                chrono::Duration::try_seconds(expire_secs as i64).unwrap_or_default();
             warn!(
                 "Temporary ban connect failure: {}",
                 DisplayableNodeRef(node)
@@ -1813,9 +1813,10 @@ impl Client {
                     .build(),
             ));
         } else {
-            // Also the landing spot for a 402 that omitted `code`/`expire`:
-            // WA Web errors out there instead of reporting a ban that lifts at
-            // the epoch, so the raw stanza is all we can honestly hand over.
+            // Also the landing spot for a 402 whose `code`/`expire` is missing
+            // or does not fit a `Duration`: WA Web errors out there instead of
+            // reporting a zero-length ban, so the raw stanza is all we can
+            // honestly hand over.
             warn!("Unknown connect failure: {}", DisplayableNodeRef(node));
             self.core.event_bus.dispatch(Event::ConnectFailure(
                 crate::types::events::ConnectFailure::builder()

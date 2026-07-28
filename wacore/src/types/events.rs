@@ -1263,7 +1263,13 @@ pub struct LoggedOut {
     /// Server-supplied logout copy, when it sent any. Present in practice on
     /// [`ConnectFailureReason::AccountLocked`].
     pub logout_message: Option<LogoutMessage>,
-    /// The whole `<failure>` stanza that caused the logout.
+    /// The whole stanza that caused the logout, when one did.
+    ///
+    /// Two shapes reach here, so dispatch on `raw.tag` rather than assuming
+    /// one: `<failure>` for a server-side refusal (`on_connect` is then true),
+    /// and `<stream:error>` for a `<conflict>`, a 516 device removal or a 401.
+    /// `None` when nothing was received at all — a locally initiated logout has
+    /// no stanza to report.
     ///
     /// A forced logout is where the server puts data it will never repeat: an
     /// account lock carries a one-time `appeal_token` plus `violation_reason`
@@ -1317,9 +1323,14 @@ impl fmt::Display for TempBanReason {
 #[non_exhaustive]
 pub struct TemporaryBan {
     pub code: TempBanReason,
-    /// Dispatched only when the server sent `expire`; a ban stanza missing
-    /// `code` or `expire` surfaces as [`Event::ConnectFailure`] instead, the
-    /// way WA Web rejects it rather than inventing a zero.
+    /// How long the ban lasts — the wire's `expire` is a duration in seconds,
+    /// not a deadline (WA Web renders it as "You'll be able to use WhatsApp
+    /// again in {duration}").
+    ///
+    /// Dispatched only when the server sent an `expire` that fits a `Duration`;
+    /// a ban stanza missing `code`/`expire`, or carrying one that does not,
+    /// surfaces as [`Event::ConnectFailure`] instead, the way WA Web rejects it
+    /// rather than inventing a zero.
     pub expire: Duration,
     /// The server's `message` attribute, when present.
     pub message: Option<String>,
