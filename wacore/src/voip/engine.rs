@@ -2056,7 +2056,7 @@ impl CallEngine {
                 .get(&video.device_jid)
                 .or_else(|| group.video_orientations.get(&video.user_jid))
                 .copied()
-                .unwrap_or(self.peer_video_orientation);
+                .unwrap_or_default();
             for access_unit in video.access_units {
                 let keyframe = au_is_keyframe(&access_unit);
                 self.outbox.push_back(Output::VideoPlayout(VideoFrame {
@@ -4490,6 +4490,22 @@ mod tests {
                 pid: Some(2),
                 ..
             }) if *sender == peer_user && *device == peer_device
+        )));
+    }
+
+    #[test]
+    fn group_video_does_not_inherit_the_direct_peer_orientation() {
+        let (mut eng, epoch) = group_engine(true);
+        eng.set_peer_video_orientation(3);
+        let mut peer = group_peer_video(&epoch);
+        let packet = peer
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video");
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        assert!(drain(&mut eng).0.iter().any(|output| matches!(
+            output,
+            Output::VideoPlayout(VideoFrame { orientation: 0, .. })
         )));
     }
 

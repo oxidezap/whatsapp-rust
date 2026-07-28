@@ -132,7 +132,6 @@ pub struct GroupMediaRegistry {
     warp_mi_tag_len: usize,
     video_ts_stride: u32,
     roster_transaction: Option<u32>,
-    has_committed_pid_roster: bool,
     receivers: HashMap<String, ParticipantReceiver>,
     audio_routes: HashMap<u32, String>,
     video_routes: HashMap<u32, String>,
@@ -162,7 +161,6 @@ impl GroupMediaRegistry {
             warp_mi_tag_len,
             video_ts_stride,
             roster_transaction: None,
-            has_committed_pid_roster: false,
             receivers: HashMap::new(),
             audio_routes: HashMap::new(),
             video_routes: HashMap::new(),
@@ -261,10 +259,11 @@ impl GroupMediaRegistry {
 
         let active = active_devices(update, &self.self_lid);
         if active.is_empty() {
-            if self.has_committed_pid_roster {
-                self.receivers.clear();
-                self.rebuild_routes()?;
-            }
+            // Even the first authoritative roster supersedes the direct-call fallback. Retaining
+            // its seeded receiver when every remote device has already left would keep accepting
+            // media under a participant identity the group roster no longer authorizes.
+            self.receivers.clear();
+            self.rebuild_routes()?;
             self.roster_transaction = Some(update.transaction_id);
             self.install_best_pending_epoch()?;
             return Ok(GroupRosterApply::Applied);
@@ -313,7 +312,6 @@ impl GroupMediaRegistry {
             next.insert(participant_id, receiver);
         }
         self.receivers = next;
-        self.has_committed_pid_roster = true;
         self.roster_transaction = Some(update.transaction_id);
         self.install_best_pending_epoch()?;
         self.rebuild_routes()?;
@@ -860,6 +858,34 @@ mod tests {
             registry
                 .unprotect_audio(&unknown.protect_audio(&payload))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn first_empty_group_roster_removes_the_seeded_direct_peer() {
+        let epoch = [0x42; 32];
+        let peer = Jid::new("200002", Server::Lid).with_device(2);
+        let mut sender = peer_sender(&epoch, &peer);
+        let mut registry = registry();
+        registry
+            .seed_direct_peer(&epoch, &peer.to_non_ad(), &peer, true)
+            .expect("direct peer");
+        assert!(
+            registry
+                .unprotect_audio(&sender.protect_audio(&[0x50; 20]))
+                .is_some(),
+            "the direct fallback is active before the first roster"
+        );
+
+        registry
+            .apply_group_update(&update(1, vec![device("100001", 1, 1)]))
+            .expect("authoritative empty remote roster");
+        assert!(registry.active_participant_ids().is_empty());
+        assert!(
+            registry
+                .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
+                .is_none(),
+            "the first authoritative roster must revoke a departed direct peer"
         );
     }
 

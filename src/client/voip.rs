@@ -777,38 +777,85 @@ impl Voip<'_> {
             ));
         }
 
-        let current_state = registry.group_state_if_current(&join.call_id, generation);
-        if let Some(room) = current_state
+        let rekey_required = join
+            .group
             .as_ref()
-            .and_then(wacore::voip::GroupCallState::waiting_room)
-            .cloned()
-        {
-            join.waiting_room_enabled = room.enabled;
-            join.is_admin = room.is_admin;
-            join.waiting_room = Some(room);
-        }
-        let still_waiting =
-            registry.phase_if_current(&join.call_id, generation) == Some(CallPhase::WaitingRoom);
-        let current_update = current_state.and_then(|state| state.snapshot().cloned());
-        if !still_waiting {
-            join.in_waiting_room = false;
-            if current_update.is_some() {
-                join.group.clone_from(&current_update);
+            .is_some_and(|update| update.rekey_requested);
+        let mut still_waiting = self
+            .synchronize_call_link_admission(&mut join, generation, rekey_required)
+            .await?;
+        if still_waiting {
+            let heartbeat = self
+                .waiting_room_heartbeat(&join.call_id, &join.call_creator)
+                .await;
+            // The heartbeat crosses an unbounded transport await. Admission may have committed
+            // while it was in flight, so re-read the generation before publishing the result or
+            // starting a task that now belongs to an admitted call.
+            still_waiting = self
+                .synchronize_call_link_admission(&mut join, generation, rekey_required)
+                .await?;
+            if still_waiting {
+                heartbeat?;
             }
         }
-
         if still_waiting {
-            self.waiting_room_heartbeat(&join.call_id, &join.call_creator)
-                .await?;
             self.start_waiting_room_heartbeat(
                 join.call_id.clone(),
                 join.call_creator.clone(),
                 generation,
             );
-        } else if let Some(update) = current_update.as_ref()
-            && update.rekey_requested
+        }
+
+        registry.set_group_invite_self_device(
+            &join.call_id,
+            generation,
+            wacore::types::group_call::GroupCallDevice::new(own_lid).with_capability(1, capability),
+        );
+        registration.disarm();
+        Ok(CallLinkJoinRegistration { join, generation })
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    async fn synchronize_call_link_admission(
+        &self,
+        join: &mut CallLinkJoin,
+        generation: u64,
+        rekey_required: bool,
+    ) -> Result<bool, CallError> {
+        let registry = self.client.call_registry();
+        let transition_lock = registry
+            .group_transition_lock(&join.call_id, generation)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        let _transition_guard = transition_lock.lock().await;
+        let state = registry
+            .group_state_if_current(&join.call_id, generation)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        if let Some(room) = state.waiting_room().cloned() {
+            join.waiting_room_enabled = room.enabled;
+            join.is_admin = room.is_admin;
+            join.waiting_room = Some(room);
+        }
+        let phase = registry
+            .phase_if_current(&join.call_id, generation)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        if phase == CallPhase::WaitingRoom {
+            join.in_waiting_room = true;
+            return Ok(true);
+        }
+
+        let update = state.snapshot().cloned().ok_or(CallError::Media(
+            "admitted call link has no authoritative group snapshot",
+        ))?;
+        join.in_waiting_room = false;
+        join.group = Some(update.clone());
+        let retained_epoch =
+            registry.pending_group_epoch_transaction_if_current(&join.call_id, generation);
+        if (rekey_required || update.rekey_requested)
+            && retained_epoch.is_none_or(|transaction| transaction < update.transaction_id)
         {
-            crate::voip::facade::fanout_group_epoch(self.client, update)
+            // The shared transition lane keeps roster selection, fan-out, and publication on the
+            // same transaction even if a post-registration update tries to overtake the ACK.
+            crate::voip::facade::fanout_group_epoch(self.client, &update)
                 .await?
                 .commit(|epoch| {
                     registry
@@ -824,14 +871,7 @@ impl Voip<'_> {
                         ))
                 })?;
         }
-
-        registry.set_group_invite_self_device(
-            &join.call_id,
-            generation,
-            wacore::types::group_call::GroupCallDevice::new(own_lid).with_capability(1, capability),
-        );
-        registration.disarm();
-        Ok(CallLinkJoinRegistration { join, generation })
+        Ok(false)
     }
 
     /// Enable or disable approval for a live call-link waiting room.
@@ -2813,6 +2853,86 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn call_link_rekey_targets_the_latest_post_registration_roster() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "POST-REGISTRATION-REKEY";
+        let mut participant =
+            GroupCallParticipant::new(own_lid.to_non_ad(), vec![GroupCallDevice::new(own_lid)]);
+        participant.state = Some("connected".to_string());
+        let initial = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(true)
+            .participants(vec![participant.clone()])
+            .build();
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator.clone());
+        session.group = Some(initial.clone());
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::Connecting);
+        let generation = client
+            .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+            .await
+            .expect("registered admitted call link");
+
+        let mut current = initial.clone();
+        current.transaction_id = 2;
+        current.rekey_requested = false;
+        assert_eq!(
+            client
+                .call_registry()
+                .apply_group_update_if_current(current, generation),
+            wacore::voip::GroupStateApply::Applied
+        );
+        let mut join = wacore::types::group_call::CallLinkJoin::builder()
+            .token("TEST-CALL-LINK".to_string())
+            .media(CallLinkMedia::Audio)
+            .call_id(call_id.to_string())
+            .call_creator(creator)
+            .waiting_room_enabled(false)
+            .in_waiting_room(false)
+            .is_admin(false)
+            .group(initial)
+            .build();
+
+        assert!(
+            !client
+                .voip()
+                .synchronize_call_link_admission(&mut join, generation, true)
+                .await
+                .expect("latest admission state")
+        );
+        assert_eq!(
+            join.group.as_ref().map(|update| update.transaction_id),
+            Some(2)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .pending_group_epoch_transaction_if_current(call_id, generation),
+            Some(2),
+            "the ACK rekey obligation must publish against the latest serialized roster"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn invalid_admitted_call_link_snapshot_is_not_registered() {
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
         let creator = Jid::new("333333333333333", Server::Lid);
@@ -3166,6 +3286,144 @@ mod tests {
             None,
             "cancelling after registration must reap only that generation"
         );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_join_reports_admission_committed_during_heartbeat() {
+        use wacore::handshake::NoiseCipher;
+
+        struct GatedTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for GatedTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                self.started
+                    .send(())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("heartbeat observer closed"))?;
+                self.release
+                    .recv()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("heartbeat gate closed"))?;
+                Ok(())
+            }
+
+            async fn disconnect(&self) {}
+        }
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let join_client = client.clone();
+        let join = tokio::spawn(async move {
+            join_client
+                .voip()
+                .join_call_link_registration_with_audio(
+                    "ADMISSION-RACE-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        let request = sent.await.expect("link_join request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let gated_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(GatedTransport {
+                started: started_tx,
+                release: release_rx,
+            }),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(gated_socket));
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .attr("id", request_id.as_str())
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "ADMISSION-RACE-CALL")
+                    .attr("call-creator", creator.clone())
+                    .attr("link-token", "ADMISSION-RACE-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "1")
+                    .build()])
+                .build(),
+        )
+        .await;
+        started_rx.recv().await.expect("heartbeat send started");
+
+        let registry = client.call_registry();
+        let generation = registry
+            .generation_of("ADMISSION-RACE-CALL")
+            .expect("registered waiting-room generation");
+        let mut participant =
+            GroupCallParticipant::new(own_lid.to_non_ad(), vec![GroupCallDevice::new(own_lid)]);
+        participant.state = Some("connected".to_string());
+        let admitted = GroupCallUpdate::builder()
+            .call_id("ADMISSION-RACE-CALL".to_string())
+            .call_creator(creator)
+            .transaction_id(2)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .build();
+        let transition_lock = registry
+            .group_transition_lock("ADMISSION-RACE-CALL", generation)
+            .expect("group transition lane");
+        let transition_guard = transition_lock.lock().await;
+        assert_eq!(
+            registry.apply_group_update_if_current(admitted, generation),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(registry.transition_if_current(
+            "ADMISSION-RACE-CALL",
+            generation,
+            CallPhase::Connecting
+        ));
+        drop(transition_guard);
+        release_tx.send(()).await.expect("release heartbeat send");
+
+        let registration = join.await.expect("join task").expect("join response");
+        assert_eq!(registration.generation, generation);
+        assert!(!registration.join.in_waiting_room);
+        assert_eq!(
+            registration
+                .join
+                .group
+                .as_ref()
+                .map(|update| update.transaction_id),
+            Some(2),
+            "the public result must report admission committed during the heartbeat"
+        );
+        registry.remove_if_current("ADMISSION-RACE-CALL", generation);
     }
 
     #[cfg(feature = "voip-runtime")]
