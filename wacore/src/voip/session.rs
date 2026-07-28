@@ -711,6 +711,10 @@ impl VideoPipeline {
         true
     }
 
+    pub(crate) fn reset_depacketizer(&mut self) {
+        self.depacketizer.reset();
+    }
+
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
     pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
         if au.len() > H264_MAX_AU_BYTES {

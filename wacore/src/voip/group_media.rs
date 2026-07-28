@@ -309,6 +309,14 @@ impl GroupMediaRegistry {
             receiver.user_jid = participant.jid.clone();
             receiver.device_jid = device.jid.clone();
             receiver.pid = device.pid;
+            if update.media == "audio"
+                && receiver.video_enabled
+                && let Some(video) = receiver.video.as_mut()
+            {
+                // Preserve SRTP replay state for a later reactivation, but discard incomplete
+                // pre-downgrade access units so they cannot be emitted under the new roster.
+                video.reset_depacketizer();
+            }
             receiver.video_enabled = update.media == "video";
             next.insert(participant_id, receiver);
         }
@@ -1018,6 +1026,51 @@ mod tests {
                 .iter()
                 .any(|packet| registry.unprotect_video(packet).is_some()),
             "a later video roster may reactivate the retained receiver"
+        );
+    }
+
+    #[test]
+    fn audio_downgrade_discards_partial_video_access_units() {
+        let epoch = [0x35; 32];
+        let alice = Jid::new("200002", Server::Lid).with_device(2);
+        let participants = vec![device("100001", 1, 1), device("200002", 2, 2)];
+        let mut registry = registry();
+        registry
+            .apply_group_update(&update(1, participants.clone()))
+            .unwrap();
+        registry.apply_raw_epoch(1, &epoch).unwrap();
+        let mut sender = peer_video_sender(&epoch, &alice);
+        let mut fragmented = vec![0, 0, 0, 1, 0x65];
+        fragmented.resize(3_005, 0x88);
+        let packets = sender.protect_video(&fragmented);
+        assert!(packets.len() > 1, "fixture must create a fragmented AU");
+        for packet in &packets[..packets.len() - 1] {
+            assert!(
+                registry
+                    .unprotect_video(packet)
+                    .is_some_and(|video| video.access_units.is_empty())
+            );
+        }
+
+        let mut audio_only = update(2, participants.clone());
+        audio_only.media = "audio".to_string();
+        registry.apply_group_update(&audio_only).unwrap();
+        registry
+            .apply_group_update(&update(3, participants))
+            .unwrap();
+        assert!(
+            registry
+                .unprotect_video(packets.last().unwrap())
+                .is_some_and(|video| video.access_units.is_empty()),
+            "reactivation must not complete an access unit retained before the downgrade"
+        );
+
+        let fresh = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21];
+        assert!(
+            sender.protect_video(&fresh).iter().any(|packet| registry
+                .unprotect_video(packet)
+                .is_some_and(|video| !video.access_units.is_empty())),
+            "resetting the depacketizer must preserve the receiver's SRTP state"
         );
     }
 

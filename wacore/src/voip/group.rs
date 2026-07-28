@@ -240,6 +240,10 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
     let mut devices = HashSet::new();
     update.participants.iter().all(|participant| {
         users.insert(participant.jid.to_non_ad())
+            && participant
+                .pn
+                .as_ref()
+                .is_none_or(|pn| users.insert(pn.to_non_ad()))
             && participant.devices.iter().all(|device| {
                 devices.insert(device.jid.clone())
                     && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
@@ -468,6 +472,28 @@ mod tests {
             state.apply_update(duplicate_device),
             GroupStateApply::InvalidSnapshot,
             "one device identity cannot belong to two roster participants"
+        );
+
+        let shared_alias = Jid::new("12025550111", Server::Pn);
+        let mut first = participant("100001", "connected", 1);
+        first.pn = Some(shared_alias.clone());
+        let mut second = participant("200002", "connected", 2);
+        second.pn = Some(shared_alias);
+        assert_eq!(
+            state.apply_update(update(1, vec![first, second])),
+            GroupStateApply::InvalidSnapshot,
+            "one PN alias cannot resolve to two canonical participants"
+        );
+
+        let canonical_pn = Jid::new("12025550112", Server::Pn);
+        let mut aliased = participant("100001", "connected", 1);
+        aliased.pn = Some(canonical_pn.clone());
+        let mut canonical = participant("200002", "connected", 2);
+        canonical.jid = canonical_pn;
+        assert_eq!(
+            state.apply_update(update(1, vec![aliased, canonical])),
+            GroupStateApply::InvalidSnapshot,
+            "a PN alias cannot collide with another participant's canonical identity"
         );
 
         let mut oversized = update(1, vec![]);

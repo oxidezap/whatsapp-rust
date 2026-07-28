@@ -66,6 +66,7 @@ const ALLOCATE_TIMEOUT_MS: Millis = 10_000;
 const PLAYOUT_MS: Millis = 20;
 const APP_DATA_RETRANSMIT_MS: Millis = 50;
 const APP_DATA_RETRANSMIT_COUNT: u8 = 10;
+const MAX_PENDING_REACTIONS: usize = 64;
 /// 20ms @ 16kHz: samples drained to the speaker per playout tick.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_DRAIN: usize = 320;
@@ -1159,10 +1160,17 @@ impl CallEngine {
             group
                 .decoders
                 .retain(|participant, _| active.contains(participant));
-            let subscriptions_changed = group.registry.active_pids() != previous_pids;
+            let current_pids = group.registry.active_pids();
+            let subscriptions_changed = current_pids != previous_pids;
+            let participant_added = update.media == "video"
+                && current_pids.iter().any(|pid| !previous_pids.contains(pid));
             if update.media == "audio" {
                 self.disable_video();
                 self.purge_queued_video_outputs();
+            } else if participant_added {
+                // A newly subscribed receiver has no decoder reference state. Start its stream on
+                // an IDR even when no locally queued video happened to require purging.
+                self.require_video_keyframe();
             }
             self.commit_group_allocate(now, update, relay_refresh, subscriptions_changed)?;
             self.sync_group_epoch()?;
@@ -1197,6 +1205,9 @@ impl CallEngine {
             .map_err(|_| GroupMediaError::Pipeline)?;
         let packet = group.app_data.protect_audio(&payload);
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+        if group.pending_reactions.len() == MAX_PENDING_REACTIONS {
+            group.pending_reactions.pop_front();
+        }
         group.pending_reactions.push_back(PendingReaction {
             payload,
             remaining: APP_DATA_RETRANSMIT_COUNT - 1,
@@ -1345,6 +1356,9 @@ impl CallEngine {
         media.pipe.commit_send_rekey(audio_rekey);
         if let (Some(video), Some(rekey)) = (media.video.as_mut(), video_rekey) {
             video.pipe.commit_send_rekey(rekey);
+            // A new group epoch may be the first decryptable media for a recently admitted
+            // participant, so never begin that epoch with a dependent frame.
+            video.keyframe_required = true;
         }
         group.app_data.commit_send_rekey(app_data_rekey);
         media.call_key.zeroize();
@@ -2807,6 +2821,81 @@ mod encoded_tests {
     }
 
     #[test]
+    fn group_roster_additions_and_epoch_changes_require_an_idr() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        let delta = [0, 0, 0, 1, 0x41, 4, 5, 6];
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Transmit(packet)
+                if parse_rtp_header(packet)
+                    .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+        )));
+        engine.handle_input(2, Input::VideoFrame(&delta));
+        let _ = drain(&mut engine);
+
+        let mut expanded = group_update();
+        expanded.transaction_id = 8;
+        expanded.media = "video".to_string();
+        expanded.relay = Some(group_relay());
+        let participant = Jid::new("15550003333", Server::Lid);
+        expanded.participants.push(GroupCallParticipant {
+            jid: participant.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: participant,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(
+            engine.apply_group_update(3, &expanded).unwrap(),
+            GroupRosterApply::Applied
+        );
+        let _ = drain(&mut engine);
+
+        engine.handle_input(4, Input::VideoFrame(&delta));
+        assert!(
+            drain(&mut engine).iter().all(|output| !matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "a newly admitted participant must not receive a dependent frame first"
+        );
+        engine.handle_input(5, Input::VideoFrame(&idr));
+        let _ = drain(&mut engine);
+
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &[0x48; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.handle_input(6, Input::VideoFrame(&delta));
+        assert!(
+            drain(&mut engine).iter().all(|output| !matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "the first video frame under a new group epoch must be an IDR"
+        );
+    }
+
+    #[test]
     fn authoritative_roster_removal_terminates_local_group_media() {
         let mut engine = group_engine();
         assert_eq!(
@@ -3667,6 +3756,42 @@ mod encoded_tests {
                 ..
             }) if *participant == peer_jid.to_non_ad() && emoji.as_deref() == Some("✅")
         )));
+    }
+
+    #[test]
+    fn pending_group_reaction_retransmissions_are_bounded() {
+        let epoch = [0x42; 32];
+        let update = group_update();
+        let self_jid = update.participants[0].devices[0].jid.clone();
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("engine");
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid,
+                initial_update: update,
+                direct_peer: None,
+            })
+            .unwrap();
+        engine.apply_group_raw_epoch(7, &epoch).unwrap();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        for index in 0..=MAX_PENDING_REACTIONS {
+            engine
+                .send_group_reaction(10, &format!("reaction-{index}"))
+                .unwrap();
+            let _ = drain(&mut engine);
+        }
+
+        let pending = &engine.group.as_ref().unwrap().pending_reactions;
+        assert_eq!(pending.len(), MAX_PENDING_REACTIONS);
+        assert_eq!(
+            app_data::decode_reactions(&pending.front().unwrap().payload).unwrap()[0]
+                .transaction_id,
+            2,
+            "the newest bounded retry window must supersede the oldest pending reaction"
+        );
     }
 
     #[test]
