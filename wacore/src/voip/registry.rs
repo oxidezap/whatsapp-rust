@@ -1341,14 +1341,27 @@ impl CallRegistry {
         generation: u64,
         update: GroupCallUpdate,
     ) -> bool {
-        let tx = self
+        let delivery = self
             .inner
             .lock()
             .expect("registry lock poisoned")
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.group_ctl_tx.clone());
-        tx.is_some_and(|tx| {
+            .and_then(|entry| {
+                let tx = entry.group_ctl_tx.clone()?;
+                // `apply_group_update_if_current` may have inherited relay material omitted by
+                // this wire update. Route that committed snapshot so mailbox coalescing cannot
+                // replace a relay refresh with a later roster-only payload that drops it.
+                let update = entry
+                    .group
+                    .as_ref()
+                    .and_then(GroupCallState::snapshot)
+                    .filter(|committed| committed.transaction_id >= update.transaction_id)
+                    .cloned()
+                    .unwrap_or(update);
+                Some((tx, update))
+            });
+        delivery.is_some_and(|(tx, update)| {
             Self::force_send_preserving_epoch(&tx, GroupControl::Update(Box::new(update)))
         })
     }
@@ -3036,6 +3049,44 @@ mod tests {
             Ok(GroupControl::Transition { update, epoch })
                 if update.transaction_id == 3 && epoch.transaction_id == 3
         ));
+    }
+
+    #[test]
+    fn roster_only_update_preserves_committed_relay_under_backpressure() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        let mut initial = group_update(1);
+        initial.relay = Some(group_relay(1));
+        assert_eq!(reg.apply_group_update(initial), GroupStateApply::Applied);
+        let (tx, rx) = async_channel::bounded(1);
+        reg.set_group_control_sender("GROUP-CALL", generation, tx);
+        let _ = rx.try_recv().expect("initial authoritative snapshot");
+
+        let mut relay_refresh = group_update(2);
+        relay_refresh.relay = Some(group_relay(2));
+        assert_eq!(
+            reg.apply_group_update(relay_refresh.clone()),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_update_if_current("GROUP-CALL", generation, relay_refresh));
+
+        let roster_only = group_update(3);
+        assert_eq!(
+            reg.apply_group_update(roster_only.clone()),
+            GroupStateApply::Applied
+        );
+        assert!(reg.send_group_update_if_current("GROUP-CALL", generation, roster_only));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(GroupControl::Update(update))
+                if update.transaction_id == 3
+                    && update.relay.as_ref().and_then(|relay| relay.transaction_id) == Some(2)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the later committed snapshot must coalesce the relay refresh into one update"
+        );
     }
 
     #[test]

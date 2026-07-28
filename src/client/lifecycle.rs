@@ -416,6 +416,8 @@ impl Client {
                 voip::PendingCallLinkJoins::default(),
             )),
             #[cfg(feature = "voip-runtime")]
+            pending_call_link_join_lane: Arc::new(Mutex::new(())),
+            #[cfg(feature = "voip-runtime")]
             answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             #[cfg(feature = "voip-runtime")]
             pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),

@@ -2982,7 +2982,7 @@ fn group_video_upgrade_allowed(group: &wacore::voip::GroupCallState) -> bool {
         .is_some_and(|room| room.media == CallLinkMedia::Audio)
         && group
             .snapshot()
-            .is_none_or(|snapshot| snapshot.media == "video" || snapshot.av_upgradable)
+            .is_some_and(|snapshot| snapshot.media == "video")
 }
 
 impl CallHandle {
@@ -7504,7 +7504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_video_rejects_non_upgradable_group_before_attaching() {
+    async fn start_video_rejects_audio_group_before_attaching() {
         let (client, sent_count, handle, _relay_keepalive) = sending_handle().await;
         let update = GroupCallUpdate::builder()
             .call_id("CID-FACADE".to_string())
@@ -7513,7 +7513,7 @@ mod tests {
             .media("audio".to_string())
             .connected_limit(32)
             .joinable(true)
-            .av_upgradable(false)
+            .av_upgradable(true)
             .rekey_requested(false)
             .participants(Vec::new())
             .build();

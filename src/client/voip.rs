@@ -754,6 +754,11 @@ impl Voip<'_> {
         media: CallLinkMedia,
         audio_format: AudioFormat,
     ) -> Result<CallLinkJoinRegistration, CallError> {
+        // Before the ACK arrives, creator-authenticated admission traffic has no trusted call id
+        // to associate with this request. Keep one such request active at a time so bounded-buffer
+        // saturation can fail only its owning join; other joins wait here and start with clean
+        // staging state.
+        let _pending_join_lane = self.client.pending_call_link_join_lane.lock().await;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
         let request_id = self.client.generate_request_id();
@@ -2678,6 +2683,63 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn concurrent_call_link_join_waits_for_the_unknown_call_id_lane() {
+        use std::time::Duration;
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+
+        let first_request = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .voip()
+                .join_call_link_registration_with_audio(
+                    "FIRST-CALL-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        first_request.await.expect("first link_join request");
+
+        let second_request = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .voip()
+                .join_call_link_registration_with_audio(
+                    "SECOND-CALL-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second_request)
+                .await
+                .is_err(),
+            "a second unknown-call-id join must wait instead of sharing the first join's buffer"
+        );
+
+        let released_request = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        first.abort();
+        let _ = first.await;
+        tokio::time::timeout(Duration::from_secs(1), released_request)
+            .await
+            .expect("the second join lane should be released")
+            .expect("second link_join request");
+        second.abort();
+        let _ = second.await;
     }
 
     #[cfg(feature = "voip-runtime")]

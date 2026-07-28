@@ -1355,6 +1355,12 @@ pub struct Client {
     #[cfg(feature = "voip-runtime")]
     pending_call_link_joins: Arc<std::sync::Mutex<voip::PendingCallLinkJoins>>,
 
+    /// Serializes call-link joins until the ACK reveals which call id owns any admission state
+    /// buffered during the request. This keeps a bounded overflow tied to one join instead of
+    /// letting it reject an unrelated concurrent join.
+    #[cfg(feature = "voip-runtime")]
+    pending_call_link_join_lane: Arc<Mutex<()>>,
+
     /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
     /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
     /// current in the removal-before-send window. Stripes bound storage while allowing independent
