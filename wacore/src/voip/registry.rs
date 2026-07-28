@@ -37,6 +37,8 @@ const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_CONTROL_QUEUE_BYTES: usize = 1024 * 1024;
 const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
+const MAX_RINGING_GROUP_CALLS: usize = 64;
+const MAX_RINGING_GROUP_CALL_BYTES: usize = 1024 * 1024;
 
 /// Identifies one peer video-upgrade request within one call generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -300,6 +302,15 @@ impl CallEntry {
             + size_of::<event_listener::Event>()
             + queued_bytes
     }
+
+    fn retained_bytes(&self, call_id: &str) -> usize {
+        use crate::stats::HeapSize;
+
+        size_of::<String>()
+            .saturating_add(call_id.heap_bytes())
+            .saturating_add(size_of::<CallEntry>())
+            .saturating_add(self.heap_bytes())
+    }
 }
 
 /// Exclusive publication right for an actionable signaling event awaiting its typed ack.
@@ -414,12 +425,7 @@ impl CallRegistry {
             let map = self.inner.lock().expect("registry lock poisoned");
             let bytes = map
                 .iter()
-                .map(|(call_id, entry)| {
-                    size_of::<String>()
-                        + call_id.heap_bytes()
-                        + size_of::<CallEntry>()
-                        + entry.heap_bytes()
-                })
+                .map(|(call_id, entry)| entry.retained_bytes(call_id))
                 .sum::<usize>();
             (map.len(), bytes)
         };
@@ -934,6 +940,16 @@ impl CallRegistry {
     /// The creator is the only trusted bootstrap sender before a call-link admission installs its
     /// first authoritative roster. Once a roster exists, its participants are authorized too.
     pub fn group_sender_authorized(&self, call_id: &str, call_creator: &Jid, sender: &Jid) -> bool {
+        if sender.to_non_ad() == call_creator.to_non_ad()
+            && self
+                .inner
+                .lock()
+                .expect("registry lock poisoned")
+                .get(call_id)
+                .is_some_and(|entry| entry.session.call_creator == *call_creator)
+        {
+            return true;
+        }
         self.canonical_group_participant(call_id, call_creator, sender)
             .is_some()
     }
@@ -946,6 +962,18 @@ impl CallRegistry {
         call_creator: &Jid,
         sender: &Jid,
     ) -> bool {
+        if sender.to_non_ad() == call_creator.to_non_ad()
+            && self
+                .inner
+                .lock()
+                .expect("registry lock poisoned")
+                .get(call_id)
+                .is_some_and(|entry| {
+                    entry.generation == generation && entry.session.call_creator == *call_creator
+                })
+        {
+            return true;
+        }
         self.canonical_group_participant_if_current(call_id, generation, call_creator, sender)
             .is_some()
     }
@@ -983,7 +1011,7 @@ impl CallRegistry {
         let entry = map
             .get(call_id)
             .filter(|entry| entry.session.call_creator == *call_creator)?;
-        Self::canonical_group_participant_for_entry(entry, call_creator, sender)
+        Self::canonical_group_participant_for_entry(entry, sender)
     }
 
     /// Resolve a sender only while `generation` still owns this call-id.
@@ -998,7 +1026,7 @@ impl CallRegistry {
         let entry = map.get(call_id).filter(|entry| {
             entry.generation == generation && entry.session.call_creator == *call_creator
         })?;
-        Self::canonical_group_participant_for_entry(entry, call_creator, sender)
+        Self::canonical_group_participant_for_entry(entry, sender)
     }
 
     /// Resolve a routed device to the exact device JID retained by the authoritative roster.
@@ -1023,14 +1051,7 @@ impl CallRegistry {
             .map(|device| device.jid.clone())
     }
 
-    fn canonical_group_participant_for_entry(
-        entry: &CallEntry,
-        call_creator: &Jid,
-        sender: &Jid,
-    ) -> Option<Jid> {
-        if sender.to_non_ad() == call_creator.to_non_ad() {
-            return Some(call_creator.to_non_ad());
-        }
+    fn canonical_group_participant_for_entry(entry: &CallEntry, sender: &Jid) -> Option<Jid> {
         let snapshot = entry.group.as_ref().and_then(GroupCallState::snapshot)?;
         let sender_user = sender.to_non_ad();
         snapshot.participants.iter().find_map(|participant| {
@@ -1130,6 +1151,19 @@ impl CallRegistry {
         let generation = {
             let mut ringing = self.ringing.lock().expect("registry lock poisoned");
             let mut map = self.inner.lock().expect("registry lock poisoned");
+            let (ringing_group_entries, ringing_group_bytes) = map
+                .iter()
+                .filter(|(call_id, entry)| {
+                    ringing.contains(*call_id)
+                        && entry.is_group_call
+                        && entry.session.phase() == CallPhase::Ringing
+                })
+                .fold((0usize, 0usize), |(entries, bytes), (call_id, entry)| {
+                    (
+                        entries.saturating_add(1),
+                        bytes.saturating_add(entry.retained_bytes(call_id)),
+                    )
+                });
             if let Some(entry) = map.get_mut(&call_id) {
                 if entry.session.phase() != CallPhase::Ringing {
                     return Ok(None);
@@ -1138,7 +1172,42 @@ impl CallRegistry {
                     return Err(GroupStateApply::IdentityMismatch);
                 }
                 if let Some(update) = session.group.take() {
-                    let _ = entry.group_mut().apply_update(update);
+                    let mut preview = entry.group.clone().unwrap_or_else(|| {
+                        GroupCallState::new(
+                            entry.session.call_id.clone(),
+                            entry.session.call_creator.clone(),
+                        )
+                    });
+                    match preview.apply_update(update) {
+                        GroupStateApply::Applied => {
+                            use crate::stats::HeapSize;
+
+                            let mut preview_session = entry.session.clone();
+                            preview_session.group = preview.snapshot().cloned();
+                            let current_state_bytes = entry
+                                .group
+                                .as_ref()
+                                .map_or(0, HeapSize::heap_bytes)
+                                .saturating_add(entry.session.heap_bytes());
+                            let preview_state_bytes = preview
+                                .heap_bytes()
+                                .saturating_add(preview_session.heap_bytes());
+                            let prospective_entry_bytes = entry
+                                .retained_bytes(&call_id)
+                                .saturating_sub(current_state_bytes)
+                                .saturating_add(preview_state_bytes);
+                            let prospective_total = ringing_group_bytes
+                                .saturating_sub(entry.retained_bytes(&call_id))
+                                .saturating_add(prospective_entry_bytes);
+                            if prospective_total > MAX_RINGING_GROUP_CALL_BYTES {
+                                return Err(GroupStateApply::InvalidSnapshot);
+                            }
+                            entry.session.group = preview_session.group;
+                            entry.group = Some(preview);
+                        }
+                        GroupStateApply::Stale => {}
+                        reason => return Err(reason),
+                    }
                 }
                 session.group = entry
                     .group
@@ -1152,6 +1221,12 @@ impl CallRegistry {
             } else {
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
                 let entry = Self::new_entry(session, generation, true, false);
+                if ringing_group_entries >= MAX_RINGING_GROUP_CALLS
+                    || ringing_group_bytes.saturating_add(entry.retained_bytes(&call_id))
+                        > MAX_RINGING_GROUP_CALL_BYTES
+                {
+                    return Err(GroupStateApply::InvalidSnapshot);
+                }
                 ringing.insert(call_id.clone());
                 map.insert(call_id, entry);
                 generation
@@ -2759,6 +2834,119 @@ mod tests {
     }
 
     #[test]
+    fn ringing_group_redelivery_rejects_conflicting_group_jid() {
+        let reg = CallRegistry::new();
+        let incoming = |transaction_id, group_jid: &str| {
+            let creator = Jid::new("111111111111111", Server::Lid);
+            let mut session = CallSession::new_incoming("GROUP-CALL", creator.clone(), creator);
+            let mut update = group_update(transaction_id);
+            update.group_jid = Some(Jid::new(group_jid, Server::Group));
+            session.group = Some(update);
+            session
+        };
+        let generation = reg
+            .insert_ringing_group_if_inactive(incoming(1, "120363000000000001"))
+            .expect("valid initial offer")
+            .expect("first offer registers");
+
+        assert_eq!(
+            reg.insert_ringing_group_if_inactive(incoming(2, "120363000000000002")),
+            Err(GroupStateApply::IdentityMismatch)
+        );
+        assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().and_then(|update| update.group_jid.clone())),
+            Some(Jid::new("120363000000000001", Server::Group)),
+            "a conflicting redelivery must leave the original group identity intact"
+        );
+    }
+
+    #[test]
+    fn ringing_group_registrations_are_bounded_by_count_and_bytes() {
+        let incoming = |call_id: &str| {
+            let creator = Jid::new("111111111111111", Server::Lid);
+            let mut session = CallSession::new_incoming(call_id, creator.clone(), creator.clone());
+            let mut update = group_update(1);
+            update.call_id = call_id.to_string();
+            update.call_creator = creator;
+            session.group = Some(update);
+            session
+        };
+        let reg = CallRegistry::new();
+        let first_generation = (0..MAX_RINGING_GROUP_CALLS).fold(None, |first, index| {
+            let call_id = format!("GROUP-CALL-{index}");
+            let generation = reg
+                .insert_ringing_group_if_inactive(incoming(&call_id))
+                .expect("bounded offer")
+                .expect("offer registers");
+            first.or(Some(generation))
+        });
+        assert_eq!(
+            reg.insert_ringing_group_if_inactive(incoming("GROUP-CALL-OVERFLOW")),
+            Err(GroupStateApply::InvalidSnapshot)
+        );
+        assert_eq!(reg.active_count(), MAX_RINGING_GROUP_CALLS);
+
+        assert!(reg.take_ringing("GROUP-CALL-0"));
+        assert!(reg.remove_if_current("GROUP-CALL-0", first_generation.expect("first generation")));
+        assert!(
+            reg.insert_ringing_group_if_inactive(incoming("GROUP-CALL-RECOVERED"))
+                .expect("recovered capacity")
+                .is_some()
+        );
+
+        let oversized = CallRegistry::new();
+        let mut session = incoming("GROUP-CALL-OVERSIZED");
+        let mut relay = group_relay(1);
+        relay.tokens = vec![vec![9; MAX_RINGING_GROUP_CALL_BYTES]];
+        session.group.as_mut().expect("group snapshot").relay = Some(relay);
+        assert_eq!(
+            oversized.insert_ringing_group_if_inactive(session),
+            Err(GroupStateApply::InvalidSnapshot)
+        );
+        assert_eq!(oversized.active_count(), 0);
+        assert!(!oversized.take_ringing("GROUP-CALL-OVERSIZED"));
+
+        let growing = CallRegistry::new();
+        let generation = growing
+            .insert_ringing_group_if_inactive(incoming("GROUP-CALL-GROWING"))
+            .expect("valid initial offer")
+            .expect("offer registers");
+        let mut redelivery = incoming("GROUP-CALL-GROWING");
+        redelivery
+            .group
+            .as_mut()
+            .expect("group snapshot")
+            .transaction_id = 2;
+        let mut relay = group_relay(2);
+        relay.tokens = vec![vec![9; MAX_RINGING_GROUP_CALL_BYTES]];
+        redelivery.group.as_mut().expect("group snapshot").relay = Some(relay);
+        assert_eq!(
+            growing.insert_ringing_group_if_inactive(redelivery),
+            Err(GroupStateApply::InvalidSnapshot)
+        );
+        assert_eq!(
+            growing
+                .group_state("GROUP-CALL-GROWING")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(1),
+            "an oversized redelivery must not consume the authoritative transaction"
+        );
+        let mut corrected = incoming("GROUP-CALL-GROWING");
+        corrected
+            .group
+            .as_mut()
+            .expect("group snapshot")
+            .transaction_id = 2;
+        assert_eq!(
+            growing.insert_ringing_group_if_inactive(corrected),
+            Ok(Some(generation)),
+            "a corrected same-transaction redelivery must remain admissible"
+        );
+    }
+
+    #[test]
     fn outgoing_group_identity_exists_before_the_first_roster() {
         let reg = CallRegistry::new();
         let generation = reg.insert_group(session("GROUP-CALL"));
@@ -3335,6 +3523,15 @@ mod tests {
             reg.group_sender_authorized("GROUP-CALL", &creator, &creator.clone().with_device(7)),
             "the creator must be able to install the first call-link admission snapshot"
         );
+        assert_eq!(
+            reg.canonical_group_participant(
+                "GROUP-CALL",
+                &creator,
+                &creator.clone().with_device(7)
+            ),
+            None,
+            "creator bootstrap must not authorize participant-scoped controls before a roster"
+        );
         assert!(!reg.group_sender_authorized(
             "GROUP-CALL",
             &creator,
@@ -3405,6 +3602,15 @@ mod tests {
         assert!(
             reg.group_sender_authorized("GROUP-CALL", &creator, &creator.clone().with_device(7)),
             "the explicit creator bootstrap exception remains valid"
+        );
+        assert_eq!(
+            reg.canonical_group_participant(
+                "GROUP-CALL",
+                &creator,
+                &creator.clone().with_device(7)
+            ),
+            None,
+            "a departed creator must not regain participant-scoped control authorization"
         );
     }
 

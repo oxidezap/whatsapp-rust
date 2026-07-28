@@ -3375,6 +3375,15 @@ impl CallHandle {
             ));
         }
         let client = self.upgrade_client()?;
+        // Group downgrades also reset video negotiation and release its endpoints. Take their lane
+        // first so eligibility, request publication, endpoint attachment, and teardown-hook
+        // replacement are one transition relative to an authoritative audio-only snapshot.
+        let group_transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _group_transition_guard = group_transition_lock.lock().await;
+        self.ensure_current()?;
         let transition_lock = self
             .client_registry
             .video_transition_lock(&self.call_id, self.generation)
@@ -7688,6 +7697,69 @@ mod tests {
         assert!(
             handle.video.sink_slot.lock().unwrap().is_none(),
             "an ineligible group call must not attach video endpoints"
+        );
+        handle.hangup().await;
+    }
+
+    #[tokio::test]
+    async fn group_downgrade_serializes_with_video_setup() {
+        let (client, sent_count, handle, _relay_keepalive) = sending_handle().await;
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("video".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client.call_registry().apply_group_update(update.clone()),
+            wacore::voip::GroupStateApply::Applied
+        );
+        let group_transition_lock = client
+            .call_registry()
+            .group_transition_lock("CID-FACADE", handle.generation)
+            .expect("current group transition");
+        let group_transition_guard = group_transition_lock.lock().await;
+        let sent_before = sent_count.load(Ordering::SeqCst);
+        let video_handle = handle.clone();
+        let (source, sink) = video_endpoints();
+        let upgrade = tokio::spawn(async move { video_handle.start_video(source, sink).await });
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "video setup must wait behind an authoritative group transition"
+        );
+        assert_eq!(sent_count.load(Ordering::SeqCst), sent_before);
+
+        let mut downgrade = update;
+        downgrade.transaction_id = 2;
+        downgrade.media = "audio".to_string();
+        assert_eq!(
+            client.call_registry().apply_group_update(downgrade),
+            wacore::voip::GroupStateApply::Applied
+        );
+        drop(group_transition_guard);
+
+        assert!(matches!(
+            upgrade.await.expect("video task"),
+            Err(CallError::Media(
+                "group media mode does not allow a video upgrade"
+            ))
+        ));
+        assert_eq!(
+            sent_count.load(Ordering::SeqCst),
+            sent_before,
+            "the overtaken upgrade must not send video signaling"
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "the overtaken upgrade must not attach video endpoints"
         );
         handle.hangup().await;
     }
