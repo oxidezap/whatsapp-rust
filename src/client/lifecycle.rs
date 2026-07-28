@@ -948,6 +948,7 @@ impl Client {
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
         if self.lifecycle.is_none() {
             self.cleanup_connection_state_inner().await;
+            self.clear_connection_scoped_pair_code().await;
             return;
         }
 
