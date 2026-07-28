@@ -259,13 +259,6 @@ async fn handle_pair_success<'a>(
     request_node: &NodeRef<'a>,
     success_node: &NodeRef<'a>,
 ) {
-    if let Some(tx) = client.pairing_cancellation_tx.lock().await.take() {
-        let _ = tx.try_send(());
-        debug!("Sent QR rotation stop signal");
-    } else {
-        debug!("QR rotation channel not yet stored — is_logged_in guard will stop the task");
-    }
-
     client.update_server_time_offset(request_node);
 
     let req_id = match request_node.get_attr("id").map(|v| v.as_str()) {
@@ -328,12 +321,23 @@ async fn handle_pair_success<'a>(
 
     match result {
         Ok((self_signed_identity_bytes, key_index)) => {
-            // Retired only once the identity and its HMAC check out. A
+            // Both retired only once the identity and its HMAC check out. A
             // pair-success that arrives after its own flow was written off can
             // otherwise cancel the replacement that succeeded it, and then fail
             // verification against the secret that replacement derived —
-            // leaving neither able to complete.
+            // leaving neither able to complete. Stopping the QR rotation early
+            // is the same mistake in the other direction: a rejected response
+            // would take the displayed code down with it, and nothing puts one
+            // back.
             *client.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Completed;
+            if let Some(tx) = client.pairing_cancellation_tx.lock().await.take() {
+                let _ = tx.try_send(());
+                debug!("Sent QR rotation stop signal");
+            } else {
+                debug!(
+                    "QR rotation channel not yet stored — is_logged_in guard will stop the task"
+                );
+            }
 
             let signed_identity_for_event = match waproto::codec::adv_signed_device_identity_decode(
                 self_signed_identity_bytes.as_slice(),

@@ -203,9 +203,13 @@ impl Serialize for LazyHistorySync {
 }
 
 /// Discriminant for each [`Event`] variant, used to express handler interest
-/// without materializing the event. One per `Event` variant, in declaration
-/// order; the value doubles as a bit index in [`EventInterest`], so there can
-/// be at most 128 kinds.
+/// without materializing the event. One per `Event` variant; the value doubles
+/// as a bit index in [`EventInterest`], so there can be at most 128 kinds.
+///
+/// New kinds go at the **end**, whatever position their `Event` variant takes:
+/// the discriminant is what a consumer persists or transmits, and inserting in
+/// the middle renumbers every kind after it. `ServerAck` and
+/// `PairingQrCodesExhausted` both sit here for that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -218,7 +222,6 @@ pub enum EventKind {
     PairingQrCode,
     PairingCode,
     PairingCodeRefresh,
-    PairingQrCodesExhausted,
     QrScannedWithoutMultidevice,
     ClientOutdated,
     Messages,
@@ -269,6 +272,7 @@ pub enum EventKind {
     PairPasskeyConfirmation,
     PairPasskeyError,
     ServerAck,
+    PairingQrCodesExhausted,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -282,7 +286,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ServerAck as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairingQrCodesExhausted as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
