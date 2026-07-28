@@ -317,16 +317,22 @@ impl Client {
         // this number, which then routes `primary_hello` to whichever it likes
         // — the overlap the claim exists to prevent.
         if !self.owns_code_claim(claim).await {
+            // Someone else owns the slot; releasing would take theirs.
+            claim_guard.armed = false;
             return Err(PairCodeError::Cancelled.into());
         }
 
         let response = match self.send_iq(query).await {
             Ok(response) => response,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                claim_guard.release_now().await;
+                return Err(e.into());
+            }
         };
 
         let Some(pairing_ref) = PairCodeUtils::parse_companion_hello_response(response.get())
         else {
+            claim_guard.release_now().await;
             return Err(PairCodeError::MissingPairingRef.into());
         };
 
@@ -343,6 +349,7 @@ impl Client {
         {
             let mut state = self.pair_code_state.lock().await;
             if !matches!(&*state, PairCodeState::RequestingCode { claim: c, .. } if *c == claim) {
+                claim_guard.armed = false;
                 return Err(PairCodeError::Cancelled.into());
             }
             *state = PairCodeState::WaitingForPhoneConfirmation {
@@ -410,13 +417,25 @@ impl Client {
 
 /// Releases a stage-1 claim unless the flow it belongs to was installed.
 ///
-/// `Drop` cannot await, so the release is spawned; the claim is identified by
-/// its token, which makes a late release harmless once something else has taken
-/// the slot.
+/// Error paths call [`Self::release_now`]; `Drop` is the backstop for a caller
+/// that drops the future instead. It cannot await, so that release is spawned —
+/// the claim is identified by its token, which makes a late release harmless
+/// once something else has taken the slot.
 struct ClaimGuard {
     client: Arc<Client>,
     claim: wacore::pair_code::PairCodeClaim,
     armed: bool,
+}
+
+impl ClaimGuard {
+    /// Hand the claim back before returning, so a caller that retries the
+    /// moment it sees the error does not race the detached release and get
+    /// `CodeAlreadyOutstanding` for a request that already failed. `Drop` is
+    /// left to cover only the caller who never sees the error at all.
+    async fn release_now(&mut self) {
+        self.armed = false;
+        self.client.release_code_claim(self.claim).await;
+    }
 }
 
 impl Drop for ClaimGuard {
@@ -1550,6 +1569,32 @@ mod tests {
             )
         })
         .await;
+    }
+
+    /// Regression: the claim has to be back *before* the error reaches the
+    /// caller. Releasing it only from `Drop` schedules a detached task, and a
+    /// caller that retries the moment it sees the failure gets
+    /// `CodeAlreadyOutstanding` for a request that already gave up.
+    // Paused clock: the failure here is the IQ timing out, and waiting 30s of
+    // real time for it would be the slowest test in the suite.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_request_hands_the_claim_back_before_it_returns() {
+        let (client, _transport) = create_iq_test_client().await;
+        client.set_connected_for_test(false);
+
+        client
+            .pair_with_code(options())
+            .await
+            .expect_err("stage 1 cannot complete while disconnected");
+
+        // Checked without awaiting: a detached release would not have run yet.
+        assert!(
+            matches!(
+                client.pair_code_state.try_lock().as_deref(),
+                Some(PairCodeState::Idle)
+            ),
+            "the slot must be free the moment the error is returned"
+        );
     }
 
     /// The predicate stage 1 rechecks before putting `companion_hello` on the

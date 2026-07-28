@@ -129,8 +129,17 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                 // has left. WA Web re-renders through one path
                                 // for a ref change and for an adv-secret change
                                 // (`Link/DeviceQrcode.react.js`).
+                                // One sleep for the whole ref, polled across
+                                // re-renders rather than recreated by them: it
+                                // is the runtime's own clock that decides when
+                                // this ref is spent, and restarting it would
+                                // let a refresh extend a ref past the deadline
+                                // the server set. `started` only feeds the
+                                // advisory countdown on the event.
+                                let sleep = client_clone.runtime.sleep(ttl);
+                                futures::pin_mut!(sleep);
+
                                 loop {
-                                    let remaining = ttl.saturating_sub(started.elapsed());
                                     let snapshot =
                                         client_clone.persistence_manager.get_device_snapshot();
                                     let code = PairUtils::make_qr_data(
@@ -145,20 +154,16 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                     client_clone.core.event_bus.dispatch(Event::PairingQrCode(
                                         crate::types::events::PairingQrCode::builder()
                                             .code(code)
-                                            .timeout(remaining)
+                                            .timeout(ttl.saturating_sub(started.elapsed()))
                                             .build(),
                                     ));
 
-                                    // The runtime has no `sleep_until`, and the remaining slice is
-                                    // what a re-render has to resume against anyway.
-                                    let sleep = client_clone.runtime.sleep(remaining);
                                     let stop = stop_rx.recv();
                                     let refresh = refresh_rx.recv();
-                                    futures::pin_mut!(sleep);
                                     futures::pin_mut!(stop);
                                     futures::pin_mut!(refresh);
                                     let outcome = futures::future::select(
-                                        sleep,
+                                        sleep.as_mut(),
                                         futures::future::select(stop, refresh),
                                     )
                                     .await;
