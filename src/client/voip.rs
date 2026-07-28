@@ -1005,7 +1005,10 @@ impl Voip<'_> {
         Ok(())
     }
 
-    /// Immediately accept an active group-call invitation using call-scoped signaling.
+    /// Send an early call-scoped accept for an active group invitation.
+    ///
+    /// The retained offer remains ringing so [`accept`](Self::accept) can subsequently attach the
+    /// application's media endpoints to the exact same generation.
     #[cfg(feature = "voip-runtime")]
     pub async fn accept_group_invite(&self, incoming: &IncomingCall) -> Result<(), CallError> {
         let CallAction::Offer {
@@ -1032,7 +1035,7 @@ impl Voip<'_> {
         )
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.client.send_node(node).await?;
-        if !registry.accept_ringing_if_current(call_id, generation) {
+        if registry.ringing_group_generation(call_id, call_creator) != Some(generation) {
             return Err(CallError::CallEndedDuringSetup);
         }
         Ok(())
@@ -4212,6 +4215,71 @@ mod tests {
             "a stale join cannot grant waiting-room admin state to its replacement"
         );
         registry.remove_if_current(call_id, replacement);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn early_group_invite_accept_preserves_media_attachment_generation() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = call_creator();
+        let call_id = "ATTACHABLE-GROUP-INVITE";
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        let mut incoming = IncomingCall::new_for_test(
+            creator.clone(),
+            "ATTACHABLE-GROUP-INVITE-STANZA".to_string(),
+            wacore::time::from_secs(1_766_847_151_i64).expect("valid ts"),
+            CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: creator.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            },
+        );
+        incoming.group = Some(Box::new(update.clone()));
+        let mut ringing = CallSession::new_incoming(call_id, creator.clone(), creator.clone());
+        ringing.group = Some(update);
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(ringing)
+            .expect("valid group snapshot")
+            .expect("ringing invitation");
+
+        client
+            .voip()
+            .accept_group_invite(&incoming)
+            .await
+            .expect("early group invitation accept");
+
+        assert_eq!(
+            client
+                .call_registry()
+                .ringing_group_generation(call_id, &creator),
+            Some(generation),
+            "the media accept builder must still be able to claim the exact ringing generation"
+        );
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, generation),
+            Some(CallPhase::Ringing)
+        );
+        assert!(client.call_registry().take_ringing(call_id));
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-runtime")]

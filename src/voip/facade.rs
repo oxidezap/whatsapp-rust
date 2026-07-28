@@ -1432,9 +1432,21 @@ async fn fanout_group_epoch_for_generation(
             teardown,
         });
     }
+    let device = client.persistence_manager().get_device_snapshot();
     let encrypted = {
         let lock_jids = client.build_session_lock_keys(&recipients).await;
         let session_guards = client.session_guards_for(&lock_jids).await;
+        if device.account.is_none() {
+            for recipient in &recipients {
+                if client
+                    .would_emit_pkmsg(recipient)
+                    .await
+                    .map_err(|error| CallError::Setup(error.to_string()))?
+                {
+                    return Err(CallError::MissingDeviceIdentity);
+                }
+            }
+        }
         let plan = wacore::send::SessionPlan::assume_ready(recipients.len());
         let mut adapter = client.signal_adapter().await;
         let mut stores = adapter.as_signal_stores();
@@ -1452,7 +1464,6 @@ async fn fanout_group_epoch_for_generation(
     };
     let encrypted = encrypted?;
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
-    let device = client.persistence_manager().get_device_snapshot();
     let device_identity = wacore::send::needs_device_identity(
         encrypted.includes_prekey_message,
         device.account.as_deref(),
@@ -1463,21 +1474,45 @@ async fn fanout_group_epoch_for_generation(
         .await
         .map_err(|error| CallError::Setup(error.to_string()))?;
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
-    if encrypted.devices.len() != recipients.len() {
-        return Err(CallError::Media(
-            "group epoch encryption did not cover every recipient",
-        ));
-    }
+    publish_group_epoch_ciphertexts(
+        client,
+        update,
+        generation,
+        &recipients,
+        &encrypted,
+        device_identity.as_deref(),
+    )
+    .await?;
+    Ok(GroupEpochFanout {
+        raw_epoch,
+        teardown,
+    })
+}
 
+async fn publish_group_epoch_ciphertexts(
+    client: &Client,
+    update: &GroupCallUpdate,
+    generation: Option<u64>,
+    recipients: &[Jid],
+    encrypted: &wacore::send::EncryptForDevicesRaw,
+    device_identity: Option<&[u8]>,
+) -> Result<(), CallError> {
+    let complete = encrypted.devices.len() == recipients.len()
+        && recipients.iter().all(|recipient| {
+            encrypted
+                .devices
+                .iter()
+                .any(|encrypted| encrypted.device_jid == *recipient)
+        });
     let mut nodes = Vec::with_capacity(recipients.len());
-    for recipient in &recipients {
-        let encrypted = encrypted
+    for recipient in recipients {
+        let Some(encrypted) = encrypted
             .devices
             .iter()
             .find(|encrypted| encrypted.device_jid == *recipient)
-            .ok_or(CallError::Media(
-                "group epoch encryption omitted a recipient",
-            ))?;
+        else {
+            continue;
+        };
         nodes.push(
             wacore::stanza::group_call::build_group_enc_rekey(
                 &wacore::stanza::group_call::GroupEncRekeyParams {
@@ -1491,7 +1526,7 @@ async fn fanout_group_epoch_for_generation(
                         ciphertext: encrypted.ciphertext.clone(),
                         enc_type: encrypted.enc_type.to_string(),
                     },
-                    device_identity: device_identity.as_deref(),
+                    device_identity,
                 },
             )
             .map_err(|error| CallError::Response(error.to_string()))?,
@@ -1502,10 +1537,12 @@ async fn fanout_group_epoch_for_generation(
         client.send_node(node).await?;
         ensure_group_rekey_generation(client, &update.call_id, generation)?;
     }
-    Ok(GroupEpochFanout {
-        raw_epoch,
-        teardown,
-    })
+    if !complete {
+        return Err(CallError::Media(
+            "group epoch encryption did not cover every recipient",
+        ));
+    }
+    Ok(())
 }
 
 /// Drain every dormant outgoing call (relay never arrived) and notify each one's `ended` so any
@@ -5589,6 +5626,83 @@ mod tests {
             client.call_registry().snapshot(&update.call_id).is_none(),
             "a committed rekey request that cannot be retried must terminate its generation"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_group_identity_is_rejected_before_advancing_fresh_sessions() {
+        let (client, _sent) = make_sending_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetAccount(None))
+            .await;
+        let recipient = peer_lid();
+        seed_peer_session(&client, &recipient).await;
+        assert!(
+            client
+                .would_emit_pkmsg(&recipient)
+                .await
+                .expect("fresh session inspection"),
+            "the seeded recipient must require a pre-key message"
+        );
+        let update = rekey_update(&client, std::slice::from_ref(&recipient));
+        register_group_update(&client, &update);
+
+        assert!(matches!(
+            fanout_group_epoch(&client, &update).await,
+            Err(CallError::MissingDeviceIdentity)
+        ));
+        assert!(
+            client
+                .would_emit_pkmsg(&recipient)
+                .await
+                .expect("session inspection after rejected fanout"),
+            "identity preflight must reject before advancing the fresh Signal session"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_group_rekey_encryption_publishes_every_successful_ciphertext() {
+        let (client, sent) = make_sending_client().await;
+        let recipients = [
+            peer_lid(),
+            Jid::new("444444444444444", Server::Lid).with_device(0),
+        ];
+        let update = rekey_update(&client, &recipients);
+        let generation = register_group_update(&client, &update);
+        let encrypted = wacore::send::EncryptForDevicesRaw {
+            devices: vec![wacore::send::EncryptedDevice {
+                device_jid: recipients[0].clone(),
+                enc_type: "msg",
+                is_prekey: false,
+                ciphertext: vec![7; 32],
+            }],
+            includes_prekey_message: false,
+            had_unregistered_device: false,
+            rejected_devices: Vec::new(),
+        };
+
+        assert!(matches!(
+            publish_group_epoch_ciphertexts(
+                &client,
+                &update,
+                Some(generation),
+                &recipients,
+                &encrypted,
+                None,
+            )
+            .await,
+            Err(CallError::Media(
+                "group epoch encryption did not cover every recipient"
+            ))
+        ));
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            1,
+            "the successfully encrypted recipient must be published before reporting partial coverage"
+        );
+        client
+            .call_registry()
+            .remove_if_current(&update.call_id, generation);
     }
 
     #[tokio::test]
