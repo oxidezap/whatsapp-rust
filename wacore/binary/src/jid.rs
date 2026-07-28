@@ -14,6 +14,36 @@ pub struct ParsedJidParts<'a> {
     pub integrator: u16,
 }
 
+/// Decimal-only `u16` parser for the device and agent fields.
+///
+/// Deliberately not `str::parse`: `from_str_radix` is generic over radix and
+/// signedness and carries the branches to prove it, which the JID scanner pays
+/// on every device it splits out. The accepted grammar is the same one
+/// `u16::from_str` accepts — an optional `+`, then decimal digits, rejecting
+/// empty input and anything that overflows — and `decimal_fast_path_matches_u16_from_str`
+/// holds the two together. A `-` is a non-digit here for the same reason it is
+/// one in std: the sign is only recognised for signed types.
+#[inline]
+fn parse_u16_decimal(s: &str) -> Option<u16> {
+    let mut bytes = s.as_bytes();
+    if bytes.first() == Some(&b'+') {
+        bytes = &bytes[1..];
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut value = 0u16;
+    for &byte in bytes {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(digit as u16)?;
+    }
+    Some(value)
+}
+
 /// Single-pass JID parser optimized for hot paths.
 /// Scans the input string once to find all relevant separators (@, :)
 /// and returns slices into the original string without allocation.
@@ -68,7 +98,7 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
         // LID user parts may contain dots, which are not agent separators.
         Some(Server::Lid) => {
             let (user, device) = match colon_pos {
-                Some(pos) => (&s[..pos], s[pos + 1..at].parse::<u16>().unwrap_or(0)),
+                Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
                 None => (user_part, 0),
             };
             Some((
@@ -91,14 +121,14 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
                         user: &s[..pos],
                         server: server_str,
                         agent: 0,
-                        device: s[pos + 1..at].parse::<u16>().unwrap_or(0),
+                        device: parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0),
                         integrator: 0,
                     },
                     server,
                 ));
             }
             if let Some(dot_pos) = last_dot_pos
-                && let Ok(device_val) = s[dot_pos + 1..at].parse::<u16>()
+                && let Some(device_val) = parse_u16_decimal(&s[dot_pos + 1..at])
             {
                 return Some((
                     ParsedJidParts {
@@ -125,7 +155,7 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
         // Everything else (including unknown servers): `user.agent:device`.
         _ => {
             let (user_before_colon, device) = match colon_pos {
-                Some(pos) => (&s[..pos], s[pos + 1..at].parse::<u16>().unwrap_or(0)),
+                Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
                 None => (user_part, 0),
             };
             // Deliberately `rfind` on the pre-colon slice rather than reusing
@@ -133,8 +163,8 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
             // second colon (`a:1.5:2`), and this branch is cold enough that
             // matching the historical rule is worth the extra scan.
             let (final_user, agent) = match user_before_colon.rfind('.') {
-                Some(dot_pos) => match user_before_colon[dot_pos + 1..].parse::<u16>() {
-                    Ok(agent_val) if agent_val <= u8::MAX as u16 => {
+                Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
+                    Some(agent_val) if agent_val <= u8::MAX as u16 => {
                         (&user_before_colon[..dot_pos], agent_val as u8)
                     }
                     _ => (user_before_colon, 0),
@@ -1533,6 +1563,23 @@ mod tests {
 
         assert!(parse_jid_ref("g.us").is_none(), "server-only uses fallback");
         assert!(parse_jid_ref("user@unknown").is_none());
+    }
+
+    /// `parse_u16_decimal` stands in for `u16::from_str` inside the scanner, so
+    /// it has to accept and reject exactly what std does — including the shapes
+    /// nobody writes on purpose but a malformed stanza can still carry.
+    #[test]
+    fn decimal_fast_path_matches_u16_from_str() {
+        for raw in [
+            "", "+", "-", "0", "7", "+7", "007", "33", "255", "256", "65535", "65536", "99999",
+            "-0", "-1", "1x", "x1", " 1", "1 ", "1_0", "+-1", "++1", "1.0", "٣", "𝟛",
+        ] {
+            assert_eq!(
+                parse_u16_decimal(raw),
+                raw.parse::<u16>().ok(),
+                "mismatch for {raw:?}"
+            );
+        }
     }
 
     /// The scan stops at the first `@` and dispatches on the resolved `Server`,
