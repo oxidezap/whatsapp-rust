@@ -19,6 +19,7 @@ use wacore::iq::usync::{
 use wacore::stanza::business::BusinessNotificationType;
 use wacore::stanza::devices::DeviceNotificationType;
 use wacore::stanza::groups::{GroupNotificationAction, MembershipRequestMethod};
+use wacore::types::call::CallAction;
 use wacore::types::events::{
     BusinessUpdateType, ConnectFailureReason, DecryptFailMode, DeviceListUpdateType, TempBanReason,
     UnavailableType,
@@ -37,6 +38,18 @@ where
         let back: T = serde_json::from_value(json.clone()).expect("deserialize");
         assert_eq!(&back, v, "round-trip mismatch for JSON {json}");
     }
+}
+
+#[allow(deprecated)]
+#[test]
+fn call_action_kind_remains_a_source_compatible_wire_tag_alias() {
+    let action = CallAction::OfferNotice {
+        call_id: "TEST-CALL-ID".to_string(),
+        call_creator: Jid::new("111111111111111", wacore_binary::jid::Server::Lid),
+        is_video: false,
+        is_group: true,
+    };
+    assert_eq!(action.action_kind(), action.wire_tag());
 }
 
 /// `serde_json` discards the field count handed to `serialize_struct`, so a

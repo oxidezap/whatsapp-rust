@@ -283,6 +283,13 @@ impl CallAction {
             Self::WaitingRoomUpdate { room } => &room.call_creator,
         }
     }
+
+    /// Backwards-compatible name for the action's wire tag.
+    #[deprecated(since = "0.6.0", note = "use CallAction::wire_tag")]
+    #[inline]
+    pub fn action_kind(&self) -> &'static str {
+        self.wire_tag()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

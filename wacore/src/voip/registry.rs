@@ -352,6 +352,15 @@ fn pending_initial_group_control_retained_bytes(call: &IncomingCall) -> usize {
     size_of::<IncomingCall>().saturating_add(pending_initial_group_control_heap_bytes(call))
 }
 
+fn pending_initial_group_control_matches(
+    call: &IncomingCall,
+    call_id: &str,
+    call_creator: &Jid,
+) -> bool {
+    call.action.call_id() == call_id
+        && call.action.call_creator().to_non_ad() == call_creator.to_non_ad()
+}
+
 /// Thread-safe map of active calls keyed by call-id.
 #[derive(Default)]
 pub struct CallRegistry {
@@ -453,7 +462,11 @@ impl CallRegistry {
         if !call.stanza_id.is_empty()
             && pending.iter().any(|queued| {
                 queued.stanza_id == call.stanza_id
-                    && queued.action.call_id() == call.action.call_id()
+                    && pending_initial_group_control_matches(
+                        queued,
+                        call.action.call_id(),
+                        call.action.call_creator(),
+                    )
             })
         {
             return true;
@@ -466,13 +479,48 @@ impl CallRegistry {
             .iter()
             .map(pending_initial_group_control_retained_bytes)
             .sum::<usize>();
+        // A control may replace older state for its own prospective call, but unrelated traffic
+        // cannot make room by discarding a roster or epoch that already won the bounded race.
+        let (matching_entries, matching_bytes) = pending
+            .iter()
+            .filter(|queued| {
+                pending_initial_group_control_matches(
+                    queued,
+                    call.action.call_id(),
+                    call.action.call_creator(),
+                )
+            })
+            .fold((0usize, 0usize), |(entries, bytes), queued| {
+                (
+                    entries.saturating_add(1),
+                    bytes.saturating_add(pending_initial_group_control_retained_bytes(queued)),
+                )
+            });
+        if pending.len().saturating_sub(matching_entries) >= MAX_PENDING_INITIAL_GROUP_CONTROLS
+            || pending_bytes
+                .saturating_sub(matching_bytes)
+                .saturating_add(retained_bytes)
+                > MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES
+        {
+            return false;
+        }
         while pending.len() >= MAX_PENDING_INITIAL_GROUP_CONTROLS
             || pending_bytes.saturating_add(retained_bytes)
                 > MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES
         {
-            let Some(evicted) = pending.pop_front() else {
-                break;
-            };
+            let index = pending
+                .iter()
+                .position(|queued| {
+                    pending_initial_group_control_matches(
+                        queued,
+                        call.action.call_id(),
+                        call.action.call_creator(),
+                    )
+                })
+                .expect("preflight proved a matching control can be evicted");
+            let evicted = pending
+                .remove(index)
+                .expect("matching pending control must remain present");
             pending_bytes = pending_bytes
                 .saturating_sub(pending_initial_group_control_retained_bytes(&evicted));
         }
@@ -2236,7 +2284,7 @@ mod tests {
             Jid::new("999999999999999", Server::Lid),
         )));
 
-        for index in 0..=MAX_PENDING_INITIAL_GROUP_CONTROLS {
+        for index in 0..MAX_PENDING_INITIAL_GROUP_CONTROLS {
             assert!(reg.buffer_initial_group_control(initial_group_update(
                 &format!("GROUP-{index}"),
                 &format!("STANZA-{index}"),
@@ -2249,18 +2297,23 @@ mod tests {
             "fabricated call IDs must not grow the pending-control buffer without bound"
         );
         assert!(
-            reg.take_initial_group_controls("GROUP-0", &creator)
-                .is_empty(),
-            "the oldest control must be evicted at capacity"
+            !reg.buffer_initial_group_control(initial_group_update(
+                "OVER-CAPACITY",
+                "OVER-CAPACITY-STANZA",
+                creator.clone().with_device(1),
+            )),
+            "a new prospective identity cannot evict an already-retained call"
         );
-        let latest = reg.take_initial_group_controls(
-            &format!("GROUP-{MAX_PENDING_INITIAL_GROUP_CONTROLS}"),
-            &creator,
-        );
-        assert_eq!(latest.len(), 1);
+        assert!(reg.buffer_initial_group_control(initial_group_update(
+            "GROUP-0",
+            "REPLACEMENT-STANZA",
+            creator.clone().with_device(1),
+        )));
+        let latest = reg.take_initial_group_controls("GROUP-0", &creator);
+        assert_eq!(latest.len(), 1, "only the same identity may evict itself");
         assert_eq!(
-            latest[0].action.call_id(),
-            format!("GROUP-{MAX_PENDING_INITIAL_GROUP_CONTROLS}")
+            latest[0].stanza_id, "REPLACEMENT-STANZA",
+            "same-identity replacement should retain the newest control"
         );
         reg.abort_all();
         assert_eq!(reg.memory_stats().entries, 0);
@@ -2307,8 +2360,9 @@ mod tests {
         let reg = CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let chunk = MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES / 3;
+        let mut accepted = 0;
         for index in 0..4 {
-            assert!(reg.buffer_initial_group_control(initial_group_rekey(
+            accepted += usize::from(reg.buffer_initial_group_control(initial_group_rekey(
                 &format!("GROUP-{index}"),
                 &format!("EPOCH-{index}"),
                 creator.clone().with_device(1),
@@ -2316,15 +2370,15 @@ mod tests {
             )));
         }
         let stats = reg.memory_stats();
-        assert!(stats.entries < 4, "the byte cap must evict older controls");
+        assert!(accepted < 4, "the byte cap must reject excess identities");
         assert!(
             stats.bytes <= MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES as u64,
             "retained bootstrap controls must stay within the aggregate byte budget"
         );
         assert!(
-            reg.take_initial_group_controls("GROUP-0", &creator)
+            !reg.take_initial_group_controls("GROUP-0", &creator)
                 .is_empty(),
-            "byte-pressure eviction removes the oldest control first"
+            "byte pressure from unrelated identities must preserve the first control"
         );
 
         assert!(
@@ -2336,6 +2390,37 @@ mod tests {
             )),
             "one oversized control cannot consume the entire bootstrap budget"
         );
+    }
+
+    #[test]
+    fn unrelated_pre_offer_controls_cannot_evict_a_retained_epoch() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        assert!(reg.buffer_initial_group_control(initial_group_rekey(
+            "PROTECTED-GROUP",
+            "PROTECTED-EPOCH",
+            creator.clone().with_device(1),
+            32,
+        )));
+        for index in 1..MAX_PENDING_INITIAL_GROUP_CONTROLS {
+            assert!(reg.buffer_initial_group_control(initial_group_update(
+                &format!("UNRELATED-GROUP-{index}"),
+                &format!("UNRELATED-STANZA-{index}"),
+                creator.clone().with_device(1),
+            )));
+        }
+        assert!(
+            !reg.buffer_initial_group_control(initial_group_update(
+                "OVERFLOW-GROUP",
+                "OVERFLOW-STANZA",
+                creator.clone().with_device(1),
+            )),
+            "a new identity must be dropped once the global bound is occupied"
+        );
+
+        let retained = reg.take_initial_group_controls("PROTECTED-GROUP", &creator);
+        assert_eq!(retained.len(), 1);
+        assert!(matches!(retained[0].action, CallAction::EncRekey { .. }));
     }
 
     fn group_relay(transaction_id: u32) -> GroupCallRelay {
