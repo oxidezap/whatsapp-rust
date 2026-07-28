@@ -79,7 +79,15 @@ impl<'a> AttrParserRef<'a> {
     /// If the value is a JidRef, returns it directly without parsing (zero allocation).
     /// If the value is a string, parses it as a JID.
     pub fn optional_jid(&mut self, key: &str) -> Option<Jid> {
-        self.get_raw(key, false).and_then(|v| match v.to_jid() {
+        self.get_jid(key, false)
+    }
+
+    /// Shared by `optional_jid` and `jid`, so the required variant can record a
+    /// missing attribute and read the present one from the same lookup instead
+    /// of scanning the attribute list a second time to fetch what it just
+    /// proved was there.
+    fn get_jid(&mut self, key: &str, require: bool) -> Option<Jid> {
+        self.get_raw(key, require).and_then(|v| match v.to_jid() {
             Some(jid) => Some(jid),
             None => {
                 // to_jid() only returns None if it's a String that failed to parse
@@ -113,8 +121,7 @@ impl<'a> AttrParserRef<'a> {
     }
 
     pub fn jid(&mut self, key: &str) -> Jid {
-        self.get_raw(key, true);
-        self.optional_jid(key).unwrap_or_default()
+        self.get_jid(key, true).unwrap_or_default()
     }
 
     pub fn non_ad_jid(&mut self, key: &str) -> Jid {
@@ -165,8 +172,7 @@ impl<'a> AttrParserRef<'a> {
     }
 
     pub fn unix_time(&mut self, key: &str) -> i64 {
-        self.get_raw(key, true);
-        self.optional_unix_time(key).unwrap_or_default()
+        self.get_i64(key, true).unwrap_or_default()
     }
 
     pub fn optional_unix_time(&mut self, key: &str) -> Option<i64> {
@@ -174,8 +180,7 @@ impl<'a> AttrParserRef<'a> {
     }
 
     pub fn unix_milli(&mut self, key: &str) -> i64 {
-        self.get_raw(key, true);
-        self.optional_unix_milli(key).unwrap_or_default()
+        self.get_i64(key, true).unwrap_or_default()
     }
 
     pub fn optional_unix_milli(&mut self, key: &str) -> Option<i64> {
@@ -256,7 +261,15 @@ impl<'a> AttrParser<'a> {
     /// If the value is a JID variant, returns it directly without parsing (zero allocation clone).
     /// If the value is a string, parses it as a JID.
     pub fn optional_jid(&mut self, key: &str) -> Option<Jid> {
-        self.get_raw(key, false).and_then(|v| match v {
+        self.get_jid(key, false)
+    }
+
+    /// Shared by `optional_jid` and `jid`, so the required variant can record a
+    /// missing attribute and read the present one from the same lookup instead
+    /// of scanning the attribute list a second time to fetch what it just
+    /// proved was there.
+    fn get_jid(&mut self, key: &str, require: bool) -> Option<Jid> {
+        self.get_raw(key, require).and_then(|v| match v {
             NodeValue::Jid(j) => Some(j.clone()),
             NodeValue::String(s) => match Jid::from_str(s) {
                 Ok(jid) => Some(jid),
@@ -280,8 +293,7 @@ impl<'a> AttrParser<'a> {
     }
 
     pub fn jid(&mut self, key: &str) -> Jid {
-        self.get_raw(key, true); // Push "not found" error if needed.
-        self.optional_jid(key).unwrap_or_default()
+        self.get_jid(key, true).unwrap_or_default()
     }
 
     pub fn non_ad_jid(&mut self, key: &str) -> Jid {
@@ -330,8 +342,7 @@ impl<'a> AttrParser<'a> {
     }
 
     pub fn unix_time(&mut self, key: &str) -> i64 {
-        self.get_raw(key, true);
-        self.optional_unix_time(key).unwrap_or_default()
+        self.get_i64(key, true).unwrap_or_default()
     }
 
     pub fn optional_unix_time(&mut self, key: &str) -> Option<i64> {
@@ -339,8 +350,7 @@ impl<'a> AttrParser<'a> {
     }
 
     pub fn unix_milli(&mut self, key: &str) -> i64 {
-        self.get_raw(key, true);
-        self.optional_unix_milli(key).unwrap_or_default()
+        self.get_i64(key, true).unwrap_or_default()
     }
 
     pub fn optional_unix_milli(&mut self, key: &str) -> Option<i64> {
@@ -358,6 +368,53 @@ impl<'a> AttrParser<'a> {
                     None
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod required_getter_tests {
+    use super::*;
+    use crate::builder::NodeBuilder;
+
+    /// The required getters used to look the attribute up once to report it
+    /// missing and again to read it. Folding that into one lookup must not move
+    /// which error comes out: absent still reports "not found", and a present
+    /// but unparsable value still reports the parse failure rather than being
+    /// swallowed as absent.
+    #[test]
+    fn required_getters_keep_reporting_missing_and_invalid_separately() {
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511999998888@s.whatsapp.net")
+            .attr("bad_jid", "@@@")
+            .attr("t", "1700000000")
+            .attr("bad_t", "not-a-number")
+            .build();
+
+        // Present and valid: no error, value read.
+        let mut p = AttrParser::new(&node);
+        assert_eq!(p.jid("from").user, "5511999998888");
+        assert_eq!(p.unix_time("t"), 1700000000);
+        assert!(p.ok(), "clean parse should not record errors");
+
+        // Absent: reported as missing, not as a parse failure.
+        let mut p = AttrParser::new(&node);
+        assert_eq!(p.jid("nope"), Jid::default());
+        assert!(format!("{:?}", p.errors).contains("not found"));
+
+        let mut p = AttrParser::new(&node);
+        assert_eq!(p.unix_time("nope"), 0);
+        assert!(format!("{:?}", p.errors).contains("not found"));
+
+        // Present but invalid: reported as a parse failure, not as missing.
+        let mut p = AttrParser::new(&node);
+        assert_eq!(p.jid("bad_jid"), Jid::default());
+        assert!(!p.ok());
+        assert!(!format!("{:?}", p.errors).contains("not found"));
+
+        let mut p = AttrParser::new(&node);
+        assert_eq!(p.unix_time("bad_t"), 0);
+        assert!(!p.ok());
+        assert!(!format!("{:?}", p.errors).contains("not found"));
     }
 }
 
