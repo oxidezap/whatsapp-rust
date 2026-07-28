@@ -43,7 +43,18 @@
 //!
 //! ## Concurrent with QR Codes
 //!
-//! Pair code and QR code can run simultaneously. Whichever completes first wins.
+//! Pair code and QR code run on the same connection, and whichever completes
+//! first wins — matching WA Web, which leaves its QR rotation running when the
+//! user switches to phone-number linking.
+//!
+//! They are not, however, the same clock. A QR code is superseded every 20s and
+//! the surface re-renders it; a pair code is read off a screen and typed into a
+//! phone minutes later, so **a QR rotation is not a reason to request a new
+//! pair code**. WA Web mints one per user action and regenerates it only on the
+//! server's `refresh_code`, on `force_manual_refresh`, or on its own expiry
+//! timers. [`Client::pair_with_code`] enforces that: it refuses to supersede a
+//! code that is still live, and [`Client::cancel_pair_code`] is the explicit
+//! way to replace one.
 
 use crate::client::Client;
 use crate::request::{InfoQuery, InfoQueryType, IqError};
@@ -92,6 +103,20 @@ impl Client {
     ///
     /// This can run concurrently with QR code pairing - whichever completes first wins.
     ///
+    /// # One code at a time
+    ///
+    /// Fails with [`PairCodeError::CodeAlreadyOutstanding`] while a previously
+    /// issued code is still within its validity window. A second code does not
+    /// replace the first for the phone: the server routes `primary_hello` by
+    /// number, so whoever enters the older code still reaches stage 2 and is
+    /// answered with a key bundle their code cannot open — the phone reports a
+    /// failed link and nothing surfaces here. Call
+    /// [`Client::cancel_pair_code`] first when the replacement is intentional.
+    ///
+    /// In particular, do not drive this from QR-code rotation: the two have
+    /// unrelated lifetimes, and a code being typed into a phone outlives
+    /// several QR refs.
+    ///
     /// # Arguments
     ///
     /// * `options` - Configuration for pair code authentication
@@ -99,9 +124,10 @@ impl Client {
     /// # Returns
     ///
     /// * `Ok(String)` - The 8-character pairing code to display
-    /// * `Err` - If validation fails, not connected, or server error. A
-    ///   [`PairError::RequestFailed`] carrying `bad-request` may be **rate-limiting**
-    ///   (throttled per phone number), not invalid input — back off and retry.
+    /// * `Err` - If validation fails, a code is already outstanding, not
+    ///   connected, or server error. A [`PairError::RequestFailed`] carrying
+    ///   `bad-request` may be **rate-limiting** (throttled per phone number),
+    ///   not invalid input — back off and retry.
     ///
     /// # Example
     ///
@@ -157,6 +183,23 @@ impl Client {
             }
             None => PairCodeUtils::generate_code(),
         };
+
+        // A second code does not replace the first for the *phone*: the server
+        // routes `primary_hello` by number, never seeing the code, so whoever
+        // is still reading the older one reaches stage 2 and is handed a key
+        // bundle their code cannot open — the phone reports a failed link and
+        // nothing surfaces here. WA Web makes the overlap impossible by
+        // guarding `startAltLinkingFlow` with `invariant(stage === Initialized)`
+        // (`Alt/DeviceLinkingApi.js`); `cancel_pair_code` is our
+        // `initializeAltDeviceLinking()`.
+        if let Some(remaining) = self
+            .pair_code_state
+            .lock()
+            .await
+            .live_flow_remaining(wacore::time::now_secs())
+        {
+            return Err(PairCodeError::CodeAlreadyOutstanding { remaining }.into());
+        }
 
         info!(
             target: "Client/PairCode",
@@ -289,6 +332,19 @@ impl Client {
 
         Ok(code)
     }
+
+    /// Abandons the outstanding pair-code flow, if any.
+    ///
+    /// The explicit reset [`Client::pair_with_code`] requires before it will
+    /// mint a replacement — WA Web's `initializeAltDeviceLinking()`. After this
+    /// the previous code can no longer complete: a `primary_hello` for it is
+    /// dropped rather than answered with a bundle its holder cannot open.
+    pub async fn cancel_pair_code(self: &Arc<Self>) {
+        let mut state = self.pair_code_state.lock().await;
+        if !matches!(&*state, PairCodeState::Idle) {
+            *state = PairCodeState::Idle;
+        }
+    }
 }
 
 /// Handles a `link_code_companion_reg` notification. Dispatches on the child's
@@ -372,15 +428,14 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
         }
     };
 
-    // Serialize the whole of stage 2 under the pair_code_state lock. The
-    // transport dispatches <notification> stanzas on concurrent detached tasks
-    // (see client/node_io.rs), so holding the guard across derive → persist →
-    // send makes two primary_hello for the same code sequential, matching WA
-    // Web's single-threaded model. Without it, both could derive a *different*
-    // random adv_secret and race SetAdvSecretKey (last-write-wins), leaving the
-    // persisted secret out of sync with the companion_finish the server acts on
-    // → pair-success HMAC failure. The state is kept (not taken) so a genuine
-    // retry can reuse it.
+    // Only the cheap guards run here. Everything they admit is handed to a
+    // task, because this function's return is what releases the stanza's ack:
+    // WA Web starts `handlePrimaryHello` without awaiting it and returns the
+    // ack in the same expression (`Alt/DeviceLinkingHandleNotification.js`),
+    // whereas running stage 2 inline puts a 131k-round PBKDF2 between the
+    // server's notification and our acknowledgement of it.
+    //
+    // The lock still serializes stage 2 end to end — see `run_stage_two`.
     let mut state_guard = client.pair_code_state.lock().await;
     let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = match &mut *state_guard {
         PairCodeState::WaitingForPhoneConfirmation {
@@ -441,6 +496,55 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
         "Phone confirmed code entry, processing stage 2"
     );
 
+    // Released before the task runs: `run_stage_two` re-takes it.
+    drop(state_guard);
+
+    let client = Arc::clone(client);
+    client.clone().runtime.spawn_detached(Box::pin(async move {
+        run_stage_two(
+            client,
+            pairing_ref,
+            phone_jid,
+            pair_code,
+            ephemeral_keypair,
+            primary_wrapped_ephemeral,
+            primary_identity_pub,
+        )
+        .await;
+    }));
+    true
+}
+
+/// Derive the key bundle, persist the rotated adv secret, send
+/// `companion_finish`, and start the clock on the `pair-success` that should
+/// answer it.
+///
+/// Runs under the `pair_code_state` lock from derive through send. The
+/// transport dispatches `notification` stanzas on concurrent detached tasks
+/// (see `client/node_io.rs`), so without it two `primary_hello` for the same
+/// code could each derive a *different* random adv_secret and race
+/// `SetAdvSecretKey` (last-write-wins), leaving the persisted secret out of
+/// sync with the `companion_finish` the server acts on → pair-success HMAC
+/// failure. The state is kept (not taken) so a genuine retry can reuse it.
+#[allow(clippy::too_many_arguments)]
+async fn run_stage_two(
+    client: Arc<Client>,
+    pairing_ref: Vec<u8>,
+    phone_jid: String,
+    pair_code: String,
+    ephemeral_keypair: KeyPair,
+    primary_wrapped_ephemeral: Vec<u8>,
+    primary_identity_pub: [u8; 32],
+) {
+    let state_guard = client.pair_code_state.lock().await;
+    // pair-success may have landed while this task waited for the lock.
+    if !matches!(
+        &*state_guard,
+        PairCodeState::WaitingForPhoneConfirmation { .. }
+    ) {
+        return;
+    }
+
     // Decrypt primary's ephemeral public key (expensive PBKDF2 operation)
     // Run in spawn_blocking to avoid stalling the async runtime
     let pair_code_clone = pair_code.clone();
@@ -455,7 +559,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
                 target: "Client/PairCode",
                 "Failed to decrypt primary ephemeral pub: {e}"
             );
-            return false;
+            return;
         }
     };
 
@@ -472,7 +576,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
         Ok(result) => result,
         Err(e) => {
             error!(target: "Client/PairCode", "Failed to prepare key bundle: {e}");
-            return false;
+            return;
         }
     };
 
@@ -503,7 +607,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
 
     if let Err(e) = client.send_node(iq).await {
         error!(target: "Client/PairCode", "Failed to send companion_finish: {e}");
-        return false;
+        return;
     }
 
     info!(
@@ -512,10 +616,53 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     );
 
     // State stays WaitingForPhoneConfirmation so a retry can reuse it; only
-    // pair-success (see `crate::pair`) transitions to Completed. `state_guard`
-    // (held since the top for serialization) is released here.
+    // pair-success (see `crate::pair`) transitions to Completed.
     drop(state_guard);
-    true
+
+    start_pair_success_timeout(client, pairing_ref);
+}
+
+/// Write the code off if `pair-success` never answers `companion_finish`.
+///
+/// The primary reading the code proves nothing about the outcome: if it cannot
+/// open the key bundle — which is what a superseded or mistyped code looks like
+/// from here — it reports a failed link to its own user and says nothing to us.
+/// WA Web treats that silence as the failure signal, arming a one-minute timer
+/// on `primary_hello_received` and regenerating the code when it fires
+/// (`Link/DevicePhoneNumberCodeScreen.react.js`).
+fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>) {
+    let timeout = PairCodeUtils::primary_hello_pair_success_timeout();
+    client.clone().runtime.spawn_detached(Box::pin(async move {
+        client.runtime.sleep(timeout).await;
+
+        {
+            let mut state = client.pair_code_state.lock().await;
+            // Only this flow's own timer may retire it: pair-success, a
+            // cancellation, or a replacement code all leave a state this
+            // does not match.
+            let still_ours = matches!(
+                &*state,
+                PairCodeState::WaitingForPhoneConfirmation { pairing_ref: r, .. }
+                    if r.as_slice() == pairing_ref.as_slice()
+            );
+            if !still_ours {
+                return;
+            }
+            // Cleared before the event so the consumer acting on it is not
+            // rejected by the very flow it was told to replace.
+            *state = PairCodeState::Idle;
+        }
+
+        warn!(
+            target: "Client/PairCode",
+            "No pair-success within {timeout:?} of companion_finish; the code will not complete"
+        );
+        client.core.event_bus.dispatch(Event::PairingCodeRefresh(
+            crate::types::events::PairingCodeRefresh::builder()
+                .force_manual(false)
+                .build(),
+        ));
+    }));
 }
 
 /// The server asked us to refresh the code we are displaying (WA Web
@@ -542,14 +689,22 @@ async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bo
         .unwrap_or(false);
 
     // Ignore a refresh whose ref doesn't match the outstanding code — matches
-    // WA Web's `getCurrentRef()` guard.
+    // WA Web's `getCurrentRef()` guard. A matching one retires the flow on the
+    // spot: the consumer is being told to request a replacement, and leaving
+    // the old flow standing would make `pair_with_code` reject it. WA Web does
+    // the same, re-running `initializeAltDeviceLinking()` on the
+    // `force_manual_refresh` path.
     let matches_current = {
-        let state_guard = client.pair_code_state.lock().await;
-        matches!(
+        let mut state_guard = client.pair_code_state.lock().await;
+        let matches = matches!(
             &*state_guard,
             PairCodeState::WaitingForPhoneConfirmation { pairing_ref, .. }
                 if pairing_ref.as_slice() == notif_ref.as_slice()
-        )
+        );
+        if matches {
+            *state_guard = PairCodeState::Idle;
+        }
+        matches
     };
     if !matches_current {
         warn!(
@@ -617,7 +772,7 @@ mod tests {
     // proxy for "we did not process the notification"; conversely a valid
     // primary_hello rotates it (via `SetAdvSecretKey`) before the socket send.
 
-    use crate::test_utils::create_test_client;
+    use crate::test_utils::{create_iq_test_client, create_test_client, poll_until};
     use wacore::libsignal::protocol::KeyPair;
     use wacore_binary::Node;
     use wacore_binary::builder::NodeBuilder;
@@ -750,11 +905,11 @@ mod tests {
 
         let good = primary_hello_notif(&pairing_ref);
         let _ = handle_pair_code_notification(&client, &good.as_node_ref()).await;
-        assert_ne!(
-            adv(&client),
-            adv_before,
-            "the genuine primary_hello must still reach stage 2 after stale mismatches"
-        );
+        poll_until(
+            "the genuine primary_hello to still reach stage 2 after stale mismatches",
+            || adv(&client) != adv_before,
+        )
+        .await;
     }
 
     /// Regression: a `primary_hello` for a code older than the ~180s validity
@@ -833,11 +988,11 @@ mod tests {
         let notif = primary_hello_notif(&pairing_ref);
         let _ = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
 
-        assert_ne!(
-            adv(&client),
-            adv_before,
-            "a valid in-window retry must reach stage 2 and rotate the adv secret"
-        );
+        poll_until(
+            "a valid in-window retry to reach stage 2 and rotate the adv secret",
+            || adv(&client) != adv_before,
+        )
+        .await;
     }
 
     /// A `refresh_code` whose ref matches the outstanding flow surfaces a
@@ -906,6 +1061,233 @@ mod tests {
         assert!(
             collector.events().is_empty(),
             "no event should fire for a refresh_code with an unknown ref"
+        );
+    }
+
+    // ── Requesting a code over a live one ────────────────────────────────────
+    //
+    // WA Web guards `startAltLinkingFlow` with `invariant(stage === Initialized)`
+    // (`Alt/DeviceLinkingApi.js`): a second `companion_hello` may only follow an
+    // explicit `initializeAltDeviceLinking()`. Silently minting a second code
+    // strands whoever is reading the first one — the server keeps routing
+    // `primary_hello` by phone number, so the stale code reaches stage 2 and the
+    // primary is handed a key bundle its code cannot open.
+
+    /// Answers the `companion_hello` this flow puts on the wire, so
+    /// `pair_with_code` can complete against the harness.
+    async fn answer_companion_hello(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        frame: usize,
+        pairing_ref: &[u8],
+    ) {
+        let hello = crate::test_utils::decode_sent_iq(transport, frame).await;
+        let id = hello
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("companion_hello carries an id")
+            .into_owned();
+        let response = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net".to_string()),
+                ("type", "result".to_string()),
+                ("id", id.clone()),
+            ])
+            .children([NodeBuilder::new("link_code_companion_reg")
+                .attr("stage", "companion_hello")
+                .children([NodeBuilder::new("link_code_pairing_ref")
+                    .bytes(pairing_ref.to_vec())
+                    .build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(client, &id, &response).await;
+    }
+
+    fn options() -> PairCodeOptions {
+        PairCodeOptions {
+            phone_number: "15551234567".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_with_code_refuses_to_supersede_a_live_code() {
+        let (client, _transport) = create_iq_test_client().await;
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+
+        let err = client
+            .pair_with_code(options())
+            .await
+            .expect_err("a second code would strand the one already displayed");
+
+        assert!(
+            matches!(
+                err,
+                PairError::PairCode(PairCodeError::CodeAlreadyOutstanding { .. })
+            ),
+            "expected CodeAlreadyOutstanding, got {err:?}"
+        );
+    }
+
+    /// `cancel_pair_code` is our `initializeAltDeviceLinking()`: the explicit
+    /// reset that lets a caller mint a replacement on purpose.
+    #[tokio::test]
+    async fn cancel_pair_code_lets_a_replacement_be_requested() {
+        let (client, transport) = create_iq_test_client().await;
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+
+        client.cancel_pair_code().await;
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        answer_companion_hello(&client, &transport, 0, b"3@2:fresh").await;
+        let code = pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect("a cancelled flow leaves the way clear");
+        assert!(PairCodeUtils::validate_code(&code));
+    }
+
+    /// An expired code strands nobody — its holder cannot complete it either —
+    /// so it must not block a fresh request.
+    #[tokio::test]
+    async fn an_expired_code_does_not_block_a_new_one() {
+        let (client, transport) = create_iq_test_client().await;
+        let stale =
+            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        set_waiting(&client, vec![1, 2, 3, 4], stale, 0).await;
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        answer_companion_hello(&client, &transport, 0, b"3@2:fresh").await;
+        pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect("an expired code must not block a new request");
+    }
+
+    /// The server's `refresh_code` asks for a replacement, so it must also
+    /// clear the way for one — WA Web's `force_manual_refresh` path calls
+    /// `initializeAltDeviceLinking()` before the screen re-requests.
+    #[tokio::test]
+    async fn refresh_code_clears_the_flow_it_asks_to_replace() {
+        let client = create_test_client().await;
+        let pairing_ref = vec![5, 6, 7, 8];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = refresh_code_notif(&pairing_ref, Some(true));
+        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
+
+        assert!(
+            !is_waiting(&client).await,
+            "a consumer acting on the refresh must not be rejected by the flow it replaces"
+        );
+    }
+
+    // ── Stage-2 liveness (WA Web parity) ─────────────────────────────────────
+
+    /// Regression: WA Web acks the `primary_hello` notification before stage 2
+    /// runs — `Alt/DeviceLinkingHandleNotification.js` starts
+    /// `handlePrimaryHello` without awaiting it and returns the ack in the same
+    /// expression. Holding the ack behind a 131k-round PBKDF2 is a divergence
+    /// the server sees. Runs on the default current-thread runtime, so the
+    /// spawned stage-2 task provably has not been polled when the handler
+    /// returns.
+    #[tokio::test]
+    async fn primary_hello_returns_before_stage_two_reaches_the_wire() {
+        let (client, transport) = create_iq_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = primary_hello_notif(&pairing_ref);
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(handled, "a valid primary_hello is handled");
+        assert!(
+            transport.sent().is_empty(),
+            "the ack must not wait on stage-2 crypto; companion_finish belongs to a later poll"
+        );
+        poll_until("companion_finish to reach the transport", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+    }
+
+    /// Regression: `companion_finish` leaving the socket is not the end of the
+    /// flow — the server may still never send `pair-success` (a primary that
+    /// could not open the key bundle simply goes quiet). WA Web arms a
+    /// one-minute timer on `primary_hello_received`
+    /// (`Link/DevicePhoneNumberCodeScreen.react.js`) and regenerates the code
+    /// when it fires; we had no timeout at all, leaving the consumer with a
+    /// code that will never complete and no signal that anything went wrong.
+    #[tokio::test(start_paused = true)]
+    async fn a_primary_hello_that_never_pairs_asks_for_a_new_code() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = primary_hello_notif(&pairing_ref);
+        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
+        poll_until("companion_finish to reach the transport", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        tokio::time::advance(
+            PairCodeUtils::primary_hello_pair_success_timeout() + std::time::Duration::from_secs(1),
+        )
+        .await;
+        poll_until("the regeneration request", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if !r.force_manual))
+        })
+        .await;
+        assert!(
+            !is_waiting(&client).await,
+            "the abandoned flow must not reject the replacement it just asked for"
+        );
+    }
+
+    /// The timer must not fire once pairing actually completed, or a freshly
+    /// linked client would be told to hand out a new code.
+    #[tokio::test(start_paused = true)]
+    async fn pair_success_silences_the_regeneration_timer() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = primary_hello_notif(&pairing_ref);
+        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
+        poll_until("companion_finish to reach the transport", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        // What `handle_pair_success` does once the server confirms the link.
+        *client.pair_code_state.lock().await = PairCodeState::Completed;
+
+        tokio::time::advance(
+            PairCodeUtils::primary_hello_pair_success_timeout() + std::time::Duration::from_secs(1),
+        )
+        .await;
+        poll_until("the timer to have had its chance", || true).await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(_))),
+            "a completed pairing must not ask the consumer for another code"
         );
     }
 

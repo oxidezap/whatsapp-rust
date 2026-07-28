@@ -52,6 +52,7 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         "link_code_companion_reg" => {
             crate::pair_code::handle_pair_code_notification(client, nr).await;
         }
+        "companion_reg_refresh" => handle_companion_reg_refresh(client, nr).await,
         "business" => handle_business_notification(client, nr).await,
         "picture" => handle_picture_notification(client, nr),
         "privacy_token" => handle_privacy_token_notification(client, nr).await,
@@ -83,6 +84,7 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
     }
 }
 
+mod companion_reg;
 mod device;
 mod groups;
 mod privacy_business;
@@ -90,6 +92,7 @@ mod profile;
 
 // `pub(crate)` re-export keeps `crate::handlers::notification::handle_local_identity_change`
 // resolving for device_registry.rs.
+use companion_reg::*;
 pub(crate) use device::*;
 use groups::*;
 use privacy_business::*;
@@ -111,6 +114,102 @@ mod tests {
 
     fn node_to_arc(node: Node) -> Arc<OwnedNodeRef> {
         crate::test_utils::node_to_owned_ref(&node)
+    }
+
+    // ── `companion_reg_refresh` (WA Web `Handle/CompanionReqRefreshNotification.js`)
+    //
+    // The server tells an unpaired companion to re-mint its registration. WA
+    // Web regenerates the ADV secret key and acks; we routed the stanza to the
+    // catch-all instead, so the QR we kept advertising carried a secret the
+    // server had already retired.
+
+    fn companion_reg_refresh_notif(child: &'static str) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", "companion_reg_refresh")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "reg-refresh-1")
+            .children([NodeBuilder::new(child).build()])
+            .build()
+    }
+
+    async fn adv_secret(client: &Arc<Client>) -> [u8; 32] {
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .adv_secret_key
+    }
+
+    #[tokio::test]
+    async fn companion_reg_refresh_rotates_the_adv_secret() {
+        let client = create_test_client().await;
+        let before = adv_secret(&client).await;
+
+        let notif = companion_reg_refresh_notif("companion_reg_refresh");
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert_ne!(
+            adv_secret(&client).await,
+            before,
+            "companion_reg_refresh must re-mint the ADV secret the QR advertises"
+        );
+    }
+
+    /// WA Web accepts either child tag on this notification.
+    #[tokio::test]
+    async fn pair_device_rotate_qr_is_the_same_request() {
+        let client = create_test_client().await;
+        let before = adv_secret(&client).await;
+
+        let notif = companion_reg_refresh_notif("pair-device-rotate-qr");
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert_ne!(adv_secret(&client).await, before);
+    }
+
+    /// WA Web's parser rejects the stanza when neither child is present; a
+    /// malformed notification must not silently rotate live key material.
+    #[tokio::test]
+    async fn companion_reg_refresh_without_a_known_child_is_ignored() {
+        let client = create_test_client().await;
+        let before = adv_secret(&client).await;
+
+        let notif = companion_reg_refresh_notif("something-else");
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert_eq!(adv_secret(&client).await, before);
+    }
+
+    /// The one place we deliberately diverge: WA Web rotates unconditionally,
+    /// but a pair-code flow past stage 2 has already derived the ADV secret the
+    /// upcoming `pair-success` HMAC is computed over. Rotating it there would
+    /// swap a working link for a failing one, so the QR-side refresh yields to
+    /// the outstanding phone-number flow.
+    #[tokio::test]
+    async fn companion_reg_refresh_leaves_an_outstanding_pair_code_alone() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::pair_code::PairCodeState;
+
+        let client = create_test_client().await;
+        *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: b"3@2:ref".to_vec(),
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: wacore::time::now_secs(),
+            primary_hello_attempt_count: 0,
+        };
+        let before = adv_secret(&client).await;
+
+        let notif = companion_reg_refresh_notif("companion_reg_refresh");
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert_eq!(
+            adv_secret(&client).await,
+            before,
+            "rotating here would break the pair-success HMAC of the live pair-code flow"
+        );
     }
 
     #[test]

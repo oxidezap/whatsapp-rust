@@ -87,6 +87,14 @@ const PAIR_CODE_VALIDITY_SECS: u64 = 180;
 /// abandoned. Matches WA Web `DeviceLinkingApi` (`T = 3`, `MaxPrimaryHelloError`).
 const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
 
+/// How long a `companion_finish` may go unanswered before the code is written
+/// off. WA Web arms exactly this on `primary_hello_received`
+/// (`Link/DevicePhoneNumberCodeScreen.react.js`, `1 * MINUTE_MILLISECONDS`) and
+/// regenerates the code when it fires: the primary having read the code is no
+/// guarantee it could open the key bundle, and a primary that could not simply
+/// goes quiet — no error ever reaches the companion.
+const PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS: u64 = 60;
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -178,6 +186,37 @@ pub enum PairCodeState {
     },
     /// Pairing completed (success or failure).
     Completed,
+}
+
+impl PairCodeState {
+    /// The window left on a code someone may still be reading, or `None` when
+    /// there is nothing left to strand.
+    ///
+    /// A second `companion_hello` mints a new code *and* a new ephemeral
+    /// keypair, but the server keeps routing `primary_hello` by phone number —
+    /// it never sees the code itself. So the holder of the superseded code
+    /// still reaches stage 2, and gets a key bundle derived from key material
+    /// their code cannot open: the primary fails to link with no error the
+    /// companion can see. WA Web forbids the overlap outright, guarding
+    /// `startAltLinkingFlow` with `invariant(stage === Initialized)`
+    /// (`Alt/DeviceLinkingApi.js`) so a replacement must follow an explicit
+    /// `initializeAltDeviceLinking()`.
+    ///
+    /// The boundary matches [`PairCodeUtils::code_validity`] as applied in
+    /// stage 2, which rejects only `age > validity`.
+    pub fn live_flow_remaining(&self, now: i64) -> Option<std::time::Duration> {
+        let Self::WaitingForPhoneConfirmation {
+            code_generation_ts, ..
+        } = self
+        else {
+            return None;
+        };
+        let validity = PairCodeUtils::code_validity();
+        // A backwards clock jump reads as "no time has passed", never as an
+        // expiry that would let the overlap through unreported.
+        let age = now.saturating_sub(*code_generation_ts).max(0) as u64;
+        (age <= validity.as_secs()).then(|| validity - std::time::Duration::from_secs(age))
+    }
 }
 
 impl std::fmt::Debug for PairCodeState {
@@ -510,6 +549,12 @@ impl PairCodeUtils {
     pub fn max_primary_hello_attempts() -> u32 {
         PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS
     }
+
+    /// How long `companion_finish` may go unanswered before the code is written
+    /// off — WA Web's one-minute `primary_hello_expire` timer.
+    pub fn primary_hello_pair_success_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS)
+    }
 }
 
 /// Errors raised by wacore-side pair-code validation, key derivation, and
@@ -530,6 +575,17 @@ pub enum PairCodeError {
 
     #[error("invalid custom code: must be 8 characters from Crockford Base32 alphabet")]
     InvalidCustomCode,
+
+    /// A code is already displayed and still within its validity window.
+    ///
+    /// Minting a second one does not replace the first for the *phone*: the
+    /// server routes `primary_hello` by number, so whoever enters the older
+    /// code still reaches stage 2 and receives a key bundle their code cannot
+    /// open — the phone reports a failed link and the companion sees nothing.
+    /// WA Web forbids the overlap with `invariant(stage === Initialized)`.
+    /// Cancel the outstanding flow first if the replacement is intentional.
+    #[error("a pair code is already outstanding ({remaining:?} left of its validity window)")]
+    CodeAlreadyOutstanding { remaining: std::time::Duration },
 
     #[error("invalid wrapped data: expected {expected} bytes, got {got}")]
     InvalidWrappedData { expected: usize, got: usize },
@@ -912,6 +968,75 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_companion_platform(&opts, &p).1, "Chrome (Linux)");
+    }
+
+    // ── `PairCodeState::live_flow_remaining` ─────────────────────────────────
+    //
+    // A second `companion_hello` mints a fresh code and ref, and the server
+    // keeps routing `primary_hello` by phone number — so whoever is still
+    // holding the previous code gets a `companion_finish` derived from key
+    // material their code cannot open. WA Web never reaches that state from a
+    // QR rotation: `Alt/DeviceLinkingApi.js` generates the code once from the
+    // user's action and only regenerates it through `refreshAltLinkingCode`,
+    // `forceManualRefresh`, or the screen's own timers. This predicate is what
+    // lets the overwrite be reported instead of silent.
+
+    fn waiting_at(ts: i64) -> PairCodeState {
+        PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: b"3@2:ref".to_vec(),
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: ts,
+            primary_hello_attempt_count: 0,
+        }
+    }
+
+    #[test]
+    fn live_flow_remaining_is_none_when_no_code_is_outstanding() {
+        assert_eq!(PairCodeState::Idle.live_flow_remaining(1_000), None);
+        assert_eq!(PairCodeState::Completed.live_flow_remaining(1_000), None);
+    }
+
+    #[test]
+    fn live_flow_remaining_counts_down_the_validity_window() {
+        let validity = PairCodeUtils::code_validity().as_secs() as i64;
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000),
+            Some(PairCodeUtils::code_validity())
+        );
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000 + 30),
+            Some(std::time::Duration::from_secs(validity as u64 - 30))
+        );
+    }
+
+    /// The boundary matches `handle_primary_hello`, which rejects only
+    /// `age > validity` (WA Web `OldCodeError`): at exactly the window the code
+    /// is still usable, so it is still worth reporting as lost.
+    #[test]
+    fn live_flow_remaining_treats_the_exact_window_as_still_live() {
+        let validity = PairCodeUtils::code_validity().as_secs() as i64;
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000 + validity),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000 + validity + 1),
+            None,
+            "an expired code is not a flow anyone can still complete"
+        );
+    }
+
+    /// A clock that jumped backwards must not underflow into a bogus window.
+    #[test]
+    fn live_flow_remaining_survives_a_backwards_clock() {
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(900),
+            Some(PairCodeUtils::code_validity())
+        );
     }
 
     #[test]
