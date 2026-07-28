@@ -647,6 +647,27 @@ impl CallRegistry {
             else {
                 return GroupStateApply::UnknownCall;
             };
+            if let Some(group_ctl_tx) = entry.group_ctl_tx.as_ref() {
+                let mut preview = entry.group.clone().unwrap_or_else(|| {
+                    GroupCallState::new(
+                        entry.session.call_id.clone(),
+                        entry.session.call_creator.clone(),
+                    )
+                });
+                if preview.apply_update(update.clone()) == GroupStateApply::Applied {
+                    let committed = preview
+                        .snapshot()
+                        .expect("an applied preview owns a snapshot")
+                        .clone();
+                    if !group_ctl_tx.accepts(&GroupControl::Update(Box::new(committed))) {
+                        // Do not consume the authoritative transaction when its committed form
+                        // cannot fit one bounded media-driver slot. A corrected same-transaction
+                        // redelivery must remain admissible instead of leaving registry and media
+                        // state permanently split.
+                        return GroupStateApply::InvalidSnapshot;
+                    }
+                }
+            }
             let downgrades_video = update.media == "audio"
                 && (entry.session.is_video
                     || entry
@@ -1591,36 +1612,39 @@ impl CallRegistry {
         }
     }
 
-    /// Deliver an authoritative roster only while `generation` owns this call-id.
+    /// Deliver an authoritative roster only while `generation` owns this call-id. Before media
+    /// attaches, the committed registry snapshot is itself the retained delivery; attaching the
+    /// group-control sender replays that latest snapshot.
     pub fn send_group_update_if_current(
         &self,
         call_id: &str,
         generation: u64,
         update: GroupCallUpdate,
     ) -> bool {
-        let delivery = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .filter(|entry| entry.generation == generation)
-            .and_then(|entry| {
-                let tx = entry.group_ctl_tx.clone()?;
-                // `apply_group_update_if_current` may have inherited relay material omitted by
-                // this wire update. Route that committed snapshot so mailbox coalescing cannot
-                // replace a relay refresh with a later roster-only payload that drops it.
-                let update = entry
-                    .group
-                    .as_ref()
-                    .and_then(GroupCallState::snapshot)
-                    .filter(|committed| committed.transaction_id >= update.transaction_id)
-                    .cloned()
-                    .unwrap_or(update);
-                Some((tx, update))
-            });
-        delivery.is_some_and(|(tx, update)| {
-            Self::force_send_preserving_epoch(&tx, GroupControl::Update(Box::new(update)))
-        })
+        let delivery = {
+            let map = self.inner.lock().expect("registry lock poisoned");
+            let Some(entry) = map
+                .get(call_id)
+                .filter(|entry| entry.generation == generation)
+            else {
+                return false;
+            };
+            let Some(tx) = entry.group_ctl_tx.clone() else {
+                return true;
+            };
+            // `apply_group_update_if_current` may have inherited relay material omitted by this
+            // wire update. Route that committed snapshot so mailbox coalescing cannot replace a
+            // relay refresh with a later roster-only payload that drops it.
+            let update = entry
+                .group
+                .as_ref()
+                .and_then(GroupCallState::snapshot)
+                .filter(|committed| committed.transaction_id >= update.transaction_id)
+                .cloned()
+                .unwrap_or(update);
+            (tx, update)
+        };
+        Self::force_send_preserving_epoch(&delivery.0, GroupControl::Update(Box::new(delivery.1)))
     }
 
     /// Deliver one decrypted shared epoch only while `generation` owns this call-id.
@@ -3123,6 +3147,57 @@ mod tests {
             ),
             "rejecting an oversized roster must leave capacity for an epoch"
         );
+    }
+
+    #[test]
+    fn oversized_group_update_does_not_consume_the_registry_transaction() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("GROUP-CALL"));
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(1), generation),
+            GroupStateApply::Applied
+        );
+        let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
+        reg.set_group_control_sender("GROUP-CALL", generation, control_tx);
+        control_rx.try_recv().expect("initial roster");
+
+        let mut oversized = group_update(2);
+        oversized.participants.push(GroupCallParticipant {
+            jid: Jid::new("222222222222222", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(2),
+                capability_version: Some(1),
+                capability: vec![7; MAX_GROUP_CONTROL_QUEUE_BYTES],
+            }],
+        });
+        assert_eq!(
+            reg.apply_group_update_if_current(oversized, generation),
+            GroupStateApply::InvalidSnapshot,
+            "a snapshot that cannot fit one driver slot must be rejected before commit"
+        );
+        assert_eq!(
+            reg.group_state_if_current("GROUP-CALL", generation)
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(1)
+        );
+        assert!(control_rx.is_empty());
+
+        let corrected = group_update(2);
+        assert_eq!(
+            reg.apply_group_update_if_current(corrected.clone(), generation),
+            GroupStateApply::Applied,
+            "a corrected redelivery at the same transaction must remain admissible"
+        );
+        assert!(reg.send_group_update_if_current("GROUP-CALL", generation, corrected));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(GroupControl::Update(update)) if update.transaction_id == 2
+        ));
     }
 
     #[test]

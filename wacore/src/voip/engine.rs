@@ -2059,6 +2059,12 @@ impl CallEngine {
         let Some(audio) = self.media.as_ref().map(|media| media.audio) else {
             return;
         };
+        if !self.group_epoch_ready() {
+            // An authoritative rekey request retires the old shared epoch immediately. Until the
+            // requested transaction installs, accepting inbound RTP would let a removed member
+            // forge audio, video, or reactions with the still-resident receiver pipelines.
+            return;
+        }
         let Some(group) = self.group.as_mut() else {
             return;
         };
@@ -3020,6 +3026,79 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Transmit(_))),
             "media must resume only after the requested epoch is installed"
+        );
+    }
+
+    #[test]
+    fn requested_group_rekey_gates_inbound_media_from_the_retired_epoch() {
+        let old_epoch = [0x42; 32];
+        let new_epoch = [0x48; 32];
+        let update = group_update();
+        let call_id = update.call_id.clone();
+        let self_jid = update.participants[0].devices[0].jid.clone();
+        let peer_jid = update.participants[1].devices[0].jid.clone();
+        let peer_id = ssrc::format_e2e_srtp_participant_id(&peer_jid.to_string());
+        let sender = |epoch: &[u8]| {
+            let mut pipe = MediaPipeline::new(&MediaPipelineParams {
+                call_key: epoch,
+                self_lid: &peer_jid.to_string(),
+                peer_lid: &self_jid.to_string(),
+                ssrc: ssrc::derive_wasm_participant_ssrc(
+                    &call_id,
+                    &peer_id,
+                    ssrc::WASM_RELAY_STREAM_SLOT_WORDS[0],
+                ),
+                samples_per_packet: AudioFormat::OPUS_16KHZ_60MS.rtp_timestamp_step,
+                warp_mi_tag_len: 4,
+            })
+            .expect("peer group audio pipeline");
+            assert!(pipe.set_audio_payload_type(AudioFormat::OPUS_16KHZ_60MS.rtp_payload_type));
+            pipe
+        };
+        let mut old_sender = sender(&old_epoch);
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &old_epoch).unwrap(),
+            GroupEpochApply::Installed
+        );
+
+        let before = old_sender.protect_audio(&[0x08, 1, 2, 3]);
+        engine.handle_input(1, Input::RelayPacket(&before));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::EncodedAudio(_))),
+            "the installed epoch must initially admit inbound media"
+        );
+
+        let mut rekey = update;
+        rekey.transaction_id = 8;
+        rekey.rekey_requested = true;
+        assert_eq!(
+            engine.apply_group_update(2, &rekey).unwrap(),
+            GroupRosterApply::Applied
+        );
+        let retired = old_sender.protect_audio(&[0x08, 4, 5, 6]);
+        engine.handle_input(3, Input::RelayPacket(&retired));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::EncodedAudio(_))),
+            "old-key inbound media must remain gated while the requested epoch is pending"
+        );
+
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &new_epoch).unwrap(),
+            GroupEpochApply::Installed
+        );
+        let mut new_sender = sender(&new_epoch);
+        let resumed = new_sender.protect_audio(&[0x08, 7, 8, 9]);
+        engine.handle_input(4, Input::RelayPacket(&resumed));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::EncodedAudio(_))),
+            "inbound media must resume under the requested epoch"
         );
     }
 

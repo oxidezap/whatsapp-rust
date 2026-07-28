@@ -494,6 +494,44 @@ struct DroppedMedia {
     packets: u32,
 }
 
+type RelaySendFuture = Fuse<BoxFuture<'static, anyhow::Result<()>>>;
+
+struct InFlightSend {
+    future: RelaySendFuture,
+    kind: Option<SendBatchKind>,
+}
+
+impl Default for InFlightSend {
+    fn default() -> Self {
+        Self {
+            future: Fuse::terminated(),
+            kind: None,
+        }
+    }
+}
+
+fn cancel_in_flight_group_media(
+    sending: &mut InFlightSend,
+    epoch_advanced: bool,
+    audio_only: bool,
+) -> DroppedMedia {
+    let Some(kind) = sending.kind else {
+        return DroppedMedia::default();
+    };
+    let cancel = (epoch_advanced && kind != SendBatchKind::Control)
+        || (audio_only && kind == SendBatchKind::Video);
+    if !cancel {
+        return DroppedMedia::default();
+    }
+    // Dropping the owned send future cancels a relay write that is still pending. Its packet was
+    // already removed from `send_queue`, so queue purging alone cannot retire this old-key media.
+    *sending = InFlightSend::default();
+    DroppedMedia {
+        video_access_units: u32::from(kind == SendBatchKind::Video),
+        packets: 1,
+    }
+}
+
 fn record_drop(dropped: &mut DroppedMedia, batch: &SendBatch) {
     dropped.packets = dropped
         .packets
@@ -570,16 +608,22 @@ fn apply_group_epoch_control(
     send_queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
     awaiting_video_keyframe: &mut bool,
+    sending: &mut InFlightSend,
     events: &async_channel::Sender<CallEvent>,
 ) {
     match engine.apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes()) {
         Ok(crate::voip::GroupEpochApply::Installed) => {
-            let dropped = purge_queued(
+            let mut dropped = purge_queued(
                 send_queue,
                 pending_video,
                 awaiting_video_keyframe,
                 |batch| batch.kind != SendBatchKind::Control,
             );
+            let in_flight = cancel_in_flight_group_media(sending, true, false);
+            dropped.video_access_units = dropped
+                .video_access_units
+                .saturating_add(in_flight.video_access_units);
+            dropped.packets = dropped.packets.saturating_add(in_flight.packets);
             if dropped.packets != 0 {
                 let _ = events.try_send(CallEvent::OutboundMediaDropped {
                     video_access_units: dropped.video_access_units,
@@ -740,19 +784,20 @@ fn queue_transmit(
     dropped
 }
 
-fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<Bytes> {
+fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<(Bytes, SendBatchKind)> {
     let index = queue
         .iter()
         .position(|batch| batch.kind == SendBatchKind::Control)
         .unwrap_or(0);
     let batch = queue.get_mut(index)?;
     batch.started = true;
+    let kind = batch.kind;
     let packet = batch.packets.pop_front()?;
     batch.bytes = batch.bytes.saturating_sub(packet.len());
     if batch.packets.is_empty() {
         queue.remove(index);
     }
-    Some(packet)
+    Some((packet, kind))
 }
 
 /// Drive one call to completion: returns when the relay channel disconnects, a send fails, or the
@@ -862,7 +907,7 @@ async fn run_call_with_clock_and_wallclock(
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
-    let mut sending: Fuse<BoxFuture<'static, anyhow::Result<()>>> = Fuse::terminated();
+    let mut sending = InFlightSend::default();
 
     'drive: loop {
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
@@ -936,7 +981,7 @@ async fn run_call_with_clock_and_wallclock(
         if let Some(endpoint) = reconnect_to {
             // An in-flight write belongs to the retired channel and is delivery-ambiguous. Drop it;
             // the fresh Allocate emitted after ReconnectRelay establishes the replacement path.
-            sending = Fuse::terminated();
+            sending = InFlightSend::default();
             let Ok((replacement, replacement_events)) = transport.reconnect(endpoint).await else {
                 break 'drive;
             };
@@ -947,13 +992,14 @@ async fn run_call_with_clock_and_wallclock(
 
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
         // `'static` (no borrow of the loop's `transport`).
-        if sending.is_terminated()
-            && let Some(data) = pop_next_packet(&mut send_queue)
+        if sending.future.is_terminated()
+            && let Some((data, kind)) = pop_next_packet(&mut send_queue)
         {
             let t = transport.clone();
             let fut: BoxFuture<'static, anyhow::Result<()>> =
                 Box::pin(async move { t.send(data).await });
-            sending = fut.fuse();
+            sending.future = fut.fuse();
+            sending.kind = Some(kind);
         }
 
         // Arm the timer for the engine's next deadline (or never, if it has none).
@@ -1063,7 +1109,8 @@ async fn run_call_with_clock_and_wallclock(
         // flood can't starve the keepalive/playout.
         futures::select_biased! {
             // The in-flight send completed. A failure tears the call down (the old inline behavior).
-            res = sending => {
+            res = &mut sending.future => {
+                sending.kind = None;
                 if res.is_err() {
                     break 'drive;
                 }
@@ -1086,14 +1133,25 @@ async fn run_call_with_clock_and_wallclock(
                         let previous_epoch = eng.group_epoch_transaction();
                         let update_accepted = match eng.apply_group_update(now_ms(), &update) {
                             Ok(crate::voip::GroupRosterApply::Applied) => {
-                                let dropped = purge_group_transition_media(
+                                let epoch_advanced = update.rekey_requested
+                                    || eng.group_epoch_transaction() != previous_epoch;
+                                let mut dropped = purge_group_transition_media(
                                     &mut send_queue,
                                     &mut pending_video,
                                     &mut awaiting_video_keyframe,
-                                    update.rekey_requested
-                                        || eng.group_epoch_transaction() != previous_epoch,
+                                    epoch_advanced,
                                     update.media == "audio",
                                 );
+                                let in_flight = cancel_in_flight_group_media(
+                                    &mut sending,
+                                    epoch_advanced,
+                                    update.media == "audio",
+                                );
+                                dropped.video_access_units = dropped
+                                    .video_access_units
+                                    .saturating_add(in_flight.video_access_units);
+                                dropped.packets =
+                                    dropped.packets.saturating_add(in_flight.packets);
                                 if dropped.packets != 0 {
                                     let _ = channels.events.try_send(
                                         CallEvent::OutboundMediaDropped {
@@ -1126,6 +1184,7 @@ async fn run_call_with_clock_and_wallclock(
                                 &mut send_queue,
                                 &mut pending_video,
                                 &mut awaiting_video_keyframe,
+                                &mut sending,
                                 &channels.events,
                             );
                         } else if paired_epoch.is_some() {
@@ -1143,6 +1202,7 @@ async fn run_call_with_clock_and_wallclock(
                             &mut send_queue,
                             &mut pending_video,
                             &mut awaiting_video_keyframe,
+                            &mut sending,
                             &channels.events,
                         );
                     }
@@ -2705,9 +2765,38 @@ mod tests {
         assert_eq!(queue[0].packets.len(), 40);
 
         let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
-            .map(|packet| parse_rtp_header(&packet).unwrap().sequence_number)
+            .map(|(packet, _)| parse_rtp_header(&packet).unwrap().sequence_number)
             .collect();
         assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn epoch_transition_cancels_media_already_removed_from_the_send_queue() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(cancelled.clone());
+        let future: BoxFuture<'static, anyhow::Result<()>> = Box::pin(async move {
+            let _probe = probe;
+            futures::future::pending().await
+        });
+        let mut sending = InFlightSend {
+            future: future.fuse(),
+            kind: Some(SendBatchKind::Media),
+        };
+
+        let dropped = cancel_in_flight_group_media(&mut sending, true, false);
+
+        assert!(sending.future.is_terminated());
+        assert_eq!(sending.kind, None);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(dropped.packets, 1);
+        assert_eq!(dropped.video_access_units, 0);
     }
 
     #[test]

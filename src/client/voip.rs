@@ -52,6 +52,8 @@ const WAITING_ROOM_HEARTBEAT_MAX_CONSECUTIVE_FAILURES: u8 = 3;
 const MAX_PENDING_CALL_LINK_TRANSITIONS: usize = 32;
 #[cfg(feature = "voip-runtime")]
 const MAX_PENDING_CALL_LINK_TRANSITION_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "voip-runtime")]
+const MAX_PENDING_CALL_LINK_SATURATION_FINGERPRINTS: usize = 32;
 
 /// Opaque call-control handle obtained via [`Client::voip`]. Borrows the client;
 /// kept as a newtype so the surface can grow without breaking callers.
@@ -158,6 +160,9 @@ pub(super) struct PendingCallLinkJoins {
     active: usize,
     bound_call_id: Option<String>,
     transitions: std::collections::HashMap<String, Vec<PendingCallLinkTransition>>,
+    saturation_fingerprints: Vec<u64>,
+    saturation_hash_builder: std::collections::hash_map::RandomState,
+    untracked_saturation: bool,
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -191,16 +196,29 @@ impl PendingCallLinkJoins {
     }
 
     fn bind_call_id(&mut self, call_id: &str) {
+        let fingerprint = self.call_id_fingerprint(call_id);
         self.bound_call_id = Some(call_id.to_string());
         self.transitions.retain(|retained, _| retained == call_id);
+        self.saturation_fingerprints
+            .retain(|retained| *retained == fingerprint);
     }
 
     fn is_saturated(&self, call_id: &str) -> bool {
-        self.transitions.get(call_id).is_some_and(|transitions| {
-            transitions
-                .iter()
-                .any(|transition| matches!(transition, PendingCallLinkTransition::Saturated))
-        })
+        self.untracked_saturation
+            || self
+                .saturation_fingerprints
+                .contains(&self.call_id_fingerprint(call_id))
+            || self.transitions.get(call_id).is_some_and(|transitions| {
+                transitions
+                    .iter()
+                    .any(|transition| matches!(transition, PendingCallLinkTransition::Saturated))
+            })
+    }
+
+    fn call_id_fingerprint(&self, call_id: &str) -> u64 {
+        use std::hash::BuildHasher;
+
+        self.saturation_hash_builder.hash_one(call_id)
     }
 
     fn mark_saturated(&mut self, call_id: &str) {
@@ -213,13 +231,28 @@ impl PendingCallLinkJoins {
                 call_id.to_string(),
                 vec![PendingCallLinkTransition::Saturated],
             );
+            return;
+        }
+        let fingerprint = self.call_id_fingerprint(call_id);
+        if self.saturation_fingerprints.contains(&fingerprint) {
+            return;
+        }
+        if self.saturation_fingerprints.len() < MAX_PENDING_CALL_LINK_SATURATION_FINGERPRINTS {
+            // Keep the failure identity in fixed-size metadata even when unrelated payloads have
+            // consumed every transition slot. Binding the ACK can then fail exactly the join whose
+            // admission state was dropped without letting unrelated saturation poison it.
+            self.saturation_fingerprints.push(fingerprint);
+        } else {
+            // If even the bounded fingerprint reserve is exhausted, fail closed. Silently
+            // registering without a potentially dropped admission/rekey transition is unsafe.
+            self.untracked_saturation = true;
         }
     }
 
     pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
         use wacore::stats::HeapSize;
 
-        let bytes = self
+        let transition_bytes = self
             .transitions
             .iter()
             .map(|(call_id, transitions)| {
@@ -232,11 +265,15 @@ impl PendingCallLinkJoins {
                         .sum::<usize>()
             })
             .sum::<usize>();
+        let bytes = transition_bytes
+            .saturating_add(self.saturation_fingerprints.capacity() * size_of::<u64>());
         wacore::stats::CollectionStats::new(
             self.transitions
                 .values()
                 .map(Vec::len)
                 .sum::<usize>()
+                .saturating_add(self.saturation_fingerprints.len())
+                .saturating_add(usize::from(self.untracked_saturation))
                 .try_into()
                 .unwrap_or(u64::MAX),
             bytes.try_into().unwrap_or(u64::MAX),
@@ -260,6 +297,8 @@ impl Drop for PendingCallLinkJoinGuard {
         if state.active == 0 {
             state.bound_call_id = None;
             state.transitions.clear();
+            state.saturation_fingerprints.clear();
+            state.untracked_saturation = false;
         }
     }
 }
@@ -313,6 +352,8 @@ impl Client {
         if state.active == 0 {
             state.bound_call_id = None;
             state.transitions.clear();
+            state.saturation_fingerprints.clear();
+            state.untracked_saturation = false;
         }
         state.active = state.active.saturating_add(1);
         drop(state);
@@ -624,11 +665,9 @@ impl Client {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.bind_call_id(&call_id);
+        let saturated = state.is_saturated(&call_id);
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
-        if staged
-            .iter()
-            .any(|transition| matches!(transition, PendingCallLinkTransition::Saturated))
-        {
+        if saturated {
             return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
         }
         let generation = self.call_registry.insert_call_link_checked(session)?;
@@ -3364,6 +3403,63 @@ mod tests {
                 .await,
             Err(wacore::voip::GroupStateApply::InvalidSnapshot),
             "a saturated join must fail rather than wait forever for a discarded admission"
+        );
+        assert_eq!(client.call_registry().generation_of(call_id), None);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn saturated_admission_is_retained_when_unrelated_call_ids_fill_the_payload_budget() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let sender = creator.clone().with_device(1);
+        let _pending = client.begin_call_link_join();
+        for index in 0..MAX_PENDING_CALL_LINK_TRANSITIONS {
+            let unrelated_creator = Jid::new(format!("55555555555{index:04}"), Server::Lid);
+            let unrelated_sender = unrelated_creator.clone().with_device(1);
+            assert_eq!(
+                client.buffer_pending_call_link_terminate(
+                    &format!("UNRELATED-{index}"),
+                    &unrelated_creator,
+                    &unrelated_sender,
+                ),
+                PendingCallLinkBuffer::Buffered
+            );
+        }
+
+        let call_id = "SATURATED-AFTER-UNRELATED";
+        let oversized = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                creator.clone(),
+                vec![
+                    GroupCallDevice::new(sender.clone())
+                        .with_capability(1, vec![7; MAX_PENDING_CALL_LINK_TRANSITION_BYTES]),
+                ],
+            )])
+            .build();
+        assert_eq!(
+            client.buffer_pending_call_link_update(&oversized, &sender),
+            PendingCallLinkBuffer::Saturated
+        );
+
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::WaitingRoom);
+        assert_eq!(
+            client
+                .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK",)
+                .await,
+            Err(wacore::voip::GroupStateApply::InvalidSnapshot),
+            "binding the ACK must retain the exact overflow identity outside the full payload map"
         );
         assert_eq!(client.call_registry().generation_of(call_id), None);
     }

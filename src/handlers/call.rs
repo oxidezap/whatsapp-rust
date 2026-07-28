@@ -1029,11 +1029,18 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
             }
             match registry.apply_group_update_if_current(update.as_ref().clone(), generation) {
                 GroupStateApply::Applied => {
-                    registry.send_group_update_if_current(
+                    if !registry.send_group_update_if_current(
                         &update.call_id,
                         generation,
                         update.as_ref().clone(),
-                    );
+                    ) {
+                        warn!(
+                            "call: terminating {} after its committed group snapshot could not reach media",
+                            update.call_id
+                        );
+                        registry.remove_if_current(&update.call_id, generation);
+                        return false;
+                    }
                     if update.rekey_requested {
                         match crate::voip::facade::fanout_group_epoch(client, update).await {
                             Ok(fanout) => {
