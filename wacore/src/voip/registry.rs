@@ -1252,8 +1252,7 @@ impl CallRegistry {
                         bytes.saturating_add(entry.retained_bytes(call_id)),
                     )
                 });
-            if map.contains_key(&call_id) {
-                let entry = map.get(&call_id).expect("entry presence checked");
+            if let Some(entry) = map.get(&call_id) {
                 if entry.session.phase() != CallPhase::Ringing {
                     return Ok(None);
                 }

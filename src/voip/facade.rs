@@ -1409,7 +1409,8 @@ async fn fanout_group_epoch_for_generation(
     // fallible step instead of leaving the generation alive without its requested epoch.
     let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
-    let self_id = own_lid.to_string();
+    let own_lid = own_lid.to_non_ad();
+    let own_pn = client.pn().map(|jid| jid.to_non_ad());
     let mut seen = std::collections::HashSet::new();
     let recipients = update
         .participants
@@ -1417,8 +1418,10 @@ async fn fanout_group_epoch_for_generation(
         .filter(|participant| participant.state.as_deref() == Some("connected"))
         .flat_map(|participant| participant.devices.iter())
         .filter(|device| {
+            let device_user = device.jid.to_non_ad();
             device.pid.is_some()
-                && device.jid.to_string() != self_id
+                && device_user != own_lid
+                && own_pn.as_ref() != Some(&device_user)
                 && seen.insert(device.jid.clone())
         })
         .map(|device| device.jid.clone())
@@ -5705,6 +5708,33 @@ mod tests {
             sent.load(Ordering::SeqCst),
             0,
             "an empty recipient set must initialize only the local epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_rekey_fanout_excludes_the_local_pn_device_alias() {
+        let (client, sent) = make_sending_client().await;
+        let own_pn = Jid::new("12025550111", Server::Pn);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                own_pn.clone(),
+            )))
+            .await;
+        let mut update = rekey_update(&client, &[]);
+        update.participants[0].devices[0].jid = own_pn.with_device(0);
+
+        let epoch_len = fanout_group_epoch(&client, &update)
+            .await
+            .expect("local PN alias must not require a Signal session")
+            .commit(|epoch| Ok(epoch.len()))
+            .expect("local epoch commit");
+
+        assert_eq!(epoch_len, 32);
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            0,
+            "the local PN device alias must be excluded from remote epoch recipients"
         );
     }
 
