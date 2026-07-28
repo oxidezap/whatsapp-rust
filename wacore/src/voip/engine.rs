@@ -723,7 +723,7 @@ struct GroupEngineState {
     hbh_fec_ssrcs: [u32; 2],
     app_data: MediaPipeline,
     reaction_transaction: u64,
-    reaction_last_seen: HashMap<String, u64>,
+    reaction_last_seen: HashMap<String, ReactionWatermark>,
     pending_reactions: VecDeque<PendingReaction>,
     mixer: ParticipantAudioMixer,
     video_orientations: HashMap<Jid, u8>,
@@ -731,6 +731,11 @@ struct GroupEngineState {
     video_reception: HashMap<String, RtpReceptionStats>,
     #[cfg(feature = "voip-mlow")]
     decoders: HashMap<String, mlow::MlowDecoder>,
+}
+
+struct ReactionWatermark {
+    pid: Option<u32>,
+    transaction_id: u64,
 }
 
 struct PendingReaction {
@@ -2149,12 +2154,19 @@ impl CallEngine {
             let last_seen = group
                 .reaction_last_seen
                 .entry(participant.participant_id)
-                .or_default();
+                .or_insert(ReactionWatermark {
+                    pid: participant.pid,
+                    transaction_id: 0,
+                });
+            if last_seen.pid != participant.pid {
+                last_seen.pid = participant.pid;
+                last_seen.transaction_id = 0;
+            }
             for reaction in reactions {
-                if reaction.transaction_id <= *last_seen {
+                if reaction.transaction_id <= last_seen.transaction_id {
                     continue;
                 }
-                *last_seen = reaction.transaction_id;
+                last_seen.transaction_id = reaction.transaction_id;
                 let emoji = (!reaction.emoji.is_empty()).then_some(reaction.emoji);
                 self.outbox.push_back(Output::Event(CallEvent::Reaction {
                     participant: participant.user_jid.clone(),
@@ -3758,19 +3770,38 @@ mod encoded_tests {
             }) if *participant == peer_jid.to_non_ad()
         )));
 
+        let mut migrated = group_update();
+        migrated.transaction_id = 8;
+        migrated.participants[1].devices[0].pid = Some(9);
+        engine
+            .apply_group_update(1, &migrated)
+            .expect("replace the participant media session");
+        let restarted = sender.protect_audio(&app_data::encode_reaction(1, "🔄").unwrap());
+        engine.handle_input(503, Input::RelayPacket(&restarted));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Event(CallEvent::Reaction {
+                participant,
+                pid: Some(9),
+                emoji,
+                removed: false,
+                ..
+            }) if *participant == peer_jid.to_non_ad() && emoji.as_deref() == Some("🔄")
+        )));
+
         let mut departed = group_update();
-        departed.transaction_id = 8;
+        departed.transaction_id = 9;
         departed.participants.truncate(1);
         engine
-            .apply_group_update(1, &departed)
+            .apply_group_update(2, &departed)
             .expect("remove participant");
         let mut rejoined = group_update();
-        rejoined.transaction_id = 9;
+        rejoined.transaction_id = 10;
         engine
-            .apply_group_update(2, &rejoined)
+            .apply_group_update(3, &rejoined)
             .expect("rejoin participant");
         let restarted = sender.protect_audio(&app_data::encode_reaction(1, "✅").unwrap());
-        engine.handle_input(503, Input::RelayPacket(&restarted));
+        engine.handle_input(504, Input::RelayPacket(&restarted));
         assert!(drain(&mut engine).iter().any(|output| matches!(
             output,
             Output::Event(CallEvent::Reaction {

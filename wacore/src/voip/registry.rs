@@ -1282,6 +1282,25 @@ impl CallRegistry {
         true
     }
 
+    /// Remove exactly the ringing generation carried by a dispatched offer.
+    pub fn reject_ringing_if_current(&self, call_id: &str, generation: u64) -> bool {
+        let removed = {
+            let mut ringing = self.ringing.lock().expect("registry lock poisoned");
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            if map.get(call_id).is_some_and(|entry| {
+                entry.generation == generation && entry.session.phase() == CallPhase::Ringing
+            }) {
+                ringing.remove(call_id);
+                map.remove(call_id)
+            } else {
+                None
+            }
+        };
+        let rejected = removed.is_some();
+        drop(removed);
+        rejected
+    }
+
     fn new_entry(
         session: CallSession,
         generation: u64,
@@ -3054,6 +3073,32 @@ mod tests {
                 .expect("registry lock")
                 .contains("GROUP-CALL"),
             "a stale accept must not consume the replacement's ringing marker"
+        );
+    }
+
+    #[test]
+    fn rejecting_a_stale_ringing_generation_leaves_replacement_untouched() {
+        let reg = CallRegistry::new();
+        let incoming = || {
+            CallSession::new_incoming(
+                "GROUP-CALL",
+                Jid::new("222222222222222", Server::Lid),
+                Jid::new("111111111111111", Server::Lid),
+            )
+        };
+        let stale = reg.insert_ringing_group(incoming());
+        let current = reg.insert_ringing_group(incoming());
+        reg.mark_incoming_ringing("GROUP-CALL");
+
+        assert!(!reg.reject_ringing_if_current("GROUP-CALL", stale));
+        assert_eq!(reg.generation_of("GROUP-CALL"), Some(current));
+        assert_eq!(reg.phase("GROUP-CALL"), Some(CallPhase::Ringing));
+        assert!(
+            reg.ringing
+                .lock()
+                .expect("registry lock")
+                .contains("GROUP-CALL"),
+            "a stale reject must not consume the replacement's ringing marker"
         );
     }
 

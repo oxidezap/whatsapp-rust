@@ -84,6 +84,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         offline,
         action,
         group,
+        ringing_generation: None,
         // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
         // capture them only on an <offer> and only when `voip` is on (RelayData lives there).
         #[cfg(feature = "voip")]

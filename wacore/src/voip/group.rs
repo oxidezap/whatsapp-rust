@@ -245,7 +245,13 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
                 .as_ref()
                 .is_none_or(|pn| users.insert(pn.to_non_ad()))
             && participant.devices.iter().all(|device| {
-                devices.insert(device.jid.clone())
+                let device_user = device.jid.to_non_ad();
+                (device_user == participant.jid.to_non_ad()
+                    || participant
+                        .pn
+                        .as_ref()
+                        .is_some_and(|pn| device_user == pn.to_non_ad()))
+                    && devices.insert(device.jid.clone())
                     && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
             })
     }) && super::group_media::validate_group_media_snapshot(update).is_ok()
@@ -531,6 +537,28 @@ mod tests {
             state.apply_update(update(1, vec![device_fanout])),
             GroupStateApply::InvalidSnapshot,
             "one connected user cannot expand the active media registry past the call limit"
+        );
+    }
+
+    #[test]
+    fn roster_devices_must_belong_to_their_enclosing_participant() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut mismatched = participant("100001", "connected", 1);
+        mismatched.devices[0].jid = Jid::new("200002", Server::Lid).with_device(1);
+        assert_eq!(
+            state.apply_update(update(1, vec![mismatched])),
+            GroupStateApply::InvalidSnapshot,
+            "a device cannot be attributed to an unrelated canonical participant"
+        );
+
+        let mut aliased = participant("100001", "connected", 1);
+        let pn = Jid::new("12025550113", Server::Pn);
+        aliased.pn = Some(pn.clone());
+        aliased.devices[0].jid = pn.with_device(2);
+        assert_eq!(
+            state.apply_update(update(1, vec![aliased])),
+            GroupStateApply::Applied,
+            "a device matching the participant's explicit PN alias remains valid"
         );
     }
 

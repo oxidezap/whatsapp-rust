@@ -83,6 +83,23 @@ impl StanzaHandler for CallHandler {
         match parse_call_stanza(nr) {
             Ok(Some(call)) => {
                 #[cfg(feature = "voip-runtime")]
+                let mut call = call;
+                #[cfg(feature = "voip-runtime")]
+                if matches!(
+                    &call.action,
+                    CallAction::GroupUpdate { update } if update.rekey_requested
+                ) {
+                    // This is a transport receipt, independent of whether the authoritative
+                    // transition later commits. Send it before Signal fanout can block for every
+                    // participant, and suppress the router's deferred generic ACK.
+                    *cancelled = true;
+                    if let Err(error) = client.send_ack_for(nr).await {
+                        warn!(
+                            "call: failed to acknowledge group update before epoch fanout: {error}"
+                        );
+                    }
+                }
+                #[cfg(feature = "voip-runtime")]
                 let is_terminate = matches!(&call.action, CallAction::Terminate { .. });
                 #[cfg(feature = "voip-runtime")]
                 let is_group_transition = matches!(
@@ -211,7 +228,8 @@ impl StanzaHandler for CallHandler {
                                 .call_registry()
                                 .insert_ringing_group_if_inactive(session)
                             {
-                                Ok(Some(_)) => {
+                                Ok(Some(generation)) => {
+                                    call.set_ringing_generation(generation);
                                     buffered_initial_group_controls =
                                         client.call_registry().take_initial_group_controls(
                                             call.action.call_id(),
@@ -2206,6 +2224,99 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn rekey_group_update_is_acknowledged_before_epoch_fanout() {
+        use wacore::types::group_call::GroupCallUpdate;
+        use wacore::voip::{CallSession, GroupStateApply};
+
+        let (client, send_started, release_send) = make_blocking_sending_client().await;
+        client.set_connected_for_test(true);
+        let creator = fake_caller_lid();
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                creator.clone(),
+            )))
+            .await;
+        let call_id = "GROUP-REKEY-ACK";
+        let registry = client.call_registry();
+        let generation = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        assert_eq!(
+            registry.apply_group_update(
+                GroupCallUpdate::builder()
+                    .call_id(call_id.to_string())
+                    .call_creator(creator.clone())
+                    .transaction_id(1)
+                    .media("audio".to_string())
+                    .connected_limit(32)
+                    .joinable(true)
+                    .av_upgradable(true)
+                    .rekey_requested(false)
+                    .participants(Vec::new())
+                    .build(),
+            ),
+            GroupStateApply::Applied
+        );
+        let stanza = NodeBuilder::new("call")
+            .attr("from", creator.clone())
+            .attr("id", "GROUP-REKEY-ACK-STANZA")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("group_update")
+                .attr("call-id", call_id)
+                .attr("call-creator", creator)
+                .children([NodeBuilder::new("group_info")
+                    .attr("transaction-id", "2")
+                    .attr("connected-limit", "32")
+                    .attr("media", "audio")
+                    .attr("joinable", "1")
+                    .attr("rekey", "1")
+                    .build()])
+                .build()])
+            .build();
+        let node = node_to_owned_ref(&stanza);
+        let mut cancelled = false;
+        let handled = {
+            let handling = CallHandler.handle(client.clone(), node, &mut cancelled);
+            tokio::pin!(handling);
+            tokio::select! {
+                started = send_started.recv() => started.expect("generic transport ACK send started"),
+                _ = &mut handling => panic!("handler completed before the rekey ACK send"),
+            }
+            assert_eq!(
+                registry
+                    .group_state_if_current(call_id, generation)
+                    .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+                Some(1),
+                "the transport ACK must start before the roster commit and epoch fanout"
+            );
+            release_send.send(()).await.expect("release ACK send");
+            handling.await
+        };
+
+        assert!(handled);
+        assert!(
+            cancelled,
+            "the router must not send a duplicate generic ACK"
+        );
+        assert_eq!(
+            registry
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(2)
+        );
+        assert_eq!(
+            registry.pending_group_epoch_transaction_if_current(call_id, generation),
+            Some(2),
+            "the requested epoch must still commit after the early transport receipt"
+        );
+        registry.remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn initial_group_control_waits_in_a_bounded_buffer_for_its_offer() {
         let client = make_sending_client().await;
         let mut cancelled = false;
@@ -3402,6 +3513,10 @@ mod tests {
             .call_registry()
             .snapshot("GROUP-CALL")
             .expect("active group offer must register a session");
+        let generation = client
+            .call_registry()
+            .generation_of("GROUP-CALL")
+            .expect("registered generation");
         assert_eq!(session.phase(), CallPhase::Ringing);
         assert_eq!(
             session.group.as_ref().map(|group| group.transaction_id),
@@ -3413,13 +3528,19 @@ mod tests {
         );
         assert_eq!(sends.load(Ordering::SeqCst), 1);
         assert!(!cancelled);
-        assert!(matches!(
-            event_rx.try_recv().as_deref(),
-            Ok(Event::IncomingCall(IncomingCall {
-                group: Some(group),
-                ..
-            })) if group.transaction_id == 7
-        ));
+        let event = event_rx.try_recv().expect("incoming group offer event");
+        let Event::IncomingCall(incoming) = event.as_ref() else {
+            panic!("expected incoming group offer event");
+        };
+        assert_eq!(
+            incoming.group.as_deref().map(|group| group.transaction_id),
+            Some(7)
+        );
+        assert_eq!(
+            incoming.ringing_generation(),
+            Some(generation),
+            "the dispatched event must retain the exact eagerly registered generation"
+        );
     }
 
     #[cfg(feature = "voip-runtime")]

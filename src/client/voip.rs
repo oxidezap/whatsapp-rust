@@ -895,10 +895,11 @@ pub enum CallError {
 impl Voip<'_> {
     /// Reject an incoming call. Fire-and-forget — no server response is expected.
     pub async fn reject(&self, incoming: &IncomingCall) -> Result<(), CallError> {
-        self.reject_call(
+        self.reject_call_inner(
             incoming.action.call_id(),
             &incoming.from,
             incoming.action.call_creator(),
+            incoming.ringing_generation(),
         )
         .await
     }
@@ -914,6 +915,17 @@ impl Voip<'_> {
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
+        self.reject_call_inner(call_id, peer, call_creator, None)
+            .await
+    }
+
+    async fn reject_call_inner(
+        &self,
+        call_id: &str,
+        peer: &Jid,
+        call_creator: &Jid,
+        _ringing_generation: Option<u64>,
+    ) -> Result<(), CallError> {
         if call_id.is_empty() {
             return Err(CallError::EmptyCallId);
         }
@@ -925,10 +937,14 @@ impl Voip<'_> {
         #[cfg(feature = "voip-runtime")]
         {
             let registry = self.client.call_registry();
-            let generation = registry.ringing_group_generation(call_id, call_creator);
-            registry.take_ringing(call_id);
-            if let Some(generation) = generation {
-                registry.remove_if_current(call_id, generation);
+            if let Some(generation) = _ringing_generation {
+                registry.reject_ringing_if_current(call_id, generation);
+            } else {
+                let generation = registry.ringing_group_generation(call_id, call_creator);
+                registry.take_ringing(call_id);
+                if let Some(generation) = generation {
+                    registry.remove_if_current(call_id, generation);
+                }
             }
         }
         self.client.send_node(stanza).await?;
@@ -2072,6 +2088,73 @@ mod tests {
             Some(generation),
             "reject must reap the exact eagerly registered group offer"
         );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn rejecting_a_stale_group_offer_event_preserves_the_replacement_generation() {
+        let (client, _count) = make_client_with_count().await;
+        let creator = caller();
+        let call_id = "REPLACED-INCOMING-GROUP-CALL";
+        let update = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        let mut session = CallSession::new_incoming(call_id, creator.clone(), creator.clone());
+        session.group = Some(update.clone());
+        let stale = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing generation");
+        let mut incoming = IncomingCall::new_for_test(
+            creator.clone(),
+            "STALE-GROUP-OFFER".to_string(),
+            wacore::time::from_secs(1_766_847_151_i64).expect("valid ts"),
+            CallAction::Offer {
+                call_id: call_id.to_string(),
+                call_creator: creator.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            },
+        );
+        incoming.group = Some(Box::new(update.clone()));
+        incoming.set_ringing_generation(stale);
+
+        let mut replacement = CallSession::new_incoming(call_id, creator.clone(), creator.clone());
+        replacement.group = Some(update);
+        let replacement = client.call_registry().insert_ringing_group(replacement);
+
+        client.voip().reject(&incoming).await.expect("reject");
+
+        assert_eq!(
+            client.call_registry().generation_of(call_id),
+            Some(replacement),
+            "a retained application event must not reap a newer same-id generation"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .ringing_group_generation(call_id, &creator),
+            Some(replacement),
+            "the newer offer must remain available for the application to answer or reject"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, replacement);
+        client.call_registry().take_ringing(call_id);
     }
 
     #[tokio::test]

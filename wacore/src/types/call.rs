@@ -317,6 +317,10 @@ pub struct IncomingCall {
     /// Group snapshot embedded in an initial offer or active-call invitation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<Box<GroupCallUpdate>>,
+    /// Registry generation assigned before the offer is dispatched. This is internal routing
+    /// metadata, not part of the serialized event payload.
+    #[serde(skip)]
+    pub(crate) ringing_generation: Option<u64>,
     /// Media material from an `<offer>` (the encrypted callKey + parsed relay), captured by the
     /// parser so the `voip` media facade can drive the call. `None` for non-offer actions or an
     /// offer with no `<enc>` for us. Boxed so the large `RelayData` doesn't bloat every `Event`
@@ -411,6 +415,18 @@ pub enum ElsewhereOutcome {
 }
 
 impl IncomingCall {
+    /// Attach the exact ringing generation to a dispatched offer.
+    #[doc(hidden)]
+    pub fn set_ringing_generation(&mut self, generation: u64) {
+        self.ringing_generation = Some(generation);
+    }
+
+    /// Return the exact ringing generation attached before dispatch, when available.
+    #[doc(hidden)]
+    pub fn ringing_generation(&self) -> Option<u64> {
+        self.ringing_generation
+    }
+
     /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the
     /// struct literal cross-crate, so this is the supported way to build one outside `wacore`. The
     /// optional/media fields default to absent; mutate the public fields after for other shapes.
@@ -433,6 +449,7 @@ impl IncomingCall {
             offline: false,
             action,
             group: None,
+            ringing_generation: None,
             #[cfg(feature = "voip")]
             media: None,
         }
