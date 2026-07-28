@@ -1059,6 +1059,27 @@ impl<'a> CallLinkCall<'a> {
                 if update.relay.is_some() {
                     break update;
                 }
+                if registry.phase_if_current(&join.call_id, generation)
+                    == Some(CallPhase::Connecting)
+                {
+                    let update = match wacore::runtime::timeout(
+                        &*self.client.runtime,
+                        OFFER_ACK_RELAY_TIMEOUT,
+                        wait_for_group_relay(&registry, &join.call_id, generation),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => return Err(CallError::ResponseTimeout),
+                    };
+                    if update.call_creator != join.call_creator {
+                        return Err(CallError::Response(
+                            "call-link admitted snapshot changed call identity".to_string(),
+                        ));
+                    }
+                    ensure_call_link_admitted_media(&update, self.media)?;
+                    break update;
+                }
             }
             listener.await;
         };
@@ -6805,9 +6826,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cancelling_call_link_after_relayless_admission_terminates_the_call_scope() {
-        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    async fn start_waiting_room_call_link(
+        call_id: &'static str,
+    ) -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+        tokio::task::JoinHandle<Result<CallHandle, CallError>>,
+        Jid,
+        Jid,
+        u64,
+    ) {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let own_lid = Jid::new("111111111111111", Server::Lid).with_device(1);
         client
             .persistence_manager()
@@ -6815,7 +6844,6 @@ mod tests {
                 own_lid.clone(),
             )))
             .await;
-        let call_id = "RELAYLESS-ADMISSION";
         let creator = Jid::new("333333333333333", Server::Lid);
         let join_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         let start_client = client.clone();
@@ -6862,6 +6890,61 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, generation),
+            Some(CallPhase::WaitingRoom)
+        );
+        (client, transport, start, own_lid, creator, generation)
+    }
+
+    #[tokio::test]
+    async fn cancelling_call_link_in_waiting_room_sends_no_terminate() {
+        let (client, transport, start, _own_lid, _creator, _generation) =
+            start_waiting_room_call_link("WAITING-CANCELLATION").await;
+
+        start.abort();
+        match start.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("call-link start must cancel"),
+        }
+        for _ in 0..20 {
+            if client
+                .call_registry()
+                .generation_of("WAITING-CANCELLATION")
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            client.call_registry().generation_of("WAITING-CANCELLATION"),
+            None,
+            "cancellation must reap the exact waiting-room generation"
+        );
+        for index in 0..transport.sent_count() {
+            let node = crate::test_utils::decode_sent_iq(&transport, index).await;
+            let node = node.get();
+            let sent_terminate = node.tag == "call"
+                && node.children().is_some_and(|children| {
+                    children.iter().any(|child| {
+                        child.tag == "terminate"
+                            && child.attrs().optional_string("call-id").as_deref()
+                                == Some("WAITING-CANCELLATION")
+                    })
+                });
+            assert!(
+                !sent_terminate,
+                "leaving a waiting room is local and must not terminate a call scope"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_call_link_after_relayless_admission_terminates_the_call_scope() {
+        let call_id = "RELAYLESS-ADMISSION";
+        let (client, _transport, start, own_lid, creator, generation) =
+            start_waiting_room_call_link(call_id).await;
         let mut participant =
             GroupCallParticipant::new(own_lid.to_non_ad(), vec![GroupCallDevice::new(own_lid)]);
         participant.state = Some("connected".to_string());
@@ -6903,6 +6986,53 @@ mod tests {
             .expect("terminate stanza");
         let terminate_ref = terminate.as_node_ref();
         let action = &terminate_ref.children().expect("terminate action")[0];
+        assert_eq!(action.tag.as_ref(), "terminate");
+        assert_eq!(
+            action.attrs().optional_string("call-id").as_deref(),
+            Some(call_id)
+        );
+        assert_eq!(client.call_registry().generation_of(call_id), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relayless_call_link_admission_times_out_and_terminates() {
+        let call_id = "RELAYLESS-TIMEOUT";
+        let (client, _transport, start, own_lid, creator, generation) =
+            start_waiting_room_call_link(call_id).await;
+        let mut participant =
+            GroupCallParticipant::new(own_lid.to_non_ad(), vec![GroupCallDevice::new(own_lid)]);
+        participant.state = Some("connected".to_string());
+        assert_eq!(
+            client.call_registry().apply_group_update(
+                GroupCallUpdate::builder()
+                    .call_id(call_id.to_string())
+                    .call_creator(creator)
+                    .transaction_id(2)
+                    .media("audio".to_string())
+                    .connected_limit(32)
+                    .joinable(true)
+                    .av_upgradable(true)
+                    .rekey_requested(false)
+                    .participants(vec![participant])
+                    .build(),
+            ),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, generation),
+            Some(CallPhase::Connecting)
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let terminate_sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        tokio::time::advance(OFFER_ACK_RELAY_TIMEOUT).await;
+        let result = start.await.expect("call-link setup task");
+        assert!(matches!(result, Err(CallError::ResponseTimeout)));
+        let terminate = terminate_sent.await.expect("timeout terminate stanza");
+        let terminate = terminate.as_node_ref();
+        let action = &terminate.children().expect("terminate action")[0];
         assert_eq!(action.tag.as_ref(), "terminate");
         assert_eq!(
             action.attrs().optional_string("call-id").as_deref(),

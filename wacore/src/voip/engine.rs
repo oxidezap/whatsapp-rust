@@ -473,6 +473,8 @@ pub enum CallEvent {
     RelayAllocateFailed(u16),
     /// The relay never acked the allocate within the deadline (wedged relay). Terminal.
     RelayAllocateTimedOut,
+    /// Replacing a migrated relay transport did not finish within the reconnect deadline.
+    RelayReconnectTimedOut,
     /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
     /// Pushed by the signaling handler, not the engine; surfaced here so one event stream carries
     /// the whole call. For an upgrade request, pass `upgrade_token` to `accept_video`; a cancelled
@@ -582,6 +584,7 @@ impl CallEvent {
             Self::RelayAllocated
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut
+            | Self::RelayReconnectTimedOut
             | Self::VideoStateChanged { .. }
             | Self::WaitingRoomHeartbeatFailed
             | Self::GroupControlRejected { .. }
@@ -715,6 +718,7 @@ fn make_video_plane(
 
 struct GroupEngineState {
     registry: GroupMediaRegistry,
+    local_device: Jid,
     local_epoch_transaction: Option<u32>,
     required_epoch_transaction: Option<u32>,
     direct_fallback_active: bool,
@@ -963,7 +967,7 @@ impl CallEngine {
         now: Millis,
         config: GroupEngineConfig,
     ) -> Result<(), EngineError> {
-        if !group_roster_contains_participant(&config.initial_update, &self.self_participant_id) {
+        if !group_roster_contains_participant(&config.initial_update, &config.self_jid) {
             return Err(GroupMediaError::LocalParticipantRemoved.into());
         }
         // Validate relay material before constructing or publishing group state. In particular, a
@@ -1035,6 +1039,7 @@ impl CallEngine {
         ];
         let mut group = GroupEngineState {
             registry,
+            local_device: config.self_jid,
             local_epoch_transaction: None,
             required_epoch_transaction: config
                 .initial_update
@@ -1137,7 +1142,12 @@ impl CallEngine {
             .registry
             .apply_group_update(update)?;
         if result == GroupRosterApply::Applied {
-            if !group_roster_contains_participant(update, &self.self_participant_id) {
+            let local_device = &self
+                .group
+                .as_ref()
+                .ok_or(GroupMediaError::Pipeline)?
+                .local_device;
+            if !group_roster_contains_participant(update, local_device) {
                 // A full replacement roster that removes this endpoint is authoritative teardown.
                 // Mark the engine inert before returning the fatal control result so no caller that
                 // observes the error can continue capturing or protecting media.
@@ -2490,20 +2500,17 @@ fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec
     pids
 }
 
-fn group_roster_contains_participant(update: &GroupCallUpdate, participant_id: &str) -> bool {
-    let Ok(local_device) = participant_id.parse::<Jid>() else {
-        return false;
-    };
+fn group_roster_contains_participant(update: &GroupCallUpdate, local_device: &Jid) -> bool {
     update
         .participants
         .iter()
         .filter(|participant| participant.is_connected())
         .any(|participant| {
-            let owns_local_user = participant.jid.is_same_user_as(&local_device)
+            let owns_local_user = participant.jid.is_same_user_as(local_device)
                 || participant
                     .pn
                     .as_ref()
-                    .is_some_and(|pn| pn.is_same_user_as(&local_device));
+                    .is_some_and(|pn| pn.is_same_user_as(local_device));
             owns_local_user
                 && participant.devices.iter().any(|device| {
                     device.jid.device == local_device.device
@@ -2779,6 +2786,8 @@ mod encoded_tests {
             &relay,
         )
         .expect("group config");
+        let mut config = config;
+        config.audio = AudioConfig::encoded(AudioFormat::OPUS_16KHZ_60MS);
         let mut engine = CallEngine::new(config, Box::new(SequentialTxIds::new())).expect("engine");
 
         engine

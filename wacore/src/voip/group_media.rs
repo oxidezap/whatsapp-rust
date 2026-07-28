@@ -240,9 +240,7 @@ impl GroupMediaRegistry {
                 let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
                 self.receivers
                     .get(&participant_id)
-                    .filter(|receiver| {
-                        receiver.pid.is_some() && device.pid.is_some() && receiver.pid != device.pid
-                    })
+                    .filter(|receiver| pid_migrated(receiver.pid, device.pid))
                     .map(|_| participant_id)
             })
             .collect()
@@ -299,7 +297,7 @@ impl GroupMediaRegistry {
         for (participant, device) in active {
             let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
             let mut receiver = if let Some(mut existing) = previous.remove(&participant_id) {
-                if existing.pid.is_some() && existing.pid != device.pid {
+                if pid_migrated(existing.pid, device.pid) {
                     // A PID identifies one relay media session. Reusing its authenticated ROC,
                     // replay, and depacketizer state across a PID migration can reject the new
                     // stream's first packets or combine fragments from two different sessions.
@@ -721,6 +719,10 @@ impl GroupMediaRegistry {
         }
         validate_group_media_snapshot(update)
     }
+}
+
+fn pid_migrated(existing: Option<u32>, incoming: Option<u32>) -> bool {
+    existing.is_some() && existing != incoming
 }
 
 pub(crate) fn validate_group_media_snapshot(
@@ -1259,5 +1261,14 @@ mod tests {
             assert_eq!(decoded.device_jid, *peer);
             assert_eq!(decoded.access_units, [access_unit.to_vec()]);
         }
+    }
+
+    #[test]
+    fn pid_migration_rule_is_shared_by_receiver_and_mixer_updates() {
+        assert!(!pid_migrated(None, None));
+        assert!(!pid_migrated(None, Some(7)));
+        assert!(!pid_migrated(Some(7), Some(7)));
+        assert!(pid_migrated(Some(7), Some(8)));
+        assert!(pid_migrated(Some(7), None));
     }
 }

@@ -25,7 +25,8 @@ use super::call::{
 };
 
 const MAX_RELAY_TOKENS: usize = 64;
-const MAX_WAITING_ROOM_USERS: usize = GROUP_CALL_MAX_PARTICIPANTS;
+// Call links may queue more users for approval than the 32 endpoints that can be connected at once.
+const MAX_WAITING_ROOM_USERS: usize = 128;
 const MAX_WAITING_ROOM_RETAINED_BYTES: usize = 1024 * 1024;
 
 // Group signaling is control-plane traffic. Marking its entry points cold keeps fat LTO from
@@ -2068,6 +2069,15 @@ mod tests {
                 .collect(),
         );
         assert!(parse_waiting_room_update(&too_many.as_node_ref()).is_err());
+        let at_limit = room(
+            (0..MAX_WAITING_ROOM_USERS)
+                .map(|index| user(index, "pending".to_string()))
+                .collect(),
+        );
+        assert!(
+            parse_waiting_room_update(&at_limit.as_node_ref()).is_ok(),
+            "the waiting-room cap is larger than the connected-call roster cap"
+        );
 
         let oversized = room(vec![user(
             1,

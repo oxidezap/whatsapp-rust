@@ -650,6 +650,54 @@ impl CallRegistry {
         }
         let (applied, waiting_room_task, video_teardown, event) = {
             let mut map = self.inner.lock().expect("registry lock poisoned");
+            if let Some(entry) = map
+                .get(&update.call_id)
+                .filter(|entry| generation.is_none_or(|current| entry.generation == current))
+                .filter(|entry| entry.is_group_call && entry.session.phase() == CallPhase::Ringing)
+            {
+                use crate::stats::HeapSize;
+
+                let mut preview = entry.group.clone().unwrap_or_else(|| {
+                    GroupCallState::new(
+                        entry.session.call_id.clone(),
+                        entry.session.call_creator.clone(),
+                    )
+                });
+                if preview.apply_update(update.clone()) == GroupStateApply::Applied {
+                    let mut preview_session = entry.session.clone();
+                    preview_session.group = preview.snapshot().cloned();
+                    let current_state_bytes = entry
+                        .group
+                        .as_ref()
+                        .map_or(0, HeapSize::heap_bytes)
+                        .saturating_add(entry.session.heap_bytes());
+                    let preview_state_bytes = preview
+                        .heap_bytes()
+                        .saturating_add(preview_session.heap_bytes());
+                    let prospective_entry_bytes = entry
+                        .retained_bytes(&update.call_id)
+                        .saturating_sub(current_state_bytes)
+                        .saturating_add(preview_state_bytes);
+                    let ringing_group_bytes = map
+                        .iter()
+                        .filter(|(_, candidate)| {
+                            candidate.is_group_call
+                                && candidate.session.phase() == CallPhase::Ringing
+                        })
+                        .fold(0usize, |bytes, (call_id, candidate)| {
+                            bytes.saturating_add(candidate.retained_bytes(call_id))
+                        });
+                    if ringing_group_bytes
+                        .saturating_sub(entry.retained_bytes(&update.call_id))
+                        .saturating_add(prospective_entry_bytes)
+                        > MAX_RINGING_GROUP_CALL_BYTES
+                    {
+                        // Preserve the transaction watermark so a corrected same-transaction
+                        // snapshot can still be accepted.
+                        return GroupStateApply::InvalidSnapshot;
+                    }
+                }
+            }
             let Some(entry) = map
                 .get_mut(&update.call_id)
                 .filter(|entry| generation.is_none_or(|current| entry.generation == current))
@@ -2986,6 +3034,39 @@ mod tests {
             growing.insert_ringing_group_if_inactive(corrected),
             Ok(Some(generation)),
             "a corrected same-transaction redelivery must remain admissible"
+        );
+
+        let generic = CallRegistry::new();
+        let generic_generation = generic
+            .insert_ringing_group_if_inactive(incoming("GROUP-CALL-GENERIC"))
+            .expect("valid initial offer")
+            .expect("offer registers");
+        let mut oversized_update = incoming("GROUP-CALL-GENERIC")
+            .group
+            .expect("group snapshot");
+        oversized_update.transaction_id = 2;
+        let mut relay = group_relay(2);
+        relay.tokens = vec![vec![9; MAX_RINGING_GROUP_CALL_BYTES]];
+        oversized_update.relay = Some(relay);
+        assert_eq!(
+            generic.apply_group_update_if_current(oversized_update, generic_generation),
+            GroupStateApply::InvalidSnapshot,
+            "generic signaling updates must not bypass the ringing aggregate byte budget"
+        );
+        assert_eq!(
+            generic
+                .group_state("GROUP-CALL-GENERIC")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(1)
+        );
+        let mut corrected = incoming("GROUP-CALL-GENERIC")
+            .group
+            .expect("group snapshot");
+        corrected.transaction_id = 2;
+        assert_eq!(
+            generic.apply_group_update_if_current(corrected, generic_generation),
+            GroupStateApply::Applied,
+            "a corrected same-transaction generic update must remain admissible"
         );
     }
 

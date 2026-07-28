@@ -264,7 +264,7 @@ impl VideoControlSender {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "voip-mlow"))]
     pub(crate) fn retained_len(&self) -> usize {
         self.state
             .len()
@@ -650,10 +650,21 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
         CallEvent::RelayAllocated
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
+            | CallEvent::RelayReconnectTimedOut
     ) {
         let _ = events.force_send(event);
     } else {
         let _ = events.try_send(event);
+    }
+}
+
+async fn disconnect_relay_bounded(rt: &dyn Runtime, transport: &dyn RelayTransport) {
+    let disconnect = transport.disconnect().fuse();
+    let timeout = rt.sleep(RELAY_RECONNECT_TIMEOUT).fuse();
+    futures::pin_mut!(disconnect, timeout);
+    futures::select_biased! {
+        () = disconnect => {},
+        () = timeout => {},
     }
 }
 
@@ -989,14 +1000,17 @@ async fn run_call_with_clock_and_wallclock(
             futures::pin_mut!(reconnect, timeout);
             let reconnect_result = futures::select_biased! {
                 result = reconnect => result,
-                () = timeout => break 'drive,
+                () = timeout => {
+                    publish_engine_event(&channels.events, CallEvent::RelayReconnectTimedOut);
+                    break 'drive;
+                },
             };
             let Ok((replacement, replacement_events)) = reconnect_result else {
                 break 'drive;
             };
             let retired = std::mem::replace(&mut transport, replacement);
             relay_events = replacement_events;
-            retired.disconnect().await;
+            disconnect_relay_bounded(&*rt, &*retired).await;
             eng.relay_reconnected(now_ms());
         }
 
@@ -1496,6 +1510,23 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct HangingDisconnectTransport {
+        disconnects: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RelayTransport for HangingDisconnectTransport {
+        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+            futures::future::pending().await
+        }
+    }
+
     #[async_trait]
     impl RelayTransport for ReconnectTransport {
         async fn send(&self, data: Bytes) -> anyhow::Result<()> {
@@ -1544,6 +1575,7 @@ mod tests {
             CallEvent::RelayAllocated,
             CallEvent::RelayAllocateFailed(486),
             CallEvent::RelayAllocateTimedOut,
+            CallEvent::RelayReconnectTimedOut,
         ] {
             let (tx, rx) = async_channel::bounded(1);
             tx.try_send(CallEvent::GroupControlRejected {
@@ -1843,7 +1875,7 @@ mod tests {
         let (_initial_tx, initial_rx) = async_channel::unbounded();
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded();
-        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
         let (group_tx, group_rx) = async_channel::bounded(1);
         group_tx
             .try_send(GroupControl::Update(Box::new(group_update(
@@ -1865,9 +1897,28 @@ mod tests {
 
         assert_eq!(transport.reconnects.load(Ordering::Relaxed), 1);
         assert_eq!(
+            ev_rx.try_recv(),
+            Ok(CallEvent::RelayReconnectTimedOut),
+            "the application must learn why relay migration ended the call"
+        );
+        assert_eq!(
             transport.disconnects.load(Ordering::Relaxed),
             1,
             "the timed-out driver must tear down the original transport"
+        );
+    }
+
+    #[test]
+    fn group_relay_migration_bounds_retired_transport_disconnect() {
+        let transport = HangingDisconnectTransport::default();
+        futures::executor::block_on(disconnect_relay_bounded(
+            &ReconnectTimeoutRuntime,
+            &transport,
+        ));
+        assert_eq!(
+            transport.disconnects.load(Ordering::Relaxed),
+            1,
+            "the retired transport cleanup must be attempted without parking the driver"
         );
     }
 
