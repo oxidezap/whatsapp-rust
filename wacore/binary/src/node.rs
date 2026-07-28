@@ -1048,6 +1048,41 @@ mod owned_node_ref_tests {
     }
 
     #[test]
+    fn yoked_attrs_ref_survives_make_transform_and_mutation() {
+        // `NodeRef`'s derived `Yokeable` transmutes the whole struct in one go,
+        // so yoking a node never calls `AttrsRef`'s hand-written impl — that one
+        // is there to satisfy the derive's bound on the field. Reaching its
+        // three methods takes a yoke of `AttrsRef` itself, and it is the only
+        // way to put our own transmutes, rather than yoke's generated ones, in
+        // front of the interpreter.
+        let cart = BytesCart(Bytes::from_static(b"idabc"));
+        let mut yoke: Yoke<AttrsRef<'static>, BytesCart> = Yoke::attach_to_cart(cart, |buf| {
+            // Borrowed from the cart, which is what makes the transmutes load-bearing.
+            let (key, value) = buf.split_at(2);
+            AttrsRef::from_vec(vec![(
+                NodeStr::Borrowed(std::str::from_utf8(key).expect("ascii")),
+                ValueRef::String(NodeStr::Borrowed(
+                    std::str::from_utf8(value).expect("ascii"),
+                )),
+            )])
+        });
+
+        // `make` ran on attach; `transform` runs here.
+        let (key, value) = &yoke.get().as_slice()[0];
+        assert!(*key == "id");
+        assert!(*value == "abc");
+
+        // `transform_mut`, which nothing in the workspace calls.
+        yoke.with_mut(|attrs| {
+            *attrs = AttrsRef::from_vec(vec![(
+                NodeStr::Owned("k".into()),
+                ValueRef::String(NodeStr::Owned("v".into())),
+            )]);
+        });
+        assert!(yoke.get().as_slice()[0].1 == "v");
+    }
+
+    #[test]
     fn slice_bytes_views_the_backing_buffer_without_copying() {
         let owned = OwnedNodeRef::new(encoded(&sample())).unwrap();
         let content = owned.content_bytes().unwrap();
