@@ -2983,7 +2983,12 @@ fn current_group_invite_offer_context(
                     "invite target already belongs to the call",
                 ));
             }
-            snapshot.participants.clone()
+            snapshot
+                .participants
+                .iter()
+                .filter(|participant| participant.state.as_deref() == Some("connected"))
+                .cloned()
+                .collect()
         };
         return Ok((participants, snapshot.media == "video"));
     }
@@ -4082,6 +4087,50 @@ mod tests {
             ))
         ));
         registry.remove_if_current("GROUP-CALL", generation);
+    }
+
+    #[test]
+    fn new_group_invite_context_excludes_disconnected_members() {
+        let registry = wacore::voip::CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let connected = Jid::new("222222222222222", Server::Lid);
+        let disconnected = Jid::new("333333333333333", Server::Lid);
+        let target = Jid::new("444444444444444", Server::Lid);
+        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+            "GROUP-CALL",
+            Jid::new("GROUP-CALL", Server::Call),
+            creator.clone(),
+        ));
+        let participant = |jid: Jid, state: &str| {
+            let mut participant = GroupCallParticipant::new(jid, Vec::new());
+            participant.state = Some(state.to_string());
+            participant
+        };
+        let snapshot = GroupCallUpdate::builder()
+            .call_id("GROUP-CALL".to_string())
+            .call_creator(creator)
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![
+                participant(connected.clone(), "connected"),
+                participant(disconnected, "disconnected"),
+            ])
+            .build();
+        assert_eq!(
+            registry.apply_group_update_if_current(snapshot, generation),
+            wacore::voip::GroupStateApply::Applied
+        );
+
+        let (participants, video) =
+            current_group_invite_offer_context(&registry, "GROUP-CALL", generation, &target, false)
+                .expect("new target can be invited");
+        assert!(!video);
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].jid, connected);
     }
 
     #[test]

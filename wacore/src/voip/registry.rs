@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::{size_of, size_of_val};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_lock::Mutex as AsyncMutex;
 use portable_atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -30,6 +31,9 @@ const MAX_PENDING_INITIAL_GROUP_CONTROLS: usize = 64;
 /// Bootstrap controls only bridge the short offer-registration race. One MiB leaves ample room for
 /// a legitimate full roster plus rekey while bounding unauthenticated call-id retention.
 const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
+/// Match the call-service offer ACK horizon so abandoned prospective identities cannot reserve the
+/// global buffer indefinitely, while controls from an in-flight offer still survive reordering.
+const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
 const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
 
@@ -322,6 +326,11 @@ fn routed_call_sender(call: &IncomingCall) -> &Jid {
     call.participant.as_ref().unwrap_or(&call.from)
 }
 
+struct PendingInitialGroupControl {
+    call: IncomingCall,
+    expires_at: crate::time::Instant,
+}
+
 fn pending_initial_group_control_heap_bytes(call: &IncomingCall) -> usize {
     use crate::stats::HeapSize;
 
@@ -349,7 +358,8 @@ fn pending_initial_group_control_heap_bytes(call: &IncomingCall) -> usize {
 }
 
 fn pending_initial_group_control_retained_bytes(call: &IncomingCall) -> usize {
-    size_of::<IncomingCall>().saturating_add(pending_initial_group_control_heap_bytes(call))
+    size_of::<PendingInitialGroupControl>()
+        .saturating_add(pending_initial_group_control_heap_bytes(call))
 }
 
 fn pending_initial_group_control_matches(
@@ -368,7 +378,7 @@ pub struct CallRegistry {
     next_gen: AtomicU64,
     /// Creator-authenticated controls that overtook their initial group offer. A bounded value
     /// queue avoids retaining one task per fabricated call id while preserving the real offer race.
-    pending_initial_group_controls: Mutex<VecDeque<IncomingCall>>,
+    pending_initial_group_controls: Mutex<VecDeque<PendingInitialGroupControl>>,
     /// Wakes controls that arrived just before the corresponding offer registered its generation.
     registration_event: Arc<event_listener::Event>,
     /// Incoming offers we've rung but not yet answered, keyed by call-id. Mirrors WA Web's
@@ -401,13 +411,15 @@ impl CallRegistry {
             (map.len(), bytes)
         };
         let (pending_entries, pending_bytes) = {
-            let pending = self
+            let mut pending = self
                 .pending_initial_group_controls
                 .lock()
                 .expect("registry lock poisoned");
+            let now = crate::time::Instant::now();
+            pending.retain(|queued| queued.expires_at > now);
             let bytes = pending
                 .iter()
-                .map(pending_initial_group_control_retained_bytes)
+                .map(|queued| pending_initial_group_control_retained_bytes(&queued.call))
                 .sum::<usize>();
             (pending.len(), bytes)
         };
@@ -451,6 +463,8 @@ impl CallRegistry {
             .pending_initial_group_controls
             .lock()
             .expect("registry lock poisoned");
+        let now = crate::time::Instant::now();
+        pending.retain(|queued| queued.expires_at > now);
         if self
             .inner
             .lock()
@@ -461,9 +475,9 @@ impl CallRegistry {
         }
         if !call.stanza_id.is_empty()
             && pending.iter().any(|queued| {
-                queued.stanza_id == call.stanza_id
+                queued.call.stanza_id == call.stanza_id
                     && pending_initial_group_control_matches(
-                        queued,
+                        &queued.call,
                         call.action.call_id(),
                         call.action.call_creator(),
                     )
@@ -477,7 +491,7 @@ impl CallRegistry {
         }
         let mut pending_bytes = pending
             .iter()
-            .map(pending_initial_group_control_retained_bytes)
+            .map(|queued| pending_initial_group_control_retained_bytes(&queued.call))
             .sum::<usize>();
         // A control may replace older state for its own prospective call, but unrelated traffic
         // cannot make room by discarding a roster or epoch that already won the bounded race.
@@ -485,7 +499,7 @@ impl CallRegistry {
             .iter()
             .filter(|queued| {
                 pending_initial_group_control_matches(
-                    queued,
+                    &queued.call,
                     call.action.call_id(),
                     call.action.call_creator(),
                 )
@@ -493,7 +507,8 @@ impl CallRegistry {
             .fold((0usize, 0usize), |(entries, bytes), queued| {
                 (
                     entries.saturating_add(1),
-                    bytes.saturating_add(pending_initial_group_control_retained_bytes(queued)),
+                    bytes
+                        .saturating_add(pending_initial_group_control_retained_bytes(&queued.call)),
                 )
             });
         if pending.len().saturating_sub(matching_entries) >= MAX_PENDING_INITIAL_GROUP_CONTROLS
@@ -512,7 +527,7 @@ impl CallRegistry {
                 .iter()
                 .position(|queued| {
                     pending_initial_group_control_matches(
-                        queued,
+                        &queued.call,
                         call.action.call_id(),
                         call.action.call_creator(),
                     )
@@ -522,9 +537,12 @@ impl CallRegistry {
                 .remove(index)
                 .expect("matching pending control must remain present");
             pending_bytes = pending_bytes
-                .saturating_sub(pending_initial_group_control_retained_bytes(&evicted));
+                .saturating_sub(pending_initial_group_control_retained_bytes(&evicted.call));
         }
-        pending.push_back(call);
+        pending.push_back(PendingInitialGroupControl {
+            call,
+            expires_at: now + PENDING_INITIAL_GROUP_CONTROL_TTL,
+        });
         true
     }
 
@@ -539,14 +557,17 @@ impl CallRegistry {
             .pending_initial_group_controls
             .lock()
             .expect("registry lock poisoned");
+        let now = crate::time::Instant::now();
+        pending.retain(|queued| queued.expires_at > now);
         let mut retained = VecDeque::with_capacity(pending.len());
         let mut matched = Vec::new();
-        while let Some(call) = pending.pop_front() {
-            if call.action.call_id() == call_id && call.action.call_creator().to_non_ad() == creator
+        while let Some(queued) = pending.pop_front() {
+            if queued.call.action.call_id() == call_id
+                && queued.call.action.call_creator().to_non_ad() == creator
             {
-                matched.push(call);
+                matched.push(queued.call);
             } else {
-                retained.push_back(call);
+                retained.push_back(queued);
             }
         }
         *pending = retained;
@@ -2421,6 +2442,41 @@ mod tests {
         let retained = reg.take_initial_group_controls("PROTECTED-GROUP", &creator);
         assert_eq!(retained.len(), 1);
         assert!(matches!(retained[0].action, CallAction::EncRekey { .. }));
+    }
+
+    #[test]
+    fn expired_pre_offer_controls_release_capacity_for_new_identity() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        for index in 0..MAX_PENDING_INITIAL_GROUP_CONTROLS {
+            assert!(reg.buffer_initial_group_control(initial_group_update(
+                &format!("STALE-GROUP-{index}"),
+                &format!("STALE-STANZA-{index}"),
+                creator.clone().with_device(1),
+            )));
+        }
+        reg.pending_initial_group_controls
+            .lock()
+            .expect("registry lock poisoned")
+            .front_mut()
+            .expect("one retained control")
+            .expires_at = crate::time::Instant::ZERO;
+
+        assert!(reg.buffer_initial_group_control(initial_group_update(
+            "LEGITIMATE-GROUP",
+            "LEGITIMATE-STANZA",
+            creator.clone().with_device(1),
+        )));
+        assert!(
+            reg.take_initial_group_controls("STALE-GROUP-0", &creator)
+                .is_empty(),
+            "expired reservations must be removed before capacity is evaluated"
+        );
+        assert_eq!(
+            reg.take_initial_group_controls("LEGITIMATE-GROUP", &creator)
+                .len(),
+            1
+        );
     }
 
     fn group_relay(transaction_id: u32) -> GroupCallRelay {

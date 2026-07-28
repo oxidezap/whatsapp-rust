@@ -158,11 +158,11 @@ fn parse_media_offer(
                 return None;
             }
             let capability_version = match capability.get_attr("ver") {
-                None => Some(1),
-                Some(version) => version.as_str().parse::<u32>().ok(),
+                None => 1,
+                Some(version) => version.as_str().parse::<u32>().ok()?,
             };
             let mut device = GroupCallDevice::new(peer.clone());
-            device.capability_version = capability_version;
+            device.capability_version = Some(capability_version);
             device.capability = bytes;
             Some(device)
         });
@@ -1038,7 +1038,9 @@ mod tests {
     }
 
     #[cfg(feature = "voip")]
-    fn parsed_peer_capability_version(version: Option<&str>) -> Option<u32> {
+    fn parsed_peer_capability(
+        version: Option<&str>,
+    ) -> Option<crate::types::group_call::GroupCallDevice> {
         let mut capability = NodeBuilder::new("capability").bytes(CAPABILITY_OFFER.to_vec());
         if let Some(version) = version {
             capability = capability.attr("ver", version);
@@ -1065,17 +1067,24 @@ mod tests {
             .media
             .expect("media offer")
             .peer_device
-            .expect("peer capability")
-            .capability_version
     }
 
     #[cfg(feature = "voip")]
     #[test]
     fn capability_version_defaults_only_when_absent() {
-        assert_eq!(parsed_peer_capability_version(None), Some(1));
-        assert_eq!(parsed_peer_capability_version(Some("7")), Some(7));
-        assert_eq!(parsed_peer_capability_version(Some("invalid")), None);
-        assert_eq!(parsed_peer_capability_version(Some("4294967296")), None);
+        assert_eq!(
+            parsed_peer_capability(None).and_then(|device| device.capability_version),
+            Some(1)
+        );
+        assert_eq!(
+            parsed_peer_capability(Some("7")).and_then(|device| device.capability_version),
+            Some(7)
+        );
+        assert!(
+            parsed_peer_capability(Some("invalid")).is_none(),
+            "an explicitly malformed version must discard the entire capability"
+        );
+        assert!(parsed_peer_capability(Some("4294967296")).is_none());
     }
 
     // An offer carrying an <enc> (the encrypted callKey) and a <relay> must surface both on
