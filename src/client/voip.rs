@@ -89,6 +89,7 @@ enum PendingCallLinkTransition {
         raw_epoch: Zeroizing<Vec<u8>>,
     },
     Terminated,
+    Saturated,
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -125,7 +126,7 @@ impl PendingCallLinkTransition {
             Self::Group(update) => Self::group_heap_bytes(update),
             Self::WaitingRoom(room) => Self::waiting_room_heap_bytes(room),
             Self::RawEpoch { raw_epoch, .. } => raw_epoch.capacity(),
-            Self::Terminated => 0,
+            Self::Terminated | Self::Saturated => 0,
         }
     }
 }
@@ -134,7 +135,6 @@ impl PendingCallLinkTransition {
 #[derive(Default)]
 pub(super) struct PendingCallLinkJoins {
     active: usize,
-    saturated: bool,
     transitions: std::collections::HashMap<String, Vec<PendingCallLinkTransition>>,
 }
 
@@ -160,6 +160,27 @@ impl PendingCallLinkJoins {
             .saturating_add(new_key_bytes.try_into().unwrap_or(u64::MAX))
             .saturating_add(structural_reserve.try_into().unwrap_or(u64::MAX))
             <= MAX_PENDING_CALL_LINK_TRANSITION_BYTES as u64
+    }
+
+    fn is_saturated(&self, call_id: &str) -> bool {
+        self.transitions.get(call_id).is_some_and(|transitions| {
+            transitions
+                .iter()
+                .any(|transition| matches!(transition, PendingCallLinkTransition::Saturated))
+        })
+    }
+
+    fn mark_saturated(&mut self, call_id: &str) {
+        // Saturation belongs to the call whose transition could not be retained. An unrelated
+        // creator-authenticated control must not poison the one unknown call-link join that owns
+        // this bounded buffer.
+        self.transitions.remove(call_id);
+        if self.can_buffer_transition(call_id, 0) {
+            self.transitions.insert(
+                call_id.to_string(),
+                vec![PendingCallLinkTransition::Saturated],
+            );
+        }
     }
 
     pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
@@ -204,7 +225,6 @@ impl Drop for PendingCallLinkJoinGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.active = state.active.saturating_sub(1);
         if state.active == 0 {
-            state.saturated = false;
             state.transitions.clear();
         }
     }
@@ -305,7 +325,7 @@ impl Client {
         {
             return PendingCallLinkBuffer::NotPending;
         }
-        if state.saturated {
+        if state.is_saturated(&update.call_id) {
             return PendingCallLinkBuffer::Saturated;
         }
         if state
@@ -318,7 +338,8 @@ impl Client {
                 PendingCallLinkTransition::Group(update) => Some(update.transaction_id),
                 PendingCallLinkTransition::WaitingRoom(_)
                 | PendingCallLinkTransition::RawEpoch { .. }
-                | PendingCallLinkTransition::Terminated => None,
+                | PendingCallLinkTransition::Terminated
+                | PendingCallLinkTransition::Saturated => None,
             })
             .is_some_and(|transaction_id| transaction_id >= update.transaction_id)
         {
@@ -328,7 +349,7 @@ impl Client {
             &update.call_id,
             PendingCallLinkTransition::group_heap_bytes(update),
         ) {
-            state.saturated = true;
+            state.mark_saturated(&update.call_id);
             return PendingCallLinkBuffer::Saturated;
         }
         state
@@ -360,7 +381,7 @@ impl Client {
         {
             return PendingCallLinkBuffer::NotPending;
         }
-        if state.saturated {
+        if state.is_saturated(call_id) {
             return PendingCallLinkBuffer::Saturated;
         }
         if state
@@ -378,7 +399,7 @@ impl Client {
             return PendingCallLinkBuffer::Buffered;
         }
         if !state.can_buffer_transition(call_id, raw_epoch.capacity()) {
-            state.saturated = true;
+            state.mark_saturated(call_id);
             return PendingCallLinkBuffer::Saturated;
         }
         state
@@ -411,7 +432,7 @@ impl Client {
         {
             return PendingCallLinkBuffer::NotPending;
         }
-        if state.saturated {
+        if state.is_saturated(call_id) {
             return PendingCallLinkBuffer::Saturated;
         }
         if state
@@ -424,7 +445,7 @@ impl Client {
             return PendingCallLinkBuffer::Buffered;
         }
         if !state.can_buffer_transition(call_id, 0) {
-            state.saturated = true;
+            state.mark_saturated(call_id);
             return PendingCallLinkBuffer::Saturated;
         }
         state
@@ -482,14 +503,14 @@ impl Client {
         {
             return PendingCallLinkBuffer::NotPending;
         }
-        if state.saturated {
+        if state.is_saturated(&room.call_id) {
             return PendingCallLinkBuffer::Saturated;
         }
         if !state.can_buffer_transition(
             &room.call_id,
             PendingCallLinkTransition::waiting_room_heap_bytes(room),
         ) {
-            state.saturated = true;
+            state.mark_saturated(&room.call_id);
             return PendingCallLinkBuffer::Saturated;
         }
         state
@@ -522,14 +543,13 @@ impl Client {
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.saturated {
-            return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
-        }
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
-        if staged
-            .iter()
-            .any(|transition| matches!(transition, PendingCallLinkTransition::Terminated))
-        {
+        if staged.iter().any(|transition| {
+            matches!(
+                transition,
+                PendingCallLinkTransition::Terminated | PendingCallLinkTransition::Saturated
+            )
+        }) {
             return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
         }
         let generation = self.call_registry.insert_call_link_checked(session)?;
@@ -594,6 +614,10 @@ impl Client {
                     }
                 }
                 PendingCallLinkTransition::Terminated => {
+                    self.call_registry.remove_if_current(&call_id, generation);
+                    return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
+                }
+                PendingCallLinkTransition::Saturated => {
                     self.call_registry.remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
@@ -3134,6 +3158,54 @@ mod tests {
             "a saturated join must fail rather than wait forever for a discarded admission"
         );
         assert_eq!(client.call_registry().generation_of(call_id), None);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn unrelated_saturation_does_not_reject_the_valid_call_link_join() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let unrelated_creator = Jid::new("333333333333333", Server::Lid);
+        let unrelated_sender = unrelated_creator.clone().with_device(1);
+        let _pending = client.begin_call_link_join();
+        let oversized = GroupCallUpdate::builder()
+            .call_id("UNRELATED-SATURATED-CALL".to_string())
+            .call_creator(unrelated_creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                unrelated_creator,
+                vec![
+                    GroupCallDevice::new(unrelated_sender.clone())
+                        .with_capability(1, vec![7; MAX_PENDING_CALL_LINK_TRANSITION_BYTES]),
+                ],
+            )])
+            .build();
+        assert_eq!(
+            client.buffer_pending_call_link_update(&oversized, &unrelated_sender),
+            PendingCallLinkBuffer::Saturated
+        );
+
+        let call_id = "VALID-CALL-LINK";
+        let call_creator = Jid::new("444444444444444", Server::Lid);
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), call_creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::WaitingRoom);
+        let generation = client
+            .register_call_link_session(session, None, CallLinkMedia::Audio, "VALID-CALL-LINK")
+            .await
+            .expect("an unrelated saturated control cannot abort the ACK's actual call id");
+        assert!(
+            client.call_registry().is_current(call_id, generation),
+            "the legitimate call-link generation must remain registered"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-runtime")]
