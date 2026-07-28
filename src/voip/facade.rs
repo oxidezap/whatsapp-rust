@@ -2920,6 +2920,62 @@ fn ensure_group_invite_capacity(
     Ok(())
 }
 
+fn current_group_invite_offer_context(
+    registry: &wacore::voip::CallRegistry,
+    call_id: &str,
+    generation: u64,
+    target: &Jid,
+    existing_only: bool,
+) -> Result<(Vec<GroupCallParticipant>, bool), CallError> {
+    if let Some(state) = registry.group_state_if_current(call_id, generation)
+        && let Some(snapshot) = state.snapshot()
+    {
+        let member = snapshot
+            .participants
+            .iter()
+            .find(|participant| participant.jid.to_non_ad() == target.to_non_ad());
+        ensure_group_invite_capacity(snapshot, existing_only)?;
+        let participants = if existing_only {
+            let member =
+                member.ok_or(CallError::Media("ring target does not belong to the call"))?;
+            if member.state.as_deref() == Some("connected") {
+                return Err(CallError::Media("ring target is already connected"));
+            }
+            snapshot
+                .participants
+                .iter()
+                .filter(|participant| {
+                    participant.state.as_deref() == Some("connected")
+                        && participant.jid.to_non_ad() != target.to_non_ad()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            if member.is_some() {
+                return Err(CallError::Media(
+                    "invite target already belongs to the call",
+                ));
+            }
+            snapshot.participants.clone()
+        };
+        return Ok((participants, snapshot.media == "video"));
+    }
+    if existing_only {
+        return Err(CallError::Media(
+            "ring target does not belong to an authoritative group roster",
+        ));
+    }
+    let session = registry
+        .snapshot_if_current(call_id, generation)
+        .ok_or(CallError::Media("call is no longer active"))?;
+    let participants = registry
+        .group_invite_fallback_roster(call_id, generation)
+        .ok_or(CallError::Media(
+            "active device capabilities are not ready for group promotion",
+        ))?;
+    Ok((participants, session.is_video))
+}
+
 impl CallHandle {
     /// The call-id this handle controls.
     pub fn call_id(&self) -> &str {
@@ -2976,59 +3032,14 @@ impl CallHandle {
             .await
             .ok_or(CallError::NoDevices)?
             .to_non_ad();
-        let (participants, video) = if let Some(state) = self
-            .client_registry
-            .group_state_if_current(&self.call_id, self.generation)
-            && let Some(snapshot) = state.snapshot()
-        {
-            let member = snapshot
-                .participants
-                .iter()
-                .find(|participant| participant.jid.to_non_ad() == target);
-            ensure_group_invite_capacity(snapshot, existing_only)?;
-            let participants = if existing_only {
-                let member =
-                    member.ok_or(CallError::Media("ring target does not belong to the call"))?;
-                if member.state.as_deref() == Some("connected") {
-                    return Err(CallError::Media("ring target is already connected"));
-                }
-                snapshot
-                    .participants
-                    .iter()
-                    .filter(|participant| {
-                        participant.state.as_deref() == Some("connected")
-                            && participant.jid.to_non_ad() != target
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else {
-                if member.is_some() {
-                    return Err(CallError::Media(
-                        "invite target already belongs to the call",
-                    ));
-                }
-                snapshot.participants.clone()
-            };
-            (participants, snapshot.media == "video")
-        } else {
-            if existing_only {
-                return Err(CallError::Media(
-                    "ring target does not belong to an authoritative group roster",
-                ));
-            }
-            let session = self
-                .client_registry
-                .snapshot_if_current(&self.call_id, self.generation)
-                .ok_or(CallError::Media("call is no longer active"))?;
-            let participants = self
-                .client_registry
-                .group_invite_fallback_roster(&self.call_id, self.generation)
-                .ok_or(CallError::Media(
-                    "active device capabilities are not ready for group promotion",
-                ))?;
-            (participants, session.is_video)
-        };
-        if participants.is_empty() {
+        let (initial_participants, _) = current_group_invite_offer_context(
+            &self.client_registry,
+            &self.call_id,
+            self.generation,
+            &target,
+            existing_only,
+        )?;
+        if initial_participants.is_empty() {
             return Err(CallError::Media("call has no connected invite roster"));
         }
         let devices = drop_hosted_devices(
@@ -3039,6 +3050,22 @@ impl CallHandle {
         );
         if devices.is_empty() {
             return Err(CallError::NoDevices);
+        }
+        let transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+        let (participants, video) = current_group_invite_offer_context(
+            &self.client_registry,
+            &self.call_id,
+            self.generation,
+            &target,
+            existing_only,
+        )?;
+        if participants.is_empty() {
+            return Err(CallError::Media("call has no connected invite roster"));
         }
         let request_id = client.generate_request_id();
         let node = build_group_invite_offer(&GroupInviteOfferParams {
@@ -3917,6 +3944,98 @@ mod tests {
         ));
         snapshot.connected_limit = 0;
         assert!(ensure_group_invite_capacity(&snapshot, false).is_ok());
+    }
+
+    #[test]
+    fn group_invite_context_revalidates_the_latest_roster_and_media() {
+        let registry = wacore::voip::CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let target = Jid::new("222222222222222", Server::Lid);
+        let connected = Jid::new("333333333333333", Server::Lid);
+        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+            "GROUP-CALL",
+            Jid::new("GROUP-CALL", Server::Call),
+            creator.clone(),
+        ));
+        let participant = |jid: Jid, state: &str| {
+            let mut participant = GroupCallParticipant::new(jid, Vec::new());
+            participant.state = Some(state.to_string());
+            participant
+        };
+        let update = |transaction_id, media: &str, target_state: &str, connected_limit| {
+            GroupCallUpdate::builder()
+                .call_id("GROUP-CALL".to_string())
+                .call_creator(creator.clone())
+                .transaction_id(transaction_id)
+                .media(media.to_string())
+                .connected_limit(connected_limit)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(vec![
+                    participant(connected.clone(), "connected"),
+                    participant(target.clone(), target_state),
+                ])
+                .build()
+        };
+
+        assert_eq!(
+            registry
+                .apply_group_update_if_current(update(1, "audio", "disconnected", 32), generation,),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(
+            !current_group_invite_offer_context(
+                &registry,
+                "GROUP-CALL",
+                generation,
+                &target,
+                true,
+            )
+            .expect("initial disconnected target")
+            .1
+        );
+
+        assert_eq!(
+            registry
+                .apply_group_update_if_current(update(2, "video", "disconnected", 32), generation,),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(
+            current_group_invite_offer_context(&registry, "GROUP-CALL", generation, &target, true,)
+                .expect("latest disconnected target")
+                .1,
+            "a newer roster's video mode must replace the pre-await offer mode"
+        );
+
+        assert_eq!(
+            registry
+                .apply_group_update_if_current(update(3, "video", "connected", 32), generation,),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(matches!(
+            current_group_invite_offer_context(&registry, "GROUP-CALL", generation, &target, true,),
+            Err(CallError::Media("ring target is already connected"))
+        ));
+
+        assert_eq!(
+            registry
+                .apply_group_update_if_current(update(4, "video", "disconnected", 1), generation,),
+            wacore::voip::GroupStateApply::Applied
+        );
+        assert!(matches!(
+            current_group_invite_offer_context(
+                &registry,
+                "GROUP-CALL",
+                generation,
+                &Jid::new("444444444444444", Server::Lid),
+                false,
+            ),
+            Err(CallError::Media(
+                "group connected-participant limit reached"
+            ))
+        ));
+        registry.remove_if_current("GROUP-CALL", generation);
     }
 
     #[test]

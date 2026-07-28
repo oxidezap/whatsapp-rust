@@ -26,7 +26,7 @@ use wacore::types::call::{CallAction, VideoState};
 #[cfg(feature = "voip-runtime")]
 use wacore::types::group_call::{
     CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallUpdate, ScreenShare,
-    ScreenShareState,
+    ScreenShareState, WaitingRoom,
 };
 #[cfg(feature = "voip-runtime")]
 use wacore::voip::{AudioFormat, CallEvent, CallPhase, CallSession, VideoControl};
@@ -75,29 +75,61 @@ enum WaitingRoomUserAction {
 }
 
 #[cfg(feature = "voip-runtime")]
+enum PendingCallLinkTransition {
+    Group(Box<GroupCallUpdate>),
+    WaitingRoom(WaitingRoom),
+}
+
+#[cfg(feature = "voip-runtime")]
+impl PendingCallLinkTransition {
+    fn heap_bytes(&self) -> usize {
+        use wacore::stats::HeapSize;
+
+        match self {
+            Self::Group(update) => size_of::<GroupCallUpdate>() + update.heap_bytes(),
+            Self::WaitingRoom(room) => room.heap_bytes(),
+        }
+    }
+}
+
+#[cfg(feature = "voip-runtime")]
 #[derive(Default)]
 pub(super) struct PendingCallLinkJoins {
     active: usize,
-    updates: std::collections::HashMap<String, GroupCallUpdate>,
+    transitions: std::collections::HashMap<String, Vec<PendingCallLinkTransition>>,
 }
 
 #[cfg(feature = "voip-runtime")]
 impl PendingCallLinkJoins {
+    fn can_buffer_transition(&self) -> bool {
+        const MAX_BUFFERED_TRANSITIONS: usize = 32;
+
+        self.transitions.values().map(Vec::len).sum::<usize>() < MAX_BUFFERED_TRANSITIONS
+    }
+
     pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
         use wacore::stats::HeapSize;
 
         let bytes = self
-            .updates
+            .transitions
             .iter()
-            .map(|(call_id, update)| {
+            .map(|(call_id, transitions)| {
                 size_of::<String>()
                     + call_id.heap_bytes()
-                    + size_of::<GroupCallUpdate>()
-                    + update.heap_bytes()
+                    + transitions.capacity() * size_of::<PendingCallLinkTransition>()
+                    + transitions
+                        .iter()
+                        .map(PendingCallLinkTransition::heap_bytes)
+                        .sum::<usize>()
             })
             .sum::<usize>();
         wacore::stats::CollectionStats::new(
-            self.updates.len().try_into().unwrap_or(u64::MAX),
+            self.transitions
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+                .try_into()
+                .unwrap_or(u64::MAX),
             bytes.try_into().unwrap_or(u64::MAX),
         )
     }
@@ -117,7 +149,7 @@ impl Drop for PendingCallLinkJoinGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.active = state.active.saturating_sub(1);
         if state.active == 0 {
-            state.updates.clear();
+            state.transitions.clear();
         }
     }
 }
@@ -184,8 +216,6 @@ impl Client {
         update: &GroupCallUpdate,
         sender: &Jid,
     ) -> bool {
-        const MAX_BUFFERED_UPDATES: usize = 32;
-
         let mut state = self
             .pending_call_link_joins
             .lock()
@@ -202,17 +232,57 @@ impl Client {
         {
             return false;
         }
-        if let Some(current) = state.updates.get(&update.call_id)
-            && current.transaction_id >= update.transaction_id
+        if state
+            .transitions
+            .get(&update.call_id)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find_map(|transition| match transition {
+                PendingCallLinkTransition::Group(update) => Some(update.transaction_id),
+                PendingCallLinkTransition::WaitingRoom(_) => None,
+            })
+            .is_some_and(|transaction_id| transaction_id >= update.transaction_id)
         {
             return true;
         }
-        if state.updates.len() >= MAX_BUFFERED_UPDATES
-            && !state.updates.contains_key(&update.call_id)
+        if !state.can_buffer_transition() {
+            return false;
+        }
+        state
+            .transitions
+            .entry(update.call_id.clone())
+            .or_default()
+            .push(PendingCallLinkTransition::Group(Box::new(update.clone())));
+        true
+    }
+
+    /// Buffer a creator-authenticated waiting-room snapshot in the same ordered call-link
+    /// transition stream as admission rosters.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) fn buffer_pending_call_link_waiting_room(
+        &self,
+        room: &WaitingRoom,
+        sender: &Jid,
+    ) -> bool {
+        let mut state = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.call_registry.generation_of(&room.call_id).is_some()
+            || state.active == 0
+            || room.call_id.is_empty()
+            || room.link_token.is_empty()
+            || sender.to_non_ad() != room.call_creator.to_non_ad()
+            || !state.can_buffer_transition()
         {
             return false;
         }
-        state.updates.insert(update.call_id.clone(), update.clone());
+        state
+            .transitions
+            .entry(room.call_id.clone())
+            .or_default()
+            .push(PendingCallLinkTransition::WaitingRoom(room.clone()));
         true
     }
 
@@ -220,23 +290,59 @@ impl Client {
     fn register_call_link_session(
         &self,
         session: CallSession,
+        waiting_room: Option<WaitingRoom>,
         expected_media: CallLinkMedia,
-    ) -> u64 {
+        expected_token: &str,
+    ) -> Result<u64, wacore::voip::GroupStateApply> {
         let call_id = session.call_id.clone();
         let call_creator = session.call_creator.clone();
+        let mut rekey_pending = session
+            .group
+            .as_ref()
+            .is_some_and(|update| update.rekey_requested);
         let mut state = self
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let generation = self.call_registry.insert(session);
-        let staged = state.updates.remove(&call_id).filter(|update| {
-            update.call_creator == call_creator && update.media == expected_media.as_str()
-        });
-        drop(state);
-        if let Some(update) = staged {
-            self.apply_pending_call_link_update(update, generation);
+        let staged = state.transitions.remove(&call_id).unwrap_or_default();
+        let generation = self.call_registry.insert_group_checked(session)?;
+        if let Some(room) = waiting_room {
+            let applied = self
+                .call_registry
+                .apply_waiting_room_if_current(room, generation);
+            if applied != wacore::voip::GroupStateApply::Applied {
+                self.call_registry.remove_if_current(&call_id, generation);
+                return Err(applied);
+            }
         }
-        generation
+        for transition in staged {
+            match transition {
+                PendingCallLinkTransition::Group(update)
+                    if update.call_creator == call_creator
+                        && update.media == expected_media.as_str() =>
+                {
+                    let mut update = *update;
+                    update.rekey_requested |= rekey_pending;
+                    let staged_rekey = update.rekey_requested;
+                    if self.apply_pending_call_link_update(update, generation)
+                        == wacore::voip::GroupStateApply::Applied
+                    {
+                        rekey_pending = staged_rekey;
+                    }
+                }
+                PendingCallLinkTransition::WaitingRoom(room)
+                    if room.call_creator == call_creator
+                        && room.media == expected_media
+                        && room.link_token == expected_token =>
+                {
+                    let _ = self
+                        .call_registry
+                        .apply_waiting_room_if_current(room, generation);
+                }
+                _ => {}
+            }
+        }
+        Ok(generation)
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -596,29 +702,34 @@ impl Voip<'_> {
             CallPhase::Connecting
         });
         let registry = self.client.call_registry();
-        let generation = self.client.register_call_link_session(session, media);
+        let generation = self
+            .client
+            .register_call_link_session(session, join.waiting_room.clone(), media, &token)
+            .map_err(|_| {
+                CallError::Response("call-link admission snapshot was rejected".to_string())
+            })?;
         let mut registration =
             CallLinkRegistrationGuard::new(registry.clone(), &join.call_id, generation);
 
-        if let Some(room) = join.waiting_room.clone() {
-            if registry.apply_waiting_room_if_current(room, generation)
-                != wacore::voip::GroupStateApply::Applied
-            {
-                return Err(CallError::Response(
-                    "call-link waiting-room identity was rejected".to_string(),
-                ));
-            }
-        } else if join.in_waiting_room {
+        if join.in_waiting_room && join.waiting_room.is_none() {
             return Err(CallError::Response(
                 "call-link join omitted its waiting-room state".to_string(),
             ));
         }
 
+        let current_state = registry.group_state_if_current(&join.call_id, generation);
+        if let Some(room) = current_state
+            .as_ref()
+            .and_then(wacore::voip::GroupCallState::waiting_room)
+            .cloned()
+        {
+            join.waiting_room_enabled = room.enabled;
+            join.is_admin = room.is_admin;
+            join.waiting_room = Some(room);
+        }
         let still_waiting =
             registry.phase_if_current(&join.call_id, generation) == Some(CallPhase::WaitingRoom);
-        let current_update = registry
-            .group_state_if_current(&join.call_id, generation)
-            .and_then(|state| state.snapshot().cloned());
+        let current_update = current_state.and_then(|state| state.snapshot().cloned());
         if !still_waiting {
             join.in_waiting_room = false;
             if current_update.is_some() {
@@ -1206,7 +1317,8 @@ mod tests {
     use wacore::types::call::{CallAction, IncomingCall};
     #[cfg(feature = "voip-runtime")]
     use wacore::types::group_call::{
-        CallLinkMedia, GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
+        CallLinkMedia, GroupCallDevice, GroupCallParticipant, GroupCallRelay,
+        GroupCallRelayEndpoint, GroupCallUpdate, ScreenShareState, WaitingRoom,
     };
     #[cfg(feature = "voip-runtime")]
     use wacore::voip::{
@@ -2064,7 +2176,7 @@ mod tests {
         ));
         assert_eq!(
             registry.apply_waiting_room(
-                wacore::types::group_call::WaitingRoom::builder()
+                WaitingRoom::builder()
                     .call_id(call_id.to_string())
                     .call_creator(creator.clone())
                     .link_token("TEST-CALL-LINK".to_string())
@@ -2138,7 +2250,7 @@ mod tests {
             creator.clone(),
         ));
         let room = |transaction_id, enabled| {
-            wacore::types::group_call::WaitingRoom::builder()
+            WaitingRoom::builder()
                 .call_id(call_id.to_string())
                 .call_creator(creator.clone())
                 .link_token("TEST-CALL-LINK".to_string())
@@ -2230,7 +2342,7 @@ mod tests {
             ));
             assert_eq!(
                 registry.apply_waiting_room(
-                    wacore::types::group_call::WaitingRoom::builder()
+                    WaitingRoom::builder()
                         .call_id(call_id.clone())
                         .call_creator(creator.clone())
                         .link_token("TEST-CALL-LINK".to_string())
@@ -2357,7 +2469,9 @@ mod tests {
             CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
         let _ = session.transition_to(CallPhase::Calling);
         let _ = session.transition_to(CallPhase::WaitingRoom);
-        let generation = client.register_call_link_session(session, CallLinkMedia::Audio);
+        let generation = client
+            .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+            .expect("valid buffered admission");
         assert_eq!(
             client.call_registry().phase_if_current(call_id, generation),
             Some(CallPhase::Connecting),
@@ -2383,6 +2497,176 @@ mod tests {
         client
             .call_registry()
             .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn call_link_registration_replays_staged_transitions_in_order() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "ORDERED-CALL-LINK";
+        let participant = GroupCallParticipant::new(
+            creator.clone(),
+            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        );
+        let relay = GroupCallRelay::builder()
+            .transaction_id(8)
+            .self_pid(1)
+            .uuid("TEST-RELAY".to_string())
+            .participant_uuid("TEST-PARTICIPANT".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(vec![7; 32])
+            .tokens(vec![vec![9; 16]])
+            .endpoints(vec![
+                GroupCallRelayEndpoint::builder()
+                    .relay_id(1)
+                    .token_id(0)
+                    .auth_token_id(0)
+                    .relay_name("test-relay".to_string())
+                    .is_fna(false)
+                    .ipv4("203.0.113.7".to_string())
+                    .port(3478)
+                    .build(),
+            ])
+            .build();
+        let first = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(8)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(true)
+            .participants(vec![participant.clone()])
+            .relay(relay)
+            .build();
+        let second = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(9)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .build();
+        let initial_room = WaitingRoom::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .link_token("TEST-CALL-LINK".to_string())
+            .media(CallLinkMedia::Audio)
+            .enabled(true)
+            .is_admin(false)
+            .transaction_id(1)
+            .users(Vec::new())
+            .build();
+        let newer_room = WaitingRoom::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .link_token("TEST-CALL-LINK".to_string())
+            .media(CallLinkMedia::Audio)
+            .enabled(true)
+            .is_admin(true)
+            .transaction_id(2)
+            .users(Vec::new())
+            .build();
+
+        let pending = client.begin_call_link_join();
+        let sender = creator.clone().with_device(1);
+        assert!(client.buffer_pending_call_link_update(&first, &sender));
+        assert!(client.buffer_pending_call_link_waiting_room(&newer_room, &sender));
+        assert!(client.buffer_pending_call_link_update(&second, &sender));
+        assert_eq!(
+            client
+                .memory_report()
+                .await
+                .pending_call_link_updates
+                .entries,
+            3
+        );
+
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::WaitingRoom);
+        let generation = client
+            .register_call_link_session(
+                session,
+                Some(initial_room),
+                CallLinkMedia::Audio,
+                "TEST-CALL-LINK",
+            )
+            .expect("valid staged transitions");
+        let state = client
+            .call_registry()
+            .group_state_if_current(call_id, generation)
+            .expect("registered group state");
+        let snapshot = state.snapshot().expect("latest admission roster");
+        assert_eq!(snapshot.transaction_id, 9);
+        assert!(snapshot.relay.is_some(), "roster-only update retains relay");
+        assert!(
+            snapshot.rekey_requested,
+            "the earlier unfulfilled rekey obligation survives the roster-only update"
+        );
+        assert!(
+            state
+                .waiting_room()
+                .is_some_and(|room| room.transaction_id == Some(2) && room.is_admin)
+        );
+        assert_eq!(
+            client.call_registry().phase_if_current(call_id, generation),
+            Some(CallPhase::Connecting)
+        );
+        assert_eq!(
+            client
+                .memory_report()
+                .await
+                .pending_call_link_updates
+                .entries,
+            0
+        );
+
+        drop(pending);
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn invalid_admitted_call_link_snapshot_is_not_registered() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let call_id = "INVALID-CALL-LINK";
+        let mut invalid = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        invalid.connected_limit = 0;
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        session.group = Some(invalid);
+
+        assert_eq!(
+            client.register_call_link_session(
+                session,
+                None,
+                CallLinkMedia::Audio,
+                "TEST-CALL-LINK",
+            ),
+            Err(wacore::voip::GroupStateApply::InvalidSnapshot)
+        );
+        assert_eq!(client.call_registry().generation_of(call_id), None);
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -2450,7 +2734,7 @@ mod tests {
             Jid::new(call_id, Server::Call),
             creator.clone(),
         ));
-        let room = wacore::types::group_call::WaitingRoom::builder()
+        let room = WaitingRoom::builder()
             .call_id(call_id.to_string())
             .call_creator(creator)
             .link_token("TEST-CALL-LINK".to_string())

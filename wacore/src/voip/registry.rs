@@ -833,6 +833,24 @@ impl CallRegistry {
         self.insert_inner(session, true, true)
     }
 
+    /// Register a group call only after validating any initial authoritative snapshot.
+    ///
+    /// Waiting-room call links may not have a roster yet, so an absent snapshot remains valid.
+    pub fn insert_group_checked(&self, session: CallSession) -> Result<u64, GroupStateApply> {
+        if let Some(initial_update) = session.group.as_ref() {
+            if super::engine::validate_group_relay_update(initial_update).is_err() {
+                return Err(GroupStateApply::InvalidSnapshot);
+            }
+            let mut initial_state =
+                GroupCallState::new(session.call_id.clone(), session.call_creator.clone());
+            let applied = initial_state.apply_update(initial_update.clone());
+            if applied != GroupStateApply::Applied {
+                return Err(applied);
+            }
+        }
+        Ok(self.insert_inner(session, true, true))
+    }
+
     /// Register an active-group invitation without marking it answered.
     ///
     /// Roster and epoch updates can land while the user decides, while the separate ringing set

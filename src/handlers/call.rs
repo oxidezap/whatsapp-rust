@@ -445,50 +445,29 @@ impl StanzaHandler for CallHandler {
                             .await;
                         }
                         CallAction::WaitingRoomUpdate { room }
-                            if !group_transition_generation.is_some_and(|generation| {
-                                client.call_registry().group_creator_authorized_if_current(
-                                    &room.call_id,
-                                    generation,
-                                    &room.call_creator,
-                                    &routed_call_sender(&call),
-                                )
-                            }) =>
+                            if client.buffer_pending_call_link_waiting_room(
+                                room,
+                                &routed_call_sender(&call),
+                            ) =>
                         {
-                            warn!(
-                                "call: rejected waiting-room snapshot from unauthorized sender for {}",
-                                room.call_id
-                            );
+                            // The ACK can wake the join task before it publishes its generation.
+                            // Registration replays this creator-authenticated snapshot in order.
                             dispatch_call = false;
                         }
+                        CallAction::WaitingRoomUpdate { room }
+                            if group_transition_generation.is_none() =>
+                        {
+                            dispatch_call =
+                                apply_current_waiting_room_update(&client, room, &call).await;
+                        }
                         CallAction::WaitingRoomUpdate { room } => {
-                            dispatch_call = match group_transition_generation {
-                                Some(generation) => match client
-                                    .call_registry()
-                                    .apply_waiting_room_if_current(
-                                        room.as_ref().clone(),
-                                        generation,
-                                    ) {
-                                    GroupStateApply::Applied => {
-                                        client.call_registry().send_call_event_if_current(
-                                            &room.call_id,
-                                            generation,
-                                            CallEvent::WaitingRoomUpdated(room.clone()),
-                                        );
-                                        true
-                                    }
-                                    GroupStateApply::Stale | GroupStateApply::UnknownCall => false,
-                                    GroupStateApply::IdentityMismatch
-                                    | GroupStateApply::InvalidSnapshot => {
-                                        warn!(
-                                            "call: rejected invalid waiting-room snapshot for {}",
-                                            room.call_id
-                                        );
-                                        false
-                                    }
-                                    _ => false,
-                                },
-                                None => false,
-                            };
+                            dispatch_call = apply_waiting_room_update(
+                                &client,
+                                room,
+                                &call,
+                                group_transition_generation
+                                    .expect("matched waiting-room update has a generation"),
+                            );
                         }
                         CallAction::RaiseHand {
                             call_id,
@@ -611,17 +590,22 @@ impl StanzaHandler for CallHandler {
                         } else {
                             None
                         };
-                        let event_permit = registry
-                            .is_current(call_id, generation)
-                            .then(|| registry.reserve_call_event(call_id))
-                            .flatten()
-                            .filter(|permit| permit.generation() == generation);
-                        if event_permit.is_none() {
+                        let event_permit = group_participant
+                            .is_none()
+                            .then(|| {
+                                registry
+                                    .is_current(call_id, generation)
+                                    .then(|| registry.reserve_call_event(call_id))
+                                    .flatten()
+                                    .filter(|permit| permit.generation() == generation)
+                            })
+                            .flatten();
+                        if group_participant.is_none() && event_permit.is_none() {
                             warn!(
                                 "call: video state event queue is unavailable; leaving the transition unacknowledged"
                             );
                         }
-                        let acked = if event_permit.is_some() {
+                        let acked = if group_participant.is_some() || event_permit.is_some() {
                             match build_call_video_ack(&call, nr) {
                                 Some(ack) => {
                                     *cancelled = true;
@@ -643,6 +627,30 @@ impl StanzaHandler for CallHandler {
                         } else {
                             false
                         };
+                        if let Some(participant) = group_participant {
+                            // A group participant's `<video>` state describes only that sender.
+                            // The authoritative roster owns group media mode; never feed this into
+                            // the 1:1 negotiation state machine or tear down the local plane.
+                            dispatch_call = acked && registry.is_current(call_id, generation);
+                            if dispatch_call && let Some(orientation) = orientation {
+                                registry.send_video_ctl(
+                                    call_id,
+                                    generation,
+                                    VideoControl::SetParticipantOrientation {
+                                        participant,
+                                        orientation: *orientation,
+                                    },
+                                );
+                            }
+                            drop(event_permit);
+                            drop(_transition_guard);
+                            if dispatch_call {
+                                client.core.event_bus.dispatch(Event::IncomingCall(call));
+                            }
+                            replay_initial_group_controls(&client, buffered_initial_group_controls)
+                                .await;
+                            return true;
+                        }
                         let mut transition_current =
                             acked && registry.is_current(call_id, generation);
                         let transition = if transition_current
@@ -745,15 +753,12 @@ impl StanzaHandler for CallHandler {
 
                         transition_current &= registry.is_current(call_id, generation);
                         if transition_current {
-                            if let Some(o) = orientation {
-                                let control = group_participant.clone().map_or(
-                                    VideoControl::SetOrientation(*o),
-                                    |participant| VideoControl::SetParticipantOrientation {
-                                        participant,
-                                        orientation: *o,
-                                    },
+                            if let Some(orientation) = orientation {
+                                registry.send_video_ctl(
+                                    call_id,
+                                    generation,
+                                    VideoControl::SetOrientation(*orientation),
                                 );
-                                registry.send_video_ctl(call_id, generation, control);
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {
                                 permit.send(CallEvent::VideoStateChanged {
@@ -822,6 +827,65 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
         return false;
     }
     apply_group_control(client, call, generation).await
+}
+
+#[cfg(feature = "voip-runtime")]
+async fn apply_current_waiting_room_update(
+    client: &Client,
+    room: &wacore::types::group_call::WaitingRoom,
+    call: &IncomingCall,
+) -> bool {
+    let registry = client.call_registry();
+    let Some((generation, lock)) = registry.current_group_transition(&room.call_id) else {
+        warn!(
+            "call: rejected waiting-room snapshot without a matching link join for {}",
+            room.call_id
+        );
+        return false;
+    };
+    let _guard = lock.lock().await;
+    apply_waiting_room_update(client, room, call, generation)
+}
+
+#[cfg(feature = "voip-runtime")]
+fn apply_waiting_room_update(
+    client: &Client,
+    room: &wacore::types::group_call::WaitingRoom,
+    call: &IncomingCall,
+    generation: u64,
+) -> bool {
+    let registry = client.call_registry();
+    if !registry.group_creator_authorized_if_current(
+        &room.call_id,
+        generation,
+        &room.call_creator,
+        &routed_call_sender(call),
+    ) {
+        warn!(
+            "call: rejected waiting-room snapshot from unauthorized sender for {}",
+            room.call_id
+        );
+        return false;
+    }
+    match registry.apply_waiting_room_if_current(room.clone(), generation) {
+        GroupStateApply::Applied => {
+            registry.send_call_event_if_current(
+                &room.call_id,
+                generation,
+                CallEvent::WaitingRoomUpdated(Box::new(room.clone())),
+            );
+            true
+        }
+        GroupStateApply::Stale | GroupStateApply::UnknownCall => false,
+        GroupStateApply::IdentityMismatch | GroupStateApply::InvalidSnapshot => {
+            warn!(
+                "call: rejected invalid waiting-room snapshot for {}",
+                room.call_id
+            );
+            false
+        }
+        _ => false,
+    }
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -1156,6 +1220,49 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
+    async fn waiting_room_update_rechecks_a_generation_published_during_registration() {
+        let client = make_sending_client().await;
+        let creator = fake_caller_lid();
+        let call_id = "CALL-LINK-RACE";
+        let registry = client.call_registry();
+        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let room = wacore::types::group_call::WaitingRoom::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .link_token("TEST-CALL-LINK".to_string())
+            .media(wacore::types::group_call::CallLinkMedia::Audio)
+            .enabled(true)
+            .is_admin(true)
+            .transaction_id(2)
+            .users(Vec::new())
+            .build();
+        let mut call = IncomingCall::new_for_test(
+            Jid::new(call_id, Server::Call),
+            "WAITING-ROOM-RACE".to_string(),
+            wacore::time::from_secs(1_766_847_151_i64).expect("valid ts"),
+            CallAction::WaitingRoomUpdate {
+                room: Box::new(room.clone()),
+            },
+        );
+        call.participant = Some(creator.with_device(1));
+
+        assert!(apply_current_waiting_room_update(&client, &room, &call).await);
+        assert!(
+            registry
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.waiting_room().cloned())
+                .is_some_and(|current| { current.transaction_id == Some(2) && current.is_admin }),
+            "the update must apply to the generation that appeared after the initial lookup"
+        );
+        registry.remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
     async fn typed_control_after_unknown_child_suppresses_the_generic_ack() {
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
@@ -1297,7 +1404,7 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
-    async fn routed_group_video_canonicalizes_a_participant_pn_alias() {
+    async fn routed_group_video_is_participant_scoped_and_canonicalizes_a_pn_alias() {
         use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
         use wacore::voip::{CallEvent, CallSession, GroupStateApply, VideoControl};
 
@@ -1341,7 +1448,7 @@ mod tests {
             ),
             GroupStateApply::Applied
         );
-        let (event_tx, _event_rx) = async_channel::unbounded::<CallEvent>();
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
         let (control_tx, control_rx) = video_control_channel();
         registry.set_video_channels(
             "GROUP-CALL",
@@ -1358,7 +1465,7 @@ mod tests {
             .children([NodeBuilder::new("video")
                 .attr("call-id", "GROUP-CALL")
                 .attr("call-creator", creator)
-                .attr("state", "1")
+                .attr("state", "0")
                 .attr("device_orientation", "3")
                 .build()])
             .build();
@@ -1370,15 +1477,37 @@ mod tests {
                 .await
         );
         assert!(cancelled);
+        assert_eq!(
+            registry.video_states("GROUP-CALL", generation),
+            Some((VideoState::Enabled, VideoState::Enabled)),
+            "one participant's disabled state must not downgrade the whole group"
+        );
         assert!(
-            std::iter::from_fn(|| control_rx.try_recv().ok()).any(|control| matches!(
+            registry
+                .snapshot("GROUP-CALL")
+                .is_some_and(|session| session.is_video),
+            "participant signaling must not tear down the local group video plane"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the 1:1 video event lacks participant identity and must stay unused for group peers"
+        );
+        let controls = std::iter::from_fn(|| control_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            controls.iter().any(|control| matches!(
                 control,
                 VideoControl::SetParticipantOrientation {
                     participant: canonical,
                     orientation: 3,
-                } if canonical == participant
+                } if canonical == &participant
             )),
             "video orientation must be keyed by the roster LID, not the routed PN alias"
+        );
+        assert!(
+            !controls
+                .iter()
+                .any(|control| matches!(control, VideoControl::Disable)),
+            "participant signaling cannot disable the call-wide video plane"
         );
     }
 
