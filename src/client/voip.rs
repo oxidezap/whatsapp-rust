@@ -345,7 +345,7 @@ impl Client {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
-        let generation = self.call_registry.insert_group_checked(session)?;
+        let generation = self.call_registry.insert_call_link_checked(session)?;
         if let Some(room) = waiting_room {
             let applied = self
                 .call_registry
@@ -2309,11 +2309,13 @@ mod tests {
         let call_id = "TEST-APPROVAL-GENERATION";
         let creator = Jid::new("333333333333333", Server::Lid);
         let registry = client.call_registry();
-        let first = registry.insert(CallSession::new_outgoing(
-            call_id,
-            Jid::new(call_id, Server::Call),
-            creator.clone(),
-        ));
+        let first = registry
+            .insert_call_link_checked(CallSession::new_outgoing(
+                call_id,
+                Jid::new(call_id, Server::Call),
+                creator.clone(),
+            ))
+            .expect("valid call-link session");
         assert_eq!(
             registry.apply_waiting_room(
                 WaitingRoom::builder()
@@ -2384,11 +2386,13 @@ mod tests {
         let call_id = "TEST-APPROVAL-SERIALIZATION";
         let creator = Jid::new("333333333333333", Server::Lid);
         let registry = client.call_registry();
-        let generation = registry.insert(CallSession::new_outgoing(
-            call_id,
-            Jid::new(call_id, Server::Call),
-            creator.clone(),
-        ));
+        let generation = registry
+            .insert_call_link_checked(CallSession::new_outgoing(
+                call_id,
+                Jid::new(call_id, Server::Call),
+                creator.clone(),
+            ))
+            .expect("valid call-link session");
         let room = |transaction_id, enabled| {
             WaitingRoom::builder()
                 .call_id(call_id.to_string())
@@ -2475,11 +2479,13 @@ mod tests {
             let call_id = format!("TEST-WAITING-ACTION-{index}");
             let creator = Jid::new("333333333333333", Server::Lid);
             let registry = client.call_registry();
-            let first = registry.insert(CallSession::new_outgoing(
-                &call_id,
-                Jid::new(&call_id, Server::Call),
-                creator.clone(),
-            ));
+            let first = registry
+                .insert_call_link_checked(CallSession::new_outgoing(
+                    &call_id,
+                    Jid::new(&call_id, Server::Call),
+                    creator.clone(),
+                ))
+                .expect("valid call-link session");
             assert_eq!(
                 registry.apply_waiting_room(
                     WaitingRoom::builder()

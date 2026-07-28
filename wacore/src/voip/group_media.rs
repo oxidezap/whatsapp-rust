@@ -32,7 +32,7 @@ struct EpochKey(Vec<u8>);
 
 impl EpochKey {
     fn new(value: &[u8]) -> Option<Self> {
-        (value.len() >= 32).then(|| Self(value[..32].to_vec()))
+        (value.len() == 32).then(|| Self(value.to_vec()))
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -40,7 +40,7 @@ impl EpochKey {
     }
 
     fn equals(&self, other: &[u8]) -> bool {
-        other.len() >= 32 && bool::from(self.0.ct_eq(&other[..32]))
+        other.len() == 32 && bool::from(self.0.ct_eq(other))
     }
 }
 
@@ -73,7 +73,7 @@ pub enum GroupMediaError {
     IdentityMismatch,
     #[error("group media snapshot is invalid")]
     InvalidSnapshot,
-    #[error("group media epoch must contain at least 32 bytes")]
+    #[error("group media epoch must contain exactly 32 bytes")]
     InvalidEpoch,
     #[error("group media epoch conflicts with an existing transaction")]
     ConflictingEpoch,
@@ -271,7 +271,6 @@ impl GroupMediaRegistry {
 
         // Route derivation is fallible protocol validation. Complete it before moving any existing
         // receiver or advancing the roster transaction so a corrected resend remains admissible.
-        self.validate_active_route_keys(&active)?;
         let mut previous = std::mem::take(&mut self.receivers);
         let mut next = HashMap::with_capacity(active.len());
         for (participant, device) in active {
@@ -325,7 +324,7 @@ impl GroupMediaRegistry {
         transaction_id: u32,
         raw_epoch: &[u8],
     ) -> Result<GroupEpochApply, GroupMediaError> {
-        if transaction_id == 0 || raw_epoch.len() < 32 {
+        if transaction_id == 0 || raw_epoch.len() != 32 {
             return Err(GroupMediaError::InvalidEpoch);
         }
         if let Some((installed_transaction, installed)) = self.installed_epoch.as_ref() {
@@ -459,41 +458,6 @@ impl GroupMediaRegistry {
         self.install_epoch(transaction, epoch.as_slice())?;
         self.pending_epochs
             .retain(|pending_transaction, _| *pending_transaction > transaction);
-        Ok(())
-    }
-
-    fn validate_active_route_keys(
-        &self,
-        active: &[(&GroupCallParticipant, &GroupCallDevice)],
-    ) -> Result<(), GroupMediaError> {
-        let mut audio = HashSet::with_capacity(active.len());
-        let mut video = HashSet::with_capacity(active.len());
-        let mut app_data = HashSet::with_capacity(active.len());
-        let mut rtcp = HashSet::with_capacity(active.len() * RELAY_STREAM_SLOT_COUNT as usize);
-        for (_, device) in active {
-            let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
-            let audio_ssrc = derive_wasm_participant_ssrc(&self.call_id, &participant_id, 0);
-            let video_ssrc =
-                derive_wasm_participant_ssrc(&self.call_id, &participant_id, VIDEO_SSRC_SLOT_WORD);
-            let app_data_ssrc = derive_wasm_participant_ssrc(
-                &self.call_id,
-                &participant_id,
-                APP_DATA_SSRC_SLOT_WORD,
-            );
-            if !audio.insert(audio_ssrc)
-                || !video.insert(video_ssrc)
-                || !app_data.insert(app_data_ssrc)
-            {
-                return Err(GroupMediaError::InvalidSnapshot);
-            }
-            for slot_word in 0..RELAY_STREAM_SLOT_COUNT {
-                let rtcp_ssrc =
-                    derive_wasm_participant_ssrc(&self.call_id, &participant_id, slot_word);
-                if !rtcp.insert(rtcp_ssrc) {
-                    return Err(GroupMediaError::InvalidSnapshot);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -709,20 +673,50 @@ impl GroupMediaRegistry {
         {
             return Err(GroupMediaError::InvalidSnapshot);
         }
-        let active = active_devices(update, &self.self_lid);
-        let mut pids = HashSet::with_capacity(active.len());
-        let mut devices = HashSet::with_capacity(active.len());
-        for (_, device) in active {
-            let Some(pid) = device.pid else {
-                continue;
-            };
-            let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
-            if !pids.insert(pid) || !devices.insert(participant_id) {
+        validate_group_media_snapshot(update)
+    }
+}
+
+pub(crate) fn validate_group_media_snapshot(
+    update: &GroupCallUpdate,
+) -> Result<(), GroupMediaError> {
+    let mut pids = HashSet::new();
+    let mut devices = HashSet::new();
+    let mut audio = HashSet::new();
+    let mut video = HashSet::new();
+    let mut app_data = HashSet::new();
+    let mut rtcp = HashSet::new();
+    for device in update
+        .participants
+        .iter()
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
+        .flat_map(|participant| &participant.devices)
+    {
+        let Some(pid) = device.pid else {
+            continue;
+        };
+        let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
+        if pid == 0 || !pids.insert(pid) || !devices.insert(participant_id.clone()) {
+            return Err(GroupMediaError::InvalidSnapshot);
+        }
+        let audio_ssrc = derive_wasm_participant_ssrc(&update.call_id, &participant_id, 0);
+        let video_ssrc =
+            derive_wasm_participant_ssrc(&update.call_id, &participant_id, VIDEO_SSRC_SLOT_WORD);
+        let app_data_ssrc =
+            derive_wasm_participant_ssrc(&update.call_id, &participant_id, APP_DATA_SSRC_SLOT_WORD);
+        if !audio.insert(audio_ssrc) || !video.insert(video_ssrc) || !app_data.insert(app_data_ssrc)
+        {
+            return Err(GroupMediaError::InvalidSnapshot);
+        }
+        for slot_word in 0..RELAY_STREAM_SLOT_COUNT {
+            let rtcp_ssrc =
+                derive_wasm_participant_ssrc(&update.call_id, &participant_id, slot_word);
+            if !rtcp.insert(rtcp_ssrc) {
                 return Err(GroupMediaError::InvalidSnapshot);
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 fn active_devices<'a>(

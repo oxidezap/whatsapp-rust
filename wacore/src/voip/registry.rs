@@ -209,6 +209,8 @@ struct CallEntry {
     video: VideoNegotiation,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
+    /// This generation originated from a reusable call-link join and may accept waiting-room state.
+    is_call_link: bool,
     group: Option<GroupCallState>,
     /// Active 1:1 devices retained so an established call can become an ad-hoc group call.
     group_invite_self_device: Option<GroupCallDevice>,
@@ -606,6 +608,14 @@ impl CallRegistry {
         else {
             return GroupStateApply::UnknownCall;
         };
+        if !entry.is_call_link
+            && !entry
+                .group
+                .as_ref()
+                .is_some_and(|group| group.waiting_room().is_some())
+        {
+            return GroupStateApply::InvalidSnapshot;
+        }
         entry.group_mut().apply_waiting_room(room)
     }
 
@@ -849,18 +859,31 @@ impl CallRegistry {
     /// and [`remove_if_current`](Self::remove_if_current) so a finishing task only ever reaps its
     /// OWN entry, never a newer replacement.
     pub fn insert(&self, session: CallSession) -> u64 {
-        self.insert_inner(session, true, false)
+        self.insert_inner(session, true, false, false)
     }
 
     /// Register a group call before its first authoritative roster is available.
     pub fn insert_group(&self, session: CallSession) -> u64 {
-        self.insert_inner(session, true, true)
+        self.insert_inner(session, true, true, false)
     }
 
     /// Register a group call only after validating any initial authoritative snapshot.
     ///
     /// Waiting-room call links may not have a roster yet, so an absent snapshot remains valid.
     pub fn insert_group_checked(&self, session: CallSession) -> Result<u64, GroupStateApply> {
+        self.insert_group_checked_inner(session, false)
+    }
+
+    /// Register a call-link generation after validating any immediately admitted group snapshot.
+    pub fn insert_call_link_checked(&self, session: CallSession) -> Result<u64, GroupStateApply> {
+        self.insert_group_checked_inner(session, true)
+    }
+
+    fn insert_group_checked_inner(
+        &self,
+        session: CallSession,
+        is_call_link: bool,
+    ) -> Result<u64, GroupStateApply> {
         if let Some(initial_update) = session.group.as_ref() {
             if super::engine::validate_group_relay_update(initial_update).is_err() {
                 return Err(GroupStateApply::InvalidSnapshot);
@@ -872,7 +895,7 @@ impl CallRegistry {
                 return Err(applied);
             }
         }
-        Ok(self.insert_inner(session, true, true))
+        Ok(self.insert_inner(session, true, true, is_call_link))
     }
 
     /// Register an active-group invitation without marking it answered.
@@ -880,7 +903,7 @@ impl CallRegistry {
     /// Roster and epoch updates can land while the user decides, while the separate ringing set
     /// still classifies a remote timeout as a missed call.
     pub fn insert_ringing_group(&self, session: CallSession) -> u64 {
-        self.insert_inner(session, false, true)
+        self.insert_inner(session, false, true, false)
     }
 
     /// Register an incoming group offer unless this call id already belongs to an active call.
@@ -928,7 +951,7 @@ impl CallRegistry {
                 entry.generation
             } else {
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let entry = Self::new_entry(session, generation, true);
+                let entry = Self::new_entry(session, generation, true, false);
                 ringing.insert(call_id.clone());
                 map.insert(call_id, entry);
                 generation
@@ -938,7 +961,13 @@ impl CallRegistry {
         Ok(Some(generation))
     }
 
-    fn insert_inner(&self, session: CallSession, consume_ringing: bool, force_group: bool) -> u64 {
+    fn insert_inner(
+        &self,
+        session: CallSession,
+        consume_ringing: bool,
+        force_group: bool,
+        is_call_link: bool,
+    ) -> u64 {
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
         // Registering a call as active answers (accept) or places (outgoing) it: it is no longer
         // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
@@ -950,7 +979,7 @@ impl CallRegistry {
             let mut map = self.inner.lock().expect("registry lock poisoned");
             map.insert(
                 session.call_id.clone(),
-                Self::new_entry(session, generation, force_group),
+                Self::new_entry(session, generation, force_group, is_call_link),
             )
         };
         // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
@@ -978,7 +1007,12 @@ impl CallRegistry {
         true
     }
 
-    fn new_entry(session: CallSession, generation: u64, force_group: bool) -> CallEntry {
+    fn new_entry(
+        session: CallSession,
+        generation: u64,
+        force_group: bool,
+        is_call_link: bool,
+    ) -> CallEntry {
         let video = VideoNegotiation::new(session.is_video);
         let is_group_call = force_group || session.group.is_some();
         let group = session.group.as_ref().map(|update| {
@@ -1004,6 +1038,7 @@ impl CallRegistry {
             group_update_event: Arc::new(event_listener::Event::new()),
             video,
             is_group_call,
+            is_call_link,
             group,
             group_invite_self_device: None,
             group_invite_peer_device: None,
@@ -2479,7 +2514,9 @@ mod tests {
         let mut waiting = session("GROUP-CALL");
         assert!(waiting.transition_to(CallPhase::Calling));
         assert!(waiting.transition_to(CallPhase::WaitingRoom));
-        let generation = reg.insert(waiting);
+        let generation = reg
+            .insert_call_link_checked(waiting)
+            .expect("valid call-link registration");
         let listener = reg
             .listen_group_update("GROUP-CALL", generation)
             .expect("live listener");
@@ -2863,10 +2900,37 @@ mod tests {
     }
 
     #[test]
+    fn direct_calls_reject_waiting_room_promotion() {
+        let reg = CallRegistry::new();
+        reg.insert(session("GROUP-CALL"));
+        assert_eq!(
+            reg.apply_waiting_room(
+                WaitingRoom::builder()
+                    .call_id("GROUP-CALL".to_string())
+                    .call_creator(Jid::new("111111111111111", Server::Lid))
+                    .link_token("TEST-CALL-LINK".to_string())
+                    .media(CallLinkMedia::Audio)
+                    .enabled(true)
+                    .is_admin(false)
+                    .transaction_id(1)
+                    .users(Vec::new())
+                    .build(),
+            ),
+            GroupStateApply::InvalidSnapshot
+        );
+        assert!(!reg.is_group_call("GROUP-CALL"));
+        assert!(reg.group_state("GROUP-CALL").is_none());
+    }
+
+    #[test]
     fn local_group_commits_reject_stale_generations() {
         let reg = CallRegistry::new();
-        let stale = reg.insert(session("GROUP-CALL"));
-        let current = reg.insert(session("GROUP-CALL"));
+        let stale = reg
+            .insert_call_link_checked(session("GROUP-CALL"))
+            .expect("valid stale call link");
+        let current = reg
+            .insert_call_link_checked(session("GROUP-CALL"))
+            .expect("valid current call link");
         assert_eq!(
             reg.apply_group_update(group_update(1)),
             GroupStateApply::Applied

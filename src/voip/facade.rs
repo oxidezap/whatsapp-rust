@@ -6817,7 +6817,9 @@ mod tests {
         );
         session.group = Some(update);
         let registry = client.call_registry();
-        let generation = registry.insert(session);
+        let generation = registry
+            .insert_call_link_checked(session)
+            .expect("valid call-link session");
         assert_eq!(
             registry.apply_waiting_room(
                 wacore::types::group_call::WaitingRoom::builder()

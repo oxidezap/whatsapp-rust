@@ -1059,10 +1059,16 @@ async fn decrypt_group_epoch(
             .and_then(|call| call.call_key)
             .ok_or_else(|| anyhow::anyhow!("message has no call key"))?,
     );
-    if raw_epoch.len() < 32 {
-        anyhow::bail!("call key is shorter than 32 bytes");
-    }
+    validate_group_epoch_key(&raw_epoch)?;
     Ok(raw_epoch)
+}
+
+#[cfg(feature = "voip-runtime")]
+fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
+    if raw_epoch.len() != 32 {
+        anyhow::bail!("call key must contain exactly 32 bytes");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -1223,17 +1229,27 @@ mod tests {
     }
 
     #[cfg(feature = "voip-runtime")]
+    #[test]
+    fn group_epoch_keys_require_the_exact_protocol_length() {
+        assert!(validate_group_epoch_key(&[0; 32]).is_ok());
+        assert!(validate_group_epoch_key(&[0; 31]).is_err());
+        assert!(validate_group_epoch_key(&[0; 33]).is_err());
+    }
+
+    #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn waiting_room_update_rechecks_a_generation_published_during_registration() {
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
         let call_id = "CALL-LINK-RACE";
         let registry = client.call_registry();
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
-            call_id,
-            Jid::new(call_id, Server::Call),
-            creator.clone(),
-        ));
+        let generation = registry
+            .insert_call_link_checked(wacore::voip::CallSession::new_outgoing(
+                call_id,
+                Jid::new(call_id, Server::Call),
+                creator.clone(),
+            ))
+            .expect("valid call-link session");
         let room = wacore::types::group_call::WaitingRoom::builder()
             .call_id(call_id.to_string())
             .call_creator(creator.clone())
@@ -1526,11 +1542,13 @@ mod tests {
         let client = make_sending_client().await;
         let creator = fake_caller_lid();
         let registry = client.call_registry();
-        let generation = registry.insert(CallSession::new_outgoing(
-            "GROUP-CALL",
-            Jid::new("GROUP-CALL", Server::Call),
-            creator.clone(),
-        ));
+        let generation = registry
+            .insert_call_link_checked(CallSession::new_outgoing(
+                "GROUP-CALL",
+                Jid::new("GROUP-CALL", Server::Call),
+                creator.clone(),
+            ))
+            .expect("valid call-link session");
         let participant = Jid::new("222222222222222", Server::Lid).with_device(2);
         let update = GroupCallUpdate::builder()
             .call_id("GROUP-CALL".to_string())

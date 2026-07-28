@@ -226,13 +226,14 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
                 devices.insert(device.jid.clone())
                     && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
             })
-    })
+    }) && super::group_media::validate_group_media_snapshot(update).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::group_call::{GroupCallDevice, GroupCallParticipant, GroupCallRelay};
+    use crate::voip::ssrc::{derive_wasm_participant_ssrc, format_e2e_srtp_participant_id};
     use wacore_binary::Server;
 
     fn creator() -> Jid {
@@ -418,6 +419,40 @@ mod tests {
         assert_eq!(
             state.apply_update(oversized),
             GroupStateApply::InvalidSnapshot
+        );
+    }
+
+    #[test]
+    fn route_collisions_do_not_consume_the_roster_transaction() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let first = "37774";
+        let second = "53838";
+        let first_id = format_e2e_srtp_participant_id(
+            &Jid::new(first, Server::Lid).with_device(1).to_string(),
+        );
+        let second_id = format_e2e_srtp_participant_id(
+            &Jid::new(second, Server::Lid).with_device(1).to_string(),
+        );
+        assert_eq!(
+            derive_wasm_participant_ssrc("CALL", &first_id, 0),
+            derive_wasm_participant_ssrc("CALL", &second_id, 0),
+            "fixture must collide in the audio route"
+        );
+
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![
+                    participant(first, "connected", 1),
+                    participant(second, "connected", 2),
+                ],
+            )),
+            GroupStateApply::InvalidSnapshot
+        );
+        assert_eq!(
+            state.apply_update(update(1, vec![participant(first, "connected", 1)])),
+            GroupStateApply::Applied,
+            "a corrected redelivery must retain the rejected transaction ID"
         );
     }
 

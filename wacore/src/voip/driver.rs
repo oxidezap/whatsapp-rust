@@ -598,6 +598,19 @@ fn apply_group_epoch_control(
     }
 }
 
+fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
+    if matches!(
+        &event,
+        CallEvent::RelayAllocated
+            | CallEvent::RelayAllocateFailed(_)
+            | CallEvent::RelayAllocateTimedOut
+    ) {
+        let _ = events.force_send(event);
+    } else {
+        let _ = events.try_send(event);
+    }
+}
+
 fn is_fatal_group_update_error(error: &engine::EngineError) -> bool {
     !matches!(error, engine::EngineError::GroupMedia(_))
 }
@@ -880,7 +893,7 @@ async fn run_call_with_clock_and_wallclock(
                     let _ = channels.video_out.try_send(frame);
                 }
                 Output::Event(ev) => {
-                    let _ = channels.events.try_send(ev);
+                    publish_engine_event(&channels.events, ev);
                 }
                 Output::ReconnectRelay(endpoint) => {
                     // Anything queued before this intent targets the retired relay. Later outputs in
@@ -1383,6 +1396,26 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn relay_lifecycle_events_replace_saturated_diagnostics() {
+        for lifecycle in [
+            CallEvent::RelayAllocated,
+            CallEvent::RelayAllocateFailed(486),
+            CallEvent::RelayAllocateTimedOut,
+        ] {
+            let (tx, rx) = async_channel::bounded(1);
+            tx.try_send(CallEvent::GroupControlRejected {
+                control: engine::GroupControlKind::Update,
+            })
+            .expect("diagnostic fills the event queue");
+
+            publish_engine_event(&tx, lifecycle.clone());
+
+            assert_eq!(rx.try_recv(), Ok(lifecycle));
+            assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+        }
     }
 
     #[test]
