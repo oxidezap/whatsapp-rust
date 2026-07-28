@@ -218,17 +218,36 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::VideoNotOffered);
         }
         let registry = self.client.call_registry();
-        let mut group = registry
-            .group_state(call_id)
-            .and_then(|state| state.snapshot().cloned())
-            .or_else(|| self.incoming.group.as_deref().cloned());
+        let group_generation = if self.incoming.group.is_some() {
+            Some(
+                registry
+                    .ringing_group_generation(call_id, call_creator)
+                    .ok_or(CallError::CallEndedDuringSetup)?,
+            )
+        } else {
+            if registry.is_group_call(call_id) {
+                // The application retained a direct offer past a same-id group replacement. It
+                // must not borrow that newer roster or replace its eagerly registered generation.
+                return Err(CallError::CallEndedDuringSetup);
+            }
+            None
+        };
+        let mut group = match group_generation {
+            Some(generation) => Some(
+                registry
+                    .group_state_if_current(call_id, generation)
+                    .and_then(|state| state.snapshot().cloned())
+                    .ok_or(CallError::CallEndedDuringSetup)?,
+            ),
+            None => None,
+        };
         if self.incoming.group.is_some()
             && self.incoming.media.is_none()
             && group
                 .as_ref()
                 .and_then(|update| update.relay.as_ref())
                 .is_none()
-            && let Some(generation) = registry.generation_of(call_id)
+            && let Some(generation) = group_generation
         {
             group = Some(
                 match wacore::runtime::timeout(
@@ -273,7 +292,15 @@ impl<'a> AcceptCall<'a> {
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
         // a call that has already ended.
-        let mut registration = RegisteredCall::new(self.client, session).await;
+        let mut registration = if let Some(generation) = group_generation {
+            let _answer_transition = self.client.lock_answer_transition(call_id).await;
+            if !registry.promote_ringing_group_if_current(session, generation) {
+                return Err(CallError::CallEndedDuringSetup);
+            }
+            RegisteredCall::from_existing(self.client, call_id, generation)?
+        } else {
+            RegisteredCall::new(self.client, session).await
+        };
         let mut teardown = AnswerTeardown::new(self.client, &registration);
         let preaccept_id = self.client.generate_request_id();
         let accept_id = self.client.generate_request_id();
@@ -4228,19 +4255,31 @@ mod tests {
         let client = make_client().await;
         let mut incoming = incoming_offer(true);
         let call_id = incoming.action.call_id().to_string();
-        incoming.group = Some(Box::new(
-            GroupCallUpdate::builder()
-                .call_id(call_id)
-                .call_creator(caller())
-                .transaction_id(1)
-                .media("audio".to_string())
-                .connected_limit(32)
-                .joinable(true)
-                .av_upgradable(true)
-                .rekey_requested(false)
-                .participants(Vec::new())
-                .build(),
-        ));
+        let mut group = GroupCallUpdate::builder()
+            .call_id(call_id)
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        group.relay = Some(sample_group_relay(1));
+        incoming.group = Some(Box::new(group));
+        let mut session = wacore::voip::CallSession::new_incoming(
+            incoming.action.call_id(),
+            incoming.from.clone(),
+            incoming.action.call_creator().clone(),
+        );
+        session.is_video = true;
+        session.group = incoming.group.as_deref().cloned();
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing group generation");
         let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
         let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
 
@@ -4256,10 +4295,57 @@ mod tests {
             Err(CallError::Response(message))
                 if message == "group offer signaling and roster media modes differ"
         ));
-        assert_eq!(
-            client.call_registry().active_count(),
-            0,
-            "conflicting group media must fail before registration"
+        assert!(
+            client
+                .call_registry()
+                .is_current(incoming.action.call_id(), generation),
+            "conflicting media must fail before accepting or replacing the ringing generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_direct_accept_cannot_borrow_or_replace_a_group_offer() {
+        let client = make_client().await;
+        let incoming = incoming_offer(false);
+        let call_id = incoming.action.call_id().to_string();
+        let group_creator = Jid::new("15550003333", Server::Lid);
+        let mut group_session = wacore::voip::CallSession::new_incoming(
+            &call_id,
+            group_creator.clone(),
+            group_creator.clone(),
+        );
+        group_session.group = Some(
+            GroupCallUpdate::builder()
+                .call_id(call_id.clone())
+                .call_creator(group_creator)
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        );
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(group_session)
+            .expect("valid group snapshot")
+            .expect("ringing group generation");
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        assert!(matches!(result, Err(CallError::CallEndedDuringSetup)));
+        assert!(
+            client.call_registry().is_current(&call_id, generation),
+            "the newer ringing group generation must survive a stale direct accept"
         );
     }
 

@@ -1078,6 +1078,40 @@ impl CallRegistry {
         Some(generation)
     }
 
+    /// Promote only the exact ringing group generation captured for an incoming offer.
+    pub fn promote_ringing_group_if_current(
+        &self,
+        mut session: CallSession,
+        generation: u64,
+    ) -> bool {
+        let call_id = session.call_id.clone();
+        let mut ringing = self.ringing.lock().expect("registry lock poisoned");
+        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let Some(entry) = map.get_mut(&call_id).filter(|entry| {
+            entry.generation == generation
+                && matches!(
+                    entry.session.phase(),
+                    CallPhase::Ringing | CallPhase::Connecting
+                )
+                && entry.session.call_creator == session.call_creator
+                && entry.group.is_some()
+        }) else {
+            return false;
+        };
+        if let Some(latest) = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .cloned()
+        {
+            session.group = Some(latest);
+        }
+        entry.video = VideoNegotiation::new(session.is_video);
+        entry.session = session;
+        ringing.remove(&call_id);
+        true
+    }
+
     /// Attach (or replace) the media task for the call registered under `generation`. If the call
     /// was removed or superseded by a newer generation, the handle is aborted immediately so its
     /// task can't outlive the call.

@@ -1081,6 +1081,20 @@ impl CallEngine {
         // Validate fallible relay material before advancing the roster transaction. Otherwise a
         // malformed relay could partially commit the roster and make a corrected resend look stale.
         let relay_refresh = prepare_group_relay_refresh(update)?;
+        let established_warp_mi_tag_len = self
+            .media
+            .as_ref()
+            .ok_or(GroupMediaError::Pipeline)?
+            .warp_mi_tag_len;
+        if relay_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.warp_mi_tag_len != established_warp_mi_tag_len)
+        {
+            // Every existing send/receive pipeline was constructed with the established WARP tag
+            // length. A roster refresh cannot change that packet boundary atomically today, so
+            // reject it before the authoritative transaction commits.
+            return Err(GroupMediaError::Pipeline.into());
+        }
         let previous_pids = self
             .group
             .as_ref()
@@ -2299,6 +2313,7 @@ struct GroupRelayRefresh {
     relay_token: Vec<u8>,
     endpoint_xor: [u8; 6],
     integrity_key: Vec<u8>,
+    warp_mi_tag_len: usize,
 }
 
 fn prepare_group_relay_refresh(
@@ -2307,12 +2322,17 @@ fn prepare_group_relay_refresh(
     let Some(relay) = update.relay.as_ref() else {
         return Ok(None);
     };
+    let warp_mi_tag_len = relay.warp_mi_tag_len.unwrap_or(4) as usize;
+    if !(1..=20).contains(&warp_mi_tag_len) {
+        return Err(GroupMediaError::Pipeline);
+    }
     let (relay_token, endpoint_xor, integrity_key) = group_relay_allocate_material(relay)?;
     Ok(Some(GroupRelayRefresh {
         relay_addr: group_relay_socket_addr(relay)?,
         relay_token,
         endpoint_xor,
         integrity_key,
+        warp_mi_tag_len,
     }))
 }
 
@@ -3124,6 +3144,30 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
             "the replacement allocation must retain the timeout safety net"
+        );
+    }
+
+    #[test]
+    fn group_relay_tag_length_refresh_is_rejected_before_roster_commit() {
+        let mut engine = group_engine();
+        let mut update = group_update();
+        update.transaction_id = 8;
+        let mut relay = group_relay();
+        relay.transaction_id = Some(8);
+        relay.warp_mi_tag_len = Some(6);
+        update.relay = Some(relay);
+
+        assert!(matches!(
+            engine.apply_group_update(2_000, &update),
+            Err(EngineError::GroupMedia(GroupMediaError::Pipeline))
+        ));
+        assert_eq!(
+            engine
+                .group
+                .as_ref()
+                .and_then(|group| group.registry.roster_transaction()),
+            Some(7),
+            "an unsupported tag-boundary transition cannot consume the roster transaction"
         );
     }
 
