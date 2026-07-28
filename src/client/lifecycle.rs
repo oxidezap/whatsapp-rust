@@ -353,6 +353,7 @@ impl Client {
             connected_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
+            pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
@@ -954,6 +955,14 @@ impl Client {
     }
 
     async fn cleanup_connection_state_inner(&self) {
+        // A pair-code flow belongs to the connection that carried it: the
+        // pairing ref and any in-flight companion_hello die with the socket, and
+        // the server routes no primary_hello to a session it has dropped. Left
+        // standing, the outstanding-code guard would reject the very request
+        // that reconnecting exists to make. Taken before `login_transition`,
+        // whose std guard is not Send and may not span an await.
+        *self.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Idle;
+
         #[cfg(feature = "client-lifecycle")]
         let login_transition = self
             .login_transition

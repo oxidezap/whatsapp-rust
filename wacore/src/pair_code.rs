@@ -160,6 +160,21 @@ impl Default for PairCodeOptions {
     }
 }
 
+/// Identity of one `pair_with_code` request, minted per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairCodeClaim(u64);
+
+impl PairCodeClaim {
+    /// A value no live claim shares. Process-wide rather than per-client: a
+    /// counter is cheaper than the coordination that scoping it would need, and
+    /// only equality within one client is ever asked of it.
+    pub fn next() -> Self {
+        use core::sync::atomic::Ordering;
+        static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// State machine for pair code authentication flow.
 #[derive(Default)]
 pub enum PairCodeState {
@@ -178,6 +193,11 @@ pub enum PairCodeState {
         /// Stamped before `companion_hello`, and carried into
         /// [`Self::WaitingForPhoneConfirmation`] unchanged.
         code_generation_ts: i64,
+        /// Identifies *this* request. The stamp cannot: cancel a request and
+        /// start its replacement inside the same second and both carry the same
+        /// number, so the first one's late response would install its code over
+        /// the replacement's claim, and its failure path would release it.
+        claim: PairCodeClaim,
     },
     /// Stage 1 complete - waiting for phone to confirm code entry.
     WaitingForPhoneConfirmation {
@@ -235,8 +255,18 @@ impl PairCodeState {
         )
     }
 
+    /// Whether anything would be stranded by starting a new flow now.
+    ///
+    /// The union of the two clocks: the code's own validity window, and the
+    /// link that outlives it once the phone has answered.
+    pub fn is_outstanding(&self, now: i64) -> bool {
+        self.live_flow_remaining(now).is_some() || self.awaiting_pair_success()
+    }
+
     pub fn live_flow_remaining(&self, now: i64) -> Option<std::time::Duration> {
-        let (Self::RequestingCode { code_generation_ts }
+        let (Self::RequestingCode {
+            code_generation_ts, ..
+        }
         | Self::WaitingForPhoneConfirmation {
             code_generation_ts, ..
         }) = self

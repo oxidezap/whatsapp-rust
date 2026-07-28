@@ -200,12 +200,21 @@ impl Client {
         // `codeGenerationTs` before sending), so the ~180s window covers the
         // round trip rather than starting after it.
         let code_generation_ts = wacore::time::now_secs();
+        let claim = wacore::pair_code::PairCodeClaim::next();
         {
             let mut state = self.pair_code_state.lock().await;
-            if let Some(remaining) = state.live_flow_remaining(code_generation_ts) {
-                return Err(PairCodeError::CodeAlreadyOutstanding { remaining }.into());
+            if state.is_outstanding(code_generation_ts) {
+                return Err(PairCodeError::CodeAlreadyOutstanding {
+                    remaining: state
+                        .live_flow_remaining(code_generation_ts)
+                        .unwrap_or_default(),
+                }
+                .into());
             }
-            *state = PairCodeState::RequestingCode { code_generation_ts };
+            *state = PairCodeState::RequestingCode {
+                code_generation_ts,
+                claim,
+            };
         }
         // From here on every failing exit path has to hand the claim back, or
         // the client refuses to ever issue another code.
@@ -299,14 +308,14 @@ impl Client {
         let response = match self.send_iq(query).await {
             Ok(response) => response,
             Err(e) => {
-                self.release_code_claim(code_generation_ts).await;
+                self.release_code_claim(claim).await;
                 return Err(e.into());
             }
         };
 
         let Some(pairing_ref) = PairCodeUtils::parse_companion_hello_response(response.get())
         else {
-            self.release_code_claim(code_generation_ts).await;
+            self.release_code_claim(claim).await;
             return Err(PairCodeError::MissingPairingRef.into());
         };
 
@@ -322,8 +331,7 @@ impl Client {
         // strand the code that replacement returned.
         {
             let mut state = self.pair_code_state.lock().await;
-            if !matches!(&*state, PairCodeState::RequestingCode { code_generation_ts: ts } if *ts == code_generation_ts)
-            {
+            if !matches!(&*state, PairCodeState::RequestingCode { claim: c, .. } if *c == claim) {
                 return Err(PairCodeError::Cancelled.into());
             }
             *state = PairCodeState::WaitingForPhoneConfirmation {
@@ -358,12 +366,11 @@ impl Client {
 
     /// Hand back a claim taken by [`Self::pair_with_code`] when stage 1 failed.
     ///
-    /// Identified by its stamp, so a claim already superseded — by a
+    /// Identified by its token, so a claim already superseded — by a
     /// cancellation, or by the replacement that followed one — is left alone.
-    async fn release_code_claim(self: &Arc<Self>, code_generation_ts: i64) {
+    async fn release_code_claim(self: &Arc<Self>, claim: wacore::pair_code::PairCodeClaim) {
         let mut state = self.pair_code_state.lock().await;
-        if matches!(&*state, PairCodeState::RequestingCode { code_generation_ts: ts } if *ts == code_generation_ts)
-        {
+        if matches!(&*state, PairCodeState::RequestingCode { claim: c, .. } if *c == claim) {
             *state = PairCodeState::Idle;
         }
     }
@@ -472,7 +479,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     //
     // The lock still serializes stage 2 end to end — see `run_stage_two`.
     let mut state_guard = client.pair_code_state.lock().await;
-    let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = match &mut *state_guard {
+    let (pairing_ref, phone_jid, pair_code, ephemeral_keypair, attempt) = match &mut *state_guard {
         PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref,
             phone_jid,
@@ -515,6 +522,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
                 phone_jid.clone(),
                 pair_code.clone(),
                 (**ephemeral_keypair).clone(),
+                *primary_hello_attempt_count,
             )
         }
         _ => {
@@ -540,7 +548,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     // starts on the notification. Waiting for a successful `companion_finish`
     // would leave a failed stage 2 with no timeout at all — the case that most
     // needs the consumer to hear about it.
-    start_pair_success_timeout(Arc::clone(&client), pairing_ref.clone());
+    start_pair_success_timeout(Arc::clone(&client), pairing_ref.clone(), attempt);
     client.clone().runtime.spawn_detached(Box::pin(async move {
         run_stage_two(
             client,
@@ -676,7 +684,7 @@ async fn run_stage_two(
 /// WA Web treats that silence as the failure signal, arming a one-minute timer
 /// on `primary_hello_received` and regenerating the code when it fires
 /// (`Link/DevicePhoneNumberCodeScreen.react.js`).
-fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>) {
+fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt: u32) {
     let timeout = PairCodeUtils::primary_hello_pair_success_timeout();
     client.clone().runtime.spawn_detached(Box::pin(async move {
         client.runtime.sleep(timeout).await;
@@ -686,10 +694,17 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>) {
             // Only this flow's own timer may retire it: pair-success, a
             // cancellation, or a replacement code all leave a state this
             // does not match.
+            // Keyed on the attempt, not just the ref: a retry accepted partway
+            // through this window opens its own, and the earlier timer must not
+            // cut it short.
             let still_ours = matches!(
                 &*state,
-                PairCodeState::WaitingForPhoneConfirmation { pairing_ref: r, .. }
-                    if r.as_slice() == pairing_ref.as_slice()
+                PairCodeState::WaitingForPhoneConfirmation {
+                    pairing_ref: r,
+                    primary_hello_attempt_count,
+                    ..
+                } if r.as_slice() == pairing_ref.as_slice()
+                    && *primary_hello_attempt_count == attempt
             );
             if !still_ours {
                 return;
@@ -1326,6 +1341,146 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(d + std::time::Duration::from_secs(1)).await;
+    }
+
+    /// Regression: a second-granularity stamp is not an identity. Cancel a
+    /// request and start its replacement inside the same wall-clock second and
+    /// both claims carry the same number, so the first one's late response
+    /// installs its own code over the replacement's claim — and its failure
+    /// path would release the replacement's.
+    #[tokio::test]
+    async fn a_claim_is_identified_by_more_than_the_second_it_started_in() {
+        let (client, transport) = create_iq_test_client().await;
+
+        let first = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the first companion_hello", || !transport.sent().is_empty()).await;
+
+        // Same second, by construction: no clock advances in between.
+        client.cancel_pair_code().await;
+        let second = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the replacement's companion_hello", || {
+            transport.sent().len() >= 2
+        })
+        .await;
+
+        answer_companion_hello(&client, &transport, 0, b"3@2:first").await;
+        let stale = first
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("the cancelled request must not install its flow");
+        assert!(
+            matches!(stale, PairError::PairCode(PairCodeError::Cancelled)),
+            "expected Cancelled, got {stale:?}"
+        );
+
+        answer_companion_hello(&client, &transport, 1, b"3@2:second").await;
+        second
+            .await
+            .expect("the pair-code task should not panic")
+            .expect("the replacement owns the slot and must complete");
+        assert!(
+            matches!(
+                &*client.pair_code_state.lock().await,
+                PairCodeState::WaitingForPhoneConfirmation { pairing_ref, .. }
+                    if pairing_ref.as_slice() == b"3@2:second"
+            ),
+            "the replacement's flow must be the one left standing"
+        );
+    }
+
+    /// Regression: the code's validity window and the link's are different
+    /// clocks. A `primary_hello` accepted near the end of the window leaves
+    /// `companion_finish` pending for up to a minute more, and a new request
+    /// started in that gap races the pending pair-success for the adv secret.
+    #[tokio::test]
+    async fn a_pending_pair_success_still_owns_the_slot() {
+        let (client, _transport) = create_iq_test_client().await;
+        let expired =
+            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        // Stage 2 ran: companion_finish is out, pair-success is pending.
+        set_waiting(&client, vec![1, 2, 3, 4], expired, 1).await;
+
+        let err = client
+            .pair_with_code(options())
+            .await
+            .expect_err("a pending link still owns the flow");
+        assert!(
+            matches!(
+                err,
+                PairError::PairCode(PairCodeError::CodeAlreadyOutstanding { .. })
+            ),
+            "expected CodeAlreadyOutstanding, got {err:?}"
+        );
+    }
+
+    /// Regression: an accepted retry deserves its own response window. Timers
+    /// keyed only on the shared `pairing_ref` let the first attempt's timer
+    /// retire a flow the second attempt had just renewed.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_gets_its_own_response_window() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = primary_hello_notif(&pairing_ref);
+        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
+        poll_until("the first companion_finish", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        // Most of the first attempt's window goes by, then the phone retries.
+        advance_past(std::time::Duration::from_secs(50)).await;
+        let retry = primary_hello_notif(&pairing_ref);
+        assert!(handle_pair_code_notification(&client, &retry.as_node_ref()).await);
+        poll_until("the second companion_finish", || {
+            transport.sent().len() >= 2
+        })
+        .await;
+
+        // The first attempt's timer is due about now; the retry's is not.
+        advance_past(std::time::Duration::from_secs(15)).await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(_))),
+            "the first attempt's timer must not cut the retry's window short"
+        );
+
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        poll_until("the retry's own timeout", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(_)))
+        })
+        .await;
+    }
+
+    /// Regression: the pairing ref and any in-flight `companion_hello` belong to
+    /// the connection that carried them. Left standing across a teardown, they
+    /// make the one-code guard reject the request that reconnecting is supposed
+    /// to enable — for the rest of the validity window.
+    #[tokio::test]
+    async fn a_teardown_does_not_leave_the_slot_claimed() {
+        let (client, _transport) = create_iq_test_client().await;
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+
+        client.cleanup_connection_state().await;
+
+        assert!(
+            matches!(&*client.pair_code_state.lock().await, PairCodeState::Idle),
+            "a flow scoped to a dead connection must not outlive it"
+        );
     }
 
     // ── Stage-2 liveness (WA Web parity) ─────────────────────────────────────

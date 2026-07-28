@@ -216,13 +216,13 @@ mod tests {
         );
     }
 
-    /// The one place we deliberately diverge: WA Web rotates unconditionally,
-    /// but a pair-code flow past stage 2 has already derived the ADV secret the
-    /// upcoming `pair-success` HMAC is computed over. Rotating it there would
-    /// swap a working link for a failing one, so the QR-side refresh yields to
-    /// the outstanding phone-number flow.
+    /// A code that is merely displayed does not depend on the current ADV
+    /// secret — stage 2 derives and persists a fresh one when the phone
+    /// answers. Deferring there would protect nothing while leaving the QR,
+    /// which shares the connection, advertising registration material the
+    /// server asked to retire for the code's whole validity window.
     #[tokio::test]
-    async fn companion_reg_refresh_leaves_an_outstanding_pair_code_alone() {
+    async fn a_merely_displayed_code_does_not_defer_the_rotation() {
         use wacore::libsignal::protocol::KeyPair;
         use wacore::pair_code::PairCodeState;
 
@@ -242,10 +242,10 @@ mod tests {
         let notif = companion_reg_refresh_notif("companion_reg_refresh");
         handle_notification_impl(&client, node_to_arc(notif)).await;
 
-        assert_eq!(
+        assert_ne!(
             adv_secret(&client).await,
             before,
-            "rotating here would break the pair-success HMAC of the live pair-code flow"
+            "nothing depends on this secret yet, and the QR still needs it rotated"
         );
     }
 

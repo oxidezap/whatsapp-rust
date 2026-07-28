@@ -28,24 +28,16 @@ pub(super) async fn handle_companion_reg_refresh(client: &Arc<Client>, node: &No
     }
 
     // The one place we knowingly diverge from WA Web, which rotates
-    // unconditionally. Past stage 2 a phone-number flow has already derived the
-    // adv secret that the pair-success HMAC will be computed over, so rotating
-    // it there turns a link that was about to succeed into one that cannot. We
-    // deliberately cover the whole flow, not just that half: this request is
-    // about the QR payload, which an outstanding pair code is in the process of
-    // replacing anyway. The pending half outlives the code's own validity
-    // window, so it is tracked separately from it.
-    let defer_to_pair_code = {
-        let state = client.pair_code_state.lock().await;
-        state
-            .live_flow_remaining(wacore::time::now_secs())
-            .is_some()
-            || state.awaiting_pair_success()
-    };
-    if defer_to_pair_code {
+    // unconditionally. Once stage 2 has run, this is the secret the pending
+    // pair-success HMAC is computed over, and rotating it turns a link that was
+    // about to succeed into one that cannot. A code that is only displayed does
+    // not qualify: stage 2 derives its own secret when the phone answers, so
+    // deferring there would protect nothing while leaving the QR that shares
+    // this connection advertising material the server just retired.
+    if client.pair_code_state.lock().await.awaiting_pair_success() {
         debug!(
             target: "Client/PairRefresh",
-            "Server asked to refresh companion registration; keeping the adv secret an outstanding pair-code flow depends on"
+            "Server asked to refresh companion registration; keeping the adv secret a pending pair-success depends on"
         );
         return;
     }
@@ -63,4 +55,7 @@ pub(super) async fn handle_companion_reg_refresh(client: &Arc<Client>, node: &No
         target: "Client/PairRefresh",
         "Server asked to refresh companion registration; rotated the adv secret"
     );
+    // The QR on screen embeds the old secret; re-render it rather than let it
+    // stay scannable until its ref expires.
+    client.refresh_pairing_qr().await;
 }
