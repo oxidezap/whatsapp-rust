@@ -31,16 +31,18 @@ pub(super) async fn handle_companion_reg_refresh(client: &Arc<Client>, node: &No
     // unconditionally. Past stage 2 a phone-number flow has already derived the
     // adv secret that the pair-success HMAC will be computed over, so rotating
     // it there turns a link that was about to succeed into one that cannot. We
-    // cannot tell that half of the flow apart from its first half cheaply, and
-    // do not need to: this request is about the QR payload, which an
-    // outstanding pair code is in the process of replacing anyway.
-    if client
-        .pair_code_state
-        .lock()
-        .await
-        .live_flow_remaining(wacore::time::now_secs())
-        .is_some()
-    {
+    // deliberately cover the whole flow, not just that half: this request is
+    // about the QR payload, which an outstanding pair code is in the process of
+    // replacing anyway. The pending half outlives the code's own validity
+    // window, so it is tracked separately from it.
+    let defer_to_pair_code = {
+        let state = client.pair_code_state.lock().await;
+        state
+            .live_flow_remaining(wacore::time::now_secs())
+            .is_some()
+            || state.awaiting_pair_success()
+    };
+    if defer_to_pair_code {
         debug!(
             target: "Client/PairRefresh",
             "Server asked to refresh companion registration; keeping the adv secret an outstanding pair-code flow depends on"

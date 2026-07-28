@@ -56,27 +56,21 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                         warn!("Failed to send acknowledgement: {e:?}");
                     }
 
-                    let mut codes = Vec::new();
-
-                    let device_snapshot = client.persistence_manager.get_device_snapshot();
-                    let device_state = DeviceState {
-                        identity_key: device_snapshot.identity_key.clone(),
-                        noise_key: device_snapshot.noise_key.clone(),
-                        adv_secret_key: device_snapshot.adv_secret_key,
-                    };
-                    let client_type =
-                        companion_web_client_type_for_props(&device_snapshot.device_props);
-
-                    for grandchild in child.get_children_by_tag("ref") {
-                        if let Some(bytes) = grandchild.content_bytes()
-                            && let Ok(r) = std::str::from_utf8(bytes)
-                        {
-                            codes.push(PairUtils::make_qr_data(&device_state, r, client_type));
-                        }
-                    }
+                    // Refs, not payloads: the QR string embeds the ADV secret,
+                    // and anything that re-mints it mid-rotation (see the
+                    // `companion_reg_refresh` handler) would leave every queued
+                    // payload advertising a retired one. WA Web builds each
+                    // payload as it publishes the ref, from the state of that
+                    // moment.
+                    let refs: Vec<String> = child
+                        .get_children_by_tag("ref")
+                        .filter_map(|grandchild| {
+                            let bytes = grandchild.content_bytes()?;
+                            std::str::from_utf8(bytes).ok().map(str::to_owned)
+                        })
+                        .collect();
 
                     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
-                    let codes_clone = codes.clone();
                     let client_clone = client.clone();
 
                     client
@@ -84,7 +78,7 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                         .spawn(Box::pin(async move {
                             let mut is_first = true;
 
-                            for code in codes_clone {
+                            for pairing_ref in refs {
                                 // Guard: pairing may complete before this task gets polled
                                 // (single-threaded runtimes, fast auto-pair, mock servers)
                                 if client_clone.is_logged_in() {
@@ -99,6 +93,17 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                     std::time::Duration::from_secs(20)
                                 };
 
+                                let snapshot =
+                                    client_clone.persistence_manager.get_device_snapshot();
+                                let code = PairUtils::make_qr_data(
+                                    &DeviceState {
+                                        identity_key: snapshot.identity_key.clone(),
+                                        noise_key: snapshot.noise_key.clone(),
+                                        adv_secret_key: snapshot.adv_secret_key,
+                                    },
+                                    &pairing_ref,
+                                    companion_web_client_type_for_props(&snapshot.device_props),
+                                );
                                 client_clone.core.event_bus.dispatch(Event::PairingQrCode(
                                     crate::types::events::PairingQrCode::builder()
                                         .code(code)
@@ -545,6 +550,53 @@ mod tests {
             code_generation_ts: wacore::time::now_secs(),
             primary_hello_attempt_count: 0,
         };
+    }
+
+    /// Regression: the six payloads used to be built once, from a single
+    /// snapshot, and handed to the rotation task. Anything that re-mints the ADV
+    /// secret mid-rotation (see the `companion_reg_refresh` handler) then left
+    /// every queued payload advertising a secret the server had retired, so a
+    /// scan produced pairing data `handle_pair_success` verifies against the new
+    /// one. WA Web builds each payload when it publishes the ref, not up front.
+    #[tokio::test(start_paused = true)]
+    async fn each_qr_payload_carries_the_adv_secret_of_its_own_moment() {
+        use base64::Engine as _;
+
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        poll_until("the first QR code", || qr_codes_seen(&collector) >= 1).await;
+
+        let rotated = [7u8; 32];
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetAdvSecretKey(
+                rotated,
+            ))
+            .await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        poll_until("the second QR code", || qr_codes_seen(&collector) >= 2).await;
+
+        let expected = base64::engine::general_purpose::STANDARD.encode(rotated);
+        let codes: Vec<String> = collector
+            .events()
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::PairingQrCode(qr) => Some(qr.code.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !codes[0].contains(&expected),
+            "the first code predates the rotation"
+        );
+        assert!(
+            codes[1].contains(&expected),
+            "a code published after the rotation must advertise the new secret"
+        );
     }
 
     /// Regression: a pair-code flow outlives the QR refs. WA Web's rotation

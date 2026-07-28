@@ -90,9 +90,9 @@ mod groups;
 mod privacy_business;
 mod profile;
 
+use companion_reg::*;
 // `pub(crate)` re-export keeps `crate::handlers::notification::handle_local_identity_change`
 // resolving for device_registry.rs.
-use companion_reg::*;
 pub(crate) use device::*;
 use groups::*;
 use privacy_business::*;
@@ -177,6 +177,43 @@ mod tests {
         handle_notification_impl(&client, node_to_arc(notif)).await;
 
         assert_eq!(adv_secret(&client).await, before);
+    }
+
+    /// Regression: the displayed-code window and the pending-link window are not
+    /// the same. A `primary_hello` accepted near the end of the 180s validity
+    /// leaves `companion_finish` waiting up to another minute for pair-success,
+    /// and the ADV secret that HMAC is computed over is already derived — but
+    /// the code itself has expired, so a validity-only guard would rotate right
+    /// through it.
+    #[tokio::test]
+    async fn companion_reg_refresh_waits_for_a_pending_pair_success() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::pair_code::{PairCodeState, PairCodeUtils};
+
+        let client = create_test_client().await;
+        let expired =
+            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: b"3@2:ref".to_vec(),
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: expired,
+            // Stage 2 ran: companion_finish is out and pair-success is pending.
+            primary_hello_attempt_count: 1,
+        };
+        let before = adv_secret(&client).await;
+
+        let notif = companion_reg_refresh_notif("companion_reg_refresh");
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert_eq!(
+            adv_secret(&client).await,
+            before,
+            "the pending pair-success HMAC is computed over this secret"
+        );
     }
 
     /// The one place we deliberately diverge: WA Web rotates unconditionally,

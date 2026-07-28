@@ -192,25 +192,29 @@ impl Client {
         // guarding `startAltLinkingFlow` with `invariant(stage === Initialized)`
         // (`Alt/DeviceLinkingApi.js`); `cancel_pair_code` is our
         // `initializeAltDeviceLinking()`.
-        if let Some(remaining) = self
-            .pair_code_state
-            .lock()
-            .await
-            .live_flow_remaining(wacore::time::now_secs())
+        //
+        // Claimed under the same lock that reads it, because releasing it
+        // across the stage-1 round trip would let two concurrent callers both
+        // find the state idle. The stamp doubles as the validity clock, which
+        // WA Web also starts before the request (`startAltLinkingFlow` sets
+        // `codeGenerationTs` before sending), so the ~180s window covers the
+        // round trip rather than starting after it.
+        let code_generation_ts = wacore::time::now_secs();
         {
-            return Err(PairCodeError::CodeAlreadyOutstanding { remaining }.into());
+            let mut state = self.pair_code_state.lock().await;
+            if let Some(remaining) = state.live_flow_remaining(code_generation_ts) {
+                return Err(PairCodeError::CodeAlreadyOutstanding { remaining }.into());
+            }
+            *state = PairCodeState::RequestingCode { code_generation_ts };
         }
+        // From here on every failing exit path has to hand the claim back, or
+        // the client refuses to ever issue another code.
 
         info!(
             target: "Client/PairCode",
             "Starting pair code authentication for phone: {}",
             phone_number
         );
-
-        // Stamp the validity clock before companion_hello, matching WA Web
-        // (`startAltLinkingFlow` sets codeGenerationTs before sending), so the
-        // ~180s window covers the stage-1 round-trip rather than starting after it.
-        let code_generation_ts = wacore::time::now_secs();
 
         // Generate ephemeral keypair for this pairing session
         let ephemeral_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
@@ -292,10 +296,19 @@ impl Client {
             timeout: Some(std::time::Duration::from_secs(30)),
         };
 
-        let response = self.send_iq(query).await?;
+        let response = match self.send_iq(query).await {
+            Ok(response) => response,
+            Err(e) => {
+                self.release_code_claim(code_generation_ts).await;
+                return Err(e.into());
+            }
+        };
 
-        let pairing_ref = PairCodeUtils::parse_companion_hello_response(response.get())
-            .ok_or(PairCodeError::MissingPairingRef)?;
+        let Some(pairing_ref) = PairCodeUtils::parse_companion_hello_response(response.get())
+        else {
+            self.release_code_claim(code_generation_ts).await;
+            return Err(PairCodeError::MissingPairingRef.into());
+        };
 
         info!(
             target: "Client/PairCode",
@@ -303,15 +316,25 @@ impl Client {
             code
         );
 
-        // Store state for when phone confirms
-        *self.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
-            pairing_ref,
-            phone_jid: phone_number,
-            pair_code: code.clone(),
-            ephemeral_keypair: Box::new(ephemeral_keypair),
-            code_generation_ts,
-            primary_hello_attempt_count: 0,
-        };
+        // Store state for when phone confirms, unless the claim was withdrawn
+        // while stage 1 was in flight: installing over a cancellation would
+        // revive a flow the caller asked to drop, and over a replacement would
+        // strand the code that replacement returned.
+        {
+            let mut state = self.pair_code_state.lock().await;
+            if !matches!(&*state, PairCodeState::RequestingCode { code_generation_ts: ts } if *ts == code_generation_ts)
+            {
+                return Err(PairCodeError::Cancelled.into());
+            }
+            *state = PairCodeState::WaitingForPhoneConfirmation {
+                pairing_ref,
+                phone_jid: phone_number,
+                pair_code: code.clone(),
+                ephemeral_keypair: Box::new(ephemeral_keypair),
+                code_generation_ts,
+                primary_hello_attempt_count: 0,
+            };
+        }
 
         // Dispatch event for the user to display the code. The validity clock
         // started at `code_generation_ts` (before stage 1), so advertise the
@@ -331,6 +354,18 @@ impl Client {
         ));
 
         Ok(code)
+    }
+
+    /// Hand back a claim taken by [`Self::pair_with_code`] when stage 1 failed.
+    ///
+    /// Identified by its stamp, so a claim already superseded — by a
+    /// cancellation, or by the replacement that followed one — is left alone.
+    async fn release_code_claim(self: &Arc<Self>, code_generation_ts: i64) {
+        let mut state = self.pair_code_state.lock().await;
+        if matches!(&*state, PairCodeState::RequestingCode { code_generation_ts: ts } if *ts == code_generation_ts)
+        {
+            *state = PairCodeState::Idle;
+        }
     }
 
     /// Abandons the outstanding pair-code flow, if any.
@@ -500,6 +535,12 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     drop(state_guard);
 
     let client = Arc::clone(client);
+    // Armed on acceptance, matching WA Web: `primaryHelloReceivedAltLinking`
+    // fires before `handlePrimaryHelloInternal` runs, so the screen's clock
+    // starts on the notification. Waiting for a successful `companion_finish`
+    // would leave a failed stage 2 with no timeout at all — the case that most
+    // needs the consumer to hear about it.
+    start_pair_success_timeout(Arc::clone(&client), pairing_ref.clone());
     client.clone().runtime.spawn_detached(Box::pin(async move {
         run_stage_two(
             client,
@@ -537,11 +578,18 @@ async fn run_stage_two(
     primary_identity_pub: [u8; 32],
 ) {
     let state_guard = client.pair_code_state.lock().await;
-    // pair-success may have landed while this task waited for the lock.
-    if !matches!(
+    // The flow can be retired while this task waits for the lock — by
+    // pair-success, a cancellation, or a replacement code. Matching the ref
+    // rather than the variant is what tells a replacement apart from our own
+    // flow: answering for one would persist a retired adv secret over the
+    // replacement's and put a `companion_finish` on the wire for a ref nobody
+    // holds.
+    let still_ours = matches!(
         &*state_guard,
-        PairCodeState::WaitingForPhoneConfirmation { .. }
-    ) {
+        PairCodeState::WaitingForPhoneConfirmation { pairing_ref: current, .. }
+            if current.as_slice() == pairing_ref.as_slice()
+    );
+    if !still_ours {
         return;
     }
 
@@ -616,10 +664,8 @@ async fn run_stage_two(
     );
 
     // State stays WaitingForPhoneConfirmation so a retry can reuse it; only
-    // pair-success (see `crate::pair`) transitions to Completed.
-    drop(state_guard);
-
-    start_pair_success_timeout(client, pairing_ref);
+    // pair-success (see `crate::pair`) transitions to Completed. The timeout
+    // that answers for this send was armed by the caller, on acceptance.
 }
 
 /// Write the code off if `pair-success` never answers `companion_finish`.
@@ -1189,6 +1235,99 @@ mod tests {
         );
     }
 
+    /// Regression: the guard has to survive two callers, not just two calls.
+    /// Checking the state and then releasing the lock across the
+    /// `companion_hello` round trip lets both pass, and the second response
+    /// overwrites the first flow's key material — so the code returned first
+    /// can no longer complete.
+    #[tokio::test]
+    async fn a_request_racing_another_is_refused_too() {
+        let (client, transport) = create_iq_test_client().await;
+
+        let first = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the first companion_hello to be on the wire", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        let second = client.pair_with_code(options()).await;
+        assert!(
+            matches!(
+                second,
+                Err(PairError::PairCode(
+                    PairCodeError::CodeAlreadyOutstanding { .. }
+                ))
+            ),
+            "a request in flight already owns the slot, got {second:?}"
+        );
+
+        answer_companion_hello(&client, &transport, 0, b"3@2:first").await;
+        first
+            .await
+            .expect("the pair-code task should not panic")
+            .expect("the winner still completes");
+    }
+
+    /// ...and a request that fails must hand the slot back, or the client is
+    /// stuck refusing to issue any code at all.
+    #[tokio::test]
+    async fn a_rejected_request_frees_the_slot() {
+        let (client, transport) = create_iq_test_client().await;
+
+        let first = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        let hello = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = hello
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("companion_hello carries an id")
+            .into_owned();
+        let error = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net".to_string()),
+                ("type", "error".to_string()),
+                ("id", id.clone()),
+            ])
+            .children([NodeBuilder::new("error")
+                .attrs([
+                    ("code", "400".to_string()),
+                    ("text", "bad-request".to_string()),
+                ])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &error).await;
+        first
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("the server rejected this one");
+
+        let retry = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        answer_companion_hello(&client, &transport, 1, b"3@2:second").await;
+        retry
+            .await
+            .expect("the pair-code task should not panic")
+            .expect("a rejected request must not leave the slot taken");
+    }
+
+    /// Move the clock past `d`, after giving spawned tasks a turn to register
+    /// their timers. A jump taken before the sleep exists only pushes its
+    /// deadline out of reach.
+    async fn advance_past(d: std::time::Duration) {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(d + std::time::Duration::from_secs(1)).await;
+    }
+
     // ── Stage-2 liveness (WA Web parity) ─────────────────────────────────────
 
     /// Regression: WA Web acks the `primary_hello` notification before stage 2
@@ -1218,6 +1357,73 @@ mod tests {
         .await;
     }
 
+    /// Cancelling mid-request must not be undone when stage 1 lands: installing
+    /// the flow anyway would revive one the caller dropped, and would overwrite
+    /// whatever replaced it.
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_install_its_flow() {
+        let (client, transport) = create_iq_test_client().await;
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the companion_hello to be on the wire", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        client.cancel_pair_code().await;
+        answer_companion_hello(&client, &transport, 0, b"3@2:late").await;
+
+        let err = pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("a cancelled request must not report a usable code");
+        assert!(
+            matches!(err, PairError::PairCode(PairCodeError::Cancelled)),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(
+            !is_waiting(&client).await,
+            "the cancelled flow must stay cancelled"
+        );
+    }
+
+    /// Regression: a stage-2 task can be scheduled and then find, once it has
+    /// the lock, that its flow was replaced rather than merely retired. Matching
+    /// on the variant alone reads the replacement as its own flow, and it would
+    /// then persist a retired adv secret and answer with a `companion_finish`
+    /// keyed to the old ref — breaking the replacement that was about to work.
+    #[tokio::test]
+    async fn a_stage_two_task_does_not_answer_for_the_flow_that_replaced_it() {
+        let (client, transport) = create_iq_test_client().await;
+        // The replacement: a live flow, but not the one stage 2 was spawned for.
+        set_waiting(&client, vec![9, 9, 9, 9], wacore::time::now_secs(), 0).await;
+        let adv_before = adv(&client);
+
+        run_stage_two(
+            client.clone(),
+            vec![1, 2, 3, 4],
+            "15551234567".to_string(),
+            "ABCD1234".to_string(),
+            KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
+            vec![7u8; 80],
+            [9u8; 32],
+        )
+        .await;
+
+        assert_eq!(
+            adv(&client),
+            adv_before,
+            "the replacement flow's adv secret must survive"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "no companion_finish may go out for a ref nobody is holding"
+        );
+    }
+
     /// Regression: `companion_finish` leaving the socket is not the end of the
     /// flow — the server may still never send `pair-success` (a primary that
     /// could not open the key bundle simply goes quiet). WA Web arms a
@@ -1240,10 +1446,7 @@ mod tests {
         })
         .await;
 
-        tokio::time::advance(
-            PairCodeUtils::primary_hello_pair_success_timeout() + std::time::Duration::from_secs(1),
-        )
-        .await;
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
         poll_until("the regeneration request", || {
             collector
                 .events()
@@ -1255,6 +1458,33 @@ mod tests {
             !is_waiting(&client).await,
             "the abandoned flow must not reject the replacement it just asked for"
         );
+    }
+
+    /// Regression: WA Web starts the one-minute clock when the notification
+    /// arrives (`primaryHelloReceivedAltLinking` fires before
+    /// `handlePrimaryHelloInternal` runs), not when `companion_finish` lands.
+    /// Arming it after the send means stage 2 failing leaves the consumer with
+    /// no signal at all — the one case where it most needs one.
+    #[tokio::test(start_paused = true)]
+    async fn the_timeout_is_armed_even_when_stage_two_cannot_run() {
+        // No transport, so the companion_finish send fails.
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = primary_hello_notif(&pairing_ref);
+        assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
+
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        poll_until("the regeneration request", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if !r.force_manual))
+        })
+        .await;
     }
 
     /// The timer must not fire once pairing actually completed, or a freshly
@@ -1277,11 +1507,12 @@ mod tests {
         // What `handle_pair_success` does once the server confirms the link.
         *client.pair_code_state.lock().await = PairCodeState::Completed;
 
-        tokio::time::advance(
-            PairCodeUtils::primary_hello_pair_success_timeout() + std::time::Duration::from_secs(1),
-        )
-        .await;
-        poll_until("the timer to have had its chance", || true).await;
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        // The timer task is spawned, so it needs turns of the executor, not just
+        // a clock jump — `poll_until` would return on its first check here.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
         assert!(
             !collector
                 .events()

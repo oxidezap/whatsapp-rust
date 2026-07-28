@@ -166,6 +166,19 @@ pub enum PairCodeState {
     /// Initial state - no pair code request in progress.
     #[default]
     Idle,
+    /// `companion_hello` is in flight and the slot is already spoken for.
+    ///
+    /// Checking for a live flow and then releasing the lock across the stage-1
+    /// round trip would let two concurrent callers both mint a code, and the
+    /// second response would overwrite the first flow's ephemeral keypair —
+    /// stranding the code that was returned first. WA Web tracks the same
+    /// window as a distinct stage (`AfterSendCompanionHello` follows
+    /// `Initialized` before the request resolves).
+    RequestingCode {
+        /// Stamped before `companion_hello`, and carried into
+        /// [`Self::WaitingForPhoneConfirmation`] unchanged.
+        code_generation_ts: i64,
+    },
     /// Stage 1 complete - waiting for phone to confirm code entry.
     WaitingForPhoneConfirmation {
         /// Reference returned by server in stage 1.
@@ -204,10 +217,29 @@ impl PairCodeState {
     ///
     /// The boundary matches [`PairCodeUtils::code_validity`] as applied in
     /// stage 2, which rejects only `age > validity`.
+    /// Whether a `companion_finish` is out and its `pair-success` still due.
+    ///
+    /// Distinct from [`Self::live_flow_remaining`], which tracks how long the
+    /// *code* stays enterable. A `primary_hello` accepted near the end of that
+    /// window leaves the link pending for up to
+    /// [`PairCodeUtils::primary_hello_pair_success_timeout`] longer, and the adv
+    /// secret its HMAC is computed over is already derived — so anything that
+    /// would re-mint that secret has to wait for this, not for the code.
+    pub fn awaiting_pair_success(&self) -> bool {
+        matches!(
+            self,
+            Self::WaitingForPhoneConfirmation {
+                primary_hello_attempt_count: 1..,
+                ..
+            }
+        )
+    }
+
     pub fn live_flow_remaining(&self, now: i64) -> Option<std::time::Duration> {
-        let Self::WaitingForPhoneConfirmation {
+        let (Self::RequestingCode { code_generation_ts }
+        | Self::WaitingForPhoneConfirmation {
             code_generation_ts, ..
-        } = self
+        }) = self
         else {
             return None;
         };
@@ -223,6 +255,7 @@ impl std::fmt::Debug for PairCodeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Idle => write!(f, "Idle"),
+            Self::RequestingCode { .. } => write!(f, "RequestingCode"),
             Self::WaitingForPhoneConfirmation { phone_jid, .. } => f
                 .debug_struct("WaitingForPhoneConfirmation")
                 .field("phone_jid", phone_jid)
@@ -616,6 +649,11 @@ pub enum PairCodeError {
 
     #[error("server response missing pairing ref")]
     MissingPairingRef,
+
+    /// The flow was cancelled (or replaced) while `companion_hello` was in
+    /// flight, so the code stage 1 produced was never installed.
+    #[error("the pair-code flow was cancelled while it was being requested")]
+    Cancelled,
 }
 
 #[cfg(test)]
