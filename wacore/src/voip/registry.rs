@@ -1452,23 +1452,48 @@ impl CallRegistry {
     /// Roster updates may be coalesced under backpressure; losing the only pending epoch would leave
     /// the media engine permanently unable to decrypt the latest generation.
     fn force_send_preserving_epoch(tx: &GroupControlQueue, mut command: GroupControl) -> bool {
+        let latest_update_transaction = match &command {
+            GroupControl::Update(update) | GroupControl::Transition { update, .. } => {
+                Some(update.transaction_id)
+            }
+            GroupControl::RawEpoch(_) | GroupControl::Reaction(_) => None,
+        };
         loop {
             let queued_epoch = command.epoch_transaction_id();
             tx.max_payload_bytes
                 .fetch_max(command.heap_bytes(), Ordering::Relaxed);
-            // Each retry keeps the newer of the queued and evicted epochs. Because the mailbox is
-            // bounded, it eventually evicts a non-epoch or an older epoch and returns.
+            // Each retry keeps the newer of the queued and evicted epochs. If the rotation reaches
+            // the roster this delivery just inserted, put that roster back once and shed the next
+            // epoch instead. Existing Transition pairs remain indivisible, while an epoch-only full
+            // mailbox still reserves one slot for the newest authoritative snapshot.
             match tx.tx.force_send(command) {
-                Ok(Some(evicted))
+                Ok(Some(evicted)) => {
+                    let evicted_latest_update = latest_update_transaction.is_some_and(
+                        |latest_transaction| match &evicted {
+                            GroupControl::Update(update)
+                            | GroupControl::Transition { update, .. } => {
+                                update.transaction_id == latest_transaction
+                            }
+                            GroupControl::RawEpoch(_) | GroupControl::Reaction(_) => false,
+                        },
+                    );
+                    if evicted_latest_update {
+                        tx.max_payload_bytes
+                            .fetch_max(evicted.heap_bytes(), Ordering::Relaxed);
+                        return tx.tx.force_send(evicted).is_ok();
+                    }
                     if evicted
                         .epoch_transaction_id()
                         .is_some_and(|evicted_transaction| {
                             queued_epoch.is_none_or(|queued| evicted_transaction > queued)
-                        }) =>
-                {
-                    command = evicted;
+                        })
+                    {
+                        command = evicted;
+                    } else {
+                        return true;
+                    }
                 }
-                Ok(_) => return true,
+                Ok(None) => return true,
                 Err(_) => return false,
             }
         }
@@ -2705,6 +2730,44 @@ mod tests {
                 |control| matches!(control, GroupControl::Update(update) if update.transaction_id == 9)
             ),
             "roster coalescing must retain the newest independent update"
+        );
+    }
+
+    #[test]
+    fn bounded_group_mailbox_preserves_roster_when_every_slot_has_an_epoch() {
+        let (raw_tx, rx) = async_channel::bounded(2);
+        let tx = GroupControlQueue::new(raw_tx);
+        for transaction_id in 8..=9 {
+            assert!(CallRegistry::force_send_preserving_epoch(
+                &tx,
+                GroupControl::RawEpoch(GroupRawEpoch::new(
+                    transaction_id,
+                    vec![transaction_id as u8; 32],
+                )),
+            ));
+        }
+
+        assert!(CallRegistry::force_send_preserving_epoch(
+            &tx,
+            GroupControl::Update(Box::new(group_update(10))),
+        ));
+
+        let controls = [rx.try_recv().unwrap(), rx.try_recv().unwrap()];
+        assert!(
+            controls.iter().any(|control| matches!(
+                control,
+                GroupControl::Update(update) | GroupControl::Transition { update, .. }
+                    if update.transaction_id == 10
+            )),
+            "epoch preservation must not evict the newest authoritative roster"
+        );
+        assert!(
+            controls
+                .iter()
+                .filter_map(GroupControl::epoch_transaction_id)
+                .max()
+                .is_some_and(|transaction_id| transaction_id == 9),
+            "the newest queued epoch must remain resident with the roster"
         );
     }
 

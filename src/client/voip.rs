@@ -85,10 +85,15 @@ enum PendingCallLinkTransition {
     Group(Box<GroupCallUpdate>),
     WaitingRoom(WaitingRoom),
     RawEpoch {
+        call_creator: Jid,
+        sender: Jid,
         transaction_id: u32,
         raw_epoch: Zeroizing<Vec<u8>>,
     },
-    Terminated,
+    Terminated {
+        call_creator: Jid,
+        sender: Jid,
+    },
     Saturated,
 }
 
@@ -122,11 +127,27 @@ impl PendingCallLinkTransition {
     }
 
     fn heap_bytes(&self) -> usize {
+        use wacore::stats::HeapSize;
+
         match self {
             Self::Group(update) => Self::group_heap_bytes(update),
             Self::WaitingRoom(room) => Self::waiting_room_heap_bytes(room),
-            Self::RawEpoch { raw_epoch, .. } => raw_epoch.capacity(),
-            Self::Terminated | Self::Saturated => 0,
+            Self::RawEpoch {
+                call_creator,
+                sender,
+                raw_epoch,
+                ..
+            } => call_creator
+                .heap_bytes()
+                .saturating_add(sender.heap_bytes())
+                .saturating_add(raw_epoch.capacity()),
+            Self::Terminated {
+                call_creator,
+                sender,
+            } => call_creator
+                .heap_bytes()
+                .saturating_add(sender.heap_bytes()),
+            Self::Saturated => 0,
         }
     }
 }
@@ -338,7 +359,7 @@ impl Client {
                 PendingCallLinkTransition::Group(update) => Some(update.transaction_id),
                 PendingCallLinkTransition::WaitingRoom(_)
                 | PendingCallLinkTransition::RawEpoch { .. }
-                | PendingCallLinkTransition::Terminated
+                | PendingCallLinkTransition::Terminated { .. }
                 | PendingCallLinkTransition::Saturated => None,
             })
             .is_some_and(|transaction_id| transaction_id >= update.transaction_id)
@@ -391,7 +412,14 @@ impl Client {
             .flatten()
             .rev()
             .find_map(|transition| match transition {
-                PendingCallLinkTransition::RawEpoch { transaction_id, .. } => Some(*transaction_id),
+                PendingCallLinkTransition::RawEpoch {
+                    call_creator: retained_creator,
+                    sender: retained_sender,
+                    transaction_id,
+                    ..
+                } if retained_creator == call_creator && retained_sender == sender => {
+                    Some(*transaction_id)
+                }
                 _ => None,
             })
             .is_some_and(|retained| retained >= transaction_id)
@@ -407,6 +435,8 @@ impl Client {
             .entry(call_id.to_string())
             .or_default()
             .push(PendingCallLinkTransition::RawEpoch {
+                call_creator: call_creator.clone(),
+                sender: sender.clone(),
                 transaction_id,
                 raw_epoch,
             });
@@ -440,7 +470,15 @@ impl Client {
             .get(call_id)
             .into_iter()
             .flatten()
-            .any(|transition| matches!(transition, PendingCallLinkTransition::Terminated))
+            .any(|transition| {
+                matches!(
+                    transition,
+                    PendingCallLinkTransition::Terminated {
+                        call_creator: retained_creator,
+                        sender: retained_sender,
+                    } if retained_creator == call_creator && retained_sender == sender
+                )
+            })
         {
             return PendingCallLinkBuffer::Buffered;
         }
@@ -452,7 +490,10 @@ impl Client {
             .transitions
             .entry(call_id.to_string())
             .or_default()
-            .push(PendingCallLinkTransition::Terminated);
+            .push(PendingCallLinkTransition::Terminated {
+                call_creator: call_creator.clone(),
+                sender: sender.clone(),
+            });
         PendingCallLinkBuffer::Buffered
     }
 
@@ -544,12 +585,10 @@ impl Client {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
-        if staged.iter().any(|transition| {
-            matches!(
-                transition,
-                PendingCallLinkTransition::Terminated | PendingCallLinkTransition::Saturated
-            )
-        }) {
+        if staged
+            .iter()
+            .any(|transition| matches!(transition, PendingCallLinkTransition::Saturated))
+        {
             return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
         }
         let generation = self.call_registry.insert_call_link_checked(session)?;
@@ -600,9 +639,19 @@ impl Client {
                     }
                 }
                 PendingCallLinkTransition::RawEpoch {
+                    call_creator: staged_creator,
+                    sender,
                     transaction_id,
                     raw_epoch,
                 } => {
+                    if !self.call_registry.group_sender_authorized_if_current(
+                        &call_id,
+                        generation,
+                        &staged_creator,
+                        &sender,
+                    ) {
+                        continue;
+                    }
                     if !self.call_registry.send_group_epoch_if_current(
                         &call_id,
                         generation,
@@ -613,7 +662,18 @@ impl Client {
                         return Err(wacore::voip::GroupStateApply::UnknownCall);
                     }
                 }
-                PendingCallLinkTransition::Terminated => {
+                PendingCallLinkTransition::Terminated {
+                    call_creator: staged_creator,
+                    sender,
+                } => {
+                    if !self.call_registry.group_creator_authorized_if_current(
+                        &call_id,
+                        generation,
+                        &staged_creator,
+                        &sender,
+                    ) {
+                        continue;
+                    }
                     self.call_registry.remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
@@ -2988,6 +3048,56 @@ mod tests {
                 .pending_group_epoch_transaction_if_current(call_id, generation),
             Some(7),
             "the decrypted epoch must survive until the media driver attaches"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn staged_call_link_epoch_and_termination_revalidate_provenance() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let call_id = "PROVENANCE-CALL-LINK";
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let asserted_creator = Jid::new("999999999999999", Server::Lid);
+        let asserted_sender = asserted_creator.clone().with_device(7);
+        let _pending = client.begin_call_link_join();
+
+        assert_eq!(
+            client.buffer_pending_call_link_epoch(
+                call_id,
+                &asserted_creator,
+                &asserted_sender,
+                7,
+                Zeroizing::new(vec![7; 32]),
+            ),
+            PendingCallLinkBuffer::Buffered
+        );
+        assert_eq!(
+            client
+                .buffer_pending_call_link_terminate(call_id, &asserted_creator, &asserted_sender,),
+            PendingCallLinkBuffer::Buffered
+        );
+
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::Connecting);
+        let generation = client
+            .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
+            .await
+            .expect("unauthorized staged controls must not abort the legitimate join");
+        assert!(
+            client.call_registry().is_current(call_id, generation),
+            "the unauthorized terminal marker must be ignored after registration"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .pending_group_epoch_transaction_if_current(call_id, generation),
+            None,
+            "the unauthorized epoch must not enter the registered generation"
         );
         client
             .call_registry()
