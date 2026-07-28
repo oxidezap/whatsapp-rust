@@ -19,7 +19,7 @@ use wacore::types::call::{CallAction, CallActionTag, IncomingCall, MissedCall, M
 use wacore::types::call::{CallEndedElsewhere, ElsewhereOutcome, VideoState};
 use wacore::types::events::Event;
 #[cfg(feature = "voip-runtime")]
-use wacore::types::group_call::{GroupCallDevice, GroupCallEncRekey};
+use wacore::types::group_call::{GroupCallDevice, GroupCallEncRekey, ScreenShareState};
 #[cfg(feature = "voip-runtime")]
 use wacore::voip::GroupStateApply;
 #[cfg(feature = "voip-runtime")]
@@ -611,20 +611,39 @@ impl StanzaHandler for CallHandler {
                                         .map(|participant| (generation, participant))
                                 })
                             {
-                                client.call_registry().set_screen_share_if_current(
+                                let registry = client.call_registry();
+                                let media_allows_share = screen_share.state
+                                    != ScreenShareState::Started
+                                    || registry
+                                        .group_state_if_current(call_id, generation)
+                                        .and_then(|state| {
+                                            state
+                                                .snapshot()
+                                                .map(|snapshot| snapshot.media == "video")
+                                        })
+                                        .unwrap_or(false);
+                                if !media_allows_share {
+                                    warn!(
+                                        "call: rejected screen-share start for audio-only group {call_id}"
+                                    );
+                                    dispatch_call = false;
+                                } else if registry.set_screen_share_if_current(
                                     call_id,
                                     generation,
                                     &participant,
                                     screen_share.clone(),
-                                );
-                                client.call_registry().send_call_event_if_current(
-                                    call_id,
-                                    generation,
-                                    CallEvent::ScreenShareChanged {
-                                        participant,
-                                        screen_share: screen_share.clone(),
-                                    },
-                                );
+                                ) {
+                                    registry.send_call_event_if_current(
+                                        call_id,
+                                        generation,
+                                        CallEvent::ScreenShareChanged {
+                                            participant,
+                                            screen_share: screen_share.clone(),
+                                        },
+                                    );
+                                } else {
+                                    dispatch_call = false;
+                                }
                             } else {
                                 warn!(
                                     "call: rejected screen-share state from unauthorized sender for {call_id}"
@@ -1561,6 +1580,86 @@ mod tests {
             "unauthorized video state must not reach the public event bus"
         );
         registry.remove_if_current("GROUP-CALL", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn remote_screen_share_start_is_rejected_for_an_audio_only_group() {
+        use wacore::types::group_call::{GroupCallParticipant, GroupCallUpdate};
+        use wacore::voip::{CallSession, GroupStateApply};
+
+        let client = make_sending_client().await;
+        let creator = fake_caller_lid();
+        let participant = Jid::new("222222222222222", Server::Lid);
+        let participant_device = participant.clone().with_device(2);
+        let call_id = "AUDIO-GROUP-CALL";
+        let registry = client.call_registry();
+        let generation = registry.insert(CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        ));
+        let mut creator_roster = GroupCallParticipant::new(
+            creator.clone(),
+            vec![GroupCallDevice::new(creator.clone().with_device(1))],
+        );
+        creator_roster.state = Some("connected".to_string());
+        let mut participant_roster = GroupCallParticipant::new(
+            participant,
+            vec![GroupCallDevice::new(participant_device.clone())],
+        );
+        participant_roster.state = Some("connected".to_string());
+        assert_eq!(
+            registry.apply_group_update(
+                GroupCallUpdate::builder()
+                    .call_id(call_id.to_string())
+                    .call_creator(creator.clone())
+                    .transaction_id(1)
+                    .media("audio".to_string())
+                    .connected_limit(32)
+                    .joinable(true)
+                    .av_upgradable(true)
+                    .rekey_requested(false)
+                    .participants(vec![creator_roster, participant_roster])
+                    .build()
+            ),
+            GroupStateApply::Applied
+        );
+        let (handler, global_rx) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+        let stanza = NodeBuilder::new("call")
+            .attr("from", Jid::new(call_id, Server::Call))
+            .attr("participant", participant_device)
+            .attr("id", "AUDIO-GROUP-SCREEN-SHARE")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new(CallActionTag::ScreenShare.as_str())
+                .attr("call-id", call_id)
+                .attr("call-creator", creator)
+                .attr("screenshare_state", "1")
+                .attr("version", "2")
+                .attr("screen_share_id", "7")
+                .build()])
+            .build();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
+                .await
+        );
+        assert!(cancelled, "the typed control must still receive its ACK");
+        assert!(
+            registry
+                .group_state_if_current(call_id, generation)
+                .expect("group state")
+                .screen_shares()
+                .is_empty(),
+            "an audio-only roster must not retain a remote screen-share start"
+        );
+        assert!(
+            global_rx.try_recv().is_err(),
+            "the rejected screen-share start must not reach the public event bus"
+        );
+        registry.remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-runtime")]

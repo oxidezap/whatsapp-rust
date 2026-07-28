@@ -1784,6 +1784,12 @@ impl CallEngine {
 
     fn on_rtcp(&mut self, now: Millis, pkt: &[u8]) {
         if self.group.is_some() {
+            if !self.group_epoch_ready() {
+                // A requested epoch retires the old shared SRTCP keys together with SRTP. Besides
+                // forged feedback, accepting a high old-key index here would advance the replay
+                // window that survives rekey and suppress legitimate packets under the new epoch.
+                return;
+            }
             let (audio_ssrc, video_ssrc) = match self.media.as_ref() {
                 Some(media) => (
                     media.pipe.send_ssrc(),
@@ -3099,6 +3105,73 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::EncodedAudio(_))),
             "inbound media must resume under the requested epoch"
+        );
+    }
+
+    #[test]
+    fn requested_group_rekey_gates_inbound_rtcp_and_its_replay_index() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys_from_raw, protect_srtcp};
+        use crate::voip::rtcp::RTCP_PT_RR;
+
+        let old_epoch = [0x42; 32];
+        let new_epoch = [0x48; 32];
+        let update = group_update();
+        let call_id = update.call_id.clone();
+        let peer_jid = update.participants[1].devices[0].jid.clone();
+        let peer_id = ssrc::format_e2e_srtp_participant_id(&peer_jid.to_string());
+        let peer_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &call_id,
+            &peer_id,
+            ssrc::WASM_RELAY_STREAM_SLOT_WORDS[0],
+        );
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &old_epoch).unwrap(),
+            GroupEpochApply::Installed
+        );
+        let local_ssrc = engine.media.as_ref().expect("group media").pipe.send_ssrc();
+        let protect = |epoch: &[u8], index| {
+            let mut rr = vec![0x81, RTCP_PT_RR, 0, 7];
+            rr.extend_from_slice(&peer_ssrc.to_be_bytes());
+            rr.extend_from_slice(&local_ssrc.to_be_bytes());
+            rr.extend_from_slice(&[0; 20]);
+            let keys = derive_srtcp_keys_from_raw(epoch, &peer_id).expect("peer group SRTCP keys");
+            protect_srtcp(&keys, peer_ssrc, index, &rr)
+        };
+
+        engine.handle_input(1, Input::RelayPacket(&protect(&old_epoch, 0)));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RtcpReceived { .. }))),
+            "the installed epoch must initially admit authenticated RTCP"
+        );
+
+        let mut rekey = update;
+        rekey.transaction_id = 8;
+        rekey.rekey_requested = true;
+        assert_eq!(
+            engine.apply_group_update(2, &rekey).unwrap(),
+            GroupRosterApply::Applied
+        );
+        engine.handle_input(3, Input::RelayPacket(&protect(&old_epoch, 10_000)));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Event(CallEvent::RtcpReceived { .. }))),
+            "old-key RTCP must not advance replay state while the requested epoch is pending"
+        );
+
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &new_epoch).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.handle_input(4, Input::RelayPacket(&protect(&new_epoch, 1)));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::RtcpReceived { .. }))),
+            "the low legitimate index must remain admissible after the requested rekey"
         );
     }
 
