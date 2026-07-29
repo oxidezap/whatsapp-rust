@@ -16,8 +16,8 @@ use wacore::client::context::{GroupInfo, SendContextResolver};
 use wacore::messages::MessageUtils;
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::send::{
-    GroupStanzaRequest, SenderKeyDistributionPolicy, SignalStores, prepare_group_stanza,
-    prepare_peer_stanza,
+    DmStanzaRequest, GroupStanzaRequest, ResolvedDmDevices, SenderKeyDistributionPolicy,
+    SignalStores, prepare_dm_stanza, prepare_group_stanza, prepare_peer_stanza,
 };
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore::types::message::AddressingMode;
@@ -344,6 +344,15 @@ impl User {
         }
     }
 
+    /// The same account on another device: same keys, distinct address. Real
+    /// DM fan-out targets several devices of one user, which `User::new` alone
+    /// cannot express since it derives the address from user+server.
+    fn with_device(mut self, device: u16) -> Self {
+        self.jid.device = device;
+        self.address = self.jid.to_protocol_address();
+        self
+    }
+
     fn prekey_bundle(&self) -> PreKeyBundle {
         PreKeyBundle::new(
             self.identity.reg_id,
@@ -542,10 +551,31 @@ fn decrypt_group(
 // DM setups
 // ---------------------------------------------------------------------------
 
+/// The `<device-identity>` blob a paired device carries.
+///
+/// Every send path takes `Option<&ADVSignedDeviceIdentity>` and behaves
+/// differently on `None`: `prepare_peer_stanza` runs a whole extra session
+/// checkout to pre-flight whether a pkmsg would be emitted, and the DM/group
+/// paths refuse a pkmsg outright. A paired device always has one
+/// (`device_snapshot.account.as_deref()`), so a bench that passes `None`
+/// measures a shape production never sends.
+///
+/// Only the bytes matter here — it is serialised into the stanza, never
+/// validated by the sender.
+fn bench_account() -> wa::ADVSignedDeviceIdentity {
+    wa::ADVSignedDeviceIdentity {
+        details: Some(vec![0xAD; 32]),
+        account_signature_key: Some(vec![0xAC; 32]),
+        account_signature: Some(vec![0x51; 64]),
+        device_signature: Some(vec![0xD5; 64]),
+    }
+}
+
 struct DmSendData {
     alice: User,
     bob_jid: Jid,
     msg: wa::Message,
+    account: wa::ADVSignedDeviceIdentity,
 }
 
 fn setup_dm_send() -> DmSendData {
@@ -556,6 +586,7 @@ fn setup_dm_send() -> DmSendData {
         alice,
         bob_jid: bob.jid,
         msg: text_msg(),
+        account: bench_account(),
     }
 }
 
@@ -571,7 +602,11 @@ fn setup_dm_recv() -> DmRecvData {
     let mut bob = User::new("5511999000002", "s.whatsapp.net");
     establish_bidirectional(&mut alice, &mut bob);
 
-    // Encrypt a message (subsequent, not PreKey — realistic steady-state)
+    // A `msg` rather than a `pkmsg`, but NOT steady state: Bob has not decrypted
+    // anything on this sending chain yet, so this first one costs him a DH ratchet
+    // step (two X25519 agreements plus a key generation). That is a real shape —
+    // the first message after the peer replies — but it is ~25x a steady-state
+    // decrypt, so the two need separate benches or the common case is invisible.
     let (ciphertext, enc_type) = futures::executor::block_on(async {
         let ct = message_encrypt(
             &MessageUtils::pad_message_v2(text_msg().encode_to_vec()),
@@ -737,6 +772,7 @@ fn setup_group_recv() -> GrpRecvData {
 
     let runtime = BenchRuntime;
     let message = text_msg();
+    let account = bench_account();
     let result = futures::executor::block_on(prepare_group_stanza(
         &runtime,
         &mut stores,
@@ -745,7 +781,7 @@ fn setup_group_recv() -> GrpRecvData {
             group: &group_info,
             own_jid: &own_jid,
             own_lid: &own_jid,
-            account: None,
+            account: Some(&account),
             to: &group_jid,
             message: &message,
             message_id: "bench-grp-recv",
@@ -774,8 +810,122 @@ fn setup_group_recv() -> GrpRecvData {
 // Benchmarks
 // ===========================================================================
 
+struct DmFanoutData {
+    alice: User,
+    to_jid: Jid,
+    msg: wa::Message,
+    account: wa::ADVSignedDeviceIdentity,
+    devices: ResolvedDmDevices,
+    resolver: MockResolver,
+    runtime: BenchRuntime,
+}
+
+/// The real 1:1 send: `prepare_dm_stanza`, which fans out to the recipient's
+/// devices and our own companions and builds the `<participants>` tree.
+///
+/// `n_recipient_devices` counts the contact's devices; one own companion is
+/// always added, because a paired account has at least the phone and this
+/// bench should not measure the degenerate zero-companion shape.
+fn setup_dm_fanout(n_recipient_devices: usize) -> DmFanoutData {
+    let mut alice = User::new("5511999000001", "s.whatsapp.net");
+    let own_jid = alice.jid.clone();
+    let to_base: Jid = "5511999000002@s.whatsapp.net".parse().unwrap();
+
+    let mut all_devices = Vec::with_capacity(n_recipient_devices + 1);
+    for i in 0..n_recipient_devices {
+        let mut device = to_base.clone();
+        device.device = i as u16;
+        let peer = User::new("5511999000002", "s.whatsapp.net").with_device(i as u16);
+        establish_session(&mut alice, &peer);
+        all_devices.push(device);
+    }
+    // One own companion, so the own-device half of the partition is exercised.
+    let mut companion = own_jid.clone();
+    companion.device = 42;
+    let own_peer = User::new("5511999000001", "s.whatsapp.net").with_device(42);
+    establish_session(&mut alice, &own_peer);
+    all_devices.push(companion);
+
+    let resolver = MockResolver(all_devices.clone());
+    let devices = ResolvedDmDevices::new(all_devices, &own_jid, None);
+    // Warm the phash memo in setup, as the per-recipient memo does for repeat
+    // sends in production; otherwise every iteration measures the cold path.
+    devices.phash();
+
+    DmFanoutData {
+        alice,
+        to_jid: to_base,
+        msg: text_msg(),
+        account: bench_account(),
+        devices,
+        resolver,
+        runtime: BenchRuntime,
+    }
+}
+
+fn setup_dm_fanout_1() -> DmFanoutData {
+    setup_dm_fanout(1)
+}
+fn setup_dm_fanout_4() -> DmFanoutData {
+    setup_dm_fanout(4)
+}
+
+fn run_dm_fanout(d: &mut DmFanoutData) {
+    let own_jid = d.alice.jid.clone();
+    let mut stores = SignalStores {
+        sender_key_store: &mut d.alice.sender_keys,
+        session_store: &mut d.alice.sessions,
+        identity_store: &mut d.alice.identity,
+        prekey_store: &mut d.alice.prekeys,
+        signed_prekey_store: &d.alice.signed_prekeys,
+    };
+    let prepared = futures::executor::block_on(prepare_dm_stanza(
+        &d.runtime,
+        &mut stores,
+        &d.resolver,
+        DmStanzaRequest {
+            own_jid: &own_jid,
+            account: Some(&d.account),
+            to: &d.to_jid,
+            message: &d.msg,
+            message_id: "b-dm",
+            edit: None,
+            extra_nodes: &[],
+            devices: &d.devices,
+            pre_encoded: None,
+        },
+    ))
+    .unwrap();
+    black_box(marshal(&prepared.node).unwrap());
+}
+
+/// The 1:1 path an actual message takes. Nothing covered this before: the only
+/// DM-shaped bench measured `prepare_peer_stanza`, which is the own-device peer
+/// path and skips the fan-out, the participants tree and the reporting token.
 #[divan::bench]
 fn bench_dm_send(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_dm_fanout_1)
+        .bench_refs(run_dm_fanout);
+}
+
+/// Multi-device recipient: the shape that actually spawns encrypt tasks.
+#[divan::bench]
+fn bench_dm_send_4_devices(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_dm_fanout_4)
+        .bench_refs(run_dm_fanout);
+}
+
+/// A peer stanza: what we send to our OWN other devices, not a DM to a contact.
+/// See `bench_dm_send` for the contact path.
+///
+/// `account` is `Some`, matching a paired device. With `None` the `&&` in
+/// `prepare_peer_stanza` does not short-circuit and every send pays an extra
+/// `SessionCheckout::load` + `commit()` just to pre-flight the pkmsg case —
+/// work production never does, and enough of it to move the baseline.
+#[divan::bench]
+fn bench_peer_send(bencher: divan::Bencher) {
     bencher.with_inputs(setup_dm_send).bench_refs(|d| {
         let signal_addr = d.bob_jid.to_protocol_address();
         let node = futures::executor::block_on(prepare_peer_stanza(
@@ -785,7 +935,7 @@ fn bench_dm_send(bencher: divan::Bencher) {
             &signal_addr,
             &d.msg,
             "b-001",
-            None,
+            Some(&d.account),
         ))
         .unwrap();
         black_box(marshal(&node).unwrap());
@@ -795,6 +945,63 @@ fn bench_dm_send(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_dm_recv(bencher: divan::Bencher) {
     bencher.with_inputs(setup_dm_recv).bench_refs(|d| {
+        black_box(decrypt_dm(
+            &d.ciphertext,
+            &d.enc_type,
+            &d.alice_addr,
+            &mut d.bob,
+        ));
+    });
+}
+
+/// Steady state: Bob has already ratcheted into Alice's current sending chain,
+/// so this decrypt is symmetric-only — no curve operation at all. This is what
+/// an active conversation actually pays per message, and it is roughly an order
+/// of magnitude cheaper than the ratchet step `bench_dm_recv` measures.
+fn setup_dm_recv_steady() -> DmRecvData {
+    let mut alice = User::new("5511999000001", "s.whatsapp.net");
+    let mut bob = User::new("5511999000002", "s.whatsapp.net");
+    establish_bidirectional(&mut alice, &mut bob);
+
+    let bob_addr = bob.address.clone();
+    fn encrypt_one(alice: &mut User, to: &ProtocolAddress) -> (Vec<u8>, String) {
+        futures::executor::block_on(async {
+            let ct = message_encrypt(
+                &MessageUtils::pad_message_v2(text_msg().encode_to_vec()),
+                to,
+                &mut alice.sessions,
+                &mut alice.identity,
+            )
+            .await
+            .unwrap();
+            match ct {
+                CiphertextMessage::SignalMessage(m) => (m.serialized().to_vec(), "msg".to_string()),
+                CiphertextMessage::PreKeySignalMessage(m) => {
+                    (m.serialized().to_vec(), "pkmsg".to_string())
+                }
+                _ => panic!("unexpected type"),
+            }
+        })
+    }
+
+    // Burn the ratchet step on a throwaway message, so the one we hand back is
+    // decrypted with the chain already advanced.
+    let (first, first_type) = encrypt_one(&mut alice, &bob_addr);
+    decrypt_dm(&first, &first_type, &alice.address, &mut bob);
+
+    let (ciphertext, enc_type) = encrypt_one(&mut alice, &bob_addr);
+
+    DmRecvData {
+        bob,
+        alice_addr: alice.address,
+        ciphertext,
+        enc_type,
+    }
+}
+
+#[divan::bench]
+fn bench_dm_recv_steady(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_recv_steady).bench_refs(|d| {
         black_box(decrypt_dm(
             &d.ciphertext,
             &d.enc_type,
@@ -827,6 +1034,7 @@ fn run_group_send(d: &mut GrpSendData) {
         signed_prekey_store: &d.alice.signed_prekeys,
     };
 
+    let account = bench_account();
     let result = futures::executor::block_on(prepare_group_stanza(
         &d.runtime,
         &mut stores,
@@ -835,7 +1043,7 @@ fn run_group_send(d: &mut GrpSendData) {
             group: &group_info,
             own_jid: &own_jid,
             own_lid: &own_jid,
-            account: None,
+            account: Some(&account),
             to: &d.group_jid,
             message: &d.msg,
             message_id: "b-grp",
