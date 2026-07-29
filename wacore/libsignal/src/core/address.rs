@@ -243,10 +243,17 @@ impl AddressBuf {
     #[inline]
     pub fn as_str(&self) -> &str {
         match &self.0 {
-            // Only whole `&str` fragments are ever appended, never split, so
-            // the inline bytes are valid UTF-8 by construction.
-            AddressRepr::Inline { bytes, len } => std::str::from_utf8(&bytes[..usize::from(*len)])
-                .expect("address is built from whole str fragments"),
+            AddressRepr::Inline { bytes, len } => {
+                let bytes = &bytes[..usize::from(*len)];
+                debug_assert!(std::str::from_utf8(bytes).is_ok());
+                // SAFETY: `push_str` is the only writer and it is all-or-nothing
+                // -- a fragment that would not fit promotes the whole buffer to
+                // the heap without copying anything, and `clear` only rewinds
+                // `len`, so `bytes[..len]` is always a concatenation of whole
+                // `&str` fragments. Writing raw bytes into the array, or copying
+                // a fragment prefix on overflow, breaks this.
+                unsafe { std::str::from_utf8_unchecked(bytes) }
+            }
             AddressRepr::Heap(buf) => buf,
         }
     }
@@ -620,6 +627,51 @@ mod address_buffer_tests {
         assert!(!spilled.buf.is_inline());
         assert_eq!(spilled.name(), format!("{filler}é"));
         assert_eq!(spilled.as_str(), format!("{filler}é.0"));
+    }
+
+    /// The inline arm hands out a `&str` without revalidating the bytes it just
+    /// wrote, so every shape that reaches it has to be read back through
+    /// `as_str()` under Miri: multibyte code points, a buffer filled to its last
+    /// byte, the overflow that promotes to the heap, and a rewind that leaves a
+    /// multibyte tail behind.
+    #[test]
+    fn every_inline_shape_reads_back_the_characters_that_were_written() {
+        let multibyte = "señor✅🎉@c.us";
+        let address = ProtocolAddress::new(multibyte, DeviceId::new(7));
+        assert!(address.buf.is_inline());
+        assert_eq!(address.as_str(), format!("{multibyte}.7"));
+        assert_eq!(address.name(), multibyte);
+
+        // Ends on a multibyte character and fills the buffer to the last byte,
+        // so the name/suffix split lands immediately after that character.
+        let tail = "é✅";
+        let suffix = ".0";
+        let name = format!(
+            "{}{tail}",
+            "a".repeat(INLINE_CAPACITY - suffix.len() - tail.len())
+        );
+        let exact = ProtocolAddress::new(&name, DeviceId::new(0));
+        assert!(exact.buf.is_inline(), "this name fills the buffer exactly");
+        assert_eq!(exact.as_str().len(), INLINE_CAPACITY);
+        assert_eq!(exact.name(), name);
+
+        // Four bytes more than fits: the whole fragment moves to the heap
+        // rather than the part of it that would have fit.
+        let mut spilled = ProtocolAddress::empty(DeviceId::new(0));
+        spilled.reset_with(|buf| {
+            buf.push_str(&name);
+            buf.push('🎉');
+        });
+        assert!(!spilled.buf.is_inline());
+        assert_eq!(spilled.as_str(), format!("{name}🎉.0"));
+
+        // Rewinding to a shorter name leaves the previous multibyte tail in the
+        // array; reading one byte past `len` would slice a character in half.
+        let mut reused = ProtocolAddress::new("aaaaaaaa🎉🎉@c.us", DeviceId::new(0));
+        assert!(reused.buf.is_inline());
+        reused.reset_with(|buf| buf.push_str("b@c.us"));
+        assert_eq!(reused.as_str(), "b@c.us.0");
+        assert_eq!(reused.name(), "b@c.us");
     }
 
     /// An empty name is a real state (a freshly reset address), and the
