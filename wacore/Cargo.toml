@@ -117,6 +117,10 @@ name = "token_lookup_benchmark"
 harness = false
 
 [[bench]]
+name = "signal_address_probe_benchmark"
+harness = false
+
+[[bench]]
 name = "history_sync_benchmark"
 harness = false
 
