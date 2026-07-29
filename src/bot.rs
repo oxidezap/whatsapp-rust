@@ -622,6 +622,10 @@ impl Bot {
                         info!(target: "Bot/PairCode", "Pair code generated: {}", code);
                     }
                     Err(e) => {
+                        // Only logged here: `pair_with_code` already dispatched
+                        // `Event::PairingCodeError`, which is what a consumer
+                        // observes — this task is detached, so returning the
+                        // error is not an option.
                         warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
                     }
                 }
@@ -996,6 +1000,36 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         })
     }
 
+    /// Run `handler` when a pair-code request fails, so no code will be issued
+    /// ([`Event::PairingCodeError`]).
+    ///
+    /// The counterpart to [`BotBuilder::on_pair_code`], and the only way to
+    /// observe the failure of a [`BotBuilder::with_pair_code`] request: that one
+    /// runs in a detached task, so its `Err` reaches no caller.
+    ///
+    /// Branch on `err.rejection` rather than the message.
+    /// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled)
+    /// is the case to slow down for — re-requesting on the original schedule
+    /// spends more of the budget the server just refused — and `err.backoff`
+    /// carries the server's own delay when it named one.
+    pub fn on_pair_code_error<F, Fut>(self, handler: F) -> Self
+    where
+        F: Fn(crate::types::events::PairingCodeError, Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_event_for(&[EventKind::PairingCodeError], move |event, client| {
+            let fut = match &*event {
+                Event::PairingCodeError(e) => Some(handler(e.clone(), client)),
+                _ => None,
+            };
+            async move {
+                if let Some(fut) = fut {
+                    fut.await
+                }
+            }
+        })
+    }
+
     /// Run `handler` when the server asks the companion to refresh an
     /// in-progress pairing code ([`Event::PairingCodeRefresh`]). The `bool` is
     /// `force_manual`. The typical reaction is to request a fresh code via
@@ -1156,6 +1190,12 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// a connection, and the pairing code will be dispatched via `Event::PairingCode`
     /// (see [`BotBuilder::on_pair_code`]). This runs concurrently with QR code
     /// pairing - whichever completes first wins.
+    ///
+    /// The request runs in a detached task, so a failure cannot be returned to
+    /// the caller: it arrives as `Event::PairingCodeError` instead (see
+    /// [`BotBuilder::on_pair_code_error`]). Subscribe to it if the consumer must
+    /// distinguish "still waiting for the user" from "no code is coming" — a
+    /// rate-limited request is otherwise indistinguishable from the former.
     ///
     /// # Example
     /// ```rust,ignore

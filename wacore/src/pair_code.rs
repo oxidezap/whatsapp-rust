@@ -620,6 +620,88 @@ impl PairCodeUtils {
     }
 }
 
+/// How the server refused a `companion_hello`, as a matchable status.
+///
+/// The five named variants are the complete set WA Web's own response parser
+/// accepts (`WASmaxInMdIqMixinErrors.parseIqMixinErrors`, reached from
+/// `WASmaxInMdCompanionHelloResponseError`); anything else makes its RPC throw
+/// "unknown error". They exist so a consumer can branch on the refusal instead
+/// of matching the formatted message, which is not a stable surface.
+///
+/// The numbers are the `code` attribute. WA Web pairs each with a literal
+/// `text` (`429`/`rate-overlimit`, `452`/`feature-not-available`, …) and
+/// rejects a response whose two disagree, so the code alone identifies the
+/// refusal.
+///
+/// WA Web branches on exactly two of them (`DevicePhoneNumberCodeScreen`, on
+/// `CompanionHelloError.type.name`): [`RateOverlimit`](Self::RateOverlimit)
+/// becomes "too many attempts, try again later" and
+/// [`FeatureNotAvailable`](Self::FeatureNotAvailable) becomes "not available to
+/// you yet, link with QR code instead". The rest share a generic "try again or
+/// link with the QR code". In every case it resets the linking flow and waits
+/// for the person to act — it never retries on its own, and never reads the
+/// `backoff` hint, so treat that value as the server's advice rather than a
+/// schedule WA Web is known to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+#[wire(kind = "int")]
+pub enum PairCodeRejection {
+    /// The request was malformed — **or** throttled for this phone number: the
+    /// server reuses `bad-request` for its per-number pair-code limit rather
+    /// than answering `rate-overlimit`. So this is not reliably a permanent
+    /// failure; see [`PairCodeRejection::is_throttled`].
+    #[wire = 400]
+    BadRequest,
+    #[wire = 403]
+    Forbidden,
+    /// The connection is asking for codes too fast. The server states the rate
+    /// is too high; the only correct response is to slow down.
+    #[wire = 429]
+    RateOverlimit,
+    /// Phone-number linking is not enabled for this account. Retrying will not
+    /// change that — WA Web sends the user to the QR code instead.
+    #[wire = 452]
+    FeatureNotAvailable,
+    #[wire = 500]
+    InternalServerError,
+    /// A `code` outside the set WA Web accepts. Its own RPC would raise
+    /// "unknown error" here; we keep the number so a consumer can log it and a
+    /// server-side addition is visible rather than silently reshaped.
+    #[wire_fallback]
+    Unknown(i32),
+}
+
+impl PairCodeRejection {
+    /// Whether this refusal is the server rate-limiting the request.
+    ///
+    /// True for [`RateOverlimit`](Self::RateOverlimit) and
+    /// [`BadRequest`](Self::BadRequest), because the server throttles pair-code
+    /// requests per phone number under `bad-request` instead of
+    /// `rate-overlimit`. That makes the predicate deliberately wider than the
+    /// literal 429: a `bad-request` may equally be genuinely invalid content,
+    /// and the two are indistinguishable on the wire. Treat a true here as
+    /// "back off, then retry at most a bounded number of times" — not as proof
+    /// the request would ever succeed.
+    pub fn is_throttled(self) -> bool {
+        matches!(self, Self::RateOverlimit | Self::BadRequest)
+    }
+}
+
+impl core::fmt::Display for PairCodeRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The `text` WA Web pairs with each code, so a log line reads like the
+        // stanza it came from.
+        let text = match self {
+            Self::BadRequest => "bad-request",
+            Self::Forbidden => "forbidden",
+            Self::RateOverlimit => "rate-overlimit",
+            Self::FeatureNotAvailable => "feature-not-available",
+            Self::InternalServerError => "internal-server-error",
+            Self::Unknown(code) => return write!(f, "unknown ({code})"),
+        };
+        write!(f, "{text} ({})", self.code())
+    }
+}
+
 /// Errors raised by wacore-side pair-code validation, key derivation, and
 /// protocol-bundle building. The high-level crate wraps this in
 /// `whatsapp_rust::pair_code::PairError` and adds an IQ-failure variant for the

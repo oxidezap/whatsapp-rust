@@ -68,7 +68,7 @@ use wacore_binary::Jid;
 use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
 pub use wacore::companion_reg::{CompanionOs, CompanionWebClientType};
-pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
+pub use wacore::pair_code::{PairCodeError, PairCodeOptions, PairCodeRejection};
 
 /// Errors raised by the high-level pair-code flow.
 ///
@@ -90,8 +90,42 @@ pub enum PairError {
     /// OS, so a display-shaped rejection is already ruled out — see
     /// [`wacore::companion_reg::CompanionOs`].) Any server `backoff` hint is
     /// preserved on the wrapped [`IqError`].
-    #[error("pair-code IQ request failed")]
+    ///
+    /// Renders what it wraps, per the [rendering
+    /// convention](crate::error#rendering) — so the code and text reach a log
+    /// line that only prints the error, without the reader having to reach for
+    /// the `Debug` form.
+    #[error("{0}")]
     RequestFailed(#[from] IqError),
+}
+
+// Imported inside each body, not at module scope: `ErrorChainExt::as_dyn_error`
+// would then be ambiguous with thiserror's own `AsDynError` for every `#[from]`
+// in this module.
+impl PairError {
+    /// How the server refused the request, as a status to branch on.
+    ///
+    /// `None` when nothing was refused: local validation, no connection, or a
+    /// request that went unanswered. Prefer this to matching the message, which
+    /// is not a stable surface.
+    pub fn rejection(&self) -> Option<PairCodeRejection> {
+        use crate::error::ErrorChainExt;
+        self.server_rejection()
+            .map(|rejection| PairCodeRejection::from(i32::from(rejection.code)))
+    }
+
+    /// How long the server asked the client to wait before retrying, from the
+    /// `backoff` attribute.
+    ///
+    /// Usually `None` — the server rarely populates it on this request, and WA
+    /// Web never reads it — but a value here is the server naming its own delay,
+    /// which beats an interval the consumer picked.
+    pub fn backoff(&self) -> Option<std::time::Duration> {
+        use crate::error::ErrorChainExt;
+        self.server_rejection()
+            .and_then(|rejection| rejection.backoff)
+            .map(|secs| std::time::Duration::from_secs(u64::from(secs)))
+    }
 }
 
 impl Client {
@@ -152,6 +186,35 @@ impl Client {
         tracing::instrument(name = "wa.pair.code", level = "debug", skip_all, err(Debug))
     )]
     pub async fn pair_with_code(
+        self: &Arc<Self>,
+        options: PairCodeOptions,
+    ) -> Result<String, PairError> {
+        // The failure is dispatched here rather than at each `return Err`
+        // below: stage 1 fails from a dozen places, and what a consumer needs
+        // from all of them is the same single fact — no code is coming. Wrapping
+        // the flow is also what stops a *later* early return from going
+        // unreported. `BotBuilder::with_pair_code` depends on it having no gaps,
+        // because it drives this from a detached task whose `Err` reaches nobody.
+        //
+        // Mirrors the success path, which likewise both returns the code and
+        // dispatches `Event::PairingCode`; a direct caller sees the failure
+        // twice, and a `with_pair_code` consumer sees it at all.
+        match self.pair_with_code_inner(options).await {
+            Ok(code) => Ok(code),
+            Err(e) => {
+                self.core.event_bus.dispatch(Event::PairingCodeError(
+                    crate::types::events::PairingCodeError::builder()
+                        .maybe_rejection(e.rejection())
+                        .maybe_backoff(e.backoff())
+                        .error(e.to_string())
+                        .build(),
+                ));
+                Err(e)
+            }
+        }
+    }
+
+    async fn pair_with_code_inner(
         self: &Arc<Self>,
         options: PairCodeOptions,
     ) -> Result<String, PairError> {
@@ -852,6 +915,130 @@ async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the five arms against `WASmaxInMdIqMixinErrors.parseIqMixinErrors`,
+    /// the complete set WA Web's `companion_hello` response parser accepts, so a
+    /// renumber can't silently break a consumer's branching.
+    #[test]
+    fn rejection_codes_match_wa_web() {
+        assert_eq!(PairCodeRejection::BadRequest.code(), 400);
+        assert_eq!(PairCodeRejection::Forbidden.code(), 403);
+        assert_eq!(PairCodeRejection::RateOverlimit.code(), 429);
+        assert_eq!(PairCodeRejection::FeatureNotAvailable.code(), 452);
+        assert_eq!(PairCodeRejection::InternalServerError.code(), 500);
+        // A code outside WA Web's set keeps its number rather than collapsing
+        // into a named arm.
+        assert_eq!(
+            PairCodeRejection::from(418),
+            PairCodeRejection::Unknown(418)
+        );
+    }
+
+    /// The whole point of the typed status: a 429 is recoverable as
+    /// `RateOverlimit` without matching the message.
+    #[test]
+    fn rate_overlimit_is_recoverable_as_a_typed_status() {
+        let pe: PairError = IqError::ServerError {
+            code: 429,
+            text: "rate-overlimit".into(),
+            error_type: None,
+            backoff: Some(30),
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::RateOverlimit));
+        assert_eq!(pe.backoff(), Some(std::time::Duration::from_secs(30)));
+        assert!(
+            pe.rejection().is_some_and(PairCodeRejection::is_throttled),
+            "429 must read as throttled"
+        );
+        // `RequestFailed` renders what it wraps, so a log line that prints only
+        // the error still names the refusal.
+        assert!(
+            pe.to_string().contains("429") && pe.to_string().contains("rate-overlimit"),
+            "Display should carry the server's code and text, got: {pe}"
+        );
+    }
+
+    /// `feature-not-available` is the one refusal that retrying cannot fix — it
+    /// must not read as throttled, or a consumer would back off forever instead
+    /// of falling back to the QR code the way WA Web does.
+    #[test]
+    fn feature_not_available_is_not_throttled() {
+        let pe: PairError = IqError::ServerError {
+            code: 452,
+            text: "feature-not-available".into(),
+            error_type: None,
+            backoff: None,
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::FeatureNotAvailable));
+        assert!(!PairCodeRejection::FeatureNotAvailable.is_throttled());
+        assert_eq!(pe.backoff(), None);
+    }
+
+    /// A failure that never reached the server has no status to report, so
+    /// `rejection` stays `None` rather than inventing one.
+    #[test]
+    fn local_failure_reports_no_rejection() {
+        let pe: PairError = PairCodeError::PhoneNumberTooShort.into();
+        assert_eq!(pe.rejection(), None);
+        assert_eq!(pe.backoff(), None);
+    }
+
+    /// The regression the event exists for: a failed request must be observable
+    /// on the bus, not only through the `Err` that
+    /// `BotBuilder::with_pair_code`'s detached task throws away.
+    ///
+    /// Uses a validation failure because it needs no server, and it covers the
+    /// harder half of the guarantee: the dispatch wraps the whole flow, so even
+    /// a path that returns before the IQ is built still reports.
+    #[tokio::test]
+    async fn failed_request_dispatches_pairing_code_error() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let err = client
+            .pair_with_code(PairCodeOptions {
+                phone_number: "123".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 3-digit number must be refused");
+        assert!(matches!(
+            err,
+            PairError::PairCode(PairCodeError::PhoneNumberTooShort)
+        ));
+
+        poll_until("a PairingCodeError to reach the bus", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_)))
+        })
+        .await;
+
+        let events = collector.events();
+        let dispatched = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::PairingCodeError(e) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("just polled for it");
+        assert_eq!(
+            dispatched.rejection, None,
+            "a local validation failure never reached the server"
+        );
+        assert_eq!(dispatched.backoff, None);
+        assert!(
+            dispatched.error.contains("too short"),
+            "the message should say what failed, got: {}",
+            dispatched.error
+        );
+    }
 
     #[test]
     fn pair_error_request_failed_preserves_iq_source() {

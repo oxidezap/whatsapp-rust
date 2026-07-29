@@ -222,6 +222,7 @@ pub enum EventKind {
     PairingQrCode,
     PairingCode,
     PairingCodeRefresh,
+    PairingCodeError,
     QrScannedWithoutMultidevice,
     ClientOutdated,
     Messages,
@@ -818,6 +819,7 @@ pub enum Event {
     PairingQrCode(PairingQrCode),
     PairingCode(PairingCode),
     PairingCodeRefresh(PairingCodeRefresh),
+    PairingCodeError(PairingCodeError),
     PairingQrCodesExhausted(PairingQrCodesExhausted),
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
@@ -995,6 +997,7 @@ impl Event {
             Event::PairingQrCode(_) => EventKind::PairingQrCode,
             Event::PairingCode(_) => EventKind::PairingCode,
             Event::PairingCodeRefresh(_) => EventKind::PairingCodeRefresh,
+            Event::PairingCodeError(_) => EventKind::PairingCodeError,
             Event::PairingQrCodesExhausted(_) => EventKind::PairingQrCodesExhausted,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
@@ -1235,6 +1238,46 @@ pub struct PairingCodeRefresh {
     /// `true` when the server set `force_manual_refresh` — the code must be
     /// re-requested explicitly rather than auto-rotated.
     pub force_manual: bool,
+}
+
+/// A phone-number pair-code request failed, so no code will be shown.
+///
+/// The counterpart to [`PairingCode`] on the failure path, and the only surface
+/// that reports it when pairing is driven by `BotBuilder::with_pair_code` —
+/// that request runs in a detached task, so nothing returns its error to the
+/// caller. `Client::pair_with_code` dispatches this in addition to returning
+/// `Err`, matching how the success path both returns the code and emits
+/// [`PairingCode`].
+///
+/// Fires for every failure, including local validation (a phone number that is
+/// too short never reaches the server): a consumer waiting on a code needs to
+/// learn that it is not coming, whatever the reason. [`rejection`](Self::rejection)
+/// is what distinguishes the two — `None` means the request never got an answer
+/// from the server.
+///
+/// The outstanding-code claim is released before this fires, so
+/// `pair_with_code` can be called again without `cancel_pair_code` first.
+/// Whether it *should* be is the point of the fields: back off on
+/// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled),
+/// stop on
+/// [`PairCodeRejection::FeatureNotAvailable`](crate::pair_code::PairCodeRejection::FeatureNotAvailable).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingCodeError {
+    /// The server's refusal, when it answered with one. `None` when the failure
+    /// was local (validation, no connection) or the request went unanswered
+    /// (timeout) — nothing was refused, so there is no status to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<crate::pair_code::PairCodeRejection>,
+    /// How long the server asked the client to wait, from the `backoff`
+    /// attribute. Usually absent — WA Web does not read it on this path — but
+    /// when present it is the server naming its own retry delay, which beats
+    /// any interval the consumer would pick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<std::time::Duration>,
+    /// The failure rendered for logs. Do not branch on it; use
+    /// [`rejection`](Self::rejection).
+    pub error: String,
 }
 
 /// The server's `<pair-device>` refs are used up: there is no QR left to
