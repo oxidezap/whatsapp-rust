@@ -3042,11 +3042,30 @@ fn ensure_group_invite_capacity(
     Ok(())
 }
 
+fn group_invite_target_matches(
+    participant: &GroupCallParticipant,
+    target: &Jid,
+    requested_target: &Jid,
+) -> bool {
+    let matches = |candidate: &Jid| {
+        [target, requested_target]
+            .iter()
+            .any(|identity| candidate.user == identity.user && candidate.server == identity.server)
+    };
+    matches(&participant.jid)
+        || participant.pn.as_ref().is_some_and(matches)
+        || participant
+            .devices
+            .iter()
+            .any(|device| matches(&device.jid))
+}
+
 fn current_group_invite_offer_context(
     registry: &wacore::voip::CallRegistry,
     call_id: &str,
     generation: u64,
     target: &Jid,
+    requested_target: &Jid,
     existing_only: bool,
 ) -> Result<(Vec<GroupCallParticipant>, bool), CallError> {
     if let Some(state) = registry.group_state_if_current(call_id, generation)
@@ -3055,7 +3074,7 @@ fn current_group_invite_offer_context(
         let member = snapshot
             .participants
             .iter()
-            .find(|participant| participant.jid.to_non_ad() == target.to_non_ad());
+            .find(|participant| group_invite_target_matches(participant, target, requested_target));
         ensure_group_invite_capacity(snapshot, existing_only)?;
         let participants = if existing_only {
             let member =
@@ -3068,7 +3087,7 @@ fn current_group_invite_offer_context(
                 .iter()
                 .filter(|participant| {
                     participant.state.as_deref() == Some("connected")
-                        && participant.jid.to_non_ad() != target.to_non_ad()
+                        && !group_invite_target_matches(participant, target, requested_target)
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -3163,6 +3182,7 @@ impl CallHandle {
     ) -> Result<(), CallError> {
         self.ensure_current()?;
         let client = self.upgrade_client()?;
+        let requested_target = target.to_non_ad();
         let target = client
             .resolve_recipient_to_lid(target)
             .await
@@ -3173,6 +3193,7 @@ impl CallHandle {
             &self.call_id,
             self.generation,
             &target,
+            &requested_target,
             existing_only,
         )?;
         if initial_participants.is_empty() {
@@ -3198,6 +3219,7 @@ impl CallHandle {
             &self.call_id,
             self.generation,
             &target,
+            &requested_target,
             existing_only,
         )?;
         if participants.is_empty() {
@@ -4145,6 +4167,7 @@ mod tests {
                 "GROUP-CALL",
                 generation,
                 &target,
+                &target,
                 true,
             )
             .expect("initial disconnected target")
@@ -4157,9 +4180,16 @@ mod tests {
             wacore::voip::GroupStateApply::Applied
         );
         assert!(
-            current_group_invite_offer_context(&registry, "GROUP-CALL", generation, &target, true,)
-                .expect("latest disconnected target")
-                .1,
+            current_group_invite_offer_context(
+                &registry,
+                "GROUP-CALL",
+                generation,
+                &target,
+                &target,
+                true,
+            )
+            .expect("latest disconnected target")
+            .1,
             "a newer roster's video mode must replace the pre-await offer mode"
         );
 
@@ -4169,7 +4199,14 @@ mod tests {
             wacore::voip::GroupStateApply::Applied
         );
         assert!(matches!(
-            current_group_invite_offer_context(&registry, "GROUP-CALL", generation, &target, true,),
+            current_group_invite_offer_context(
+                &registry,
+                "GROUP-CALL",
+                generation,
+                &target,
+                &target,
+                true,
+            ),
             Err(CallError::Media("ring target is already connected"))
         ));
 
@@ -4183,6 +4220,7 @@ mod tests {
                 &registry,
                 "GROUP-CALL",
                 generation,
+                &Jid::new("444444444444444", Server::Lid),
                 &Jid::new("444444444444444", Server::Lid),
                 false,
             ),
@@ -4229,12 +4267,89 @@ mod tests {
             wacore::voip::GroupStateApply::Applied
         );
 
-        let (participants, video) =
-            current_group_invite_offer_context(&registry, "GROUP-CALL", generation, &target, false)
-                .expect("new target can be invited");
+        let (participants, video) = current_group_invite_offer_context(
+            &registry,
+            "GROUP-CALL",
+            generation,
+            &target,
+            &target,
+            false,
+        )
+        .expect("new target can be invited");
         assert!(!video);
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].jid, connected);
+    }
+
+    #[test]
+    fn group_invite_context_matches_pn_and_lid_roster_aliases() {
+        let registry = wacore::voip::CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let connected = Jid::new("222222222222222", Server::Lid);
+        let target_lid = Jid::new("333333333333333", Server::Lid);
+        let target_pn = Jid::new("12025550123", Server::Pn);
+        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+            "GROUP-CALL",
+            Jid::new("GROUP-CALL", Server::Call),
+            creator.clone(),
+        ));
+        let snapshot = GroupCallUpdate::builder()
+            .call_id("GROUP-CALL".to_string())
+            .call_creator(creator)
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![
+                GroupCallParticipant::builder()
+                    .jid(connected.clone())
+                    .state("connected".to_string())
+                    .devices(Vec::new())
+                    .build(),
+                GroupCallParticipant::builder()
+                    .jid(target_pn.clone())
+                    .state("disconnected".to_string())
+                    .devices(Vec::new())
+                    .build(),
+            ])
+            .build();
+        assert_eq!(
+            registry.apply_group_update_if_current(snapshot, generation),
+            wacore::voip::GroupStateApply::Applied
+        );
+
+        let (participants, video) = current_group_invite_offer_context(
+            &registry,
+            "GROUP-CALL",
+            generation,
+            &target_lid,
+            &target_pn,
+            true,
+        )
+        .expect("the PN request and resolved LID identify the same disconnected member");
+        assert!(!video);
+        assert_eq!(
+            participants
+                .iter()
+                .map(|participant| participant.jid.clone())
+                .collect::<Vec<_>>(),
+            vec![connected]
+        );
+        assert!(matches!(
+            current_group_invite_offer_context(
+                &registry,
+                "GROUP-CALL",
+                generation,
+                &target_lid,
+                &target_pn,
+                false,
+            ),
+            Err(CallError::Media(
+                "invite target already belongs to the call"
+            ))
+        ));
     }
 
     #[test]

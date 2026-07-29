@@ -1697,20 +1697,16 @@ impl CallRegistry {
         let self_device = entry.group_invite_self_device.clone()?;
         let peer_device = entry.group_invite_peer_device.clone()?;
         Some(vec![
-            GroupCallParticipant {
-                jid: self_device.jid.to_non_ad(),
-                pn: None,
-                state: Some("connected".to_string()),
-                participant_type: None,
-                devices: vec![self_device],
-            },
-            GroupCallParticipant {
-                jid: peer_device.jid.to_non_ad(),
-                pn: None,
-                state: Some("connected".to_string()),
-                participant_type: None,
-                devices: vec![peer_device],
-            },
+            GroupCallParticipant::builder()
+                .jid(self_device.jid.to_non_ad())
+                .state("connected".to_string())
+                .devices(vec![self_device])
+                .build(),
+            GroupCallParticipant::builder()
+                .jid(peer_device.jid.to_non_ad())
+                .state("connected".to_string())
+                .devices(vec![peer_device])
+                .build(),
         ])
     }
 
