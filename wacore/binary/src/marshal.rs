@@ -265,13 +265,10 @@ mod tests {
 
     type TestResult = Result<()>;
 
-    /// An AD-JID carries its server as a domain byte, which the decoder must not
-    /// also keep as an `agent`: `agent` is part of the derived `PartialEq`/`Hash`,
-    /// and only a wire-decoded JID would carry it. The two round-trips below are
-    /// the ones real code performs — through the wire, and through the store,
-    /// which holds JIDs as text — and a JID that survives one must equal a JID
-    /// that survives the other, or `stored_jid == wire_jid` silently flips
-    /// depending on where each side came from.
+    /// The two round-trips real code performs — through the wire, and through the
+    /// store, which holds JIDs as text — have to agree: a JID that survives one
+    /// must equal a JID that survives the other, or `stored_jid == wire_jid`
+    /// silently flips depending on where each side came from.
     #[test]
     fn ad_jid_round_trips_equal_through_the_wire_and_through_text() -> TestResult {
         use crate::jid::Server;
