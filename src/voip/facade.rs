@@ -2456,7 +2456,12 @@ impl Drop for AnswerTeardown {
     }
 }
 
-async fn send_answer_terminate(client: &Client, call_id: &str, peer_jid: &Jid, call_creator: &Jid) {
+pub(crate) async fn send_answer_terminate(
+    client: &Client,
+    call_id: &str,
+    peer_jid: &Jid,
+    call_creator: &Jid,
+) {
     let id = client.generate_request_id();
     let stanza = build_terminate(&TerminateParams {
         call_id,

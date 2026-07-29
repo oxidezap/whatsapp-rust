@@ -72,24 +72,24 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .flatten()
         .map(Box::new);
 
-    Ok(Some(IncomingCall {
-        from,
-        stanza_id,
-        notify,
-        platform,
-        version,
-        participant,
-        recipient,
-        timestamp,
-        offline,
-        action,
-        group,
-        ringing_generation: None,
-        // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
-        // capture them only on an <offer> and only when `voip` is on (RelayData lives there).
-        #[cfg(feature = "voip")]
-        media,
-    }))
+    let call = IncomingCall::builder()
+        .from(from)
+        .stanza_id(stanza_id)
+        .maybe_notify(notify)
+        .maybe_platform(platform)
+        .maybe_version(version)
+        .maybe_participant(participant)
+        .maybe_recipient(recipient)
+        .timestamp(timestamp)
+        .offline(offline)
+        .action(action)
+        .maybe_group(group);
+    // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
+    // capture it only on an <offer> and only when `voip` is on (RelayData lives there).
+    #[cfg(feature = "voip")]
+    let call = call.maybe_media(media);
+
+    Ok(Some(call.build()))
 }
 
 /// Extract the media material from an `<offer>`: the `<enc>` addressed to us (direct child or under

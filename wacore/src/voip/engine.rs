@@ -25,6 +25,7 @@ use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwardi
 use super::group_audio::ParticipantAudioMixer;
 use super::group_media::{
     GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupMediaStream, GroupRosterApply,
+    group_device_is_local,
 };
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 #[cfg(feature = "voip-mlow")]
@@ -45,7 +46,7 @@ use super::session::{
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
 use crate::types::group_call::{GroupCallRelay, GroupCallUpdate, ScreenShare, WaitingRoom};
-use wacore_binary::{Jid, JidExt};
+use wacore_binary::Jid;
 use zeroize::Zeroize;
 
 /// Monotonic milliseconds. The shell supplies it; the engine never reads a clock.
@@ -1316,7 +1317,7 @@ impl CallEngine {
             self.allocate_deadline = NEVER;
         }
         let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
-        let pids = remote_group_pids(update, &self.self_participant_id);
+        let pids = remote_group_pids(update, &group.local_device);
         let transaction_id = self.tx_ids.next_tx_id();
         let allocate = Bytes::from(stun::build_wasm_group_stun_allocate_request(
             &stun::WasmGroupStunAllocateRequest {
@@ -2484,14 +2485,16 @@ fn group_relay_socket_addr(relay: &GroupCallRelay) -> Result<SocketAddr, GroupMe
     Ok(SocketAddr::new(IpAddr::V4(ip), port))
 }
 
-fn remote_group_pids(update: &GroupCallUpdate, self_participant_id: &str) -> Vec<u32> {
+fn remote_group_pids(update: &GroupCallUpdate, local_device: &Jid) -> Vec<u32> {
     let mut pids = update
         .participants
         .iter()
         .filter(|participant| participant.is_connected())
-        .flat_map(|participant| participant.devices.iter())
-        .filter(|device| {
-            ssrc::format_e2e_srtp_participant_id(&device.jid.to_string()) != self_participant_id
+        .flat_map(|participant| {
+            participant
+                .devices
+                .iter()
+                .filter(|device| !group_device_is_local(participant, device, local_device))
         })
         .filter_map(|device| device.pid)
         .collect::<Vec<_>>();
@@ -2506,20 +2509,10 @@ fn group_roster_contains_participant(update: &GroupCallUpdate, local_device: &Ji
         .iter()
         .filter(|participant| participant.is_connected())
         .any(|participant| {
-            let owns_local_user = participant.jid.is_same_user_as(local_device)
-                || participant
-                    .pn
-                    .as_ref()
-                    .is_some_and(|pn| pn.is_same_user_as(local_device));
-            owns_local_user
-                && participant.devices.iter().any(|device| {
-                    device.jid.device == local_device.device
-                        && (device.jid.is_same_user_as(&participant.jid)
-                            || participant
-                                .pn
-                                .as_ref()
-                                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
-                })
+            participant
+                .devices
+                .iter()
+                .any(|device| group_device_is_local(participant, device, local_device))
         })
 }
 
@@ -2794,10 +2787,21 @@ mod encoded_tests {
             .configure_group(GroupEngineConfig {
                 call_creator: update.call_creator.clone(),
                 self_jid: Jid::new("15550001111", Server::Lid),
-                initial_update: update,
+                initial_update: update.clone(),
                 direct_peer: None,
             })
             .expect("the local PN device belongs to the local LID participant");
+        let group = engine.group.as_ref().expect("group state");
+        assert_eq!(
+            group.registry.active_pids(),
+            vec![2],
+            "the local PN device must not create a media receiver"
+        );
+        assert_eq!(
+            remote_group_pids(&update, &Jid::new("15550001111", Server::Lid),),
+            vec![2],
+            "the local PN device must not be subscribed through the relay"
+        );
     }
 
     #[test]

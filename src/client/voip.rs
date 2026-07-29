@@ -63,8 +63,10 @@ pub struct Voip<'a> {
 
 #[cfg(feature = "voip-runtime")]
 struct CallLinkRegistrationGuard {
+    client: std::sync::Weak<Client>,
     registry: Arc<wacore::voip::CallRegistry>,
     call_id: String,
+    call_creator: Jid,
     generation: u64,
     armed: bool,
 }
@@ -321,10 +323,18 @@ impl Drop for PendingCallLinkJoinGuard {
 
 #[cfg(feature = "voip-runtime")]
 impl CallLinkRegistrationGuard {
-    fn new(registry: Arc<wacore::voip::CallRegistry>, call_id: &str, generation: u64) -> Self {
+    fn new(
+        client: &Client,
+        registry: Arc<wacore::voip::CallRegistry>,
+        call_id: &str,
+        call_creator: Jid,
+        generation: u64,
+    ) -> Self {
         Self {
+            client: client.self_weak.get().cloned().unwrap_or_default(),
             registry,
             call_id: call_id.to_string(),
+            call_creator,
             generation,
             armed: true,
         }
@@ -338,10 +348,42 @@ impl CallLinkRegistrationGuard {
 #[cfg(feature = "voip-runtime")]
 impl Drop for CallLinkRegistrationGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if !self.armed {
+            return;
+        }
+        let Some(client) = self.client.upgrade() else {
             self.registry
                 .remove_if_current(&self.call_id, self.generation);
-        }
+            return;
+        };
+        let registry = self.registry.clone();
+        let call_id = self.call_id.clone();
+        let call_creator = self.call_creator.clone();
+        let generation = self.generation;
+        let runtime = client.runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                // A cancelled admitted join is still live on the call service. Claim this exact
+                // generation under the replacement lane before deciding whether a wire terminate
+                // is required; waiting-room cancellation remains local-only.
+                let _transition = client.lock_answer_transition(&call_id).await;
+                let Some(phase) = registry.remove_if_current_with_phase(&call_id, generation)
+                else {
+                    return;
+                };
+                if phase == CallPhase::WaitingRoom {
+                    return;
+                }
+                let target = Jid::new(&call_id, Server::Call);
+                crate::voip::facade::send_answer_terminate(
+                    &client,
+                    &call_id,
+                    &target,
+                    &call_creator,
+                )
+                .await;
+            }))
+            .detach();
     }
 }
 
@@ -1200,8 +1242,13 @@ impl Voip<'_> {
             .map_err(|_| {
                 CallError::Response("call-link admission snapshot was rejected".to_string())
             })?;
-        let mut registration =
-            CallLinkRegistrationGuard::new(registry.clone(), &join.call_id, generation);
+        let mut registration = CallLinkRegistrationGuard::new(
+            self.client,
+            registry.clone(),
+            &join.call_id,
+            join.call_creator.clone(),
+            generation,
+        );
 
         if join.in_waiting_room && join.waiting_room.is_none() {
             return Err(CallError::Response(
@@ -4681,6 +4728,39 @@ mod tests {
             None,
             "cancelling after registration must reap only that generation"
         );
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn cancelling_an_admitted_call_link_registration_sends_terminate() {
+        let (client, sends) = make_client_with_count().await;
+        let call_id = "CANCELLED-ADMITTED-CALL";
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let mut session =
+            CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator.clone());
+        let _ = session.transition_to(CallPhase::Calling);
+        let _ = session.transition_to(CallPhase::Connecting);
+        let registry = client.call_registry();
+        let generation = registry.insert(session);
+        let registration = super::CallLinkRegistrationGuard::new(
+            &client,
+            registry.clone(),
+            call_id,
+            creator,
+            generation,
+        );
+
+        drop(registration);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sends.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted cancellation must send a call-scoped terminate");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.generation_of(call_id), None);
     }
 
     #[cfg(feature = "voip-runtime")]

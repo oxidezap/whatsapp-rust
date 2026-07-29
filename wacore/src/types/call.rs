@@ -292,7 +292,7 @@ impl CallAction {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct IncomingCall {
     pub from: Jid,
@@ -320,6 +320,7 @@ pub struct IncomingCall {
     /// Registry generation assigned before the offer is dispatched. This is internal routing
     /// metadata, not part of the serialized event payload.
     #[serde(skip)]
+    #[builder(skip)]
     pub(crate) ringing_generation: Option<u64>,
     /// Media material from an `<offer>` (the encrypted callKey + parsed relay), captured by the
     /// parser so the `voip` media facade can drive the call. `None` for non-offer actions or an
@@ -437,21 +438,12 @@ impl IncomingCall {
         timestamp: DateTime<Utc>,
         action: CallAction,
     ) -> Self {
-        Self {
-            from,
-            stanza_id,
-            notify: None,
-            platform: None,
-            version: None,
-            participant: None,
-            recipient: None,
-            timestamp,
-            offline: false,
-            action,
-            group: None,
-            ringing_generation: None,
-            #[cfg(feature = "voip")]
-            media: None,
-        }
+        Self::builder()
+            .from(from)
+            .stanza_id(stanza_id)
+            .timestamp(timestamp)
+            .offline(false)
+            .action(action)
+            .build()
     }
 }

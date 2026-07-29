@@ -1295,13 +1295,14 @@ async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     // signaling per device.) Skip the device that accepted/rejected: compare on device identity
     // (user + server + device), not full Jid equality, since the usync device-list and the accept's
     // `from` can carry a different `agent` for the same physical device.
+    let answerer = routed_call_sender(call);
     let others: Vec<Jid> = devices
         .into_iter()
-        .filter(|d| !same_device(d, &call.from))
+        .filter(|device| !same_device(device, &answerer))
         .collect();
     debug!(
         "call: {reason} from {} for {call_id}: dismissing {} sibling device(s)",
-        call.from.observe(),
+        answerer.observe(),
         others.len()
     );
     for dev in &others {
@@ -3825,7 +3826,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn accept_dismisses_other_callee_device() {
-        let client = make_client().await;
+        let (client, sends) = make_sending_client_with_failure_after(None).await;
         let peer = Jid::new("222222222222222", Server::Lid);
         let creator = Jid::new("111111111111111", Server::Lid);
         let (sibling, accepting) = (peer.with_device(1), peer.with_device(2));
@@ -3836,9 +3837,11 @@ mod tests {
         session.ring_devices = vec![sibling.clone(), accepting.clone()];
         client.call_registry().insert(session);
 
-        // The `accepting` device accepts.
+        // The call-scoped wrapper routes the acceptance through `participant`; `from` is not the
+        // answering device and must never be used to choose the sibling dismiss targets.
         let accept = NodeBuilder::new("call")
-            .attr("from", accepting.clone())
+            .attr("from", Jid::new("CALL-ID-0001", Server::Call))
+            .attr("participant", accepting.clone())
             .attr("id", "STANZA-ACCEPT")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("accept")
@@ -3882,6 +3885,11 @@ mod tests {
                 .take_dismiss_targets("CALL-ID-0001")
                 .is_none(),
             "the rung device set must be consumed one-shot"
+        );
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the routed answerer must not receive accepted_elsewhere"
         );
     }
 

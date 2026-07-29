@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use subtle::ConstantTimeEq;
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt};
 use zeroize::Zeroize;
 
 use crate::types::group_call::{
@@ -130,6 +130,7 @@ pub struct GroupMediaRegistry {
     call_id: String,
     call_creator: Jid,
     self_lid: String,
+    self_device: Jid,
     samples_per_packet: u32,
     warp_mi_tag_len: usize,
     video_ts_stride: u32,
@@ -159,6 +160,7 @@ impl GroupMediaRegistry {
             call_id: call_id.into(),
             call_creator,
             self_lid: format_e2e_srtp_participant_id(&self_lid.to_string()),
+            self_device: self_lid.clone(),
             samples_per_packet,
             warp_mi_tag_len,
             video_ts_stride,
@@ -234,7 +236,7 @@ impl GroupMediaRegistry {
     }
 
     pub(crate) fn participants_with_pid_changes(&self, update: &GroupCallUpdate) -> Vec<String> {
-        active_devices(update, &self.self_lid)
+        active_devices(update, &self.self_device)
             .into_iter()
             .filter_map(|(_, device)| {
                 let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
@@ -278,7 +280,7 @@ impl GroupMediaRegistry {
             return Ok(GroupRosterApply::Stale);
         }
 
-        let active = active_devices(update, &self.self_lid);
+        let active = active_devices(update, &self.self_device);
         if active.is_empty() {
             // Even the first authoritative roster supersedes the direct-call fallback. Retaining
             // its seeded receiver when every remote device has already left would keep accepting
@@ -767,9 +769,28 @@ pub(crate) fn validate_group_media_snapshot(
     Ok(())
 }
 
+pub(crate) fn group_device_is_local(
+    participant: &GroupCallParticipant,
+    device: &GroupCallDevice,
+    local_device: &Jid,
+) -> bool {
+    let owns_local_user = participant.jid.is_same_user_as(local_device)
+        || participant
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(local_device));
+    owns_local_user
+        && device.jid.device == local_device.device
+        && (device.jid.is_same_user_as(&participant.jid)
+            || participant
+                .pn
+                .as_ref()
+                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
+}
+
 fn active_devices<'a>(
     update: &'a GroupCallUpdate,
-    self_lid: &str,
+    local_device: &Jid,
 ) -> Vec<(&'a GroupCallParticipant, &'a GroupCallDevice)> {
     update
         .participants
@@ -782,7 +803,7 @@ fn active_devices<'a>(
                 .filter(|device| device.pid.is_some())
                 .map(move |device| (participant, device))
         })
-        .filter(|(_, device)| format_e2e_srtp_participant_id(&device.jid.to_string()) != self_lid)
+        .filter(|(participant, device)| !group_device_is_local(participant, device, local_device))
         .collect()
 }
 

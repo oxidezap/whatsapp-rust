@@ -7,7 +7,6 @@ use core::mem::size_of;
 
 use serde::Serialize;
 use wacore_binary::Jid;
-#[cfg(feature = "voip")]
 use zeroize::Zeroize;
 
 /// Maximum call membership from WA Web's `group_call_max_participants` AB prop.
@@ -195,7 +194,6 @@ impl core::fmt::Debug for GroupCallRelay {
     }
 }
 
-#[cfg(feature = "voip")]
 impl Drop for GroupCallRelay {
     fn drop(&mut self) {
         self.key.zeroize();
@@ -426,5 +424,18 @@ impl ScreenShare {
             version: 2,
             screen_share_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GroupCallRelay;
+
+    #[test]
+    fn group_call_relay_always_scrubs_on_drop() {
+        assert!(
+            core::mem::needs_drop::<GroupCallRelay>(),
+            "relay secrets must be scrubbed even without the media feature"
+        );
     }
 }
