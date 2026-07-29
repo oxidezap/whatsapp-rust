@@ -265,6 +265,73 @@ mod tests {
 
     type TestResult = Result<()>;
 
+    /// An interop JID's `integrator` has a wire field only in `INTEROP_JID`.
+    /// Encoding one as a `JID_PAIR` writes user and server and nothing else, so
+    /// the value is gone by the time it reaches the peer — and two interop JIDs
+    /// that differ only there are two destinations, not one.
+    #[test]
+    fn interop_jid_keeps_its_integrator_through_the_wire() -> TestResult {
+        use crate::jid::Server;
+
+        for (device, integrator) in [(0u16, 1u16), (7, 300), (0, u16::MAX), (65535, 42)] {
+            let original = Jid {
+                user: "123456789".into(),
+                server: Server::Interop,
+                agent: 0,
+                device,
+                integrator,
+            };
+
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
+            let node = Node::new("iq", attrs, None);
+
+            // marshal writes a leading format byte that unmarshal_ref does not expect.
+            let bytes = marshal(&node)?;
+            let decoded = unmarshal_ref(&bytes[1..])?;
+            let round_tripped = decoded
+                .attrs
+                .iter()
+                .find(|(k, _)| &**k == "jid")
+                .and_then(|(_, v)| v.to_jid())
+                .expect("jid attr survives the round-trip");
+
+            assert_eq!(
+                round_tripped, original,
+                "device {device}, integrator {integrator}: interop JID must survive encoding"
+            );
+            assert_eq!(
+                round_tripped.integrator, integrator,
+                "device {device}: the integrator itself must come back"
+            );
+        }
+
+        // Without an integrator there is nothing for JID_PAIR to lose, and that
+        // is the form we have always sent — so it must keep taking that path.
+        let plain = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 0,
+            device: 3,
+            integrator: 0,
+        };
+        let mut attrs = Attrs::with_capacity(1);
+        attrs.push("jid".to_string(), NodeValue::Jid(plain.clone()));
+        let bytes = marshal(&Node::new("iq", attrs, None))?;
+        let decoded = unmarshal_ref(&bytes[1..])?;
+        let back = decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| &**k == "jid")
+            .and_then(|(_, v)| v.to_jid())
+            .expect("jid attr");
+        assert_eq!(back.user, plain.user);
+        assert_eq!(back.server, Server::Interop);
+        assert_eq!(back.integrator, 0);
+
+        Ok(())
+    }
+
     /// The two round-trips real code performs — through the wire, and through the
     /// store, which holds JIDs as text — have to agree: a JID that survives one
     /// must equal a JID that survives the other, or `stored_jid == wire_jid`

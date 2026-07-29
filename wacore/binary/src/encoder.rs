@@ -355,6 +355,23 @@ fn server_to_domain_type(server: jid::Server) -> u8 {
     }
 }
 
+/// Whether this JID needs the dedicated `INTEROP_JID` token to survive the
+/// round-trip.
+///
+/// An interop JID carries an `integrator` that no other wire form has a field
+/// for: `JID_PAIR` writes only user and server, so encoding one that way silently
+/// drops it. WA Web has a matching branch (`WA/Wap.js`, the `JID_INTEROP` arm of
+/// its JID writer) and its decoder reads the field back, as does ours.
+///
+/// Restricted to a non-zero integrator on purpose. An interop JID without one
+/// loses nothing through `JID_PAIR`, and that is the form we have always sent —
+/// this fixes the case that was lossy without changing the bytes for the case
+/// that was not.
+#[inline]
+fn needs_interop_jid(server: jid::Server, integrator: u16) -> bool {
+    server == jid::Server::Interop && integrator != 0
+}
+
 /// AD_JID round-trips back to a server via `domain_type` only for the four
 /// servers the decoder explicitly maps. For everything else (bot, group,
 /// broadcast, newsletter, call, interop, msgr, legacy) no valid AD_JID domain
@@ -760,7 +777,30 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
 
     /// Write a JidRef directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
+    /// `INTEROP_JID`: user, `u16` device, `u16` integrator, then the server.
+    ///
+    /// Field order and widths mirror `read_interop_jid`, which is also what WA
+    /// Web's decoder reads (`WA/Wap.js`: user, `readUint16`, `readUint16`, then a
+    /// fourth read whose value it discards — the server it just validated).
+    ///
+    /// The trailing server is written even though WA Web's *writer* omits it. Its
+    /// writer shadows the module-level interop-domain binding with a local of the
+    /// same name for the user, and the domain write that its own decoder — and
+    /// ours — expects is simply absent; the sibling `JID_FB` arm two lines up does
+    /// write its domain. Following the writer literally would emit bytes neither
+    /// decoder accepts, so this follows the decoders, which agree.
+    fn write_interop_jid(&mut self, user: &str, device: u16, integrator: u16) -> Result<()> {
+        self.write_u8(token::INTEROP_JID)?;
+        self.write_string(user)?;
+        self.write_u16_be(device)?;
+        self.write_u16_be(integrator)?;
+        self.write_string(jid::INTEROP_SERVER)
+    }
+
     pub fn write_jid_ref(&mut self, jid: &JidRef<'_>) -> Result<()> {
+        if needs_interop_jid(jid.server, jid.integrator) {
+            return self.write_interop_jid(&jid.user, jid.device, jid.integrator);
+        }
         if jid.device > 0 && server_supports_ad_jid(jid.server) {
             // AD_JID format: domain_type, device, user
             let device = u8::try_from(jid.device).map_err(|_| {
@@ -786,6 +826,9 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
     /// Write an owned Jid directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
     pub fn write_jid_owned(&mut self, jid: &Jid) -> Result<()> {
+        if needs_interop_jid(jid.server, jid.integrator) {
+            return self.write_interop_jid(&jid.user, jid.device, jid.integrator);
+        }
         if jid.device > 0 && server_supports_ad_jid(jid.server) {
             // AD_JID format: domain_type, device, user
             let device = u8::try_from(jid.device).map_err(|_| {
