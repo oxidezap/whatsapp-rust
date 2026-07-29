@@ -894,7 +894,15 @@ impl PartialEq for Jid {
             && self.server == other.server
             && self.device == other.device
             && self.integrator == other.integrator
-            && identity_agent(self.server, self.agent) == identity_agent(other.server, other.agent)
+            // Equal raw agents are already equal identity agents — the servers
+            // match by the check above, so both sides normalise the same way.
+            // Skipping the lookup in that case is worth it because it is the
+            // overwhelmingly common one: nothing off the wire carries an agent
+            // on the AD servers. Load-bearing on the `self.server == other.server`
+            // above; reordering these would make the shortcut wrong.
+            && (self.agent == other.agent
+                || identity_agent(self.server, self.agent)
+                    == identity_agent(other.server, other.agent))
     }
 }
 
@@ -918,7 +926,10 @@ impl PartialEq for JidRef<'_> {
             && self.server == other.server
             && self.device == other.device
             && self.integrator == other.integrator
-            && identity_agent(self.server, self.agent) == identity_agent(other.server, other.agent)
+            // See `PartialEq for Jid` for why the raw compare can short-circuit.
+            && (self.agent == other.agent
+                || identity_agent(self.server, self.agent)
+                    == identity_agent(other.server, other.agent))
     }
 }
 
@@ -942,7 +953,10 @@ impl PartialEq<JidRef<'_>> for Jid {
             && self.server == other.server
             && self.device == other.device
             && self.integrator == other.integrator
-            && identity_agent(self.server, self.agent) == identity_agent(other.server, other.agent)
+            // See `PartialEq for Jid`.
+            && (self.agent == other.agent
+                || identity_agent(self.server, self.agent)
+                    == identity_agent(other.server, other.agent))
     }
 }
 
