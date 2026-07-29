@@ -497,8 +497,33 @@ pub trait JidExt {
     }
 }
 
+/// The parts of `agent`/`integrator` that are actually part of a JID's identity.
+///
+/// Neither field is universal. `agent` is only meaningful where the server
+/// renders it — on Pn/Lid/Hosted/HostedLid the wire spells the server as a
+/// domain byte instead, and `Display` omits any agent set there. `integrator`
+/// only exists on interop. Off those servers the fields are inert: nothing
+/// encodes them, nothing prints them, so two JIDs differing only there address
+/// the same thing.
+///
+/// Letting them into equality anyway is what made a JID decoded from the wire
+/// unequal to the same JID read back from the store, which holds JIDs as text
+/// (see `read_ad_jid`). Equality and `Hash` both go through here so they cannot
+/// disagree.
+#[inline]
+fn identity_extras(server: Server, agent: u8, integrator: u16) -> (u8, u16) {
+    (
+        if server.renders_agent() { agent } else { 0 },
+        if matches!(server, Server::Interop) {
+            integrator
+        } else {
+            0
+        },
+    )
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Jid {
     pub user: CompactString,
     pub server: Server,
@@ -507,7 +532,7 @@ pub struct Jid {
     pub integrator: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, yoke::Yokeable)]
+#[derive(Debug, Clone, yoke::Yokeable)]
 pub struct JidRef<'a> {
     pub user: NodeStr<'a>,
     pub server: Server,
@@ -855,14 +880,60 @@ impl<'a> JidRef<'a> {
     }
 }
 
+impl PartialEq for Jid {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.user == other.user
+            && self.server == other.server
+            && self.device == other.device
+            && identity_extras(self.server, self.agent, self.integrator)
+                == identity_extras(other.server, other.agent, other.integrator)
+    }
+}
+
+impl Eq for Jid {}
+
+impl std::hash::Hash for Jid {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.user.hash(state);
+        self.server.hash(state);
+        self.device.hash(state);
+        identity_extras(self.server, self.agent, self.integrator).hash(state);
+    }
+}
+
+impl PartialEq for JidRef<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.user.as_ref() == other.user.as_ref()
+            && self.server == other.server
+            && self.device == other.device
+            && identity_extras(self.server, self.agent, self.integrator)
+                == identity_extras(other.server, other.agent, other.integrator)
+    }
+}
+
+impl Eq for JidRef<'_> {}
+
+impl std::hash::Hash for JidRef<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.user.as_ref().hash(state);
+        self.server.hash(state);
+        self.device.hash(state);
+        identity_extras(self.server, self.agent, self.integrator).hash(state);
+    }
+}
+
 impl PartialEq<JidRef<'_>> for Jid {
     #[inline]
     fn eq(&self, other: &JidRef<'_>) -> bool {
         self.user.as_str() == other.user.as_ref()
             && self.server == other.server
-            && self.agent == other.agent
             && self.device == other.device
-            && self.integrator == other.integrator
+            && identity_extras(self.server, self.agent, self.integrator)
+                == identity_extras(other.server, other.agent, other.integrator)
     }
 }
 
@@ -1322,6 +1393,107 @@ mod tests {
             &*over.to_non_ad_arc_str(),
             &*format!("{}@lid", "9".repeat(61))
         );
+    }
+
+    /// `agent` off an agent-rendering server and `integrator` off interop are
+    /// inert: nothing encodes them, nothing prints them. Two JIDs differing only
+    /// there address the same thing, so equality and `Hash` must both say so —
+    /// and must agree with each other, or a `HashMap<Jid, _>` gets an entry it
+    /// can never look up again.
+    #[test]
+    fn inert_agent_and_integrator_stay_out_of_identity() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(jid: &Jid) -> u64 {
+            let mut h = DefaultHasher::new();
+            jid.hash(&mut h);
+            h.finish()
+        }
+
+        // The four AD servers spell the server as a domain byte, so an agent set
+        // on one is a wire artefact, not identity.
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let clean = Jid {
+                user: "123456789012345".into(),
+                server,
+                agent: 0,
+                device: 7,
+                integrator: 0,
+            };
+            let with_agent = Jid {
+                agent: 1,
+                ..clean.clone()
+            };
+            assert_eq!(
+                clean, with_agent,
+                "{server:?}: agent must not split identity"
+            );
+            assert_eq!(
+                hash_of(&clean),
+                hash_of(&with_agent),
+                "{server:?}: Hash must agree with Eq"
+            );
+
+            // Same for integrator, which only exists on interop.
+            let with_integrator = Jid {
+                integrator: 0xBEEF,
+                ..clean.clone()
+            };
+            assert_eq!(
+                clean, with_integrator,
+                "{server:?}: integrator is not identity"
+            );
+            assert_eq!(hash_of(&clean), hash_of(&with_integrator));
+
+            // The borrowed form and the cross-type comparison follow the same rule.
+            let borrowed = JidRef {
+                user: NodeStr::Borrowed("123456789012345"),
+                server,
+                agent: 1,
+                device: 7,
+                integrator: 0,
+            };
+            assert_eq!(clean, borrowed, "{server:?}: owned == borrowed");
+            assert_eq!(borrowed, clean, "{server:?}: borrowed == owned");
+        }
+
+        // Where the server DOES render the agent it is identity, and must still split.
+        let bot = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 4,
+            device: 0,
+            integrator: 0,
+        };
+        let other_agent = Jid {
+            agent: 5,
+            ..bot.clone()
+        };
+        assert_ne!(
+            bot, other_agent,
+            "interop renders the agent, so it is identity"
+        );
+        assert_ne!(
+            bot,
+            Jid {
+                integrator: 9,
+                ..bot.clone()
+            },
+            "interop is where integrator is real"
+        );
+
+        // Fields that are always identity keep splitting.
+        let pn = Jid::new("123456789012345", Server::Pn);
+        assert_ne!(
+            pn,
+            Jid {
+                device: 1,
+                ..pn.clone()
+            }
+        );
+        assert_ne!(pn, Jid::new("123456789012346", Server::Pn));
+        assert_ne!(pn, Jid::new("123456789012345", Server::Lid));
     }
 
     #[test]
