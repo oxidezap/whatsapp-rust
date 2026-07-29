@@ -1108,19 +1108,24 @@ mod tests {
         assert!(media.enc_for(Some(&other)).is_none());
     }
 
-    // Regression: a LID `<to jid>` decoded from the wire is an AD-JID carrying agent=1 (the Lid domain
-    // byte); our own LID is agent=1 too. The parser must read the TYPED jid (`to_jid`), never
-    // stringify+reparse it (which drops the agent to 0, since `renders_agent(Lid)` is false), or a
-    // multi-device callee never matches its `<to>` and silently fails "offer carried no callKey",
-    // even against the real server. The typed Jid value with agent=1 here is exactly what
-    // `as_node_ref`/the decoder carries for an AD-JID.
+    // Regression: `enc_for` matches `<to jid>` against our own JID by full structural
+    // equality, so the two must agree field for field or a multi-device callee never
+    // matches its `<to>` and silently fails "offer carried no callKey", even against
+    // the real server. The parser reads the TYPED jid (`to_jid`) rather than
+    // stringify+reparsing it, which keeps whatever `Display` does not spell out.
+    //
+    // The original failure was the AD-JID domain byte landing in `agent`, which only
+    // a wire-decoded JID carried; the decoder no longer keeps it, and
+    // `ad_jid_round_trips_equal_through_the_wire_and_through_text` guards that at the
+    // source. `integrator` is still display-invisible, so the typed read is what keeps
+    // this honest for interop JIDs.
     #[cfg(feature = "voip")]
     #[test]
-    fn offer_to_jid_keeps_lid_agent_from_typed_jid() {
+    fn offer_to_jid_matches_our_own_jid_field_for_field() {
         let wire_to = Jid {
             user: "111111111111111".into(),
             server: Server::Lid,
-            agent: 1, // the AD-JID domain byte; the string form suppresses it
+            agent: 0,
             device: 7,
             integrator: 0,
         };
@@ -1141,7 +1146,8 @@ mod tests {
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
         let media = call.media.expect("offer captures media");
 
-        // Our own device LID as lid() yields it: agent=1.
+        // Our own device LID as `lid()` yields it — out of the store, which holds it
+        // as text, so it has to compare equal to the one that came off the wire.
         assert_eq!(
             media
                 .enc_for(Some(&wire_to))

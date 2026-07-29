@@ -304,9 +304,12 @@ impl Server {
     }
 
     /// Whether the `agent` byte is part of the rendered JID for this server.
-    /// AD-capable servers (Pn/Lid/Hosted/HostedLid) carry it as a hidden domain
-    /// byte and suppress it in display; others (e.g. `@bot`/`@interop`) render it.
-    /// Single source of truth shared by the formatter and `Jid::is_same_chat_as`.
+    /// AD-capable servers (Pn/Lid/Hosted/HostedLid) have no agent of their own —
+    /// their wire form spells the server as a domain byte, which the decoder
+    /// resolves into `server` rather than keeping — so an agent set on one is
+    /// meaningless and stays out of the rendered form. Others (e.g. `@bot`,
+    /// `@interop`) render it. Single source of truth shared by the formatter and
+    /// `Jid::is_same_chat_as`.
     #[inline]
     pub fn renders_agent(self) -> bool {
         !matches!(self, Self::Pn | Self::Lid | Self::Hosted | Self::HostedLid)
