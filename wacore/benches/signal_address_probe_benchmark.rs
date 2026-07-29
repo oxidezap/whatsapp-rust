@@ -40,7 +40,7 @@ fn addresses(count: usize, salt: u64) -> Vec<ProtocolAddress> {
     (0..count)
         .map(|i| {
             let i = i as u64;
-            let jid = if i % 2 == 0 {
+            let jid = if i.is_multiple_of(2) {
                 Jid::new(
                     format!("5511{:09}", 900_000_000 + salt + i * 7919),
                     Server::Pn,
