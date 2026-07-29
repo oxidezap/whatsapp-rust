@@ -607,6 +607,16 @@ impl Bot {
                     .await
                 {
                     warn!(target: "Bot/PairCode", "Timeout waiting for socket: {}", e);
+                    // The request never happens, so `pair_with_code` never runs
+                    // and never dispatches for it. Reported here instead: to a
+                    // consumer waiting on a code this is the same fact as any
+                    // other failure — none is coming — and leaving this one path
+                    // silent would put the indefinite wait back.
+                    client_for_pair.core.event_bus.dispatch(Event::PairingCodeError(
+                        crate::types::events::PairingCodeError::builder()
+                            .error(e.to_string())
+                            .build(),
+                    ));
                     return;
                 }
 

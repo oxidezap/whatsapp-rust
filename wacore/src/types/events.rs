@@ -1255,9 +1255,13 @@ pub struct PairingCodeRefresh {
 /// is what distinguishes the two — `None` means the request never got an answer
 /// from the server.
 ///
-/// The outstanding-code claim is released before this fires, so
-/// `pair_with_code` can be called again without `cancel_pair_code` first.
-/// Whether it *should* be is the point of the fields: back off on
+/// A claim the failed request itself took is released before this fires, so a
+/// request that got as far as the server leaves nothing behind. It does **not**
+/// follow that a retry will be accepted: `CodeAlreadyOutstanding` is refused
+/// precisely because an *earlier* code is still live, and that one is untouched
+/// — call `cancel_pair_code` or wait out its window first.
+///
+/// Whether to retry at all is the point of the fields: back off on
 /// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled),
 /// stop on
 /// [`PairCodeRejection::FeatureNotAvailable`](crate::pair_code::PairCodeRejection::FeatureNotAvailable).
