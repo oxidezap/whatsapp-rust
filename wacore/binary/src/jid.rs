@@ -766,9 +766,16 @@ impl Jid {
         s
     }
 
-    /// Append the AD-string form (`user.agent:device@server`) to `buf`, for
-    /// callers that batch many JIDs into one shared buffer instead of paying
-    /// a heap `String` per JID (see `participant_list_hash`).
+    /// Append the AD-string form (`user.0:device@server`) to `buf`, for callers
+    /// that batch many JIDs into one shared buffer instead of paying a heap
+    /// `String` per JID (see `participant_list_hash`).
+    ///
+    /// The agent position is the literal `0`, not `self.agent`. That is what WA
+    /// Web writes: its `formatFull` spelling hardcodes `".0"` and never reads an
+    /// agent off the Wid (`WAWebWid`'s `toString`, and its Wid has no agent field
+    /// at all). The only caller is the phash, which the server validates against
+    /// its own computation of the same string — so writing our agent here would
+    /// mean a rejected hash for any JID that happened to carry one.
     #[inline]
     pub fn push_ad_to(&self, buf: &mut String) {
         if self.user.is_empty() {
@@ -776,9 +783,7 @@ impl Jid {
             return;
         }
         buf.push_str(&self.user);
-        buf.push('.');
-        buf.push_str(itoa::Buffer::new().format(self.agent));
-        buf.push(':');
+        buf.push_str(".0:");
         buf.push_str(itoa::Buffer::new().format(self.device));
         buf.push('@');
         buf.push_str(self.server.as_str());
@@ -1392,6 +1397,49 @@ mod tests {
         assert_eq!(
             &*over.to_non_ad_arc_str(),
             &*format!("{}@lid", "9".repeat(61))
+        );
+    }
+
+    /// The AD form feeds the phash, which the server recomputes and validates, so
+    /// it has to match WA Web byte for byte. WA Web writes a literal `.0` in the
+    /// agent position (`formatFull`) and its Wid carries no agent at all, so ours
+    /// must not leak one in either — and two JIDs that compare equal must produce
+    /// the same string, or the phash memo (keyed by JID) can serve a hash computed
+    /// for a different one.
+    #[test]
+    fn ad_form_writes_the_agent_position_as_zero_like_wa_web() {
+        let plain = Jid {
+            user: "5511999998888".into(),
+            server: Server::Lid,
+            agent: 0,
+            device: 3,
+            integrator: 0,
+        };
+        assert_eq!(plain.to_ad_string(), "5511999998888.0:3@lid");
+
+        let with_agent = Jid {
+            agent: 7,
+            ..plain.clone()
+        };
+        assert_eq!(
+            with_agent.to_ad_string(),
+            "5511999998888.0:3@lid",
+            "the agent must not reach the hashed string"
+        );
+
+        // The pairing the phash memo relies on: equal JIDs, equal AD strings.
+        assert_eq!(plain, with_agent);
+        assert_eq!(plain.to_ad_string(), with_agent.to_ad_string());
+
+        // A server-only JID still degenerates to the server, and device still counts.
+        assert_eq!(Jid::new("", Server::Pn).to_ad_string(), "s.whatsapp.net");
+        assert_ne!(
+            plain.to_ad_string(),
+            Jid {
+                device: 4,
+                ..plain.clone()
+            }
+            .to_ad_string()
         );
     }
 
