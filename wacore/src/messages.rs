@@ -138,7 +138,9 @@ impl core::fmt::Write for Utf8Sink<'_> {
 impl MessageUtils {
     fn random_pad_len() -> u8 {
         use rand::RngExt;
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        // The thread-local generator directly: seeding a fresh StdRng per
+        // plaintext ran a full ChaCha key schedule to produce one byte.
+        let mut rng = rand::rng();
         // Uniform 1..=16, matching WA Web / whatsmeow (rand%16 + 1). The prior
         // `& 0x0F` with a 0->15 remap skewed toward 15 and never produced 16.
         (rng.random::<u8>() & 0x0F) + 1
