@@ -1404,14 +1404,14 @@ mod tests {
         );
     }
 
-    /// The AD form feeds the phash, which the server recomputes and validates, so
+    /// The phash form is recomputed and validated by the server, so
     /// it has to match WA Web byte for byte. WA Web writes a literal `.0` in the
     /// agent position (`formatFull`) and its Wid carries no agent at all, so ours
     /// must not leak one in either — and two JIDs that compare equal must produce
     /// the same string, or the phash memo (keyed by JID) can serve a hash computed
     /// for a different one.
     #[test]
-    fn ad_form_writes_the_agent_position_as_zero_like_wa_web() {
+    fn phash_form_writes_the_agent_position_as_zero_like_wa_web() {
         let plain = Jid {
             user: "5511999998888".into(),
             server: Server::Lid,
