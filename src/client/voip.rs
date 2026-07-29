@@ -1190,7 +1190,7 @@ impl Voip<'_> {
         let token = normalize_call_link_token(token_or_url, media)?;
         let capability =
             crate::voip::facade::offer_capability(media == CallLinkMedia::Video, audio_format);
-        let _pending_join = self.client.begin_call_link_join();
+        let pending_join = self.client.begin_call_link_join();
         let mut join =
             execute_call_link_join_request(self.client, &token, media, capability).await?;
         if join.media != media {
@@ -1242,6 +1242,9 @@ impl Voip<'_> {
             .map_err(|_| {
                 CallError::Response("call-link admission snapshot was rejected".to_string())
             })?;
+        // Publication transfers admission controls to the generation-scoped registry. Clear the
+        // provisional binding before another serialized unknown-id join starts with a clean buffer.
+        drop(pending_join);
         drop(pending_join_lane);
         let mut registration = CallLinkRegistrationGuard::new(
             self.client,
@@ -3586,7 +3589,7 @@ mod tests {
                 .attr("id", request_id.as_str())
                 .children([NodeBuilder::new("waiting_room")
                     .attr("call-id", "FIRST-CALL-ID")
-                    .attr("call-creator", creator)
+                    .attr("call-creator", creator.clone())
                     .attr("link-token", "FIRST-CALL-LINK")
                     .attr("media", "audio")
                     .attr("enabled", "1")
@@ -3624,6 +3627,23 @@ mod tests {
                 .expect("second request action")[0]
                 .tag,
             "link_join"
+        );
+        let second_sender = creator.clone().with_device(1);
+        let second_update = GroupCallUpdate::builder()
+            .call_id("SECOND-CALL-ID".to_string())
+            .call_creator(creator)
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client.buffer_pending_call_link_update(&second_update, &second_sender),
+            PendingCallLinkBuffer::Buffered,
+            "the second join must not inherit the first call id's provisional binding"
         );
 
         release_tx.send(()).await.expect("release heartbeat send");

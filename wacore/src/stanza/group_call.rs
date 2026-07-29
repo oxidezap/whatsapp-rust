@@ -382,19 +382,18 @@ fn parse_group_info(
             participants.push(parse_group_participant(child)?);
         }
     }
-    Ok(GroupCallUpdate {
-        call_id,
-        call_creator,
-        group_jid,
-        transaction_id,
-        media,
-        connected_limit,
-        joinable,
-        av_upgradable: false,
-        rekey_requested,
-        participants,
-        relay: None,
-    })
+    Ok(GroupCallUpdate::builder()
+        .call_id(call_id)
+        .call_creator(call_creator)
+        .maybe_group_jid(group_jid)
+        .transaction_id(transaction_id)
+        .media(media)
+        .connected_limit(connected_limit)
+        .joinable(joinable)
+        .av_upgradable(false)
+        .rekey_requested(rekey_requested)
+        .participants(participants)
+        .build())
 }
 
 #[cold]

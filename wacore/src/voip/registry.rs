@@ -24,6 +24,7 @@ use crate::types::group_call::{
 use crate::voip::driver::{GroupControl, GroupRawEpoch, VideoControl, VideoControlSender};
 use crate::voip::engine::CallEvent;
 use crate::voip::group::{GroupCallState, GroupStateApply};
+use crate::voip::group_media::group_device_is_local;
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
 
@@ -187,7 +188,11 @@ impl GroupControlQueue {
     }
 
     fn accepts(&self, control: &GroupControl) -> bool {
-        let queue_capacity = self.tx.capacity().unwrap_or(1).max(1);
+        Self::accepts_with_capacity(control, self.tx.capacity().unwrap_or(1))
+    }
+
+    fn accepts_with_capacity(control: &GroupControl, queue_capacity: usize) -> bool {
+        let queue_capacity = queue_capacity.max(1);
         let max_control_bytes = MAX_GROUP_CONTROL_QUEUE_BYTES / queue_capacity;
         size_of::<GroupControl>().saturating_add(control.heap_bytes()) <= max_control_bytes
     }
@@ -753,25 +758,32 @@ impl CallRegistry {
                 // remain admissible instead of splitting registry and driver state.
                 return GroupStateApply::InvalidSnapshot;
             }
-            if let Some(group_ctl_tx) = entry.group_ctl_tx.as_ref() {
-                let mut preview = entry.group.clone().unwrap_or_else(|| {
-                    GroupCallState::new(
-                        entry.session.call_id.clone(),
-                        entry.session.call_creator.clone(),
-                    )
-                });
-                if preview.apply_update(update.clone()) == GroupStateApply::Applied {
-                    let committed = preview
-                        .snapshot()
-                        .expect("an applied preview owns a snapshot")
-                        .clone();
-                    if !group_ctl_tx.accepts(&GroupControl::Update(Box::new(committed))) {
-                        // Do not consume the authoritative transaction when its committed form
-                        // cannot fit one bounded media-driver slot. A corrected same-transaction
-                        // redelivery must remain admissible instead of leaving registry and media
-                        // state permanently split.
-                        return GroupStateApply::InvalidSnapshot;
-                    }
+            let mut preview = entry.group.clone().unwrap_or_else(|| {
+                GroupCallState::new(
+                    entry.session.call_id.clone(),
+                    entry.session.call_creator.clone(),
+                )
+            });
+            if preview.apply_update(update.clone()) == GroupStateApply::Applied {
+                let committed = preview
+                    .snapshot()
+                    .expect("an applied preview owns a snapshot")
+                    .clone();
+                let control = GroupControl::Update(Box::new(committed));
+                let fits = entry.group_ctl_tx.as_ref().map_or(
+                    !entry.is_call_link || {
+                        GroupControlQueue::accepts_with_capacity(
+                            &control,
+                            DEFAULT_CALL_EVENT_QUEUE_CAPACITY,
+                        )
+                    },
+                    |group_ctl_tx| group_ctl_tx.accepts(&control),
+                );
+                if !fits {
+                    // Do not consume the authoritative transaction when its committed form cannot
+                    // fit one production media-driver slot, including before the sender attaches.
+                    // A corrected same-transaction redelivery must remain admissible.
+                    return GroupStateApply::InvalidSnapshot;
                 }
             }
             let downgrades_video = update.media == "audio"
@@ -832,7 +844,7 @@ impl CallRegistry {
                 && participant
                     .devices
                     .iter()
-                    .any(|candidate| candidate.jid.device_eq(device))
+                    .any(|candidate| group_device_is_local(participant, candidate, device))
         })
     }
 
@@ -1202,6 +1214,18 @@ impl CallRegistry {
             let applied = initial_state.apply_update(initial_update.clone());
             if applied != GroupStateApply::Applied {
                 return Err(applied);
+            }
+            if is_call_link {
+                let committed = initial_state
+                    .snapshot()
+                    .expect("an applied initial state owns a snapshot")
+                    .clone();
+                if !GroupControlQueue::accepts_with_capacity(
+                    &GroupControl::Update(Box::new(committed)),
+                    DEFAULT_CALL_EVENT_QUEUE_CAPACITY,
+                ) {
+                    return Err(GroupStateApply::InvalidSnapshot);
+                }
             }
         }
         Ok(self.insert_inner(session, true, true, is_call_link))
@@ -3424,6 +3448,44 @@ mod tests {
     }
 
     #[test]
+    fn call_link_admission_accepts_the_local_device_through_its_pn_alias() {
+        let reg = CallRegistry::new();
+        let mut waiting = session("GROUP-CALL");
+        assert!(waiting.transition_to(CallPhase::Calling));
+        assert!(waiting.transition_to(CallPhase::WaitingRoom));
+        let generation = reg
+            .insert_call_link_checked(waiting)
+            .expect("valid call-link registration");
+
+        let local_lid = Jid::new("222222222222222", Server::Lid).with_device(1);
+        let local_pn = Jid::new("12025550123", Server::Pn).with_device(1);
+        assert!(reg.set_group_invite_self_device(
+            "GROUP-CALL",
+            generation,
+            GroupCallDevice::new(local_lid),
+        ));
+
+        let mut admitted = group_update(1);
+        let mut local_participant = GroupCallParticipant::new(
+            Jid::new("222222222222222", Server::Lid),
+            vec![GroupCallDevice::new(local_pn)],
+        );
+        local_participant.pn = Some(Jid::new("12025550123", Server::Pn));
+        local_participant.state = Some("connected".to_string());
+        admitted.participants = vec![local_participant];
+
+        assert_eq!(
+            reg.apply_group_update_if_current(admitted, generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            reg.phase("GROUP-CALL"),
+            Some(CallPhase::Connecting),
+            "the accepted PN alias represents the exact local LID device"
+        );
+    }
+
+    #[test]
     fn recording_the_local_device_rechecks_a_retained_admission_roster() {
         let reg = CallRegistry::new();
         let mut waiting = session("GROUP-CALL");
@@ -3780,6 +3842,49 @@ mod tests {
             control_rx.try_recv(),
             Ok(GroupControl::Update(update)) if update.transaction_id == 2
         ));
+    }
+
+    #[test]
+    fn oversized_pre_attachment_group_update_does_not_consume_the_transaction() {
+        let reg = CallRegistry::new();
+        let generation = reg
+            .insert_call_link_checked(session("GROUP-CALL"))
+            .expect("call-link registration without media");
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(1), generation),
+            GroupStateApply::Applied
+        );
+
+        let mut oversized = group_update(2);
+        oversized.participants.push(GroupCallParticipant {
+            jid: Jid::new("222222222222222", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
+                platform: Some("web".to_string()),
+                pid: Some(2),
+                capability_version: Some(1),
+                capability: vec![7; MAX_GROUP_CONTROL_QUEUE_BYTES],
+            }],
+        });
+        assert_eq!(
+            reg.apply_group_update_if_current(oversized, generation),
+            GroupStateApply::InvalidSnapshot,
+            "a pre-attachment generation must not retain a snapshot too large for its future queue"
+        );
+        assert_eq!(
+            reg.group_state_if_current("GROUP-CALL", generation)
+                .and_then(|state| state.snapshot().map(|snapshot| snapshot.transaction_id)),
+            Some(1)
+        );
+
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(2), generation),
+            GroupStateApply::Applied,
+            "a corrected same-transaction redelivery must remain admissible"
+        );
     }
 
     #[test]

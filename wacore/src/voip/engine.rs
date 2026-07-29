@@ -1007,11 +1007,20 @@ impl CallEngine {
         }
         registry.apply_group_update(&config.initial_update)?;
 
-        let local_sender = local_sender.to_string();
+        let live_sender = self.started || self.allocated || self.allocate_pending;
+        let local_sender = if live_sender {
+            self.media
+                .as_ref()
+                .ok_or(GroupMediaError::Pipeline)?
+                .self_lid
+                .clone()
+        } else {
+            local_sender.to_string()
+        };
         let local_participant_id = ssrc::format_e2e_srtp_participant_id(&local_sender);
         let derived_stream_ssrcs =
             ssrc::derive_wasm_relay_stream_ssrcs(&self.call_id, &local_participant_id);
-        if self.started || self.allocated || self.allocate_pending {
+        if live_sender {
             let media = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?;
             let sender_is_unchanged = self.self_participant_id == local_participant_id
                 && media.pipe.send_ssrc() == derived_stream_ssrcs[0]
@@ -3082,10 +3091,14 @@ mod encoded_tests {
         engine.start(1, 1_700_000_000_000);
         let _ = drain(&mut engine);
 
+        let mut update = group_update();
+        let local_pn = Jid::new("12025550111", Server::Pn);
+        update.participants[0].pn = Some(local_pn.clone());
+        update.participants[0].devices[0].jid = local_pn;
         assert_eq!(
             engine
-                .apply_group_update(2, &group_update())
-                .expect("identity-preserving live promotion"),
+                .apply_group_update(2, &update)
+                .expect("PN-alias roster promotion preserving the live sender"),
             GroupRosterApply::Applied
         );
         assert!(engine.is_group());
