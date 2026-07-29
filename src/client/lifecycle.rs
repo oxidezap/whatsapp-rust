@@ -574,7 +574,24 @@ impl Client {
                 delay,
                 error_count + 1
             );
-            self.runtime.sleep(delay).await;
+            // Race the wait against the terminal shutdown: the loop only tests
+            // `is_running` at the top, so a bare sleep would hold a shutdown
+            // unobserved for as long as the backoff runs — up to the 900s cap,
+            // which a 429 reaches in a couple of stream errors. Falling through
+            // is the whole fix; the loop condition handles the exit.
+            //
+            // Fresh listener per iteration (event_listener is edge-triggered);
+            // `shutdown` itself is subscribed once above and holds the notifier
+            // alive. Deliberately NOT `connection_shutdown_signal()`: that one
+            // fires on every disconnect the loop is here to reconnect from, so
+            // watching it would collapse the backoff instead of interrupting it.
+            let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
+            futures::select! {
+                _ = self.runtime.sleep(delay).fuse() => {}
+                _ = shutdown_fired.fuse() => {
+                    debug!("Shutdown signalled during reconnect backoff, exiting run loop.");
+                }
+            }
         }
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
@@ -1340,5 +1357,95 @@ mod tests {
             .await
             .expect_err("connecting twice must be refused");
         assert!(matches!(error, ConnectError::AlreadyConnected));
+    }
+
+    /// Far enough up the Fibonacci sequence that the next backoff is the 900s
+    /// cap. The cap is what makes these tests decisive: an uninterruptible
+    /// wait parks the loop for 15 minutes, so a prompt return can only come
+    /// from the wait racing the shutdown signal.
+    const CAPPED_BACKOFF_ATTEMPTS: u32 = 40;
+
+    /// Starts `run()` and returns once the loop has actually reached its
+    /// reconnect backoff. The attempt counter is bumped immediately before the
+    /// wait, so observing the bump is proof the loop is parked there — no
+    /// timed guess involved.
+    async fn run_until_parked_in_backoff(client: &Arc<Client>) -> tokio::task::JoinHandle<()> {
+        client
+            .auto_reconnect_errors
+            .store(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);
+
+        let runner = client.clone();
+        let run = tokio::spawn(async move { runner.run().await });
+
+        crate::test_utils::poll_until("the run loop to reach its reconnect backoff", || {
+            client.auto_reconnect_errors.load(Ordering::Relaxed) > CAPPED_BACKOFF_ATTEMPTS
+        })
+        .await;
+
+        run
+    }
+
+    /// A shutdown that lands *during* the reconnect backoff must be observed
+    /// then, not when the sleep happens to expire. `disconnect()` returns
+    /// promptly either way; what the consumer awaits is the run future, and
+    /// with an uninterruptible wait that future outlives the shutdown by up to
+    /// the 900s cap — long enough that a supervisor awaiting `Bot::run` reads
+    /// it as a hang.
+    #[tokio::test]
+    async fn disconnect_interrupts_the_reconnect_backoff() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.disconnect().await;
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return when disconnect() fires, not after the 900s backoff")
+            .expect("the run task must not panic");
+    }
+
+    /// `signal_shutdown_sync()` is the flag-only path taken by `Drop` impls on
+    /// FFI wrappers, and its contract is the same: watchers exit on their next
+    /// poll. The run loop is a watcher, so the parked backoff must wake here
+    /// too — it is the path a `Drop` cannot follow up with an `await`.
+    #[tokio::test]
+    async fn signal_shutdown_sync_interrupts_the_reconnect_backoff() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.signal_shutdown_sync();
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return when signal_shutdown_sync() fires")
+            .expect("the run task must not panic");
+    }
+
+    /// The counterpart guard: the *per-connection* shutdown fires on every
+    /// disconnect the loop is supposed to reconnect from, so the backoff must
+    /// not watch it. Subscribing to the wrong signal would pass the two tests
+    /// above while silently turning every backoff into a no-op and hammering
+    /// the server — this pins the normal path down.
+    #[tokio::test]
+    async fn a_connection_level_shutdown_does_not_cut_the_backoff_short() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.notify_connection_shutdown();
+
+        // Still parked: the loop must not have come back around to bump the
+        // counter for another attempt.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client.auto_reconnect_errors.load(Ordering::Relaxed),
+            CAPPED_BACKOFF_ATTEMPTS + 1,
+            "a per-connection shutdown must not release the reconnect backoff"
+        );
+
+        client.disconnect().await;
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must still return on a terminal shutdown")
+            .expect("the run task must not panic");
     }
 }
