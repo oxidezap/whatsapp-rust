@@ -561,32 +561,48 @@ fn parsed_jid_encoded_size_with_cache(
     }
 }
 
+/// Byte count for one encoded JID.
+///
+/// Must mirror `write_jid_ref`/`write_jid_owned` branch for branch: the exact
+/// marshal sizes its output slice from this and then writes into it, so a plan
+/// that disagrees with the writer is not a bad estimate — it is an
+/// `UnexpectedEof` on a send. Both JID flavours route through here so the two
+/// cannot drift apart.
+#[inline]
+fn jid_encoded_size_with_cache(
+    user: &str,
+    server: jid::Server,
+    device: u16,
+    integrator: u16,
+    hints: &mut StringHintCache,
+) -> usize {
+    if needs_interop_jid(server, integrator) {
+        // token + user + u16 device + u16 integrator + server
+        return 1
+            + string_encoded_size_with_cache(user, hints)
+            + 2
+            + 2
+            + string_encoded_size_with_cache(jid::INTEROP_SERVER, hints);
+    }
+    if device > 0 && server_supports_ad_jid(server) {
+        return 3 + string_encoded_size_with_cache(user, hints);
+    }
+    let user_size = if user.is_empty() {
+        1
+    } else {
+        string_encoded_size_with_cache(user, hints)
+    };
+    1 + user_size + string_encoded_size_with_cache(server.as_str(), hints)
+}
+
 #[inline]
 fn owned_jid_encoded_size_with_cache(jid: &Jid, hints: &mut StringHintCache) -> usize {
-    if jid.device > 0 && server_supports_ad_jid(jid.server) {
-        3 + string_encoded_size_with_cache(&jid.user, hints)
-    } else {
-        let user_size = if jid.user.is_empty() {
-            1
-        } else {
-            string_encoded_size_with_cache(&jid.user, hints)
-        };
-        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
-    }
+    jid_encoded_size_with_cache(&jid.user, jid.server, jid.device, jid.integrator, hints)
 }
 
 #[inline]
 fn jid_ref_encoded_size_with_cache(jid: &JidRef<'_>, hints: &mut StringHintCache) -> usize {
-    if jid.device > 0 && server_supports_ad_jid(jid.server) {
-        3 + string_encoded_size_with_cache(&jid.user, hints)
-    } else {
-        let user_size = if jid.user.is_empty() {
-            1
-        } else {
-            string_encoded_size_with_cache(&jid.user, hints)
-        };
-        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
-    }
+    jid_encoded_size_with_cache(&jid.user, jid.server, jid.device, jid.integrator, hints)
 }
 
 #[inline]
