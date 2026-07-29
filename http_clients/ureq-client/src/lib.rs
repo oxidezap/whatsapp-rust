@@ -116,21 +116,29 @@ fn status_as_response<Any>(req: ureq::RequestBuilder<Any>) -> ureq::RequestBuild
     req.config().http_status_as_error(false).build()
 }
 
-/// Ceiling on a non-2xx body. A CDN error page is diagnostic text, not payload:
-/// WhatsApp Web reads it (a 403 whose body contains `URL signature expired` is
-/// reclassified as an expired URL rather than a genuine refusal), and
-/// `upload.rs` puts it in the error message. Bounded independently of
-/// [`UreqHttpClient::max_body_bytes`] so a tightened media cap can't make an
-/// over-cap error page discard the status it came with.
+/// Ceiling on a non-2xx body, on top of [`UreqHttpClient::max_body_bytes`]
+/// rather than instead of it — that knob is the caller's memory bound, and an
+/// error page is not a reason to overrun it.
+///
+/// A CDN error page is diagnostic text, not payload: `upload.rs` puts it in the
+/// error message, and WhatsApp Web goes further, reclassifying a 403 whose body
+/// says `URL signature expired` as an expired URL rather than a refusal. Worth
+/// a few KiB, never worth the megabytes a hostile host could send.
 const ERROR_BODY_CAP: u64 = 64 * 1024;
 
 /// Read the response body, keeping the status readable no matter what.
 ///
 /// A 2xx body IS the payload, so an over-cap read there stays an error — the
 /// caller must not mistake a truncated media file for a complete one. A non-2xx
-/// body is diagnostic, so it is truncated at [`ERROR_BODY_CAP`] instead: losing
-/// the tail of an error page costs nothing, while losing the status costs the
-/// media-conn refresh (see [`status_as_response`]).
+/// body is diagnostic, so it is truncated instead: losing the tail of an error
+/// page costs nothing, while losing the status costs the media-conn refresh
+/// (see [`status_as_response`]).
+///
+/// Truncating leaves bytes unread, so ureq drops the connection instead of
+/// pooling it. That is the intended trade: draining an unbounded error body to
+/// save a socket hands a broken or hostile host a way to spend our time, and
+/// the host that just answered 401/403 is the one this attempt is about to
+/// rotate away from anyway.
 fn read_body(response: ureq::http::Response<ureq::Body>, max_body_bytes: u64) -> Result<Vec<u8>> {
     if response.status().is_success() {
         // ureq's `read_to_vec()` default cap is 10 MiB.
