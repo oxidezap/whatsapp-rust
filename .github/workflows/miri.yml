@@ -62,6 +62,16 @@ jobs:
           - name: wacore-noise
             cache-key: noise
             args: -p wacore-noise --lib
+          # `AddressBuf::as_str` hands out a `&str` over the inline array
+          # without revalidating it, on the invariant that `push_str` only ever
+          # copies whole fragments. A writer that broke that would put a partial
+          # code point into release builds, and nothing else would notice.
+          # Filtered to `address` on purpose: the invariant is local to that
+          # module, and interpreting the crate's curve25519/AES tests would cost
+          # the whole time budget while proving nothing about it.
+          - name: wacore-libsignal (address)
+            cache-key: libsignal-address
+            args: -p wacore-libsignal --lib address
     steps:
       - uses: actions/checkout@v6
         with:
