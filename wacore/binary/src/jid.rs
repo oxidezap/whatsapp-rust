@@ -497,29 +497,26 @@ pub trait JidExt {
     }
 }
 
-/// The parts of `agent`/`integrator` that are actually part of a JID's identity.
+/// The part of `agent` that is actually part of a JID's identity.
 ///
-/// Neither field is universal. `agent` is only meaningful where the server
-/// renders it — on Pn/Lid/Hosted/HostedLid the wire spells the server as a
-/// domain byte instead, and `Display` omits any agent set there. `integrator`
-/// only exists on interop. Off those servers the fields are inert: nothing
-/// encodes them, nothing prints them, so two JIDs differing only there address
-/// the same thing.
+/// `agent` is only meaningful where the server renders it. On Pn/Lid/Hosted/
+/// HostedLid the wire spells the server as a domain byte instead, so nothing
+/// encodes an agent set there (`server_to_domain_type`), nothing prints it
+/// (`renders_agent`), and nothing hashes it (`push_ad_to` writes a literal `0`,
+/// matching WA Web). Two JIDs differing only there address the same device.
 ///
-/// Letting them into equality anyway is what made a JID decoded from the wire
+/// Letting it into equality anyway is what made a JID decoded from the wire
 /// unequal to the same JID read back from the store, which holds JIDs as text
 /// (see `read_ad_jid`). Equality and `Hash` both go through here so they cannot
-/// disagree.
+/// disagree, and `sort_dedup_by_device` keys on the same rule so the fan-out
+/// cannot treat one device as two.
+///
+/// `integrator` is deliberately NOT normalised here. It is only ever non-zero on
+/// interop, but `is_same_chat_as` and `jids_share_user_identity` compare it
+/// unconditionally — folding it in here would make `==` disagree with them.
 #[inline]
-fn identity_extras(server: Server, agent: u8, integrator: u16) -> (u8, u16) {
-    (
-        if server.renders_agent() { agent } else { 0 },
-        if matches!(server, Server::Interop) {
-            integrator
-        } else {
-            0
-        },
-    )
+fn identity_agent(server: Server, agent: u8) -> u8 {
+    if server.renders_agent() { agent } else { 0 }
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -891,8 +888,8 @@ impl PartialEq for Jid {
         self.user == other.user
             && self.server == other.server
             && self.device == other.device
-            && identity_extras(self.server, self.agent, self.integrator)
-                == identity_extras(other.server, other.agent, other.integrator)
+            && self.integrator == other.integrator
+            && identity_agent(self.server, self.agent) == identity_agent(other.server, other.agent)
     }
 }
 
@@ -904,7 +901,8 @@ impl std::hash::Hash for Jid {
         self.user.hash(state);
         self.server.hash(state);
         self.device.hash(state);
-        identity_extras(self.server, self.agent, self.integrator).hash(state);
+        self.integrator.hash(state);
+        identity_agent(self.server, self.agent).hash(state);
     }
 }
 
@@ -914,8 +912,8 @@ impl PartialEq for JidRef<'_> {
         self.user.as_ref() == other.user.as_ref()
             && self.server == other.server
             && self.device == other.device
-            && identity_extras(self.server, self.agent, self.integrator)
-                == identity_extras(other.server, other.agent, other.integrator)
+            && self.integrator == other.integrator
+            && identity_agent(self.server, self.agent) == identity_agent(other.server, other.agent)
     }
 }
 
@@ -927,7 +925,8 @@ impl std::hash::Hash for JidRef<'_> {
         self.user.as_ref().hash(state);
         self.server.hash(state);
         self.device.hash(state);
-        identity_extras(self.server, self.agent, self.integrator).hash(state);
+        self.integrator.hash(state);
+        identity_agent(self.server, self.agent).hash(state);
     }
 }
 
@@ -937,8 +936,8 @@ impl PartialEq<JidRef<'_>> for Jid {
         self.user.as_str() == other.user.as_ref()
             && self.server == other.server
             && self.device == other.device
-            && identity_extras(self.server, self.agent, self.integrator)
-                == identity_extras(other.server, other.agent, other.integrator)
+            && self.integrator == other.integrator
+            && identity_agent(self.server, self.agent) == identity_agent(other.server, other.agent)
     }
 }
 
@@ -1443,13 +1442,15 @@ mod tests {
         );
     }
 
-    /// `agent` off an agent-rendering server and `integrator` off interop are
-    /// inert: nothing encodes them, nothing prints them. Two JIDs differing only
-    /// there address the same thing, so equality and `Hash` must both say so —
-    /// and must agree with each other, or a `HashMap<Jid, _>` gets an entry it
-    /// can never look up again.
+    /// An `agent` off an agent-rendering server is inert: nothing encodes it,
+    /// prints it, or hashes it. Two JIDs differing only there address the same
+    /// device, so equality and `Hash` must both say so — and must agree with each
+    /// other, or a `HashMap<Jid, _>` gets an entry it can never look up again.
+    ///
+    /// `integrator` stays in identity: it is only non-zero on interop, but
+    /// `is_same_chat_as` compares it unconditionally, and `==` must not disagree.
     #[test]
-    fn inert_agent_and_integrator_stay_out_of_identity() {
+    fn inert_agent_stays_out_of_identity() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -1483,16 +1484,21 @@ mod tests {
                 "{server:?}: Hash must agree with Eq"
             );
 
-            // Same for integrator, which only exists on interop.
+            // integrator is NOT normalised: `is_same_chat_as` compares it always,
+            // and `==` must not disagree with it.
             let with_integrator = Jid {
                 integrator: 0xBEEF,
                 ..clean.clone()
             };
-            assert_eq!(
+            assert_ne!(
                 clean, with_integrator,
-                "{server:?}: integrator is not identity"
+                "{server:?}: integrator stays in identity, matching is_same_chat_as"
             );
-            assert_eq!(hash_of(&clean), hash_of(&with_integrator));
+            assert_eq!(
+                clean.is_same_chat_as(&with_integrator),
+                clean == with_integrator,
+                "{server:?}: == must agree with is_same_chat_as"
+            );
 
             // The borrowed form and the cross-type comparison follow the same rule.
             let borrowed = JidRef {

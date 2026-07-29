@@ -108,18 +108,21 @@ pub fn sort_dedup_by_user(jids: &mut Vec<Jid>) {
     jids.dedup_by(|a, b| a.user == b.user && a.server == b.server);
 }
 
-/// Sort and deduplicate by device identity (user + server + agent + device).
+/// Sort and deduplicate by device identity (user + server + device).
+///
+/// Keyed on the same rule as `Jid`'s equality, and deliberately not on the raw
+/// `agent`: on the AD servers an agent is not part of the device's identity, so
+/// two JIDs carrying different ones encode to the same AD-JID and resolve to the
+/// same Signal address. Keying on it here would let both survive and give the
+/// group fan-out two jobs against one session.
 pub fn sort_dedup_by_device(jids: &mut Vec<Jid>) {
     jids.sort_unstable_by(|a, b| {
         a.user
             .cmp(&b.user)
             .then_with(|| a.server.cmp(&b.server))
-            .then_with(|| a.agent.cmp(&b.agent))
             .then_with(|| a.device.cmp(&b.device))
     });
-    jids.dedup_by(|a, b| {
-        a.user == b.user && a.server == b.server && a.agent == b.agent && a.device == b.device
-    });
+    jids.dedup_by(|a, b| a.user == b.user && a.server == b.server && a.device == b.device);
 }
 
 /// Build a `SenderKeyName` from a `&Jid` + `&ProtocolAddress` in a single
@@ -193,6 +196,7 @@ pub fn observe_protocol_address(addr: &ProtocolAddress) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use wacore_binary::Server;
 
     #[test]
     fn test_signal_address_string_lid() {
@@ -338,5 +342,44 @@ mod tests {
 
         write_protocol_address_to(&second, &mut buf);
         assert_eq!(buf.as_str(), "123456789:33@lid.0");
+    }
+
+    /// The fan-out uses this to collapse duplicate wire destinations, so it has
+    /// to agree with `Jid`'s equality. Two LID JIDs differing only in the agent
+    /// are one device — same AD-JID on the wire, same Signal address — and must
+    /// not both survive, or the group send builds two encryption jobs against
+    /// one session.
+    #[test]
+    fn device_dedup_collapses_jids_that_differ_only_in_an_inert_agent() {
+        let plain = Jid {
+            user: "123456789012345".into(),
+            server: Server::Lid,
+            agent: 0,
+            device: 33,
+            integrator: 0,
+        };
+        let with_agent = Jid {
+            agent: 1,
+            ..plain.clone()
+        };
+        assert_eq!(plain, with_agent, "precondition: one identity");
+        assert_eq!(
+            plain.to_signal_address_string(),
+            with_agent.to_signal_address_string(),
+            "precondition: one Signal address"
+        );
+
+        let mut jids = vec![plain.clone(), with_agent];
+        sort_dedup_by_device(&mut jids);
+        assert_eq!(jids, vec![plain.clone()], "one device, one entry");
+
+        // A different device still survives as its own entry.
+        let other_device = Jid {
+            device: 34,
+            ..plain.clone()
+        };
+        let mut jids = vec![plain.clone(), other_device.clone()];
+        sort_dedup_by_device(&mut jids);
+        assert_eq!(jids.len(), 2);
     }
 }
