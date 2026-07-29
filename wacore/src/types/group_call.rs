@@ -194,12 +194,18 @@ impl core::fmt::Debug for GroupCallRelay {
     }
 }
 
-impl Drop for GroupCallRelay {
-    fn drop(&mut self) {
+impl GroupCallRelay {
+    pub(crate) fn scrub(&mut self) {
         self.key.zeroize();
         self.hbh_key.zeroize();
         self.tokens.zeroize();
         self.auth_tokens.zeroize();
+    }
+}
+
+impl Drop for GroupCallRelay {
+    fn drop(&mut self) {
+        self.scrub();
     }
 }
 
@@ -432,10 +438,27 @@ mod tests {
     use super::GroupCallRelay;
 
     #[test]
-    fn group_call_relay_always_scrubs_on_drop() {
-        assert!(
-            core::mem::needs_drop::<GroupCallRelay>(),
-            "relay secrets must be scrubbed even without the media feature"
-        );
+    fn group_call_relay_scrub_clears_every_secret_field() {
+        let mut relay = GroupCallRelay::builder()
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .key(vec![1, 2, 3])
+            .hbh_key(vec![4, 5, 6])
+            .tokens(vec![vec![7, 8, 9]])
+            .auth_tokens(vec![vec![10, 11, 12]])
+            .endpoints(Vec::new())
+            .build();
+        assert!(!relay.key.is_empty());
+        assert!(!relay.hbh_key.is_empty());
+        assert!(!relay.tokens.is_empty());
+        assert!(!relay.auth_tokens.is_empty());
+
+        relay.scrub();
+
+        assert!(relay.key.is_empty());
+        assert!(relay.hbh_key.is_empty());
+        assert!(relay.tokens.is_empty());
+        assert!(relay.auth_tokens.is_empty());
     }
 }

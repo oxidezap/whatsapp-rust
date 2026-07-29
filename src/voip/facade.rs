@@ -1409,8 +1409,7 @@ async fn fanout_group_epoch_for_generation(
     // fallible step instead of leaving the generation alive without its requested epoch.
     let teardown = GroupRekeyTeardown::new(client, update, generation, true);
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
-    let own_lid = own_lid.to_non_ad();
-    let own_pn = client.pn().map(|jid| jid.to_non_ad());
+    let own_pn = client.pn();
     let mut seen = std::collections::HashSet::new();
     let recipients = update
         .participants
@@ -1418,10 +1417,11 @@ async fn fanout_group_epoch_for_generation(
         .filter(|participant| participant.state.as_deref() == Some("connected"))
         .flat_map(|participant| participant.devices.iter())
         .filter(|device| {
-            let device_user = device.jid.to_non_ad();
             device.pid.is_some()
-                && device_user != own_lid
-                && own_pn.as_ref() != Some(&device_user)
+                && !same_device_identity(&device.jid, &own_lid)
+                && !own_pn
+                    .as_ref()
+                    .is_some_and(|own_pn| same_device_identity(&device.jid, own_pn))
                 && seen.insert(device.jid.clone())
         })
         .map(|device| device.jid.clone())
@@ -1510,6 +1510,10 @@ async fn fanout_group_epoch_for_generation(
         raw_epoch,
         teardown,
     })
+}
+
+fn same_device_identity(left: &Jid, right: &Jid) -> bool {
+    left.user == right.user && left.server == right.server && left.device == right.device
 }
 
 async fn publish_group_epoch_ciphertexts(
@@ -5740,6 +5744,39 @@ mod tests {
             sent.load(Ordering::SeqCst),
             0,
             "the local PN device alias must be excluded from remote epoch recipients"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_rekey_fanout_keeps_a_sibling_device_of_the_local_account() {
+        let (client, sent) = make_sending_client().await;
+        let own_pn = Jid::new("12025550111", Server::Pn);
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                own_pn.clone(),
+            )))
+            .await;
+        let local_device = own_pn.clone().with_device(0);
+        let sibling = own_pn.with_device(2);
+        seed_peer_session(&client, &sibling).await;
+        let mut update = rekey_update(&client, &[]);
+        update.participants[0].pn = Some(local_device.to_non_ad());
+        update.participants[0].devices[0].jid = local_device;
+        let mut sibling_device = GroupCallDevice::new(sibling.clone());
+        sibling_device.pid = Some(2);
+        update.participants[0].devices.push(sibling_device);
+
+        fanout_group_epoch(&client, &update)
+            .await
+            .expect("the local account's sibling remains a remote recipient")
+            .commit(|_| Ok(()))
+            .expect("local epoch commit");
+
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            1,
+            "only the exact local endpoint is excluded from epoch fanout"
         );
     }
 

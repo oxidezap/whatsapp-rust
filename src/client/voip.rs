@@ -1185,7 +1185,7 @@ impl Voip<'_> {
         // to associate with this request. Keep one such request active at a time so bounded-buffer
         // saturation can fail only its owning join; other joins wait here and start with clean
         // staging state.
-        let _pending_join_lane = self.client.pending_call_link_join_lane.lock().await;
+        let pending_join_lane = self.client.pending_call_link_join_lane.lock().await;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
         let capability =
@@ -1242,6 +1242,7 @@ impl Voip<'_> {
             .map_err(|_| {
                 CallError::Response("call-link admission snapshot was rejected".to_string())
             })?;
+        drop(pending_join_lane);
         let mut registration = CallLinkRegistrationGuard::new(
             self.client,
             registry.clone(),
@@ -3502,6 +3503,91 @@ mod tests {
             .expect("second link_join request");
         second.abort();
         let _ = second.await;
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn registered_call_link_releases_the_unknown_id_lane_before_heartbeat() {
+        use std::time::Duration;
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid).with_device(1),
+            )))
+            .await;
+        let creator = Jid::new("333333333333333", Server::Lid);
+        let first_request = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .voip()
+                .join_call_link_registration_with_audio(
+                    "FIRST-CALL-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        let request = first_request.await.expect("first link_join request");
+        let request_id = request
+            .as_node_ref()
+            .attrs()
+            .optional_string("id")
+            .expect("request id")
+            .into_owned();
+        let heartbeat = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new("ack")
+                .attr("class", "call")
+                .attr("type", "link_join")
+                .attr("id", request_id.as_str())
+                .children([NodeBuilder::new("waiting_room")
+                    .attr("call-id", "FIRST-CALL-ID")
+                    .attr("call-creator", creator)
+                    .attr("link-token", "FIRST-CALL-LINK")
+                    .attr("media", "audio")
+                    .attr("enabled", "1")
+                    .attr("is_admin", "0")
+                    .attr("transaction-id", "1")
+                    .build()])
+                .build(),
+        )
+        .await;
+        heartbeat.await.expect("first waiting-room heartbeat");
+
+        let second_request = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .voip()
+                .join_call_link_registration_with_audio(
+                    "SECOND-CALL-LINK",
+                    CallLinkMedia::Audio,
+                    AudioFormat::OPUS_16KHZ_60MS,
+                )
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), second_request)
+            .await
+            .expect("registration must release the unknown-call-id lane")
+            .expect("second link_join request");
+        assert_eq!(
+            request
+                .as_node_ref()
+                .children()
+                .expect("second request action")[0]
+                .tag,
+            "link_join"
+        );
+
+        second.abort();
+        let _ = second.await;
+        first.abort();
+        let _ = first.await;
     }
 
     #[cfg(feature = "voip-runtime")]

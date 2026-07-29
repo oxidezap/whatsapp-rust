@@ -968,9 +968,10 @@ impl CallEngine {
         now: Millis,
         config: GroupEngineConfig,
     ) -> Result<(), EngineError> {
-        if !group_roster_contains_participant(&config.initial_update, &config.self_jid) {
-            return Err(GroupMediaError::LocalParticipantRemoved.into());
-        }
+        let local_sender = group_roster_local_device(&config.initial_update, &config.self_jid)
+            .ok_or(GroupMediaError::LocalParticipantRemoved)?
+            .jid
+            .clone();
         // Validate relay material before constructing or publishing group state. In particular, a
         // failed direct-to-group promotion must remain retryable with the same roster transaction.
         let relay_refresh = prepare_group_relay_refresh(&config.initial_update)?;
@@ -1006,16 +1007,18 @@ impl CallEngine {
         }
         registry.apply_group_update(&config.initial_update)?;
 
+        let local_sender = local_sender.to_string();
+        let local_participant_id = ssrc::format_e2e_srtp_participant_id(&local_sender);
         let app_data_ssrc = ssrc::derive_wasm_participant_ssrc(
             &self.call_id,
-            &self.self_participant_id,
+            &local_participant_id,
             ssrc::APP_DATA_SSRC_SLOT_WORD,
         );
-        let stream_ssrcs = self.prepare_group_stream_ssrcs(app_data_ssrc)?;
+        let stream_ssrcs = self.prepare_group_stream_ssrcs(&local_participant_id, app_data_ssrc)?;
         let media = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?;
         let mut app_data = MediaPipeline::new(&MediaPipelineParams {
             call_key: &media.call_key,
-            self_lid: &media.self_lid,
+            self_lid: &local_sender,
             peer_lid: &media.recv_peer_lid,
             ssrc: app_data_ssrc,
             samples_per_packet: app_data::APP_DATA_RTP_TIMESTAMP_STRIDE,
@@ -1029,15 +1032,22 @@ impl CallEngine {
         let hbh_fec_ssrcs = [
             ssrc::derive_wasm_participant_ssrc(
                 &self.call_id,
-                &self.self_participant_id,
+                &local_participant_id,
                 ssrc::HBH_FEC_TX_SSRC_SLOT_WORD,
             ),
             ssrc::derive_wasm_participant_ssrc(
                 &self.call_id,
-                &self.self_participant_id,
+                &local_participant_id,
                 ssrc::HBH_FEC_RX_SSRC_SLOT_WORD,
             ),
         ];
+        self.self_participant_id = local_participant_id;
+        let media = self.media.as_mut().ok_or(GroupMediaError::Pipeline)?;
+        media.self_lid = local_sender;
+        media.pipe.set_send_ssrc(stream_ssrcs[0]);
+        if let Some(video) = media.video.as_mut() {
+            video.pipe.set_send_ssrc(stream_ssrcs[3]);
+        }
         let mut group = GroupEngineState {
             registry,
             local_device: config.self_jid,
@@ -1253,9 +1263,12 @@ impl CallEngine {
         Ok(())
     }
 
-    fn prepare_group_stream_ssrcs(&mut self, app_data_ssrc: u32) -> Result<[u32; 9], EngineError> {
-        let mut stream_ssrcs =
-            ssrc::derive_wasm_relay_stream_ssrcs(&self.call_id, &self.self_participant_id);
+    fn prepare_group_stream_ssrcs(
+        &mut self,
+        participant_id: &str,
+        app_data_ssrc: u32,
+    ) -> Result<[u32; 9], EngineError> {
+        let mut stream_ssrcs = ssrc::derive_wasm_relay_stream_ssrcs(&self.call_id, participant_id);
         let mut used = stream_ssrcs[..6]
             .iter()
             .copied()
@@ -2504,15 +2517,22 @@ fn remote_group_pids(update: &GroupCallUpdate, local_device: &Jid) -> Vec<u32> {
 }
 
 fn group_roster_contains_participant(update: &GroupCallUpdate, local_device: &Jid) -> bool {
+    group_roster_local_device(update, local_device).is_some()
+}
+
+fn group_roster_local_device<'a>(
+    update: &'a GroupCallUpdate,
+    local_device: &Jid,
+) -> Option<&'a crate::types::group_call::GroupCallDevice> {
     update
         .participants
         .iter()
         .filter(|participant| participant.is_connected())
-        .any(|participant| {
+        .find_map(|participant| {
             participant
                 .devices
                 .iter()
-                .any(|device| group_device_is_local(participant, device, local_device))
+                .find(|device| group_device_is_local(participant, device, local_device))
         })
 }
 
@@ -2769,7 +2789,7 @@ mod encoded_tests {
         let mut update = group_update();
         let local_pn = Jid::new("12025550111", Server::Pn);
         update.participants[0].pn = Some(local_pn.clone());
-        update.participants[0].devices[0].jid = local_pn;
+        update.participants[0].devices[0].jid = local_pn.clone();
         update.relay = Some(relay.clone());
         let config = CallConfig::for_group(
             CallDirection::Outgoing,
@@ -2802,6 +2822,63 @@ mod encoded_tests {
             vec![2],
             "the local PN device must not be subscribed through the relay"
         );
+        let local_participant_id = ssrc::format_e2e_srtp_participant_id(&local_pn.to_string());
+        assert_eq!(engine.self_participant_id, local_participant_id);
+        let local_ssrc =
+            ssrc::derive_wasm_participant_ssrc(&update.call_id, &local_participant_id, 0);
+        let group = engine.group.as_ref().expect("group state");
+        assert_eq!(
+            group.stream_ssrcs[3],
+            ssrc::derive_video_participant_ssrc(&update.call_id, &local_participant_id)
+        );
+        assert_eq!(
+            group.app_data_ssrc,
+            ssrc::derive_wasm_participant_ssrc(
+                &update.call_id,
+                &local_participant_id,
+                ssrc::APP_DATA_SSRC_SLOT_WORD,
+            )
+        );
+        assert_eq!(
+            engine.media.as_ref().expect("group media").self_lid,
+            local_pn.to_string()
+        );
+        assert_eq!(
+            engine.media.as_ref().expect("group media").pipe.send_ssrc(),
+            local_ssrc,
+            "outbound media must use the admitted roster device identity"
+        );
+
+        let epoch = [0x42; 32];
+        assert_eq!(
+            engine
+                .apply_group_raw_epoch(update.transaction_id, &epoch)
+                .expect("install group epoch"),
+            GroupEpochApply::Installed
+        );
+        engine.handle_input(1, Input::EncodedAudio(&[0x08, 1, 2]));
+        let packet = drain(&mut engine)
+            .into_iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet) => Some(packet),
+                _ => None,
+            })
+            .expect("authenticated outbound audio");
+        let peer = update.participants[1].devices[0].jid.clone();
+        let mut receiver = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &epoch,
+            self_lid: &peer.to_string(),
+            peer_lid: &local_pn.to_string(),
+            ssrc: 1,
+            samples_per_packet: AudioFormat::OPUS_16KHZ_60MS.rtp_timestamp_step,
+            warp_mi_tag_len: 4,
+        })
+        .expect("peer receiver");
+        let (header, payload) = receiver
+            .unprotect_audio(&packet)
+            .expect("the peer derives the local PN sender key");
+        assert_eq!(header.ssrc, local_ssrc);
+        assert_eq!(payload, [0x08, 1, 2]);
     }
 
     #[test]

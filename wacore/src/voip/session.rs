@@ -449,6 +449,10 @@ impl MediaPipeline {
         self.rtp.ssrc
     }
 
+    pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
+        self.rtp.ssrc = ssrc;
+    }
+
     /// Select the negotiated audio RTP payload type without resetting sequence/timestamp state.
     pub fn set_audio_payload_type(&mut self, payload_type: u8) -> bool {
         self.rtp.set_payload_type(payload_type)
@@ -703,6 +707,10 @@ impl VideoPipeline {
 
     pub fn send_ssrc(&self) -> u32 {
         self.rtp.ssrc
+    }
+
+    pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
+        self.rtp.ssrc = ssrc;
     }
 
     pub(crate) fn set_timestamp_stride(&mut self, ts_stride: u32) -> bool {

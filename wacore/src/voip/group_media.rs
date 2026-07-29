@@ -795,7 +795,7 @@ fn active_devices<'a>(
     update
         .participants
         .iter()
-        .filter(|participant| participant.state.as_deref() == Some("connected"))
+        .filter(|participant| participant.is_connected())
         .flat_map(|participant| {
             participant
                 .devices
