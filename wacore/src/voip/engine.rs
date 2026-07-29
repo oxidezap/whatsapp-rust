@@ -1009,6 +1009,22 @@ impl CallEngine {
 
         let local_sender = local_sender.to_string();
         let local_participant_id = ssrc::format_e2e_srtp_participant_id(&local_sender);
+        let derived_stream_ssrcs =
+            ssrc::derive_wasm_relay_stream_ssrcs(&self.call_id, &local_participant_id);
+        if self.started || self.allocated || self.allocate_pending {
+            let media = self.media.as_ref().ok_or(GroupMediaError::Pipeline)?;
+            let sender_is_unchanged = self.self_participant_id == local_participant_id
+                && media.pipe.send_ssrc() == derived_stream_ssrcs[0]
+                && media
+                    .video
+                    .as_ref()
+                    .is_none_or(|video| video.pipe.send_ssrc() == derived_stream_ssrcs[3]);
+            if !sender_is_unchanged {
+                // A live promotion may add the group receive/control planes, but it cannot rotate
+                // an already allocated sender identity or RTP stream underneath in-flight media.
+                return Err(GroupMediaError::Pipeline.into());
+            }
+        }
         let app_data_ssrc = ssrc::derive_wasm_participant_ssrc(
             &self.call_id,
             &local_participant_id,
@@ -3021,6 +3037,62 @@ mod encoded_tests {
                 .apply_group_raw_epoch(7, &[0x42; 32])
                 .expect("install group epoch"),
             GroupEpochApply::Installed
+        );
+    }
+
+    #[test]
+    fn live_direct_engine_rejects_group_promotion_that_changes_sender_ssrc() {
+        let mut engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+        let original_participant_id = engine.self_participant_id.clone();
+        let original_ssrc = engine
+            .media
+            .as_ref()
+            .expect("direct media")
+            .pipe
+            .send_ssrc();
+        engine.start(1, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        assert!(matches!(
+            engine.apply_group_update(2, &group_update()),
+            Err(EngineError::GroupMedia(GroupMediaError::Pipeline))
+        ));
+        assert!(!engine.is_group());
+        assert_eq!(engine.self_participant_id, original_participant_id);
+        assert_eq!(
+            engine
+                .media
+                .as_ref()
+                .expect("direct media")
+                .pipe
+                .send_ssrc(),
+            original_ssrc
+        );
+    }
+
+    #[test]
+    fn live_direct_engine_promotes_when_sender_identity_and_ssrc_are_unchanged() {
+        let mut config = config();
+        let participant_id = ssrc::format_e2e_srtp_participant_id(&config.self_lid);
+        config.ssrc = ssrc::derive_wasm_participant_ssrc(&config.call_id, &participant_id, 0);
+        let original_ssrc = config.ssrc;
+        let mut engine =
+            CallEngine::new(config, Box::new(SequentialTxIds::new())).expect("direct engine");
+        engine.start(1, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        assert_eq!(
+            engine
+                .apply_group_update(2, &group_update())
+                .expect("identity-preserving live promotion"),
+            GroupRosterApply::Applied
+        );
+        assert!(engine.is_group());
+        assert_eq!(engine.self_participant_id, participant_id);
+        assert_eq!(
+            engine.media.as_ref().expect("group media").pipe.send_ssrc(),
+            original_ssrc
         );
     }
 

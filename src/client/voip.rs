@@ -3509,6 +3509,33 @@ mod tests {
     #[tokio::test]
     async fn registered_call_link_releases_the_unknown_id_lane_before_heartbeat() {
         use std::time::Duration;
+        use wacore::handshake::NoiseCipher;
+
+        struct GatedTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+            gate_next_send: std::sync::atomic::AtomicBool,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for GatedTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                if self.gate_next_send.swap(false, Ordering::AcqRel) {
+                    self.started
+                        .send(())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("heartbeat observer closed"))?;
+                    self.release
+                        .recv()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("heartbeat gate closed"))?;
+                }
+                Ok(())
+            }
+
+            async fn disconnect(&self) {}
+        }
 
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
         client
@@ -3537,7 +3564,19 @@ mod tests {
             .optional_string("id")
             .expect("request id")
             .into_owned();
-        let heartbeat = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let gated_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(GatedTransport {
+                started: started_tx,
+                release: release_rx,
+                gate_next_send: std::sync::atomic::AtomicBool::new(true),
+            }),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+            NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(gated_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,
@@ -3557,7 +3596,10 @@ mod tests {
                 .build(),
         )
         .await;
-        heartbeat.await.expect("first waiting-room heartbeat");
+        started_rx
+            .recv()
+            .await
+            .expect("first waiting-room heartbeat entered the gated transport");
 
         let second_request = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         let second_client = client.clone();
@@ -3573,7 +3615,7 @@ mod tests {
         });
         let request = tokio::time::timeout(Duration::from_secs(1), second_request)
             .await
-            .expect("registration must release the unknown-call-id lane")
+            .expect("registration must release the lane while the heartbeat remains gated")
             .expect("second link_join request");
         assert_eq!(
             request
@@ -3584,10 +3626,14 @@ mod tests {
             "link_join"
         );
 
+        release_tx.send(()).await.expect("release heartbeat send");
         second.abort();
         let _ = second.await;
-        first.abort();
-        let _ = first.await;
+        let registration = first
+            .await
+            .expect("first join task")
+            .expect("first waiting-room registration");
+        drop(registration);
     }
 
     #[cfg(feature = "voip-runtime")]
