@@ -166,7 +166,13 @@ impl<'a> Decoder<'a> {
         Ok(JidRef {
             user,
             server,
-            agent,
+            // The domain byte is not an agent — it is `server` in wire form, and
+            // `write_jid_*` re-derives it from `server` on the way out. Keeping a
+            // second copy here put a field in the derived `PartialEq`/`Hash` that
+            // only wire-decoded JIDs ever carry, so the same JID compared unequal
+            // depending on whether it came off the wire or out of the store (which
+            // holds JIDs as text, where `Display` suppresses the agent anyway).
+            agent: 0,
             device,
             integrator: 0,
         })
