@@ -85,14 +85,14 @@ fuzz_target!(|data: &[u8]| {
         }
 
         if let Ok(jid) = text.parse::<Jid>() {
-            let _ = jid.to_ad_string();
+            let _ = jid.to_phash_form_string();
             let _ = jid.device_key();
             assert!(jid.display_eq(&jid.to_string()));
 
             // The non-AD form drops agent and device by definition, so it must
             // re-parse to the same identity with both cleared. Users holding a `.`
             // or `:` are excluded: rendering them back invites the parser to read
-            // those separators as an agent/device. `to_ad_string` is checked only
+            // those separators as an agent/device. `to_phash_form_string` is checked only
             // for panics, since it is not round-trippable at all.
             if !jid.user.is_empty() && !jid.user.contains(['.', ':']) {
                 let bare = jid.to_non_ad_string();
