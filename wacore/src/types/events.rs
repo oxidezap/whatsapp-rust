@@ -1255,11 +1255,15 @@ pub struct PairingCodeRefresh {
 /// is what distinguishes the two — `None` means the request never got an answer
 /// from the server.
 ///
-/// A claim the failed request itself took is released before this fires, so a
-/// request that got as far as the server leaves nothing behind. It does **not**
-/// follow that a retry will be accepted: `CodeAlreadyOutstanding` is refused
-/// precisely because an *earlier* code is still live, and that one is untouched
-/// — call `cancel_pair_code` or wait out its window first.
+/// A claim the failed request itself took is released before this fires, so
+/// nothing is left holding the flow and `pair_with_code` can be called again.
+///
+/// The one failure that does **not** arrive here is `CodeAlreadyOutstanding`:
+/// it is refused precisely because an earlier code is still live, so a code *is*
+/// coming — the consumer already has it from the [`PairingCode`] that minted it
+/// — and this event would say the opposite. Retrying is futile there until
+/// `cancel_pair_code` runs or the window closes, and a direct caller still gets
+/// it as `Err`.
 ///
 /// Whether to retry at all is the point of the fields: back off on
 /// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled),
@@ -1934,11 +1938,13 @@ mod tests {
         assert_eq!(EventKind::Messages as u8, 10);
         assert_eq!(EventKind::Receipt as u8, 11);
 
-        // The newest kind sits past every pre-existing one, including the two
-        // already parked at the end for this same reason.
-        let newest = EventKind::PairingCodeError as u8;
-        assert!(newest > EventKind::ServerAck as u8);
-        assert!(newest > EventKind::PairingQrCodesExhausted as u8);
+        // The two already parked at the end for this same reason, and the
+        // newest past both. Pinned absolutely rather than as an offset from its
+        // neighbour: a relative check still passes when a kind is inserted
+        // *before* the pair, which shifts all three together.
+        assert_eq!(EventKind::ServerAck as u8, 57);
+        assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
+        assert_eq!(EventKind::PairingCodeError as u8, 59);
     }
 
     #[test]

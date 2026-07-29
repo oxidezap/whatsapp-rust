@@ -119,6 +119,21 @@ impl PairError {
             .map(|rejection| PairCodeRejection::from_server(rejection.code, rejection.text))
     }
 
+    /// Whether this failure left an earlier code live rather than ending the
+    /// flow.
+    ///
+    /// True only for [`PairCodeError::CodeAlreadyOutstanding`]: the request was
+    /// refused *because* a previous code is still within its validity window, so
+    /// unlike every other failure a code is on screen and may yet be entered.
+    /// Retrying is futile until [`Client::cancel_pair_code`] runs or the window
+    /// closes, which is why no [`Event::PairingCodeError`] is dispatched for it.
+    pub fn leaves_a_code_outstanding(&self) -> bool {
+        matches!(
+            self,
+            Self::PairCode(PairCodeError::CodeAlreadyOutstanding { .. })
+        )
+    }
+
     /// How long the server asked the client to wait before retrying, from the
     /// `backoff` attribute.
     ///
@@ -206,6 +221,15 @@ impl Client {
         // twice, and a `with_pair_code` consumer sees it at all.
         match self.pair_with_code_inner(options).await {
             Ok(code) => Ok(code),
+            // `CodeAlreadyOutstanding` is the one failure that does not mean
+            // "no code is coming", so dispatching it would say the opposite of
+            // what happened: a code *is* live, and the consumer was handed it by
+            // the `PairingCode` that minted it. A concurrent request that has
+            // not got there yet still resolves on its own — into `PairingCode`
+            // or into this event — so refusing the duplicate strands nobody.
+            // Reporting it here would instead invite a retry loop against a code
+            // that only `cancel_pair_code` or expiry can clear.
+            Err(e) if e.leaves_a_code_outstanding() => Err(e),
             Err(e) => {
                 self.core.event_bus.dispatch(Event::PairingCodeError(
                     crate::types::events::PairingCodeError::builder()
@@ -936,6 +960,46 @@ mod tests {
         assert_eq!(
             PairCodeRejection::from(418),
             PairCodeRejection::Unknown(418)
+        );
+    }
+
+    /// `CodeAlreadyOutstanding` is the one failure that must *not* dispatch: a
+    /// code is still live, the consumer already has it from the `PairingCode`
+    /// that minted it, and an error event would say the opposite while inviting
+    /// a retry loop nothing but `cancel_pair_code` or expiry can break.
+    #[tokio::test]
+    async fn an_outstanding_code_is_not_reported_as_a_failure() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        // Park a live code in the slot so the next request is the duplicate.
+        let now = wacore::time::now_secs();
+        *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
+            code_generation_ts: now,
+            claim: wacore::pair_code::PairCodeClaim::next(),
+        };
+
+        let err = client
+            .pair_with_code(PairCodeOptions {
+                phone_number: "15551234567".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a second code must be refused while one is live");
+        assert!(
+            err.leaves_a_code_outstanding(),
+            "expected CodeAlreadyOutstanding, got: {err:?}"
+        );
+
+        // Let any dispatch that was going to happen get through.
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a still-live code must not be reported as 'no code is coming'"
         );
     }
 
