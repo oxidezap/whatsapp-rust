@@ -101,6 +101,21 @@ fn build_agent() -> ureq::Agent {
     builder.build().into()
 }
 
+/// Deliver 4xx/5xx as a response instead of `ureq::Error::StatusCode`.
+///
+/// [`HttpClient`] reserves `Err` for transport failures: the media paths read
+/// `status_code` to decide whether a failure is retryable on the same host
+/// (5xx), needs a refreshed media-auth token (401/403), or a re-derived URL
+/// (404/410). ureq's default would collapse all of those into one opaque error
+/// and take the media-conn refresh with it.
+///
+/// Set per request rather than on the agent, so a caller-supplied agent
+/// ([`UreqHttpClient::with_agent`]) — which carries ureq's defaults, not ours —
+/// still honors the contract.
+fn status_as_response<Any>(req: ureq::RequestBuilder<Any>) -> ureq::RequestBuilder<Any> {
+    req.config().http_status_as_error(false).build()
+}
+
 #[async_trait]
 impl HttpClient for UreqHttpClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
@@ -110,14 +125,14 @@ impl HttpClient for UreqHttpClient {
         tokio::task::spawn_blocking(move || {
             let response = match request.method.as_str() {
                 "GET" => {
-                    let mut req = agent.get(&request.url);
+                    let mut req = status_as_response(agent.get(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
                     req.call()?
                 }
                 "POST" => {
-                    let mut req = agent.post(&request.url);
+                    let mut req = status_as_response(agent.post(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
@@ -159,7 +174,7 @@ impl HttpClient for UreqHttpClient {
         // in one blocking thread.
         let response = match request.method.as_str() {
             "GET" => {
-                let mut req = self.agent.get(&request.url);
+                let mut req = status_as_response(self.agent.get(&request.url));
                 for (key, value) in &request.headers {
                     req = req.header(key, value);
                 }
@@ -207,7 +222,7 @@ impl HttpClient for UreqHttpClient {
             ));
         }
 
-        let mut req = self.agent.post(&request.url);
+        let mut req = status_as_response(self.agent.post(&request.url));
         for (key, value) in &request.headers {
             req = req.header(key, value);
         }
@@ -487,6 +502,136 @@ mod tests {
                 .resource_report()
                 .is_some()
         );
+    }
+
+    /// Answers one request with `status`. The request body is drained first so a
+    /// rejected upload never races a broken pipe against the response.
+    fn spawn_status_server(status: u16, reason: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let reason = reason.to_string();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                match stream.read(&mut tmp) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            if let Some(cl) = parsed_content_length(&headers) {
+                let mut body_len = buf.len() - header_end;
+                while body_len < cl {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => body_len += n,
+                    }
+                }
+            }
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied"
+                )
+                .as_bytes(),
+            );
+        });
+        format!("http://{addr}")
+    }
+
+    fn get(url: String) -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            url,
+            headers: std::collections::HashMap::new(),
+            body: None,
+        }
+    }
+
+    /// Regression (#1185): a CDN 403/404 is a *response*, not a transport error.
+    /// `download.rs` classifies the status itself — 401/403 into a media-auth
+    /// refresh, 404/410 into a URL re-derivation — so swallowing the status into
+    /// an opaque `Err` makes both paths unreachable and every host retry carries
+    /// the same stale auth token.
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_surfaces_non_2xx_status_instead_of_erroring() {
+        for (status, reason) in [
+            (401u16, "Unauthorized"),
+            (403, "Forbidden"),
+            (404, "Not Found"),
+        ] {
+            let url = spawn_status_server(status, reason);
+            let resp = UreqHttpClient::new()
+                .execute(get(url))
+                .await
+                .unwrap_or_else(|e| panic!("{status} must arrive as a response, got error: {e}"));
+            assert_eq!(resp.status_code, status);
+            assert_eq!(resp.body, b"denied");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_post_surfaces_non_2xx_status_instead_of_erroring() {
+        let url = spawn_status_server(403, "Forbidden");
+        let resp = UreqHttpClient::new()
+            .execute(HttpRequest::post(url).with_body(b"payload".to_vec()))
+            .await
+            .expect("403 must arrive as a response, not an error");
+        assert_eq!(resp.status_code, 403);
+    }
+
+    /// The streaming path is what media downloads actually use.
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_streaming_surfaces_non_2xx_status_instead_of_erroring() {
+        let url = spawn_status_server(403, "Forbidden");
+        let status = tokio::task::spawn_blocking(move || {
+            UreqHttpClient::new()
+                .execute_streaming(get(url))
+                .expect("403 must arrive as a response, not an error")
+                .status_code
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 403);
+    }
+
+    /// Uploads classify `is_media_auth_error(status)` off the response too.
+    #[test]
+    fn execute_upload_surfaces_non_2xx_status_instead_of_erroring() {
+        let url = spawn_status_server(403, "Forbidden");
+        let payload = vec![7u8; 128];
+        let resp = UreqHttpClient::new()
+            .execute_upload(
+                HttpRequest {
+                    method: "POST".into(),
+                    url,
+                    headers: std::collections::HashMap::new(),
+                    body: None,
+                },
+                Box::new(std::io::Cursor::new(payload.clone())),
+                payload.len() as u64,
+            )
+            .expect("403 must arrive as a response, not an error");
+        assert_eq!(resp.status_code, 403);
+    }
+
+    /// A caller-supplied agent carries ureq's own defaults, so the status
+    /// contract has to be enforced per request rather than on our agent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_agent_also_surfaces_non_2xx_status() {
+        let url = spawn_status_server(403, "Forbidden");
+        let agent: ureq::Agent = ureq::config::Config::builder().build().into();
+        let resp = UreqHttpClient::with_agent(agent)
+            .execute(get(url))
+            .await
+            .expect("403 must arrive as a response even with a custom agent");
+        assert_eq!(resp.status_code, 403);
     }
 
     #[test]

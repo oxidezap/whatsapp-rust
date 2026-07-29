@@ -614,6 +614,177 @@ mod tests {
             .to_vec()
     }
 
+    /// Answers a single request with `status` and `body`, then closes. Stands in
+    /// for one CDN host.
+    #[cfg(feature = "ureq-client")]
+    fn spawn_cdn_server(status: u16, reason: &'static str, body: Vec<u8>) -> String {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut tmp) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        format!("http://{addr}")
+    }
+
+    #[cfg(feature = "ureq-client")]
+    fn spawn_cdn_status_server(status: u16, reason: &'static str) -> String {
+        spawn_cdn_server(status, reason, b"denied".to_vec())
+    }
+
+    #[cfg(feature = "ureq-client")]
+    fn plaintext_request(url: String) -> wacore::download::DownloadRequest {
+        wacore::download::DownloadRequest {
+            url,
+            decryption: MediaDecryption::Plaintext {
+                file_sha256: vec![0u8; 32],
+            },
+        }
+    }
+
+    #[cfg(feature = "ureq-client")]
+    async fn ureq_client() -> Arc<Client> {
+        crate::test_utils::create_test_client_with_http(
+            "cdn-status",
+            Arc::new(whatsapp_rust_ureq_http_client::UreqHttpClient::new()),
+        )
+        .await
+    }
+
+    // Regression (#1185): `validate_download_status` was unit-tested while being
+    // unreachable — the HTTP client turned every non-2xx into a transport error,
+    // so a stale-auth 403 classified as `Other` and the whole host list was
+    // retried with the same dead token instead of refreshing the media conn.
+    // These two drive the real HTTP client against a real socket, so nothing
+    // between the CDN status and the classifier is stubbed out.
+    #[cfg(feature = "ureq-client")]
+    #[tokio::test]
+    async fn cdn_auth_status_reaches_the_classifier_on_the_streaming_path() {
+        for status in [401u16, 403] {
+            let url = spawn_cdn_status_server(status, "Forbidden");
+            let client = ureq_client().await;
+            let (_writer, result) = client
+                .streaming_download_and_decrypt(&plaintext_request(url), Cursor::new(Vec::new()))
+                .await
+                .expect("the request itself completes; the status is the failure");
+            let err = result.expect_err("a non-2xx CDN response must fail the download");
+            assert!(
+                err.is_auth(),
+                "{status} must classify as an auth error so the media conn is refreshed, got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "ureq-client")]
+    #[tokio::test]
+    async fn cdn_expired_status_reaches_the_classifier_on_the_buffered_path() {
+        for status in [404u16, 410] {
+            let url = spawn_cdn_status_server(status, "Gone");
+            let client = ureq_client().await;
+            let err = client
+                .buffered_download_body(&plaintext_request(url))
+                .await
+                .expect_err("a non-2xx CDN response must fail the download");
+            assert!(
+                err.is_not_found(),
+                "{status} must classify as expired so the URL is re-derived, got {err:?}"
+            );
+        }
+    }
+
+    /// The chain the two tests above only prove one link of: a real CDN 403 must
+    /// reach `invalidate_media_conn()` and let the forced-refresh attempt
+    /// succeed. Before the fix the 403 arrived as an opaque transport error, so
+    /// this loop rotated hosts on the same dead auth token and never refreshed.
+    #[cfg(feature = "ureq-client")]
+    #[tokio::test]
+    async fn stale_auth_403_invalidates_the_media_conn_and_the_retry_recovers() {
+        let body = b"download me".to_vec();
+        let file_sha256 = plaintext_sha256(&body);
+        let stale_host = spawn_cdn_status_server(403, "Forbidden");
+        let fresh_host = spawn_cdn_server(200, "OK", body.clone());
+        let client = ureq_client().await;
+        let invalidations = Arc::new(Mutex::new(0usize));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+
+        let downloaded = download_media_with_retry(
+            {
+                let attempts = Arc::clone(&attempts);
+                move |force| {
+                    let attempts = Arc::clone(&attempts);
+                    let url = if force {
+                        fresh_host.clone()
+                    } else {
+                        stale_host.clone()
+                    };
+                    let file_sha256 = file_sha256.clone();
+                    async move {
+                        attempts.lock().await.push(force);
+                        Ok(vec![wacore::download::DownloadRequest {
+                            url,
+                            decryption: MediaDecryption::Plaintext { file_sha256 },
+                        }])
+                    }
+                }
+            },
+            {
+                let invalidations = Arc::clone(&invalidations);
+                move || {
+                    let invalidations = Arc::clone(&invalidations);
+                    async move {
+                        *invalidations.lock().await += 1;
+                    }
+                }
+            },
+            // Mirrors `Client::download`'s executor: streaming into a fresh buffer.
+            |request| {
+                let client = Arc::clone(&client);
+                async move {
+                    match client
+                        .streaming_download_and_decrypt(&request, Cursor::new(Vec::new()))
+                        .await
+                    {
+                        Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+                        Ok((_, Err(e))) => Err(e),
+                        Err(e) => Err(DownloadRequestError::other(e)),
+                    }
+                }
+            },
+        )
+        .await
+        .expect("the forced-refresh retry must recover the download");
+
+        assert_eq!(downloaded, body);
+        assert_eq!(
+            *invalidations.lock().await,
+            1,
+            "a 403 must invalidate the cached media conn"
+        );
+        assert_eq!(
+            *attempts.lock().await,
+            vec![false, true],
+            "the second attempt must ask for a refreshed media conn"
+        );
+    }
+
     #[test]
     fn download_statuses_have_one_shared_classification() {
         use crate::http::{HTTP_STATUS_FORBIDDEN, HTTP_STATUS_UNAUTHORIZED};

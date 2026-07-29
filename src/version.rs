@@ -1,4 +1,4 @@
-use crate::http::{HttpClient, HttpRequest};
+use crate::http::{HTTP_STATUS_REDIRECTION_START, HttpClient, HttpRequest};
 use crate::store::commands::DeviceCommand;
 use crate::store::persistence_manager::PersistenceManager;
 use anyhow::{Result, anyhow};
@@ -21,6 +21,17 @@ pub async fn fetch_latest_app_version(
         .execute(request)
         .await
         .map_err(|e| anyhow!("HTTP request to {} failed: {}", SW_URL, e))?;
+
+    // `HttpClient` returns a non-2xx as a response, so name the status here
+    // instead of letting an error page fall through to a "no client_revision"
+    // parse failure.
+    if response.status_code >= HTTP_STATUS_REDIRECTION_START {
+        return Err(anyhow!(
+            "HTTP request to {} returned status {}",
+            SW_URL,
+            response.status_code
+        ));
+    }
 
     let body_str = response
         .body_string()
@@ -80,6 +91,33 @@ pub async fn resolve_and_update_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::HttpResponse;
+
+    struct StatusOnlyHttpClient(u16);
+
+    #[async_trait::async_trait]
+    impl HttpClient for StatusOnlyHttpClient {
+        async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status_code: self.0,
+                body: b"<html>error</html>".to_vec(),
+            })
+        }
+    }
+
+    /// A non-2xx sw.js fetch arrives as a response, so the status has to be
+    /// named here — not swallowed into a "no client_revision" parse failure.
+    #[tokio::test]
+    async fn fetch_version_reports_the_http_status_on_a_non_2xx_response() {
+        let http_client: Arc<dyn HttpClient> = Arc::new(StatusOnlyHttpClient(403));
+        let err = fetch_latest_app_version(&http_client)
+            .await
+            .expect_err("a 403 must not be parsed as a version document");
+        assert!(
+            err.to_string().contains("403"),
+            "the error must name the status, got: {err}"
+        );
+    }
 
     #[test]
     fn test_parse_sw_js_client_revision_quoted() {

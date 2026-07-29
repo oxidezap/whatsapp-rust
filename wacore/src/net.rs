@@ -187,11 +187,22 @@ pub struct StreamingHttpResponse {
 /// transfer-encoding on upload).
 pub type UploadBody = Box<dyn std::io::Read + Send>;
 
-/// Trait for executing HTTP requests in a runtime-agnostic way
+/// Trait for executing HTTP requests in a runtime-agnostic way.
+///
+/// **A completed exchange is `Ok`, whatever the status.** `Err` means the
+/// exchange never happened — DNS, connect, TLS, timeout, a body that broke the
+/// declared cap. Implementations MUST NOT map 4xx/5xx to an error: media
+/// download and upload read `status_code` to tell a stale media-auth token
+/// (401/403) and an expired URL (404/410) — both of which need a refreshed
+/// media connection before the retry — apart from a host-level failure that
+/// should simply move to the next CDN host. An implementation that hides the
+/// status behind an opaque error makes every one of those retries repeat the
+/// same dead auth token. Some HTTP crates default the other way: `ureq`'s
+/// `http_status_as_error` is the known case.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HttpClient: crate::sync_marker::MaybeSendSync {
-    /// Executes a given HTTP request and returns the response.
+    /// Executes a given HTTP request and returns the response, non-2xx included.
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse>;
 
     /// Whether this client supports synchronous streaming downloads.
