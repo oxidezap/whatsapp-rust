@@ -1049,6 +1049,16 @@ impl Voip<'_> {
         if incoming.group.is_none() {
             return Err(CallError::Media("offer is not an active group invitation"));
         }
+        let registry = self.client.call_registry();
+        let Some(retained_generation) = incoming.ringing_generation() else {
+            return Err(CallError::CallEndedDuringSetup);
+        };
+        let generation = registry
+            .ringing_group_generation(call_id, call_creator)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        if generation != retained_generation {
+            return Err(CallError::CallEndedDuringSetup);
+        }
         let node = build_active_group_preaccept(
             call_id,
             call_creator,
@@ -1057,6 +1067,9 @@ impl Voip<'_> {
         )
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.client.send_node(node).await?;
+        if registry.ringing_group_generation(call_id, call_creator) != Some(generation) {
+            return Err(CallError::CallEndedDuringSetup);
+        }
         Ok(())
     }
 
@@ -4584,7 +4597,7 @@ mod tests {
 
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
-    async fn group_invite_accept_is_bound_to_the_retained_offer_generation() {
+    async fn group_invite_preaccept_and_accept_are_bound_to_the_retained_offer_generation() {
         let client = crate::test_utils::create_test_client().await;
         let retained_creator = call_creator();
         let replacement_creator = retained_creator.clone();
@@ -4632,6 +4645,10 @@ mod tests {
         replacement.group = Some(replacement_update);
         let current = client.call_registry().insert_ringing_group(replacement);
 
+        assert!(matches!(
+            client.voip().preaccept_group_invite(&incoming).await,
+            Err(CallError::CallEndedDuringSetup)
+        ));
         assert!(matches!(
             client.voip().accept_group_invite(&incoming).await,
             Err(CallError::CallEndedDuringSetup)
