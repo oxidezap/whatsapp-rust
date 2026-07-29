@@ -116,6 +116,41 @@ fn status_as_response<Any>(req: ureq::RequestBuilder<Any>) -> ureq::RequestBuild
     req.config().http_status_as_error(false).build()
 }
 
+/// Ceiling on a non-2xx body. A CDN error page is diagnostic text, not payload:
+/// WhatsApp Web reads it (a 403 whose body contains `URL signature expired` is
+/// reclassified as an expired URL rather than a genuine refusal), and
+/// `upload.rs` puts it in the error message. Bounded independently of
+/// [`UreqHttpClient::max_body_bytes`] so a tightened media cap can't make an
+/// over-cap error page discard the status it came with.
+const ERROR_BODY_CAP: u64 = 64 * 1024;
+
+/// Read the response body, keeping the status readable no matter what.
+///
+/// A 2xx body IS the payload, so an over-cap read there stays an error — the
+/// caller must not mistake a truncated media file for a complete one. A non-2xx
+/// body is diagnostic, so it is truncated at [`ERROR_BODY_CAP`] instead: losing
+/// the tail of an error page costs nothing, while losing the status costs the
+/// media-conn refresh (see [`status_as_response`]).
+fn read_body(response: ureq::http::Response<ureq::Body>, max_body_bytes: u64) -> Result<Vec<u8>> {
+    if response.status().is_success() {
+        // ureq's `read_to_vec()` default cap is 10 MiB.
+        return Ok(response
+            .into_body()
+            .into_with_config()
+            .limit(max_body_bytes)
+            .read_to_vec()?);
+    }
+
+    let mut body = Vec::new();
+    let mut reader = std::io::Read::take(
+        response.into_body().into_reader(),
+        max_body_bytes.min(ERROR_BODY_CAP),
+    );
+    // A read that fails partway still leaves the status worth returning.
+    let _ = std::io::Read::read_to_end(&mut reader, &mut body);
+    Ok(body)
+}
+
 #[async_trait]
 impl HttpClient for UreqHttpClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
@@ -148,18 +183,9 @@ impl HttpClient for UreqHttpClient {
             };
 
             let status_code = response.status().as_u16();
+            let body = read_body(response, max_body_bytes)?;
 
-            // ureq's `read_to_vec()` default cap is 10 MiB.
-            let body_bytes = response
-                .into_body()
-                .into_with_config()
-                .limit(max_body_bytes)
-                .read_to_vec()?;
-
-            Ok(HttpResponse {
-                status_code,
-                body: body_bytes,
-            })
+            Ok(HttpResponse { status_code, body })
         })
         .await?
     }
@@ -234,16 +260,9 @@ impl HttpClient for UreqHttpClient {
         let response = req.send(ureq::SendBody::from_owned_reader(body))?;
 
         let status_code = response.status().as_u16();
-        let body_bytes = response
-            .into_body()
-            .into_with_config()
-            .limit(self.max_body_bytes)
-            .read_to_vec()?;
+        let body = read_body(response, self.max_body_bytes)?;
 
-        Ok(HttpResponse {
-            status_code,
-            body: body_bytes,
-        })
+        Ok(HttpResponse { status_code, body })
     }
 
     fn resource_report(&self) -> Option<HttpResourceReport> {
@@ -504,9 +523,13 @@ mod tests {
         );
     }
 
-    /// Answers one request with `status`. The request body is drained first so a
-    /// rejected upload never races a broken pipe against the response.
     fn spawn_status_server(status: u16, reason: &str) -> String {
+        spawn_status_server_with_body(status, reason, b"denied".to_vec())
+    }
+
+    /// Answers one request with `status` and `body`. The request body is drained
+    /// first so a rejected upload never races a broken pipe against the response.
+    fn spawn_status_server_with_body(status: u16, reason: &str, body: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().unwrap();
         let reason = reason.to_string();
@@ -535,12 +558,14 @@ mod tests {
                     }
                 }
             }
-            let _ = stream.write_all(
-                format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied"
-                )
-                .as_bytes(),
+            let header = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
             );
+            // Either write can fail: the client is free to hang up once it has
+            // all of the body it intends to keep.
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
         });
         format!("http://{addr}")
     }
@@ -619,6 +644,40 @@ mod tests {
             )
             .expect("403 must arrive as a response, not an error");
         assert_eq!(resp.status_code, 403);
+    }
+
+    /// Knowing the status is not enough if reading the body then throws it away.
+    /// A 403 whose error page overruns a tightened `max_body_bytes` must still
+    /// arrive as a 403 — otherwise the media-conn refresh is unreachable again,
+    /// by a different route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn over_cap_error_body_does_not_cost_the_status() {
+        const CAP: u64 = 1024;
+        let url = spawn_status_server_with_body(403, "Forbidden", vec![b'x'; 4 * 1024 * 1024]);
+        let resp = UreqHttpClient::new()
+            .with_max_body_bytes(CAP)
+            .execute(get(url))
+            .await
+            .expect("an over-cap error page must not erase the status it came with");
+        assert_eq!(resp.status_code, 403);
+        assert!(
+            resp.body.len() as u64 <= CAP,
+            "the diagnostic body must stay bounded, got {} bytes",
+            resp.body.len()
+        );
+    }
+
+    /// The mirror case, and the reason the truncation is not unconditional: a
+    /// 2xx body IS the payload, so an over-cap read there must stay an error
+    /// rather than hand back a silently truncated media file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn over_cap_success_body_is_still_an_error() {
+        let url = spawn_status_server_with_body(200, "OK", vec![b'x'; 4 * 1024 * 1024]);
+        UreqHttpClient::new()
+            .with_max_body_bytes(1024)
+            .execute(get(url))
+            .await
+            .expect_err("a truncated 2xx payload must never look like a complete one");
     }
 
     /// A caller-supplied agent carries ureq's own defaults, so the status
