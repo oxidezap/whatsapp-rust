@@ -266,29 +266,21 @@ mod tests {
     type TestResult = Result<()>;
 
     /// An interop JID's `integrator` has a wire field only in `INTEROP_JID`.
-    /// Encoding one as a `JID_PAIR` writes user and server and nothing else, so
-    /// the value is gone by the time it reaches the peer — and two interop JIDs
-    /// that differ only there are two destinations, not one.
+    /// Encoded as a `JID_PAIR` it is simply absent, so two interop destinations
+    /// that differ only there went out as the same bytes.
     ///
-    /// Every encoder path is exercised, not just the owned one: `marshal_exact`
-    /// sizes its output slice from the size estimator and then writes into it, so
-    /// an estimator that disagrees with the writer fails as `UnexpectedEof`
-    /// rather than as wrong bytes — and `marshal_exact` is what production sends
-    /// through.
+    /// Asserted on the emitted bytes rather than by round-tripping: our decoder
+    /// reads a trailing server that the outbound form does not carry (see
+    /// `write_interop_jid`), so a local encode/decode cycle is the wrong oracle
+    /// here — the two directions of this token genuinely differ.
+    ///
+    /// Every encoder path is covered because `marshal_exact` sizes its output
+    /// slice from the size estimator before writing into it: an estimator that
+    /// disagrees with the writer surfaces as `UnexpectedEof`, not as wrong bytes,
+    /// and `marshal_exact` is what production sends through.
     #[test]
-    fn interop_jid_keeps_its_integrator_through_the_wire() -> TestResult {
+    fn interop_jid_carries_its_integrator_onto_the_wire() -> TestResult {
         use crate::jid::Server;
-
-        fn round_trip(bytes: &[u8]) -> Jid {
-            // marshal writes a leading format byte that unmarshal_ref does not expect.
-            let decoded = unmarshal_ref(&bytes[1..]).expect("decodes");
-            decoded
-                .attrs
-                .iter()
-                .find(|(k, _)| &**k == "jid")
-                .and_then(|(_, v)| v.to_jid())
-                .expect("jid attr survives the round-trip")
-        }
 
         fn node_for(jid: &Jid) -> Node {
             let mut attrs = Attrs::with_capacity(1);
@@ -296,53 +288,76 @@ mod tests {
             Node::new("iq", attrs, None)
         }
 
-        for (device, integrator) in [(0u16, 1u16), (7, 300), (0, u16::MAX), (65535, 42)] {
-            let original = Jid {
-                user: "123456789".into(),
-                server: Server::Interop,
-                agent: 0,
-                device,
-                integrator,
-            };
-            let node = node_for(&original);
-            let case = format!("device {device}, integrator {integrator}");
-
-            for (path, bytes) in [
-                ("marshal", marshal(&node)?),
-                ("marshal_exact", marshal_exact(&node)?),
-                ("marshal_ref", marshal_ref(&node.as_node_ref())?),
-                ("marshal_ref_exact", marshal_ref_exact(&node.as_node_ref())?),
-            ] {
-                let back = round_trip(&bytes);
-                assert_eq!(back, original, "{case} via {path}: must survive encoding");
-                assert_eq!(
-                    back.integrator, integrator,
-                    "{case} via {path}: the integrator itself must come back"
-                );
-                assert_eq!(back.device, device, "{case} via {path}: device too");
-            }
+        fn encode_all(jid: &Jid) -> Vec<(&'static str, Vec<u8>)> {
+            let node = node_for(jid);
+            let r = node.as_node_ref();
+            vec![
+                ("marshal", marshal(&node).expect("marshal")),
+                ("marshal_exact", marshal_exact(&node).expect("exact")),
+                ("marshal_ref", marshal_ref(&r).expect("ref")),
+                (
+                    "marshal_ref_exact",
+                    marshal_ref_exact(&r).expect("ref exact"),
+                ),
+            ]
         }
 
-        // A zero-integrator interop JID keeps taking the `JID_PAIR` path, which is
-        // the form we have always sent. That path is itself lossy — it carries
-        // user and server only — so the device does NOT survive it. Asserting that
-        // is what distinguishes "still on the old path" from "silently switched".
-        let plain = Jid {
+        let base = Jid {
             user: "123456789".into(),
             server: Server::Interop,
             agent: 0,
-            device: 3,
-            integrator: 0,
+            device: 7,
+            integrator: 300,
         };
-        let back = round_trip(&marshal(&node_for(&plain))?);
-        assert_eq!(back.user, plain.user);
-        assert_eq!(back.server, Server::Interop);
-        assert_eq!(back.integrator, 0);
-        assert_eq!(
-            back.device, 0,
-            "JID_PAIR carries no device; this is the pre-existing lossy form kept \
-             for wire compatibility, not something this change fixes"
+
+        // The integrator reaches the bytes: change only it, and the encoding
+        // changes. Under JID_PAIR these were byte-identical.
+        let other = Jid {
+            integrator: 301,
+            ..base.clone()
+        };
+        for ((path, a), (_, b)) in encode_all(&base).into_iter().zip(encode_all(&other)) {
+            assert_ne!(a, b, "{path}: the integrator must reach the wire");
+            assert!(
+                a.contains(&crate::token::INTEROP_JID),
+                "{path}: must use the INTEROP_JID token"
+            );
+            // Big-endian device and integrator, adjacent, as WA Web writes them.
+            assert!(
+                a.windows(4).any(|w| w == [0x00, 0x07, 0x01, 0x2C]),
+                "{path}: device 7 and integrator 300 as u16 BE"
+            );
+        }
+
+        // Every path agrees byte for byte, so the exact-size plan matches the
+        // writer. When it does not, `marshal_exact` fails outright.
+        let encodings = encode_all(&base);
+        let (_, first) = &encodings[0];
+        for (path, bytes) in &encodings[1..] {
+            assert_eq!(bytes, first, "{path}: must agree with marshal");
+        }
+
+        // A zero-integrator interop JID keeps the JID_PAIR form we have always
+        // sent. That form carries user and server only — it drops the device —
+        // which is pre-existing and deliberately untouched here.
+        let plain = Jid {
+            integrator: 0,
+            ..base.clone()
+        };
+        let bytes = marshal(&node_for(&plain))?;
+        assert!(
+            !bytes.contains(&crate::token::INTEROP_JID),
+            "no integrator, no INTEROP_JID token"
         );
+        let decoded = unmarshal_ref(&bytes[1..])?;
+        let back = decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| &**k == "jid")
+            .and_then(|(_, v)| v.to_jid())
+            .expect("jid attr");
+        assert_eq!(back.server, Server::Interop);
+        assert_eq!(back.device, 0, "JID_PAIR carries no device");
 
         Ok(())
     }

@@ -577,12 +577,9 @@ fn jid_encoded_size_with_cache(
     hints: &mut StringHintCache,
 ) -> usize {
     if needs_interop_jid(server, integrator) {
-        // token + user + u16 device + u16 integrator + server
-        return 1
-            + string_encoded_size_with_cache(user, hints)
-            + 2
-            + 2
-            + string_encoded_size_with_cache(jid::INTEROP_SERVER, hints);
+        // token + user + u16 device + u16 integrator; no server, see
+        // `write_interop_jid`.
+        return 1 + string_encoded_size_with_cache(user, hints) + 2 + 2;
     }
     if device > 0 && server_supports_ad_jid(server) {
         return 3 + string_encoded_size_with_cache(user, hints);
@@ -793,24 +790,27 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
 
     /// Write a JidRef directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
-    /// `INTEROP_JID`: user, `u16` device, `u16` integrator, then the server.
+    /// `INTEROP_JID`: token, user, `u16` device, `u16` integrator — and no server.
     ///
-    /// Field order and widths mirror `read_interop_jid`, which is also what WA
-    /// Web's decoder reads (`WA/Wap.js`: user, `readUint16`, `readUint16`, then a
-    /// fourth read whose value it discards — the server it just validated).
+    /// Mirrors WA Web's outbound writer (`WA/Wap.js`, the `JID_INTEROP` arm):
+    /// `writeUint8(S), te(user), writeUint16(device), writeUint16(integrator)`.
     ///
-    /// The trailing server is written even though WA Web's *writer* omits it. Its
-    /// writer shadows the module-level interop-domain binding with a local of the
-    /// same name for the user, and the domain write that its own decoder — and
-    /// ours — expects is simply absent; the sibling `JID_FB` arm two lines up does
-    /// write its domain. Following the writer literally would emit bytes neither
-    /// decoder accepts, so this follows the decoders, which agree.
+    /// Its inbound decoder reads a fourth value after those — the server — and so
+    /// does ours. That asymmetry is deliberate here rather than a bug being
+    /// copied: the fourth read describes what the *server sends us*, not what it
+    /// accepts from us, and the writer above is what actually runs against the
+    /// real server. Emitting a server the server does not expect would not merely
+    /// mis-parse the JID: the extra token would be read as the next value in the
+    /// stanza, desynchronising everything after it.
+    ///
+    /// The consequence is that this output does not round-trip through our own
+    /// `read_interop_jid`. That is a property of the protocol's two directions,
+    /// not a defect to fix by making both ends agree locally.
     fn write_interop_jid(&mut self, user: &str, device: u16, integrator: u16) -> Result<()> {
         self.write_u8(token::INTEROP_JID)?;
         self.write_string(user)?;
         self.write_u16_be(device)?;
-        self.write_u16_be(integrator)?;
-        self.write_string(jid::INTEROP_SERVER)
+        self.write_u16_be(integrator)
     }
 
     pub fn write_jid_ref(&mut self, jid: &JidRef<'_>) -> Result<()> {
