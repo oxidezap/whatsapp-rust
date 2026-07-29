@@ -471,7 +471,7 @@ impl MessageUtils {
         let mut arena = String::with_capacity(ranges.capacity() * 36);
         for jid in devices {
             let start = arena.len();
-            jid.push_ad_to(&mut arena);
+            jid.push_phash_form_to(&mut arena);
             ranges.push((start, arena.len()));
         }
         ranges.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
@@ -1835,7 +1835,10 @@ mod parse_message_info_tests {
         }
 
         let single = vec![dev("5511999999999", 3, wacore_binary::Server::Pn)];
-        assert_eq!(single[0].to_ad_string(), "5511999999999.0:3@s.whatsapp.net");
+        assert_eq!(
+            single[0].to_phash_form_string(),
+            "5511999999999.0:3@s.whatsapp.net"
+        );
         let h_single = MessageUtils::participant_list_hash(&single).unwrap();
 
         let control = vec![dev("5511999999999", 0, wacore_binary::Server::Pn)];
@@ -1889,7 +1892,7 @@ mod parse_message_info_tests {
             dev("999", 0, 65535, wacore_binary::Server::Bot),
         ];
 
-        let mut reference: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
+        let mut reference: Vec<String> = devices.iter().map(|j| j.to_phash_form_string()).collect();
         reference.sort_unstable();
         let mut hasher = Sha256::new();
         for jid in &reference {

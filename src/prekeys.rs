@@ -185,11 +185,7 @@ impl Client {
         const COMPANION_IDENTITY_LOAD_CONCURRENCY: usize = 16;
         let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
         futures::stream::iter(companions)
-            .map(|jid| async move {
-                self.load_account_identity(&jid)
-                    .await
-                    .map(|id| (jid.normalize_for_prekey_bundle(), id))
-            })
+            .map(|jid| async move { self.load_account_identity(&jid).await.map(|id| (jid, id)) })
             .buffer_unordered(COMPANION_IDENTITY_LOAD_CONCURRENCY)
             .filter_map(|entry| async move { entry })
             .collect()

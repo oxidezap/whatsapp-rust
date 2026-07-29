@@ -646,18 +646,11 @@ pub async fn ensure_sessions_for_devices(
 
         let make_session_task = |spawn_idx: usize| {
             let idx = indices_needing_prekeys[spawn_idx];
-            let device_jid = devices[idx].clone();
-            let mut encryption_jid = encryption_override_at(&encryption_overrides, idx)
+            let lookup_jid = devices[idx].clone();
+            let encryption_jid = encryption_override_at(&encryption_overrides, idx)
                 .cloned()
-                .unwrap_or_else(|| device_jid.clone());
+                .unwrap_or_else(|| lookup_jid.clone());
 
-            // Normalize agent to 0 for LID JIDs to match how pre-key bundles are stored.
-            // prekeys.rs forces agent=0 for LID; we must match that here.
-            if encryption_jid.is_lid() {
-                encryption_jid.agent = 0;
-            }
-
-            let lookup_jid = device_jid.normalize_for_prekey_bundle();
             let bundles = prekey_bundles.clone();
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();

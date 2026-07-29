@@ -217,7 +217,7 @@ impl PreKeyUtils {
                 log::warn!("prekey response carried a <user> with no usable jid; skipping");
                 continue;
             };
-            let mut jid = named.normalize_for_prekey_bundle();
+            let mut jid = named;
             if jid.device == 0
                 && matches!(
                     jid.server,
@@ -573,7 +573,11 @@ mod tests {
         let parsed_jid = bundles.keys().next().expect("parsed jid");
         assert_eq!(parsed_jid.user, base_jid.user);
         assert_eq!(parsed_jid.device, base_jid.device);
-        assert_eq!(parsed_jid.agent, 0);
+        // The server's stray agent byte rides along on the parsed key rather than
+        // being scrubbed off it. It is inert on a LID, so it never reaches
+        // identity — which is what the two `contains_key` assertions above prove,
+        // and what the scrubbing used to be needed for.
+        assert_eq!(parsed_jid.agent, 1);
     }
 
     /// The server names a rejected device inside its own `<user>`, which is the

@@ -502,7 +502,7 @@ pub trait JidExt {
 /// `agent` is only meaningful where the server renders it. On Pn/Lid/Hosted/
 /// HostedLid the wire spells the server as a domain byte instead, so nothing
 /// encodes an agent set there (`server_to_domain_type`), nothing prints it
-/// (`renders_agent`), and nothing hashes it (`push_ad_to` writes a literal `0`,
+/// (`renders_agent`), and nothing hashes it (`push_phash_form_to` writes a literal `0`,
 /// matching WA Web). Two JIDs differing only there address the same device.
 ///
 /// Letting it into equality anyway is what made a JID decoded from the wire
@@ -744,37 +744,30 @@ impl Jid {
         self.is_same_user_as(user) || lid.is_some_and(|l| self.is_same_user_as(l))
     }
 
-    /// Normalize the JID for use in pre-key bundle storage and lookup.
-    ///
-    /// WhatsApp servers may return JIDs with varied agent fields, or we might derive them
-    /// with agent fields in some contexts. However, pre-key bundles are stored and looked up
-    /// using a normalized key where the agent is 0 for standard servers (s.whatsapp.net, lid).
-    pub fn normalize_for_prekey_bundle(&self) -> Self {
-        let mut jid = self.clone();
-        if matches!(jid.server, Server::Pn | Server::Lid) {
-            jid.agent = 0;
-        }
-        jid
-    }
-
-    pub fn to_ad_string(&self) -> String {
+    /// See [`Jid::push_phash_form_to`]. Not a general JID rendering — use
+    /// `Display`/`to_string` for that.
+    pub fn to_phash_form_string(&self) -> String {
         let mut s = String::with_capacity(self.user.len() + 20);
-        self.push_ad_to(&mut s);
+        self.push_phash_form_to(&mut s);
         s
     }
 
-    /// Append the AD-string form (`user.0:device@server`) to `buf`, for callers
-    /// that batch many JIDs into one shared buffer instead of paying a heap
-    /// `String` per JID (see `participant_list_hash`).
+    /// Append the form the participant hash is computed over
+    /// (`user.0:device@server`) to `buf`, for callers that batch many JIDs into
+    /// one shared buffer instead of paying a heap `String` per JID (see
+    /// `participant_list_hash`).
     ///
-    /// The agent position is the literal `0`, not `self.agent`. That is what WA
-    /// Web writes: its `formatFull` spelling hardcodes `".0"` and never reads an
-    /// agent off the Wid (`WAWebWid`'s `toString`, and its Wid has no agent field
-    /// at all). The only caller is the phash, which the server validates against
-    /// its own computation of the same string — so writing our agent here would
-    /// mean a rejected hash for any JID that happened to carry one.
+    /// **This is not a general-purpose JID rendering.** The agent position is
+    /// the literal `0`, never `self.agent`, and that is deliberate: WA Web's
+    /// `formatFull` spelling hardcodes `".0"` unconditionally — there is no
+    /// per-server carve-out, and `WAWebWid` has no agent field to read one from.
+    /// The server recomputes this exact string to validate the phash, so writing
+    /// our agent would mean a rejected hash for any JID that carried one.
+    ///
+    /// If you want the JID as it is addressed, including the agent on the servers
+    /// that render it, use `Display` / [`Jid::push_to`] instead.
     #[inline]
-    pub fn push_ad_to(&self, buf: &mut String) {
+    pub fn push_phash_form_to(&self, buf: &mut String) {
         if self.user.is_empty() {
             buf.push_str(self.server.as_str());
             return;
@@ -819,6 +812,18 @@ impl Jid {
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
         self.user == other.user && self.server == other.server && self.device == other.device
+    }
+
+    /// The `agent` as far as identity is concerned: the field itself where the
+    /// server renders it (`@bot`, `@interop`), `0` where it does not.
+    ///
+    /// Exposed so callers that build their own key over a JID — sorting,
+    /// deduplicating, indexing — can key on the same rule `==` and `Hash` use
+    /// instead of on the raw field, which would split one device in two or, in
+    /// reverse, merge two real ones.
+    #[inline]
+    pub fn identity_agent(&self) -> u8 {
+        identity_agent(self.server, self.agent)
     }
 
     /// Get a borrowing key for O(1) HashSet lookups by device identity.
@@ -1414,31 +1419,37 @@ mod tests {
             device: 3,
             integrator: 0,
         };
-        assert_eq!(plain.to_ad_string(), "5511999998888.0:3@lid");
+        assert_eq!(plain.to_phash_form_string(), "5511999998888.0:3@lid");
 
         let with_agent = Jid {
             agent: 7,
             ..plain.clone()
         };
         assert_eq!(
-            with_agent.to_ad_string(),
+            with_agent.to_phash_form_string(),
             "5511999998888.0:3@lid",
             "the agent must not reach the hashed string"
         );
 
         // The pairing the phash memo relies on: equal JIDs, equal AD strings.
         assert_eq!(plain, with_agent);
-        assert_eq!(plain.to_ad_string(), with_agent.to_ad_string());
+        assert_eq!(
+            plain.to_phash_form_string(),
+            with_agent.to_phash_form_string()
+        );
 
         // A server-only JID still degenerates to the server, and device still counts.
-        assert_eq!(Jid::new("", Server::Pn).to_ad_string(), "s.whatsapp.net");
+        assert_eq!(
+            Jid::new("", Server::Pn).to_phash_form_string(),
+            "s.whatsapp.net"
+        );
         assert_ne!(
-            plain.to_ad_string(),
+            plain.to_phash_form_string(),
             Jid {
                 device: 4,
                 ..plain.clone()
             }
-            .to_ad_string()
+            .to_phash_form_string()
         );
     }
 

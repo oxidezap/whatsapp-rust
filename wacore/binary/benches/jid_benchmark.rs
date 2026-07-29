@@ -43,7 +43,7 @@ fn bench_jid_to_non_ad_string(bencher: divan::Bencher) {
 /// The per-recipient fan-out formatter: writes the AD form into a reused
 /// buffer instead of allocating a String per device.
 #[divan::bench]
-fn bench_jid_push_ad_to(bencher: divan::Bencher) {
+fn bench_jid_push_phash_form(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| {
             let mut jid = Jid::lid("123456789012345");
@@ -51,7 +51,7 @@ fn bench_jid_push_ad_to(bencher: divan::Bencher) {
             (jid, String::with_capacity(64))
         })
         .bench_refs(|(jid, buf)| {
-            jid.push_ad_to(buf);
+            jid.push_phash_form_to(buf);
             // black-box the contents, not just the length: observing only
             // `len` lets LLVM elide the actual formatting writes.
             black_box(buf.as_bytes());
