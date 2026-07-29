@@ -986,21 +986,20 @@ mod tests {
         let mut requested_jid = Jid::lid("123456789");
         requested_jid.agent = 1;
 
-        // 1. Verify direct lookup fails (This is the bug)
+        // The agent is inert on a LID, so it does not hide the bundle: the raw
+        // lookup finds it. This is what `normalize_for_prekey_bundle` was added
+        // to work around.
         assert!(
-            !prekey_bundles.contains_key(&requested_jid),
-            "Direct lookup of non-normalized JID should fail"
+            prekey_bundles.contains_key(&requested_jid),
+            "an inert agent must not hide the bundle"
         );
 
-        // 2. Verify normalized lookup succeeds (This is the fix)
-        // This mirrors the logic change in fetch_and_establish_sessions
+        // Normalising still works, for the callers that still do it.
         let normalized_lookup = requested_jid.normalize_for_prekey_bundle();
         assert!(
             prekey_bundles.contains_key(&normalized_lookup),
             "Normalized lookup should succeed"
         );
-
-        // Ensure the normalization actually produced the key we stored
         assert_eq!(normalized_lookup, normalized_jid);
     }
 }

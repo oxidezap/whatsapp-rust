@@ -1209,106 +1209,31 @@ fn test_dm_encryption_treats_own_lid_devices_as_self() {
     );
 }
 
-/// Test case: LID Prekey Lookup Normalization
-///
-/// Verifies that when looking up pre-key bundles for LID JIDs, the lookup key
-/// is normalized (agent=0) to match how the bundles are stored in the map.
-///
-/// This validates the fix for "No pre-key bundle returned" when the requested JID
-/// has non-standard agent/server fields but the bundle is stored under the normalized key.
+/// A pre-key bundle is stored under the JID parsed out of the server's response,
+/// and looked up with the JID we already hold for that device. Those two can
+/// disagree on `agent` — a LID arriving as an AD-JID used to carry the domain
+/// byte there — which once hid the bundle and surfaced as "No pre-key bundle
+/// returned". `agent` is not part of a LID's identity, so the raw lookup finds
+/// it; `normalize_for_prekey_bundle` is left working for callers that still use it.
 #[test]
-fn test_lid_prekey_lookup_normalization() {
-    // 1. Define JIDs
-    // The JID we request (simulating what comes from resolve_devices or elsewhere)
-    // Let's pretend it has agent=1 to simulate a mismatch
+fn lid_prekey_bundle_is_found_without_normalising_the_lookup_key() {
     let mut requested_jid = Jid::lid_device("123456789".to_string(), 0);
     requested_jid.agent = 1;
 
-    // The normalized JID (how it's stored in the bundle map)
-    let normalized_jid = Jid::lid_device("123456789".to_string(), 0); // agent=0 by default
+    let stored_jid = Jid::lid_device("123456789".to_string(), 0);
+    assert_eq!(requested_jid.agent, 1, "the inert field is really set");
 
-    // 2. Setup Resolver
-    // Store the bundle under the NORMALIZED key (agent=0)
-    let resolver = MockSendContextResolver::new()
-        .with_bundle(normalized_jid.clone(), create_mock_bundle())
-        .with_devices(vec![requested_jid.clone()]);
-
-    // 3. Verify Mock Setup
-    // Ensure bundle is accessible via normalized key but NOT via requested (raw) key
-    // This confirms our test condition is valid (that implicit lookup would fail)
-    assert!(
-        resolver.prekey_bundles.contains_key(&normalized_jid),
-        "Setup: bundle should exist for normalized key"
-    );
-    assert!(
-        !resolver.prekey_bundles.contains_key(&requested_jid),
-        "Setup: bundle should NOT exist for requested raw key"
-    );
-
-    // 4. Test logic mirroring `encrypt_for_devices`
-    let mut jid_to_encryption_jid = HashMap::new();
-    // Assume direct mapping for simplicity
-    jid_to_encryption_jid.insert(requested_jid.clone(), requested_jid.clone());
-
-    // Get the bundles map (mocks `fetch_prekeys_for_identity_check`)
-    // The mock implementation returns the map as-is filtered by keys.
-    // HOWEVER, `fetch_prekeys` usually takes a list.
-    // In `encrypt_for_devices`, we call:
-    // let prekey_bundles = resolver.fetch_prekeys_for_identity_check(&[requested_jid]).await?;
-
-    // Let's simulate what `fetch_prekeys_for_identity_check` would return.
-    // Our mock implementation `fetch_prekeys` logic:
-    // if let Some(bundle_opt) = self.prekey_bundles.get(jid)
-
-    // Wait, if the mock follows exact HashMap lookup, `fetch_prekeys(&[requested_jid])`
-    // will return EMPTY because `requested_jid` is not in `prekey_bundles`.
-    // The REAL `fetch_prekeys` (in `client.rs` -> `prekeys.rs`) sends an IQ to the server,
-    // and the server response is parsed. The parsing logic (in `prekeys.rs`) normalizes the key.
-    // So the HashMap returned by `fetch_prekeys` will contain NORMALIZED keys.
-
-    // So for this test to be accurate, we must simulate that `fetch_prekeys` returned a map
-    // where the key is NORMALIZED, even if we asked for `requested_jid`?
-    // Actually, `PreKeyFetchSpec` asks for JIDs. The response contains JIDs.
-    // If we ask for `agent=1`, does the server return `agent=1`?
-    // The logs showed:
-    // parsed: `...:82@lid` (agent=0 probably, or just not printed?)
-    // lookup: `...` (failed)
-
-    // The critical part is that the `HashMap` returned by `resolver.fetch_prekeys`
-    // definitely contains the bundle under some key.
-    // If `prekeys.rs` normalizes it, it's under the normalized key.
-    // The `encrypt_for_devices` logic has:
-    // `match prekey_bundles.get(device_jid)`
-    // where `device_jid` is the one from the loop (requested_jid).
-
-    // If `fetch_prekeys` returns a map with `normalized_jid`, and we lookup `requested_jid`, it fails.
-    // My fix was to normalize `requested_jid` before lookup.
-
-    // So I need to construct the `prekey_bundles` map manually here to simulate the return from fetch.
     let mut prekey_bundles = HashMap::new();
-    prekey_bundles.insert(normalized_jid.clone(), create_mock_bundle());
+    prekey_bundles.insert(stored_jid, create_mock_bundle());
 
-    // Now test the logic:
-    let device_jid = &requested_jid;
-
-    // -- Logic from fix --
-    // Use centralized normalization logic
-    let lookup_jid = device_jid.normalize_for_prekey_bundle();
-
-    // Fix: Use the normalized device_jid to lookup the bundle
-    let bundle = prekey_bundles.get(&lookup_jid);
-    // --------------------
-
-    assert!(bundle.is_some(), "Should find bundle after normalization");
-
-    // Verify it would have failed without normalization
-    let raw_lookup = prekey_bundles.get(device_jid);
     assert!(
-        raw_lookup.is_none(),
-        "Should NOT find bundle without normalization"
+        prekey_bundles.contains_key(&requested_jid),
+        "an inert agent must not hide the bundle"
     );
-
-    println!("✅ LID Prekey Lookup Normalization passed");
+    assert!(
+        prekey_bundles.contains_key(&requested_jid.normalize_for_prekey_bundle()),
+        "normalising the key must still work for callers that do it"
+    );
 }
 
 mod group_retry {
