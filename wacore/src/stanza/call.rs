@@ -1109,16 +1109,12 @@ mod tests {
     }
 
     // Regression: `enc_for` matches `<to jid>` against our own JID by full structural
-    // equality, so the two must agree field for field or a multi-device callee never
-    // matches its `<to>` and silently fails "offer carried no callKey", even against
-    // the real server. The parser reads the TYPED jid (`to_jid`) rather than
-    // stringify+reparsing it, which keeps whatever `Display` does not spell out.
-    //
-    // The original failure was the AD-JID domain byte landing in `agent`, which only
-    // a wire-decoded JID carried; the decoder no longer keeps it, and
-    // `ad_jid_round_trips_equal_through_the_wire_and_through_text` guards that at the
-    // source. `integrator` is still display-invisible, so the typed read is what keeps
-    // this honest for interop JIDs.
+    // equality, so a `<to>` that came off the wire and a JID that came from text have
+    // to agree field for field. When they did not, a multi-device callee never matched
+    // its `<to>` and silently failed "offer carried no callKey" against the real
+    // server. The stanza goes through marshal/unmarshal here so the `<to jid>` is
+    // produced by the real AD-JID decode rather than handed to the parser as an
+    // already-built value.
     #[cfg(feature = "voip")]
     #[test]
     fn offer_to_jid_matches_our_own_jid_field_for_field() {
@@ -1143,14 +1139,23 @@ mod tests {
                 .build()])
             .build();
 
-        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        // marshal writes a leading format byte that unmarshal_ref does not expect.
+        let bytes = wacore_binary::marshal::marshal(&node).unwrap();
+        let decoded = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).unwrap();
+        let call = parse_call_stanza(&decoded).unwrap().unwrap();
         let media = call.media.expect("offer captures media");
 
-        // Our own device LID as `lid()` yields it — out of the store, which holds it
-        // as text, so it has to compare equal to the one that came off the wire.
+        let from_wire = media.encs[0].to.as_ref().expect("<to jid> survives decode");
+        let from_text: Jid = "111111111111111:7@lid".parse().unwrap();
+        assert_eq!(
+            from_wire, &from_text,
+            "the decoded <to jid> must equal the same JID read back as text, which is \
+             how our own LID reaches `enc_for`"
+        );
+
         assert_eq!(
             media
-                .enc_for(Some(&wire_to))
+                .enc_for(Some(&from_text))
                 .expect("callKey for our device")
                 .ciphertext,
             vec![0xB2],
