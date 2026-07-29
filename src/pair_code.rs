@@ -108,10 +108,15 @@ impl PairError {
     /// `None` when nothing was refused: local validation, no connection, or a
     /// request that went unanswered. Prefer this to matching the message, which
     /// is not a stable surface.
+    ///
+    /// Classified from the `code` and `text` together, so a pairing WA Web
+    /// would not accept reads as
+    /// [`PairCodeRejection::Unknown`] rather than as the named arm — see
+    /// [`PairCodeRejection::from_server`].
     pub fn rejection(&self) -> Option<PairCodeRejection> {
         use crate::error::ErrorChainExt;
         self.server_rejection()
-            .map(|rejection| PairCodeRejection::from(i32::from(rejection.code)))
+            .map(|rejection| PairCodeRejection::from_server(rejection.code, rejection.text))
     }
 
     /// How long the server asked the client to wait before retrying, from the
@@ -932,6 +937,43 @@ mod tests {
             PairCodeRejection::from(418),
             PairCodeRejection::Unknown(418)
         );
+    }
+
+    /// WA Web asserts `code` and `text` as a pair and falls to its generic
+    /// error path when they disagree, so a contradicting text must not keep
+    /// reading as the named arm.
+    #[test]
+    fn a_contradicting_text_demotes_to_unknown() {
+        let pe: PairError = IqError::ServerError {
+            code: 429,
+            text: "something-else".into(),
+            error_type: None,
+            backoff: None,
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::Unknown(429)));
+        assert!(
+            !pe.rejection().is_some_and(PairCodeRejection::is_throttled),
+            "a pairing WA Web would reject must not drive throttle handling"
+        );
+    }
+
+    /// An absent `text` is not a contradiction. Deliberately laxer than WA Web:
+    /// demoting a bare 429 would clear `is_throttled` and put the issue's silent
+    /// failure back for the one refusal that most needs acting on.
+    #[test]
+    fn an_absent_text_still_classifies_by_code() {
+        let pe: PairError = IqError::ServerError {
+            code: 429,
+            text: String::new(),
+            error_type: None,
+            backoff: None,
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::RateOverlimit));
+        assert!(pe.rejection().is_some_and(PairCodeRejection::is_throttled));
     }
 
     /// The whole point of the typed status: a 429 is recoverable as

@@ -684,21 +684,53 @@ impl PairCodeRejection {
     pub fn is_throttled(self) -> bool {
         matches!(self, Self::RateOverlimit | Self::BadRequest)
     }
-}
 
-impl core::fmt::Display for PairCodeRejection {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // The `text` WA Web pairs with each code, so a log line reads like the
-        // stanza it came from.
-        let text = match self {
+    /// The `text` WA Web pairs with this code; `None` for
+    /// [`Unknown`](Self::Unknown), which has no expected pairing.
+    pub fn text(self) -> Option<&'static str> {
+        Some(match self {
             Self::BadRequest => "bad-request",
             Self::Forbidden => "forbidden",
             Self::RateOverlimit => "rate-overlimit",
             Self::FeatureNotAvailable => "feature-not-available",
             Self::InternalServerError => "internal-server-error",
-            Self::Unknown(code) => return write!(f, "unknown ({code})"),
-        };
-        write!(f, "{text} ({})", self.code())
+            Self::Unknown(_) => return None,
+        })
+    }
+
+    /// Classify a server `<error>` from both of its attributes.
+    ///
+    /// A `text` that *contradicts* the code demotes the result to
+    /// [`Unknown`](Self::Unknown): WA Web asserts the two as a pair
+    /// (`literal(attrInt, …, "code", 429)` beside
+    /// `literal(attrString, …, "text", "rate-overlimit")`) and drops to its
+    /// generic error path when they disagree, so a changed pairing must not
+    /// keep reading as the named arm.
+    ///
+    /// An **absent** `text` is treated as no contradiction and the code alone
+    /// decides. That is deliberately laxer than WA Web, which would reject it:
+    /// demoting a bare `429` to `Unknown` would also clear
+    /// [`is_throttled`](Self::is_throttled), turning the one refusal a consumer
+    /// most needs to act on back into a silent one. A missing attribute is not
+    /// evidence that the code means something else.
+    pub fn from_server(code: u16, text: &str) -> Self {
+        let by_code = Self::from(i32::from(code));
+        match by_code.text() {
+            Some(expected) if !text.is_empty() && text != expected => {
+                Self::Unknown(i32::from(code))
+            }
+            _ => by_code,
+        }
+    }
+}
+
+impl core::fmt::Display for PairCodeRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Rendered as the stanza it came from, so a log line reads the same way.
+        match self.text() {
+            Some(text) => write!(f, "{text} ({})", self.code()),
+            None => write!(f, "unknown ({})", self.code()),
+        }
     }
 }
 

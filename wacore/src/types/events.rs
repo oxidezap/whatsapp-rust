@@ -222,7 +222,6 @@ pub enum EventKind {
     PairingQrCode,
     PairingCode,
     PairingCodeRefresh,
-    PairingCodeError,
     QrScannedWithoutMultidevice,
     ClientOutdated,
     Messages,
@@ -274,6 +273,7 @@ pub enum EventKind {
     PairPasskeyError,
     ServerAck,
     PairingQrCodesExhausted,
+    PairingCodeError,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -287,7 +287,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::PairingQrCodesExhausted as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairingCodeError as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1916,6 +1916,30 @@ mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
+
+    /// A new kind must go at the end. The discriminant doubles as an
+    /// `EventInterest` bit index and is what a consumer persists or transmits,
+    /// so inserting one in the middle silently re-points every stored mask
+    /// after it at the wrong events.
+    ///
+    /// Pinned by value rather than by ordering: a spot check of the run's
+    /// start, the pair-code block a new kind is most tempting to sit inside,
+    /// and the two most-subscribed kinds past it.
+    #[test]
+    fn event_kind_discriminants_are_append_only() {
+        assert_eq!(EventKind::Connected as u8, 0);
+        assert_eq!(EventKind::PairingCode as u8, 6);
+        assert_eq!(EventKind::PairingCodeRefresh as u8, 7);
+        assert_eq!(EventKind::QrScannedWithoutMultidevice as u8, 8);
+        assert_eq!(EventKind::Messages as u8, 10);
+        assert_eq!(EventKind::Receipt as u8, 11);
+
+        // The newest kind sits past every pre-existing one, including the two
+        // already parked at the end for this same reason.
+        let newest = EventKind::PairingCodeError as u8;
+        assert!(newest > EventKind::ServerAck as u8);
+        assert!(newest > EventKind::PairingQrCodesExhausted as u8);
+    }
 
     #[test]
     fn group_update_builder_defaults_additive_scalar_fields() {
