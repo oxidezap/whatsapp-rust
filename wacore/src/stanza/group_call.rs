@@ -415,13 +415,13 @@ fn parse_group_participant(node: &NodeRef<'_>) -> Result<GroupCallParticipant> {
             devices.push(parse_group_device(child)?);
         }
     }
-    Ok(GroupCallParticipant {
-        jid,
-        pn,
-        state,
-        participant_type,
-        devices,
-    })
+    Ok(GroupCallParticipant::builder()
+        .jid(jid)
+        .maybe_pn(pn)
+        .maybe_state(state)
+        .maybe_participant_type(participant_type)
+        .devices(devices)
+        .build())
 }
 
 #[cold]
@@ -443,13 +443,13 @@ fn parse_group_device(node: &NodeRef<'_>) -> Result<GroupCallDevice> {
         }
         None => (None, Vec::new()),
     };
-    Ok(GroupCallDevice {
-        jid,
-        platform,
-        pid,
-        capability_version,
-        capability,
-    })
+    Ok(GroupCallDevice::builder()
+        .jid(jid)
+        .maybe_platform(platform)
+        .maybe_pid(pid)
+        .maybe_capability_version(capability_version)
+        .capability(capability)
+        .build())
 }
 
 #[cold]
@@ -891,11 +891,11 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
             bail!("waiting-room snapshot exceeds the user limit");
         }
         let mut attrs = child.attrs();
-        let user = WaitingRoomUser {
-            jid: required_jid(&mut attrs, "jid")?,
-            pn: attrs.optional_jid("user_pn"),
-            state: required_string(&mut attrs, "state")?,
-        };
+        let user = WaitingRoomUser::builder()
+            .jid(required_jid(&mut attrs, "jid")?)
+            .maybe_pn(attrs.optional_jid("user_pn"))
+            .state(required_string(&mut attrs, "state")?)
+            .build();
         use crate::stats::HeapSize;
         retained_bytes = retained_bytes
             .saturating_add(size_of::<WaitingRoomUser>())
@@ -905,16 +905,16 @@ fn parse_waiting_room(node: &NodeRef<'_>) -> Result<WaitingRoom> {
         }
         users.push(user);
     }
-    Ok(WaitingRoom {
-        call_id,
-        call_creator,
-        link_token,
-        media,
-        enabled,
-        is_admin,
-        transaction_id,
-        users,
-    })
+    Ok(WaitingRoom::builder()
+        .call_id(call_id)
+        .call_creator(call_creator)
+        .link_token(link_token)
+        .media(media)
+        .enabled(enabled)
+        .is_admin(is_admin)
+        .maybe_transaction_id(transaction_id)
+        .users(users)
+        .build())
 }
 
 /// Toggle approval requirements for a live link call.
@@ -1132,11 +1132,11 @@ pub fn parse_screen_share(node: &NodeRef<'_>) -> Result<ScreenShare> {
     let version = required_u32(&mut attrs, "version")?;
     let screen_share_id = optional_u32(&mut attrs, "screen_share_id")?;
     finish_attrs(&attrs)?;
-    Ok(ScreenShare {
-        state,
-        version,
-        screen_share_id,
-    })
+    Ok(ScreenShare::builder()
+        .state(state)
+        .version(version)
+        .maybe_screen_share_id(screen_share_id)
+        .build())
 }
 
 /// Typed ACK for a received group-call control action.

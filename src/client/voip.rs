@@ -528,7 +528,7 @@ impl Client {
         call_creator: &Jid,
         sender: &Jid,
         transaction_id: u32,
-        raw_epoch: Zeroizing<Vec<u8>>,
+        raw_epoch: &[u8],
     ) -> PendingCallLinkBuffer {
         let mut state = self
             .pending_call_link_joins
@@ -566,7 +566,7 @@ impl Client {
         {
             return PendingCallLinkBuffer::Buffered;
         }
-        if !state.can_buffer_transition(call_id, raw_epoch.capacity()) {
+        if !state.can_buffer_transition(call_id, raw_epoch.len()) {
             state.mark_saturated(call_id);
             return PendingCallLinkBuffer::Saturated;
         }
@@ -578,7 +578,7 @@ impl Client {
                 call_creator: call_creator.clone(),
                 sender: sender.clone(),
                 transaction_id,
-                raw_epoch,
+                raw_epoch: Zeroizing::new(raw_epoch.to_vec()),
             });
         PendingCallLinkBuffer::Buffered
     }
@@ -1933,8 +1933,6 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::{Jid, Server};
-    #[cfg(feature = "voip-runtime")]
-    use zeroize::Zeroizing;
 
     #[cfg(feature = "voip-runtime")]
     use super::{
@@ -3376,7 +3374,7 @@ mod tests {
                 &creator,
                 &creator.clone().with_device(1),
                 7,
-                Zeroizing::new(vec![7; 32]),
+                &[7; 32],
             ),
             PendingCallLinkBuffer::Buffered
         );
@@ -3417,7 +3415,7 @@ mod tests {
                 &asserted_creator,
                 &asserted_sender,
                 7,
-                Zeroizing::new(vec![7; 32]),
+                &[7; 32],
             ),
             PendingCallLinkBuffer::Buffered
         );

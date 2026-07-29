@@ -502,17 +502,16 @@ impl StanzaHandler for CallHandler {
                                         &rekey.call_creator,
                                         &sender,
                                         rekey.transaction_id,
-                                        raw_epoch,
+                                        &raw_epoch,
                                     );
                                     if buffered.suppresses_dispatch() {
                                         false
                                     } else {
-                                        let registry = client.call_registry();
-                                        if registry.buffer_initial_group_control(call.clone()) {
-                                            false
-                                        } else {
-                                            apply_current_group_control(&client, &call).await
-                                        }
+                                        apply_current_decrypted_group_epoch(
+                                            &client, rekey, &sender, &raw_epoch,
+                                        )
+                                        .await;
+                                        false
                                     }
                                 }
                                 Err(error) => {
@@ -979,6 +978,40 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
 }
 
 #[cfg(feature = "voip-runtime")]
+async fn apply_current_decrypted_group_epoch(
+    client: &Client,
+    rekey: &GroupCallEncRekey,
+    sender: &Jid,
+    raw_epoch: &[u8],
+) {
+    let registry = client.call_registry();
+    let Some((generation, lock)) = registry.current_group_transition(&rekey.call_id) else {
+        warn!(
+            "call: rejected enc_rekey without a matching group offer for {}",
+            rekey.call_id
+        );
+        return;
+    };
+    let _guard = lock.lock().await;
+    if !registry.is_current(&rekey.call_id, generation) {
+        return;
+    }
+    if !registry.group_sender_authorized_if_current(
+        &rekey.call_id,
+        generation,
+        &rekey.call_creator,
+        sender,
+    ) {
+        warn!(
+            "call: rejected group epoch from unauthorized sender for {}",
+            rekey.call_id
+        );
+        return;
+    }
+    commit_decrypted_group_epoch(client, rekey, generation, raw_epoch);
+}
+
+#[cfg(feature = "voip-runtime")]
 async fn apply_current_waiting_room_update(
     client: &Client,
     room: &wacore::types::group_call::WaitingRoom,
@@ -1160,17 +1193,7 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
             }
             match decrypt_group_epoch(client, rekey, &sender).await {
                 Ok(raw_epoch) => {
-                    if !client.call_registry().send_group_epoch_if_current(
-                        &rekey.call_id,
-                        generation,
-                        rekey.transaction_id,
-                        raw_epoch.to_vec(),
-                    ) {
-                        debug!(
-                            "call: group epoch for {} has no active media consumer",
-                            rekey.call_id
-                        );
-                    }
+                    commit_decrypted_group_epoch(client, rekey, generation, &raw_epoch)
                 }
                 Err(error) => {
                     warn!(
@@ -1182,6 +1205,27 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
             false
         }
         _ => false,
+    }
+}
+
+#[cfg(feature = "voip-runtime")]
+fn commit_decrypted_group_epoch(
+    client: &Client,
+    rekey: &GroupCallEncRekey,
+    generation: u64,
+    raw_epoch: &[u8],
+) {
+    let registry = client.call_registry();
+    if !registry.send_group_epoch_if_current(
+        &rekey.call_id,
+        generation,
+        rekey.transaction_id,
+        raw_epoch.to_vec(),
+    ) {
+        debug!(
+            "call: group epoch for {} has no active media consumer",
+            rekey.call_id
+        );
     }
 }
 
@@ -1419,6 +1463,61 @@ mod tests {
         assert!(validate_group_epoch_key(&[0; 32]).is_ok());
         assert!(validate_group_epoch_key(&[0; 31]).is_err());
         assert!(validate_group_epoch_key(&[0; 33]).is_err());
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn decrypted_epoch_is_committed_when_registration_overtakes_pending_buffering() {
+        use wacore::types::group_call::GroupCallEncRekey;
+        use wacore::voip::CallSession;
+
+        let client = make_client().await;
+        let creator = fake_caller_lid();
+        let sender = creator.clone().with_device(1);
+        let call_id = "CALL-LINK-EPOCH-RACE";
+        let generation = client
+            .call_registry()
+            .insert_call_link_checked(CallSession::new_outgoing(
+                call_id,
+                Jid::new(call_id, Server::Call),
+                creator.clone(),
+            ))
+            .expect("registration won while Signal decryption was in flight");
+        let rekey = GroupCallEncRekey::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator)
+            .transaction_id(7)
+            .key_generation(2)
+            .encryption_type("msg".to_string())
+            .encryption_version(2)
+            .ciphertext(vec![0xff])
+            .build();
+        let raw_epoch = [7; 32];
+
+        assert!(
+            !client
+                .buffer_pending_call_link_epoch(
+                    call_id,
+                    &rekey.call_creator,
+                    &sender,
+                    rekey.transaction_id,
+                    &raw_epoch,
+                )
+                .suppresses_dispatch(),
+            "the published generation must win before the pending buffer can retain the key"
+        );
+        apply_current_decrypted_group_epoch(&client, &rekey, &sender, &raw_epoch).await;
+
+        assert_eq!(
+            client
+                .call_registry()
+                .pending_group_epoch_transaction_if_current(call_id, generation),
+            Some(7),
+            "the already decrypted key must reach the generation without reprocessing ciphertext"
+        );
+        client
+            .call_registry()
+            .remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-runtime")]
