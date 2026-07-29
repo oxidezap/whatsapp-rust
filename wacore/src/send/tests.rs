@@ -1214,7 +1214,7 @@ fn test_dm_encryption_treats_own_lid_devices_as_self() {
 /// disagree on `agent` — a LID arriving as an AD-JID used to carry the domain
 /// byte there — which once hid the bundle and surfaced as "No pre-key bundle
 /// returned". `agent` is not part of a LID's identity, so the raw lookup finds
-/// it; `normalize_for_prekey_bundle` is left working for callers that still use it.
+/// it, and the normalising helper that used to be required is gone.
 #[test]
 fn lid_prekey_bundle_is_found_without_normalising_the_lookup_key() {
     let mut requested_jid = Jid::lid_device("123456789".to_string(), 0);
@@ -1229,10 +1229,6 @@ fn lid_prekey_bundle_is_found_without_normalising_the_lookup_key() {
     assert!(
         prekey_bundles.contains_key(&requested_jid),
         "an inert agent must not hide the bundle"
-    );
-    assert!(
-        prekey_bundles.contains_key(&requested_jid.normalize_for_prekey_bundle()),
-        "normalising the key must still work for callers that do it"
     );
 }
 
@@ -4996,7 +4992,7 @@ mod local_identity_change_on_send {
             };
             let resolver = MockSendContextResolver::new()
                 .with_phone_to_lid(pn.user.as_str(), lid.user.as_str())
-                .with_bundle(pn.normalize_for_prekey_bundle(), signed_prekey_bundle());
+                .with_bundle(pn.clone(), signed_prekey_bundle());
 
             let plan = ensure_sessions_for_devices(
                 &TokioTestRuntime,

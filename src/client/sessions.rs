@@ -493,10 +493,7 @@ impl Client {
         let mut failed_count = 0;
 
         for jid in jids {
-            if let Some(bundle) = prekey_bundles
-                .bundles
-                .get(&jid.normalize_for_prekey_bundle())
-            {
+            if let Some(bundle) = prekey_bundles.bundles.get(jid) {
                 match self
                     .install_prekey_bundle_cached(jid, bundle, &mut adapter, &mut rng)
                     .await
@@ -987,19 +984,12 @@ mod tests {
         requested_jid.agent = 1;
 
         // The agent is inert on a LID, so it does not hide the bundle: the raw
-        // lookup finds it. This is what `normalize_for_prekey_bundle` was added
-        // to work around.
+        // lookup finds it. Normalising the key first was the workaround this
+        // replaced, and the helper that did it is gone.
         assert!(
             prekey_bundles.contains_key(&requested_jid),
             "an inert agent must not hide the bundle"
         );
-
-        // Normalising still works, for the callers that still do it.
-        let normalized_lookup = requested_jid.normalize_for_prekey_bundle();
-        assert!(
-            prekey_bundles.contains_key(&normalized_lookup),
-            "Normalized lookup should succeed"
-        );
-        assert_eq!(normalized_lookup, normalized_jid);
+        assert_eq!(requested_jid, normalized_jid);
     }
 }
