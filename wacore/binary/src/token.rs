@@ -205,7 +205,13 @@ mod tests {
     /// `None`). Probes the length-bucketed lookup for any discriminator collision
     /// that would silently map a non-token (a JID/id) onto a token and corrupt the
     /// wire, and stays durable against future token-set edits.
+    ///
+    /// Ignored under Miri: ~3M lookups (every byte position of every token,
+    /// times 256) is minutes of interpretation for a table probe that holds no
+    /// `unsafe` and no raw pointers, so there is nothing there for the
+    /// interpreter to find.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn lookup_matches_reference_under_byte_mutation() {
         use std::collections::HashMap;
 

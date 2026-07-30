@@ -12,7 +12,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_websockets::{ClientBuilder, Message, WebSocketStream};
 use wacore::net::{
-    DisconnectReason, Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_WS_URL,
+    DisconnectReason, Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_ORIGIN,
+    WHATSAPP_WEB_WS_URL,
 };
 
 pub use tokio_websockets::Connector;
@@ -275,6 +276,7 @@ where
 pub struct TokioWebSocketTransportFactory {
     url: String,
     connector: Option<Connector>,
+    origin: Option<String>,
 }
 
 impl TokioWebSocketTransportFactory {
@@ -282,11 +284,31 @@ impl TokioWebSocketTransportFactory {
         Self {
             url: WHATSAPP_WEB_WS_URL.to_string(),
             connector: None,
+            origin: Some(WHATSAPP_WEB_ORIGIN.to_string()),
         }
     }
 
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = url.into();
+        self
+    }
+
+    /// Send a different `Origin` on the upgrade request.
+    ///
+    /// The default is [`WHATSAPP_WEB_ORIGIN`], and it stays correct when
+    /// [`with_url`](Self::with_url) points at a relay or a mock — the origin
+    /// names the endpoint the peer is standing in for, not the host dialled.
+    /// Reach for this only when something in front of WhatsApp demands its own.
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
+    }
+
+    /// Open the socket with no `Origin` at all, as this crate did before the
+    /// header was added. For a peer that rejects the upgrade over it; no known
+    /// WhatsApp endpoint does.
+    pub fn without_origin(mut self) -> Self {
+        self.origin = None;
         self
     }
 
@@ -326,9 +348,17 @@ impl TransportFactory for TokioWebSocketTransportFactory {
             }
         };
 
+        let mut builder = ClientBuilder::from_uri(uri).connector(connector);
+        if let Some(origin) = &self.origin {
+            let value = http::HeaderValue::from_str(origin)
+                .map_err(|e| anyhow::anyhow!("Invalid Origin {origin:?}: {e}"))?;
+            builder = builder
+                .add_header(http::header::ORIGIN, value)
+                .map_err(|e| anyhow::anyhow!("Failed to set Origin header: {e}"))?;
+        }
+
         debug!("Dialing {}", self.url);
-        let (ws, _) = ClientBuilder::from_uri(uri)
-            .connector(connector)
+        let (ws, _) = builder
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {e}"))?;
@@ -353,5 +383,84 @@ mod tests {
             report.total_bytes(),
             EST_READ_BUFFER_BYTES + EST_WRITE_BUFFER_BYTES + EST_TLS_STATE_BYTES
         );
+    }
+
+    /// Runs one upgrade attempt against a throwaway listener and returns the
+    /// request bytes the peer read.
+    ///
+    /// tokio-websockets exposes no view of the request it builds, so the socket
+    /// is the only place the header is observable — which is also the only
+    /// place it matters. `ws://` keeps the listener plain: `connect()` routes
+    /// that scheme through `Connector::Plain` and ignores our TLS connector.
+    /// The connect itself always fails, because the listener answers nothing.
+    async fn captured_upgrade_request(
+        factory: TokioWebSocketTransportFactory,
+    ) -> Result<String, anyhow::Error> {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let server = tokio::task::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buf = [0u8; 512];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await? {
+                    0 => break,
+                    n => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            Ok::<_, std::io::Error>(String::from_utf8_lossy(&request).into_owned())
+        });
+
+        let _ = factory
+            .with_url(format!("ws://{addr}/ws/chat"))
+            .create_transport()
+            .await;
+
+        Ok(server.await??)
+    }
+
+    #[tokio::test]
+    async fn upgrade_carries_the_web_origin_by_default() -> Result<(), anyhow::Error> {
+        let request = captured_upgrade_request(TokioWebSocketTransportFactory::new()).await?;
+
+        assert!(
+            request.contains(&format!("origin: {WHATSAPP_WEB_ORIGIN}\r\n")),
+            "upgrade must carry the WA Web origin, got:\n{request}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_origin_replaces_the_default() -> Result<(), anyhow::Error> {
+        let request = captured_upgrade_request(
+            TokioWebSocketTransportFactory::new().with_origin("https://relay.example"),
+        )
+        .await?;
+
+        assert!(
+            request.contains("origin: https://relay.example\r\n"),
+            "the override must reach the wire, got:\n{request}"
+        );
+        assert!(
+            !request.contains(WHATSAPP_WEB_ORIGIN),
+            "the default must not be sent alongside it, got:\n{request}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_origin_omits_the_header() -> Result<(), anyhow::Error> {
+        let request =
+            captured_upgrade_request(TokioWebSocketTransportFactory::new().without_origin())
+                .await?;
+
+        assert!(
+            !request.to_ascii_lowercase().contains("origin:"),
+            "opting out must send no origin at all, got:\n{request}"
+        );
+        Ok(())
     }
 }

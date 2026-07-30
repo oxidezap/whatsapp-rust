@@ -200,9 +200,29 @@ fn regression_a11_history_sync_config_advertises_support_flags() {
     assert_eq!(cfg.support_group_history, Some(true));
     assert_eq!(cfg.support_manus_history, Some(true));
     assert_eq!(cfg.support_hatch_history, Some(true));
+    assert_eq!(cfg.support_call_log_history, Some(true));
 
-    // Platform-gated in WA Web: only Windows clients advertise it.
-    assert_eq!(cfg.support_call_log_history, Some(false));
+    // Travels with `require_full_sync`; see the branch table on DEVICE_PROPS.
+    assert_eq!(cfg.full_sync_days_limit, None);
+}
+
+// A11b. DeviceProps defaults stay on the browser row of the branch table
+// documented on `DEVICE_PROPS`. The two fields move off one flag in WA Web,
+// so this pins them together — neither may drift alone.
+
+#[test]
+fn regression_a11b_default_device_props_request_a_recent_sync() {
+    let props = &*wacore::store::device::DEVICE_PROPS;
+
+    assert_eq!(props.require_full_sync, Some(false));
+    assert_eq!(
+        props
+            .history_sync_config
+            .as_option()
+            .expect("history_sync_config")
+            .full_sync_days_limit,
+        None,
+    );
 }
 
 // A7. value-MAC matches WA Web bytewise (u8 packed at offset 7 of 8-byte buf).

@@ -308,7 +308,58 @@ impl Client {
         self.wait_for_offline_delivery_end().await;
         self.ensure_sessions_inner(jids.to_vec()).await
     }
+}
 
+/// Whether a prekey fetch failed because the server considers the devices
+/// unregistered.
+///
+/// Batch-wide by nature: the fetch is one IQ, so a `406` answers for every jid
+/// in it rather than naming one.
+///
+/// Asked through `server_rejection` rather than by downcasting to one error
+/// type. This preflight calls `fetch_pre_keys` directly and gets a
+/// `crate::request::IqError::ServerError`; the fan-out reaches the same fetch
+/// through `SendContextResolver`, which re-wraps it as a
+/// `wacore::request::ServerErrorCode` to cross the crate boundary. A downcast
+/// to either one alone silently answers `false` for the other, and the failure
+/// mode of that is the send failing exactly as it did before.
+/// The `<error code>` the server attaches to a device it no longer knows.
+const UNREGISTERED_DEVICE_CODE: u16 = 406;
+
+fn is_device_unregistered(err: &anyhow::Error) -> bool {
+    use crate::error::ErrorChainExt;
+    err.server_rejection()
+        .is_some_and(|r| r.code == UNREGISTERED_DEVICE_CODE)
+}
+
+/// The distinct users named by `jids`, in first-seen order.
+///
+/// A prekey batch is usually several devices of the same one or two users, and
+/// every invalidation takes the registry lock and deletes rows, so visiting a
+/// user once per device would pay that repeatedly for no effect. Split out from
+/// the invalidation so the deduplication is observable on its own: through the
+/// cache it is not, since a user invalidated twice looks exactly like a user
+/// invalidated once.
+fn distinct_users(jids: &[Jid]) -> smallvec::SmallVec<[&str; 4]> {
+    let mut seen: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
+    for jid in jids {
+        if !seen.contains(&jid.user.as_str()) {
+            seen.push(jid.user.as_str());
+        }
+    }
+    seen
+}
+
+impl Client {
+    /// Refreshes the device list of every user named in `jids`, once each.
+    async fn invalidate_device_caches_for(&self, jids: &[Jid]) {
+        for user in distinct_users(jids) {
+            self.invalidate_device_cache(user).await;
+        }
+    }
+}
+
+impl Client {
     /// Core session-check + prekey-fetch logic shared by both entry points.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<()> {
@@ -378,9 +429,61 @@ impl Client {
             return Ok(0);
         }
 
-        let prekey_bundles = self
+        let prekey_bundles = match self
             .fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity))
-            .await?;
+            .await
+        {
+            Ok(bundles) => bundles,
+            // A `406` means the server no longer knows these devices, so the
+            // cached list that named them is stale. Refresh it before giving up,
+            // or the retry resolves the same absent device and collects the same
+            // 406 forever. It cannot affect the send in flight, whose device set
+            // is already resolved.
+            //
+            // The error still propagates, and deliberately so. The fetch is one
+            // IQ over a batch of up to `SESSION_CHECK_BATCH_SIZE` devices, and a
+            // 406 answers for the whole batch without naming which device it is
+            // about. Continuing would mean treating every device in that batch
+            // as having no prekeys, so a registered device that merely lacked a
+            // local session would be skipped by the fan-out and the message
+            // would go out to fewer devices than intended, with nothing to say
+            // so. A failed send is visible and now retries against a refreshed
+            // list; a silently short fan-out is neither.
+            Err(e) if is_device_unregistered(&e) => {
+                log::debug!(
+                    "Prekey fetch returned 406 for {} device(s); \
+                     refreshing their device lists before failing the send",
+                    jids.len()
+                );
+                self.invalidate_device_caches_for(jids).await;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+
+        // The server named these individually, which is the per-device signal a
+        // batch-wide failure cannot give: refresh exactly their device lists and
+        // leave the rest of the batch alone. The send continues, because the
+        // devices that did come back with a bundle are unaffected and skipping
+        // them would deliver to fewer devices for a reason that only concerns
+        // the named ones.
+        if !prekey_bundles.rejected.is_empty() {
+            let rejected: Vec<Jid> = prekey_bundles
+                .rejected
+                .iter()
+                .filter(|device| device.code == UNREGISTERED_DEVICE_CODE)
+                .map(|device| device.jid.clone())
+                .collect();
+            if !rejected.is_empty() {
+                log::debug!(
+                    "prekey fetch rejected {} of {} device(s) as unregistered; \
+                     refreshing their device lists",
+                    rejected.len(),
+                    jids.len()
+                );
+                self.invalidate_device_caches_for(&rejected).await;
+            }
+        }
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<StdRng>();
@@ -390,7 +493,7 @@ impl Client {
         let mut failed_count = 0;
 
         for jid in jids {
-            if let Some(bundle) = prekey_bundles.get(&jid.normalize_for_prekey_bundle()) {
+            if let Some(bundle) = prekey_bundles.bundles.get(jid) {
                 match self
                     .install_prekey_bundle_cached(jid, bundle, &mut adapter, &mut rng)
                     .await
@@ -515,6 +618,82 @@ impl Client {
 mod tests {
     use super::*;
     use wacore_binary::{JidExt, Server};
+
+    /// The 406 the preflight now tolerates is recognised by its server code and
+    /// nothing else: any other failure must still fail the send, or a transport
+    /// or auth error would be silently downgraded into "these devices have no
+    /// prekeys" and the message would go out to fewer devices than it should.
+    #[test]
+    fn only_a_406_counts_as_an_unregistered_device() {
+        // Both spellings, because they are both real: this preflight calls
+        // `fetch_pre_keys` directly and receives the first, while the fan-out
+        // goes through `SendContextResolver`, which re-wraps it as the second.
+        let as_iq_error = |code| {
+            anyhow::Error::new(crate::request::IqError::ServerError {
+                code,
+                text: "not-acceptable".to_string(),
+                error_type: None,
+                backoff: None,
+            })
+        };
+        let as_shared = |code| {
+            anyhow::Error::new(wacore::request::ServerErrorCode {
+                code,
+                text: "not-acceptable".to_string(),
+                error_type: None,
+                backoff: None,
+            })
+        };
+
+        assert!(
+            is_device_unregistered(&as_iq_error(406)),
+            "the error this preflight actually receives must be recognised"
+        );
+        assert!(is_device_unregistered(&as_shared(406)));
+
+        for code in [400, 401, 403, 404, 429, 500, 503] {
+            assert!(
+                !is_device_unregistered(&as_iq_error(code)),
+                "a {code} must not be treated as an unregistered device"
+            );
+            assert!(!is_device_unregistered(&as_shared(code)));
+        }
+
+        // Not every failure is a server error at all.
+        assert!(!is_device_unregistered(&anyhow::anyhow!("socket closed")));
+    }
+
+    /// A prekey batch is several devices of the same one or two users, and each
+    /// invalidation takes the registry lock and deletes rows, so the users are
+    /// visited once each rather than once per device.
+    ///
+    /// Asserted on the list rather than through the cache: an entry invalidated
+    /// twice is indistinguishable from one invalidated once, so a cache-level
+    /// test would pass no matter how many times each user was visited.
+    #[test]
+    fn a_batch_names_each_user_once_in_order() {
+        let a = Jid::pn("5511900000050");
+        let b = Jid::pn("5511900000051");
+        let jids = vec![
+            a.with_device(0),
+            a.with_device(1),
+            b.with_device(0),
+            a.with_device(2),
+            b.with_device(3),
+        ];
+
+        assert_eq!(
+            distinct_users(&jids).as_slice(),
+            [a.user.as_str(), b.user.as_str()],
+            "each user once, in the order the batch first names them"
+        );
+
+        assert!(distinct_users(&[]).is_empty());
+        assert_eq!(
+            distinct_users(std::slice::from_ref(&a.with_device(7))).as_slice(),
+            [a.user.as_str()]
+        );
+    }
 
     #[test]
     fn test_primary_phone_jid_creation_from_pn() {
@@ -804,21 +983,13 @@ mod tests {
         let mut requested_jid = Jid::lid("123456789");
         requested_jid.agent = 1;
 
-        // 1. Verify direct lookup fails (This is the bug)
+        // The agent is inert on a LID, so it does not hide the bundle: the raw
+        // lookup finds it. Normalising the key first was the workaround this
+        // replaced, and the helper that did it is gone.
         assert!(
-            !prekey_bundles.contains_key(&requested_jid),
-            "Direct lookup of non-normalized JID should fail"
+            prekey_bundles.contains_key(&requested_jid),
+            "an inert agent must not hide the bundle"
         );
-
-        // 2. Verify normalized lookup succeeds (This is the fix)
-        // This mirrors the logic change in fetch_and_establish_sessions
-        let normalized_lookup = requested_jid.normalize_for_prekey_bundle();
-        assert!(
-            prekey_bundles.contains_key(&normalized_lookup),
-            "Normalized lookup should succeed"
-        );
-
-        // Ensure the normalization actually produced the key we stored
-        assert_eq!(normalized_lookup, normalized_jid);
+        assert_eq!(requested_jid, normalized_jid);
     }
 }

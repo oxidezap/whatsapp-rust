@@ -87,6 +87,14 @@ const PAIR_CODE_VALIDITY_SECS: u64 = 180;
 /// abandoned. Matches WA Web `DeviceLinkingApi` (`T = 3`, `MaxPrimaryHelloError`).
 const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
 
+/// How long a `companion_finish` may go unanswered before the code is written
+/// off. WA Web arms exactly this on `primary_hello_received`
+/// (`Link/DevicePhoneNumberCodeScreen.react.js`, `1 * MINUTE_MILLISECONDS`) and
+/// regenerates the code when it fires: the primary having read the code is no
+/// guarantee it could open the key bundle, and a primary that could not simply
+/// goes quiet — no error ever reaches the companion.
+const PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS: u64 = 60;
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -152,12 +160,45 @@ impl Default for PairCodeOptions {
     }
 }
 
+/// Identity of one `pair_with_code` request, minted per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairCodeClaim(u64);
+
+impl PairCodeClaim {
+    /// A value no live claim shares. Process-wide rather than per-client: a
+    /// counter is cheaper than the coordination that scoping it would need, and
+    /// only equality within one client is ever asked of it.
+    pub fn next() -> Self {
+        use core::sync::atomic::Ordering;
+        static NEXT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// State machine for pair code authentication flow.
 #[derive(Default)]
 pub enum PairCodeState {
     /// Initial state - no pair code request in progress.
     #[default]
     Idle,
+    /// `companion_hello` is in flight and the slot is already spoken for.
+    ///
+    /// Checking for a live flow and then releasing the lock across the stage-1
+    /// round trip would let two concurrent callers both mint a code, and the
+    /// second response would overwrite the first flow's ephemeral keypair —
+    /// stranding the code that was returned first. WA Web tracks the same
+    /// window as a distinct stage (`AfterSendCompanionHello` follows
+    /// `Initialized` before the request resolves).
+    RequestingCode {
+        /// Stamped before `companion_hello`, and carried into
+        /// [`Self::WaitingForPhoneConfirmation`] unchanged.
+        code_generation_ts: i64,
+        /// Identifies *this* request. The stamp cannot: cancel a request and
+        /// start its replacement inside the same second and both carry the same
+        /// number, so the first one's late response would install its code over
+        /// the replacement's claim, and its failure path would release it.
+        claim: PairCodeClaim,
+    },
     /// Stage 1 complete - waiting for phone to confirm code entry.
     WaitingForPhoneConfirmation {
         /// Reference returned by server in stage 1.
@@ -180,10 +221,71 @@ pub enum PairCodeState {
     Completed,
 }
 
+impl PairCodeState {
+    /// The window left on a code someone may still be reading, or `None` when
+    /// there is nothing left to strand.
+    ///
+    /// A second `companion_hello` mints a new code *and* a new ephemeral
+    /// keypair, but the server keeps routing `primary_hello` by phone number —
+    /// it never sees the code itself. So the holder of the superseded code
+    /// still reaches stage 2, and gets a key bundle derived from key material
+    /// their code cannot open: the primary fails to link with no error the
+    /// companion can see. WA Web forbids the overlap outright, guarding
+    /// `startAltLinkingFlow` with `invariant(stage === Initialized)`
+    /// (`Alt/DeviceLinkingApi.js`) so a replacement must follow an explicit
+    /// `initializeAltDeviceLinking()`.
+    ///
+    /// The boundary matches [`PairCodeUtils::code_validity`] as applied in
+    /// stage 2, which rejects only `age > validity`.
+    /// Whether a `companion_finish` is out and its `pair-success` still due.
+    ///
+    /// Distinct from [`Self::live_flow_remaining`], which tracks how long the
+    /// *code* stays enterable. A `primary_hello` accepted near the end of that
+    /// window leaves the link pending for up to
+    /// [`PairCodeUtils::primary_hello_pair_success_timeout`] longer, and the adv
+    /// secret its HMAC is computed over is already derived — so anything that
+    /// would re-mint that secret has to wait for this, not for the code.
+    pub fn awaiting_pair_success(&self) -> bool {
+        matches!(
+            self,
+            Self::WaitingForPhoneConfirmation {
+                primary_hello_attempt_count: 1..,
+                ..
+            }
+        )
+    }
+
+    /// Whether anything would be stranded by starting a new flow now.
+    ///
+    /// The union of the two clocks: the code's own validity window, and the
+    /// link that outlives it once the phone has answered.
+    pub fn is_outstanding(&self, now: i64) -> bool {
+        self.live_flow_remaining(now).is_some() || self.awaiting_pair_success()
+    }
+
+    pub fn live_flow_remaining(&self, now: i64) -> Option<std::time::Duration> {
+        let (Self::RequestingCode {
+            code_generation_ts, ..
+        }
+        | Self::WaitingForPhoneConfirmation {
+            code_generation_ts, ..
+        }) = self
+        else {
+            return None;
+        };
+        let validity = PairCodeUtils::code_validity();
+        // A backwards clock jump reads as "no time has passed", never as an
+        // expiry that would let the overlap through unreported.
+        let age = now.saturating_sub(*code_generation_ts).max(0) as u64;
+        (age <= validity.as_secs()).then(|| validity - std::time::Duration::from_secs(age))
+    }
+}
+
 impl std::fmt::Debug for PairCodeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Idle => write!(f, "Idle"),
+            Self::RequestingCode { .. } => write!(f, "RequestingCode"),
             Self::WaitingForPhoneConfirmation { phone_jid, .. } => f
                 .debug_struct("WaitingForPhoneConfirmation")
                 .field("phone_jid", phone_jid)
@@ -510,6 +612,136 @@ impl PairCodeUtils {
     pub fn max_primary_hello_attempts() -> u32 {
         PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS
     }
+
+    /// How long `companion_finish` may go unanswered before the code is written
+    /// off — WA Web's one-minute `primary_hello_expire` timer.
+    pub fn primary_hello_pair_success_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS)
+    }
+}
+
+/// How the server refused a `companion_hello`, as a matchable status.
+///
+/// The five named variants are the complete set WA Web's own response parser
+/// accepts (`WASmaxInMdIqMixinErrors.parseIqMixinErrors`, reached from
+/// `WASmaxInMdCompanionHelloResponseError`); anything else makes its RPC throw
+/// "unknown error". They exist so a consumer can branch on the refusal instead
+/// of matching the formatted message, which is not a stable surface.
+///
+/// The numbers are the `code` attribute, and each is the enum's whole wire form
+/// — [`code()`](Self::code) is what `Serialize` emits and what `From<i32>` reads
+/// back. WA Web pairs each code with a literal `text`
+/// (`429`/`rate-overlimit`, `452`/`feature-not-available`, …) and rejects a
+/// response whose two disagree, so construct these through
+/// [`from_server`](Self::from_server) rather than from a code alone: it is the
+/// only constructor that sees both attributes, and the only one that can decline
+/// to classify.
+///
+/// WA Web branches on exactly two of them (`DevicePhoneNumberCodeScreen`, on
+/// `CompanionHelloError.type.name`): [`RateOverlimit`](Self::RateOverlimit)
+/// becomes "too many attempts, try again later" and
+/// [`FeatureNotAvailable`](Self::FeatureNotAvailable) becomes "not available to
+/// you yet, link with QR code instead". The rest share a generic "try again or
+/// link with the QR code". In every case it resets the linking flow and waits
+/// for the person to act — it never retries on its own, and never reads the
+/// `backoff` hint, so treat that value as the server's advice rather than a
+/// schedule WA Web is known to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+#[wire(kind = "int")]
+pub enum PairCodeRejection {
+    /// The request was malformed — **or** throttled for this phone number: the
+    /// server reuses `bad-request` for its per-number pair-code limit rather
+    /// than answering `rate-overlimit`. So this is not reliably a permanent
+    /// failure; see [`PairCodeRejection::is_throttled`].
+    #[wire = 400]
+    BadRequest,
+    #[wire = 403]
+    Forbidden,
+    /// The connection is asking for codes too fast. The server states the rate
+    /// is too high; the only correct response is to slow down.
+    #[wire = 429]
+    RateOverlimit,
+    /// Phone-number linking is not enabled for this account. Retrying will not
+    /// change that — WA Web sends the user to the QR code instead.
+    #[wire = 452]
+    FeatureNotAvailable,
+    #[wire = 500]
+    InternalServerError,
+    /// A `code` outside the set WA Web accepts. Its own RPC would raise
+    /// "unknown error" here; we keep the number so a consumer can log it and a
+    /// server-side addition is visible rather than silently reshaped.
+    #[wire_fallback]
+    Unknown(i32),
+}
+
+impl PairCodeRejection {
+    /// Whether this refusal is the server rate-limiting the request.
+    ///
+    /// True for [`RateOverlimit`](Self::RateOverlimit) and
+    /// [`BadRequest`](Self::BadRequest), because the server throttles pair-code
+    /// requests per phone number under `bad-request` instead of
+    /// `rate-overlimit`. That makes the predicate deliberately wider than the
+    /// literal 429: a `bad-request` may equally be genuinely invalid content,
+    /// and the two are indistinguishable on the wire. Treat a true here as
+    /// "back off, then retry at most a bounded number of times" — not as proof
+    /// the request would ever succeed.
+    pub fn is_throttled(self) -> bool {
+        matches!(self, Self::RateOverlimit | Self::BadRequest)
+    }
+
+    /// The `text` WA Web pairs with this code; `None` for
+    /// [`Unknown`](Self::Unknown), which has no expected pairing.
+    pub fn text(self) -> Option<&'static str> {
+        Some(match self {
+            Self::BadRequest => "bad-request",
+            Self::Forbidden => "forbidden",
+            Self::RateOverlimit => "rate-overlimit",
+            Self::FeatureNotAvailable => "feature-not-available",
+            Self::InternalServerError => "internal-server-error",
+            Self::Unknown(_) => return None,
+        })
+    }
+
+    /// Classify a server `<error>` from both of its attributes, or `None` when
+    /// the two disagree and no classification is honest.
+    ///
+    /// WA Web asserts the pair (`literal(attrInt, …, "code", 429)` beside
+    /// `literal(attrString, …, "text", "rate-overlimit")`) and drops to its
+    /// generic error path when they disagree, so a changed pairing must not keep
+    /// reading as the named arm.
+    ///
+    /// `None` rather than `Unknown(code)` for that case, because `Unknown` could
+    /// not carry it: the wire form of this enum **is** `code()`, so
+    /// `Unknown(429)` serializes to `429` and rehydrates as
+    /// [`RateOverlimit`](Self::RateOverlimit) — a consumer that persisted or
+    /// forwarded the value would get the demotion silently undone and apply
+    /// throttling anyway. There is no in-band value that both records the code
+    /// and refuses to alias the arm it came from. The code is not lost: the
+    /// caller still has the error's own rendering, which names it.
+    ///
+    /// An **absent** `text` is not a contradiction, and the code alone decides.
+    /// Deliberately laxer than WA Web, which would reject it: refusing to
+    /// classify a bare `429` would also clear
+    /// [`is_throttled`](Self::is_throttled), turning the one refusal a consumer
+    /// most needs to act on back into a silent one. A missing attribute is not
+    /// evidence that the code means something else.
+    pub fn from_server(code: u16, text: &str) -> Option<Self> {
+        let by_code = Self::from(i32::from(code));
+        match by_code.text() {
+            Some(expected) if !text.is_empty() && text != expected => None,
+            _ => Some(by_code),
+        }
+    }
+}
+
+impl core::fmt::Display for PairCodeRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Rendered as the stanza it came from, so a log line reads the same way.
+        match self.text() {
+            Some(text) => write!(f, "{text} ({})", self.code()),
+            None => write!(f, "unknown ({})", self.code()),
+        }
+    }
 }
 
 /// Errors raised by wacore-side pair-code validation, key derivation, and
@@ -530,6 +762,17 @@ pub enum PairCodeError {
 
     #[error("invalid custom code: must be 8 characters from Crockford Base32 alphabet")]
     InvalidCustomCode,
+
+    /// A code is already displayed and still within its validity window.
+    ///
+    /// Minting a second one does not replace the first for the *phone*: the
+    /// server routes `primary_hello` by number, so whoever enters the older
+    /// code still reaches stage 2 and receives a key bundle their code cannot
+    /// open — the phone reports a failed link and the companion sees nothing.
+    /// WA Web forbids the overlap with `invariant(stage === Initialized)`.
+    /// Cancel the outstanding flow first if the replacement is intentional.
+    #[error("a pair code is already outstanding ({remaining:?} left of its validity window)")]
+    CodeAlreadyOutstanding { remaining: std::time::Duration },
 
     #[error("invalid wrapped data: expected {expected} bytes, got {got}")]
     InvalidWrappedData { expected: usize, got: usize },
@@ -560,6 +803,11 @@ pub enum PairCodeError {
 
     #[error("server response missing pairing ref")]
     MissingPairingRef,
+
+    /// The flow was cancelled (or replaced) while `companion_hello` was in
+    /// flight, so the code stage 1 produced was never installed.
+    #[error("the pair-code flow was cancelled while it was being requested")]
+    Cancelled,
 }
 
 #[cfg(test)]
@@ -912,6 +1160,75 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_companion_platform(&opts, &p).1, "Chrome (Linux)");
+    }
+
+    // ── `PairCodeState::live_flow_remaining` ─────────────────────────────────
+    //
+    // A second `companion_hello` mints a fresh code and ref, and the server
+    // keeps routing `primary_hello` by phone number — so whoever is still
+    // holding the previous code gets a `companion_finish` derived from key
+    // material their code cannot open. WA Web never reaches that state from a
+    // QR rotation: `Alt/DeviceLinkingApi.js` generates the code once from the
+    // user's action and only regenerates it through `refreshAltLinkingCode`,
+    // `forceManualRefresh`, or the screen's own timers. This predicate is what
+    // lets the overwrite be reported instead of silent.
+
+    fn waiting_at(ts: i64) -> PairCodeState {
+        PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: b"3@2:ref".to_vec(),
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: ts,
+            primary_hello_attempt_count: 0,
+        }
+    }
+
+    #[test]
+    fn live_flow_remaining_is_none_when_no_code_is_outstanding() {
+        assert_eq!(PairCodeState::Idle.live_flow_remaining(1_000), None);
+        assert_eq!(PairCodeState::Completed.live_flow_remaining(1_000), None);
+    }
+
+    #[test]
+    fn live_flow_remaining_counts_down_the_validity_window() {
+        let validity = PairCodeUtils::code_validity().as_secs() as i64;
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000),
+            Some(PairCodeUtils::code_validity())
+        );
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000 + 30),
+            Some(std::time::Duration::from_secs(validity as u64 - 30))
+        );
+    }
+
+    /// The boundary matches `handle_primary_hello`, which rejects only
+    /// `age > validity` (WA Web `OldCodeError`): at exactly the window the code
+    /// is still usable, so it is still worth reporting as lost.
+    #[test]
+    fn live_flow_remaining_treats_the_exact_window_as_still_live() {
+        let validity = PairCodeUtils::code_validity().as_secs() as i64;
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000 + validity),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(1_000 + validity + 1),
+            None,
+            "an expired code is not a flow anyone can still complete"
+        );
+    }
+
+    /// A clock that jumped backwards must not underflow into a bogus window.
+    #[test]
+    fn live_flow_remaining_survives_a_backwards_clock() {
+        assert_eq!(
+            waiting_at(1_000).live_flow_remaining(900),
+            Some(PairCodeUtils::code_validity())
+        );
     }
 
     #[test]

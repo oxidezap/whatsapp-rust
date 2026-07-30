@@ -797,19 +797,47 @@ impl ProtocolStore for InMemoryBackend {
         let mut s = self.state.lock().await;
 
         // Memory bound only: when the map hits the cap, drop the oldest entries
-        // (by timestamp) down to 3/4 of it so this O(n log n) scan amortizes
-        // across many inserts. Time-based pruning is the caller's keepalive sweep.
+        // (by timestamp) down to 3/4 of it so this scan amortizes across many
+        // inserts. Time-based pruning is the caller's keepalive sweep.
+        //
+        // Only the timestamps are collected: cloning every key to sort them
+        // allocated two Strings per retained entry on each eviction (4096 keys
+        // per 1024 inserts under load) while holding the state lock, which
+        // showed up both as per-message churn and as a latency spike.
+        // `select_nth_unstable` finds the cutoff in O(n) without ordering the
+        // rest, then two passes apply it: everything strictly older goes, and
+        // the cutoff's own bucket tops the removal up to the exact count. The
+        // split is what keeps the policy oldest-first, since map iteration
+        // order is arbitrary and a single pass could evict an entry AT the
+        // cutoff while keeping one below it. The exact count matters because a
+        // flood puts every entry in the same second: with one bucket for the
+        // whole map, dropping all of "timestamp <= cutoff" would clear it.
         if s.sent_messages.len() >= MAX_SENT_MESSAGES {
             let target = MAX_SENT_MESSAGES * 3 / 4;
             let drop_count = s.sent_messages.len().saturating_sub(target);
-            let mut by_age: Vec<_> = s
-                .sent_messages
-                .iter()
-                .map(|(k, e)| (e.timestamp, k.clone()))
-                .collect();
-            by_age.sort_unstable_by_key(|(ts, _)| *ts);
-            for (_, k) in by_age.into_iter().take(drop_count) {
-                s.sent_messages.remove(&k);
+            if drop_count > 0 {
+                let mut ages: Vec<i64> = s.sent_messages.values().map(|e| e.timestamp).collect();
+                let (_, &mut cutoff, _) = ages.select_nth_unstable(drop_count - 1);
+                let mut removed = 0usize;
+                s.sent_messages.retain(|_, e| {
+                    if e.timestamp < cutoff {
+                        removed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let mut remaining = drop_count.saturating_sub(removed);
+                if remaining > 0 {
+                    s.sent_messages.retain(|_, e| {
+                        if remaining > 0 && e.timestamp == cutoff {
+                            remaining -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
             }
         }
 
@@ -1146,6 +1174,85 @@ mod tests {
                 .is_some(),
             "the newest message must survive count-cap eviction"
         );
+    }
+
+    /// Under a flood every entry lands in the same second, so the eviction
+    /// cutoff is a timestamp shared by the whole map. Dropping everything at or
+    /// below it would clear the store instead of trimming it, losing the
+    /// retry/receipt payloads of messages that were just sent.
+    #[tokio::test]
+    async fn store_sent_message_eviction_trims_when_all_timestamps_tie() {
+        let backend = InMemoryBackend::new();
+        for i in 0..MAX_SENT_MESSAGES {
+            backend
+                .store_sent_message("chat@g.us", &format!("m{i}"), b"payload")
+                .await
+                .unwrap();
+        }
+        // Pin the tie instead of relying on the loop finishing inside one
+        // second: the clock advancing mid-run would silently exercise the
+        // ordinary multi-bucket path rather than the case under test.
+        {
+            let mut s = backend.state.lock().await;
+            for entry in s.sent_messages.values_mut() {
+                entry.timestamp = 1_000;
+            }
+        }
+
+        // The map is at the cap, so this insert is the one that evicts.
+        backend
+            .store_sent_message("chat@g.us", "trigger", b"payload")
+            .await
+            .unwrap();
+
+        let target = MAX_SENT_MESSAGES * 3 / 4;
+        let s = backend.state.lock().await;
+        assert_eq!(
+            s.sent_messages.len(),
+            target + 1,
+            "eviction must trim to 3/4 of the cap plus the insert that triggered it"
+        );
+        assert!(
+            s.sent_messages
+                .contains_key(&("chat@g.us".to_string(), "trigger".to_string())),
+            "the insert that triggered eviction must survive it"
+        );
+    }
+
+    /// With distinct timestamps the cutoff bucket must not shield older
+    /// entries: arbitrary map iteration order used to decide who went first.
+    #[tokio::test]
+    async fn store_sent_message_eviction_drops_the_oldest_first() {
+        let backend = InMemoryBackend::new();
+        for i in 0..MAX_SENT_MESSAGES {
+            backend
+                .store_sent_message("chat@g.us", &format!("m{i}"), b"payload")
+                .await
+                .unwrap();
+        }
+        // Two buckets: a minority strictly older than the rest. Every one of the
+        // old bucket has to go before anything from the newer bucket does.
+        let old_ids: Vec<String> = (0..16).map(|i| format!("m{i}")).collect();
+        {
+            let mut s = backend.state.lock().await;
+            for (key, entry) in s.sent_messages.iter_mut() {
+                entry.timestamp = if old_ids.contains(&key.1) { 500 } else { 1_000 };
+            }
+        }
+
+        backend
+            .store_sent_message("chat@g.us", "trigger", b"payload")
+            .await
+            .unwrap();
+
+        let s = backend.state.lock().await;
+        for id in &old_ids {
+            assert!(
+                !s.sent_messages
+                    .contains_key(&("chat@g.us".to_string(), id.clone())),
+                "entry {id} is older than the cutoff and must have been evicted"
+            );
+        }
     }
 
     #[tokio::test]

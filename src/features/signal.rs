@@ -649,11 +649,7 @@ impl<'a> Signal<'a> {
 
         // Acquire per-device session locks before encrypting (matches DM send path)
         let lock_jids = self.client.build_session_lock_keys(&device_jids).await;
-        let session_mutexes = self.client.session_mutexes_for(&lock_jids).await;
-        let mut _session_guards = Vec::with_capacity(session_mutexes.len());
-        for mutex in &session_mutexes {
-            _session_guards.push(mutex.lock().await);
-        }
+        let _session_guards = self.client.session_guards_for(&lock_jids).await;
 
         let plaintext = MessageUtils::encode_and_pad(message);
         let mut adapter = self.client.signal_adapter().await;

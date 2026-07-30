@@ -710,9 +710,12 @@ impl Node {
     }
 
     pub fn get_children_by_tag<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a Node> {
+        // `unwrap_or_default` and not `into_iter().flatten()`: the absent case is
+        // already an empty slice, so flattening only buys a nested iterator whose
+        // state machine LLVM does not fold away on this hot traversal.
         self.children()
-            .into_iter()
-            .flatten()
+            .unwrap_or_default()
+            .iter()
             .filter(move |c| c.tag == tag)
     }
 
@@ -801,8 +804,8 @@ impl<'a> NodeRef<'a> {
         'a: 'b,
     {
         self.children()
-            .into_iter()
-            .flatten()
+            .unwrap_or_default()
+            .iter()
             .filter(move |c| c.tag == tag)
     }
 
@@ -1005,6 +1008,163 @@ impl OwnedNodeRef {
     #[inline]
     pub fn content_as_string(&self) -> Option<CompactString> {
         self.get().content_as_string()
+    }
+}
+
+#[cfg(test)]
+mod value_ref_compare_tests {
+    use super::*;
+    use crate::jid::Server;
+    use std::str::FromStr;
+
+    /// Callers compare a `ValueRef` against a literal to decide whether a
+    /// stanza came from the server, so `v == needle` has to answer exactly what
+    /// `v.as_str() == needle` answered — including for the server-only shape
+    /// (`s.whatsapp.net`, no user), which is the one those checks actually use.
+    #[test]
+    fn comparing_a_jid_value_matches_comparing_its_rendered_form() {
+        let jids = [
+            "s.whatsapp.net",
+            "5511999998888@s.whatsapp.net",
+            "5511999998888:7@s.whatsapp.net",
+            "5511999998888.2@s.whatsapp.net",
+            "120363012345678901@g.us",
+            "123456789012345@lid",
+            "123456789012345:9@lid",
+            "123456789.4:17@interop",
+            "status@broadcast",
+            "12345.6@hosted.lid",
+        ];
+        let needles = [
+            "s.whatsapp.net",
+            "5511999998888@s.whatsapp.net",
+            "5511999998888:7@s.whatsapp.net",
+            "123456789012345@lid",
+            "",
+            "not-a-jid",
+        ];
+
+        for raw in jids {
+            let owned = Jid::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            let borrowed = ValueRef::Jid(JidRef {
+                user: NodeStr::Borrowed(&owned.user),
+                server: owned.server,
+                agent: owned.agent,
+                device: owned.device,
+                integrator: owned.integrator,
+            });
+            let as_string = ValueRef::String(NodeStr::Borrowed(raw));
+
+            for needle in needles {
+                assert_eq!(
+                    borrowed.as_str() == needle,
+                    borrowed == needle,
+                    "jid value {raw:?} vs {needle:?}"
+                );
+                assert_eq!(
+                    as_string.as_str() == needle,
+                    as_string == needle,
+                    "string value {raw:?} vs {needle:?}"
+                );
+            }
+        }
+
+        // The server-only shape is the one the server checks compare against.
+        let server_only = ValueRef::Jid(JidRef {
+            user: NodeStr::Borrowed(""),
+            server: Server::Pn,
+            agent: 0,
+            device: 0,
+            integrator: 0,
+        });
+        assert!(server_only == "s.whatsapp.net");
+        assert!(server_only != "5511999998888@s.whatsapp.net");
+    }
+}
+
+#[cfg(test)]
+mod owned_node_ref_tests {
+    use super::*;
+
+    /// Raw binary-protocol bytes, as `OwnedNodeRef::new` wants them: `marshal`
+    /// writes a leading format byte that `unmarshal_ref` does not expect.
+    fn encoded(node: &Node) -> Bytes {
+        let bytes = crate::marshal::marshal(node).unwrap();
+        Bytes::from(bytes[1..].to_vec())
+    }
+
+    fn sample() -> Node {
+        Node::new(
+            "iq",
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("abc".into()))].into()),
+            Some(NodeContent::Bytes(b"payload".to_vec())),
+        )
+    }
+
+    #[test]
+    fn borrowed_payloads_survive_moving_the_cart() {
+        let node = sample();
+        let owned = OwnedNodeRef::new(encoded(&node)).unwrap();
+
+        // Move the value twice — through a Box and into a Vec — before reading
+        // anything back. That is the whole `StableDeref` claim: the yoked
+        // `NodeRef` keeps pointing at live bytes even though the wrapper it
+        // borrows from has moved. Nothing but an interpreter notices when it
+        // stops being true, which is why this test exists separately from the
+        // serde one it used to be a side effect of.
+        let mut moved = vec![*Box::new(owned)];
+        let owned = moved.pop().unwrap();
+
+        assert_eq!(owned.tag(), "iq");
+        assert!(owned.get_attr("id").unwrap() == "abc");
+        assert_eq!(owned.content_bytes(), Some(&b"payload"[..]));
+        assert_eq!(owned.to_owned_node(), node);
+    }
+
+    #[test]
+    fn yoked_attrs_ref_survives_make_transform_and_mutation() {
+        // `NodeRef`'s derived `Yokeable` transmutes the whole struct in one go,
+        // so yoking a node never calls `AttrsRef`'s hand-written impl — that one
+        // is there to satisfy the derive's bound on the field. Reaching its
+        // three methods takes a yoke of `AttrsRef` itself, and it is the only
+        // way to put our own transmutes, rather than yoke's generated ones, in
+        // front of the interpreter.
+        let cart = BytesCart(Bytes::from_static(b"idabc"));
+        let mut yoke: Yoke<AttrsRef<'static>, BytesCart> = Yoke::attach_to_cart(cart, |buf| {
+            // Borrowed from the cart, which is what makes the transmutes load-bearing.
+            let (key, value) = buf.split_at(2);
+            AttrsRef::from_vec(vec![(
+                NodeStr::Borrowed(std::str::from_utf8(key).expect("ascii")),
+                ValueRef::String(NodeStr::Borrowed(
+                    std::str::from_utf8(value).expect("ascii"),
+                )),
+            )])
+        });
+
+        // `make` ran on attach; `transform` runs here.
+        let (key, value) = &yoke.get().as_slice()[0];
+        assert!(*key == "id");
+        assert!(*value == "abc");
+
+        // `transform_mut`, which nothing in the workspace calls.
+        yoke.with_mut(|attrs| {
+            *attrs = AttrsRef::from_vec(vec![(
+                NodeStr::Owned("k".into()),
+                ValueRef::String(NodeStr::Owned("v".into())),
+            )]);
+        });
+        assert!(yoke.get().as_slice()[0].1 == "v");
+    }
+
+    #[test]
+    fn slice_bytes_views_the_backing_buffer_without_copying() {
+        let owned = OwnedNodeRef::new(encoded(&sample())).unwrap();
+        let content = owned.content_bytes().unwrap();
+
+        let view = owned.slice_bytes(content);
+
+        assert_eq!(view.as_ref(), b"payload");
+        assert_eq!(view.as_ptr(), content.as_ptr(), "slice_bytes copied");
     }
 }
 

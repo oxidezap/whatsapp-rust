@@ -11,6 +11,10 @@ const APP_STATE_KEY_REQUEST_DEDUP: Duration = Duration::from_secs(24 * 3600);
 const APP_STATE_KEY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
+/// How many times an outgoing patch is rebuilt against a newer base before the
+/// send gives up. WA Web's `serverSync` runs the same resolve-and-retry loop
+/// with `y = 5` (`WAWebSyncdServerSync`).
+const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
 
 /// In-flight dedup registry for app-state collection syncs.
 ///
@@ -23,6 +27,9 @@ const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 pub(crate) struct SyncInFlight {
     entries: std::sync::Mutex<HashMap<WAPatchName, u64>>,
     next_token: AtomicU64,
+    /// Notified whenever a reservation is released, so [`SyncInFlight::begin`]
+    /// can wait for one instead of spinning.
+    released: event_listener::Event,
 }
 
 impl SyncInFlight {
@@ -30,6 +37,7 @@ impl SyncInFlight {
         Arc::new(Self {
             entries: std::sync::Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(0),
+            released: event_listener::Event::new(),
         })
     }
 
@@ -48,10 +56,31 @@ impl SyncInFlight {
         })
     }
 
+    /// Reserve `name`, waiting for the current holder to finish.
+    ///
+    /// [`try_begin`](Self::try_begin) is right for a sync, where an in-flight
+    /// one already does the work and skipping is free. A patch send cannot
+    /// skip: it must not write the collection's version and mutation MACs while
+    /// a sync is writing them, and it needs the base a concurrent sync is about
+    /// to move. Cancelling this future simply stops waiting; nothing is
+    /// reserved until the guard is returned.
+    pub(crate) async fn begin(self: &Arc<Self>, name: WAPatchName) -> SyncInFlightGuard {
+        loop {
+            // Register the listener before re-checking, so a release landing
+            // between the check and the wait cannot be missed.
+            let released = self.released.listen();
+            if let Some(guard) = self.try_begin(name) {
+                return guard;
+            }
+            released.await;
+        }
+    }
+
     /// Drop every reservation, releasing backing storage. Guards from before
     /// the clear become no-ops thanks to the token check.
     pub(crate) fn clear(&self) {
         *self.entries.lock().unwrap_or_else(|p| p.into_inner()) = HashMap::new();
+        self.released.notify(usize::MAX);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -75,6 +104,10 @@ impl Drop for SyncInFlightGuard {
         if entries.get(&self.name) == Some(&self.token) {
             entries.remove(&self.name);
         }
+        drop(entries);
+        // Waiters are keyed by nothing, so wake all of them and let each
+        // re-check its own collection.
+        self.registry.released.notify(usize::MAX);
     }
 }
 
@@ -401,20 +434,14 @@ impl Client {
         }
     }
 
+    /// Sync one collection, retrying a missing decode key and a locked DB.
+    ///
+    /// Takes no in-flight reservation of its own: the only caller is the patch
+    /// send, which already holds the collection's reservation for the whole
+    /// build-send-resolve cycle and would deadlock on its own guard. The
+    /// batched path reserves its collections in
+    /// [`sync_collections_batched`](Self::sync_collections_batched).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> Result<()> {
-        // In-flight dedup: skip if this collection is already being synced.
-        // Matches WA Web's WAWebSyncdCollectionsStateMachine which tracks in-flight syncs
-        // and queues new requests to a pending set. The guard releases on every
-        // exit path, including cancellation.
-        let Some(_guard) = self.app_state_syncing.try_begin(name) else {
-            debug!(target: "Client/AppState", "Skipping sync for {:?}: already in flight", name);
-            return Ok(());
-        };
-
-        self.fetch_app_state_with_retry_inner(name).await
-    }
-
     async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<()> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
@@ -1110,11 +1137,12 @@ impl Client {
                 let result = async {
                     self.ensure_e2e_sessions(std::slice::from_ref(&peer))
                         .await?;
+                    let request_id = self.generate_message_id();
                     self.send_message_impl(
                         peer,
                         msg,
                         crate::send::SendPipelineOptions {
-                            request_id: Some(self.generate_message_id()),
+                            request_id: Some(&request_id),
                             peer: true,
                             ..Default::default()
                         },
@@ -1131,44 +1159,213 @@ impl Client {
 
     /// Send an app state patch to the server for a given collection.
     ///
-    /// Builds the IQ stanza and sends it. Returns the updated hash state.
+    /// The server enforces optimistic concurrency on the collection `version`:
+    /// a patch built on a base another device has already moved past is refused
+    /// with `<collection type="error"><error code="409">`, *inside an otherwise
+    /// successful IQ*, together with the patches that won. WA Web resolves that
+    /// by applying the winners and letting `serverSync` re-queue the collection
+    /// while pending mutations remain, so the mutation is re-sent on the new
+    /// base instead of being dropped; this mirrors that, bounded by the same
+    /// iteration cap WA Web uses (`ServerSync.js`, `y = 5`).
+    ///
+    /// `400`/`404` are fatal and anything else retryable, per
+    /// `WAWebSyncdResponseParser`. All of them are errors here — never `Ok`.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.send_patch", level = "debug", skip_all, fields(name = %collection_name, count = mutations.len()), err(Debug)))]
     pub(crate) async fn send_app_state_patch(
         &self,
         collection_name: &str,
         mutations: Vec<wa::SyncdMutation>,
     ) -> Result<()> {
-        let proc = self.get_app_state_processor().await;
-        let (patch_bytes, base_version) = proc.build_patch(collection_name, mutations).await?;
+        use wacore::appstate::patch_decode::CollectionSyncError;
 
-        let collection_node = NodeBuilder::new("collection")
-            .attr("name", collection_name)
-            .attr("version", base_version)
-            .attr("return_snapshot", "false")
-            .children([NodeBuilder::new("patch").bytes(patch_bytes).build()])
-            .build();
-        let sync_node = NodeBuilder::new("sync").children([collection_node]).build();
-        let iq = crate::request::InfoQuery {
-            namespace: "w:sync:app:state",
-            query_type: crate::request::InfoQueryType::Set,
-            to: server_jid().clone(),
-            target: None,
-            id: None,
-            content: Some(wacore_binary::NodeContent::Nodes(vec![sync_node])),
-            timeout: None,
+        let patch_name = collection_name.parse::<WAPatchName>().ok();
+        // Held across the whole build-send-resolve cycle: the base version is
+        // read at build time and only stops being valid once the send lands, so
+        // releasing earlier would let a second verb build on a base this one is
+        // about to consume. Deliberately held over the trailing re-sync too —
+        // dropping it there would let the next send start from a base the
+        // re-sync is about to move, trading a short wait for the 409s this
+        // whole path exists to avoid.
+        let _send_guard = self.app_state_send_lock.lock().await;
+        // The send lock only orders sends against each other. This one orders
+        // the send against the sync worker, which writes the same version and
+        // mutation-MAC rows: without it, a conflict response for vN could be
+        // absorbed while a sync is persisting vN+1, and the interleaved writes
+        // would leave the ltHash disagreeing with the MAC store — the very
+        // divergence #1156 is about. Waits rather than skipping, and the
+        // re-syncs below go through `_inner` because this task already holds
+        // the reservation they would otherwise take.
+        let _collection_guard = match patch_name {
+            Some(name) => Some(self.app_state_syncing.begin(name).await),
+            None => None,
         };
+        let proc = self.get_app_state_processor().await;
 
-        self.send_iq(iq).await?;
+        for attempt in 1..=APP_STATE_PATCH_SEND_ATTEMPTS {
+            // Cloned per attempt because a conflict rebuilds the patch against
+            // the winner's base; verbs carry one or two mutations, and this only
+            // runs on the (rare) conflict path after the first attempt.
+            let (patch_bytes, base_version) =
+                proc.build_patch(collection_name, mutations.clone()).await?;
 
-        // Re-sync to get the latest state from the server after our patch was accepted.
-        // This matches whatsmeow's behavior: fetchAppState after successful send.
-        if let Ok(patch_name) = collection_name.parse::<WAPatchName>()
-            && let Err(e) = self.fetch_app_state_with_retry(patch_name).await
-        {
-            log::warn!("Failed to re-sync {collection_name} after patch send: {e}");
+            let collection_node = NodeBuilder::new("collection")
+                .attr("name", collection_name)
+                .attr("version", base_version)
+                .attr("return_snapshot", "false")
+                .children([NodeBuilder::new("patch").bytes(patch_bytes).build()])
+                .build();
+            let sync_node = NodeBuilder::new("sync").children([collection_node]).build();
+            let iq = crate::request::InfoQuery {
+                namespace: "w:sync:app:state",
+                query_type: crate::request::InfoQueryType::Set,
+                to: server_jid().clone(),
+                target: None,
+                id: None,
+                content: Some(wacore_binary::NodeContent::Nodes(vec![sync_node])),
+                timeout: None,
+            };
+
+            let resp = self.send_iq(iq).await?;
+            let resp = resp.get().to_owned();
+            // Absence and malformation are different answers. A response with no
+            // `<sync><collection>` at all carries no per-collection verdict —
+            // a transport-level failure would have come back as
+            // `<iq type="error">` and been raised by send_iq already — so it is
+            // an accepted patch. A collection that IS present but does not parse
+            // may well be carrying the rejection, and manufacturing an empty
+            // success from it would drop the mutation exactly as before.
+            let list = match wacore::appstate::patch_decode::parse_patch_list(&resp) {
+                Ok(list) => list,
+                Err(e)
+                    if resp
+                        .get_optional_child_by_tag(&["sync", "collection"])
+                        .is_none() =>
+                {
+                    debug!(
+                        target: "Client/AppState",
+                        "Patch response for {collection_name} carried no collection verdict ({e}); treating as accepted"
+                    );
+                    wacore::appstate::patch_decode::PatchList {
+                        name: patch_name.unwrap_or(WAPatchName::Unknown),
+                        has_more_patches: false,
+                        patches: Vec::new(),
+                        snapshot: None,
+                        snapshot_ref: None,
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "unreadable app-state patch response for {collection_name}"
+                    )));
+                }
+            };
+            if Some(list.name) != patch_name {
+                return Err(anyhow::anyhow!(
+                    "app-state patch response collection mismatch: requested {collection_name}, got {}",
+                    list.name.as_str()
+                ));
+            }
+
+            match list.error {
+                None => {
+                    // Re-sync to pick up whatever else moved while we were sending.
+                    // Matches whatsmeow's fetchAppState after a successful send.
+                    if let Some(patch_name) = patch_name
+                        && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
+                    {
+                        log::warn!("Failed to re-sync {collection_name} after patch send: {e}");
+                    }
+                    return Ok(());
+                }
+                Some(CollectionSyncError::Conflict { has_more }) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Patch for {collection_name} conflicted on v{base_version} \
+                         (attempt {attempt}/{APP_STATE_PATCH_SEND_ATTEMPTS}, has_more={has_more}); \
+                         applying the conflicting patches and rebuilding"
+                    );
+                    self.absorb_conflicting_patches(collection_name, patch_name, list, has_more)
+                        .await;
+                }
+                Some(error) => {
+                    return Err(anyhow::anyhow!(
+                        "app-state patch for {collection_name} rejected: {error}"
+                    ));
+                }
+            }
         }
 
-        Ok(())
+        Err(anyhow::anyhow!(
+            "app-state patch for {collection_name} still conflicting after \
+             {APP_STATE_PATCH_SEND_ATTEMPTS} attempts"
+        ))
+    }
+
+    /// Fold the patches a 409 response carried into local state, so the retry
+    /// builds on the base that actually won.
+    ///
+    /// Best-effort by design: if the response carried nothing usable (or failed
+    /// to apply — a missing decode key, a bad blob), a plain re-sync is the
+    /// fallback that advances the base. Either way the caller retries; the only
+    /// unrecoverable outcome is making no progress, which the attempt cap turns
+    /// into an error rather than a silent drop.
+    async fn absorb_conflicting_patches(
+        &self,
+        collection_name: &str,
+        patch_name: Option<WAPatchName>,
+        mut list: wacore::appstate::patch_decode::PatchList,
+        has_more: bool,
+    ) {
+        // The error tag described the send; the patches under it are ordinary
+        // inbound data, so clear it before handing the list to the processor.
+        list.error = None;
+        let applied = if list.patches.is_empty() && list.snapshot_ref.is_none() {
+            false
+        } else {
+            let pre_downloaded = self
+                .pre_download_external_blobs(std::slice::from_ref(&list))
+                .await;
+            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+                let path = ext
+                    .direct_path
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("external blob has no directPath"))?;
+                pre_downloaded
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
+            };
+            let proc = self.get_app_state_processor().await;
+            match proc.process_parsed_patch_list(list, &download, true).await {
+                Ok((mutations, _, _)) => {
+                    wacore::telemetry::appstate_mutations(mutations.len() as u64);
+                    for m in &mutations {
+                        self.dispatch_app_state_mutation(m, false).await;
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Failed to apply the patches {collection_name} conflicted with: {e:#}"
+                    );
+                    false
+                }
+            }
+        };
+
+        // `has_more` means the server held patches back, so even a clean apply
+        // leaves the base short of the head.
+        if (!applied || has_more)
+            && let Some(patch_name) = patch_name
+            && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
+        {
+            warn!(
+                target: "Client/AppState",
+                "Failed to re-sync {collection_name} after a patch conflict: {e}"
+            );
+        }
     }
 
     async fn dispatch_app_state_mutation(
@@ -1431,6 +1628,339 @@ mod tests {
     }
 }
 
+// ─── #1157: the app-state send path must read the server's answer ───────────
+//
+// `w:sync:app:state` enforces optimistic concurrency on the collection's
+// `version`. A patch built against a stale base is not rejected at the IQ
+// level: the IQ succeeds and the failure is reported *inside* it, as
+// `<collection type="error"><error code="409"/>`, carrying the patches that
+// won. WA Web reads exactly that (`WAWebSyncdResponseParser`, fn `h`) and maps
+// it onto `CollectionState.Conflict{,HasMore}`; the collection then goes
+// through `applyAppStateSyncResponse` like any other, and `serverSync` re-queues
+// it for another round as long as pending mutations remain — so the mutation is
+// re-sent on the winner's base instead of being dropped. `400`/`404` map to
+// `ErrorFatal`, anything else to `ErrorRetry`.
+//
+// These tests pin what the send path must make of each response shape: a 409 it
+// can resolve (rebuild and resend), a 409 it cannot (an error, after exhausting
+// the rebuild attempts), a fatal code (an error, not retried), and a response
+// carrying no collection verdict at all (accepted). Discarding the response —
+// which is what made a 409 indistinguishable from success — fails all four.
+#[cfg(test)]
+mod send_patch_response_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use wacore_binary::node::Node;
+
+    /// Seed the client's store with an app-state key so `build_patch` can sign,
+    /// and give the collection a non-zero base so the IQ carries a `version`.
+    async fn seed_collection(client: &Arc<Client>, collection: &str) -> Vec<u8> {
+        let backend = client.persistence_manager.backend();
+        let key_id = b"send-patch-key".to_vec();
+        backend
+            .set_sync_key(
+                &key_id,
+                crate::store::traits::AppStateSyncKey {
+                    key_data: vec![5u8; 32],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept a sync key");
+        backend
+            .set_version(
+                collection,
+                wacore::appstate::hash::HashState {
+                    version: 7,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept a version");
+        key_id
+    }
+
+    /// A `<collection>` the server marks as failed, mirroring the shape
+    /// `WAWebSyncdResponseParser` reads.
+    fn collection_error_result(request_id: &str, collection: &str, code: &str) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("sync")
+                .children([NodeBuilder::new("collection")
+                    .attr("name", collection)
+                    .attr("type", "error")
+                    .children([NodeBuilder::new("error")
+                        .attr("code", code)
+                        .attr("text", "")
+                        .build()])
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    /// A collection the server reports as clean and up to date.
+    fn empty_sync_result(request_id: &str, collection: &str) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("sync")
+                .children([NodeBuilder::new("collection")
+                    .attr("name", collection)
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    const COLLECTION: &str = "regular_low";
+
+    /// Answers every IQ the client writes, in order, with whatever `reply`
+    /// returns for it — `Some(code)` for a `<collection type="error">`, `None`
+    /// for a clean result. Runs forever: callers race it against the send, so a
+    /// send that stops writing simply drops this future.
+    ///
+    /// `reply` is told the send-attempt number for patch IQs (0 for the
+    /// re-syncs in between), which is what lets a test answer "conflict once,
+    /// then accept".
+    async fn serve_iqs(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        patch_attempts: &AtomicUsize,
+        response_collection: &str,
+        mut reply: impl FnMut(usize) -> Option<&'static str>,
+    ) {
+        let mut frame = 0usize;
+        loop {
+            let node = crate::test_utils::decode_sent_iq(transport, frame).await;
+            let node = node.get().to_owned();
+            let id = node
+                .attrs()
+                .optional_string("id")
+                .expect("every IQ carries an id")
+                .into_owned();
+            let attempt = if node
+                .get_optional_child_by_tag(&["sync", "collection", "patch"])
+                .is_some()
+            {
+                patch_attempts.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                0
+            };
+            let response = match reply(attempt) {
+                Some(code) => collection_error_result(&id, response_collection, code),
+                None => empty_sync_result(&id, response_collection),
+            };
+            crate::test_utils::answer_iq(client, &id, &response).await;
+            frame += 1;
+        }
+    }
+
+    /// Drives one `send_app_state_patch` to completion against `reply`, and
+    /// reports how many patch IQs reached the wire.
+    async fn send_against(reply: impl FnMut(usize) -> Option<&'static str>) -> (Result<()>, usize) {
+        send_against_collection(COLLECTION, reply).await
+    }
+
+    async fn send_against_collection(
+        response_collection: &'static str,
+        reply: impl FnMut(usize) -> Option<&'static str>,
+    ) -> (Result<()>, usize) {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        seed_collection(&client, COLLECTION).await;
+
+        let mut send = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .await
+            })
+        };
+
+        let patch_attempts = AtomicUsize::new(0);
+        let server = serve_iqs(
+            &client,
+            &transport,
+            &patch_attempts,
+            response_collection,
+            reply,
+        );
+        futures::pin_mut!(server);
+        let result = futures::select! {
+            result = (&mut send).fuse() => result.expect("the send task should not panic"),
+            () = server.as_mut().fuse() => unreachable!("the responder never completes"),
+        };
+
+        (result, patch_attempts.load(Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn response_for_a_different_collection_is_rejected() {
+        for error in [None, Some("409")] {
+            let (result, patches) = send_against_collection("regular_high", move |_| error).await;
+            assert!(
+                result.is_err(),
+                "a response for another collection must not accept or absorb this send"
+            );
+            assert_eq!(
+                patches, 1,
+                "a mismatched response must fail before retrying the mutation"
+            );
+        }
+    }
+
+    /// A 409 means the patch was built on a stale base and did NOT land. A
+    /// server that keeps rejecting must end as an error, never as success — a
+    /// `markChatAsRead` that silently lost must not be reported as done.
+    #[tokio::test]
+    async fn unresolvable_conflict_is_not_reported_as_success() {
+        let (result, patches) = send_against(|_| Some("409")).await;
+        assert!(
+            result.is_err(),
+            "a 409 conflict means the mutation was dropped; reporting Ok hides the loss"
+        );
+        assert_eq!(
+            patches, APP_STATE_PATCH_SEND_ATTEMPTS,
+            "the send must exhaust its rebuild attempts before giving up"
+        );
+    }
+
+    /// The resolution path: the first attempt loses the race, the client
+    /// rebuilds against the new base, and the second attempt lands. That is WA
+    /// Web's conflict loop, and the mutation survives it.
+    #[tokio::test]
+    async fn conflict_is_resolved_by_rebuilding_and_resending() {
+        let (result, patches) =
+            send_against(|attempt| if attempt == 1 { Some("409") } else { None }).await;
+        result.expect("a conflict the server later accepts must succeed, not fail");
+        assert_eq!(
+            patches, 2,
+            "the losing patch must be rebuilt and re-sent exactly once"
+        );
+    }
+
+    /// A bare `<iq type="result"/>` carries no per-collection verdict, so there
+    /// is nothing to reject: reading the response must not turn a peer that
+    /// answers tersely into a failing send.
+    #[tokio::test]
+    async fn response_without_a_collection_verdict_is_accepted() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        seed_collection(&client, COLLECTION).await;
+
+        let mut send = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .await
+            })
+        };
+
+        let bare = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let id = node
+                    .get()
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                crate::test_utils::answer_iq(
+                    &client,
+                    &id,
+                    &NodeBuilder::new("iq")
+                        .attr("type", "result")
+                        .attr("id", &id)
+                        .attr("from", "s.whatsapp.net")
+                        .build(),
+                )
+                .await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(bare);
+
+        let result = futures::select! {
+            result = (&mut send).fuse() => result.expect("the send task should not panic"),
+            () = bare.as_mut().fuse() => unreachable!("the responder never completes"),
+        };
+        result.expect("a terse but successful response must not read as a rejection");
+    }
+
+    /// A `<collection>` that IS present but does not parse may be carrying the
+    /// rejection. Manufacturing an empty success from it would drop the
+    /// mutation exactly as discarding the response did.
+    #[tokio::test]
+    async fn unreadable_collection_is_not_mistaken_for_an_absent_one() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        seed_collection(&client, COLLECTION).await;
+
+        let mut send = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .await
+            })
+        };
+
+        let malformed = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let id = node
+                    .get()
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                // A collection with no `name`: present, unreadable.
+                crate::test_utils::answer_iq(
+                    &client,
+                    &id,
+                    &NodeBuilder::new("iq")
+                        .attr("type", "result")
+                        .attr("id", &id)
+                        .attr("from", "s.whatsapp.net")
+                        .children([NodeBuilder::new("sync")
+                            .children([NodeBuilder::new("collection")
+                                .attr("type", "error")
+                                .build()])
+                            .build()])
+                        .build(),
+                )
+                .await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(malformed);
+
+        let result = futures::select! {
+            result = (&mut send).fuse() => result.expect("the send task should not panic"),
+            () = malformed.as_mut().fuse() => unreachable!("the responder never completes"),
+        };
+        assert!(
+            result.is_err(),
+            "a collection we cannot read may be the rejection; it must not read as success"
+        );
+    }
+
+    /// 400/404 are `ErrorFatal` in WA Web and `ErrAppStateUpdate` in whatsmeow —
+    /// never success, and never retried.
+    #[tokio::test]
+    async fn fatal_collection_error_is_not_reported_as_success() {
+        let (result, patches) = send_against(|_| Some("400")).await;
+        assert!(
+            result.is_err(),
+            "a fatal collection error must surface to the caller, not read as success"
+        );
+        assert_eq!(patches, 1, "a fatal error must not be retried");
+    }
+}
+
 #[cfg(test)]
 mod sync_in_flight_tests {
     use super::*;
@@ -1478,6 +2008,48 @@ mod sync_in_flight_tests {
         );
 
         drop(fresh);
+        assert!(registry.try_begin(WAPatchName::Regular).is_some());
+    }
+
+    /// A patch send cannot treat "already in flight" as "nothing to do": it has
+    /// to write the same version and mutation-MAC rows the sync writes, so it
+    /// waits for the holder instead of skipping.
+    #[tokio::test]
+    async fn begin_waits_for_the_holder_instead_of_skipping() {
+        let registry = SyncInFlight::new();
+        let held = registry
+            .try_begin(WAPatchName::Regular)
+            .expect("first reserve");
+
+        let (reserved_tx, mut reserved_rx) = tokio::sync::oneshot::channel();
+        let waiter = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                let guard = registry.begin(WAPatchName::Regular).await;
+                let _ = reserved_tx.send(());
+                guard
+            })
+        };
+
+        // A parked listener is proof the waiter reached its await point — the
+        // observable a "still waiting" assertion needs instead of a sleep.
+        crate::test_utils::poll_until("the waiter to park on the registry", || {
+            registry.released.total_listeners() >= 1
+        })
+        .await;
+        assert!(
+            reserved_rx.try_recv().is_err(),
+            "begin must not resolve while the collection is held"
+        );
+
+        drop(held);
+        let guard = waiter.await.expect("the waiter should not panic");
+        assert!(
+            registry.try_begin(WAPatchName::Regular).is_none(),
+            "the waiter must now hold the reservation, not merely have observed it free"
+        );
+
+        drop(guard);
         assert!(registry.try_begin(WAPatchName::Regular).is_some());
     }
 }

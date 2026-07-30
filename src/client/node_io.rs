@@ -1,6 +1,7 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
 use super::*;
+use crate::client::{PhashWaiter, ResponseWaiter};
 use wacore::net::DisconnectReason;
 
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
@@ -187,10 +188,13 @@ impl Client {
                                 self.stats.mark_recv_activity();
                                 let wire_bytes = data.len();
 
-                                // Feed data into the frame decoder. The payload is
-                                // adopted zero-copy when it is the sole reference
-                                // and no partial frame is pending (steady state).
-                                frame_decoder.feed_bytes(data);
+                                // Dropped before any await below: the payload is
+                                // a view into the websocket's shared read buffer,
+                                // so holding it while a node is processed keeps
+                                // that allocation alive alongside the decoder's
+                                // copy of the same bytes.
+                                frame_decoder.feed(&data);
+                                drop(data);
 
                                 // Process all complete frames.
                                 // Frame decryption must be sequential (noise protocol counter),
@@ -204,9 +208,9 @@ impl Client {
                                             self.process_decrypted_node(node).await;
                                         } else {
                                             let client = self.clone();
-                                            self.runtime.spawn(Box::pin(async move {
+                                            self.runtime.spawn_detached(Box::pin(async move {
                                                 client.process_decrypted_node(node).await;
-                                            })).detach();
+                                            }));
                                         }
                                     }
 
@@ -478,8 +482,19 @@ impl Client {
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
-            if waiter.send(Arc::clone(&node)).is_err() {
-                warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
+            // An IQ id never carries a phash waiter (those are registered under
+            // message ids), so a mismatch here means the id space collided.
+            match waiter {
+                ResponseWaiter::Iq(sender) => {
+                    #[cfg(feature = "voip-runtime")]
+                    self.bind_pending_call_link_join_ack(nr);
+                    if sender.send(Arc::clone(&node)).is_err() {
+                        warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
+                    }
+                }
+                ResponseWaiter::Phash(_) => {
+                    warn!(target: "Client/IQ", "IQ id collided with a pending phash waiter; dropping the phash check");
+                }
             }
             return;
         }
@@ -614,9 +629,12 @@ impl Client {
         }
     }
 
-    /// Possibly send a deferred ack: either immediately or via spawned task.
-    /// Handlers can cancel by setting `cancelled` to true.
-    /// Uses Arc<OwnedNodeRef> to avoid cloning when spawning the async task.
+    /// Possibly send a deferred ack: either immediately or through the ack
+    /// worker. Handlers can cancel by setting `cancelled` to true.
+    /// Uses Arc<OwnedNodeRef> so queueing does not clone the node.
+    ///
+    /// The deferred path feeds one persistent worker rather than spawning a
+    /// task per ack, which also makes acks leave in arrival order.
     async fn maybe_deferred_ack(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
         if self.synchronous_ack {
             if let Err(e) = self.send_ack_for(node.get()).await
@@ -624,18 +642,159 @@ impl Client {
             {
                 warn!("Failed to send ack: {e:?}");
             }
-        } else {
-            let this = self.clone();
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = this.send_ack_for(node.get()).await
-                        && !e.is_transport_unavailable()
-                    {
-                        warn!("Failed to send ack: {e:?}");
-                    }
-                }))
-                .detach();
+            return;
         }
+        // A closed scope means disconnect is already running; the spawned task
+        // it replaces would have failed on an unavailable transport anyway.
+        let Some(guard) = self.outbound_flush.try_track() else {
+            return;
+        };
+        let tx = self
+            .transport_ack_queue
+            .get_or_init(|| self.start_transport_ack_worker());
+        // Only fails once the worker is gone (client teardown).
+        let _ = tx.try_send((node, guard));
+    }
+
+    /// Whether queued outbound work should be dropped rather than sent.
+    ///
+    /// This is the gate [`Self::send_ack_for`] applies before every ack, hoisted
+    /// so the burst path applies it too: during an expected teardown (an
+    /// intentional disconnect, or a 515) queued acks are deliberately dropped
+    /// rather than raced against the disconnect, and sending them anyway would
+    /// also hold the outbound flush open until its timeout.
+    pub(crate) fn outbound_teardown_in_progress(&self) -> bool {
+        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_connected()
+    }
+
+    /// How many queued acks one burst may take.
+    ///
+    /// Measured, not guessed: the send-job channel holds 8, so a larger burst
+    /// fills it and makes unrelated producers (a reply, a receipt) wait for a
+    /// slot. At 16 the harness showed 29% fewer writes but 3.7% worse pong
+    /// latency (paired t = 2.8); at 4 the write saving is ~16% and latency is
+    /// no worse than main. Raising the channel instead recovers the latency but
+    /// gives back most of the coalescing, because a sender that never waits
+    /// consumes jobs one at a time.
+    const MAX_ACK_BURST: usize = 4;
+
+    /// Worker shared by every deferred ack. Holds a `Weak`, so a dropped
+    /// `Client` closes the channel and ends the task instead of keeping the
+    /// client alive.
+    fn start_transport_ack_worker(
+        self: &Arc<Self>,
+    ) -> async_channel::Sender<(
+        Arc<wacore_binary::OwnedNodeRef>,
+        crate::flush_scope::FlushGuard,
+    )> {
+        let (tx, rx) = async_channel::unbounded::<(
+            Arc<wacore_binary::OwnedNodeRef>,
+            crate::flush_scope::FlushGuard,
+        )>();
+        let client = Arc::downgrade(self);
+        self.runtime.spawn_detached(Box::pin(async move {
+            // Reuse the bounded control buffers for the worker's lifetime.
+            // Encoded payload allocations still move into `Bytes`; only
+            // the outer storage stays here.
+            let mut batch = Vec::with_capacity(Self::MAX_ACK_BURST);
+            let mut frames = Vec::with_capacity(Self::MAX_ACK_BURST);
+            let mut guards = Vec::with_capacity(Self::MAX_ACK_BURST);
+            let mut results = Vec::with_capacity(Self::MAX_ACK_BURST);
+            while let Ok(first) = rx.recv().await {
+                let Some(client) = client.upgrade() else {
+                    break;
+                };
+
+                // Take everything already waiting, not just the one job that
+                // woke us. Awaiting each ack before reading the next is what
+                // kept the noise sender from ever seeing two frames at once,
+                // so its batching only fired when some *other* producer
+                // happened to interleave. `try_recv` only: this never waits
+                // for work that has not arrived.
+                batch.push(first);
+                while batch.len() < Self::MAX_ACK_BURST
+                    && let Ok(next) = rx.try_recv()
+                {
+                    batch.push(next);
+                }
+
+                // The queue is still drained, exactly as the
+                // one-at-a-time worker did; only the send is skipped.
+                if client.outbound_teardown_in_progress() {
+                    batch.clear();
+                    continue;
+                }
+
+                // Encoding is synchronous, so the whole burst is marshalled
+                // before anything is sent and arrival order survives.
+                for (node, guard) in batch.drain(..) {
+                    match client.encode_ack_from_snapshot(
+                        node.get(),
+                        AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+                    ) {
+                        Ok(buf) => {
+                            frames.push(buf);
+                            guards.push(guard);
+                        }
+                        // Matches the single-ack path: log and drop this one
+                        // rather than failing the rest of the burst.
+                        Err(e) => warn!("Failed to encode ack: {e}"),
+                    }
+                }
+                if frames.is_empty() {
+                    continue;
+                }
+
+                // The per-ack `wa.conn.ack` span lived in `send_ack_for`,
+                // which this path no longer calls; a burst reports itself
+                // once, with its size, rather than N times. The result
+                // inspection is inside the instrumented future, not after
+                // it: a failure has to be recorded while the span is open,
+                // the way `send_ack_for`'s `err(Debug)` used to. And
+                // `instrument` rather than `entered()`, because an
+                // EnteredSpan is not Send and cannot cross the await.
+                let frame_count = frames.len();
+                let send_and_report = async {
+                    match client.send_raw_bytes_burst(&mut frames, &mut results).await {
+                        Ok(()) => {
+                            for result in results.drain(..) {
+                                if let Err(e) = result
+                                    && !e.is_transport_unavailable()
+                                {
+                                    warn!("Failed to send ack: {e:?}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !matches!(e, ClientError::NotConnected) {
+                                warn!("Failed to send ack burst: {e:?}");
+                            }
+                        }
+                    }
+                };
+                #[cfg(feature = "tracing")]
+                {
+                    use tracing::Instrument;
+                    send_and_report
+                        .instrument(tracing::trace_span!(
+                            "wa.conn.ack_burst",
+                            frames = frame_count
+                        ))
+                        .await;
+                }
+                #[cfg(not(feature = "tracing"))]
+                {
+                    let _ = frame_count;
+                    send_and_report.await;
+                }
+                debug_assert!(
+                    frames.is_empty(),
+                    "send_raw_bytes_burst must always drain its input"
+                );
+                guards.clear();
+            }
+        }));
+        tx
     }
 
     #[inline]
@@ -828,7 +987,7 @@ impl Client {
 
         let client_clone = self.clone();
         let task_generation = current_generation;
-        self.runtime.spawn(Box::pin(async move {
+        self.runtime.spawn_detached(Box::pin(async move {
             // Update LID if changed (moved here to avoid blocking the read loop
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
@@ -934,7 +1093,7 @@ impl Client {
             let key_generation = task_generation;
             client_clone
                 .runtime
-                .spawn(Box::pin(async move {
+                .spawn_detached(Box::pin(async move {
                     // A newer connection may have taken over between spawn and now.
                     if key_client.connection_generation.load(Ordering::SeqCst) != key_generation {
                         return;
@@ -955,8 +1114,7 @@ impl Client {
                     {
                         warn!("Signed pre-key rotation check failed: {e:?}");
                     }
-                }))
-                .detach();
+                }));
 
             // === Send active IQ ===
             // The server sends <ib><offline count="X"/></ib> AFTER we exit passive mode.
@@ -989,7 +1147,7 @@ impl Client {
             // Background initialization queries (can run in parallel, non-blocking)
             let bg_client = client_clone.clone();
             let bg_generation = task_generation;
-            client_clone.runtime.spawn(Box::pin(async move {
+            client_clone.runtime.spawn_detached(Box::pin(async move {
                 // Check connection and generation before starting background queries
                 if bg_client.connection_generation.load(Ordering::SeqCst) != bg_generation {
                     debug!("Skipping background init queries: connection generation changed");
@@ -1083,7 +1241,7 @@ impl Client {
                 {
                     warn!("Background init: Failed to prune expired tc_tokens: {e:?}");
                 }
-            })).detach();
+            }));
 
             check_generation!();
 
@@ -1217,7 +1375,7 @@ impl Client {
                 // Spawn remaining non-critical collections in background
                 let sync_client = client_clone.clone();
                 let sync_generation = task_generation;
-                client_clone.runtime.spawn(Box::pin(async move {
+                client_clone.runtime.spawn_detached(Box::pin(async move {
                     if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
                         debug!("App state sync cancelled: connection generation changed");
                         return;
@@ -1241,7 +1399,7 @@ impl Client {
                         .needs_initial_full_sync
                         .store(false, Ordering::Relaxed);
                     debug!(target: "Client/AppState", "Initial App State Sync Completed.");
-                })).detach();
+                }));
             } else {
                 // === Reconnection path ===
                 // Pushname is already known, send presence and Connected immediately.
@@ -1264,17 +1422,27 @@ impl Client {
 
                 client_clone.dispatch_connected(task_generation).await;
             }
-        })).detach();
+        }));
     }
 
     /// Ack entry point for callers that already share the node: the waiter
     /// receives an `Arc` clone instead of a ~1 KB re-encode + re-parse.
-    pub(crate) fn handle_ack_response_arc(&self, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+    pub(crate) fn handle_ack_response_arc(
+        self: &Arc<Self>,
+        node: &Arc<wacore_binary::OwnedNodeRef>,
+    ) -> bool {
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
-        if let Err(rejected) = waiter.send(Arc::clone(node)) {
-            Self::warn_ack_waiter_dropped(&rejected);
+        match waiter {
+            ResponseWaiter::Iq(sender) => {
+                #[cfg(feature = "voip-runtime")]
+                self.bind_pending_call_link_join_ack(node.get());
+                if let Err(rejected) = sender.send(Arc::clone(node)) {
+                    Self::warn_ack_waiter_dropped(&rejected);
+                }
+            }
+            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
     }
@@ -1282,14 +1450,52 @@ impl Client {
     /// Ack entry point for the read-loop fast path, which owns the node: the
     /// `Arc` is built from the existing allocation, and only when a waiter is
     /// actually waiting.
-    pub(crate) fn handle_ack_response_owned(&self, node: wacore_binary::OwnedNodeRef) -> bool {
+    pub(crate) fn handle_ack_response_owned(
+        self: &Arc<Self>,
+        node: wacore_binary::OwnedNodeRef,
+    ) -> bool {
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
-        if let Err(rejected) = waiter.send(Arc::new(node)) {
-            Self::warn_ack_waiter_dropped(&rejected);
+        match waiter {
+            ResponseWaiter::Iq(sender) => {
+                #[cfg(feature = "voip-runtime")]
+                self.bind_pending_call_link_join_ack(node.get());
+                if let Err(rejected) = sender.send(Arc::new(node)) {
+                    Self::warn_ack_waiter_dropped(&rejected);
+                }
+            }
+            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
+    }
+
+    /// Inline half of the phash check. The comparison is a string equality on
+    /// the read loop; only a disagreement pays for a task, and that path
+    /// re-reads caches and can force a sender-key redistribution.
+    fn check_phash_against_ack(
+        self: &Arc<Self>,
+        node: &wacore_binary::NodeRef<'_>,
+        waiter: PhashWaiter,
+    ) {
+        let Some(server) = node.get_attr("phash") else {
+            return;
+        };
+        if server.as_str() == waiter.expected {
+            return;
+        }
+        let client = Arc::clone(self);
+        let server = server.as_str().to_string();
+        self.runtime.spawn_detached(Box::pin(async move {
+            client
+                .handle_phash_mismatch(
+                    &waiter.jid,
+                    &waiter.expected,
+                    &server,
+                    waiter.invalidate_group_cache,
+                )
+                .await;
+        }));
     }
 
     fn warn_ack_waiter_dropped(rejected: &Arc<wacore_binary::OwnedNodeRef>) {
@@ -1306,10 +1512,7 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
     )]
-    fn take_ack_waiter(
-        &self,
-        node: &wacore_binary::NodeRef<'_>,
-    ) -> Option<futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>> {
+    fn take_ack_waiter(&self, node: &wacore_binary::NodeRef<'_>) -> Option<ResponseWaiter> {
         let ack_id = node.get_attr("id");
         let ack_error = node.get_attr("error");
 
@@ -1417,6 +1620,7 @@ impl Client {
                     crate::types::events::LoggedOut::builder()
                         .on_connect(false)
                         .reason(ConnectFailureReason::LoggedOut)
+                        .raw(node.to_owned())
                         .build(),
                 )
             };
@@ -1439,6 +1643,7 @@ impl Client {
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
                             .reason(ConnectFailureReason::LoggedOut)
+                            .raw(node.to_owned())
                             .build(),
                     ));
                     should_disconnect = true;
@@ -1451,6 +1656,7 @@ impl Client {
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
                             .reason(ConnectFailureReason::LoggedOut)
+                            .raw(node.to_owned())
                             .build(),
                     ));
                     should_disconnect = true;
@@ -1539,11 +1745,9 @@ impl Client {
             self.is_logged_in.store(false, Ordering::Relaxed);
             let transport_opt = self.transport.lock().await.clone();
             if let Some(transport) = transport_opt {
-                self.runtime
-                    .spawn(Box::pin(async move {
-                        transport.disconnect().await;
-                    }))
-                    .detach();
+                self.runtime.spawn_detached(Box::pin(async move {
+                    transport.disconnect().await;
+                }));
             }
             info!("Notifying connection shutdown from stream error handler");
             self.notify_connection_shutdown();
@@ -1558,9 +1762,12 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.notify_connection_shutdown();
 
-        let mut attrs = node.attrs();
-        let reason_code = attrs.optional_u64("reason").unwrap_or(0) as i32;
-        let reason = ConnectFailureReason::from(reason_code);
+        let failure = wacore::stanza::connect_failure::ConnectFailureStanza::parse(node);
+        // A `<failure>` with no usable `reason` is not a failure we can classify:
+        // treat it as unknown, which stops auto-reconnect rather than looping
+        // against a server that just refused us. (WA Web drops the stanza
+        // outright; it has a UI to fall back on, an embedder does not.)
+        let reason = failure.reason.unwrap_or(ConnectFailureReason::Unknown(0));
 
         if reason.should_reconnect() {
             self.expected_disconnect.store(false, Ordering::Relaxed);
@@ -1568,8 +1775,10 @@ impl Client {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
         }
 
+        // Every branch below keeps the stanza on its event. The server states
+        // things here exactly once — an account lock's one-time `appeal_token`,
+        // a ban's support URL — and a `warn!` line is not a delivery channel.
         if reason.is_logged_out() {
-            // Log the full <failure> so a server-side lock/ban is diagnosable;
             // `location` (e.g. "rva") is a routing token, not the cause.
             warn!(
                 "Got {reason:?} connect failure, logging out: {}",
@@ -1579,13 +1788,16 @@ impl Client {
                 crate::types::events::LoggedOut::builder()
                     .on_connect(true)
                     .reason(reason)
+                    .maybe_logout_message(failure.logout_message())
+                    .raw(node.to_owned())
                     .build(),
             ));
-        } else if let ConnectFailureReason::TempBanned = reason {
-            let ban_code = attrs.optional_u64("code").unwrap_or(0) as i32;
-            let expire_secs = attrs.optional_u64("expire").unwrap_or(0);
-            let expire_duration =
-                chrono::Duration::try_seconds(expire_secs as i64).unwrap_or_default();
+        } else if let ConnectFailureReason::TempBanned = reason
+            && let Some(expire_secs) = failure.expire
+            && let Some(ban_code) = failure.code
+            && let Ok(expire_secs) = i64::try_from(expire_secs)
+            && let Some(expire_duration) = chrono::Duration::try_seconds(expire_secs)
+        {
             warn!(
                 "Temporary ban connect failure: {}",
                 DisplayableNodeRef(node)
@@ -1594,19 +1806,28 @@ impl Client {
                 crate::types::events::TemporaryBan::builder()
                     .code(crate::types::events::TempBanReason::from(ban_code))
                     .expire(expire_duration)
+                    .maybe_message(failure.message.as_deref().map(str::to_owned))
+                    .maybe_url(failure.url.as_deref().map(str::to_owned))
+                    .raw(node.to_owned())
                     .build(),
             ));
         } else if let ConnectFailureReason::ClientOutdated = reason {
             error!("Client is outdated and was rejected by server.");
             self.core.event_bus.dispatch(Event::ClientOutdated(
-                crate::types::events::ClientOutdated::builder().build(),
+                crate::types::events::ClientOutdated::builder()
+                    .raw(node.to_owned())
+                    .build(),
             ));
         } else {
+            // Also the landing spot for a 402 whose `code`/`expire` is missing
+            // or does not fit a `Duration`: WA Web errors out there instead of
+            // reporting a zero-length ban, so the raw stanza is all we can
+            // honestly hand over.
             warn!("Unknown connect failure: {}", DisplayableNodeRef(node));
             self.core.event_bus.dispatch(Event::ConnectFailure(
                 crate::types::events::ConnectFailure::builder()
                     .reason(reason)
-                    .maybe_message(attrs.optional_string("message").map(|m| m.into_owned()))
+                    .maybe_message(failure.message.as_deref().map(str::to_owned))
                     .raw(node.to_owned())
                     .build(),
             ));

@@ -26,13 +26,21 @@ pub mod transport;
 pub mod video;
 
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
-pub use facade::{AcceptCall, CallHandle, OutgoingCall};
+pub use facade::{
+    AcceptCall, CallHandle, CallLinkCall, GroupBoundCall, OutgoingCall, OutgoingGroupCall,
+};
 pub use video::{VideoFrame, VideoSink, VideoSource};
-// CallHandle::events() yields these, so surface them next to CallHandle (they live in wacore).
+// Surface core types carried by the facade next to the builders and handle that expose them.
 pub use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
     OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
-pub use wacore::voip::{CallEvent, VideoUpgradeToken};
+pub use wacore::voip::{CallEvent, GroupCallState, GroupStateApply, VideoUpgradeToken};
 // `CallEvent::VideoStateChanged` carries this; surface it next to CallEvent (it lives in wacore).
 pub use wacore::types::call::VideoState;
+pub use wacore::types::group_call::{
+    CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GROUP_CALL_MAX_PARTICIPANTS,
+    GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
+    GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
+    WaitingRoomUser,
+};

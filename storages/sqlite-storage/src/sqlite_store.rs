@@ -97,10 +97,32 @@ const ID_PARAM_CHUNK: usize = 900;
 /// limit while bounding Diesel's temporary insert-expression allocation.
 const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
 
+/// Reader connections and the permits that bound how many run at once.
+#[derive(Clone)]
+pub(crate) struct ReadPool {
+    pub(crate) pool: SqlitePool,
+    /// One permit per connection, so the count of blocking threads parked on
+    /// `pool.get()` is bounded by the pool rather than by the caller.
+    pub(crate) semaphore: Arc<tokio::sync::Semaphore>,
+}
+
 #[derive(Clone)]
 pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
     pub(crate) db_semaphore: Arc<tokio::sync::Semaphore>,
+    /// A separate, `query_only` pool and its permits, when
+    /// [`SqliteStoreConfig::read_pool_size`] asked for reader connections and
+    /// the database is actually in WAL. `None` keeps reads on `pool` behind
+    /// `db_semaphore` — the original behaviour, where one queue covers
+    /// everything.
+    ///
+    /// Deliberately a second pool rather than extra connections in the main
+    /// one: several write paths check a connection out directly, without the
+    /// semaphore, and are serialized today only because the pool hands out one
+    /// connection at a time. Growing that pool would let two of them run at
+    /// once and deadlock on the write-lock upgrade — the exact failure this
+    /// change exists to avoid.
+    pub(crate) reads: Option<ReadPool>,
     pub(crate) database_path: String,
     device_id: i32,
 }
@@ -152,7 +174,28 @@ pub type ConnectionInitHook = Arc<
 pub struct SqliteStoreConfig {
     /// Max concurrent operations: r2d2 `max_size` AND the internal semaphore permits,
     /// kept in lockstep. Clamped to at least 1.
+    ///
+    /// Raising this makes *writes* concurrent, which SQLite does not want: two
+    /// deferred transactions that both read and then write deadlock on the
+    /// upgrade, and `busy_timeout` cannot break it. Leave it at 1 and reach for
+    /// [`read_pool_size`](Self::read_pool_size) instead — that is the knob for
+    /// concurrency, and it is safe because WAL readers never contend for the
+    /// write lock.
     pub pool_size: u32,
+    /// Extra connections reserved for read-only work, each free to run while a
+    /// write holds the write permit. `0` (default) keeps every operation on the
+    /// single queue, exactly as before this knob existed.
+    ///
+    /// WAL supports many concurrent readers alongside one writer, but that was
+    /// unreachable while one `pool_size` governed both the pool and the
+    /// serialization semaphore: the setting that would admit readers also
+    /// admitted concurrent writers. These connections are additional — the write
+    /// path keeps its own, so a burst of readers can never starve the writer.
+    ///
+    /// Costs one connection's page cache ([`cache_size_kib`](Self::cache_size_kib))
+    /// each, which is why it is off by default in a process holding many
+    /// per-session stores.
+    pub read_pool_size: u32,
     /// `PRAGMA cache_size`, in KiB per connection.
     pub cache_size_kib: u32,
     /// `PRAGMA mmap_size`, in bytes. `None` (default) leaves mmap off — the
@@ -182,6 +225,7 @@ impl Default for SqliteStoreConfig {
     fn default() -> Self {
         Self {
             pool_size: 1,
+            read_pool_size: 0,
             cache_size_kib: 512,
             mmap_size: None,
             busy_timeout: Duration::from_secs(30),
@@ -193,6 +237,14 @@ impl Default for SqliteStoreConfig {
 }
 
 impl SqliteStoreConfig {
+    /// Reserve `n` connections for read-only work, so reads stop queueing
+    /// behind the write permit. See [`read_pool_size`](Self::read_pool_size)
+    /// for what it costs and why raising `pool_size` is not the same thing.
+    pub fn with_read_pool_size(mut self, n: u32) -> Self {
+        self.read_pool_size = n;
+        self
+    }
+
     /// Set `PRAGMA mmap_size` (bytes), enabling file-backed memory-mapped reads.
     /// Builder-style so new optional knobs don't force struct-literal churn;
     /// pass `0` to keep mmap off. See the [`SqliteStoreConfig::mmap_size`] caveat.
@@ -243,6 +295,10 @@ struct ConnectionOptions {
     busy_timeout_ms: u64,
     synchronous: Synchronous,
     connection_init: Option<ConnectionInitHook>,
+    /// Stamp `PRAGMA query_only` on the connection, making a write through it a
+    /// plain error. Set on the reader pool: those connections must never take
+    /// SQLite's write lock, and enforcing it here beats documenting it.
+    query_only: bool,
 }
 
 impl std::fmt::Debug for ConnectionOptions {
@@ -288,6 +344,11 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
         if let Some(mmap_size) = self.mmap_size.filter(|&n| n > 0) {
             pragmas.push(format!("PRAGMA mmap_size = {mmap_size};"));
         }
+        // Last, so it cannot block the pragmas above (they are connection
+        // settings, not database writes, but query_only is cheap to order).
+        if self.query_only {
+            pragmas.push("PRAGMA query_only = 1;".to_string());
+        }
         for pragma in pragmas {
             diesel::sql_query(pragma)
                 .execute(conn)
@@ -322,6 +383,28 @@ fn parse_database_path(database_url: &str) -> Result<String> {
     }
 
     Ok(path.to_string())
+}
+
+/// Whether the URI asks SQLite for shared cache.
+///
+/// Only a `file:` URI carries query parameters; a bare path containing `?` is
+/// filename, not configuration. SQLite takes the first occurrence of a repeated
+/// parameter, so this stops at the first `cache=`.
+fn is_shared_cache(database_url: &str) -> bool {
+    let Some((_, query)) = database_url.split_once('?') else {
+        return false;
+    };
+    if !database_url.starts_with("file:") {
+        return false;
+    }
+    query
+        .split('#')
+        .next()
+        .unwrap_or(query)
+        .split('&')
+        .filter_map(|param| param.split_once('='))
+        .find(|(key, _)| *key == "cache")
+        .is_some_and(|(_, value)| value.eq_ignore_ascii_case("shared"))
 }
 
 /// One `ScheduledThreadPool` shared by EVERY store's r2d2 pool. By default r2d2 spawns its
@@ -384,7 +467,9 @@ impl SqliteStore {
         // store (the default 1) carries exactly one connection, and raising it for real
         // concurrency keeps the two in step.
         let pool_size = config.pool_size.max(1);
+        let read_pool_size = config.read_pool_size;
         let thread_pool = config.thread_pool.unwrap_or_else(shared_r2d2_thread_pool);
+        let read_thread_pool = Arc::clone(&thread_pool);
 
         let options = ConnectionOptions {
             cache_size_kib: config.cache_size_kib,
@@ -399,13 +484,19 @@ impl SqliteStore {
             },
             synchronous: config.synchronous,
             connection_init: config.connection_init,
+            query_only: false,
+        };
+        let read_options = ConnectionOptions {
+            query_only: true,
+            ..options.clone()
         };
 
         // r2d2's build() synchronously opens the pool's initial connection, so build the
         // pool AND run migrations inside one blocking task to keep the async runtime
         // unblocked (matters when many stores open at once).
-        let pool =
-            tokio::task::spawn_blocking(move || -> std::result::Result<SqlitePool, StoreError> {
+        let db_url = database_url.to_string();
+        let (pool, journal_mode) = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(SqlitePool, String), StoreError> {
                 // test_on_check_out(false): a local SQLite file connection doesn't
                 // spontaneously drop, so r2d2's per-checkout SELECT 1 liveness probe guards
                 // nothing — a real failure surfaces on the next query. The shared thread pool
@@ -421,22 +512,78 @@ impl SqliteStore {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                diesel::sql_query("PRAGMA journal_mode = WAL;")
-                    .execute(&mut conn)
-                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                // The PRAGMA reports the mode actually in effect, which is not
+                // always the one asked for — an in-memory database has no WAL
+                // to switch to and stays on its own journal.
+                #[derive(diesel::QueryableByName)]
+                struct JournalMode {
+                    #[diesel(sql_type = diesel::sql_types::Text)]
+                    journal_mode: String,
+                }
+                let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL;")
+                    .get_result::<JournalMode>(&mut conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?
+                    .journal_mode;
                 conn.run_pending_migrations(MIGRATIONS)
                     .map_err(StoreError::Migration)?;
 
-                Ok(pool)
-            })
+                Ok((pool, journal_mode))
+            },
+        )
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+
+        // Reader connections only pay off under WAL, and only with a page cache
+        // per connection. Each of the two ways that can fail turns the intended
+        // concurrency into a worse failure than the single queue it replaces, so
+        // decline rather than half-deliver it.
+        let wal = journal_mode.eq_ignore_ascii_case("wal");
+        // Shared cache replaces WAL's snapshot isolation with table-level locks
+        // held for the length of a transaction, so a writer touching a table a
+        // read snapshot has open fails with SQLITE_LOCKED_SHAREDCACHE — which
+        // the busy handler does not retry, so `busy_timeout` cannot absorb it.
+        let shared_cache = is_shared_cache(&db_url);
+        let declined = if !wal {
+            Some(format!("journal_mode is '{journal_mode}', not WAL"))
+        } else if shared_cache {
+            Some("the URI opts into shared cache, whose table locks block the writer".to_string())
+        } else {
+            None
+        };
+        if read_pool_size > 0
+            && let Some(reason) = &declined
+        {
+            log::warn!("sqlite-storage: read_pool_size={read_pool_size} ignored, {reason}");
+        }
+        let reads = if read_pool_size > 0 && declined.is_none() {
+            let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
+            let pool = tokio::task::spawn_blocking(
+                move || -> std::result::Result<SqlitePool, StoreError> {
+                    Pool::builder()
+                        .max_size(read_pool_size)
+                        .test_on_check_out(false)
+                        .thread_pool(read_thread_pool)
+                        .connection_customizer(Box::new(read_options))
+                        .build(manager)
+                        .map_err(|e| StoreError::Connection(Box::new(e)))
+                },
+            )
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))??;
+            Some(ReadPool {
+                pool,
+                semaphore: Arc::new(tokio::sync::Semaphore::new(read_pool_size as usize)),
+            })
+        } else {
+            None
+        };
 
         let database_path = parse_database_path(database_url)?;
 
         Ok(Self {
             pool,
             db_semaphore: Arc::new(tokio::sync::Semaphore::new(pool_size as usize)),
+            reads,
             database_path,
             device_id,
         })
@@ -3711,6 +3858,10 @@ impl DeviceStore for SqliteStore {
     /// for that session.
     async fn resource_report(&self) -> wacore::stats::StorageResourceReport {
         let pool = self.pool.clone();
+        // Reader connections carry a page cache each, exactly like the write
+        // pool's, so a report that counted only one pool would under-state a
+        // read-enabled store by the whole reader side.
+        let read_pool = self.reads.as_ref().map(|reads| reads.pool.clone());
         tokio::task::spawn_blocking(move || {
             // Non-blocking checkout: this report is best-effort, so contention
             // (e.g. a long write holding the only connection) degrades to "not
@@ -3742,7 +3893,8 @@ impl DeviceStore for SqliteStore {
             // Open connections (idle + the one just checked out), each with its
             // own independent page cache. Defaults to 1 for the single-connection
             // store, so this only widens the bound when pool_size > 1.
-            let open_connections = pool.state().connections.max(1) as u64;
+            let open_connections = pool.state().connections.max(1) as u64
+                + read_pool.map_or(0, |reads| reads.state().connections as u64);
             wacore::stats::StorageResourceReport {
                 memory_bytes: Some(per_conn_cache.saturating_mul(open_connections)),
                 pages: Some(page_count),
@@ -3823,6 +3975,7 @@ mod tests {
         // thread pool) must build and operate identically — only the resource profile differs.
         let config = SqliteStoreConfig {
             pool_size: 2,
+            read_pool_size: 0,
             cache_size_kib: 4096,
             mmap_size: None,
             busy_timeout: Duration::from_secs(7),
@@ -3970,6 +4123,7 @@ mod tests {
             connection_init: Some(Arc::new(|_conn: &mut SqliteConnection| {
                 Err("wrong key".into())
             })),
+            query_only: false,
         };
 
         use diesel::r2d2::CustomizeConnection;

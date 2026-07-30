@@ -3959,6 +3959,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "smallvec",
  "smoothutf8",
  "subtle",
  "thiserror 2.0.19",
@@ -3972,6 +3973,7 @@ dependencies = [
  "wacore-noise",
  "waproto",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
@@ -4347,6 +4349,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "smallvec",
  "syn 3.0.3",
  "thiserror 2.0.19",
  "tokio",
@@ -4365,6 +4368,7 @@ dependencies = [
  "whatsapp-rust-sqlite-storage",
  "whatsapp-rust-tokio-transport",
  "whatsapp-rust-ureq-http-client",
+ "zeroize",
 ]
 
 [[package]]

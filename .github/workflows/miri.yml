@@ -1,0 +1,108 @@
+permissions:
+  contents: read
+name: Miri
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with PROTOC_VERSION in main.yml — env is per-workflow, so the
+  # value cannot be shared across files without a repo-level Actions variable.
+  PROTOC_VERSION: '3.25.3'
+  CARGO_INCREMENTAL: "0"
+  # Miri interprets MIR and never links, so the workspace's lld/ICF and
+  # -Zshare-generics rustflags buy nothing here; a set-but-empty RUSTFLAGS takes
+  # precedence over .cargo/config.toml (same lever main.yml's stable job pulls).
+  RUSTFLAGS: ""
+
+jobs:
+  miri:
+    name: Miri (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # Interpretation costs two orders of magnitude over native. The fixtures the
+    # gate covers are small by construction (the MB-scale zlib ones are
+    # `#[cfg_attr(miri, ignore)]`), but a cold sysroot build alone is minutes.
+    timeout-minutes: 30
+    strategy:
+      # Each leg is an independent UB question; one failing should not hide the
+      # verdict on the others.
+      fail-fast: false
+      matrix:
+        include:
+          # wacore-binary owns the workspace's only load-bearing `unsafe`: the
+          # `Yokeable`/`StableDeref` impls behind `OwnedNodeRef` (two lifetime
+          # transmutes over borrowed decode output) and the `set_len` over
+          # inflate's uninitialized spare capacity in `zlib_pool`. Both are
+          # invisible to clippy and to native tests — nothing observes the
+          # aliasing violation or the uninit read until it miscompiles.
+          - name: wacore-binary
+            cache-key: binary-simd
+            args: -p wacore-binary --lib
+          # The portable-SIMD scanners in the decoder/encoder and their scalar
+          # fallbacks are separate code paths, and `--no-default-features` is the
+          # only way to reach the latter.
+          - name: wacore-binary (no simd)
+            cache-key: binary-scalar
+            args: -p wacore-binary --no-default-features --lib
+          # No `unsafe` of its own, but it drives wacore-binary's zero-copy
+          # decode over real Noise frames and pulls the crypto stack
+          # (aes/sha2/curve25519), whose unsafe backends this exercises.
+          #
+          # wacore-appstate is deliberately absent: `inout` 0.2.2's
+          # `PaddedInOutBuf::into_out` invalidates the `&mut [u8]` that `cbc`'s
+          # `encrypt_padded` still holds protected, which Miri rejects under
+          # Stacked Borrows. That is on the AES-CBC path every appstate record
+          # takes, so the leg cannot be green until the dependency is fixed —
+          # nothing in this workspace can make it so.
+          - name: wacore-noise
+            cache-key: noise
+            args: -p wacore-noise --lib
+          # `AddressBuf::as_str` hands out a `&str` over the inline array
+          # without revalidating it, on the invariant that `push_str` only ever
+          # copies whole fragments. A writer that broke that would put a partial
+          # code point into release builds, and nothing else would notice.
+          # Filtered to `address` on purpose: the invariant is local to that
+          # module, and interpreting the crate's curve25519/AES tests would cost
+          # the whole time budget while proving nothing about it.
+          - name: wacore-libsignal (address)
+            cache-key: libsignal-address
+            args: -p wacore-libsignal --lib address
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+          # rust-src is what `cargo miri setup` compiles the interpreter's
+          # sysroot from; installing `miri` does not pull it in.
+          components: miri, rust-src
+      # waproto is in the appstate/noise graphs, and its build script needs protoc.
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      # No sccache here: cargo-miri drives the build through its own
+      # RUSTC_WRAPPER and the two cannot share that slot.
+      - name: Cache Rust build (registry + target + Miri sysroot)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+          # `cargo miri setup` builds the interpreted sysroot here; without it
+          # every run recompiles core/std from rust-src.
+          cache-directories: ~/.cache/miri
+          # Each leg interprets a different feature set into target/miri.
+          key: ${{ matrix.cache-key }}
+      - name: Build Miri sysroot
+        run: cargo miri setup
+      # Default flags: Stacked Borrows, isolation on. Deliberately no
+      # -Zmiri-strict-provenance — `bytes` rebuilds its tagged `Shared` pointer
+      # out of an integer, which strict provenance rejects on sight and which is
+      # not the class of bug this gate is looking for.
+      - name: Run tests under Miri
+        run: cargo miri test ${{ matrix.args }}

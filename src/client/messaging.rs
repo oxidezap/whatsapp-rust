@@ -21,8 +21,101 @@ impl Client {
         Ok(())
     }
 
+    /// Receivers a burst holds without allocating. Both callers cap their batch
+    /// at 4 ([`MAX_ACK_BURST`](Self::MAX_ACK_BURST) and
+    /// [`MAX_RECEIPT_BURST`](Self::MAX_RECEIPT_BURST)), so a real burst fits.
+    pub(crate) const MAX_INLINE_BURST: usize = 4;
+
+    /// Send several pre-marshaled stanzas as one burst, returning a result per
+    /// stanza in the order given.
+    ///
+    /// The noise sender coalesces whatever is queued when it wakes, but a
+    /// worker that awaits each send before starting the next never has two
+    /// frames queued at once, so the coalescing it was built for never fires.
+    /// Handing over the whole burst is what turns batching from incidental into
+    /// the normal case.
+    ///
+    /// Order is preserved, which the ack worker depends on.
+    ///
+    /// Always drains `frames`, including when no socket is installed, while
+    /// retaining its outer allocation for the persistent workers to reuse.
+    ///
+    /// Results land in `results`, which the caller owns and reuses too. A
+    /// returned `Vec` would allocate once per burst, and the common burst is a
+    /// single frame, so that allocation was the dominant cost of sending one.
+    /// A multi-frame burst holds its receivers inline up to
+    /// [`MAX_INLINE_BURST`](Self::MAX_INLINE_BURST), so it does not allocate
+    /// either; beyond that the spill is one allocation, which is what the
+    /// previous `join_all` cost every time.
+    pub(crate) async fn send_raw_bytes_burst(
+        &self,
+        frames: &mut Vec<Vec<u8>>,
+        results: &mut Vec<crate::socket::error::EncryptSendResult>,
+    ) -> Result<(), ClientError> {
+        results.clear();
+        let noise_socket = match self.get_noise_socket().await {
+            Ok(socket) => socket,
+            Err(error) => {
+                frames.clear();
+                return Err(error);
+            }
+        };
+        if frames.len() == 1 {
+            let plaintext = frames.pop().expect("length checked");
+            results.push(
+                noise_socket
+                    .encrypt_and_send(bytes::Bytes::from(plaintext))
+                    .await,
+            );
+            return Ok(());
+        }
+        // Every frame is enqueued before any is awaited, which is what lets the
+        // sender coalesce them into one transport write; awaiting each before
+        // enqueueing the next would hand them over one completion apart. The
+        // receivers live inline for the burst sizes both callers cap at, so
+        // unlike `join_all` this neither allocates storage for the futures nor
+        // a `Vec` for their results.
+        let mut receivers: smallvec::SmallVec<[_; Self::MAX_INLINE_BURST]> =
+            smallvec::SmallVec::new();
+        // An enqueue only fails once the sender task is gone, which no later
+        // frame recovers from. Recording where it happened keeps `results`
+        // aligned with the frames that were drained: a caller reporting a
+        // failure against the wrong frame is worse than the failure.
+        let mut frames_after_enqueue_failed = 0usize;
+        for plaintext in frames.drain(..) {
+            if frames_after_enqueue_failed > 0 {
+                frames_after_enqueue_failed += 1;
+                continue;
+            }
+            match noise_socket
+                .enqueue_send(bytes::Bytes::from(plaintext))
+                .await
+            {
+                Ok(receiver) => receivers.push(receiver),
+                Err(_) => frames_after_enqueue_failed = 1,
+            }
+        }
+
+        for receiver in receivers {
+            results.push(NoiseSocket::await_send(receiver).await);
+        }
+        for _ in 0..frames_after_enqueue_failed {
+            results.push(Err(EncryptSendError::channel_closed()));
+        }
+        Ok(())
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
     pub async fn send_node(&self, node: Node) -> Result<(), ClientError> {
+        let plaintext_buf = self.marshal_node_for_send(node)?;
+        self.send_raw_bytes(plaintext_buf).await
+    }
+
+    /// Everything [`send_node`](Client::send_node) does short of the send:
+    /// logging, waiter resolution and marshalling. Split out so a burst can
+    /// marshal its whole batch before touching the socket, which is what keeps
+    /// the sends orderable.
+    pub(crate) fn marshal_node_for_send(&self, node: Node) -> Result<Vec<u8>, ClientError> {
         debug!(target: "Client/Send", "{}", DisplayableNode(&node));
         if self.sent_node_waiter_count.load(Ordering::Acquire) > 0 {
             self.resolve_sent_node_waiters(&Arc::new(node.clone()));
@@ -30,12 +123,10 @@ impl Client {
 
         // Exact two-pass sizing: typical stanzas are a few hundred bytes, so
         // the 1 KiB default reserve of the one-pass path mostly over-allocates.
-        let plaintext_buf = wacore_binary::marshal::marshal_exact(&node).map_err(|e| {
+        wacore_binary::marshal::marshal_exact(&node).map_err(|e| {
             error!("Failed to marshal node: {e:?}");
-            SocketError::Marshal(e)
-        })?;
-
-        self.send_raw_bytes(plaintext_buf).await
+            SocketError::Marshal(e).into()
+        })
     }
 
     #[cfg_attr(
@@ -147,7 +238,7 @@ impl Client {
             &edit_container_message,
             crate::send::SendPipelineOptions {
                 edit: Some(crate::types::message::EditAttribute::MessageEdit),
-                request_id,
+                request_id: request_id.as_deref(),
                 borrowed_message_id,
                 ..Default::default()
             },
@@ -269,14 +360,49 @@ impl Client {
     /// Register a oneshot waiter for a server ack by message ID.
     /// Returns the receiver — caller sends the node separately and awaits this in background.
     /// Sync: registration is just a `std::sync::Mutex` insert (no await).
+    /// Register a waiter that receives the ack node itself.
+    ///
+    /// Used where the caller needs the response: the VoIP offer reads the relay
+    /// out of its ack. A phash check does not, which is why that path uses
+    /// [`Self::register_phash_waiter`] and pays no channel per message. Gated on
+    /// the only consumer's feature, or it is dead code in a default build.
+    #[cfg(feature = "voip-runtime")]
     pub(crate) fn register_ack_waiter(
         &self,
         message_id: &str,
     ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
         let (tx, rx) = futures::channel::oneshot::channel();
         self.response_waiters_guard()
-            .insert(message_id.to_string(), tx);
+            .insert(message_id.to_string(), ResponseWaiter::Iq(tx));
         rx
+    }
+
+    /// Register the phash the server is expected to echo for this send.
+    ///
+    /// Nothing awaits the result: the read loop compares inline when the ack
+    /// lands and only acts on a mismatch, so a send costs a map entry instead of
+    /// a task, a oneshot and a timer.
+    pub(crate) fn register_phash_waiter(
+        &self,
+        message_id: &str,
+        expected: wacore_binary::CompactString,
+        jid: Jid,
+        invalidate_group_cache: bool,
+    ) {
+        let mut waiters = self.response_waiters_guard();
+        // Stamped with the sweep epoch under the lock the insert already holds:
+        // a deadline derived from the instant the send started would already be
+        // stale here when preparation is slow, and a wall clock can jump.
+        let registered_epoch = waiters.current_epoch();
+        waiters.insert(
+            message_id.to_string(),
+            ResponseWaiter::Phash(PhashWaiter {
+                expected,
+                jid,
+                invalidate_group_cache,
+                registered_epoch,
+            }),
+        );
     }
 
     /// Creates a normalized ChatMessageId by resolving PN to LID JIDs.

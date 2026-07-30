@@ -1,6 +1,7 @@
 //! Audio format and I/O contracts shared by the sans-I/O engine and platform drivers.
 
 use bytes::Bytes;
+use wacore_binary::Jid;
 
 use super::rtp::{
     RTP_PAYLOAD_TYPE_MLOW, RTP_PAYLOAD_TYPE_MLOW_RED, RTP_PAYLOAD_TYPE_OPUS,
@@ -439,6 +440,12 @@ pub struct EncodedAudioFrame {
     pub sequence_number: u16,
     pub timestamp: u32,
     pub marker: bool,
+    /// Group sender identity. Absent on 1:1 audio.
+    pub sender: Option<Jid>,
+    /// Group sender device identity. Absent on 1:1 audio.
+    pub device: Option<Jid>,
+    /// Relay participant id from the authoritative roster.
+    pub pid: Option<u32>,
 }
 
 #[cfg(test)]

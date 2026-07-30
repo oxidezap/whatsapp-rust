@@ -97,6 +97,28 @@ pub(crate) enum ReceiverChainState {
     Closed { next_index: u32 },
 }
 
+/// Writes a chain key's material into the protobuf field, reusing the buffer
+/// already there when it is ours to reuse.
+///
+/// `Bytes` is immutable, so assigning a fresh `copy_from_slice` allocates on
+/// every ratchet advance, and the ratchet advances three times per message
+/// round trip. After a checkout the record is uniquely owned (the cache takes
+/// it out of its `Arc` with `try_unwrap`), so the old buffer is almost always
+/// reusable: take it, overwrite in place, and freeze it back. A buffer that is
+/// still shared, or one of an unexpected length, falls back to allocating,
+/// which is exactly the previous behaviour.
+fn write_chain_key(field: &mut Option<bytes::Bytes>, key: &[u8]) {
+    if let Some(existing) = field.take()
+        && existing.len() == key.len()
+        && let Ok(mut owned) = existing.try_into_mut()
+    {
+        owned.copy_from_slice(key);
+        *field = Some(owned.freeze());
+        return;
+    }
+    *field = Some(bytes::Bytes::copy_from_slice(key));
+}
+
 impl SessionState {
     pub fn from_session_structure(session: SessionStructure) -> Self {
         Self { session }
@@ -444,19 +466,27 @@ impl SessionState {
         next_chain_key: &ChainKey,
     ) -> Result<(), InvalidSessionError> {
         use bytes::Bytes;
-        let chain_key = session_structure::chain::ChainKey {
-            index: Some(next_chain_key.index()),
-            key: Some(Bytes::copy_from_slice(next_chain_key.key())),
-        };
-
-        let mut new_chain = self
+        let chain = self
             .session
             .sender_chain
-            .take()
+            .as_option_mut()
             .ok_or(InvalidSessionError("missing sender chain"))?;
-        new_chain.chain_key = MessageField::some(chain_key);
 
-        self.session.sender_chain = MessageField::some(new_chain);
+        // Overwrite the boxed ChainKey in place. Ratchet advance runs once per
+        // sent message, so allocating a fresh Box for a two-field struct was
+        // per-message churn for no state change beyond these two fields.
+        match chain.chain_key.as_option_mut() {
+            Some(existing) => {
+                existing.index = Some(next_chain_key.index());
+                write_chain_key(&mut existing.key, next_chain_key.key());
+            }
+            None => {
+                chain.chain_key = MessageField::some(session_structure::chain::ChainKey {
+                    index: Some(next_chain_key.index()),
+                    key: Some(Bytes::copy_from_slice(next_chain_key.key())),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -585,11 +615,22 @@ impl SessionState {
             .expect("called set_receiver_chain_key for a non-existent chain");
 
         use bytes::Bytes;
-        self.session.receiver_chains[chain_idx].chain_key =
-            MessageField::some(session_structure::chain::ChainKey {
-                index: Some(chain_key.index()),
-                key: Some(Bytes::copy_from_slice(chain_key.key())),
-            });
+        // The None arm still has to initialize: a receiver chain added by
+        // add_receiver_chain carries its key from the start, but a chain
+        // deserialized from a record that predates it may not.
+        let target = &mut self.session.receiver_chains[chain_idx].chain_key;
+        match target.as_option_mut() {
+            Some(existing) => {
+                existing.index = Some(chain_key.index());
+                write_chain_key(&mut existing.key, chain_key.key());
+            }
+            None => {
+                *target = MessageField::some(session_structure::chain::ChainKey {
+                    index: Some(chain_key.index()),
+                    key: Some(Bytes::copy_from_slice(chain_key.key())),
+                });
+            }
+        }
 
         Ok(())
     }
@@ -815,6 +856,34 @@ impl SessionRecord {
         self.reserved_sender_chain_index =
             spent_counter.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
         self.pending_reservation = true;
+    }
+
+    /// Rebase the lease after a DH ratchet replaced the leased sender chain
+    /// in place.
+    ///
+    /// The ceiling bounds counters that a durable snapshot of the *retired*
+    /// chain may already have published. A ratchet derives the replacement
+    /// from a fresh random ephemeral and overwrites the old chain without
+    /// archiving it, so nothing reachable from this record can reissue those
+    /// counters and the inherited ceiling no longer describes anything. Left
+    /// in place it strands the lease arbitrarily far above the new chain's
+    /// index — a monologue of a few thousand sends followed by one peer reply
+    /// is enough to push the gap past `MAX_RESERVATION_FAST_FORWARD`, and a
+    /// recovery reload then refuses the record outright, permanently
+    /// stranding the address.
+    ///
+    /// Lowering is sound only because the swap and the rebase are a single
+    /// mutation of one record: no snapshot can pair the retired chain with
+    /// the rebased ceiling. Keeping one batch (rather than dropping to zero)
+    /// leaves the fresh chain's first counters lease-covered, so steady-state
+    /// ping-pong keeps its write-behind send path.
+    pub fn rebase_lease_after_sender_chain_reset(&mut self) {
+        // Never raises: a counter must not be published under a ceiling that
+        // is not yet durable. An in-chain lease is always within one batch of
+        // the live index, so this is a no-op outside a chain replacement.
+        self.reserved_sender_chain_index = self
+            .reserved_sender_chain_index
+            .min(consts::SENDER_CHAIN_RESERVATION_BATCH);
     }
 
     pub fn has_pending_reservation(&self) -> bool {
@@ -2002,5 +2071,77 @@ mod tests {
             restored.previous_session_count(),
             consts::ARCHIVED_STATES_MAX_LENGTH
         );
+    }
+}
+
+#[cfg(test)]
+mod chain_key_buffer_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// The ratchet advances three times per message round trip, so the buffer
+    /// this writes into is the difference between one allocation per advance
+    /// and none. Reuse is only valid when the buffer is ours alone.
+    #[test]
+    fn a_uniquely_owned_buffer_is_written_in_place() {
+        let mut field = Some(Bytes::copy_from_slice(&[0u8; 32]));
+        let before = field.as_ref().expect("seeded").as_ptr();
+
+        write_chain_key(&mut field, &[7u8; 32]);
+
+        let after = field.as_ref().expect("written");
+        assert_eq!(
+            after.as_ref(),
+            &[7u8; 32],
+            "the new key must be what is read back"
+        );
+        assert_eq!(
+            after.as_ptr(),
+            before,
+            "a uniquely owned buffer must be reused, not replaced"
+        );
+    }
+
+    /// Bad path: a buffer someone else still holds cannot be overwritten, or
+    /// that holder would observe a key it never asked for. Falling back to a
+    /// fresh allocation is the whole point of the guard.
+    #[test]
+    fn a_shared_buffer_is_never_overwritten() {
+        let shared = Bytes::copy_from_slice(&[1u8; 32]);
+        let observer = shared.clone();
+        let mut field = Some(shared);
+
+        write_chain_key(&mut field, &[9u8; 32]);
+
+        assert_eq!(
+            observer.as_ref(),
+            &[1u8; 32],
+            "the other holder must still see what it had"
+        );
+        assert_eq!(field.expect("written").as_ref(), &[9u8; 32]);
+    }
+
+    /// Bad path: a stored key of the wrong length (a record from an older
+    /// format) must not be partially overwritten, leaving a key that is half
+    /// old and half new.
+    #[test]
+    fn a_buffer_of_the_wrong_length_is_replaced_whole() {
+        let mut field = Some(Bytes::copy_from_slice(&[3u8; 16]));
+
+        write_chain_key(&mut field, &[4u8; 32]);
+
+        let written = field.expect("written");
+        assert_eq!(written.len(), 32, "the new key's length wins");
+        assert_eq!(written.as_ref(), &[4u8; 32]);
+    }
+
+    /// An empty field is the None arm: nothing to reuse, so it allocates.
+    #[test]
+    fn an_absent_buffer_is_created() {
+        let mut field: Option<Bytes> = None;
+
+        write_chain_key(&mut field, &[5u8; 32]);
+
+        assert_eq!(field.expect("written").as_ref(), &[5u8; 32]);
     }
 }

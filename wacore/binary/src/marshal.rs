@@ -265,6 +265,150 @@ mod tests {
 
     type TestResult = Result<()>;
 
+    /// An interop JID's `integrator` has a wire field only in `INTEROP_JID`.
+    /// Encoded as a `JID_PAIR` it is simply absent, so two interop destinations
+    /// that differ only there went out as the same bytes.
+    ///
+    /// Asserted on the emitted bytes rather than by round-tripping: our decoder
+    /// reads a trailing server that the outbound form does not carry (see
+    /// `write_interop_jid`), so a local encode/decode cycle is the wrong oracle
+    /// here — the two directions of this token genuinely differ.
+    ///
+    /// Every encoder path is covered because `marshal_exact` sizes its output
+    /// slice from the size estimator before writing into it: an estimator that
+    /// disagrees with the writer surfaces as `UnexpectedEof`, not as wrong bytes,
+    /// and `marshal_exact` is what production sends through.
+    #[test]
+    fn interop_jid_carries_its_integrator_onto_the_wire() -> TestResult {
+        use crate::jid::Server;
+
+        fn node_for(jid: &Jid) -> Node {
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(jid.clone()));
+            Node::new("iq", attrs, None)
+        }
+
+        fn encode_all(jid: &Jid) -> Vec<(&'static str, Vec<u8>)> {
+            let node = node_for(jid);
+            let r = node.as_node_ref();
+            vec![
+                ("marshal", marshal(&node).expect("marshal")),
+                ("marshal_exact", marshal_exact(&node).expect("exact")),
+                ("marshal_ref", marshal_ref(&r).expect("ref")),
+                (
+                    "marshal_ref_exact",
+                    marshal_ref_exact(&r).expect("ref exact"),
+                ),
+            ]
+        }
+
+        let base = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 0,
+            device: 7,
+            integrator: 300,
+        };
+
+        // The integrator reaches the bytes: change only it, and the encoding
+        // changes. Under JID_PAIR these were byte-identical.
+        let other = Jid {
+            integrator: 301,
+            ..base.clone()
+        };
+        for ((path, a), (_, b)) in encode_all(&base).into_iter().zip(encode_all(&other)) {
+            assert_ne!(a, b, "{path}: the integrator must reach the wire");
+            assert!(
+                a.contains(&crate::token::INTEROP_JID),
+                "{path}: must use the INTEROP_JID token"
+            );
+            // Big-endian device and integrator, adjacent, as WA Web writes them.
+            assert!(
+                a.windows(4).any(|w| w == [0x00, 0x07, 0x01, 0x2C]),
+                "{path}: device 7 and integrator 300 as u16 BE"
+            );
+        }
+
+        // Every path agrees byte for byte, so the exact-size plan matches the
+        // writer. When it does not, `marshal_exact` fails outright.
+        let encodings = encode_all(&base);
+        let (_, first) = &encodings[0];
+        for (path, bytes) in &encodings[1..] {
+            assert_eq!(bytes, first, "{path}: must agree with marshal");
+        }
+
+        // A zero-integrator interop JID keeps the JID_PAIR form we have always
+        // sent. That form carries user and server only — it drops the device —
+        // which is pre-existing and deliberately untouched here.
+        let plain = Jid {
+            integrator: 0,
+            ..base.clone()
+        };
+        let bytes = marshal(&node_for(&plain))?;
+        assert!(
+            !bytes.contains(&crate::token::INTEROP_JID),
+            "no integrator, no INTEROP_JID token"
+        );
+        let decoded = unmarshal_ref(&bytes[1..])?;
+        let back = decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| &**k == "jid")
+            .and_then(|(_, v)| v.to_jid())
+            .expect("jid attr");
+        assert_eq!(back.server, Server::Interop);
+        assert_eq!(back.device, 0, "JID_PAIR carries no device");
+
+        Ok(())
+    }
+
+    /// The two round-trips real code performs — through the wire, and through the
+    /// store, which holds JIDs as text — have to agree: a JID that survives one
+    /// must equal a JID that survives the other, or `stored_jid == wire_jid`
+    /// silently flips depending on where each side came from.
+    #[test]
+    fn ad_jid_round_trips_equal_through_the_wire_and_through_text() -> TestResult {
+        use crate::jid::Server;
+        use std::str::FromStr;
+
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let original = Jid {
+                user: "123456789012345".into(),
+                server,
+                agent: 0,
+                device: 7,
+                integrator: 0,
+            };
+
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
+            let node = Node::new("iq", attrs, None);
+
+            // marshal writes a leading format byte that unmarshal_ref does not expect.
+            let bytes = marshal(&node)?;
+            let decoded = unmarshal_ref(&bytes[1..])?;
+            let from_wire = decoded
+                .attrs
+                .iter()
+                .find(|(k, _)| &**k == "jid")
+                .and_then(|(_, v)| v.to_jid())
+                .expect("jid attr survives the round-trip");
+
+            assert_eq!(
+                from_wire, original,
+                "{server:?}: encode -> decode must be idempotent"
+            );
+
+            let from_text = Jid::from_str(&from_wire.to_string()).expect("renders parseably");
+            assert_eq!(
+                from_wire, from_text,
+                "{server:?}: a wire-decoded JID must equal the same JID read back as text"
+            );
+        }
+
+        Ok(())
+    }
+
     fn fixture_node() -> Node {
         let mut attrs = Attrs::with_capacity(4);
         attrs.push("id".to_string(), "ABC123");

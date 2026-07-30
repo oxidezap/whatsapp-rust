@@ -9,22 +9,128 @@
 //! and arm the next timer from `poll_timeout()`. The monotonic clock is `crate::time::Instant`
 //! (native `std::time::Instant`; wasm `performance.now`), so no wall clock leaks into the engine.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
+use portable_atomic::{AtomicBool, Ordering};
+use zeroize::Zeroize;
 
 use crate::runtime::{BoxFuture, Runtime};
 use crate::time::Instant;
+use crate::types::group_call::{GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate};
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
+use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
 use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
+
+/// Lossless, ordered signaling mutations consumed by the sans-I/O group-media engine.
+pub enum GroupControl {
+    Update(Box<GroupCallUpdate>),
+    /// One roster snapshot and its decrypted epoch, kept indivisible under mailbox backpressure.
+    Transition {
+        update: Box<GroupCallUpdate>,
+        epoch: GroupRawEpoch,
+    },
+    RawEpoch(GroupRawEpoch),
+    Reaction(String),
+}
+
+impl GroupControl {
+    /// The transaction this control carries key material for, if any.
+    pub(crate) fn epoch_transaction_id(&self) -> Option<u32> {
+        match self {
+            Self::Transition { epoch, .. } | Self::RawEpoch(epoch) => Some(epoch.transaction_id),
+            Self::Update(_) | Self::Reaction(_) => None,
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        match self {
+            Self::Update(update) => size_of::<GroupCallUpdate>() + update.heap_bytes(),
+            Self::Transition { update, epoch } => {
+                size_of::<GroupCallUpdate>() + update.heap_bytes() + epoch.heap_bytes()
+            }
+            Self::RawEpoch(epoch) => epoch.heap_bytes(),
+            Self::Reaction(emoji) => emoji.capacity(),
+        }
+    }
+}
+
+enum NormalizedGroupControl {
+    Update {
+        update: Box<GroupCallUpdate>,
+        paired_epoch: Option<GroupRawEpoch>,
+    },
+    RawEpoch(GroupRawEpoch),
+    Reaction(String),
+}
+
+impl From<GroupControl> for NormalizedGroupControl {
+    fn from(control: GroupControl) -> Self {
+        match control {
+            GroupControl::Update(update) => Self::Update {
+                update,
+                paired_epoch: None,
+            },
+            GroupControl::Transition { update, epoch } => Self::Update {
+                update,
+                paired_epoch: Some(epoch),
+            },
+            GroupControl::RawEpoch(epoch) => Self::RawEpoch(epoch),
+            GroupControl::Reaction(emoji) => Self::Reaction(emoji),
+        }
+    }
+}
+
+/// One decrypted keygen-v2 epoch. Debug output is deliberately redacted and the bytes are erased
+/// when the command leaves the driver, regardless of whether the engine accepted it.
+pub struct GroupRawEpoch {
+    pub transaction_id: u32,
+    raw_epoch: Vec<u8>,
+}
+
+impl GroupRawEpoch {
+    pub fn new(transaction_id: u32, raw_epoch: Vec<u8>) -> Self {
+        Self {
+            transaction_id,
+            raw_epoch,
+        }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.raw_epoch
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.raw_epoch.capacity()
+    }
+}
+
+impl core::fmt::Debug for GroupRawEpoch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GroupRawEpoch")
+            .field("transaction_id", &self.transaction_id)
+            .field("raw_epoch", &"[redacted]")
+            .finish()
+    }
+}
+
+impl Drop for GroupRawEpoch {
+    fn drop(&mut self) {
+        self.raw_epoch.zeroize();
+    }
+}
 
 /// Mid-call video-plane commands from the shell (upgrade / downgrade / peer orientation). Kept out
 /// of the engine so it stays sans-IO; the drive loop translates each into an engine method call.
@@ -42,36 +148,61 @@ pub enum VideoControl {
     EnableAwaitingAccept,
     /// Tear the video plane down (downgrade to audio).
     Disable,
+    /// Require the next outbound access unit to be an IDR frame after changing its source role.
+    RequireKeyframe,
     /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
     SetOrientation(u8),
+    /// One routed group participant's device orientation.
+    SetParticipantOrientation {
+        participant: wacore_binary::Jid,
+        orientation: u8,
+    },
 }
 
 /// State changes stay FIFO so `Disable` performs its purge before a later `Enable`; only the latest
 /// orientation matters while the driver is busy.
+enum VideoControlMessage {
+    State(VideoControl),
+    ParticipantOrientationsReady,
+}
+
+#[derive(Default)]
+struct PendingParticipantOrientations {
+    values: Mutex<HashMap<wacore_binary::Jid, u8>>,
+    marker_queued: AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct VideoControlSender {
-    state: async_channel::Sender<VideoControl>,
+    state: async_channel::Sender<VideoControlMessage>,
     orientation: async_channel::Sender<u8>,
+    participant_orientations: Arc<PendingParticipantOrientations>,
 }
 
 /// Receiving half of [`video_control_channel`].
 pub struct VideoControlReceiver {
-    state: async_channel::Receiver<VideoControl>,
+    state: async_channel::Receiver<VideoControlMessage>,
     orientation: async_channel::Receiver<u8>,
+    participant_orientations: Arc<PendingParticipantOrientations>,
+    ready_participant_orientations: Mutex<VecDeque<(wacore_binary::Jid, u8)>>,
 }
 
 /// Build the control mailbox used by one call driver.
 pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
     let (state_tx, state_rx) = async_channel::unbounded();
     let (orientation_tx, orientation_rx) = async_channel::bounded(1);
+    let participant_orientations = Arc::new(PendingParticipantOrientations::default());
     (
         VideoControlSender {
             state: state_tx,
             orientation: orientation_tx,
+            participant_orientations: participant_orientations.clone(),
         },
         VideoControlReceiver {
             state: state_rx,
             orientation: orientation_rx,
+            participant_orientations,
+            ready_participant_orientations: Mutex::new(VecDeque::new()),
         },
     )
 }
@@ -83,8 +214,90 @@ impl VideoControlSender {
             VideoControl::SetOrientation(orientation) => {
                 self.orientation.force_send(orientation).is_ok()
             }
-            state => self.state.try_send(state).is_ok(),
+            VideoControl::SetParticipantOrientation {
+                participant,
+                orientation,
+            } => {
+                let needs_marker = {
+                    let mut pending = self
+                        .participant_orientations
+                        .values
+                        .lock()
+                        .expect("participant orientation lock poisoned");
+                    if !pending.contains_key(&participant)
+                        && pending.len() == GROUP_CALL_MAX_PARTICIPANTS
+                        && let Some(evicted) = pending.keys().next().cloned()
+                    {
+                        pending.remove(&evicted);
+                    }
+                    pending.insert(participant, orientation);
+                    !self
+                        .participant_orientations
+                        .marker_queued
+                        .swap(true, Ordering::Relaxed)
+                };
+                if !needs_marker {
+                    return true;
+                }
+                if self
+                    .state
+                    .try_send(VideoControlMessage::ParticipantOrientationsReady)
+                    .is_ok()
+                {
+                    true
+                } else {
+                    self.participant_orientations
+                        .values
+                        .lock()
+                        .expect("participant orientation lock poisoned")
+                        .clear();
+                    self.participant_orientations
+                        .marker_queued
+                        .store(false, Ordering::Relaxed);
+                    false
+                }
+            }
+            state => self
+                .state
+                .try_send(VideoControlMessage::State(state))
+                .is_ok(),
         }
+    }
+
+    #[cfg(all(test, feature = "voip-mlow"))]
+    pub(crate) fn retained_len(&self) -> usize {
+        self.state
+            .len()
+            .saturating_add(self.orientation.len())
+            .saturating_add(
+                self.participant_orientations
+                    .values
+                    .lock()
+                    .expect("participant orientation lock poisoned")
+                    .len(),
+            )
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        let pending = self
+            .participant_orientations
+            .values
+            .lock()
+            .expect("participant orientation lock poisoned");
+        self.state
+            .len()
+            .saturating_mul(size_of::<VideoControlMessage>())
+            .saturating_add(self.orientation.len().saturating_mul(size_of::<u8>()))
+            .saturating_add(
+                pending
+                    .capacity()
+                    .saturating_mul(size_of::<(wacore_binary::Jid, u8)>()),
+            )
+            .saturating_add(pending.keys().map(HeapSize::heap_bytes).sum::<usize>())
     }
 }
 
@@ -94,12 +307,46 @@ impl VideoControlReceiver {
         self.state.is_closed() && self.orientation.is_closed()
     }
 
+    fn take_participant_orientation(&self) -> Option<VideoControl> {
+        let mut ready = self
+            .ready_participant_orientations
+            .lock()
+            .expect("participant orientation lock poisoned");
+        if ready.is_empty() {
+            let mut pending = self
+                .participant_orientations
+                .values
+                .lock()
+                .expect("participant orientation lock poisoned");
+            ready.extend(pending.drain());
+            self.participant_orientations
+                .marker_queued
+                .store(false, Ordering::Relaxed);
+        }
+        ready.pop_front().map(|(participant, orientation)| {
+            VideoControl::SetParticipantOrientation {
+                participant,
+                orientation,
+            }
+        })
+    }
+
     /// Receive a ready state first, otherwise the latest orientation.
     pub fn try_recv(&self) -> Result<VideoControl, async_channel::TryRecvError> {
-        let state_error = match self.state.try_recv() {
-            Ok(state) => return Ok(state),
-            Err(error) => error,
+        let state_error = loop {
+            match self.state.try_recv() {
+                Ok(VideoControlMessage::State(state)) => return Ok(state),
+                Ok(VideoControlMessage::ParticipantOrientationsReady) => {
+                    if let Some(orientation) = self.take_participant_orientation() {
+                        return Ok(orientation);
+                    }
+                }
+                Err(error) => break error,
+            }
         };
+        if let Some(orientation) = self.take_participant_orientation() {
+            return Ok(orientation);
+        }
         match self.orientation.try_recv() {
             Ok(orientation) => Ok(VideoControl::SetOrientation(orientation)),
             Err(async_channel::TryRecvError::Closed)
@@ -111,17 +358,30 @@ impl VideoControlReceiver {
         }
     }
 
+    async fn recv_state(&self) -> Result<VideoControl, async_channel::RecvError> {
+        loop {
+            match self.state.recv().await? {
+                VideoControlMessage::State(state) => return Ok(state),
+                VideoControlMessage::ParticipantOrientationsReady => {
+                    if let Some(orientation) = self.take_participant_orientation() {
+                        return Ok(orientation);
+                    }
+                }
+            }
+        }
+    }
+
     /// Wait for a state or orientation until every sender is gone.
     pub async fn recv(&self) -> Result<VideoControl, async_channel::RecvError> {
         loop {
             match self.try_recv() {
                 Ok(control) => return Ok(control),
-                Err(async_channel::TryRecvError::Closed) => return self.state.recv().await,
+                Err(async_channel::TryRecvError::Closed) => return self.recv_state().await,
                 Err(async_channel::TryRecvError::Empty) => {}
             }
 
             match (self.state.is_closed(), self.orientation.is_closed()) {
-                (false, true) => return self.state.recv().await,
+                (false, true) => return self.recv_state().await,
                 (true, false) => {
                     return self
                         .orientation
@@ -129,14 +389,19 @@ impl VideoControlReceiver {
                         .await
                         .map(VideoControl::SetOrientation);
                 }
-                (true, true) => return self.state.recv().await,
+                (true, true) => return self.recv_state().await,
                 (false, false) => {
                     let state = self.state.recv().fuse();
                     let orientation = self.orientation.recv().fuse();
                     futures::pin_mut!(state, orientation);
                     futures::select_biased! {
                         state = state => match state {
-                            Ok(state) => return Ok(state),
+                            Ok(VideoControlMessage::State(state)) => return Ok(state),
+                            Ok(VideoControlMessage::ParticipantOrientationsReady) => {
+                                if let Some(orientation) = self.take_participant_orientation() {
+                                    return Ok(orientation);
+                                }
+                            }
                             Err(_) => continue,
                         },
                         orientation = orientation => match orientation {
@@ -168,11 +433,14 @@ pub struct CallChannels {
     pub video_out: async_channel::Sender<VideoFrame>,
     /// Mid-call video-plane control (lossless state, coalesced orientation).
     pub video_ctl: VideoControlReceiver,
+    /// Group roster and decrypted epoch transitions. `None` for a 1:1 call.
+    pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
 }
 
 /// Bound slow relay writes without truncating a complete video access unit.
 const SEND_QUEUE_BATCH_CAP: usize = 64;
 const SEND_QUEUE_BYTE_CAP: usize = 2 * 1024 * 1024;
+const RELAY_RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendBatchKind {
@@ -227,6 +495,44 @@ struct DroppedMedia {
     packets: u32,
 }
 
+type RelaySendFuture = Fuse<BoxFuture<'static, anyhow::Result<()>>>;
+
+struct InFlightSend {
+    future: RelaySendFuture,
+    kind: Option<SendBatchKind>,
+}
+
+impl Default for InFlightSend {
+    fn default() -> Self {
+        Self {
+            future: Fuse::terminated(),
+            kind: None,
+        }
+    }
+}
+
+fn cancel_in_flight_group_media(
+    sending: &mut InFlightSend,
+    epoch_advanced: bool,
+    audio_only: bool,
+) -> DroppedMedia {
+    let Some(kind) = sending.kind else {
+        return DroppedMedia::default();
+    };
+    let cancel = (epoch_advanced && kind != SendBatchKind::Control)
+        || (audio_only && kind == SendBatchKind::Video);
+    if !cancel {
+        return DroppedMedia::default();
+    }
+    // Dropping the owned send future cancels a relay write that is still pending. Its packet was
+    // already removed from `send_queue`, so queue purging alone cannot retire this old-key media.
+    *sending = InFlightSend::default();
+    DroppedMedia {
+        video_access_units: u32::from(kind == SendBatchKind::Video),
+        packets: 1,
+    }
+}
+
 fn record_drop(dropped: &mut DroppedMedia, batch: &SendBatch) {
     dropped.packets = dropped
         .packets
@@ -252,6 +558,133 @@ fn purge_unstarted_video(
         *awaiting_video_keyframe = true;
     }
     dropped
+}
+
+fn purge_queued(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+    discard: impl Fn(&SendBatch) -> bool,
+) -> DroppedMedia {
+    let mut dropped = DroppedMedia::default();
+    queue.retain(|batch| {
+        let drop_batch = discard(batch);
+        if drop_batch {
+            record_drop(&mut dropped, batch);
+        }
+        !drop_batch
+    });
+    if !pending_video.is_empty() {
+        dropped.video_access_units = dropped.video_access_units.saturating_add(1);
+        dropped.packets = dropped
+            .packets
+            .saturating_add(pending_video.len().try_into().unwrap_or(u32::MAX));
+        pending_video.clear();
+    }
+    if dropped.video_access_units != 0 {
+        *awaiting_video_keyframe = true;
+    }
+    dropped
+}
+
+fn purge_group_transition_media(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+    epoch_advanced: bool,
+    audio_only: bool,
+) -> DroppedMedia {
+    if !epoch_advanced && !audio_only {
+        return DroppedMedia::default();
+    }
+    purge_queued(queue, pending_video, awaiting_video_keyframe, |batch| {
+        (epoch_advanced && batch.kind != SendBatchKind::Control)
+            || (audio_only && batch.kind == SendBatchKind::Video)
+    })
+}
+
+fn apply_group_epoch_control(
+    engine: &mut CallEngine,
+    epoch: GroupRawEpoch,
+    send_queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+    sending: &mut InFlightSend,
+    events: &async_channel::Sender<CallEvent>,
+) {
+    match engine.apply_group_raw_epoch(epoch.transaction_id, epoch.as_bytes()) {
+        Ok(crate::voip::GroupEpochApply::Installed) => {
+            let mut dropped = purge_queued(
+                send_queue,
+                pending_video,
+                awaiting_video_keyframe,
+                |batch| batch.kind != SendBatchKind::Control,
+            );
+            let in_flight = cancel_in_flight_group_media(sending, true, false);
+            dropped.video_access_units = dropped
+                .video_access_units
+                .saturating_add(in_flight.video_access_units);
+            dropped.packets = dropped.packets.saturating_add(in_flight.packets);
+            if dropped.packets != 0 {
+                let _ = events.try_send(CallEvent::OutboundMediaDropped {
+                    video_access_units: dropped.video_access_units,
+                    packets: dropped.packets,
+                });
+            }
+        }
+        Ok(_) => {}
+        Err(_) => {
+            // A decrypted epoch may overtake initial roster configuration. Rejecting the control
+            // keeps the driver alive; registry-originated epochs are paired with their roster and
+            // therefore retry through the transition path instead of relying on this fallback.
+            let _ = events.try_send(CallEvent::GroupControlRejected {
+                control: engine::GroupControlKind::Epoch,
+            });
+        }
+    }
+}
+
+fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
+    if matches!(
+        &event,
+        CallEvent::RelayAllocated
+            | CallEvent::RelayAllocateFailed(_)
+            | CallEvent::RelayAllocateTimedOut
+            | CallEvent::RelayReconnectTimedOut
+    ) {
+        let _ = events.force_send(event);
+    } else {
+        let _ = events.try_send(event);
+    }
+}
+
+async fn disconnect_relay_bounded(rt: &dyn Runtime, transport: &dyn RelayTransport) {
+    let disconnect = transport.disconnect().fuse();
+    let timeout = rt.sleep(RELAY_RECONNECT_TIMEOUT).fuse();
+    futures::pin_mut!(disconnect, timeout);
+    futures::select_biased! {
+        () = disconnect => {},
+        () = timeout => {},
+    }
+}
+
+fn is_fatal_group_update_error(error: &engine::EngineError) -> bool {
+    matches!(
+        error,
+        engine::EngineError::GroupMedia(GroupMediaError::LocalParticipantRemoved)
+    ) || !matches!(error, engine::EngineError::GroupMedia(_))
+}
+
+fn prepare_relay_reconnect(
+    queue: &mut VecDeque<SendBatch>,
+    pending_video: &mut Vec<Bytes>,
+    awaiting_video_keyframe: &mut bool,
+) {
+    queue.clear();
+    pending_video.clear();
+    // Discarding access units leaves remote decoders with a hole. Reopen the replacement path on
+    // an IDR rather than forwarding a delta that references frames lost with the retired relay.
+    *awaiting_video_keyframe = true;
 }
 
 fn discard_video_until_keyframe(
@@ -363,19 +796,20 @@ fn queue_transmit(
     dropped
 }
 
-fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<Bytes> {
+fn pop_next_packet(queue: &mut VecDeque<SendBatch>) -> Option<(Bytes, SendBatchKind)> {
     let index = queue
         .iter()
         .position(|batch| batch.kind == SendBatchKind::Control)
         .unwrap_or(0);
     let batch = queue.get_mut(index)?;
     batch.started = true;
+    let kind = batch.kind;
     let packet = batch.packets.pop_front()?;
     batch.bytes = batch.bytes.saturating_sub(packet.len());
     if batch.packets.is_empty() {
         queue.remove(index);
     }
-    Some(packet)
+    Some((packet, kind))
 }
 
 /// Drive one call to completion: returns when the relay channel disconnects, a send fails, or the
@@ -441,8 +875,8 @@ async fn run_call_with_clock(
 
 async fn run_call_with_clock_and_wallclock(
     rt: Arc<dyn Runtime>,
-    transport: Arc<dyn RelayTransport>,
-    relay_events: async_channel::Receiver<RelayTransportEvent>,
+    mut transport: Arc<dyn RelayTransport>,
+    mut relay_events: async_channel::Receiver<RelayTransportEvent>,
     channels: CallChannels,
     mut eng: CallEngine,
     now_ms: impl Fn() -> engine::Millis,
@@ -462,6 +896,7 @@ async fn run_call_with_clock_and_wallclock(
     // false after the first event -- a rekey or the sender closing -- so the closed channel's
     // always-ready `Err` doesn't busy-spin the select (the mic arm has the same guard).
     let mut rekey_open = true;
+    let mut group_ctl_open = true;
 
     // Same closed-channel guards for the video arms: a call that never wires a video source/control
     // sender must not busy-spin on their always-ready `Err`.
@@ -484,11 +919,12 @@ async fn run_call_with_clock_and_wallclock(
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
-    let mut sending: Fuse<BoxFuture<'static, anyhow::Result<()>>> = Fuse::terminated();
+    let mut sending = InFlightSend::default();
 
     'drive: loop {
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
         let mut pending_video = Vec::new();
+        let mut reconnect_to = None;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -518,7 +954,17 @@ async fn run_call_with_clock_and_wallclock(
                     let _ = channels.video_out.try_send(frame);
                 }
                 Output::Event(ev) => {
-                    let _ = channels.events.try_send(ev);
+                    publish_engine_event(&channels.events, ev);
+                }
+                Output::ReconnectRelay(endpoint) => {
+                    // Anything queued before this intent targets the retired relay. Later outputs in
+                    // the same drain include the fresh Allocate and are retained for the new channel.
+                    prepare_relay_reconnect(
+                        &mut send_queue,
+                        &mut pending_video,
+                        &mut awaiting_video_keyframe,
+                    );
+                    reconnect_to = Some(endpoint);
                 }
                 Output::Timeout(_) => {
                     if !pending_video.is_empty() {
@@ -544,15 +990,40 @@ async fn run_call_with_clock_and_wallclock(
             break 'drive;
         }
 
+        if let Some(endpoint) = reconnect_to {
+            // An in-flight write belongs to the retired channel and is delivery-ambiguous. Drop it;
+            // the fresh Allocate emitted after ReconnectRelay establishes the replacement path.
+            sending = InFlightSend::default();
+            let current_transport = transport.clone();
+            let reconnect = current_transport.reconnect(endpoint).fuse();
+            let timeout = rt.sleep(RELAY_RECONNECT_TIMEOUT).fuse();
+            futures::pin_mut!(reconnect, timeout);
+            let reconnect_result = futures::select_biased! {
+                result = reconnect => result,
+                () = timeout => {
+                    publish_engine_event(&channels.events, CallEvent::RelayReconnectTimedOut);
+                    break 'drive;
+                },
+            };
+            let Ok((replacement, replacement_events)) = reconnect_result else {
+                break 'drive;
+            };
+            let retired = std::mem::replace(&mut transport, replacement);
+            relay_events = replacement_events;
+            disconnect_relay_bounded(&*rt, &*retired).await;
+            eng.relay_reconnected(now_ms());
+        }
+
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
         // `'static` (no borrow of the loop's `transport`).
-        if sending.is_terminated()
-            && let Some(data) = pop_next_packet(&mut send_queue)
+        if sending.future.is_terminated()
+            && let Some((data, kind)) = pop_next_packet(&mut send_queue)
         {
             let t = transport.clone();
             let fut: BoxFuture<'static, anyhow::Result<()>> =
                 Box::pin(async move { t.send(data).await });
-            sending = fut.fuse();
+            sending.future = fut.fuse();
+            sending.kind = Some(kind);
         }
 
         // Arm the timer for the engine's next deadline (or never, if it has none).
@@ -611,6 +1082,22 @@ async fn run_call_with_clock_and_wallclock(
         .fuse();
         futures::pin_mut!(rekey_fut);
 
+        let group_ctl_live = group_ctl_open && channels.group_ctl.is_some();
+        let group_ctl_ch = channels.group_ctl.as_ref();
+        let group_ctl_fut = async move {
+            if group_ctl_live {
+                group_ctl_ch
+                    .expect("group_ctl_live implies Some")
+                    .recv()
+                    .await
+                    .ok()
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(group_ctl_fut);
+
         // Video source and control arms, guarded like the mic: a closed channel disables the arm
         // (a video source EOF must not end the call — audio keeps running after a downgrade).
         let video_in = &channels.video_in;
@@ -646,7 +1133,8 @@ async fn run_call_with_clock_and_wallclock(
         // flood can't starve the keepalive/playout.
         futures::select_biased! {
             // The in-flight send completed. A failure tears the call down (the old inline behavior).
-            res = sending => {
+            res = &mut sending.future => {
+                sending.kind = None;
                 if res.is_err() {
                     break 'drive;
                 }
@@ -658,6 +1146,105 @@ async fn run_call_with_clock_and_wallclock(
                     && !eng.rekey_recv(&lid)
                 {
                     break 'drive; // malformed stored call_key (a setup invariant violated)
+                }
+            },
+            group = group_ctl_fut => {
+                match group.map(NormalizedGroupControl::from) {
+                    Some(NormalizedGroupControl::Update {
+                        update,
+                        paired_epoch,
+                    }) => {
+                        let previous_epoch = eng.group_epoch_transaction();
+                        let update_accepted = match eng.apply_group_update(now_ms(), &update) {
+                            Ok(crate::voip::GroupRosterApply::Applied) => {
+                                let epoch_advanced = update.rekey_requested
+                                    || eng.group_epoch_transaction() != previous_epoch;
+                                let mut dropped = purge_group_transition_media(
+                                    &mut send_queue,
+                                    &mut pending_video,
+                                    &mut awaiting_video_keyframe,
+                                    epoch_advanced,
+                                    update.media == "audio",
+                                );
+                                let in_flight = cancel_in_flight_group_media(
+                                    &mut sending,
+                                    epoch_advanced,
+                                    update.media == "audio",
+                                );
+                                dropped.video_access_units = dropped
+                                    .video_access_units
+                                    .saturating_add(in_flight.video_access_units);
+                                dropped.packets =
+                                    dropped.packets.saturating_add(in_flight.packets);
+                                if dropped.packets != 0 {
+                                    let _ = channels.events.try_send(
+                                        CallEvent::OutboundMediaDropped {
+                                            video_access_units: dropped.video_access_units,
+                                            packets: dropped.packets,
+                                        },
+                                    );
+                                }
+                                true
+                            }
+                            Ok(_) => true,
+                            Err(error) => {
+                                if is_fatal_group_update_error(&error) {
+                                    break 'drive;
+                                }
+                                let _ = channels.events.try_send(
+                                    CallEvent::GroupControlRejected {
+                                        control: engine::GroupControlKind::Update,
+                                    },
+                                );
+                                false
+                            }
+                        };
+                        if update_accepted
+                            && let Some(epoch) = paired_epoch
+                        {
+                            apply_group_epoch_control(
+                                &mut eng,
+                                epoch,
+                                &mut send_queue,
+                                &mut pending_video,
+                                &mut awaiting_video_keyframe,
+                                &mut sending,
+                                &channels.events,
+                            );
+                        } else if paired_epoch.is_some() {
+                            // A transition is indivisible: rejecting its roster also discards the
+                            // paired key, so surface both halves instead of hiding the lost epoch.
+                            let _ = channels.events.try_send(CallEvent::GroupControlRejected {
+                                control: engine::GroupControlKind::Epoch,
+                            });
+                        }
+                    }
+                    Some(NormalizedGroupControl::RawEpoch(epoch)) => {
+                        apply_group_epoch_control(
+                            &mut eng,
+                            epoch,
+                            &mut send_queue,
+                            &mut pending_video,
+                            &mut awaiting_video_keyframe,
+                            &mut sending,
+                            &channels.events,
+                        );
+                    }
+                    Some(NormalizedGroupControl::Reaction(emoji)) => {
+                        if eng.send_group_reaction(now_ms(), &emoji).is_err() {
+                            let _ = channels.events.try_send(CallEvent::GroupControlRejected {
+                                control: engine::GroupControlKind::Reaction,
+                            });
+                        }
+                    }
+                    None => group_ctl_open = false,
+                }
+                let now = now_ms();
+                if let Some(at) = eng.poll_timeout()
+                    && at != engine::NEVER
+                    && now >= at
+                {
+                    eng.handle_input(now, Input::Timeout);
                 }
             },
             // State control before orientation and media, so a Disable always purges before a later
@@ -693,7 +1280,12 @@ async fn run_call_with_clock_and_wallclock(
                         // channel).
                         drain_video_in = true;
                     }
+                    Ok(VideoControl::RequireKeyframe) => eng.require_video_keyframe(),
                     Ok(VideoControl::SetOrientation(o)) => eng.set_peer_video_orientation(o),
+                    Ok(VideoControl::SetParticipantOrientation {
+                        participant,
+                        orientation,
+                    }) => eng.set_participant_video_orientation(participant, orientation),
                     Err(_) => video_ctl_open = false,
                 }
                 // Fire an overdue timer like the other ready arms so a stream of control messages
@@ -787,8 +1379,12 @@ async fn run_call_with_clock_and_wallclock(
 mod tests {
     use super::*;
     use crate::runtime::AbortHandle;
+    use crate::types::group_call::{
+        GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
+        GroupCallUpdate,
+    };
     use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
-    use crate::voip::engine::{CallConfig, SequentialTxIds};
+    use crate::voip::engine::{CallConfig, GroupEngineConfig, SequentialTxIds};
     use crate::voip::mlow::MlowEncoder;
     use crate::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
     use crate::voip::{RelayDisconnectReason, stun};
@@ -799,6 +1395,17 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use wacore_binary::{Jid, Server};
+
+    #[test]
+    fn local_roster_removal_is_the_only_fatal_group_media_update_error() {
+        assert!(is_fatal_group_update_error(
+            &engine::EngineError::GroupMedia(GroupMediaError::LocalParticipantRemoved)
+        ));
+        assert!(!is_fatal_group_update_error(
+            &engine::EngineError::GroupMedia(GroupMediaError::Pipeline)
+        ));
+    }
 
     /// Runtime whose `sleep` never resolves, so the driver is exercised purely by the relay-event
     /// stream (the timer arm stays pending). `spawn` is unused: the shell spawns `run_call`, not the
@@ -836,6 +1443,115 @@ mod tests {
         async fn disconnect(&self) {}
     }
 
+    type ReplacementRelay = (
+        Arc<dyn RelayTransport>,
+        async_channel::Receiver<RelayTransportEvent>,
+    );
+
+    struct ReconnectTransport {
+        sent: Mutex<Vec<Bytes>>,
+        reconnects: Mutex<Vec<std::net::SocketAddr>>,
+        replacement: Mutex<Option<ReplacementRelay>>,
+    }
+
+    #[derive(Default)]
+    struct HangingReconnectTransport {
+        reconnects: AtomicUsize,
+        disconnects: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RelayTransport for HangingReconnectTransport {
+        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn reconnect(
+            &self,
+            _endpoint: std::net::SocketAddr,
+        ) -> anyhow::Result<(
+            Arc<dyn RelayTransport>,
+            async_channel::Receiver<RelayTransportEvent>,
+        )> {
+            self.reconnects.fetch_add(1, Ordering::Relaxed);
+            futures::future::pending().await
+        }
+    }
+
+    struct ReconnectTimeoutRuntime;
+
+    #[async_trait]
+    impl Runtime for ReconnectTimeoutRuntime {
+        fn spawn(&self, _f: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            AbortHandle::noop()
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            if duration == RELAY_RECONNECT_TIMEOUT {
+                Box::pin(async {})
+            } else {
+                Box::pin(futures::future::pending())
+            }
+        }
+
+        fn spawn_blocking(
+            &self,
+            _f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    #[derive(Default)]
+    struct HangingDisconnectTransport {
+        disconnects: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RelayTransport for HangingDisconnectTransport {
+        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+            futures::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl RelayTransport for ReconnectTransport {
+        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn disconnect(&self) {}
+
+        async fn reconnect(
+            &self,
+            endpoint: std::net::SocketAddr,
+        ) -> anyhow::Result<(
+            Arc<dyn RelayTransport>,
+            async_channel::Receiver<RelayTransportEvent>,
+        )> {
+            self.reconnects.lock().unwrap().push(endpoint);
+            self.replacement
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("replacement already consumed"))
+        }
+    }
+
     #[test]
     fn video_control_channel_preserves_state_and_coalesces_orientation() {
         let (tx, rx) = video_control_channel();
@@ -844,11 +1560,141 @@ mod tests {
             assert!(tx.send(VideoControl::SetOrientation(orientation % 4)));
         }
         assert!(tx.send(VideoControl::Enable));
+        assert!(tx.send(VideoControl::RequireKeyframe));
 
         assert_eq!(rx.try_recv(), Ok(VideoControl::Disable));
         assert_eq!(rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::RequireKeyframe));
         assert_eq!(rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn relay_lifecycle_events_replace_saturated_diagnostics() {
+        for lifecycle in [
+            CallEvent::RelayAllocated,
+            CallEvent::RelayAllocateFailed(486),
+            CallEvent::RelayAllocateTimedOut,
+            CallEvent::RelayReconnectTimedOut,
+        ] {
+            let (tx, rx) = async_channel::bounded(1);
+            tx.try_send(CallEvent::GroupControlRejected {
+                control: engine::GroupControlKind::Update,
+            })
+            .expect("diagnostic fills the event queue");
+
+            publish_engine_event(&tx, lifecycle.clone());
+
+            assert_eq!(rx.try_recv(), Ok(lifecycle));
+            assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+        }
+    }
+
+    #[test]
+    fn video_control_channel_coalesces_group_orientation_per_participant() {
+        let (tx, rx) = video_control_channel();
+        let participant = Jid::new("200002", Server::Lid).with_device(3);
+        for orientation in 0..100u8 {
+            assert!(tx.send(VideoControl::SetParticipantOrientation {
+                participant: participant.clone(),
+                orientation: orientation % 4,
+            }));
+        }
+        assert!(
+            tx.retained_len() <= 2,
+            "one participant must retain at most one value and one wake marker"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant,
+                orientation: 3,
+            })
+        );
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn group_transitions_purge_only_packets_protected_under_stale_state() {
+        let batch = |kind, packets: usize, started| SendBatch {
+            packets: (0..packets)
+                .map(|_| Bytes::from_static(b"packet"))
+                .collect(),
+            bytes: packets * 6,
+            kind,
+            started,
+            video_keyframe: false,
+        };
+
+        let mut downgrade_queue = VecDeque::from([
+            batch(SendBatchKind::Control, 1, false),
+            batch(SendBatchKind::Media, 1, false),
+            batch(SendBatchKind::Video, 2, true),
+        ]);
+        let mut pending_video = vec![Bytes::from_static(b"fragment")];
+        let mut awaiting_keyframe = false;
+        let dropped = purge_group_transition_media(
+            &mut downgrade_queue,
+            &mut pending_video,
+            &mut awaiting_keyframe,
+            false,
+            true,
+        );
+        assert_eq!(dropped.video_access_units, 2);
+        assert_eq!(dropped.packets, 3);
+        assert_eq!(downgrade_queue.len(), 2);
+        assert!(
+            downgrade_queue
+                .iter()
+                .all(|batch| batch.kind != SendBatchKind::Video)
+        );
+        assert!(awaiting_keyframe);
+
+        downgrade_queue.push_back(batch(SendBatchKind::Video, 2, false));
+        pending_video.push(Bytes::from_static(b"fragment"));
+        let dropped = purge_group_transition_media(
+            &mut downgrade_queue,
+            &mut pending_video,
+            &mut awaiting_keyframe,
+            true,
+            false,
+        );
+        assert_eq!(dropped.video_access_units, 2);
+        assert_eq!(dropped.packets, 4);
+        assert_eq!(downgrade_queue.len(), 1);
+        assert_eq!(downgrade_queue[0].kind, SendBatchKind::Control);
+        assert!(
+            pending_video.is_empty(),
+            "a new epoch must not leave a partial old-key access unit"
+        );
+    }
+
+    #[test]
+    fn relay_reconnect_drops_deltas_until_a_fresh_keyframe() {
+        let video = |keyframe| SendBatch {
+            packets: VecDeque::from([Bytes::from_static(b"video")]),
+            bytes: 5,
+            kind: SendBatchKind::Video,
+            started: false,
+            video_keyframe: keyframe,
+        };
+        let mut queue = VecDeque::from([video(false)]);
+        let mut pending_video = vec![Bytes::from_static(b"fragment")];
+        let mut awaiting_keyframe = false;
+
+        prepare_relay_reconnect(&mut queue, &mut pending_video, &mut awaiting_keyframe);
+        assert!(queue.is_empty());
+        assert!(pending_video.is_empty());
+        assert!(awaiting_keyframe);
+
+        let dropped = enqueue_batch(&mut queue, &mut awaiting_keyframe, video(false));
+        assert_eq!(dropped.video_access_units, 1);
+        assert!(queue.is_empty(), "delta frame must not enter the new path");
+
+        let dropped = enqueue_batch(&mut queue, &mut awaiting_keyframe, video(true));
+        assert_eq!(dropped.video_access_units, 0);
+        assert_eq!(queue.len(), 1);
+        assert!(!awaiting_keyframe);
     }
 
     /// CallChannels with idle video plumbing (senders/receivers dropped immediately), for the
@@ -873,6 +1719,7 @@ mod tests {
             video_in: vin_rx,
             video_out: vout_tx,
             video_ctl: vctl_rx,
+            group_ctl: None,
         }
     }
 
@@ -894,6 +1741,397 @@ mod tests {
             enable_video: false,
             enable_sframe: false,
         }
+    }
+
+    fn group_relay(transaction_id: u32, ip: &str, port: u16) -> GroupCallRelay {
+        GroupCallRelay::builder()
+            .transaction_id(transaction_id)
+            .self_pid(1)
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![0x47]])
+            .auth_tokens(vec![vec![0x57]])
+            .endpoints(vec![GroupCallRelayEndpoint {
+                relay_id: 1,
+                token_id: 0,
+                auth_token_id: 0,
+                relay_name: "relay-1".to_string(),
+                domain_name: None,
+                rtt_ms: None,
+                is_fna: false,
+                address: Vec::new(),
+                ipv4: Some(ip.to_string()),
+                port: Some(port),
+            }])
+            .build()
+    }
+
+    fn group_update(transaction_id: u32, ip: &str, port: u16) -> GroupCallUpdate {
+        let self_jid = Jid::new("111111111111111", Server::Lid);
+        let mut self_device = GroupCallDevice::new(self_jid.clone());
+        self_device.pid = Some(1);
+        let mut participant = GroupCallParticipant::new(self_jid.to_non_ad(), vec![self_device]);
+        participant.state = Some("connected".to_string());
+        GroupCallUpdate::builder()
+            .call_id("00abcdef0123456789abcdef01234567".to_string())
+            .call_creator(self_jid)
+            .transaction_id(transaction_id)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![participant])
+            .relay(group_relay(transaction_id, ip, port))
+            .build()
+    }
+
+    fn group_engine() -> CallEngine {
+        let update = group_update(7, "203.0.113.7", 3478);
+        let mut config = CallConfig::for_group(
+            CallDirection::Outgoing,
+            &update.call_id,
+            "111111111111111@lid",
+            "111111111111111@lid",
+            update.relay.as_ref().expect("relay"),
+        )
+        .expect("group config");
+        config.audio = crate::voip::AudioConfig::MLOW_PCM;
+        let mut engine =
+            CallEngine::new(config, Box::new(SequentialTxIds::new())).expect("group engine");
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: update.call_creator.clone(),
+                initial_update: update,
+                direct_peer: None,
+            })
+            .expect("configure group");
+        engine
+    }
+
+    #[test]
+    fn group_relay_migration_redials_transport_before_reallocation() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let replacement = Arc::new(RecordingTransport::default());
+        let (replacement_tx, replacement_rx) = async_channel::unbounded();
+        replacement_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let transport = Arc::new(ReconnectTransport {
+            sent: Mutex::new(Vec::new()),
+            reconnects: Mutex::new(Vec::new()),
+            replacement: Mutex::new(Some((
+                replacement.clone() as Arc<dyn RelayTransport>,
+                replacement_rx,
+            ))),
+        });
+        let (_initial_tx, initial_rx) = async_channel::unbounded();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::Update(Box::new(group_update(
+                8,
+                "203.0.113.8",
+                3481,
+            ))))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            initial_rx,
+            channels,
+            group_engine(),
+        ));
+
+        assert_eq!(
+            *transport.reconnects.lock().unwrap(),
+            ["203.0.113.8:3481".parse().unwrap()]
+        );
+        assert!(
+            replacement
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_ALLOCATE_REQUEST)),
+            "the replacement transport must carry the fresh allocate"
+        );
+    }
+
+    #[test]
+    fn group_relay_migration_bounds_a_hung_reconnect() {
+        let transport = Arc::new(HangingReconnectTransport::default());
+        let (_initial_tx, initial_rx) = async_channel::unbounded();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::Update(Box::new(group_update(
+                8,
+                "203.0.113.8",
+                3481,
+            ))))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            Arc::new(ReconnectTimeoutRuntime),
+            transport.clone(),
+            initial_rx,
+            channels,
+            group_engine(),
+        ));
+
+        assert_eq!(transport.reconnects.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            ev_rx.try_recv(),
+            Ok(CallEvent::RelayReconnectTimedOut),
+            "the application must learn why relay migration ended the call"
+        );
+        assert_eq!(
+            transport.disconnects.load(Ordering::Relaxed),
+            1,
+            "the timed-out driver must tear down the original transport"
+        );
+    }
+
+    #[test]
+    fn group_relay_migration_bounds_retired_transport_disconnect() {
+        let transport = HangingDisconnectTransport::default();
+        futures::executor::block_on(disconnect_relay_bounded(
+            &ReconnectTimeoutRuntime,
+            &transport,
+        ));
+        assert_eq!(
+            transport.disconnects.load(Ordering::Relaxed),
+            1,
+            "the retired transport cleanup must be attempted without parking the driver"
+        );
+    }
+
+    #[test]
+    fn rejected_group_control_does_not_terminate_the_driver() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let binding =
+            stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[9u8; 12], &[], None, false);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(binding)))
+            .unwrap();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::Reaction("x".repeat(1024)))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            group_engine(),
+        ));
+
+        assert!(
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_BINDING_SUCCESS)),
+            "the driver must keep processing relay traffic after rejecting a control"
+        );
+        assert!(
+            std::iter::from_fn(|| ev_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                CallEvent::GroupControlRejected {
+                    control: engine::GroupControlKind::Reaction
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn epoch_before_group_configuration_does_not_terminate_the_driver() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let binding =
+            stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[8u8; 12], &[], None, false);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(binding)))
+            .unwrap();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        group_tx
+            .try_send(GroupControl::RawEpoch(GroupRawEpoch::new(1, vec![1; 32])))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+        let engine =
+            CallEngine::new(config(), Box::new(SequentialTxIds::new())).expect("direct engine");
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            engine,
+        ));
+
+        assert!(
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_BINDING_SUCCESS)),
+            "a racing epoch must not stop subsequent relay processing"
+        );
+        assert!(
+            std::iter::from_fn(|| ev_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                CallEvent::GroupControlRejected {
+                    control: engine::GroupControlKind::Epoch
+                }
+            )),
+            "the pre-roster epoch is rejected explicitly instead of terminating the call"
+        );
+    }
+
+    #[test]
+    fn group_update_pipeline_error_does_not_terminate_the_driver() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let binding =
+            stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[7u8; 12], &[], None, false);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(binding)))
+            .unwrap();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        let update = group_update(1, "203.0.113.7", 3478);
+        group_tx
+            .try_send(GroupControl::Update(Box::new(update.clone())))
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+        let mut direct_config = config();
+        direct_config.enable_media = false;
+        let mut engine = CallEngine::new(direct_config, Box::new(SequentialTxIds::new()))
+            .expect("control-only engine");
+        assert!(matches!(
+            engine.apply_group_update(0, &update),
+            Err(engine::EngineError::GroupMedia(GroupMediaError::Pipeline))
+        ));
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport.clone() as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            engine,
+        ));
+
+        assert!(
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_BINDING_SUCCESS)),
+            "a failed roster refresh must not stop subsequent relay processing"
+        );
+        assert!(
+            std::iter::from_fn(|| ev_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                CallEvent::GroupControlRejected {
+                    control: engine::GroupControlKind::Update
+                }
+            )),
+            "the non-fatal engine error must be surfaced as a rejected update"
+        );
+    }
+
+    #[test]
+    fn rejected_group_transition_surfaces_its_paired_epoch() {
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
+        let transport = Arc::new(RecordingTransport::default());
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        relay_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, ev_rx) = async_channel::unbounded();
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        let mut invalid = group_update(2, "203.0.113.7", 3478);
+        invalid.call_id = "WRONG-CALL".to_string();
+        group_tx
+            .try_send(GroupControl::Transition {
+                update: Box::new(invalid),
+                epoch: GroupRawEpoch::new(2, vec![2; 32]),
+            })
+            .unwrap();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        futures::executor::block_on(run_call(
+            rt,
+            transport as Arc<dyn RelayTransport>,
+            relay_rx,
+            channels,
+            group_engine(),
+        ));
+
+        let rejected = std::iter::from_fn(|| ev_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                CallEvent::GroupControlRejected { control } => Some(control),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(rejected.contains(&engine::GroupControlKind::Update));
+        assert!(rejected.contains(&engine::GroupControlKind::Epoch));
     }
 
     // The driver wiring: start sends the allocate, an inbound binding request gets a binding-success
@@ -1143,16 +2381,31 @@ mod tests {
         let (spk_tx, _spk_rx) = async_channel::unbounded();
         let (ev_tx, ev_rx) = async_channel::unbounded();
 
+        let mut eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let allocation = match eng.poll_output() {
+            Output::Transmit(packet) => packet,
+            other => panic!("expected initial allocation, got {other:?}"),
+        };
+        let transaction_id: [u8; 12] = stun::stun_transaction_id(&allocation)
+            .expect("allocation transaction id")
+            .try_into()
+            .expect("STUN transaction IDs are 12 bytes");
+
         // Raw Allocate-error STUN packet carrying ERROR-CODE 486 (class 4, number 86).
         let err_attr = [0x00, 0x09, 0x00, 0x04, 0x00, 0x00, 4u8, 86u8];
-        let err =
-            stun::encode_stun_request(stun::MSG_ALLOCATE_ERROR, &[3u8; 12], &err_attr, None, false);
+        let err = stun::encode_stun_request(
+            stun::MSG_ALLOCATE_ERROR,
+            &transaction_id,
+            &err_attr,
+            None,
+            false,
+        );
         relay_tx
             .try_send(RelayTransportEvent::PacketReceived(Bytes::from(err)))
             .unwrap();
         // Note: the relay stream is intentionally NOT closed; the engine termination must end the loop.
 
-        let eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
         futures::executor::block_on(run_call(
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
@@ -1225,9 +2478,13 @@ mod tests {
             peer.allocates += 1;
             if peer.allocates == 1 {
                 // The relay accepts the allocate, then the mirrored peer streams two MLow tone frames.
+                let transaction_id: [u8; 12] = stun::stun_transaction_id(&data)
+                    .expect("allocate transaction id")
+                    .try_into()
+                    .expect("STUN transaction IDs are 12 bytes");
                 let ok = stun::encode_stun_request(
                     stun::MSG_ALLOCATE_SUCCESS,
-                    &[1u8; 12],
+                    &transaction_id,
                     &[],
                     None,
                     false,
@@ -1551,6 +2808,7 @@ mod tests {
                 video_in: vin_rx,
                 video_out: vout_tx,
                 video_ctl: vctl_rx,
+                group_ctl: None,
             },
             eng,
         ));
@@ -1658,9 +2916,38 @@ mod tests {
         assert_eq!(queue[0].packets.len(), 40);
 
         let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
-            .map(|packet| parse_rtp_header(&packet).unwrap().sequence_number)
+            .map(|(packet, _)| parse_rtp_header(&packet).unwrap().sequence_number)
             .collect();
         assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn epoch_transition_cancels_media_already_removed_from_the_send_queue() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(cancelled.clone());
+        let future: BoxFuture<'static, anyhow::Result<()>> = Box::pin(async move {
+            let _probe = probe;
+            futures::future::pending().await
+        });
+        let mut sending = InFlightSend {
+            future: future.fuse(),
+            kind: Some(SendBatchKind::Media),
+        };
+
+        let dropped = cancel_in_flight_group_media(&mut sending, true, false);
+
+        assert!(sending.future.is_terminated());
+        assert_eq!(sending.kind, None);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(dropped.packets, 1);
+        assert_eq!(dropped.video_access_units, 0);
     }
 
     #[test]

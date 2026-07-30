@@ -10,10 +10,137 @@ use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
 
+/// Names the DSM destination without requiring it to exist as a string.
+///
+/// The DSM field needs the JID's length before its bytes, so the caller used to
+/// render one into a `String` just to measure it and copy it. A `Jid` can do
+/// both without the intermediate: this is what lets `&Jid` and `&str` share the
+/// same body instead of the format existing in two shapes.
+///
+/// Implemented for `str`, the standard string wrappers, and `Jid`, and carried
+/// through references of any depth. A type outside that set (a string newtype,
+/// say) has two ways in: pass `&*wrapper` to go through the `str`
+/// implementation, or implement this trait for it, which is why the trait is
+/// public. What is deliberately *not* offered is a blanket implementation over
+/// `Deref<Target = str>`: it collides with `Jid` and with the reference
+/// implementations at once, since `&str` derefs to `str` as well.
+pub trait DsmDestination {
+    /// Exactly the number of bytes [`Self::write_into`] appends.
+    ///
+    /// The DSM field writes this as a length prefix before the bytes, so an
+    /// implementation that disagrees with itself puts a prefix on the wire that
+    /// points past its own payload, and the peer reads the next protobuf field
+    /// from the wrong offset.
+    fn encoded_len(&self) -> usize;
+
+    /// Appends the destination's wire form, whose length must equal
+    /// [`Self::encoded_len`].
+    fn write_into(&self, out: &mut Vec<u8>);
+}
+
+/// A generic parameter does not deref-coerce the way the old `&str` argument
+/// did, so every shape a caller could previously pass has to be reachable by
+/// an implementation instead.
+///
+/// The trait is therefore implemented on the *owned* types, and the two blanket
+/// implementations below carry it through references. That covers a reference
+/// of any depth and mutability (`&String`, `&mut String`, `&&str`) without
+/// naming each one, which a finite list cannot do.
+///
+/// Recorded so it is not attempted again: a blanket
+/// `impl<T: Deref<Target = str>>` over the *reference* types instead would
+/// collide with the `Jid` implementation, because coherence cannot rule out
+/// `Jid` gaining that `Deref`.
+macro_rules! dsm_destination_via_str {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl DsmDestination for $ty {
+            #[inline]
+            fn encoded_len(&self) -> usize {
+                str::len(self)
+            }
+
+            #[inline]
+            fn write_into(&self, out: &mut Vec<u8>) {
+                out.extend_from_slice(str::as_bytes(self));
+            }
+        }
+    )+};
+}
+
+dsm_destination_via_str!(
+    str,
+    String,
+    Box<str>,
+    std::rc::Rc<str>,
+    std::sync::Arc<str>,
+    std::borrow::Cow<'_, str>,
+);
+
+impl<T: DsmDestination + ?Sized> DsmDestination for &T {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    #[inline]
+    fn write_into(&self, out: &mut Vec<u8>) {
+        (**self).write_into(out);
+    }
+}
+
+impl<T: DsmDestination + ?Sized> DsmDestination for &mut T {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    #[inline]
+    fn write_into(&self, out: &mut Vec<u8>) {
+        (**self).write_into(out);
+    }
+}
+
+impl DsmDestination for wacore_binary::jid::Jid {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        let mut counter = DisplayLen(0);
+        // Infallible: the counter never errors, so the render always completes.
+        let _ = self.write_display_to(&mut counter);
+        counter.0
+    }
+
+    #[inline]
+    fn write_into(&self, out: &mut Vec<u8>) {
+        let _ = self.write_display_to(&mut Utf8Sink(out));
+    }
+}
+
+/// Counts what a render would write, so the length is known before the bytes.
+struct DisplayLen(usize);
+
+impl core::fmt::Write for DisplayLen {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
+/// Appends a render straight into the wire buffer.
+struct Utf8Sink<'a>(&'a mut Vec<u8>);
+
+impl core::fmt::Write for Utf8Sink<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl MessageUtils {
     fn random_pad_len() -> u8 {
         use rand::RngExt;
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        // The thread-local generator directly: seeding a fresh StdRng per
+        // plaintext ran a full ChaCha key schedule to produce one byte.
+        let mut rng = rand::rng();
         // Uniform 1..=16, matching WA Web / whatsmeow (rand%16 + 1). The prior
         // `& 0x0F` with a 0->15 remap skewed toward 15 and never produced 16.
         (rng.random::<u8>() & 0x0F) + 1
@@ -126,7 +253,7 @@ impl MessageUtils {
     pub fn encode_dm_plaintexts(
         message: &wa::Message,
         extra_context: Option<&wa::MessageContextInfo>,
-        destination_jid: &str,
+        destination_jid: impl DsmDestination,
     ) -> DmPlaintexts {
         if message.message_context_info.is_set() {
             let mut owned = message.clone();
@@ -162,7 +289,7 @@ impl MessageUtils {
         });
         let mut msg_cache = buffa::SizeCache::new();
         let content_len = waproto::codec::message_compute_size(message, &mut msg_cache);
-        let dest = destination_jid.as_bytes();
+        let dest_len = destination_jid.encoded_len();
 
         // recipient = content (encoded once) + the extra message_context_info field.
         // Pre-size for content + the appended mci field + padding so it never
@@ -175,7 +302,7 @@ impl MessageUtils {
         // pre-computed so the spliced content goes straight in, and the buffer is sized
         // exactly (device_sent_message field + mci field + padding): one allocation, no
         // reallocation regardless of whether extra_context is present.
-        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest_len)
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
         let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
         let mut own_devices = Vec::with_capacity(own_cap);
@@ -185,7 +312,13 @@ impl MessageUtils {
             &mut own_devices,
         );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
-        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_wire_tag(
+            TAG_DSM_DESTINATION_JID,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut own_devices,
+        );
+        push_varint(dest_len as u64, &mut own_devices);
+        destination_jid.write_into(&mut own_devices);
         push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
         if let Some(extra) = extra_context {
             push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut own_devices);
@@ -214,7 +347,7 @@ impl MessageUtils {
     pub fn dm_plaintexts_from_encoded(
         content: &[u8],
         extra_context: Option<&wa::MessageContextInfo>,
-        destination_jid: &str,
+        destination_jid: impl DsmDestination,
     ) -> DmPlaintexts {
         const MAX_PAD: usize = 16;
 
@@ -226,12 +359,12 @@ impl MessageUtils {
             )
         });
         let content_len = content.len();
-        let dest = destination_jid.as_bytes();
+        let dest_len = destination_jid.encoded_len();
 
         let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
         recipient.extend_from_slice(content);
 
-        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest_len)
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
         let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
         let mut own_devices = Vec::with_capacity(own_cap);
@@ -241,7 +374,13 @@ impl MessageUtils {
             &mut own_devices,
         );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
-        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_wire_tag(
+            TAG_DSM_DESTINATION_JID,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut own_devices,
+        );
+        push_varint(dest_len as u64, &mut own_devices);
+        destination_jid.write_into(&mut own_devices);
         push_len_delimited(TAG_DSM_MESSAGE, content, &mut own_devices);
         if let Some(extra) = extra_context {
             push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut own_devices);
@@ -261,7 +400,10 @@ impl MessageUtils {
     /// top-level `message_context_info` that must be hoisted onto the DSM wrapper
     /// (`wrap_device_sent` semantics). Hoisting requires ownership; the common path in
     /// [`encode_dm_plaintexts`] borrows instead and never reaches this.
-    fn encode_dm_plaintexts_owned(mut message: wa::Message, destination_jid: &str) -> DmPlaintexts {
+    fn encode_dm_plaintexts_owned(
+        mut message: wa::Message,
+        destination_jid: impl DsmDestination,
+    ) -> DmPlaintexts {
         const MAX_PAD: usize = 16;
 
         // Hoist message_context_info onto the wrapper (as wrap_device_sent does) so the
@@ -277,12 +419,12 @@ impl MessageUtils {
         });
         let mut msg_cache = buffa::SizeCache::new();
         let content_len = waproto::codec::message_compute_size(&message, &mut msg_cache);
-        let dest = destination_jid.as_bytes();
+        let dest_len = destination_jid.encoded_len();
 
         let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
         waproto::codec::message_write_to(&message, &mut msg_cache, &mut recipient);
 
-        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest_len)
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
         let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
         let mut own_devices = Vec::with_capacity(own_cap);
@@ -292,7 +434,13 @@ impl MessageUtils {
             &mut own_devices,
         );
         push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
-        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_wire_tag(
+            TAG_DSM_DESTINATION_JID,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut own_devices,
+        );
+        push_varint(dest_len as u64, &mut own_devices);
+        destination_jid.write_into(&mut own_devices);
         push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
         if let Some(mci) = &mci {
             push_message_field(TAG_MESSAGE_CONTEXT_INFO, mci, &mut own_devices);
@@ -325,7 +473,7 @@ impl MessageUtils {
         let mut arena = String::with_capacity(ranges.capacity() * 36);
         for jid in devices {
             let start = arena.len();
-            jid.push_ad_to(&mut arena);
+            jid.push_phash_form_to(&mut arena);
             ranges.push((start, arena.len()));
         }
         ranges.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
@@ -1125,9 +1273,12 @@ pub fn parse_message_info(
             .unwrap_or_default(),
         timestamp: crate::time::from_secs_or_now(attrs.unix_time("t")),
         category,
+        // Parse from the borrowed attribute: `From<String>` immediately
+        // re-borrows it, so materializing a String first only buys a discarded
+        // allocation for every known variant.
         edit: attrs
             .optional_string("edit")
-            .map(|s| EditAttribute::from(s.to_string()))
+            .map(|s| EditAttribute::from(s.as_ref()))
             .unwrap_or_default(),
         is_offline,
         server_timestamp_us,
@@ -1686,7 +1837,10 @@ mod parse_message_info_tests {
         }
 
         let single = vec![dev("5511999999999", 3, wacore_binary::Server::Pn)];
-        assert_eq!(single[0].to_ad_string(), "5511999999999.0:3@s.whatsapp.net");
+        assert_eq!(
+            single[0].to_phash_form_string(),
+            "5511999999999.0:3@s.whatsapp.net"
+        );
         let h_single = MessageUtils::participant_list_hash(&single).unwrap();
 
         let control = vec![dev("5511999999999", 0, wacore_binary::Server::Pn)];
@@ -1740,7 +1894,7 @@ mod parse_message_info_tests {
             dev("999", 0, 65535, wacore_binary::Server::Bot),
         ];
 
-        let mut reference: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
+        let mut reference: Vec<String> = devices.iter().map(|j| j.to_phash_form_string()).collect();
         reference.sort_unstable();
         let mut hasher = Sha256::new();
         for jid in &reference {
@@ -1825,6 +1979,162 @@ mod parse_message_info_tests {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod device_sent_tests {
+
+    /// The DSM field writes its length before its bytes, so a `Jid` that
+    /// measures itself differently than it renders would emit a length prefix
+    /// that disagrees with the payload: the peer would then read the next field
+    /// from the wrong offset and the whole message would be garbage.
+    #[test]
+    fn a_jid_measures_itself_exactly_as_it_renders() {
+        use wacore_binary::jid::Jid;
+
+        let cases = [
+            "5511987650001@s.whatsapp.net",
+            "5511987650001:5@s.whatsapp.net",
+            "5511987650001.2:5@s.whatsapp.net",
+            "120363021033254949@g.us",
+            "100000012345678:25@lid",
+            "867051314767696:0@bot",
+            "status@broadcast",
+            "ẞünïcodé-ñ@s.whatsapp.net",
+        ];
+
+        for case in cases {
+            let jid: Jid = case.parse().unwrap_or_else(|e| panic!("parse {case}: {e}"));
+            let mut written = Vec::new();
+            jid.write_into(&mut written);
+
+            assert_eq!(
+                jid.encoded_len(),
+                written.len(),
+                "{case}: the counted length must equal the bytes written"
+            );
+            assert_eq!(
+                written,
+                jid.to_string().into_bytes(),
+                "{case}: writing directly must match rendering through a String"
+            );
+        }
+    }
+
+    /// The two spellings of the same destination must produce identical wire
+    /// bytes, since one of them is what actually goes out now.
+    #[test]
+    fn naming_the_destination_by_jid_matches_naming_it_by_string() {
+        use wacore_binary::jid::Jid;
+
+        let jid: Jid = "5511987650001:5@s.whatsapp.net".parse().expect("parse");
+        let message = wa::Message {
+            conversation: Some("destination check".to_string()),
+            ..Default::default()
+        };
+        let content = waproto::codec::message_to_vec(&message);
+
+        let by_string =
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, jid.to_string().as_str());
+        let by_jid = MessageUtils::dm_plaintexts_from_encoded(&content, None, &jid);
+
+        // Padding is random, so compare the unpadded prefix: everything the DSM
+        // field contributes lands before it.
+        let prefix = by_jid.own_devices.len().min(by_string.own_devices.len()) - 16;
+        assert_eq!(
+            by_jid.own_devices[..prefix],
+            by_string.own_devices[..prefix],
+            "the DSM bytes must not depend on how the destination was named"
+        );
+    }
+
+    /// The generic parameter does not deref-coerce, so every wrapper a caller
+    /// may hold its destination in has to be named by an implementation. This
+    /// is a compile-time check as much as a runtime one: a wrapper missing from
+    /// the list fails to build here rather than in a downstream crate.
+    #[test]
+    fn every_string_wrapper_names_the_same_destination() {
+        use std::borrow::Cow;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let message = wa::Message {
+            conversation: Some("wrapper check".to_string()),
+            ..Default::default()
+        };
+        let content = waproto::codec::message_to_vec(&message);
+        let dest = "5511987650001:5@s.whatsapp.net";
+
+        let mut owned = dest.to_string();
+        let boxed: Box<str> = dest.into();
+        let rc: Rc<str> = dest.into();
+        let arc: Arc<str> = dest.into();
+        let cow: Cow<'_, str> = Cow::Borrowed(dest);
+        let mut owned_mut = dest.to_string();
+
+        let reference = MessageUtils::dm_plaintexts_from_encoded(&content, None, dest);
+        let prefix = reference.own_devices.len() - 16;
+
+        // A mutable destination coerced to `&str` before this trait existed, so
+        // both forms have to keep working; `&mut str` is reached through the
+        // owned string it borrows from.
+        let by_mut_string =
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &mut owned_mut);
+        let by_mut_str =
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &mut *owned.as_mut_str());
+
+        // Through `encode_dm_plaintexts` specifically: it is the entry point
+        // that carried a `Copy` bound, which no `&mut` destination satisfies.
+        let by_mut_through_encode =
+            MessageUtils::encode_dm_plaintexts(&message, None, &mut owned_mut);
+
+        // Nested references coerced too, and a finite list of implementations
+        // could never cover every depth. These pin that the blanket ones do, so
+        // the extra borrows clippy offers to remove are the whole point here.
+        #[allow(
+            clippy::needless_borrows_for_generic_args,
+            reason = "the nested reference is what this asserts is accepted"
+        )]
+        let (by_double, by_triple, by_ref_to_owned) = (
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &dest),
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &&dest),
+            MessageUtils::dm_plaintexts_from_encoded(&content, None, &&owned),
+        );
+
+        for (name, produced) in [
+            ("&&str", by_double),
+            ("&&&str", by_triple),
+            ("&&String", by_ref_to_owned),
+            ("&mut String", by_mut_string),
+            ("&mut str", by_mut_str),
+            (
+                "&mut String via encode_dm_plaintexts",
+                by_mut_through_encode,
+            ),
+            (
+                "String",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &owned),
+            ),
+            (
+                "Box<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &boxed),
+            ),
+            (
+                "Rc<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &rc),
+            ),
+            (
+                "Arc<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &arc),
+            ),
+            (
+                "Cow<str>",
+                MessageUtils::dm_plaintexts_from_encoded(&content, None, &cow),
+            ),
+        ] {
+            assert_eq!(
+                produced.own_devices[..prefix],
+                reference.own_devices[..prefix],
+                "a destination held in {name} must name itself exactly as &str does"
+            );
+        }
+    }
     use super::*;
 
     fn msg_with_secret(secret: &[u8]) -> wa::Message {

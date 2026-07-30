@@ -591,8 +591,23 @@ impl Client {
     ///   handled by the ack gate, not here).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn send_delivery_receipt(&self, info: &MessageInfo) {
-        if !Self::should_send_delivery_receipt(info) {
+        let Some(frame) = self.prepare_delivery_receipt(info) else {
             return;
+        };
+        if let Err(e) = self.send_raw_bytes(frame).await
+            && !matches!(e, crate::client::ClientError::NotConnected)
+        {
+            log::warn!(target: "Client/Receipt", "Failed to send delivery receipt for message {}: {:?}", info.id, e);
+        }
+    }
+
+    /// Everything [`Self::send_delivery_receipt`] does short of the send: the
+    /// eligibility gate, node construction, logging and marshalling. Returns
+    /// `None` when no receipt is owed. Split out so the receipt worker can
+    /// prepare a whole burst before touching the socket.
+    pub(crate) fn prepare_delivery_receipt(&self, info: &MessageInfo) -> Option<Vec<u8>> {
+        if !Self::should_send_delivery_receipt(info) {
+            return None;
         }
 
         let receipt_node = build_delivery_receipt_node(info, self.receipts_are_active());
@@ -611,11 +626,11 @@ impl Client {
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
             receipt_kind.as_wire_str(), info.id, info.source.sender.observe());
 
-        if let Err(e) = self.send_node(receipt_node).await
-            && !matches!(e, crate::client::ClientError::NotConnected)
-        {
-            log::warn!(target: "Client/Receipt", "Failed to send delivery receipt for message {}: {:?}", info.id, e);
-        }
+        self.marshal_node_for_send(receipt_node)
+            .inspect_err(|e| {
+                log::warn!(target: "Client/Receipt", "Failed to marshal delivery receipt for message {}: {:?}", info.id, e);
+            })
+            .ok()
     }
 
     /// Buffer an offline-drained message's delivery receipt for the aggregate

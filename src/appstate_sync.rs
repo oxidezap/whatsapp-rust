@@ -13,8 +13,8 @@ mod tests {
     use std::sync::Arc;
     use wacore::appstate::WAPATCH_INTEGRITY;
     use wacore::appstate::hash::HashState;
-    use wacore::appstate::hash::generate_content_mac;
-    use wacore::appstate::keys::expand_app_state_keys;
+    use wacore::appstate::hash::{generate_content_mac, generate_patch_mac};
+    use wacore::appstate::keys::{ExpandedAppStateKeys, expand_app_state_keys};
     use wacore::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
     use wacore::appstate::processor::AppStateMutationMAC;
     use wacore::libsignal::crypto::aes_256_cbc_encrypt_into;
@@ -315,7 +315,7 @@ mod tests {
         op: wa::syncd_mutation::SyncdOperation,
         index_mac: &[u8],
         plaintext: &[u8],
-        keys: &wacore::appstate::keys::ExpandedAppStateKeys,
+        keys: &ExpandedAppStateKeys,
         key_id_bytes: &[u8],
     ) -> wa::SyncdMutation {
         let iv = vec![0u8; 16];
@@ -983,6 +983,269 @@ mod tests {
             missing,
             vec![snapshot_key_id],
             "the snapshot's key must be requestable after inlining the blob"
+        );
+    }
+
+    // ─── #1156: a collection whose ltHash diverged must still converge ───────
+    //
+    // A patch carries two aggregate MACs. `patchMac` covers the patch's own
+    // bytes under the app-state key, so it proves the patch came from a device
+    // that holds the key — the server cannot forge it. `snapshotMac` covers the
+    // ltHash the SENDER held after applying the patch, so it only agrees when
+    // the receiver's base is byte-identical to the sender's.
+    //
+    // Once a receiver's ltHash diverges, every later patch fails the snapshotMac
+    // comparison forever, whatever its origin. WA Web
+    // (`WAWebSyncdAntiTampering`, fn `z`) treats that case as degradation, not
+    // tampering: on a snapshotMac mismatch raised from a PATCH it persists
+    // `isCollectionInMacMismatchFatal` for the collection, logs
+    // "skip fatal after snapshot mac mismatch", and keeps applying — and every
+    // later patch short-circuits at `if (E && k) return null`, skipping the
+    // comparison entirely. Only a mismatch raised from a SNAPSHOT is fatal
+    // (it escalates to peer snapshot recovery).
+    //
+    // These two tests pin the whole-pipeline half of that: a divergent patch
+    // reaches `process_patch_list`, applies, advances the persisted version,
+    // and leaves the latch on disk. The pure-validation half is pinned in
+    // `wacore-appstate`'s own tests.
+
+    /// Sign `patch` the way a diverged peer signs one: a correct `patchMac`
+    /// (the patch really is authentic), over a `snapshotMac` computed from
+    /// `foreign_hash` — an ltHash this client does not share.
+    fn sign_patch_over_foreign_base(
+        patch: &mut wa::SyncdPatch,
+        keys: &ExpandedAppStateKeys,
+        collection: &str,
+        version: u64,
+        foreign_hash: [u8; 128],
+    ) {
+        let foreign = HashState {
+            version,
+            hash: foreign_hash,
+            ..Default::default()
+        };
+        patch.snapshot_mac = Some(foreign.generate_snapshot_mac(collection, &keys.snapshot_mac));
+        // patchMac is computed over snapshot_mac, so it must be stamped last.
+        patch.patch_mac = Some(generate_patch_mac(
+            patch,
+            collection,
+            &keys.patch_mac,
+            version,
+        ));
+    }
+
+    /// A mutation that survives `validate_macs = true`: the record's index blob
+    /// is the HMAC of the index identity bytes, and the encrypted payload
+    /// carries the same identity, so `decode_record`'s index-MAC check agrees.
+    fn validating_mutation(
+        index: &[u8],
+        timestamp: i64,
+        keys: &ExpandedAppStateKeys,
+        key_id: &[u8],
+    ) -> wa::SyncdMutation {
+        let plaintext = wa::SyncActionData {
+            index: Some(index.to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(timestamp),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &wacore::appstate::hash::generate_index_mac(index, &keys.index),
+            &plaintext,
+            keys,
+            key_id,
+        )
+    }
+
+    /// The steady-state shape of #1156: the collection is at v5 with an ltHash
+    /// nobody else computes, and the server keeps serving the authentic patches
+    /// that follow. Every one of them must apply — refusing them only freezes
+    /// the collection at the base already proven wrong, which is the reported
+    /// "114 identical failures, forever" loop.
+    #[tokio::test]
+    async fn diverged_collection_keeps_applying_authentic_patches() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let name = WAPatchName::RegularLow;
+        let key_id = b"diverged_key_id".to_vec();
+        let master_key = [3u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept sync key");
+
+        // Diverged base: a non-empty ltHash at v5 that no peer would compute.
+        backend
+            .set_version(
+                name.as_str(),
+                HashState {
+                    version: 5,
+                    hash: [0x11; 128],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+
+        for (version, index_mac, foreign_hash) in [
+            (6u64, [0x21u8; 32], [0x99u8; 128]),
+            (7, [0x22; 32], [0x9A; 128]),
+        ] {
+            let mut patch = wa::SyncdPatch {
+                version: buffa::MessageField::some(wa::SyncdVersion {
+                    version: Some(version),
+                }),
+                mutations: vec![validating_mutation(
+                    &index_mac,
+                    version as i64 * 1000,
+                    &keys,
+                    &key_id,
+                )],
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(key_id.clone()),
+                }),
+                ..Default::default()
+            };
+            sign_patch_over_foreign_base(&mut patch, &keys, name.as_str(), version, foreign_hash);
+
+            let patch_list = PatchList {
+                name,
+                has_more_patches: false,
+                patches: vec![patch],
+                snapshot: None,
+                snapshot_ref: None,
+                error: None,
+            };
+
+            let (mutations, state, _) = processor
+                .process_patch_list(patch_list, true)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "v{version} carries a valid patchMac, so it is authentic and must apply \
+                         even though the local ltHash diverged: {e:#}"
+                    )
+                });
+
+            assert_eq!(mutations.len(), 1, "v{version} mutation must be dispatched");
+            assert_eq!(state.version, version);
+            let persisted = backend
+                .get_version(name.as_str())
+                .await
+                .expect("version readable");
+            assert_eq!(
+                persisted.version, version,
+                "the collection must advance, or the next sync re-requests the same patch"
+            );
+            assert!(
+                persisted.mac_mismatch_fatal,
+                "the latch must be persisted with the version, or a restart re-detects \
+                 the divergence on v{version} and every patch after it"
+            );
+        }
+    }
+
+    /// The second half of #1156, from the issue's follow-up comment: resetting
+    /// the collection and re-fetching the snapshot recovers the base, but the
+    /// server's post-snapshot window can still contain a patch the diverged
+    /// client itself pushed. The snapshot validates and the trailing patch does
+    /// not, so today the error propagates after the snapshot was persisted:
+    /// the trailing patch's mutations are dropped and the collection never
+    /// passes the cut, re-fetching the same snapshot forever.
+    #[tokio::test]
+    async fn poisoned_trailing_patch_does_not_strand_a_valid_snapshot() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let name = WAPatchName::RegularLow;
+        let key_id = b"trailing_key_id".to_vec();
+        let master_key = [4u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept sync key");
+
+        // A legitimately signed snapshot at v10 (the reset-and-refetch result).
+        let record = validating_mutation(&[0x31; 32], 10_000, &keys, &key_id)
+            .record
+            .into_option()
+            .expect("mutation carries a record");
+        let mut snapshot_state = HashState {
+            version: 10,
+            ..Default::default()
+        };
+        snapshot_state.update_hash_from_records(std::slice::from_ref(&record));
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(10) }),
+            records: vec![record],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            mac: Some(snapshot_state.generate_snapshot_mac(name.as_str(), &keys.snapshot_mac)),
+        };
+
+        // The trailing patch the diverged client pushed before it was reset.
+        let mut trailing = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(11) }),
+            mutations: vec![validating_mutation(&[0x32; 32], 11_000, &keys, &key_id)],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+        sign_patch_over_foreign_base(&mut trailing, &keys, name.as_str(), 11, [0x77; 128]);
+
+        let patch_list = PatchList {
+            name,
+            has_more_patches: false,
+            patches: vec![trailing],
+            snapshot: Some(snapshot),
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let (mutations, state, _) = processor
+            .process_patch_list(patch_list, true)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("a poisoned trailing patch must not strand a valid snapshot: {e:#}")
+            });
+
+        assert_eq!(
+            mutations.len(),
+            2,
+            "the snapshot record and the trailing patch's mutation must both dispatch"
+        );
+        assert_eq!(state.version, 11);
+        assert_eq!(
+            backend
+                .get_version(name.as_str())
+                .await
+                .expect("version readable")
+                .version,
+            11,
+            "the collection must pass the cut, or every later sync repeats the snapshot"
         );
     }
 }

@@ -17,6 +17,7 @@
 //! without seeing the full message content. Only specific fields are extracted
 //! based on a predefined whitelist matching WhatsApp Web behavior.
 
+use smallvec::SmallVec;
 use std::{fmt, sync::LazyLock};
 
 use anyhow::{Result, anyhow};
@@ -499,23 +500,52 @@ fn encode_varint(value: u64) -> Vec<u8> {
     buf[..len].to_vec()
 }
 
-/// Extract reporting token content from encoded protobuf message bytes.
+/// One extracted field's bytes on the way to the token.
 ///
-/// This function parses raw protobuf bytes and extracts only the fields
-/// specified in the whitelist, matching WhatsApp Web's behavior.
+/// A field the token copies verbatim is named by its range in the input, so it
+/// is copied once, into the result. Only a nested field, whose content is
+/// re-framed under a fresh tag and length, has bytes of its own.
+enum Piece {
+    Borrowed(core::ops::Range<usize>),
+    Owned(Vec<u8>),
+}
+
+impl Piece {
+    fn len(&self) -> usize {
+        match self {
+            Piece::Borrowed(range) => range.len(),
+            Piece::Owned(bytes) => bytes.len(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts collector runs so a test can pin that generating a token parses
+    /// the message once. A nested field owns its bytes, so a second collection
+    /// is not just a second parse, it is a second set of buffers.
+    static COLLECT_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The whitelisted pieces, in the order the token concatenates them.
 ///
-/// # Arguments
-/// * `data` - Raw protobuf-encoded message bytes
-/// * `whitelist` - List of fields to extract
-///
-/// # Returns
-/// Concatenated bytes of all extracted fields, or None if no fields match
-pub fn extract_reporting_token_content(
+/// Split out from [`extract_reporting_token_content`] so the HMAC can consume
+/// them directly: the token is `HMAC(key, concat(pieces))` and `Mac::update` is
+/// associative over its input, so feeding the pieces one by one gives the same
+/// bytes without building the concatenation at all.
+fn collect_reporting_token_pieces(
     data: &[u8],
     whitelist: &[ReportingField],
-) -> Option<Vec<u8>> {
-    // Pre-size: most messages have 1-3 fields
-    let mut extracted: Vec<(u32, Vec<u8>)> = Vec::with_capacity(4);
+) -> Option<SmallVec<[(u32, Piece); 4]>> {
+    #[cfg(test)]
+    COLLECT_CALLS.with(|c| c.set(c.get() + 1));
+
+    // The token's bytes are contract: fields are concatenated in ascending
+    // field-number order, ties in wire order (`sort_by_key` is stable). Only
+    // where the bytes come from changed -- a flat field is named by its range
+    // in the input, and the staging list is inline for the field counts a real
+    // message has.
+    let mut extracted: SmallVec<[(u32, Piece); 4]> = SmallVec::new();
     let mut pos = 0;
 
     while pos < data.len() {
@@ -539,7 +569,7 @@ pub fn extract_reporting_token_content(
                 let (_, val_len) = decode_varint(&data[pos..])?;
                 pos += val_len;
                 if entry.is_some() {
-                    extracted.push((field_number, data[field_start..pos].to_vec()));
+                    extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                 }
             }
             wire_type::FIXED64 => {
@@ -548,7 +578,7 @@ pub fn extract_reporting_token_content(
                 }
                 pos += 8;
                 if entry.is_some() {
-                    extracted.push((field_number, data[field_start..pos].to_vec()));
+                    extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                 }
             }
             wire_type::FIXED32 => {
@@ -557,7 +587,7 @@ pub fn extract_reporting_token_content(
                 }
                 pos += 4;
                 if entry.is_some() {
-                    extracted.push((field_number, data[field_start..pos].to_vec()));
+                    extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                 }
             }
             wire_type::LENGTH_DELIMITED => {
@@ -588,7 +618,7 @@ pub fn extract_reporting_token_content(
                             field_bytes.extend_from_slice(&tag_buf[..tag_len]);
                             field_bytes.extend_from_slice(&len_buf[..len_len]);
                             field_bytes.extend(nested);
-                            extracted.push((field_number, field_bytes));
+                            extracted.push((field_number, Piece::Owned(field_bytes)));
                         }
                     } else if let Some(subfields) = entry.subfields {
                         if let Some(nested) = extract_reporting_token_content(
@@ -607,10 +637,10 @@ pub fn extract_reporting_token_content(
                             field_bytes.extend_from_slice(&tag_buf[..tag_len]);
                             field_bytes.extend_from_slice(&len_buf[..len_len]);
                             field_bytes.extend(nested);
-                            extracted.push((field_number, field_bytes));
+                            extracted.push((field_number, Piece::Owned(field_bytes)));
                         }
                     } else {
-                        extracted.push((field_number, data[field_start..pos].to_vec()));
+                        extracted.push((field_number, Piece::Borrowed(field_start..pos)));
                     }
                 }
             }
@@ -625,13 +655,39 @@ pub fn extract_reporting_token_content(
         return None;
     }
 
+    // The token's bytes are contract: ascending field number, ties in wire
+    // order, which `sort_by_key` preserves because it is stable.
     extracted.sort_by_key(|(num, _)| *num);
+    Some(extracted)
+}
 
-    let total_len: usize = extracted.iter().map(|(_, v)| v.len()).sum();
+/// Extract reporting token content from encoded protobuf message bytes.
+///
+/// Builds the concatenation. The send path does not need it: it feeds the
+/// pieces straight to the HMAC instead.
+pub fn extract_reporting_token_content(
+    data: &[u8],
+    whitelist: &[ReportingField],
+) -> Option<Vec<u8>> {
+    let pieces = collect_reporting_token_pieces(data, whitelist)?;
+
+    let total_len: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
     let mut result = Vec::with_capacity(total_len);
-    for (_, bytes) in extracted {
-        result.extend(bytes);
+    for (_, piece) in pieces {
+        match piece {
+            Piece::Borrowed(range) => result.extend_from_slice(&data[range]),
+            Piece::Owned(bytes) => result.extend_from_slice(&bytes),
+        }
     }
+    // The reservation is only worth making if it matches what was written; an
+    // understated `Piece::len` would reallocate here and go unnoticed
+    // otherwise. Checked rather than asserted on capacity, which the allocator
+    // is free to round up.
+    debug_assert_eq!(
+        result.len(),
+        total_len,
+        "the reservation disagreed with the bytes written"
+    );
     Some(result)
 }
 
@@ -668,6 +724,44 @@ pub fn calculate_reporting_token(
     token.copy_from_slice(&result[..REPORTING_TOKEN_SIZE]);
 
     Ok(token)
+}
+
+/// Same token as [`calculate_reporting_token`] over the concatenated content,
+/// without building that concatenation.
+///
+/// `Mac::update` is associative over its input, so feeding each whitelisted
+/// piece in token order hashes exactly the bytes the concatenation would have
+/// held.
+///
+/// Takes the pieces rather than collecting them: a nested field owns its
+/// re-framed bytes, so collecting twice would materialise those buffers twice
+/// and parse the message twice, which costs more than the concatenation this
+/// avoids.
+fn calculate_reporting_token_over_pieces(
+    reporting_token_key: &[u8; REPORTING_TOKEN_KEY_SIZE],
+    data: &[u8],
+    pieces: &[(u32, Piece)],
+) -> Option<[u8; REPORTING_TOKEN_SIZE]> {
+    // Both callers reach here through `collect_reporting_token_pieces`, which
+    // already returns `None` for a message with nothing whitelisted. Repeated
+    // here because the alternative is minting a perfectly valid token over no
+    // content at all, and that must not depend on a caller remembering to check.
+    if pieces.is_empty() {
+        return None;
+    }
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(reporting_token_key).ok()?;
+    for (_, piece) in pieces {
+        match piece {
+            Piece::Borrowed(range) => mac.update(&data[range.clone()]),
+            Piece::Owned(bytes) => mac.update(bytes),
+        }
+    }
+
+    let result = mac.finalize().into_bytes();
+    let mut token = [0u8; REPORTING_TOKEN_SIZE];
+    token.copy_from_slice(&result[..REPORTING_TOKEN_SIZE]);
+    Some(token)
 }
 
 /// Result of generating a reporting token for a message
@@ -726,7 +820,7 @@ pub fn generate_reporting_token_from_encoded(
     if !should_include_reporting_token(message) {
         return None;
     }
-    let content = extract_reporting_token_content(encoded_message, REPORTING_FIELDS)?;
+    let pieces = collect_reporting_token_pieces(encoded_message, REPORTING_FIELDS)?;
 
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
         if secret.len() != MESSAGE_SECRET_SIZE {
@@ -743,7 +837,7 @@ pub fn generate_reporting_token_from_encoded(
         derive_reporting_token_key_for_jids(&message_secret, stanza_id, sender_jid, remote_jid)
             .ok()?;
 
-    let token = calculate_reporting_token(&key, &content).ok()?;
+    let token = calculate_reporting_token_over_pieces(&key, encoded_message, &pieces)?;
 
     Some(ReportingTokenResult {
         message_secret,
@@ -758,8 +852,11 @@ pub fn generate_reporting_token_from_encoded(
     tracing::instrument(name = "wa.send.reporting_node", level = "debug", skip_all)
 )]
 pub fn build_reporting_node(result: &ReportingTokenResult) -> Node {
+    // The integer goes in as an integer: `NodeValue`'s numeric conversion
+    // formats through `itoa` into an inline `CompactString`, while a
+    // `to_string()` first would heap-allocate a one-byte String per message.
     let token_node = NodeBuilder::new("reporting_token")
-        .attrs([("v", result.version.to_string())])
+        .attr("v", result.version)
         .bytes(result.reporting_token.to_vec())
         .build();
 
@@ -802,6 +899,129 @@ pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Generating a token must parse the message once. Collecting twice would
+    /// re-materialise every nested field's owned buffer, which costs more than
+    /// the concatenation this change removes: the streaming path would then be
+    /// slower than what it replaced for exactly the messages that carry media
+    /// or quoted text.
+    #[test]
+    fn generating_a_token_collects_the_pieces_once() {
+        let message = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("nested content owns its bytes".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = waproto::codec::message_to_vec(&message);
+        let sender: Jid = "5511987650001@s.whatsapp.net".parse().expect("sender");
+        let remote: Jid = "5511987650002@s.whatsapp.net".parse().expect("remote");
+
+        COLLECT_CALLS.with(|c| c.set(0));
+        let result = generate_reporting_token_from_encoded(
+            &message,
+            &encoded,
+            "3EB0ABCDEF",
+            &sender,
+            &remote,
+            None,
+        );
+        assert!(result.is_some(), "the message must produce a token");
+        // Two: once for the message, once for the nested field, which the
+        // collector re-frames through the same path. What must not happen is
+        // four, which is what collecting again to feed the hmac would cost.
+        assert_eq!(
+            COLLECT_CALLS.with(|c| c.get()),
+            2,
+            "the pieces must be collected once and reused for the hmac"
+        );
+    }
+
+    /// The streaming HMAC must hash exactly the bytes the concatenation would
+    /// have held. The token goes on the wire and is verified by the server, so
+    /// a divergence here is not a performance bug, it is a message the peer
+    /// rejects.
+    #[test]
+    fn streaming_and_concatenating_produce_the_same_token() {
+        let key = [0x5au8; REPORTING_TOKEN_KEY_SIZE];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("flat text field", {
+                let m = wa::Message {
+                    conversation: Some("hello reporting".to_string()),
+                    ..Default::default()
+                };
+                waproto::codec::message_to_vec(&m)
+            }),
+            ("nested field", {
+                let m = wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("nested body".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                };
+                waproto::codec::message_to_vec(&m)
+            }),
+            // Two whitelisted fields, so the pieces have an order to get wrong.
+            // With a single piece the concatenation is trivially the same
+            // whatever order it is fed in, and this test would prove nothing.
+            ("two fields, so order matters", {
+                let m = wa::Message {
+                    conversation: Some("first by field number".to_string()),
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("sixth by field number".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                };
+                waproto::codec::message_to_vec(&m)
+            }),
+            ("multibyte payload", {
+                let m = wa::Message {
+                    conversation: Some("olá 🌍 ünïcode".repeat(4)),
+                    ..Default::default()
+                };
+                waproto::codec::message_to_vec(&m)
+            }),
+        ];
+
+        for (name, encoded) in cases {
+            let concatenated = extract_reporting_token_content(&encoded, REPORTING_FIELDS)
+                .unwrap_or_else(|| panic!("{name}: the case must extract something"));
+            let expected = calculate_reporting_token(&key, &concatenated)
+                .unwrap_or_else(|_| panic!("{name}: hmac over the concatenation"));
+            let pieces = collect_reporting_token_pieces(&encoded, REPORTING_FIELDS)
+                .unwrap_or_else(|| panic!("{name}: the case must collect something"));
+            let streamed = calculate_reporting_token_over_pieces(&key, &encoded, &pieces)
+                .unwrap_or_else(|| panic!("{name}: hmac over the pieces"));
+            assert_eq!(streamed, expected, "{name}: the token bytes are contract");
+        }
+    }
+
+    /// Bad path: a message with nothing whitelisted must decline in both
+    /// spellings rather than hashing an empty input, which would produce a
+    /// perfectly valid token for no content.
+    #[test]
+    fn a_message_with_nothing_to_report_produces_no_token() {
+        let key = [0x5au8; REPORTING_TOKEN_KEY_SIZE];
+        let encoded = waproto::codec::message_to_vec(&wa::Message::default());
+
+        assert!(extract_reporting_token_content(&encoded, REPORTING_FIELDS).is_none());
+        assert!(collect_reporting_token_pieces(&encoded, REPORTING_FIELDS).is_none());
+
+        // The collector is what stops the HMAC from ever seeing an empty list,
+        // so the HMAC is asked directly: a token over no content is a token
+        // that says nothing, and it would still verify.
+        assert!(
+            calculate_reporting_token_over_pieces(&key, &encoded, &[]).is_none(),
+            "hashing no pieces must not mint a token"
+        );
+    }
     use super::*;
 
     #[test]
@@ -1252,6 +1472,17 @@ mod tests {
                 );
             }
         }
+
+        // `v` carries the result's version, not a baked-in constant: the
+        // integer goes through `NodeValue`'s itoa conversion, so a version
+        // bump must reach the wire without touching this builder.
+        let bumped = ReportingTokenResult {
+            version: 7,
+            ..result
+        };
+        let node = build_reporting_node(&bumped);
+        let token_node = node.get_children_by_tag("reporting_token").next().unwrap();
+        assert!(token_node.attrs.get("v").is_some_and(|v| v == "7"));
     }
 
     #[test]
@@ -1613,6 +1844,197 @@ mod tests {
             extracted, expected,
             "Nested extraction with subfield filtering failed"
         );
+    }
+
+    /// Nothing whitelisted matched: the token has no content at all, which is
+    /// a distinct answer from "content that happens to be empty".
+    #[test]
+    fn no_matching_field_yields_no_content() {
+        let data = vec![
+            0x08, 0x96, 0x01, // field 1: varint 150
+            0x12, 0x05, b'h', b'e', b'l', b'l', b'o', // field 2: "hello"
+        ];
+        let whitelist = &[ReportingField::new(9)];
+        assert!(extract_reporting_token_content(&data, whitelist).is_none());
+        assert!(extract_reporting_token_content(&[], whitelist).is_none());
+    }
+
+    /// The concatenation order is by ascending field number, not wire order:
+    /// a message that puts a higher-numbered field first must still hash the
+    /// same as one that does not.
+    #[test]
+    fn fields_are_concatenated_in_field_number_order_not_wire_order() {
+        let low = [0x0a, 0x01, b'a']; // field 1: "a"
+        let high = [0x12, 0x01, b'b']; // field 2: "b"
+        let whitelist = &[ReportingField::new(1), ReportingField::new(2)];
+
+        let mut wire_ascending = Vec::new();
+        wire_ascending.extend_from_slice(&low);
+        wire_ascending.extend_from_slice(&high);
+        let mut wire_descending = Vec::new();
+        wire_descending.extend_from_slice(&high);
+        wire_descending.extend_from_slice(&low);
+
+        let expected = [0x0a, 0x01, b'a', 0x12, 0x01, b'b'];
+        assert_eq!(
+            extract_reporting_token_content(&wire_ascending, whitelist).unwrap(),
+            expected
+        );
+        assert_eq!(
+            extract_reporting_token_content(&wire_descending, whitelist).unwrap(),
+            expected
+        );
+    }
+
+    /// Repeats of the same field keep their wire order relative to each other,
+    /// which is what makes the sort's stability part of the wire contract.
+    #[test]
+    fn repeats_of_one_field_keep_their_wire_order() {
+        let data = vec![
+            0x0a, 0x01, b'x', // field 1: "x"
+            0x12, 0x01, b'm', // field 2: "m"
+            0x0a, 0x01, b'y', // field 1: "y"
+        ];
+        let whitelist = &[ReportingField::new(1), ReportingField::new(2)];
+
+        assert_eq!(
+            extract_reporting_token_content(&data, whitelist).unwrap(),
+            vec![0x0a, 0x01, b'x', 0x0a, 0x01, b'y', 0x12, 0x01, b'm'],
+        );
+    }
+
+    /// More fields than the inline staging list holds: spilling must not
+    /// reorder or drop anything.
+    #[test]
+    fn more_fields_than_the_inline_list_holds_still_concatenate_in_order() {
+        let mut data = Vec::new();
+        let mut whitelist = Vec::new();
+        // Emit fields 8..=1 (descending on the wire) so the sort has work to do.
+        for field in (1u8..=8).rev() {
+            data.push((field << 3) | 2);
+            data.push(1);
+            data.push(b'a' + field);
+            whitelist.push(ReportingField::new(u32::from(field)));
+        }
+
+        let extracted = extract_reporting_token_content(&data, &whitelist)
+            .expect("eight whitelisted fields extract");
+
+        let mut expected = Vec::new();
+        for field in 1u8..=8 {
+            expected.push((field << 3) | 2);
+            expected.push(1);
+            expected.push(b'a' + field);
+        }
+        assert_eq!(extracted, expected);
+    }
+
+    /// A multi-byte payload must be copied byte for byte: a range-based piece
+    /// that got its bounds wrong would slice a UTF-8 sequence in half.
+    #[test]
+    fn a_multibyte_payload_survives_the_copy_byte_for_byte() {
+        let text = "héllo ✅ 日本";
+        let bytes = text.as_bytes();
+        let mut data = vec![0x0a, u8::try_from(bytes.len()).unwrap()];
+        data.extend_from_slice(bytes);
+        // A second, unwhitelisted field so the extraction is not the whole input.
+        data.extend_from_slice(&[0x12, 0x02, 0xff, 0xfe]);
+
+        let whitelist = &[ReportingField::new(1)];
+        let extracted = extract_reporting_token_content(&data, whitelist)
+            .expect("the whitelisted field extracts");
+
+        assert_eq!(extracted, data[..2 + bytes.len()]);
+        assert_eq!(std::str::from_utf8(&extracted[2..]).unwrap(), text);
+    }
+
+    /// A nested field is re-framed under a fresh length, so it is the one kind
+    /// of piece that cannot be a range into the input.
+    #[test]
+    fn a_nested_field_is_rebuilt_and_still_ordered_with_the_flat_ones() {
+        let inner = vec![
+            0x0a, 0x01, b'a', // field 1: "a" (kept)
+            0x12, 0x01, b'b', // field 2: "b" (dropped)
+        ];
+        // field 1 (flat, kept) then field 6 (nested), emitted in that order.
+        let mut data = vec![0x0a, 0x01, b'z'];
+        data.push(0x32);
+        data.push(u8::try_from(inner.len()).unwrap());
+        data.extend_from_slice(&inner);
+
+        static TEST_SUBFIELDS: &[ReportingField] = &[ReportingField::new(1)];
+        let whitelist = &[
+            ReportingField::new(1),
+            ReportingField::with_subfields(6, TEST_SUBFIELDS),
+        ];
+
+        let extracted = extract_reporting_token_content(&data, whitelist)
+            .expect("flat + nested fields extract");
+
+        assert_eq!(
+            extracted,
+            vec![
+                0x0a, 0x01, b'z', // field 1 verbatim
+                0x32, 0x03, 0x0a, 0x01, b'a', // field 6 re-framed around field 1 only
+            ],
+        );
+    }
+
+    /// A nested field whose every subfield is filtered out contributes
+    /// nothing, rather than an empty re-framed wrapper.
+    #[test]
+    fn a_nested_field_with_nothing_kept_contributes_nothing() {
+        let inner = vec![0x12, 0x01, b'b']; // field 2 only
+        let mut data = vec![0x32, u8::try_from(inner.len()).unwrap()];
+        data.extend_from_slice(&inner);
+
+        static TEST_SUBFIELDS: &[ReportingField] = &[ReportingField::new(1)];
+        let whitelist = &[ReportingField::with_subfields(6, TEST_SUBFIELDS)];
+
+        assert!(extract_reporting_token_content(&data, whitelist).is_none());
+    }
+
+    /// The result is allocated once, from a length summed over every piece.
+    /// A piece kind left out of that sum makes the buffer grow mid-write,
+    /// which is exactly the allocation this staging model exists to avoid.
+    #[test]
+    fn the_result_is_allocated_once_for_the_exact_length_it_holds() {
+        // Sizes chosen so an understated reservation cannot land back on the
+        // final length by accident: Vec grows to at least twice its capacity.
+        let inner = vec![0x0a, 0x01, b'a'];
+        let mut nested_and_flat = vec![0x0a, 0x0a];
+        nested_and_flat.extend_from_slice(b"0123456789");
+        nested_and_flat.push(0x32);
+        nested_and_flat.push(u8::try_from(inner.len()).unwrap());
+        nested_and_flat.extend_from_slice(&inner);
+
+        static TEST_SUBFIELDS: &[ReportingField] = &[ReportingField::new(1)];
+        let cases: [(&[u8], &[ReportingField]); 2] = [
+            (&[0x0a, 0x01, b'z'], &[ReportingField::new(1)]),
+            (
+                &nested_and_flat,
+                &[
+                    ReportingField::new(1),
+                    ReportingField::with_subfields(6, TEST_SUBFIELDS),
+                ],
+            ),
+        ];
+
+        for (data, whitelist) in cases {
+            let extracted =
+                extract_reporting_token_content(data, whitelist).expect("content extracts");
+            // The property is that the length reserved from `Piece::len` is the
+            // length actually written; an understated reservation reallocates
+            // silently. That is checked by the `debug_assert` inside the
+            // extractor, which every call here exercises, so this case exists
+            // to feed it shapes: flat fields, a nested field, and both mixed.
+            // Asserting `capacity()` instead would be testing the allocator,
+            // which is free to round a request up.
+            assert!(
+                !extracted.is_empty(),
+                "each case must actually extract something, or it feeds the check nothing"
+            );
+        }
     }
 
     #[test]

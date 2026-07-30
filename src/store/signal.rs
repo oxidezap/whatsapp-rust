@@ -572,7 +572,7 @@ mod tests {
     async fn direct_session_store_preserves_clean_reload_and_recovery_ceiling() {
         let backend = crate::test_utils::create_test_backend().await;
         let device = Device::new(backend.clone());
-        let address = ProtocolAddress::new("15550001001".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550001001", 1.into());
 
         SessionStore::store_session(&device, &address, &leased_session())
             .await

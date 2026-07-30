@@ -56,7 +56,7 @@ impl SenderKeyStore for CachedSenderKeyStore<'_> {
 }
 
 fn dm_address() -> wacore::libsignal::protocol::ProtocolAddress {
-    wacore::libsignal::protocol::ProtocolAddress::new("15550008001".to_string(), 1.into())
+    wacore::libsignal::protocol::ProtocolAddress::new("15550008001", 1.into())
 }
 
 fn group_name() -> SenderKeyName {

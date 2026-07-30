@@ -162,6 +162,14 @@ impl Client {
                         self.spawn_retention_cleanup(sent_msg_ttl);
                     }
 
+                    // Same reason as the retention sweep above: driven by the
+                    // tick rather than by send_keepalive, because a connection
+                    // with steady inbound traffic takes the early return below
+                    // and would never sweep. A phash waiter whose ack was lost
+                    // has nothing else to remove it, and it reads as an
+                    // outstanding IQ.
+                    self.response_waiters_guard().drop_expired_phash();
+
                     let last_recv = self.stats.last_data_received_ms();
 
                     // WA Web: maybeScheduleHealthCheck — only send ping when idle.

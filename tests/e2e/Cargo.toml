@@ -21,18 +21,18 @@ uuid = { workspace = true, features = ["v4"] }
 wacore = { path = "../../wacore", features = ["test-util"] }
 wacore-binary = { path = "../../wacore/binary" }
 whatsapp-rust = { path = "../..", default-features = false, features = [
-  "danger-skip-cert-chain-verify",
-  "danger-skip-tls-verify",
-  "simd",
-  "tokio-runtime",
-  "tokio-native",
-  "signal",
+    "danger-skip-cert-chain-verify",
+    "danger-skip-tls-verify",
+    "simd",
+    "tokio-runtime",
+    "tokio-native",
+    "signal",
 ] }
 whatsapp-rust-tokio-transport = { path = "../../transports/tokio-transport", features = [
-  "danger-skip-tls-verify",
+    "danger-skip-tls-verify",
 ] }
 whatsapp-rust-ureq-http-client = { path = "../../http_clients/ureq-client", features = [
-  "danger-skip-tls-verify",
+    "danger-skip-tls-verify",
 ] }
 
 [dev-dependencies]

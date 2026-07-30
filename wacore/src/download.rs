@@ -224,13 +224,149 @@ pub struct DownloadRequest {
     pub decryption: MediaDecryption,
 }
 
-pub struct MediaConnection {
-    pub hosts: Vec<MediaHost>,
-    pub auth: String,
-}
-
+#[derive(Debug, Clone)]
 pub struct MediaHost {
     pub hostname: String,
+}
+
+impl MediaHost {
+    pub fn new(hostname: impl Into<String>) -> Self {
+        Self {
+            hostname: hostname.into(),
+        }
+    }
+}
+
+/// CDN hosts the official client carries in its binary-protocol token
+/// dictionary, primary first. Only a convenience for callers with no session to
+/// ask for a route: a live session must still take its hosts from the server,
+/// which is what lets a test harness point downloads at itself.
+pub const DEFAULT_MEDIA_HOSTS: [&str; 2] = ["mmg.whatsapp.net", "mmg-fallback.whatsapp.net"];
+
+/// Where a media download is fetched from: the CDN hosts to try, in order, plus
+/// the media auth token when the caller has a session to get one from.
+///
+/// `auth` is optional because the CDN gates a download on the signed
+/// `direct_path` and its hash token, not on the session token: WA Web's own
+/// download URL builder attaches no auth parameter at all, while its upload URL
+/// builder does. A caller already holding the decryption references can name
+/// the hosts itself and download with no session behind it.
+#[derive(Clone, Default)]
+pub struct MediaRoute {
+    pub hosts: Vec<MediaHost>,
+    pub auth: Option<String>,
+}
+
+/// Hand-written so the auth token, a live session credential, cannot reach a log
+/// through a `{:?}` or a tracing field that captured a route.
+impl std::fmt::Debug for MediaRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaRoute")
+            .field("hosts", &self.hosts)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl MediaRoute {
+    /// Route through server-provided hosts, carrying the session's media auth
+    /// token.
+    pub fn authenticated(hosts: Vec<MediaHost>, auth: String) -> Self {
+        Self {
+            hosts,
+            auth: Some(auth),
+        }
+    }
+
+    /// Route through caller-provided hosts, with no auth token.
+    pub fn unauthenticated(hosts: Vec<MediaHost>) -> Self {
+        Self { hosts, auth: None }
+    }
+
+    /// The same hosts without the auth token.
+    ///
+    /// A token outlives its session by less than the references it was fetched
+    /// alongside do, and the CDN does not ask for one on download, so a route
+    /// kept past disconnection is better off dropping it than sending a stale
+    /// one and reading the refusal as an expired reference.
+    pub fn without_auth(mut self) -> Self {
+        self.auth = None;
+        self
+    }
+
+    /// [`Self::unauthenticated`] over [`DEFAULT_MEDIA_HOSTS`].
+    pub fn default_hosts() -> Self {
+        Self::unauthenticated(
+            DEFAULT_MEDIA_HOSTS
+                .iter()
+                .copied()
+                .map(MediaHost::new)
+                .collect(),
+        )
+    }
+}
+
+/// A sink a media download can be streamed into.
+///
+/// [`Self::truncate`] is the entire reason this is not simply `Write + Seek`.
+/// Media carries a single MAC over the whole ciphertext, so
+/// [`DownloadUtils::decrypt_stream_to_writer`] has necessarily written plaintext
+/// by the time it can tell the payload was forged, and the retry that follows may
+/// write fewer bytes than the attempt it replaces. Rewinding alone would then
+/// leave verified media followed by a tail of stale bytes from the failed host.
+/// `Write + Seek` cannot express the fix: shortening a sink lives on concrete
+/// types (`File::set_len`, `Vec::truncate`), not on any std trait.
+///
+/// Implementations are provided for the sinks a download realistically targets —
+/// [`std::fs::File`], an in-memory [`std::io::Cursor`], and the `BufWriter` and
+/// `&mut` wrappers around them.
+pub trait DownloadWriter: std::io::Write + std::io::Seek {
+    /// Shorten the sink to `len` bytes, discarding anything beyond it.
+    ///
+    /// Only ever called with a length the sink already reaches, so an
+    /// implementation never has to decide what extending would mean.
+    fn truncate(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl DownloadWriter for std::fs::File {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+/// Saturating rather than fallible: `Vec::truncate` past the end is a no-op, which
+/// is exactly the right answer when the length cannot be represented locally.
+fn truncate_vec(buf: &mut Vec<u8>, len: u64) {
+    buf.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+}
+
+impl DownloadWriter for std::io::Cursor<Vec<u8>> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        truncate_vec(self.get_mut(), len);
+        Ok(())
+    }
+}
+
+impl DownloadWriter for std::io::Cursor<&mut Vec<u8>> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        truncate_vec(self.get_mut(), len);
+        Ok(())
+    }
+}
+
+/// Buffered bytes are part of the sink's length, so they have to reach it before
+/// it can be measured against `len`.
+impl<W: DownloadWriter> DownloadWriter for std::io::BufWriter<W> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        std::io::Write::flush(self)?;
+        self.get_mut().truncate(len)
+    }
+}
+
+impl<W: DownloadWriter + ?Sized> DownloadWriter for &mut W {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        (**self).truncate(len)
+    }
 }
 
 pub struct DownloadUtils;
@@ -238,7 +374,7 @@ pub struct DownloadUtils;
 impl DownloadUtils {
     pub fn prepare_download_requests(
         downloadable: &dyn Downloadable,
-        media_conn: &MediaConnection,
+        route: &MediaRoute,
     ) -> Result<Vec<DownloadRequest>> {
         let is_encrypted = downloadable.is_encrypted();
         let media_type = downloadable.app_info();
@@ -287,14 +423,17 @@ impl DownloadUtils {
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let requests = media_conn
+        let requests = route
             .hosts
             .iter()
             .map(|host| DownloadRequest {
-                url: format!(
-                    "https://{}{direct_path}?auth={}&token={token}",
-                    host.hostname, media_conn.auth,
-                ),
+                url: match route.auth.as_deref() {
+                    Some(auth) => format!(
+                        "https://{}{direct_path}?auth={auth}&token={token}",
+                        host.hostname,
+                    ),
+                    None => format!("https://{}{direct_path}?token={token}", host.hostname),
+                },
                 decryption: decryption.clone(),
             })
             .collect();
@@ -597,19 +736,33 @@ mod tests {
         }
     }
 
-    fn mock_media_conn() -> MediaConnection {
-        MediaConnection {
-            hosts: vec![
-                MediaHost {
-                    hostname: "cdn1.example.com".into(),
-                },
-                MediaHost {
-                    hostname: "cdn2.example.com".into(),
-                },
-            ],
-            auth: "test-auth-token".into(),
-        }
+    fn mock_hosts() -> Vec<MediaHost> {
+        vec![
+            MediaHost::new("cdn1.example.com"),
+            MediaHost::new("cdn2.example.com"),
+        ]
     }
+
+    fn authenticated_route() -> MediaRoute {
+        MediaRoute::authenticated(mock_hosts(), "test-auth-token".into())
+    }
+
+    /// Every variant. The exhaustive match in
+    /// `every_media_type_builds_urls_for_both_route_kinds` is what forces a new
+    /// one to be named here instead of silently skipping the URL assertions.
+    const ALL_MEDIA_TYPES: [MediaType; 11] = [
+        MediaType::Image,
+        MediaType::Video,
+        MediaType::Audio,
+        MediaType::Document,
+        MediaType::History,
+        MediaType::AppState,
+        MediaType::Sticker,
+        MediaType::StickerPack,
+        MediaType::StickerPackThumbnail,
+        MediaType::LinkThumbnail,
+        MediaType::ProductCatalogImage,
+    ];
 
     fn encrypted_media_fixture(
         plaintext: &[u8],
@@ -691,7 +844,7 @@ mod tests {
             file_enc_sha256: Some(vec![3; 32]),
             media_type: MediaType::Image,
         };
-        let reqs = DownloadUtils::prepare_download_requests(&d, &mock_media_conn()).unwrap();
+        let reqs = DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap();
         assert_eq!(reqs.len(), 2);
         assert!(matches!(
             &reqs[0].decryption,
@@ -701,6 +854,160 @@ mod tests {
         assert!(reqs[0].url.contains(&expected_token));
         assert!(reqs[0].url.starts_with("https://cdn1.example.com"));
         assert!(reqs[1].url.starts_with("https://cdn2.example.com"));
+    }
+
+    // The authenticated URL is the one real servers already accept, so it is
+    // pinned literally: making `auth` optional must not move a single byte of it.
+    #[test]
+    fn authenticated_url_keeps_its_exact_shape() {
+        let d = MockDownloadable {
+            direct_path: Some("/v/t1/media.enc".into()),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        let reqs = DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap();
+        let token = BASE64_URL_SAFE_NO_PAD.encode([3u8; 32]);
+        assert_eq!(
+            reqs[0].url,
+            format!("https://cdn1.example.com/v/t1/media.enc?auth=test-auth-token&token={token}")
+        );
+        assert_eq!(
+            reqs[1].url,
+            format!("https://cdn2.example.com/v/t1/media.enc?auth=test-auth-token&token={token}")
+        );
+    }
+
+    #[test]
+    fn unauthenticated_urls_omit_auth_and_cover_every_host_in_order() {
+        let d = MockDownloadable {
+            direct_path: Some("/v/t1/media.enc".into()),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        let route = MediaRoute::unauthenticated(mock_hosts());
+        let reqs = DownloadUtils::prepare_download_requests(&d, &route).unwrap();
+        let token = BASE64_URL_SAFE_NO_PAD.encode([3u8; 32]);
+        assert_eq!(
+            reqs.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(),
+            vec![
+                format!("https://cdn1.example.com/v/t1/media.enc?token={token}"),
+                format!("https://cdn2.example.com/v/t1/media.enc?token={token}"),
+            ],
+        );
+        assert!(reqs.iter().all(|r| !r.url.contains("auth=")));
+    }
+
+    #[test]
+    fn without_auth_keeps_the_hosts_and_drops_the_token() {
+        let route = authenticated_route().without_auth();
+        assert!(route.auth.is_none());
+        assert_eq!(
+            route
+                .hosts
+                .iter()
+                .map(|h| h.hostname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cdn1.example.com", "cdn2.example.com"],
+        );
+    }
+
+    #[test]
+    fn route_debug_redacts_the_auth_token() {
+        let rendered = format!("{:?}", authenticated_route());
+        assert!(!rendered.contains("test-auth-token"), "{rendered}");
+        assert!(rendered.contains("cdn1.example.com"), "{rendered}");
+
+        let rendered = format!("{:?}", MediaRoute::unauthenticated(mock_hosts()));
+        assert!(rendered.contains("auth: None"), "{rendered}");
+    }
+
+    #[test]
+    fn default_route_uses_the_known_cdn_hosts_without_auth() {
+        let route = MediaRoute::default_hosts();
+        assert!(route.auth.is_none());
+        assert_eq!(
+            route
+                .hosts
+                .iter()
+                .map(|h| h.hostname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mmg.whatsapp.net", "mmg-fallback.whatsapp.net"],
+        );
+    }
+
+    #[test]
+    fn every_media_type_builds_urls_for_both_route_kinds() {
+        for media_type in ALL_MEDIA_TYPES {
+            // No wildcard arm: a new variant stops compiling here until it is
+            // added to ALL_MEDIA_TYPES, which is the only thing that makes the
+            // array's length a guarantee rather than a hand-kept count.
+            match media_type {
+                MediaType::Image
+                | MediaType::Video
+                | MediaType::Audio
+                | MediaType::Document
+                | MediaType::History
+                | MediaType::AppState
+                | MediaType::Sticker
+                | MediaType::StickerPack
+                | MediaType::StickerPackThumbnail
+                | MediaType::LinkThumbnail
+                | MediaType::ProductCatalogImage => {}
+            }
+
+            let d = MockDownloadable {
+                direct_path: Some("/v/t1/media.enc".into()),
+                static_url: None,
+                media_key: Some(vec![1; 32]),
+                file_sha256: Some(vec![2; 32]),
+                file_enc_sha256: Some(vec![3; 32]),
+                media_type,
+            };
+            let token = BASE64_URL_SAFE_NO_PAD.encode([3u8; 32]);
+
+            let authenticated =
+                DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap();
+            assert_eq!(
+                authenticated[0].url,
+                format!(
+                    "https://cdn1.example.com/v/t1/media.enc?auth=test-auth-token&token={token}"
+                ),
+                "{media_type:?}"
+            );
+
+            let unauthenticated = DownloadUtils::prepare_download_requests(
+                &d,
+                &MediaRoute::unauthenticated(mock_hosts()),
+            )
+            .unwrap();
+            assert_eq!(
+                unauthenticated[0].url,
+                format!("https://cdn1.example.com/v/t1/media.enc?token={token}"),
+                "{media_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_without_hosts_yields_no_requests() {
+        let d = MockDownloadable {
+            direct_path: Some("/v/t1/media.enc".into()),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        let reqs =
+            DownloadUtils::prepare_download_requests(&d, &MediaRoute::unauthenticated(Vec::new()))
+                .unwrap();
+        assert!(reqs.is_empty());
     }
 
     #[test]
@@ -713,7 +1020,7 @@ mod tests {
             file_enc_sha256: None,
             media_type: MediaType::Image,
         };
-        let reqs = DownloadUtils::prepare_download_requests(&d, &mock_media_conn()).unwrap();
+        let reqs = DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap();
         assert_eq!(reqs.len(), 2);
         assert!(matches!(
             &reqs[0].decryption,
@@ -734,7 +1041,7 @@ mod tests {
             file_enc_sha256: None,
             media_type: MediaType::Image,
         };
-        let reqs = DownloadUtils::prepare_download_requests(&d, &mock_media_conn()).unwrap();
+        let reqs = DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap();
         // Static URL bypasses host construction → single request
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].url, "https://static.cdn.example.com/media/abc123");
@@ -742,6 +1049,23 @@ mod tests {
             &reqs[0].decryption,
             MediaDecryption::Plaintext { .. }
         ));
+    }
+
+    #[test]
+    fn prepare_requests_static_url_needs_no_hosts() {
+        let d = MockDownloadable {
+            direct_path: Some("/unused".into()),
+            static_url: Some("https://static.cdn.example.com/media/abc123".into()),
+            media_key: None,
+            file_sha256: Some(vec![5; 32]),
+            file_enc_sha256: None,
+            media_type: MediaType::Image,
+        };
+        let reqs =
+            DownloadUtils::prepare_download_requests(&d, &MediaRoute::unauthenticated(Vec::new()))
+                .unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].url, "https://static.cdn.example.com/media/abc123");
     }
 
     #[test]
@@ -754,7 +1078,7 @@ mod tests {
             file_enc_sha256: Some(vec![3; 32]),
             media_type: MediaType::Image,
         };
-        let err = DownloadUtils::prepare_download_requests(&d, &mock_media_conn()).unwrap_err();
+        let err = DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap_err();
         assert!(err.to_string().contains("Missing direct_path"));
     }
 

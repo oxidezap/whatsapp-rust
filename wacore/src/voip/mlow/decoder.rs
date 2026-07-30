@@ -615,10 +615,6 @@ mod tests {
         }
     }
 
-    /// A body whose decode consumes far more bits than it holds is malformed: the range decoder
-    /// returns zero past the end without flagging it, so the synthesis runs on invented symbols and
-    /// can diverge to full scale. Conceal it as a lost frame rather than emitting that.
-    #[test]
     /// The accepted window is the shipped decoder's, not the C fork's. The fork stops at `+2`, so a
     /// stream ending three or four bytes long would be concealed here and played by the official
     /// client. Pinned as arithmetic because no synthetic body lands on `+3` on demand.
@@ -638,6 +634,9 @@ mod tests {
         );
     }
 
+    /// A body whose decode consumes far more bits than it holds is malformed: the range decoder
+    /// returns zero past the end without flagging it, so the synthesis runs on invented symbols and
+    /// can diverge to full scale. Conceal it as a lost frame rather than emitting that.
     #[test]
     fn endpoint_check_rejects_an_overrunning_body() {
         // A 120 ms TOC with a body far too short for six internal frames.

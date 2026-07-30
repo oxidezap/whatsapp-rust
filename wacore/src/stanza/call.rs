@@ -11,19 +11,7 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef};
 
 use crate::time::from_secs;
-use crate::types::call::{CallAction, CallAudioCodec, IncomingCall, VideoState};
-
-const KNOWN_ACTIONS: &[&str] = &[
-    "offer",
-    "offer_notice",
-    "preaccept",
-    "accept",
-    "reject",
-    "terminate",
-    "transport",
-    "relaylatency",
-    "video",
-];
+use crate::types::call::{CallAction, CallActionTag, CallAudioCodec, IncomingCall, VideoState};
 
 pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     if node.tag != "call" {
@@ -32,10 +20,13 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     // Find a known action child first so unknown/future actions short-circuit
     // before attr validation (forward-compat, even if stanza attrs also shift).
-    let Some(child) = node
-        .children()
-        .and_then(|cs| cs.iter().find(|c| KNOWN_ACTIONS.contains(&c.tag.as_ref())))
-    else {
+    let Some((child, action_tag)) = node.children().and_then(|children| {
+        children.iter().find_map(|child| {
+            CallActionTag::try_from(child.tag.as_ref())
+                .ok()
+                .map(|action_tag| (child, action_tag))
+        })
+    }) else {
         return Ok(None);
     };
 
@@ -46,7 +37,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     // whatsmeow doesn't require an id on <call>, and the signaling-only actions (transport,
     // relaylatency) can arrive without one. Only the offer-ack consumes stanza_id and real offers
     // always carry it, so default a missing id to empty rather than rejecting the whole stanza --
-    // which would drop these actions right after we added them to KNOWN_ACTIONS to surface them.
+    // which would drop these actions right after the generated tag accepted them.
     let stanza_id = attrs
         .optional_string("id")
         .map(|s| s.into_owned())
@@ -56,6 +47,8 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .and_then(|s| (!s.is_empty()).then(|| s.into_owned()));
     let platform = attrs.optional_string("platform").map(|s| s.into_owned());
     let version = attrs.optional_string("version").map(|s| s.into_owned());
+    let participant = attrs.optional_jid("participant");
+    let recipient = attrs.optional_jid("recipient");
     let ts = attrs
         .optional_unix_time("t")
         .ok_or_else(|| anyhow!("<call> missing or invalid 't' attribute"))?;
@@ -66,25 +59,37 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
-    let action = parse_action(child)?;
+    let is_offer = action_tag == CallActionTag::Offer;
+    let action = parse_action(child, action_tag)?;
+    let group = if is_offer {
+        super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
+    } else {
+        None
+    };
+    #[cfg(feature = "voip")]
+    let media = is_offer
+        .then(|| parse_media_offer(node, child, participant.as_ref().unwrap_or(&from)))
+        .flatten()
+        .map(Box::new);
 
-    Ok(Some(IncomingCall {
-        from,
-        stanza_id,
-        notify,
-        platform,
-        version,
-        timestamp,
-        offline,
-        action,
-        // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
-        // capture them only on an <offer> and only when `voip` is on (RelayData lives there).
-        #[cfg(feature = "voip")]
-        media: (child.tag.as_ref() == "offer")
-            .then(|| parse_media_offer(node, child))
-            .flatten()
-            .map(Box::new),
-    }))
+    let call = IncomingCall::builder()
+        .from(from)
+        .stanza_id(stanza_id)
+        .maybe_notify(notify)
+        .maybe_platform(platform)
+        .maybe_version(version)
+        .maybe_participant(participant)
+        .maybe_recipient(recipient)
+        .timestamp(timestamp)
+        .offline(offline)
+        .action(action)
+        .maybe_group(group);
+    // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
+    // capture it only on an <offer> and only when `voip` is on (RelayData lives there).
+    #[cfg(feature = "voip")]
+    let call = call.maybe_media(media);
+
+    Ok(Some(call.build()))
 }
 
 /// Extract the media material from an `<offer>`: the `<enc>` addressed to us (direct child or under
@@ -94,8 +99,10 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 fn parse_media_offer(
     call: &NodeRef<'_>,
     offer: &NodeRef<'_>,
+    peer: &Jid,
 ) -> Option<crate::types::call::MediaOffer> {
     use crate::types::call::{MediaOffer, OfferRecipientEnc};
+    use crate::types::group_call::GroupCallDevice;
 
     let mut encs = Vec::new();
     if let Some(enc_node) = offer.get_optional_child("enc") {
@@ -147,11 +154,28 @@ fn parse_media_offer(
             )
         })
         .unwrap_or_default();
+    let peer_device = offer
+        .get_optional_child("capability")
+        .and_then(|capability| {
+            let bytes = capability.content_bytes()?.to_vec();
+            if bytes.is_empty() {
+                return None;
+            }
+            let capability_version = match capability.get_attr("ver") {
+                None => 1,
+                Some(version) => version.as_str().parse::<u32>().ok()?,
+            };
+            let mut device = GroupCallDevice::new(peer.clone());
+            device.capability_version = Some(capability_version);
+            device.capability = bytes;
+            Some(device)
+        });
     Some(MediaOffer {
         encs,
         relay,
         peer_abtest_bucket,
         peer_abtest_bucket_id_list,
+        peer_device,
     })
 }
 
@@ -200,7 +224,7 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
     Ok(CallAudioCodec { enc, rate })
 }
 
-fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
+fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAction> {
     let mut attrs = node.attrs();
     let call_id = attrs
         .required_string("call-id")
@@ -210,8 +234,29 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         .optional_jid("call-creator")
         .ok_or_else(|| anyhow!("<{}> missing 'call-creator'", node.tag))?;
 
-    Ok(match node.tag.as_ref() {
-        "offer" => {
+    // The group parsers re-read the action identity and finish their own attribute readers because
+    // they also own the action-specific attributes.
+    Ok(match action_tag {
+        CallActionTag::GroupUpdate => CallAction::GroupUpdate {
+            update: super::group_call::parse_group_update(node)?.into(),
+        },
+        CallActionTag::EncRekey => CallAction::EncRekey {
+            rekey: super::group_call::parse_group_enc_rekey(node)?.into(),
+        },
+        CallActionTag::WaitingRoomUpdate => CallAction::WaitingRoomUpdate {
+            room: super::group_call::parse_waiting_room_update(node)?.into(),
+        },
+        CallActionTag::RaiseHand => CallAction::RaiseHand {
+            call_id,
+            call_creator,
+            raised: super::group_call::parse_raise_hand(node)?,
+        },
+        CallActionTag::ScreenShare => CallAction::ScreenShare {
+            call_id,
+            call_creator,
+            screen_share: super::group_call::parse_screen_share(node)?,
+        },
+        CallActionTag::Offer => {
             let caller_pn = attrs.optional_jid("caller_pn");
             let caller_country_code = attrs
                 .optional_string("caller_country_code")
@@ -247,7 +292,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 group_jid,
             }
         }
-        "offer_notice" => {
+        CallActionTag::OfferNotice => {
             let is_video = attrs.optional_string("media").is_some_and(|s| s == "video");
             let is_group = attrs.optional_string("type").is_some_and(|s| s == "group");
             attrs
@@ -260,7 +305,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 is_group,
             }
         }
-        "preaccept" => {
+        CallActionTag::PreAccept => {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
@@ -277,7 +322,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio,
             }
         }
-        "transport" => {
+        CallActionTag::Transport => {
             let p2p_cand_round = attrs
                 .optional_string("p2p-cand-round")
                 .map(|s| s.into_owned());
@@ -294,7 +339,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 transport_message_type,
             }
         }
-        "relaylatency" => {
+        CallActionTag::RelayLatency => {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<relaylatency> attrs: {e}"))?;
@@ -303,7 +348,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 call_creator,
             }
         }
-        "accept" => {
+        CallActionTag::Accept => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
             let audio = node
                 .children()
@@ -318,7 +363,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio,
             }
         }
-        "reject" => {
+        CallActionTag::Reject => {
             // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
             // actually declining; dropping it made both look identical and ended calls the peer's
             // other devices were still answering.
@@ -330,7 +375,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 reason,
             }
         }
-        "video" => {
+        CallActionTag::VideoState => {
             let state_raw = attrs
                 .optional_string("state")
                 .and_then(|s| s.parse::<i32>().ok())
@@ -352,7 +397,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 dec,
             }
         }
-        "terminate" => {
+        CallActionTag::Terminate => {
             // WA Web gates the call-log outcome on `reason` (missed vs accepted/rejected-elsewhere),
             // so surface it instead of dropping it.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
@@ -373,7 +418,6 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio_duration,
             }
         }
-        other => return Err(anyhow!("unreachable: unknown action <{other}>")),
     })
 }
 
@@ -884,15 +928,26 @@ pub fn build_call_video_ack(call: &IncomingCall, original: &NodeRef<'_>) -> Opti
     if call.stanza_id.is_empty() {
         return None;
     }
+    build_typed_call_ack(original, "video")
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn build_typed_call_ack(original: &NodeRef<'_>, action_type: &str) -> Option<Node> {
+    if original.tag != "call" || action_type.is_empty() {
+        return None;
+    }
+    let id = original.get_attr("id")?.to_node_value();
+    let from = original.get_attr("from")?.to_node_value();
     let mut ack = NodeBuilder::new("ack")
         .attr("class", "call")
-        .attr("id", call.stanza_id.as_str())
-        .attr("to", &call.from)
-        .attr("type", "video");
-    let from = call.from.to_string();
-    if let Some(participant) = original
-        .get_attr("participant")
-        .filter(|participant| participant.as_str().as_ref() != from)
+        .attr("id", id)
+        .attr("to", from)
+        .attr("type", action_type);
+    if let Some(participant) = original.get_attr("participant")
+        && original
+            .get_attr("from")
+            .is_none_or(|from| participant.as_str() != from.as_str())
     {
         ack = ack.attr("participant", participant.to_node_value());
     }
@@ -984,6 +1039,56 @@ mod tests {
         n.as_node_ref()
     }
 
+    #[cfg(feature = "voip")]
+    fn parsed_peer_capability(
+        version: Option<&str>,
+    ) -> Option<crate::types::group_call::GroupCallDevice> {
+        let mut capability = NodeBuilder::new("capability").bytes(CAPABILITY_OFFER.to_vec());
+        if let Some(version) = version {
+            capability = capability.attr("ver", version);
+        }
+        let node = base_call_builder()
+            .children([offer_builder_base()
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("enc", "opus")
+                        .attr("rate", "16000")
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![1, 2, 3, 4])
+                        .build(),
+                    capability.build(),
+                ])
+                .build()])
+            .build();
+        parse_call_stanza(&as_ref(&node))
+            .expect("offer parses")
+            .expect("recognized call")
+            .media
+            .expect("media offer")
+            .peer_device
+    }
+
+    #[cfg(feature = "voip")]
+    #[test]
+    fn capability_version_defaults_only_when_absent() {
+        assert_eq!(
+            parsed_peer_capability(None).and_then(|device| device.capability_version),
+            Some(1)
+        );
+        assert_eq!(
+            parsed_peer_capability(Some("7")).and_then(|device| device.capability_version),
+            Some(7)
+        );
+        assert!(
+            parsed_peer_capability(Some("invalid")).is_none(),
+            "an explicitly malformed version must discard the entire capability"
+        );
+        assert!(parsed_peer_capability(Some("4294967296")).is_none());
+    }
+
     // An offer carrying an <enc> (the encrypted callKey) and a <relay> must surface both on
     // IncomingCall.media so the media facade can decrypt the callKey and connect the relay without
     // re-walking the raw stanza. Covers the bare-<enc> form; the <destination><to><enc> form is the
@@ -1018,6 +1123,10 @@ mod tests {
                             .attr("type", "pkmsg")
                             .bytes(vec![1, 2, 3, 4])
                             .build(),
+                        NodeBuilder::new("capability")
+                            .attr("ver", "1")
+                            .bytes(CAPABILITY_OFFER.to_vec())
+                            .build(),
                         NodeBuilder::new("metadata")
                             .attr("peer_abtest_bucket", "video_interop_holdout")
                             .attr("peer_abtest_bucket_id_list", "110001,110002")
@@ -1044,10 +1153,44 @@ mod tests {
             media.peer_abtest_bucket_id_list.as_deref(),
             Some("110001,110002")
         );
+        let peer_device = media.peer_device.as_ref().expect("active peer capability");
+        assert_eq!(peer_device.jid, fake_caller_lid());
+        assert_eq!(peer_device.capability_version, Some(1));
+        assert_eq!(peer_device.capability, CAPABILITY_OFFER);
         let rd = media.relay.expect("the <relay> must be parsed");
         assert_eq!(rd.warp_mi_tag_len, Some(4));
         assert_eq!(rd.relay_tokens[0], vec![0xaa, 0xbb]);
         assert_eq!(rd.endpoints[0].relay_name, "gru1c02");
+    }
+
+    #[cfg(feature = "voip")]
+    #[test]
+    fn peer_capability_binds_to_the_routed_participant() {
+        let participant = fake_caller_lid().with_device(3);
+        let node = base_call_builder()
+            .attr("participant", &participant)
+            .children([offer_builder_base()
+                .children([
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![1, 2, 3, 4])
+                        .build(),
+                    NodeBuilder::new("capability")
+                        .attr("ver", "1")
+                        .bytes(CAPABILITY_OFFER.to_vec())
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let device = parse_call_stanza(&as_ref(&node))
+            .unwrap()
+            .unwrap()
+            .media
+            .expect("media offer")
+            .peer_device
+            .expect("peer capability");
+        assert_eq!(device.jid, participant);
     }
 
     // An offer with no <enc> for us (e.g. a different device's destination) yields media=None: there
@@ -1108,19 +1251,20 @@ mod tests {
         assert!(media.enc_for(Some(&other)).is_none());
     }
 
-    // Regression: a LID `<to jid>` decoded from the wire is an AD-JID carrying agent=1 (the Lid domain
-    // byte); our own LID is agent=1 too. The parser must read the TYPED jid (`to_jid`), never
-    // stringify+reparse it (which drops the agent to 0, since `renders_agent(Lid)` is false), or a
-    // multi-device callee never matches its `<to>` and silently fails "offer carried no callKey",
-    // even against the real server. The typed Jid value with agent=1 here is exactly what
-    // `as_node_ref`/the decoder carries for an AD-JID.
+    // Regression: `enc_for` matches `<to jid>` against our own JID by full structural
+    // equality, so a `<to>` that came off the wire and a JID that came from text have
+    // to agree field for field. When they did not, a multi-device callee never matched
+    // its `<to>` and silently failed "offer carried no callKey" against the real
+    // server. The stanza goes through marshal/unmarshal here so the `<to jid>` is
+    // produced by the real AD-JID decode rather than handed to the parser as an
+    // already-built value.
     #[cfg(feature = "voip")]
     #[test]
-    fn offer_to_jid_keeps_lid_agent_from_typed_jid() {
+    fn offer_to_jid_matches_our_own_jid_field_for_field() {
         let wire_to = Jid {
             user: "111111111111111".into(),
             server: Server::Lid,
-            agent: 1, // the AD-JID domain byte; the string form suppresses it
+            agent: 0,
             device: 7,
             integrator: 0,
         };
@@ -1138,13 +1282,23 @@ mod tests {
                 .build()])
             .build();
 
-        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        // marshal writes a leading format byte that unmarshal_ref does not expect.
+        let bytes = wacore_binary::marshal::marshal(&node).unwrap();
+        let decoded = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).unwrap();
+        let call = parse_call_stanza(&decoded).unwrap().unwrap();
         let media = call.media.expect("offer captures media");
 
-        // Our own device LID as lid() yields it: agent=1.
+        let from_wire = media.encs[0].to.as_ref().expect("<to jid> survives decode");
+        let from_text: Jid = "111111111111111:7@lid".parse().unwrap();
+        assert_eq!(
+            from_wire, &from_text,
+            "the decoded <to jid> must equal the same JID read back as text, which is \
+             how our own LID reaches `enc_for`"
+        );
+
         assert_eq!(
             media
-                .enc_for(Some(&wire_to))
+                .enc_for(Some(&from_text))
                 .expect("callKey for our device")
                 .ciphertext,
             vec![0xB2],
@@ -1474,7 +1628,7 @@ mod tests {
 
     #[test]
     fn transport_and_relaylatency_are_parsed_not_dropped() {
-        // Regression: these were missing from KNOWN_ACTIONS and silently dropped (Ok(None)).
+        // Regression: these were missing from dispatch and silently dropped (Ok(None)).
         let transport = base_call_builder()
             .children([NodeBuilder::new("transport")
                 .attr("call-creator", fake_caller_lid())
@@ -2207,6 +2361,33 @@ mod tests {
             }
             other => panic!("expected VideoState, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn generated_call_action_tags_drive_dispatch_and_serialization() {
+        assert_eq!(
+            CallActionTag::try_from("group_update").expect("known generated tag"),
+            CallActionTag::GroupUpdate
+        );
+        assert!(CallActionTag::try_from("future_call_action").is_err());
+
+        let action = CallAction::RelayLatency {
+            call_id: "CID".to_string(),
+            call_creator: fake_caller_lid(),
+        };
+        let value = serde_json::to_value(action).expect("serialize call action");
+        assert_eq!(value["type"], "relaylatency");
+
+        let optional = CallAction::Reject {
+            call_id: "CID".to_string(),
+            call_creator: fake_caller_lid(),
+            reason: None,
+        };
+        let value = serde_json::to_value(optional).expect("serialize optional fields");
+        assert!(
+            value.get("reason").is_none(),
+            "tagged WireEnum preserves the frozen omission semantics for None"
+        );
     }
 
     #[test]

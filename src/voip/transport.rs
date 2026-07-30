@@ -280,6 +280,18 @@ impl RelayTransport for RelayMediaChannel {
             let _ = assoc.close().await;
         }
     }
+
+    async fn reconnect(
+        &self,
+        endpoint: SocketAddr,
+    ) -> Result<(
+        Arc<dyn RelayTransport>,
+        async_channel::Receiver<RelayTransportEvent>,
+    )> {
+        RelayMediaChannelFactory::new(endpoint, self.runtime.clone())
+            .connect()
+            .await
+    }
 }
 
 /// Inbound event-channel depth. VoIP is loss tolerant, so the read pump drops packets rather than
@@ -287,7 +299,7 @@ impl RelayTransport for RelayMediaChannel {
 const RELAY_EVENT_CAP: usize = 256;
 /// One DataChannel message fits in a UDP MTU; 1500 covers any STUN/RTP/RTCP packet WA sends. Used by
 /// the in-test loopback relay, whose messages are single small packets.
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-mlow"))]
 const RELAY_READ_BUF: usize = 1500;
 /// SCTP read buffer for the inbound pump. webrtc-sctp reassembles inbound messages up to its default
 /// `max_message_size` (65536) regardless of MTU, and a buffer smaller than the delivered message
@@ -778,9 +790,14 @@ mod udp_relay_e2e {
                         {
                             // A bare allocate-success header (magic cookie set, no MI/FP) is all the
                             // engine's is_allocate_or_binding_success requires.
+                            let transaction_id: [u8; 12] =
+                                wacore::voip::stun::stun_transaction_id(&buf[..n])
+                                    .expect("allocate transaction id")
+                                    .try_into()
+                                    .expect("STUN transaction IDs are 12 bytes");
                             let ok = wacore::voip::stun::encode_stun_request(
                                 wacore::voip::stun::MSG_ALLOCATE_SUCCESS,
-                                &[1u8; 12],
+                                &transaction_id,
                                 &[],
                                 None,
                                 false,
@@ -831,6 +848,7 @@ mod udp_relay_e2e {
                     video_in: async_channel::bounded(1).1,
                     video_out: async_channel::bounded(1).0,
                     video_ctl: video_control_channel().1,
+                    group_ctl: None,
                 },
                 eng,
             ));

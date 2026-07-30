@@ -24,7 +24,7 @@ bytes = { workspace = true }
 compact_str = { workspace = true }
 itoa = { workspace = true }
 serde = { workspace = true, optional = true }
-smallvec = "1.15"
+smallvec = { workspace = true }
 smoothutf8 = { workspace = true }
 stable_deref_trait = "1.2.1"
 yoke = { workspace = true }

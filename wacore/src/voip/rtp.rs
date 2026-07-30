@@ -14,6 +14,8 @@ pub const RTP_PAYLOAD_TYPE_MLOW: u8 = RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO;
 pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
 /// H.264 video payload type used by captured Android video RTP.
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
+/// RTC app-data stream carrying reactions and future in-call controls.
+pub const RTP_PAYLOAD_TYPE_APP_DATA: u8 = 119;
 /// Video RTP timestamp clock.
 pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// Timestamp stride per access unit at the reference 15 fps (90000 / 15).

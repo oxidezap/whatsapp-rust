@@ -126,7 +126,7 @@ impl NodeFilter {
         node.tag == self.tag.as_str()
             && self.attrs.iter().all(|(k, v)| {
                 node.get_attr(k.as_str())
-                    .is_some_and(|attr| attr.as_str() == v.as_str())
+                    .is_some_and(|attr| attr == v.as_str())
             })
     }
 }
@@ -265,6 +265,7 @@ pub struct MemoryReport {
     pub recent_messages: CollectionStats,
     pub sender_key_device_cache: CollectionStats,
     pub group_devices_memo: CollectionStats,
+    pub dm_devices_memo: CollectionStats,
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
@@ -287,6 +288,12 @@ pub struct MemoryReport {
     pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
     // -- Unbounded collections --
+    /// Deferred acks queued for the transport-ack worker. Unbounded, and each
+    /// entry retains the full inbound node plus a flush guard, so a stalled
+    /// transport shows up here as a growing backlog.
+    pub transport_ack_queue: usize,
+    /// Delivery receipts queued for their worker, same shape as above.
+    pub delivery_receipt_queue: usize,
     pub response_waiters: usize,
     pub node_waiters: usize,
     pub pending_retries: usize,
@@ -296,6 +303,12 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
+    /// Admission snapshots retained while a call-link join ACK is in flight.
+    #[cfg(feature = "voip-runtime")]
+    pub pending_call_link_updates: CollectionStats,
+    /// Active/ringing calls and bounded pre-offer group controls, including their snapshots/queues.
+    #[cfg(feature = "voip-runtime")]
+    pub active_calls: CollectionStats,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -321,7 +334,7 @@ pub struct MemoryReport {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 11] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 12] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -330,6 +343,7 @@ impl MemoryReport {
             ("recent_messages:", &self.recent_messages),
             ("sk_device_cache:", &self.sender_key_device_cache),
             ("group_devices_memo:", &self.group_devices_memo),
+            ("dm_devices_memo:", &self.dm_devices_memo),
             ("signal_sessions:", &self.signal_sessions),
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
@@ -340,6 +354,10 @@ impl MemoryReport {
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
+        #[cfg(feature = "voip-runtime")]
+        let total = total
+            .saturating_add(self.pending_call_link_updates.bytes)
+            .saturating_add(self.active_calls.bytes);
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -357,8 +375,9 @@ impl std::fmt::Display for MemoryReport {
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
         // caches; the next SIGNAL_CACHES are Signal store caches. The final
-        // entry is transient history-sync retention.
-        const TTL_BOUNDED: usize = 7;
+        // entry is transient history-sync retention. Adding a cache to
+        // collections() means moving this boundary, or the sections shift.
+        const TTL_BOUNDED: usize = 8;
         const SIGNAL_CACHES: usize = 3;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
@@ -390,6 +409,12 @@ impl std::fmt::Display for MemoryReport {
             self.resend_rate_limiter_chats
         )?;
         writeln!(f, "--- Unbounded collections ---")?;
+        writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
+        writeln!(
+            f,
+            "  delivery_receipt_queue: {}",
+            self.delivery_receipt_queue
+        )?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
@@ -407,6 +432,12 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Signal store caches ---")?;
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
+        }
+        #[cfg(feature = "voip-runtime")]
+        {
+            writeln!(f, "--- VoIP state ---")?;
+            line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
+            line(f, "active_calls:", &self.active_calls)?;
         }
         writeln!(f, "--- In-flight history sync ---")?;
         line(
@@ -706,9 +737,36 @@ pub(crate) struct OfflineSyncMetrics {
 
 type ResponseWaiterSender = futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>;
 
+/// What a pending ack/IQ entry is waiting to do once the response arrives.
+///
+/// A phash check used to be an `Iq` waiter plus a spawned task holding the
+/// receiver and a ten second timer, which is a task, a channel and a timer per
+/// outgoing message for a comparison that almost always succeeds. Carrying the
+/// expected value in the map instead lets the read loop compare it inline and
+/// spawn only on the rare mismatch.
+pub(crate) enum ResponseWaiter {
+    /// Classic request/response: hand the node to whoever is awaiting it.
+    Iq(ResponseWaiterSender),
+    /// Compare the server's `phash` against ours; act only if they differ.
+    Phash(PhashWaiter),
+}
+
+pub(crate) struct PhashWaiter {
+    pub(crate) expected: wacore_binary::CompactString,
+    pub(crate) jid: Jid,
+    pub(crate) invalidate_group_cache: bool,
+    /// Sweep epoch this waiter was registered in. Expiry is counted in sweeps
+    /// rather than seconds: a wall deadline is subject to clock jumps (see
+    /// wacore::time) and would have to be derived from an instant sampled well
+    /// before registration, while reading a fresh clock here is what the send
+    /// clock budget forbids. Surviving one full sweep is the trigger, so the
+    /// window is one keepalive tick (15 to 30 s) instead of the old fixed 10 s.
+    pub(crate) registered_epoch: u64,
+}
+
 struct ResponseWaiterEntry {
     generation: NonZeroU64,
-    sender: ResponseWaiterSender,
+    waiter: ResponseWaiter,
 }
 
 /// Map of pending IQ/ack response waiters, keyed by request id.
@@ -719,6 +777,9 @@ struct ResponseWaiterEntry {
 pub(crate) struct ResponseWaiterMap {
     entries: HashMap<String, ResponseWaiterEntry>,
     last_generation: u64,
+    /// Advanced once per sweep. Registration reads it under the lock it already
+    /// takes, so a waiter records its age without touching a clock.
+    sweep_epoch: u64,
 }
 
 impl ResponseWaiterMap {
@@ -734,14 +795,14 @@ impl ResponseWaiterMap {
     pub(crate) fn try_insert_guarded(
         &mut self,
         request_id: String,
-        sender: ResponseWaiterSender,
+        waiter: ResponseWaiter,
     ) -> Option<NonZeroU64> {
         use std::collections::hash_map::Entry;
 
         let generation = self.next_generation();
         match self.entries.entry(request_id) {
             Entry::Vacant(entry) => {
-                entry.insert(ResponseWaiterEntry { generation, sender });
+                entry.insert(ResponseWaiterEntry { generation, waiter });
                 Some(generation)
             }
             Entry::Occupied(_) => None,
@@ -751,16 +812,37 @@ impl ResponseWaiterMap {
     pub(crate) fn insert(
         &mut self,
         request_id: String,
-        sender: ResponseWaiterSender,
-    ) -> Option<ResponseWaiterSender> {
+        waiter: ResponseWaiter,
+    ) -> Option<ResponseWaiter> {
         let generation = self.next_generation();
         self.entries
-            .insert(request_id, ResponseWaiterEntry { generation, sender })
-            .map(|entry| entry.sender)
+            .insert(request_id, ResponseWaiterEntry { generation, waiter })
+            .map(|entry| entry.waiter)
     }
 
-    pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiterSender> {
-        self.entries.remove(request_id).map(|entry| entry.sender)
+    pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiter> {
+        self.entries.remove(request_id).map(|entry| entry.waiter)
+    }
+
+    /// The epoch a waiter registered now belongs to.
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.sweep_epoch
+    }
+
+    /// Drop phash waiters that lived through a whole sweep without their ack.
+    ///
+    /// Runs on the keepalive tick, before the recent-activity early return: a
+    /// connection with steady inbound traffic skips the ping entirely, and
+    /// sweeping only inside the ping would let lost acks accumulate for as long
+    /// as traffic keeps flowing. The map is also what makes keepalive treat the
+    /// connection as "IQs pending", so a stranded waiter silences pings.
+    pub(crate) fn drop_expired_phash(&mut self) {
+        let epoch = self.sweep_epoch;
+        self.entries.retain(|_, entry| match &entry.waiter {
+            ResponseWaiter::Phash(waiter) => waiter.registered_epoch >= epoch,
+            ResponseWaiter::Iq(_) => true,
+        });
+        self.sweep_epoch = self.sweep_epoch.wrapping_add(1);
     }
 
     pub(crate) fn remove_guarded(&mut self, request_id: &str, cleanup_generation: NonZeroU64) {
@@ -1015,6 +1097,16 @@ pub struct Client {
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
     pub(crate) app_state_syncing: Arc<app_state::SyncInFlight>,
+    /// Serializes outgoing app-state patch sends.
+    ///
+    /// `w:sync:app:state` is optimistic-concurrency: a patch names the base
+    /// version it was built on, and only one patch can win per version. Two
+    /// unserialized verbs (two quick `markChatAsRead`s) build on the same base
+    /// and at most one lands. One lock for every collection, rather than one
+    /// per collection, matches whatsmeow's single `appStateSyncLock` and WA Web
+    /// funnelling all collections through one `CollectionsStateMachine`; sends
+    /// are user-paced, so there is nothing to gain from finer granularity.
+    pub(crate) app_state_send_lock: Arc<Mutex<()>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
 
@@ -1055,6 +1147,16 @@ pub struct Client {
             crate::flush_scope::FlushGuard,
         )>,
     >,
+    /// Feed of the persistent transport-ack worker, mirroring
+    /// [`Self::delivery_receipt_queue`]. Deferred acks used to be one spawned
+    /// task each; the queue also gives them FIFO order, which the spawns did
+    /// not guarantee.
+    pub(crate) transport_ack_queue: std::sync::OnceLock<
+        async_channel::Sender<(
+            Arc<wacore_binary::OwnedNodeRef>,
+            crate::flush_scope::FlushGuard,
+        )>,
+    >,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
     pub(crate) presence_subscriptions: Arc<Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging
@@ -1074,6 +1176,10 @@ pub struct Client {
     pub(crate) connected_notifier: Arc<event_listener::Event>,
     pub(crate) major_sync_task_sender: async_channel::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
+    /// Asks the QR rotation task to re-render the ref it is already showing.
+    /// The payload embeds the adv secret, so a rotation has to reach the code
+    /// on screen and not just the next one.
+    pub(crate) pairing_qr_refresh_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
 
     /// State machine for pair code authentication flow.
     /// Tracks the pending pair code request and ephemeral keys.
@@ -1126,22 +1232,32 @@ pub struct Client {
     /// Maps user ID to DeviceListRecord for fast device existence checks.
     /// Backed by persistent storage.
     /// Device registry fused with its topology tracker: every write records
-    /// the change by construction, so the group-devices memo below can never
+    /// the change by construction, so the device-list memos below can never
     /// be left stale by a forgotten bump.
     pub(crate) device_registry_cache: device_topology::DeviceRegistryCache,
     /// Shared topology tracker (generation + changed-users log). LidPnCache
-    /// records mapping changes into it; the memo validates against it.
+    /// records mapping changes into it; the memos validate against it.
     pub(crate) device_topology: Arc<device_topology::DeviceTopology>,
-    /// Whether the group-devices memo may be used: false when the registry
-    /// or LID-PN caches are store-backed (a shared external store can be
-    /// written by other processes, which the in-process topology tracker
-    /// cannot observe).
-    pub(crate) group_devices_memo_enabled: bool,
+    /// Whether the device-list memos (group and DM) may be used: false when
+    /// the registry or LID-PN caches are store-backed (a shared external
+    /// store can be written by other processes, which the in-process
+    /// topology tracker cannot observe).
+    pub(crate) device_memos_enabled: bool,
     /// Per-group memo of the fully resolved (LID-converted) device list,
     /// validated by GroupInfo identity + the device topology. Serves the
     /// per-send full-set resolution in `resolve_skdm_targets` so a warm
     /// repeat send skips the per-member cache fan-out.
     pub(crate) group_devices_memo: Cache<Jid, Arc<device_registry::GroupDevicesMemo>>,
+    /// Per-recipient memo of the resolved DM fan-out (recipient devices +
+    /// own companions, partitioned, with its phash), keyed by the resolved
+    /// wire jid and validated by the sending identity + the device topology.
+    /// A warm repeat DM skips both registry lookups, the list rebuild and
+    /// the phash.
+    pub(crate) dm_devices_memo: Cache<Jid, Arc<device_registry::DmDevicesMemo>>,
+    /// Full DM fan-out recomputes (memo miss or bypass), so tests can prove a
+    /// repeat send really served the memo instead of redoing the resolution.
+    #[cfg(test)]
+    pub(crate) dm_devices_memo_recomputes: AtomicU64,
 
     /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
     /// cold sends each re-ran the full per-member fan-out before any of them
@@ -1237,6 +1353,24 @@ pub struct Client {
     /// `voip` feature: it is populated only by the `voip` media facade.
     #[cfg(feature = "voip-runtime")]
     pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
+
+    /// Admission snapshots that can race a call-link join ACK before its call id is registered.
+    /// Kept beside the client-side join lifecycle so `wacore` does not authorize unknown calls.
+    #[cfg(feature = "voip-runtime")]
+    pending_call_link_joins: Arc<std::sync::Mutex<voip::PendingCallLinkJoins>>,
+
+    /// Serializes call-link joins until the ACK reveals which call id owns any admission state
+    /// buffered during the request. This keeps a bounded overflow tied to one join instead of
+    /// letting it reject an unrelated concurrent join.
+    #[cfg(feature = "voip-runtime")]
+    pending_call_link_join_lane: Arc<Mutex<()>>,
+
+    /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
+    /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
+    /// current in the removal-before-send window. Stripes bound storage while allowing independent
+    /// lanes to progress concurrently.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; 16],
 
     /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
     /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed

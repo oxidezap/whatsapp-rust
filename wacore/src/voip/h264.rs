@@ -5,6 +5,8 @@
 //! The library never encodes or decodes pixels — callers hand us pre-encoded
 //! Annex-B access units and receive reassembled ones. Pure, no-Tokio, wasm-safe.
 
+use wacore_binary::Jid;
+
 /// Largest RTP payload we emit before fragmenting a NAL into FU-A units.
 /// Matches the reference relay MTU budget used by live WhatsApp interop.
 pub const H264_SINGLE_NAL_MAX: usize = 800;
@@ -32,6 +34,12 @@ pub struct VideoFrame {
     pub keyframe: bool,
     /// Peer device orientation in 90° steps (0..3), from `<video device_orientation>`.
     pub orientation: u8,
+    /// Group sender identity. Absent on 1:1 video.
+    pub sender: Option<Jid>,
+    /// Group sender device identity. Absent on 1:1 video.
+    pub device: Option<Jid>,
+    /// Relay participant id from the authoritative roster.
+    pub pid: Option<u32>,
 }
 
 impl VideoFrame {
@@ -41,6 +49,9 @@ impl VideoFrame {
             data,
             keyframe,
             orientation: 0,
+            sender: None,
+            device: None,
+            pid: None,
         }
     }
 }

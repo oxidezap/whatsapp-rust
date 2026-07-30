@@ -38,7 +38,8 @@ mod stores;
 mod timestamp;
 pub use crate::core::curve::{CurveError, KeyPair, PreparedVerifyingKey, PrivateKey, PublicKey};
 pub use crate::core::{
-    Aci, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes, ServiceIdKind,
+    Aci, AddressBuf, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes,
+    ServiceIdKind,
 };
 pub use crate::protocol::protocol::SENDERKEY_MESSAGE_CURRENT_VERSION;
 pub use crate::protocol::sender_keys::InvalidSenderKeySessionError;
@@ -88,6 +89,6 @@ pub use state::{
 pub use storage::{
     Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
     SessionCheckout, SessionCheckoutKey, SessionCheckoutStoreResult, SessionStore,
-    SignedPreKeyStore,
+    SignedPreKeyStore, has_session, is_trusted_identity, save_identity,
 };
 pub use timestamp::Timestamp;

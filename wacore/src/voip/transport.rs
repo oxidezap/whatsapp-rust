@@ -8,9 +8,10 @@
 //! embedded consumer could wrap a UDP `Conn`. The sans-IO `CallEngine` never touches this trait; the
 //! shell pumps `PacketReceived` events into `handle_input` and runs `Output::Transmit` via `send`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -59,6 +60,20 @@ pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
 
     /// Close the channel.
     async fn disconnect(&self);
+
+    /// Replace this channel with one connected to a newly selected relay endpoint.
+    ///
+    /// Platforms that cannot redial return an error, causing the driver to end the call instead of
+    /// silently sending allocation traffic to the retired relay.
+    async fn reconnect(
+        &self,
+        endpoint: SocketAddr,
+    ) -> Result<(
+        Arc<dyn RelayTransport>,
+        async_channel::Receiver<RelayTransportEvent>,
+    )> {
+        bail!("relay transport does not support reconnecting to {endpoint}")
+    }
 }
 
 /// Creates a [`RelayTransport`] connected to a relay endpoint, returning it alongside a push stream

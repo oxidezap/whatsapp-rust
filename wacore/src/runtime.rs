@@ -12,6 +12,17 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait Runtime: Send + Sync + 'static {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle;
+
+    /// Spawn a task nobody will cancel.
+    ///
+    /// [`Self::spawn`] has to hand back an [`AbortHandle`], which boxes a
+    /// `dyn FnOnce` capturing the executor's own handle. Fire-and-forget
+    /// callers pay for that box and drop it on the next line, so they get a
+    /// path that never builds one. The default keeps the old behaviour for
+    /// runtimes that do not override it.
+    fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+        self.spawn(future).detach();
+    }
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
     fn spawn_blocking(
         &self,
@@ -43,6 +54,11 @@ pub trait Runtime: Send + Sync + 'static {
 #[async_trait(?Send)]
 pub trait Runtime: Send + Sync + 'static {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle;
+
+    /// See the native variant: skips building an [`AbortHandle`] nobody keeps.
+    fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
+        self.spawn(future).detach();
+    }
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()>>>;
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + 'static>) -> Pin<Box<dyn Future<Output = ()>>>;
 

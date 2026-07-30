@@ -1,4 +1,5 @@
-//! Resolved group device set with its lazily memoized phash.
+//! Resolved device sets (group fan-out and DM fan-out) with their lazily
+//! memoized phash.
 
 use crate::messages::MessageUtils;
 use std::sync::OnceLock;
@@ -75,6 +76,80 @@ impl ResolvedGroupDevices {
                 None
             }
         }
+    }
+}
+
+/// The resolved DM fan-out: the recipient's devices plus our own companion
+/// devices, already partitioned for encryption, bundled with a memo of the
+/// `phash` derived from them.
+///
+/// Unlike [`ResolvedGroupDevices`] the phash needs no key: the sending
+/// identity is the only other input to both the partition and the hash, and
+/// the per-recipient memo entry that owns this struct pins it (a re-pair or a
+/// newly known own LID produces a new entry, and so a new cold instance). The
+/// stored set is already sender-excluded, so the hash is a pure function of
+/// the stored devices.
+pub struct ResolvedDmDevices {
+    partitioned: super::dm::PartitionedDmDevices,
+    phash: OnceLock<CompactString>,
+}
+
+impl crate::stats::HeapSize for ResolvedDmDevices {
+    fn heap_bytes(&self) -> usize {
+        self.partitioned.heap_bytes() + self.phash.get().map_or(0, |p| p.heap_bytes())
+    }
+}
+
+impl ResolvedDmDevices {
+    /// Partition `all_devices` into recipient devices and own companions,
+    /// dropping the sending device itself. `all_devices` must already be the
+    /// hosted-filtered, deduplicated fan-out set.
+    pub fn new(all_devices: Vec<Jid>, own_jid: &Jid, own_lid: Option<&Jid>) -> Self {
+        Self {
+            partitioned: super::dm::partition_dm_devices(all_devices, own_jid, own_lid),
+            phash: OnceLock::new(),
+        }
+    }
+
+    /// Every device the stanza encrypts for, in partition order.
+    pub fn devices(&self) -> &[Jid] {
+        self.partitioned.valid_devices()
+    }
+
+    pub(crate) fn recipient_devices(&self) -> &[Jid] {
+        self.partitioned.recipient_devices()
+    }
+
+    pub(crate) fn own_other_devices(&self) -> &[Jid] {
+        self.partitioned.own_other_devices()
+    }
+
+    /// The DM phash over the sent device set: a memo hit is an inline copy.
+    pub fn phash(&self) -> Option<CompactString> {
+        if let Some(hash) = self.phash.get() {
+            return Some(hash.clone());
+        }
+        let hash = match MessageUtils::participant_list_hash(self.devices()) {
+            Ok(phash) => CompactString::from(phash),
+            Err(e) => {
+                log::warn!("Failed to compute DM phash: {e:?}");
+                return None;
+            }
+        };
+        // Benign race: both racers computed the same value from the same
+        // immutable set, so whichever wins the cell is the right one.
+        let _ = self.phash.set(hash.clone());
+        Some(hash)
+    }
+}
+
+impl std::fmt::Debug for ResolvedDmDevices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedDmDevices")
+            .field("devices", &self.devices().len())
+            .field("recipients", &self.recipient_devices().len())
+            .field("phash_warm", &self.phash.get().is_some())
+            .finish()
     }
 }
 

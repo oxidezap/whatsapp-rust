@@ -196,23 +196,35 @@ impl RequestUtils {
     /// second, so a send that already sampled the clock for its own timestamps
     /// derives the id from that same instant instead of reading again.
     pub fn generate_message_id_at(&self, user_jid: Option<&Jid>, unix_secs: u64) -> String {
-        let mut data = Vec::with_capacity(8 + 20 + 16);
+        Self::message_id_at(user_jid, unix_secs)
+    }
 
-        data.extend_from_slice(&unix_secs.to_be_bytes());
+    /// The id derivation itself, which reads nothing from `self`. Exposed
+    /// separately so a caller on the send path does not have to materialize a
+    /// `RequestUtils` (and clone the unique id inside it) just to name a
+    /// message.
+    pub fn message_id_at(user_jid: Option<&Jid>, unix_secs: u64) -> String {
+        // Fed straight into the digest instead of through a staging Vec: this
+        // runs once per outgoing message and the input is never needed as a
+        // contiguous buffer.
+        let mut hasher = Sha256::new();
+        hasher.update(unix_secs.to_be_bytes());
 
         if let Some(jid) = user_jid {
-            data.extend_from_slice(jid.user.as_bytes());
-            data.extend_from_slice(b"@");
-            data.extend_from_slice(LEGACY_USER_SERVER.as_bytes());
+            hasher.update(jid.user.as_bytes());
+            hasher.update(b"@");
+            hasher.update(LEGACY_USER_SERVER.as_bytes());
         }
 
+        // The thread-local generator directly: seeding a fresh StdRng per
+        // message ran a full ChaCha key schedule to produce 16 bytes.
         let mut random_bytes = [0u8; 16];
-        rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut random_bytes);
-        data.extend_from_slice(&random_bytes);
+        rand::rng().fill_bytes(&mut random_bytes);
+        hasher.update(random_bytes);
 
         const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
-        let hash = Sha256::digest(&data);
+        let hash = hasher.finalize();
         let truncated = &hash[..9];
 
         // WA Web message IDs are "3EB0" + 18 hex chars (9-byte truncated hash)
@@ -388,5 +400,50 @@ mod iq_error_tests {
             IqError::UnexpectedResponseType { got } => assert!(got.is_none()),
             other => panic!("expected UnexpectedResponseType, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod message_id_tests {
+    use super::RequestUtils;
+    use wacore_binary::Jid;
+
+    fn jid() -> Jid {
+        "13135550100@s.whatsapp.net".parse().expect("valid jid")
+    }
+
+    /// The wire format is what WA Web produces; a client that drifts from it is
+    /// identifiable as non-official, so it is pinned rather than left implicit.
+    #[test]
+    fn message_id_keeps_the_wa_web_shape() {
+        let id = RequestUtils::message_id_at(Some(&jid()), 1_700_000_000);
+        assert_eq!(id.len(), 22, "id must be 3EB0 plus 18 hex chars: {id}");
+        assert!(id.starts_with("3EB0"), "id must carry the WA prefix: {id}");
+        assert!(
+            id[4..]
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)),
+            "id must be upper-case hex after the prefix: {id}"
+        );
+    }
+
+    /// Two ids from the same second and JID must still differ: the entropy comes
+    /// from the random block, not from the clock.
+    #[test]
+    fn message_id_is_unique_within_one_second() {
+        let jid = jid();
+        let ids: std::collections::HashSet<String> = (0..64)
+            .map(|_| RequestUtils::message_id_at(Some(&jid), 1_700_000_000))
+            .collect();
+        assert_eq!(ids.len(), 64, "ids repeated within the same second");
+    }
+
+    /// The JID is optional on this path (pre-pairing sends); dropping it must
+    /// not change the shape.
+    #[test]
+    fn message_id_without_jid_keeps_the_shape() {
+        let id = RequestUtils::message_id_at(None, 1_700_000_000);
+        assert_eq!(id.len(), 22);
+        assert!(id.starts_with("3EB0"));
     }
 }

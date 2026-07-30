@@ -33,16 +33,32 @@ pub fn make_qr_data_with_client_type(
     PairUtils::make_qr_data(&device_state, ref_str, client_type)
 }
 
+impl Client {
+    /// Ask the QR rotation task to re-render the ref it is currently showing.
+    ///
+    /// The QR payload embeds the adv secret key, so anything that re-mints that
+    /// key has to reach the code already on screen — waiting out the current
+    /// ref would leave a scannable code whose pairing data `handle_pair_success`
+    /// then verifies against a secret that no longer matches. WA Web drives its
+    /// QR re-render from an adv-secret change through the same path as a ref
+    /// change (`Link/DeviceQrcode.react.js`).
+    ///
+    /// A no-op when no rotation is in progress.
+    pub(crate) async fn refresh_pairing_qr(self: &Arc<Self>) {
+        if let Some(tx) = self.pairing_qr_refresh_tx.lock().await.as_ref() {
+            // Full means a refresh is already queued, which is just as good.
+            let _ = tx.try_send(());
+        }
+    }
+}
+
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.pair.handle_iq", level = "debug", skip_all)
 )]
 pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
     // Server JID is "s.whatsapp.net" (no @ prefix for server-only JIDs)
-    if node
-        .get_attr("from")
-        .is_none_or(|v| v.as_str() != SERVER_JID)
-    {
+    if node.get_attr("from").is_none_or(|v| v != SERVER_JID) {
         return false;
     }
 
@@ -56,27 +72,29 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                         warn!("Failed to send acknowledgement: {e:?}");
                     }
 
-                    let mut codes = Vec::new();
-
-                    let device_snapshot = client.persistence_manager.get_device_snapshot();
-                    let device_state = DeviceState {
-                        identity_key: device_snapshot.identity_key.clone(),
-                        noise_key: device_snapshot.noise_key.clone(),
-                        adv_secret_key: device_snapshot.adv_secret_key,
-                    };
-                    let client_type =
-                        companion_web_client_type_for_props(&device_snapshot.device_props);
-
-                    for grandchild in child.get_children_by_tag("ref") {
-                        if let Some(bytes) = grandchild.content_bytes()
-                            && let Ok(r) = std::str::from_utf8(bytes)
-                        {
-                            codes.push(PairUtils::make_qr_data(&device_state, r, client_type));
-                        }
-                    }
+                    // Refs, not payloads: the QR string embeds the ADV secret,
+                    // and anything that re-mints it mid-rotation (see the
+                    // `companion_reg_refresh` handler) would leave every queued
+                    // payload advertising a retired one. WA Web builds each
+                    // payload as it publishes the ref, from the state of that
+                    // moment.
+                    let refs: Vec<String> = child
+                        .get_children_by_tag("ref")
+                        .filter_map(|grandchild| {
+                            let bytes = grandchild.content_bytes()?;
+                            std::str::from_utf8(bytes).ok().map(str::to_owned)
+                        })
+                        .collect();
 
                     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
-                    let codes_clone = codes.clone();
+                    let (refresh_tx, refresh_rx) = async_channel::bounded::<()>(1);
+                    // Published before the task can run: `spawn` may poll it
+                    // immediately or on another thread, and a refresh arriving
+                    // in that window would find no sender and be dropped —
+                    // leaving the code already on screen keyed to a secret the
+                    // server has retired.
+                    *client.pairing_cancellation_tx.lock().await = Some(stop_tx);
+                    *client.pairing_qr_refresh_tx.lock().await = Some(refresh_tx);
                     let client_clone = client.clone();
 
                     client
@@ -84,7 +102,7 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                         .spawn(Box::pin(async move {
                             let mut is_first = true;
 
-                            for code in codes_clone {
+                            'refs: for pairing_ref in refs {
                                 // Guard: pairing may complete before this task gets polled
                                 // (single-threaded runtimes, fast auto-pair, mock servers)
                                 if client_clone.is_logged_in() {
@@ -92,48 +110,126 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                     return;
                                 }
 
-                                let timeout = if is_first {
+                                let ttl = if is_first {
                                     is_first = false;
                                     std::time::Duration::from_secs(60)
                                 } else {
                                     std::time::Duration::from_secs(20)
                                 };
+                                let started = wacore::time::Instant::now();
 
-                                client_clone.core.event_bus.dispatch(Event::PairingQrCode(
-                                    crate::types::events::PairingQrCode::builder()
-                                        .code(code)
-                                        .timeout(timeout)
-                                        .build(),
-                                ));
-
-                                let sleep = client_clone.runtime.sleep(timeout);
-                                let stop = stop_rx.recv();
+                                // Re-rendering the ref already on screen is its
+                                // own loop, because the payload embeds the adv
+                                // secret: a rotation mid-ref would otherwise
+                                // leave a scannable code keyed to a secret the
+                                // server has retired, for as long as this ref
+                                // has left. WA Web re-renders through one path
+                                // for a ref change and for an adv-secret change
+                                // (`Link/DeviceQrcode.react.js`).
+                                // One sleep for the whole ref, polled across
+                                // re-renders rather than recreated by them: it
+                                // is the runtime's own clock that decides when
+                                // this ref is spent, and restarting it would
+                                // let a refresh extend a ref past the deadline
+                                // the server set. `started` only feeds the
+                                // advisory countdown on the event.
+                                let sleep = client_clone.runtime.sleep(ttl);
                                 futures::pin_mut!(sleep);
-                                futures::pin_mut!(stop);
-                                match futures::future::select(sleep, stop).await {
-                                    futures::future::Either::Left(_) => {
-                                        if client_clone.is_logged_in() {
-                                            info!(
-                                                "Logged in during QR timeout, stopping rotation."
-                                            );
+
+                                loop {
+                                    let snapshot =
+                                        client_clone.persistence_manager.get_device_snapshot();
+                                    let code = PairUtils::make_qr_data(
+                                        &DeviceState {
+                                            identity_key: snapshot.identity_key.clone(),
+                                            noise_key: snapshot.noise_key.clone(),
+                                            adv_secret_key: snapshot.adv_secret_key,
+                                        },
+                                        &pairing_ref,
+                                        companion_web_client_type_for_props(&snapshot.device_props),
+                                    );
+                                    client_clone.core.event_bus.dispatch(Event::PairingQrCode(
+                                        crate::types::events::PairingQrCode::builder()
+                                            .code(code)
+                                            .timeout(ttl.saturating_sub(started.elapsed()))
+                                            .build(),
+                                    ));
+
+                                    let stop = stop_rx.recv();
+                                    let refresh = refresh_rx.recv();
+                                    futures::pin_mut!(stop);
+                                    futures::pin_mut!(refresh);
+                                    let outcome = futures::future::select(
+                                        sleep.as_mut(),
+                                        futures::future::select(stop, refresh),
+                                    )
+                                    .await;
+                                    match outcome {
+                                        futures::future::Either::Left(_) => {
+                                            if client_clone.is_logged_in() {
+                                                info!(
+                                                    "Logged in during QR timeout, stopping rotation."
+                                                );
+                                                return;
+                                            }
+                                            continue 'refs;
+                                        }
+                                        futures::future::Either::Right((
+                                            futures::future::Either::Left(_),
+                                            _,
+                                        )) => {
+                                            info!("Pairing complete. Stopping QR code rotation.");
                                             return;
                                         }
-                                    }
-                                    futures::future::Either::Right(_) => {
-                                        info!("Pairing complete. Stopping QR code rotation.");
-                                        return;
-                                    }
+                                        // Same ref and deadline, rebuilt payload.
+                                        futures::future::Either::Right((
+                                            futures::future::Either::Right(_),
+                                            _,
+                                        )) => continue,
+                                }
                                 }
                             }
 
-                            if !client_clone.is_logged_in() {
-                                info!("All QR codes for this session have expired.");
+                            if client_clone.is_logged_in() {
+                                return;
+                            }
+
+                            // WA Web stops here without closing the socket: its
+                            // rotation timer (`Handle/PairDevice.js`) cancels
+                            // itself and reports `UNPAIRED_IDLE`, leaving the
+                            // "click to reload" decision to the surface above.
+                            // That matters because the same connection can be
+                            // carrying a phone-number flow, whose code stays
+                            // valid past the rotation budget the six refs buy
+                            // (60s + 5×20s) — disconnecting would revoke a code
+                            // we advertised as still good, and the server would
+                            // route the eventual `primary_hello` to a session
+                            // that no longer exists. QR-only callers keep the
+                            // self-disconnect they rely on to get fresh refs.
+                            let pair_code_outstanding = client_clone
+                                .pair_code_state
+                                .lock()
+                                .await
+                                .is_outstanding(wacore::time::now_secs());
+
+                            info!(
+                                "All QR codes for this session have expired\
+                                 (pair-code flow outstanding: {pair_code_outstanding})."
+                            );
+                            client_clone
+                                .core
+                                .event_bus
+                                .dispatch(Event::PairingQrCodesExhausted(
+                                    crate::types::events::PairingQrCodesExhausted::builder()
+                                        .disconnected(!pair_code_outstanding)
+                                        .build(),
+                                ));
+                            if !pair_code_outstanding {
                                 client_clone.disconnect().await;
                             }
                         }))
                         .detach();
 
-                    *client.pairing_cancellation_tx.lock().await = Some(stop_tx);
                     true
                 }
                 "pair-success" => {
@@ -160,16 +256,6 @@ async fn handle_pair_success<'a>(
     request_node: &NodeRef<'a>,
     success_node: &NodeRef<'a>,
 ) {
-    if let Some(tx) = client.pairing_cancellation_tx.lock().await.take() {
-        let _ = tx.try_send(());
-        debug!("Sent QR rotation stop signal");
-    } else {
-        debug!("QR rotation channel not yet stored — is_logged_in guard will stop the task");
-    }
-
-    // Clear pair code state if active
-    *client.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Completed;
-
     client.update_server_time_offset(request_node);
 
     let req_id = match request_node.get_attr("id").map(|v| v.as_str()) {
@@ -232,6 +318,24 @@ async fn handle_pair_success<'a>(
 
     match result {
         Ok((self_signed_identity_bytes, key_index)) => {
+            // Both retired only once the identity and its HMAC check out. A
+            // pair-success that arrives after its own flow was written off can
+            // otherwise cancel the replacement that succeeded it, and then fail
+            // verification against the secret that replacement derived —
+            // leaving neither able to complete. Stopping the QR rotation early
+            // is the same mistake in the other direction: a rejected response
+            // would take the displayed code down with it, and nothing puts one
+            // back.
+            *client.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Completed;
+            if let Some(tx) = client.pairing_cancellation_tx.lock().await.take() {
+                let _ = tx.try_send(());
+                debug!("Sent QR rotation stop signal");
+            } else {
+                debug!(
+                    "QR rotation channel not yet stored — is_logged_in guard will stop the task"
+                );
+            }
+
             let signed_identity_for_event = match waproto::codec::adv_signed_device_identity_decode(
                 self_signed_identity_bytes.as_slice(),
             ) {
@@ -442,4 +546,272 @@ pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<()
 
     info!(target: "Client/PairTest", "Master client sent pairing confirmation.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{TestEventCollector, create_iq_test_client, poll_until};
+    use wacore::pair_code::PairCodeState;
+    use wacore_binary::Node;
+    use wacore_binary::builder::NodeBuilder;
+
+    /// The six refs the server hands out in one `<pair-device>`, and the
+    /// rotation budget they buy: WA Web `Handle/PairDevice.js` waits 60s on the
+    /// first (`u = 6e4`) and 20s on each of the rest (`c = 20 * 1e3`).
+    const QR_REFS: usize = 6;
+
+    fn qr_codes_seen(collector: &Arc<TestEventCollector>) -> usize {
+        collector
+            .events()
+            .iter()
+            .filter(|e| matches!(&***e, Event::PairingQrCode(_)))
+            .count()
+    }
+
+    /// Burn the whole rotation budget without a real-time wait.
+    ///
+    /// Each step waits for the code to actually be published before moving the
+    /// clock: the rotation task must have registered its sleep first, or the
+    /// jump lands before the timer exists and the deadline is simply pushed out
+    /// of reach.
+    async fn exhaust_qr_rotation(collector: &Arc<TestEventCollector>) {
+        for nth in 1..=QR_REFS {
+            poll_until("the next QR code to be published", || {
+                qr_codes_seen(collector) >= nth
+            })
+            .await;
+            // Longer than the first ref's 60s, which covers the 20s ones too.
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        }
+    }
+
+    fn pair_device_iq() -> Node {
+        NodeBuilder::new("iq")
+            .attrs([
+                ("from", SERVER_JID.to_string()),
+                ("type", "set".to_string()),
+                ("id", "pair-1".to_string()),
+                ("xmlns", "md".to_string()),
+            ])
+            .children([NodeBuilder::new("pair-device")
+                .children((0..QR_REFS).map(|i| {
+                    NodeBuilder::new("ref")
+                        .bytes(format!("2@ref{i}").into_bytes())
+                        .build()
+                }))
+                .build()])
+            .build()
+    }
+
+    async fn set_pair_code_waiting(client: &Arc<Client>) {
+        *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: b"3@2:ref".to_vec(),
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: wacore::time::now_secs(),
+            primary_hello_attempt_count: 0,
+        };
+    }
+
+    /// Regression: the six payloads used to be built once, from a single
+    /// snapshot, and handed to the rotation task. Anything that re-mints the ADV
+    /// secret mid-rotation (see the `companion_reg_refresh` handler) then left
+    /// every queued payload advertising a secret the server had retired, so a
+    /// scan produced pairing data `handle_pair_success` verifies against the new
+    /// one. WA Web builds each payload when it publishes the ref, not up front.
+    #[tokio::test(start_paused = true)]
+    async fn each_qr_payload_carries_the_adv_secret_of_its_own_moment() {
+        use base64::Engine as _;
+
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        poll_until("the first QR code", || qr_codes_seen(&collector) >= 1).await;
+
+        let rotated = [7u8; 32];
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetAdvSecretKey(
+                rotated,
+            ))
+            .await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        poll_until("the second QR code", || qr_codes_seen(&collector) >= 2).await;
+
+        let expected = base64::engine::general_purpose::STANDARD.encode(rotated);
+        let codes: Vec<String> = collector
+            .events()
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::PairingQrCode(qr) => Some(qr.code.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !codes[0].contains(&expected),
+            "the first code predates the rotation"
+        );
+        assert!(
+            codes[1].contains(&expected),
+            "a code published after the rotation must advertise the new secret"
+        );
+    }
+
+    /// Regression: rotating the ADV secret has to reach the code already on
+    /// screen, not just the next one. WA Web listens on `advSecretEventEmitter`
+    /// and re-renders through the same path as a ref change
+    /// (`Link/DeviceQrcode.react.js`); waiting out the current 20s or 60s ref
+    /// leaves a QR whose scan produces pairing data verified against a secret
+    /// that no longer matches.
+    #[tokio::test(start_paused = true)]
+    async fn rotating_the_adv_secret_re_emits_the_qr_on_screen() {
+        use base64::Engine as _;
+
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        poll_until("the first QR code", || qr_codes_seen(&collector) >= 1).await;
+
+        let rotated = [7u8; 32];
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetAdvSecretKey(
+                rotated,
+            ))
+            .await;
+        client.refresh_pairing_qr().await;
+
+        // No clock movement: the current ref is nowhere near expiry.
+        poll_until("the QR to be re-emitted", || qr_codes_seen(&collector) >= 2).await;
+        let expected = base64::engine::general_purpose::STANDARD.encode(rotated);
+        let codes: Vec<String> = collector
+            .events()
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::PairingQrCode(qr) => Some(qr.code.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            codes[1].contains(&expected),
+            "the re-emitted code must carry the new secret"
+        );
+        assert_eq!(
+            codes[0].split(',').next(),
+            codes[1].split(',').next(),
+            "it is the same ref, re-rendered — not the next one"
+        );
+    }
+
+    /// Regression: the pair-code lifetime the exhaustion guard has to respect is
+    /// the link's, not the code's. A `primary_hello` accepted near the end of
+    /// the validity window leaves `companion_finish` pending for up to a minute
+    /// more, and tearing the socket down there kills a confirmation still on its
+    /// way.
+    #[tokio::test(start_paused = true)]
+    async fn qr_exhaustion_keeps_the_socket_up_for_a_pending_pair_success() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let expired = wacore::time::now_secs()
+            - (wacore::pair_code::PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: b"3@2:ref".to_vec(),
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: expired,
+            // Stage 2 ran: pair-success is still due.
+            primary_hello_attempt_count: 1,
+        };
+
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        exhaust_qr_rotation(&collector).await;
+        poll_until("the QR rotation task to run out of refs", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingQrCodesExhausted(_)))
+        })
+        .await;
+
+        assert!(
+            client.is_running.load(Ordering::Relaxed),
+            "a pending pair-success still needs this socket"
+        );
+    }
+
+    /// Regression: a pair-code flow outlives the QR refs. WA Web's rotation
+    /// timer (`Handle/PairDevice.js`) cancels itself and reports
+    /// `UNPAIRED_IDLE` when the refs run out — it never closes the socket — so
+    /// tearing the connection down here would kill a phone-number link that the
+    /// server still considers open (and whose code we advertised for longer
+    /// than the rotation budget).
+    #[tokio::test(start_paused = true)]
+    async fn qr_exhaustion_keeps_the_socket_up_while_a_pair_code_is_outstanding() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        set_pair_code_waiting(&client).await;
+
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+
+        exhaust_qr_rotation(&collector).await;
+        poll_until("the QR rotation task to run out of refs", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingQrCodesExhausted(x) if !x.disconnected))
+        })
+        .await;
+
+        assert!(
+            client.is_running.load(Ordering::Relaxed),
+            "exhausted QR refs must not tear down a connection a pair-code flow is still using"
+        );
+    }
+
+    /// The companion still needs to hear that the QR codes are gone: WA Web
+    /// switches the screen to `UNPAIRED_IDLE` ("click to reload"), which is the
+    /// consumer's cue to reconnect. Without a pair-code flow in progress the
+    /// legacy self-disconnect stays, so QR-only consumers keep the reconnect
+    /// they already rely on.
+    #[tokio::test(start_paused = true)]
+    async fn qr_exhaustion_reports_itself_and_still_disconnects_a_qr_only_flow() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+
+        exhaust_qr_rotation(&collector).await;
+        poll_until("the QR rotation task to give up", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingQrCodesExhausted(x) if x.disconnected))
+        })
+        .await;
+
+        poll_until("the QR-only client to disconnect", || {
+            !client.is_running.load(Ordering::Relaxed)
+        })
+        .await;
+    }
 }

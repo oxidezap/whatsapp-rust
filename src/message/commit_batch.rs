@@ -721,6 +721,9 @@ impl Client {
             return false;
         }
 
+        // Rides on the dispatched event so a consumer that the hook already
+        // fed can skip re-materializing the batch.
+        let mut hook_committed = false;
         if let Some(hook) = self.inbound_durability_hook() {
             // Key strings live for the whole commit; rows borrow them and the
             // encode arena, so the batch write allocates nothing per row
@@ -805,6 +808,7 @@ impl Client {
                 );
                 return true;
             }
+            hook_committed = true;
 
             let delete_keys: Vec<PendingInboundKey<'_>> = items
                 .iter()
@@ -853,6 +857,7 @@ impl Client {
             MessageBatch::builder()
                 .messages(items)
                 .origin(origin)
+                .hook_committed(hook_committed)
                 .build(),
         ));
         true

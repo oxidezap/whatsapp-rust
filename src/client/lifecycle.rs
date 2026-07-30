@@ -6,6 +6,11 @@ use super::*;
 /// accounts in more groups; an evicted entry just recomputes on next send.
 const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 
+/// Max 1:1 chats with a cached resolved-device snapshot. Higher than the
+/// group bound because a bot's active DM set is typically much wider; each
+/// entry is only the device list plus its member set.
+const DM_DEVICES_MEMO_CAPACITY: u64 = 512;
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.signal_shutdown_sync();
@@ -328,6 +333,7 @@ impl Client {
             app_state_processor: Mutex::new(None),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
             app_state_syncing: app_state::SyncInFlight::new(),
+            app_state_send_lock: Arc::new(Mutex::new(())),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
             prekey_upload_lock: Arc::new(Mutex::new(())),
@@ -340,12 +346,14 @@ impl Client {
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
+            transport_ack_queue: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
+            pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
@@ -373,11 +381,16 @@ impl Client {
                 Arc::clone(&device_topology),
             ),
             device_topology,
-            group_devices_memo_enabled: cache_config.cache_stores.device_registry_cache.is_none()
+            device_memos_enabled: cache_config.cache_stores.device_registry_cache.is_none()
                 && cache_config.cache_stores.lid_pn_cache.is_none(),
             group_devices_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),
+            dm_devices_memo: Cache::builder()
+                .max_capacity(DM_DEVICES_MEMO_CAPACITY)
+                .build(),
+            #[cfg(test)]
+            dm_devices_memo_recomputes: AtomicU64::new(0),
             // A live lane also protects recipient-tracker reset/update ordering.
             group_distribution_locks: Cache::builder()
                 .max_capacity(cache_config.group_distribution_locks_capacity.max(1))
@@ -399,6 +412,14 @@ impl Client {
             raw_node_forwarding: AtomicUsize::new(0),
             #[cfg(feature = "voip-runtime")]
             call_registry: Arc::new(wacore::voip::CallRegistry::new()),
+            #[cfg(feature = "voip-runtime")]
+            pending_call_link_joins: Arc::new(std::sync::Mutex::new(
+                voip::PendingCallLinkJoins::default(),
+            )),
+            #[cfg(feature = "voip-runtime")]
+            pending_call_link_join_lane: Arc::new(Mutex::new(())),
+            #[cfg(feature = "voip-runtime")]
+            answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             #[cfg(feature = "voip-runtime")]
             pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -559,7 +580,24 @@ impl Client {
                 delay,
                 error_count + 1
             );
-            self.runtime.sleep(delay).await;
+            // Race the wait against the terminal shutdown: the loop only tests
+            // `is_running` at the top, so a bare sleep would hold a shutdown
+            // unobserved for as long as the backoff runs — up to the 900s cap,
+            // which a 429 reaches in a couple of stream errors. Falling through
+            // is the whole fix; the loop condition handles the exit.
+            //
+            // Fresh listener per iteration (event_listener is edge-triggered);
+            // `shutdown` itself is subscribed once above and holds the notifier
+            // alive. Deliberately NOT `connection_shutdown_signal()`: that one
+            // fires on every disconnect the loop is here to reconnect from, so
+            // watching it would collapse the backoff instead of interrupting it.
+            let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
+            futures::select! {
+                _ = self.runtime.sleep(delay).fuse() => {}
+                _ = shutdown_fired.fuse() => {
+                    debug!("Shutdown signalled during reconnect backoff, exiting run loop.");
+                }
+            }
         }
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
@@ -908,6 +946,20 @@ impl Client {
     #[cfg(not(feature = "client-lifecycle"))]
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
         self.cleanup_connection_state_inner().await;
+        self.clear_connection_scoped_pair_code().await;
+    }
+
+    /// A pair-code flow belongs to the connection that carried it: the pairing
+    /// ref and any in-flight `companion_hello` die with the socket, and the
+    /// server routes no `primary_hello` to a session it has dropped. Left
+    /// standing, the outstanding-code guard would reject the very request that
+    /// reconnecting exists to make.
+    ///
+    /// Runs after the inner teardown, so the generation is already retired and
+    /// the transport already closed: a request that claims the slot from here
+    /// on is one the next connection will carry.
+    async fn clear_connection_scoped_pair_code(self: &Arc<Self>) {
+        *self.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Idle;
     }
 
     #[cfg_attr(
@@ -918,6 +970,7 @@ impl Client {
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
         if self.lifecycle.is_none() {
             self.cleanup_connection_state_inner().await;
+            self.clear_connection_scoped_pair_code().await;
             return;
         }
 
@@ -937,6 +990,7 @@ impl Client {
             Ok(Err(panic)) => std::panic::resume_unwind(panic),
             Err(_) => error!("Detached connection cleanup stopped before completion"),
         }
+        self.clear_connection_scoped_pair_code().await;
     }
 
     async fn cleanup_connection_state_inner(&self) {
@@ -1309,5 +1363,95 @@ mod tests {
             .await
             .expect_err("connecting twice must be refused");
         assert!(matches!(error, ConnectError::AlreadyConnected));
+    }
+
+    /// Far enough up the Fibonacci sequence that the next backoff is the 900s
+    /// cap. The cap is what makes these tests decisive: an uninterruptible
+    /// wait parks the loop for 15 minutes, so a prompt return can only come
+    /// from the wait racing the shutdown signal.
+    const CAPPED_BACKOFF_ATTEMPTS: u32 = 40;
+
+    /// Starts `run()` and returns once the loop has actually reached its
+    /// reconnect backoff. The attempt counter is bumped immediately before the
+    /// wait, so observing the bump is proof the loop is parked there — no
+    /// timed guess involved.
+    async fn run_until_parked_in_backoff(client: &Arc<Client>) -> tokio::task::JoinHandle<()> {
+        client
+            .auto_reconnect_errors
+            .store(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);
+
+        let runner = client.clone();
+        let run = tokio::spawn(async move { runner.run().await });
+
+        crate::test_utils::poll_until("the run loop to reach its reconnect backoff", || {
+            client.auto_reconnect_errors.load(Ordering::Relaxed) > CAPPED_BACKOFF_ATTEMPTS
+        })
+        .await;
+
+        run
+    }
+
+    /// A shutdown that lands *during* the reconnect backoff must be observed
+    /// then, not when the sleep happens to expire. `disconnect()` returns
+    /// promptly either way; what the consumer awaits is the run future, and
+    /// with an uninterruptible wait that future outlives the shutdown by up to
+    /// the 900s cap — long enough that a supervisor awaiting `Bot::run` reads
+    /// it as a hang.
+    #[tokio::test]
+    async fn disconnect_interrupts_the_reconnect_backoff() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.disconnect().await;
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return when disconnect() fires, not after the 900s backoff")
+            .expect("the run task must not panic");
+    }
+
+    /// `signal_shutdown_sync()` is the flag-only path taken by `Drop` impls on
+    /// FFI wrappers, and its contract is the same: watchers exit on their next
+    /// poll. The run loop is a watcher, so the parked backoff must wake here
+    /// too — it is the path a `Drop` cannot follow up with an `await`.
+    #[tokio::test]
+    async fn signal_shutdown_sync_interrupts_the_reconnect_backoff() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.signal_shutdown_sync();
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return when signal_shutdown_sync() fires")
+            .expect("the run task must not panic");
+    }
+
+    /// The counterpart guard: the *per-connection* shutdown fires on every
+    /// disconnect the loop is supposed to reconnect from, so the backoff must
+    /// not watch it. Subscribing to the wrong signal would pass the two tests
+    /// above while silently turning every backoff into a no-op and hammering
+    /// the server — this pins the normal path down.
+    #[tokio::test]
+    async fn a_connection_level_shutdown_does_not_cut_the_backoff_short() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.notify_connection_shutdown();
+
+        // Still parked: the loop must not have come back around to bump the
+        // counter for another attempt.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client.auto_reconnect_errors.load(Ordering::Relaxed),
+            CAPPED_BACKOFF_ATTEMPTS + 1,
+            "a per-connection shutdown must not release the reconnect backoff"
+        );
+
+        client.disconnect().await;
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must still return on a terminal shutdown")
+            .expect("the run task must not panic");
     }
 }

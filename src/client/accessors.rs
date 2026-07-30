@@ -180,6 +180,10 @@ impl Client {
             .group_devices_memo
             .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
             .await;
+        let dm_devices_memo = self
+            .dm_devices_memo
+            .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
+            .await;
         let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
 
         // Each count read into a local so no two guards are ever held at once.
@@ -193,6 +197,14 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
+        #[cfg(feature = "voip-runtime")]
+        let pending_call_link_updates = self
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .memory_stats();
+        #[cfg(feature = "voip-runtime")]
+        let active_calls = self.call_registry.memory_stats();
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]
@@ -239,6 +251,7 @@ impl Client {
             recent_messages,
             sender_key_device_cache: self.sender_key_device_cache.memory_stats().await,
             group_devices_memo,
+            dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
@@ -252,6 +265,8 @@ impl Client {
             group_distribution_lock_evictions: group_distribution_locks.evictions,
             group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
+            delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
@@ -261,6 +276,10 @@ impl Client {
             signal_sessions,
             signal_identities,
             signal_sender_keys,
+            #[cfg(feature = "voip-runtime")]
+            pending_call_link_updates,
+            #[cfg(feature = "voip-runtime")]
+            active_calls,
             #[cfg(feature = "plugins")]
             plugins,
             #[cfg(feature = "plugins")]

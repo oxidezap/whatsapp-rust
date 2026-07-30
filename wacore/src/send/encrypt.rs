@@ -77,8 +77,12 @@ pub struct SignalStores<'a> {
 /// Check if an anyhow error is a 406 "not-acceptable" server error (device unregistered).
 /// Uses typed downcast to `ServerErrorCode` — the shared error type that the
 /// `SendContextResolver` impl wraps server errors in.
+/// The `<error code>` the server attaches to a device it no longer knows.
+pub(crate) const UNREGISTERED_DEVICE_CODE: u16 = 406;
+
 pub(crate) fn is_device_unregistered_error(err: &anyhow::Error) -> bool {
-    crate::request::ServerErrorCode::from_anyhow(err).is_some_and(|e| e.code == 406)
+    crate::request::ServerErrorCode::from_anyhow(err)
+        .is_some_and(|e| e.code == UNREGISTERED_DEVICE_CODE)
 }
 
 pub struct EncryptResult {
@@ -87,6 +91,9 @@ pub struct EncryptResult {
     pub encrypted_devices: Vec<Jid>,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// The devices the server rejected by name, when it named them. Empty for a
+    /// batch-wide failure, which names nobody.
+    pub rejected_devices: Vec<Jid>,
 }
 
 pub(crate) struct EncryptAttempt {
@@ -111,6 +118,8 @@ pub struct EncryptForDevicesRaw {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// See [`EncryptResult::rejected_devices`].
+    pub rejected_devices: Vec<Jid>,
 }
 
 struct RawEncryptAttempt {
@@ -371,14 +380,85 @@ pub async fn encrypt_for_devices(
     .await
 }
 
+/// What a fan-out reports back when its `<to><enc>` nodes went straight into
+/// the caller's stanza buffer instead of a per-fan-out [`EncryptResult`].
+pub struct EncryptFanoutSummary {
+    pub includes_prekey_message: bool,
+    /// True if any device returned 406 (unregistered) during prekey fetch.
+    pub had_unregistered_device: bool,
+}
+
+/// [`encrypt_for_devices`] for a caller that already owns the buffer the nodes
+/// belong in.
+///
+/// [`EncryptResult`] is shaped for the group path, which needs the encrypted
+/// device list to tell a partial SKDM distribution from a complete one. A DM
+/// never asks that question and knows up front how many participants it can
+/// have, so it sizes one vector and lets each fan-out append into it: the
+/// per-fan-out node vector and the device list it would otherwise carry are
+/// both work done only to be moved and dropped.
+#[allow(clippy::too_many_arguments)]
+pub async fn encrypt_for_devices_into(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    hide_decrypt_fail: bool,
+    mediatype: Option<&str>,
+    participant_nodes: &mut Vec<Node>,
+) -> Result<EncryptFanoutSummary> {
+    let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
+    // `first_error` is dropped here exactly as `encrypt_for_devices` drops it:
+    // a DM reports failure through the empty-participants check, not per device.
+    let RawEncryptAttempt { result: raw, .. } = encrypt_for_devices_with_sessions_raw_detailed(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        plan,
+    )
+    .await?;
+
+    participant_nodes.reserve(raw.devices.len());
+    for one in raw.devices {
+        participant_nodes.push(encrypted_device_to_participant_node(
+            one,
+            mediatype,
+            hide_decrypt_fail,
+        ));
+    }
+
+    Ok(EncryptFanoutSummary {
+        includes_prekey_message: raw.includes_prekey_message,
+        had_unregistered_device: raw.had_unregistered_device,
+    })
+}
+
 /// Session material prepared for one encrypt fan-out: per-index LID
 /// encryption overrides (mirroring the `devices` slice it was built from)
 /// plus whether any device 406'd during prekey fetch. Produced only by
 /// [`ensure_sessions_for_devices`]; consumed by
 /// [`encrypt_for_devices_with_sessions`] over the same `devices` slice.
 pub struct SessionPlan {
+    /// Device count the plan was built for. Kept alongside the (possibly empty)
+    /// override map so the "same slice" invariant is still checkable now that an
+    /// override-free plan carries no vector at all.
+    device_count: usize,
+    /// Empty means "no device is overridden"; otherwise one slot per device.
+    /// See [`record_encryption_override`].
     encryption_overrides: Vec<Option<Jid>>,
     pub had_unregistered_device: bool,
+    /// Devices the server rejected *by name*. Empty when the whole batch
+    /// failed, since a batch-wide answer names nobody.
+    ///
+    /// Kept apart from the flag because they call for different recoveries: a
+    /// named set says exactly which device lists are stale, while a batch-wide
+    /// failure leaves the caller to infer it from what went unencrypted -- and
+    /// inferring it when the server did name the devices would sweep in every
+    /// device that merely lacked a bundle or failed session setup, refreshing
+    /// unrelated users for no reason.
+    pub rejected_devices: Vec<Jid>,
     first_error: Option<anyhow::Error>,
 }
 
@@ -389,11 +469,37 @@ impl SessionPlan {
     /// and must not touch the network during the encrypt fan-out.
     pub fn assume_ready(device_count: usize) -> Self {
         Self {
-            encryption_overrides: vec![None; device_count],
+            device_count,
+            encryption_overrides: Vec::new(),
             had_unregistered_device: false,
+            rejected_devices: Vec::new(),
             first_error: None,
         }
     }
+}
+
+/// The LID address recorded for `index`, or `None` when that device encrypts
+/// against its own JID. Indexing tolerates the empty (no-override) map, which
+/// is what a warm send carries.
+fn encryption_override_at(overrides: &[Option<Jid>], index: usize) -> Option<&Jid> {
+    overrides.get(index).and_then(Option::as_ref)
+}
+
+/// Record a per-index LID override, materializing the map on its first entry.
+///
+/// A steady-state send overrides nothing, so the all-`None` vector it would
+/// otherwise allocate (once per encrypt fan-out, twice per DM that also has
+/// companion devices) never exists.
+fn record_encryption_override(
+    overrides: &mut Vec<Option<Jid>>,
+    device_count: usize,
+    index: usize,
+    jid: Jid,
+) {
+    if overrides.is_empty() {
+        overrides.resize(device_count, None);
+    }
+    overrides[index] = Some(jid);
 }
 
 /// Resolve LID overrides and establish missing Signal sessions (prekey
@@ -411,11 +517,14 @@ pub async fn ensure_sessions_for_devices(
     // None = use devices[i] as-is; Some(jid) = use this LID-upgraded version.
     // The Vec replaces a HashMap<&Jid, Jid> that paid hash + alloc per insert
     // and per get (~666 of each on a large group). Plain Vec<Option<Jid>> is
-    // direct indexing and contiguous memory.
-    let mut encryption_overrides: Vec<Option<Jid>> = vec![None; devices.len()];
+    // direct indexing and contiguous memory. Both vectors stay unallocated
+    // until something is actually recorded in them, which on a warm send is
+    // never.
+    let mut encryption_overrides: Vec<Option<Jid>> = Vec::new();
     // Indices into `devices` for those needing prekey fetch.
-    let mut indices_needing_prekeys: Vec<usize> = Vec::with_capacity(devices.len());
+    let mut indices_needing_prekeys: Vec<usize> = Vec::new();
     let mut had_406 = false;
+    let mut rejected_devices: Vec<Jid> = Vec::new();
     let mut first_error = None;
 
     let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
@@ -431,19 +540,20 @@ pub async fn ensure_sessions_for_devices(
             let lid_jid = Jid::lid_device(lid_user, device_jid.device);
             lid_jid.reset_protocol_address(&mut reusable_addr);
 
-            if stores.session_store.has_session(&reusable_addr).await? {
+            if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await?
+            {
                 log::debug!(
                     "Using LID session {} for PN {} (LID-first lookup)",
                     lid_jid.observe(),
                     device_jid.observe()
                 );
-                encryption_overrides[idx] = Some(lid_jid);
+                record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
                 continue;
             }
         }
 
         device_jid.reset_protocol_address(&mut reusable_addr);
-        if stores.session_store.has_session(&reusable_addr).await? {
+        if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await? {
             continue;
         }
 
@@ -459,7 +569,7 @@ pub async fn ensure_sessions_for_devices(
                 lid_jid.observe(),
                 device_jid.observe()
             );
-            encryption_overrides[idx] = Some(lid_jid);
+            record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
         }
         indices_needing_prekeys.push(idx);
     }
@@ -476,15 +586,36 @@ pub async fn ensure_sessions_for_devices(
             .iter()
             .map(|&i| devices[i].clone())
             .collect();
-        // 406 on this batch is all-or-nothing — per-device retries just wasted
+        // A batch-wide 406 is all-or-nothing — per-device retries just wasted
         // N·RTT with the same failure. Mark `had_406` so the caller invalidates
         // the users and the next send re-fetches. Matches WA Web's
         // `GroupSkmsgJob`: log, continue without those devices.
+        //
+        // A per-device rejection is the better-informed case: the server names
+        // the device in its own `<user>`, so it sets the same flag without
+        // condemning the rest of the batch.
         let prekey_bundles = match resolver
             .fetch_prekeys_for_identity_check(&jids_for_fetch)
             .await
         {
-            Ok(bundles) => bundles,
+            Ok(outcome) => {
+                rejected_devices.extend(
+                    outcome
+                        .rejected
+                        .iter()
+                        .filter(|device| device.code == UNREGISTERED_DEVICE_CODE)
+                        .map(|device| device.jid.clone()),
+                );
+                if !rejected_devices.is_empty() {
+                    log::debug!(
+                        "prekey fetch rejected {} of {} device(s) by name",
+                        rejected_devices.len(),
+                        jids_for_fetch.len()
+                    );
+                    had_406 = true;
+                }
+                outcome.bundles
+            }
             Err(e) if is_device_unregistered_error(&e) => {
                 // No server prekeys for these devices this round; the next send
                 // re-fetches. Debug, not warn — a batch 406 would otherwise flood the log.
@@ -515,18 +646,11 @@ pub async fn ensure_sessions_for_devices(
 
         let make_session_task = |spawn_idx: usize| {
             let idx = indices_needing_prekeys[spawn_idx];
-            let device_jid = devices[idx].clone();
-            let mut encryption_jid = encryption_overrides[idx]
-                .clone()
-                .unwrap_or_else(|| device_jid.clone());
+            let lookup_jid = devices[idx].clone();
+            let encryption_jid = encryption_override_at(&encryption_overrides, idx)
+                .cloned()
+                .unwrap_or_else(|| lookup_jid.clone());
 
-            // Normalize agent to 0 for LID JIDs to match how pre-key bundles are stored.
-            // prekeys.rs forces agent=0 for LID; we must match that here.
-            if encryption_jid.is_lid() {
-                encryption_jid.agent = 0;
-            }
-
-            let lookup_jid = device_jid.normalize_for_prekey_bundle();
             let bundles = prekey_bundles.clone();
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
@@ -607,8 +731,10 @@ pub async fn ensure_sessions_for_devices(
     }
 
     Ok(SessionPlan {
+        device_count: devices.len(),
         encryption_overrides,
         had_unregistered_device: had_406,
+        rejected_devices,
         first_error,
     })
 }
@@ -683,6 +809,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
             includes_prekey_message: raw.includes_prekey_message,
             encrypted_devices,
             had_unregistered_device: raw.had_unregistered_device,
+            rejected_devices: raw.rejected_devices.clone(),
         },
         first_error,
     })
@@ -722,13 +849,15 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     plan: SessionPlan,
 ) -> Result<RawEncryptAttempt> {
     debug_assert_eq!(
-        plan.encryption_overrides.len(),
+        plan.device_count,
         devices.len(),
         "SessionPlan built for a different device list"
     );
     let SessionPlan {
+        device_count: _,
         encryption_overrides,
         had_unregistered_device,
+        rejected_devices,
         mut first_error,
     } = plan;
 
@@ -744,9 +873,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         // a FuturesUnordered, and two store clones), with no parallelism to gain.
         // Encrypt inline.
         let device_jid = devices[0].clone();
-        let addr = encryption_overrides
-            .first()
-            .and_then(|o| o.as_ref())
+        let addr = encryption_override_at(&encryption_overrides, 0)
             .unwrap_or(&devices[0])
             .to_protocol_address();
         let res = encrypt_one_device(
@@ -782,9 +909,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             // The 'static task can't borrow devices/encryption_overrides.
             let jobs: Vec<(ProtocolAddress, Jid)> = (chunk_start..chunk_end)
                 .map(|idx| {
-                    let addr = encryption_overrides
-                        .get(idx)
-                        .and_then(|o| o.as_ref())
+                    let addr = encryption_override_at(&encryption_overrides, idx)
                         .unwrap_or(&devices[idx])
                         .to_protocol_address();
                     (addr, devices[idx].clone())
@@ -845,7 +970,85 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             devices: encrypted,
             includes_prekey_message,
             had_unregistered_device,
+            rejected_devices,
         },
         first_error,
     })
+}
+
+#[cfg(test)]
+mod encryption_override_tests {
+    use super::{SessionPlan, encryption_override_at, record_encryption_override};
+    use wacore_binary::Jid;
+
+    fn lid(user: &str, device: u16) -> Jid {
+        Jid::lid_device(user.to_owned(), device)
+    }
+
+    /// The steady state: nothing is overridden, so the per-device map is never
+    /// allocated and every lookup still answers "use the device's own JID".
+    #[test]
+    fn an_empty_map_answers_every_index_without_allocating() {
+        let overrides: Vec<Option<Jid>> = Vec::new();
+        assert_eq!(overrides.capacity(), 0, "no override must mean no buffer");
+        for index in [0, 1, 7, usize::MAX] {
+            assert!(encryption_override_at(&overrides, index).is_none());
+        }
+
+        let plan = SessionPlan::assume_ready(4);
+        assert!(
+            plan.encryption_overrides.is_empty(),
+            "a plan that overrides nothing must carry no override buffer"
+        );
+        assert_eq!(plan.device_count, 4, "the slice length is still recorded");
+    }
+
+    /// The first recorded override materializes the full map, so later indices
+    /// stay addressable and earlier ones stay `None`.
+    #[test]
+    fn recording_materializes_the_whole_map_once() {
+        let mut overrides: Vec<Option<Jid>> = Vec::new();
+        record_encryption_override(&mut overrides, 3, 2, lid("100000000000001", 5));
+        assert_eq!(overrides.len(), 3);
+        assert!(encryption_override_at(&overrides, 0).is_none());
+        assert!(encryption_override_at(&overrides, 1).is_none());
+        assert_eq!(
+            encryption_override_at(&overrides, 2),
+            Some(&lid("100000000000001", 5))
+        );
+
+        // A second record must not resize again, nor clear the first.
+        record_encryption_override(&mut overrides, 3, 0, lid("100000000000002", 0));
+        assert_eq!(overrides.len(), 3);
+        assert_eq!(
+            encryption_override_at(&overrides, 0),
+            Some(&lid("100000000000002", 0))
+        );
+        assert_eq!(
+            encryption_override_at(&overrides, 2),
+            Some(&lid("100000000000001", 5))
+        );
+
+        // Overwriting an index replaces it rather than appending.
+        record_encryption_override(&mut overrides, 3, 2, lid("100000000000003", 1));
+        assert_eq!(overrides.len(), 3);
+        assert_eq!(
+            encryption_override_at(&overrides, 2),
+            Some(&lid("100000000000003", 1))
+        );
+    }
+
+    /// A single-device fan-out is the DM hot path, and it reads index 0 off a
+    /// map that may not exist.
+    #[test]
+    fn a_single_device_plan_records_and_reads_index_zero() {
+        let mut overrides: Vec<Option<Jid>> = Vec::new();
+        assert!(encryption_override_at(&overrides, 0).is_none());
+        record_encryption_override(&mut overrides, 1, 0, lid("100000000000009", 33));
+        assert_eq!(
+            encryption_override_at(&overrides, 0),
+            Some(&lid("100000000000009", 33))
+        );
+        assert!(encryption_override_at(&overrides, 1).is_none());
+    }
 }

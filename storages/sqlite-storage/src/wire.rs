@@ -136,6 +136,7 @@ pub(crate) fn encode_hash_state(s: &HashState) -> Vec<u8> {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        mac_mismatch_fatal: s.mac_mismatch_fatal,
     }
     .encode_to_vec()
 }
@@ -151,6 +152,7 @@ pub(crate) fn decode_hash_state(bytes: &[u8]) -> Result<HashState, StoreError> {
         version: w.version,
         hash,
         index_value_map: w.index_value_map.into_iter().collect(),
+        mac_mismatch_fatal: w.mac_mismatch_fatal,
     })
 }
 
@@ -235,11 +237,17 @@ mod tests {
             version: 42,
             hash,
             index_value_map: index_value_map.clone(),
+            mac_mismatch_fatal: true,
         };
         let decoded = decode_hash_state(&encode_hash_state(&state)).unwrap();
         assert_eq!(decoded.version, 42);
         assert_eq!(decoded.hash, hash);
         assert_eq!(decoded.index_value_map, index_value_map);
+        assert!(
+            decoded.mac_mismatch_fatal,
+            "a latched collection must stay latched across restarts, or the \
+             divergence is re-detected on every patch forever"
+        );
     }
 
     #[test]
@@ -249,6 +257,23 @@ mod tests {
         assert_eq!(decoded.version, 0);
         assert_eq!(decoded.hash, [0u8; 128]);
         assert!(decoded.index_value_map.is_empty());
+        assert!(!decoded.mac_mismatch_fatal);
+    }
+
+    /// Rows written before `mac_mismatch_fatal` existed omit field 4 entirely;
+    /// proto3 decodes that to `false`, which is the healthy state.
+    #[test]
+    fn hash_state_row_without_the_latch_field_decodes_as_healthy() {
+        let bytes = HashStateWire {
+            version: 9,
+            hash: vec![0u8; 128],
+            index_value_map: Default::default(),
+            mac_mismatch_fatal: false,
+        }
+        .encode_to_vec();
+        let decoded = decode_hash_state(&bytes).expect("an old row must still decode");
+        assert_eq!(decoded.version, 9);
+        assert!(!decoded.mac_mismatch_fatal);
     }
 
     #[test]
@@ -258,6 +283,7 @@ mod tests {
             version: 1,
             hash: vec![0u8; 64],
             index_value_map: Default::default(),
+            mac_mismatch_fatal: false,
         }
         .encode_to_vec();
         assert!(decode_hash_state(&bytes).is_err());

@@ -14,6 +14,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use wacore_appstate::processor::AppStateMutationMAC;
+use wacore_binary::Jid;
 
 /// Inline protocol-sized message secret. The array makes invalid lengths
 /// unrepresentable without a heap allocation or pointer indirection per row.
@@ -80,6 +81,46 @@ pub struct MsgSecretEntry {
     pub message_ts: i64,
 }
 
+impl MsgSecretEntry {
+    /// The canonical non-AD sender identifier for a row whose chat identifier is
+    /// already in hand, sharing that allocation whenever both JIDs address the
+    /// same user. That covers every direct message (chat and sender are the peer)
+    /// and every self-authored history row, which is what the `sender` field doc
+    /// means by "often aliases `chat`".
+    pub fn sender_id_for(chat: &Jid, chat_id: &Arc<str>, sender: &Jid) -> Arc<str> {
+        if sender.is_same_chat_as(chat) {
+            Arc::clone(chat_id)
+        } else {
+            sender.to_non_ad_arc_str()
+        }
+    }
+
+    /// Build a row from the JIDs the send and receive paths already carry.
+    ///
+    /// Single chokepoint for how a row's three identifiers are derived, so the
+    /// inbound capture and the outbound persist cannot drift on either the
+    /// canonicalisation or the aliasing above.
+    pub fn new(
+        chat: &Jid,
+        sender: &Jid,
+        msg_id: &str,
+        secret: MessageSecret,
+        expires_at: i64,
+        message_ts: i64,
+    ) -> Self {
+        let chat_id = chat.to_non_ad_arc_str();
+        let sender_id = Self::sender_id_for(chat, &chat_id, sender);
+        Self {
+            chat: chat_id,
+            sender: sender_id,
+            msg_id: Arc::from(msg_id),
+            secret,
+            expires_at,
+            message_ts,
+        }
+    }
+}
+
 /// Device information for registry tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -106,6 +147,84 @@ impl DeviceInfo {
     pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
         self.is_hosted = is_hosted;
         self
+    }
+}
+
+#[cfg(test)]
+mod msg_secret_entry_tests {
+    use super::{Jid, MsgSecretEntry};
+    use std::sync::Arc;
+
+    fn jid(s: &str) -> Jid {
+        s.parse().unwrap_or_else(|e| panic!("parse {s}: {e}"))
+    }
+
+    /// A direct message names the same user as chat and as sender (the sender
+    /// only adds a device suffix), so the row must carry one shared allocation
+    /// rather than two identical strings.
+    #[test]
+    fn direct_message_shares_one_identifier_allocation() {
+        let entry = MsgSecretEntry::new(
+            &jid("5511987650001@s.whatsapp.net"),
+            &jid("5511987650001:33@s.whatsapp.net"),
+            "3EB0AABBCCDDEEFF0011",
+            [7u8; 32],
+            0,
+            0,
+        );
+
+        assert_eq!(&*entry.chat, "5511987650001@s.whatsapp.net");
+        assert_eq!(&*entry.sender, "5511987650001@s.whatsapp.net");
+        assert!(
+            Arc::ptr_eq(&entry.chat, &entry.sender),
+            "chat and sender must share the allocation when they are the same user"
+        );
+        assert_eq!(&*entry.msg_id, "3EB0AABBCCDDEEFF0011");
+    }
+
+    /// A group row (and an outbound row, where the sender is us) names two
+    /// different users, which must stay two distinct identifiers.
+    #[test]
+    fn distinct_users_keep_separate_identifiers() {
+        let entry = MsgSecretEntry::new(
+            &jid("120363021033254949@g.us"),
+            &jid("5511987650001:2@s.whatsapp.net"),
+            "M1",
+            [0u8; 32],
+            123,
+            456,
+        );
+
+        assert_eq!(&*entry.chat, "120363021033254949@g.us");
+        assert_eq!(&*entry.sender, "5511987650001@s.whatsapp.net");
+        assert!(!Arc::ptr_eq(&entry.chat, &entry.sender));
+        assert_eq!((entry.expires_at, entry.message_ts), (123, 456));
+    }
+
+    /// Same user part, different namespace: the LID and PN forms are distinct
+    /// lookup keys and must never be collapsed into one.
+    #[test]
+    fn same_user_across_namespaces_is_not_aliased() {
+        let chat = jid("100000012345678@lid");
+        let entry = MsgSecretEntry::new(
+            &chat,
+            &jid("100000012345678@s.whatsapp.net"),
+            "",
+            [0u8; 32],
+            0,
+            0,
+        );
+
+        assert_eq!(&*entry.chat, "100000012345678@lid");
+        assert_eq!(&*entry.sender, "100000012345678@s.whatsapp.net");
+        assert!(!Arc::ptr_eq(&entry.chat, &entry.sender));
+        // An empty message id is a degenerate but representable key, not a panic.
+        assert_eq!(&*entry.msg_id, "");
+
+        // The standalone helper must make the same call as the constructor.
+        let chat_id: Arc<str> = Arc::from("100000012345678@lid");
+        let aliased = MsgSecretEntry::sender_id_for(&chat, &chat_id, &jid("100000012345678:9@lid"));
+        assert!(Arc::ptr_eq(&aliased, &chat_id));
     }
 }
 

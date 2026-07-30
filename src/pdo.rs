@@ -273,7 +273,7 @@ impl Client {
             to,
             msg,
             crate::send::SendPipelineOptions {
-                request_id: Some(msg_id.clone()),
+                request_id: Some(&msg_id),
                 peer: true,
                 ..Default::default()
             },

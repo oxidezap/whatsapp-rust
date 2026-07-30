@@ -203,9 +203,13 @@ impl Serialize for LazyHistorySync {
 }
 
 /// Discriminant for each [`Event`] variant, used to express handler interest
-/// without materializing the event. One per `Event` variant, in declaration
-/// order; the value doubles as a bit index in [`EventInterest`], so there can
-/// be at most 128 kinds.
+/// without materializing the event. One per `Event` variant; the value doubles
+/// as a bit index in [`EventInterest`], so there can be at most 128 kinds.
+///
+/// New kinds go at the **end**, whatever position their `Event` variant takes:
+/// the discriminant is what a consumer persists or transmits, and inserting in
+/// the middle renumbers every kind after it. `ServerAck` and
+/// `PairingQrCodesExhausted` both sit here for that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -268,6 +272,8 @@ pub enum EventKind {
     PairPasskeyConfirmation,
     PairPasskeyError,
     ServerAck,
+    PairingQrCodesExhausted,
+    PairingCodeError,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -281,7 +287,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ServerAck as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairingCodeError as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -813,6 +819,8 @@ pub enum Event {
     PairingQrCode(PairingQrCode),
     PairingCode(PairingCode),
     PairingCodeRefresh(PairingCodeRefresh),
+    PairingCodeError(PairingCodeError),
+    PairingQrCodesExhausted(PairingQrCodesExhausted),
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
@@ -989,6 +997,8 @@ impl Event {
             Event::PairingQrCode(_) => EventKind::PairingQrCode,
             Event::PairingCode(_) => EventKind::PairingCode,
             Event::PairingCodeRefresh(_) => EventKind::PairingCodeRefresh,
+            Event::PairingCodeError(_) => EventKind::PairingCodeError,
+            Event::PairingQrCodesExhausted(_) => EventKind::PairingQrCodesExhausted,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
             Event::Messages(_) => EventKind::Messages,
@@ -1101,6 +1111,21 @@ pub enum BatchOrigin {
 pub struct MessageBatch {
     pub messages: Arc<[InboundMessage]>,
     pub origin: BatchOrigin,
+    /// Whether an inbound durability hook already committed these messages
+    /// before this event was dispatched.
+    ///
+    /// Orthogonal to [`origin`](Self::origin), which describes delivery shape:
+    /// a hook commits live batches and drain batches alike. What this answers
+    /// is whether the consumer's own durable copy already exists, so a
+    /// materializer that the hook feeds can skip the batch instead of
+    /// rewriting every row (and re-firing every invalidation) a second time.
+    ///
+    /// `false` for the producers that dispatch `Event::Messages` while
+    /// deliberately bypassing the commit pipeline — newsletters and
+    /// PDO-recovered messages — because for those the materialization on this
+    /// event is the only one there is.
+    #[builder(default)]
+    pub hook_committed: bool,
 }
 
 impl MessageBatch {
@@ -1196,11 +1221,17 @@ pub struct PairingCode {
     pub timeout: std::time::Duration,
 }
 
-/// The server asked the companion to refresh an in-progress phone-number
-/// pairing code (WA Web `refreshAltLinkingCode` / `forceManualRefresh`).
-/// Only emitted while a pair-code flow is outstanding and the server's ref
-/// matches it. The consumer should request a fresh code via
-/// `pair_with_code`; the previous code is no longer guaranteed valid.
+/// The in-progress phone-number pairing code should be replaced.
+///
+/// Emitted for the two cases WA Web regenerates on
+/// (`Alt/DeviceLinkingApi.js` + `Link/DevicePhoneNumberCodeScreen.react.js`):
+/// the server asking for it (`refreshAltLinkingCode` / `forceManualRefresh`,
+/// ref-gated against the outstanding flow), and a `companion_finish` that went
+/// unanswered for a minute — a primary that could not open the key bundle just
+/// goes quiet, so silence is the only signal there is.
+///
+/// The outstanding flow is cleared before this fires, so the consumer can call
+/// `pair_with_code` straight away. The previous code is no longer valid.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct PairingCodeRefresh {
@@ -1209,23 +1240,132 @@ pub struct PairingCodeRefresh {
     pub force_manual: bool,
 }
 
+/// A phone-number pair-code request failed, so no code will be shown.
+///
+/// The counterpart to [`PairingCode`] on the failure path, and the only surface
+/// that reports it when pairing is driven by `BotBuilder::with_pair_code` —
+/// that request runs in a detached task, so nothing returns its error to the
+/// caller. `Client::pair_with_code` dispatches this in addition to returning
+/// `Err`, matching how the success path both returns the code and emits
+/// [`PairingCode`].
+///
+/// Fires for every failure, including local validation (a phone number that is
+/// too short never reaches the server): a consumer waiting on a code needs to
+/// learn that it is not coming, whatever the reason. [`rejection`](Self::rejection)
+/// is what distinguishes the two — `None` means the request never got an answer
+/// from the server.
+///
+/// A claim the failed request itself took is released before this fires, so
+/// nothing is left holding the flow and `pair_with_code` can be called again.
+///
+/// Two failures do **not** arrive here, because for them a code may still be on
+/// its way and this event would say the opposite — a consumer acting on it
+/// would tear down a code that is about to arrive:
+///
+/// - `CodeAlreadyOutstanding` — refused precisely because an earlier code is
+///   still live, and the consumer already has it from the [`PairingCode`] that
+///   minted it. Retrying is futile until `cancel_pair_code` runs or the window
+///   closes.
+/// - `Cancelled` — the caller withdrew this request, and a replacement may
+///   already own the slot. A superseded request can return this *after* its
+///   replacement started, so the event would be uncorrelated with the flow that
+///   is actually running.
+///
+/// Both follow from something the caller did, so neither is news, and a direct
+/// caller still gets the `Err`.
+///
+/// Whether to retry at all is the point of the fields: back off on
+/// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled),
+/// stop on
+/// [`PairCodeRejection::FeatureNotAvailable`](crate::pair_code::PairCodeRejection::FeatureNotAvailable).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingCodeError {
+    /// The server's refusal, when it answered with one. `None` when the failure
+    /// was local (validation, no connection) or the request went unanswered
+    /// (timeout) — nothing was refused, so there is no status to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<crate::pair_code::PairCodeRejection>,
+    /// How long the server asked the client to wait, from the `backoff`
+    /// attribute. Usually absent — WA Web does not read it on this path — but
+    /// when present it is the server naming its own retry delay, which beats
+    /// any interval the consumer would pick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<std::time::Duration>,
+    /// The failure rendered for logs. Do not branch on it; use
+    /// [`rejection`](Self::rejection).
+    pub error: String,
+}
+
+/// The server's `<pair-device>` refs are used up: there is no QR left to
+/// render until the connection is re-established.
+///
+/// WA Web's rotation timer (`Handle/PairDevice.js`) reports `UNPAIRED_IDLE`
+/// here and stops — it does not close the socket, because an alt-linking
+/// (phone-number) flow may still be riding the same connection.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingQrCodesExhausted {
+    /// `true` when the client closed the connection itself, which it only does
+    /// with no pair-code flow outstanding. `false` means the socket was left
+    /// up and reconnecting is the consumer's call.
+    pub disconnected: bool,
+}
+
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct QrScannedWithoutMultidevice {}
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
-pub struct ClientOutdated {}
+pub struct ClientOutdated {
+    /// The whole `<failure>` stanza, so no attribute is lost to a log line.
+    pub raw: Option<Node>,
+}
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct Connected {}
+
+/// Localized text the server wants shown when it forces a logout, from
+/// `logout_message_header` / `logout_message_subtext` on `<failure>`.
+///
+/// `locale` is what makes the text safe to render: WA Web
+/// (`WAWebHandleFailure`) shows the header/subtext only when the locale equals
+/// the client's current one, and otherwise falls back to its own generic copy.
+/// It travels with the text so a consumer can apply the same rule.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct LogoutMessage {
+    pub header: Option<String>,
+    pub subtext: Option<String>,
+    /// e.g. `"pt_BR"`. Compare against the consumer's locale before rendering.
+    pub locale: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct LoggedOut {
     pub on_connect: bool,
     pub reason: ConnectFailureReason,
+    /// Server-supplied logout copy, when it sent any. Present in practice on
+    /// [`ConnectFailureReason::AccountLocked`].
+    pub logout_message: Option<LogoutMessage>,
+    /// The whole stanza that caused the logout, when one did.
+    ///
+    /// Two shapes reach here, so dispatch on `raw.tag` rather than assuming
+    /// one: `<failure>` for a server-side refusal (`on_connect` is then true),
+    /// and `<stream:error>` for a `<conflict>`, a 516 device removal or a 401.
+    /// `None` when nothing was received at all — a locally initiated logout has
+    /// no stanza to report.
+    ///
+    /// A forced logout is where the server puts data it will never repeat: an
+    /// account lock carries a one-time `appeal_token` plus `violation_reason`
+    /// and `vt`, which WA Web ignores (its own appeal flow is native) but which
+    /// an embedder cannot recover once the stanza is gone. Parsing policy stays
+    /// with the consumer — `violation_reason` is not a closed set — but the
+    /// bytes have to survive the dispatch.
+    pub raw: Option<Node>,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -1271,7 +1411,21 @@ impl fmt::Display for TempBanReason {
 #[non_exhaustive]
 pub struct TemporaryBan {
     pub code: TempBanReason,
+    /// How long the ban lasts — the wire's `expire` is a duration in seconds,
+    /// not a deadline (WA Web renders it as "You'll be able to use WhatsApp
+    /// again in {duration}").
+    ///
+    /// Dispatched only when the server sent an `expire` that fits a `Duration`;
+    /// a ban stanza missing `code`/`expire`, or carrying one that does not,
+    /// surfaces as [`Event::ConnectFailure`] instead, the way WA Web rejects it
+    /// rather than inventing a zero.
     pub expire: Duration,
+    /// The server's `message` attribute, when present.
+    pub message: Option<String>,
+    /// Support/appeal link the official UI opens for the ban.
+    pub url: Option<String>,
+    /// The whole `<failure>` stanza.
+    pub raw: Option<Node>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
@@ -1775,6 +1929,63 @@ mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
+
+    /// A new kind must go at the end. The discriminant doubles as an
+    /// `EventInterest` bit index and is what a consumer persists or transmits,
+    /// so inserting one in the middle silently re-points every stored mask
+    /// after it at the wrong events.
+    ///
+    /// Pinned by value rather than by ordering: a spot check of the run's
+    /// start, the pair-code block a new kind is most tempting to sit inside,
+    /// and the two most-subscribed kinds past it.
+    #[test]
+    fn event_kind_discriminants_are_append_only() {
+        assert_eq!(EventKind::Connected as u8, 0);
+        assert_eq!(EventKind::PairingCode as u8, 6);
+        assert_eq!(EventKind::PairingCodeRefresh as u8, 7);
+        assert_eq!(EventKind::QrScannedWithoutMultidevice as u8, 8);
+        assert_eq!(EventKind::Messages as u8, 10);
+        assert_eq!(EventKind::Receipt as u8, 11);
+
+        // The two already parked at the end for this same reason, and the
+        // newest past both. Pinned absolutely rather than as an offset from its
+        // neighbour: a relative check still passes when a kind is inserted
+        // *before* the pair, which shifts all three together.
+        assert_eq!(EventKind::ServerAck as u8, 57);
+        assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
+        assert_eq!(EventKind::PairingCodeError as u8, 59);
+    }
+
+    /// Every rejection a consumer can be handed must survive being persisted
+    /// and read back as itself.
+    ///
+    /// The wire form of `PairCodeRejection` is its `code()`, so an `Unknown`
+    /// carrying a *named* code would serialize to that code and rehydrate as the
+    /// named arm — silently upgrading a value we declined to classify. Nothing
+    /// may construct such a value; `from_server` returns `None` instead, and
+    /// this pins that the reachable ones round-trip.
+    #[test]
+    fn pair_code_rejections_do_not_alias_on_a_round_trip() {
+        use crate::pair_code::PairCodeRejection as R;
+
+        for original in [
+            R::BadRequest,
+            R::Forbidden,
+            R::RateOverlimit,
+            R::FeatureNotAvailable,
+            R::InternalServerError,
+            R::Unknown(418),
+        ] {
+            let json = serde_json::to_string(&original).expect("serializes");
+            let back: R = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, original, "{original:?} rehydrated as {back:?}");
+        }
+
+        // The aliasing that forced `from_server` to return `None`: kept as a
+        // live demonstration so the reason cannot be lost to a refactor.
+        assert_eq!(R::Unknown(429).code(), R::RateOverlimit.code());
+        assert_eq!(R::from_server(429, "something-else"), None);
+    }
 
     #[test]
     fn group_update_builder_defaults_additive_scalar_fields() {

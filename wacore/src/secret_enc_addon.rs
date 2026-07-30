@@ -146,8 +146,10 @@ pub fn encrypt_addon(
     let key = derive_use_case_secret(message_secret, ctx)?;
     let aad = build_aad(ctx);
 
+    // The thread-local generator directly: seeding a fresh StdRng per addon
+    // ran a full ChaCha key schedule to produce 12 bytes of IV.
     let mut iv = [0u8; GCM_IV_SIZE];
-    rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
+    rand::rng().fill_bytes(&mut iv);
 
     let mut payload = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
     aes_256_gcm_encrypt(&key, &iv, &aad, plaintext, &mut payload)

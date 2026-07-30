@@ -111,6 +111,24 @@ impl PublicKey {
         }
     }
 
+    /// Parse a public key out of a persisted record field, accepting either
+    /// encoding.
+    ///
+    /// Records are written with the raw 32-byte key (see [`PreKeyRecord`]), but
+    /// up to 0.6.0 `PreKeyRecord::new` and `GenericSignedPreKey::new` wrote the
+    /// 33-byte type-tagged form, so a store that persisted `record.serialize()`
+    /// rather than going through the `record_helpers` bridge still holds those.
+    /// The two lengths cannot collide, so accepting both is unambiguous, and
+    /// the next write normalizes the record to the raw form.
+    ///
+    /// [`PreKeyRecord`]: crate::protocol::PreKeyRecord
+    pub fn from_stored_public_key_bytes(bytes: &[u8]) -> Result<Self, CurveError> {
+        match bytes.len() {
+            Self::SERIALIZED_KEY_LEN => Self::deserialize(bytes),
+            _ => Self::from_djb_public_key_bytes(bytes),
+        }
+    }
+
     /// Serialize the public key to a fixed-size array (1 type byte + 32 key bytes).
     pub fn serialize(&self) -> [u8; Self::SERIALIZED_KEY_LEN] {
         let mut result = [0u8; Self::SERIALIZED_KEY_LEN];

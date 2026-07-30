@@ -266,7 +266,7 @@ mod tests {
     }
 
     fn dirty_session(client: &Arc<Client>, user: &str) -> ProtocolAddress {
-        let addr = ProtocolAddress::new(user.to_string(), 1.into());
+        let addr = ProtocolAddress::new(user, 1.into());
         assert!(
             client
                 .signal_cache
@@ -306,7 +306,7 @@ mod tests {
         wait_for_backend_session(&client, &covered).await;
 
         // A raised lease must be durable when the call returns.
-        let addr = ProtocolAddress::new("15550003002".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550003002", 1.into());
         let mut record = SessionRecord::new_fresh();
         record.reserve_sender_chain_counters(0);
         assert!(client.signal_cache.try_put_session(&addr, record).is_ok());
@@ -504,7 +504,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         // And B still makes progress: its dirty entry lands.
-        let addr = ProtocolAddress::new("15550007002".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550007002", 1.into());
         wait_for_backend_session(&client, &addr).await;
     }
 

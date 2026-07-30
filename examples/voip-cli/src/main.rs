@@ -27,10 +27,10 @@
 //! `WA_VIDEO_SIZE`, `WA_VIDEO_FPS`, `WA_VIDEO_BITRATE_KBPS`, `WA_VIDEO_SINK_FPS`.
 //! `WA_AUDIO_CODEC` = `mlow` (default when available) | `opus`.
 //!
-//! The inbound MEDIA path is the library facade: `client.voip().accept(&call).audio(mic,
-//! speaker).start()` returns a `CallHandle` and the library owns the callKey decrypt, the relay
-//! socket, the sans-IO engine, and the task lifetime. This example only supplies the cpal audio
-//! device / ffmpeg pipes and reacts to engine events.
+//! The inbound path is the library facade: `client.voip().accept(&call).audio(mic,
+//! speaker).start()` returns a `CallHandle` and the library owns preaccept/accept signaling, callKey
+//! decrypt, the relay socket, the sans-IO engine, and the task lifetime. This example only supplies
+//! the cpal audio device / ffmpeg pipes and reacts to engine events.
 
 // The usage line is this binary's output, not a diagnostic to route through `log`.
 #![allow(clippy::print_stderr)]
@@ -44,9 +44,6 @@ use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use portable_atomic::AtomicU64;
-use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER, CAPABILITY_PREACCEPT};
-#[cfg(feature = "voip-opus")]
-use wacore::stanza::call::{CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_PREACCEPT};
 use wacore::types::call::{CallAction, IncomingCall};
 use wacore::types::events::{Event, EventHandler};
 use wacore::voip::CallEvent;
@@ -156,49 +153,6 @@ impl AudioMode {
 
     fn signaling_rate(self) -> u32 {
         self.format().signaling_rate
-    }
-
-    fn signaling_rate_wire(self) -> &'static str {
-        match self.signaling_rate() {
-            16_000 => "16000",
-            8_000 => "8000",
-            _ => unreachable!("built-in audio formats use known signaling rates"),
-        }
-    }
-
-    fn preaccept_capability(self, video: bool) -> &'static [u8] {
-        match (self, video) {
-            #[cfg(feature = "voip-opus")]
-            (Self::OpusNative | Self::OpusRfc7587, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
-            #[cfg(feature = "voip-opus")]
-            (Self::OpusNative | Self::OpusRfc7587, false) => &CAPABILITY_STANDARD_OPUS_PREACCEPT,
-            (_, true) => &CAPABILITY_OFFER,
-            (_, false) => &CAPABILITY_PREACCEPT,
-        }
-    }
-
-    fn accept_capability(self) -> &'static [u8] {
-        match self {
-            #[cfg(feature = "voip-opus")]
-            Self::OpusNative | Self::OpusRfc7587 => &CAPABILITY_STANDARD_OPUS_OFFER,
-            _ => &CAPABILITY_OFFER,
-        }
-    }
-
-    fn uses_standard_opus(self) -> bool {
-        match self {
-            #[cfg(feature = "voip-opus")]
-            Self::OpusNative | Self::OpusRfc7587 => true,
-            _ => false,
-        }
-    }
-
-    fn uses_48khz_rtp_clock(self) -> bool {
-        match self {
-            #[cfg(feature = "voip-opus")]
-            Self::OpusRfc7587 => true,
-            _ => false,
-        }
     }
 }
 
@@ -988,6 +942,21 @@ enum VideoUi {
     Active,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundMediaFailureStage {
+    /// Microphone, speaker, codec bridge, or video endpoints failed before the facade took ownership.
+    LocalPreparation,
+    /// `accept().start()` ran, so its generation-aware guard owns peer teardown.
+    Facade,
+}
+
+fn should_reject_failed_media_start(
+    stage: InboundMediaFailureStage,
+    peer_already_ended: bool,
+) -> bool {
+    stage == InboundMediaFailureStage::LocalPreparation && !peer_already_ended
+}
+
 impl CallObserver {
     fn new(client: Arc<Client>, accept: bool, video: bool, audio: AudioMode) -> Self {
         Self {
@@ -1092,9 +1061,7 @@ impl EventHandler for CallObserver {
                     let cid = call_id.clone();
                     begin_call_startup(&state, &cid);
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            respond_to_offer(&client, &call, accept, initial_video, audio).await
-                        {
+                        if let Err(e) = respond_to_offer(&client, &call, accept, audio).await {
                             error!("call signaling failed: {e}");
                             complete_call_startup(&state, &cid);
                             return;
@@ -1107,22 +1074,14 @@ impl EventHandler for CallObserver {
                             .await
                         {
                             Ok(handle) => register_handle(&state, cid.clone(), handle).await,
-                            Err(e) => {
-                                let peer_ended = peer_terminated_during_startup(&state, &cid);
-                                complete_call_startup(&state, &cid);
-                                if !peer_ended
-                                    && let CallAction::Offer {
-                                        call_id,
-                                        call_creator,
-                                        ..
-                                    } = &call.action
-                                    && let Err(terminate_error) = client
-                                        .voip()
-                                        .terminate(call_id, &call.from, call_creator)
-                                        .await
+                            Err((stage, e)) => {
+                                let peer_already_ended = complete_call_startup(&state, &cid);
+                                if should_reject_failed_media_start(stage, peer_already_ended)
+                                    && let Err(reject_error) = client.voip().reject(&call).await
                                 {
                                     warn!(
-                                        "failed to terminate incomplete inbound call: {terminate_error}"
+                                        "failed to reject call after local media setup failed: \
+                                         {reject_error}"
                                     );
                                 }
                                 warn!("inbound media failed: {e}");
@@ -1155,43 +1114,50 @@ async fn start_media(
     auto_video: bool,
     audio: AudioMode,
     state: &Arc<Mutex<CallState>>,
-) -> Result<Arc<CallHandle>> {
-    let mic = spawn_mic()?;
-    let speaker = spawn_speaker()?;
-    let event_speaker = speaker.clone();
-    info!("🔌 connecting media via client.voip().accept(..)…");
-    let video_endpoints = if initial_video {
-        let opts = VideoOpts::from_env().await?;
-        let cid = call.action.call_id();
-        Some((
-            video::spawn_video_source(&opts).await?,
-            video::spawn_video_sink(&opts, cid).await?,
-        ))
-    } else {
-        None
-    };
-    if peer_terminated_during_startup(state, call.action.call_id()) {
-        bail!("peer ended the call during media preparation");
-    }
-    send_final_accept(client, call, initial_video, audio).await?;
+) -> std::result::Result<Arc<CallHandle>, (InboundMediaFailureStage, anyhow::Error)> {
     let voip = client.voip();
-    let mut builder = match audio {
-        #[cfg(feature = "voip-mlow")]
-        AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
-        #[cfg(feature = "voip-opus")]
-        AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
-            let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
-            voip.accept(call)
-                .encoded_audio(audio.format(), source, sink)
+    let (builder, event_speaker) = async {
+        let mic = spawn_mic()?;
+        let speaker = spawn_speaker()?;
+        let event_speaker = speaker.clone();
+        info!("🔌 connecting media via client.voip().accept(..)…");
+        let video_endpoints = if initial_video {
+            let opts = VideoOpts::from_env().await?;
+            let cid = call.action.call_id();
+            Some((
+                video::spawn_video_source(&opts).await?,
+                video::spawn_video_sink(&opts, cid).await?,
+            ))
+        } else {
+            None
+        };
+        if peer_terminated_during_startup(state, call.action.call_id()) {
+            bail!("peer ended the call during media preparation");
         }
-    };
-    if let Some((source, sink)) = video_endpoints {
-        builder = builder.video(source, sink);
+        let mut builder = match audio {
+            #[cfg(feature = "voip-mlow")]
+            AudioMode::Mlow => voip.accept(call).audio(mic, speaker),
+            #[cfg(feature = "voip-opus")]
+            AudioMode::OpusMlow | AudioMode::OpusNative | AudioMode::OpusRfc7587 => {
+                let (source, sink) = spawn_opus_bridge(mic, speaker, audio)?;
+                voip.accept(call)
+                    .encoded_audio(audio.format(), source, sink)
+            }
+        };
+        if let Some((source, sink)) = video_endpoints {
+            builder = builder.video(source, sink);
+        }
+        Ok::<_, anyhow::Error>((builder, event_speaker))
     }
-    let handle = builder
-        .start()
-        .await
-        .map_err(|e| anyhow!("accept media: {e}"))?;
+    .await
+    .map_err(|error| (InboundMediaFailureStage::LocalPreparation, error))?;
+
+    let handle = builder.start().await.map_err(|error| {
+        (
+            InboundMediaFailureStage::Facade,
+            anyhow!("accept media: {error}"),
+        )
+    })?;
     info!(
         "🎙  {} media flow live for call {} — speak into the mic.{}",
         audio.name(),
@@ -1483,12 +1449,10 @@ async fn respond_to_offer(
     client: &Arc<Client>,
     call: &IncomingCall,
     accept: bool,
-    video: bool,
     audio: AudioMode,
 ) -> Result<()> {
     let CallAction::Offer {
         call_id,
-        call_creator,
         audio: offered_audio,
         ..
     } = &call.action
@@ -1524,70 +1488,6 @@ async fn respond_to_offer(
             audio.signaling_rate()
         );
     }
-    // Callee flow: preaccept immediately; final accept waits for ready media.
-    let audio_rates = &[audio.signaling_rate_wire()];
-    let pre_id = hex::encode(rand::random::<[u8; 8]>());
-    client
-        .send_node(stanza::build_preaccept_with_capability(
-            call_id,
-            &call.from,
-            call_creator,
-            &pre_id,
-            audio_rates,
-            audio.preaccept_capability(video),
-            // The video node is capture-matched; standard Opus only clears the MLOW capability bit.
-            video,
-        ))
-        .await
-        .map_err(|e| anyhow!("send preaccept: {e}"))?;
-    Ok(())
-}
-
-async fn send_final_accept(
-    client: &Arc<Client>,
-    call: &IncomingCall,
-    video: bool,
-    audio: AudioMode,
-) -> Result<()> {
-    let CallAction::Offer {
-        call_id,
-        call_creator,
-        ..
-    } = &call.action
-    else {
-        return Ok(());
-    };
-    let audio_rates = &[audio.signaling_rate_wire()];
-    let accept_id = hex::encode(rand::random::<[u8; 8]>());
-    let metadata = if video { call.media.as_deref() } else { None };
-    let voip_settings = audio
-        .uses_standard_opus()
-        .then(|| stanza::standard_opus_voip_settings(audio.uses_48khz_rtp_clock()));
-    let accept_node = stanza::build_accept(&stanza::AcceptParams {
-        call_id,
-        to: &call.from,
-        id: &accept_id,
-        call_creator,
-        audio_rates,
-        relay_te: None,
-        rte: None,
-        voip_settings,
-        // A real from-start video accept carries NO <capability> (just audio/video/net/encopt); the
-        // audio path keeps advertising it.
-        capability: if video {
-            None
-        } else {
-            Some(audio.accept_capability())
-        },
-        video,
-        peer_abtest_bucket: metadata.and_then(|media| media.peer_abtest_bucket.as_deref()),
-        peer_abtest_bucket_id_list: metadata
-            .and_then(|media| media.peer_abtest_bucket_id_list.as_deref()),
-    });
-    client
-        .send_node(accept_node)
-        .await
-        .map_err(|e| anyhow!("send accept: {e}"))?;
     Ok(())
 }
 
@@ -1776,6 +1676,7 @@ mod tests {
         CallState, CliCommand, begin_call_startup, complete_call_startup, mark_call_most_recent,
         parse_cli, peer_terminated_during_startup, record_peer_terminate, video_source_is_ignored,
     };
+    use super::{InboundMediaFailureStage, should_reject_failed_media_start};
 
     fn argv(parts: &[&str]) -> Vec<String> {
         std::iter::once("voip")
@@ -1884,6 +1785,22 @@ mod tests {
     }
 
     #[test]
+    fn only_local_pre_facade_failures_need_reject_cleanup() {
+        assert!(should_reject_failed_media_start(
+            InboundMediaFailureStage::LocalPreparation,
+            false
+        ));
+        assert!(!should_reject_failed_media_start(
+            InboundMediaFailureStage::LocalPreparation,
+            true
+        ));
+        assert!(!should_reject_failed_media_start(
+            InboundMediaFailureStage::Facade,
+            false
+        ));
+    }
+
+    #[test]
     fn stdin_ui_order_tracks_the_most_recent_call() {
         let mut order = Vec::new();
         mark_call_most_recent(&mut order, "CALL-A");
@@ -1895,9 +1812,6 @@ mod tests {
     #[cfg(feature = "voip-opus")]
     #[test]
     fn native_opus_mode_keeps_codec_and_clock_negotiation_aligned() {
-        use wacore::stanza::call::{
-            CAPABILITY_STANDARD_OPUS_OFFER, CAPABILITY_STANDARD_OPUS_PREACCEPT,
-        };
         use wacore::voip::rtp::{RTP_PAYLOAD_TYPE_OPUS, RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO};
 
         let native = AudioMode::OpusNative;
@@ -1906,18 +1820,10 @@ mod tests {
             RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO
         );
         assert_eq!(native.format().rtp_clock_rate, 16_000);
-        assert_eq!(
-            native.preaccept_capability(false),
-            &CAPABILITY_STANDARD_OPUS_PREACCEPT
-        );
-        assert_eq!(native.accept_capability(), &CAPABILITY_STANDARD_OPUS_OFFER);
-        assert!(native.uses_standard_opus());
-        assert!(!native.uses_48khz_rtp_clock());
 
         let rfc7587 = AudioMode::OpusRfc7587;
         assert_eq!(rfc7587.format().rtp_payload_type, RTP_PAYLOAD_TYPE_OPUS);
         assert_eq!(rfc7587.format().rtp_clock_rate, 48_000);
-        assert!(rfc7587.uses_48khz_rtp_clock());
     }
 
     #[cfg(feature = "voip-opus")]

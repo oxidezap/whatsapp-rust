@@ -482,11 +482,7 @@ impl Client {
 /// auto-drive it if an authenticator is registered).
 pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     // The staged rotation is security-sensitive: only honor a server request.
-    if node
-        .get()
-        .get_attr("from")
-        .is_none_or(|v| v.as_str() != SERVER_JID)
-    {
+    if node.get().get_attr("from").is_none_or(|v| v != SERVER_JID) {
         warn!("ignoring passkey notification from a non-server JID");
         return;
     }
@@ -575,11 +571,7 @@ async fn auto_drive_response(
 /// Handle a `crsc_continuation` notification. Spawned: it awaits an IQ round-trip
 /// and must not block the receive loop.
 pub(crate) async fn handle_passkey_continuation(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
-    if node
-        .get()
-        .get_attr("from")
-        .is_none_or(|v| v.as_str() != SERVER_JID)
-    {
+    if node.get().get_attr("from").is_none_or(|v| v != SERVER_JID) {
         warn!("ignoring passkey continuation from a non-server JID");
         return;
     }

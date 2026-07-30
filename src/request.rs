@@ -1,5 +1,6 @@
 use crate::client::Client;
 use crate::client::ClientError;
+use crate::client::ResponseWaiter;
 use crate::socket::error::{EncryptSendError, SocketError};
 use futures::FutureExt;
 use std::num::NonZeroU64;
@@ -36,10 +37,24 @@ type IqSendFuture<'a> =
 /// cancellation-via-drop, and a lingering waiter suppresses keepalives for the
 /// life of the connection. Dropping the guard removes the entry on every exit
 /// path; on success `resolve_waiters` already removed it, so it's a no-op.
-struct ResponseWaiterGuard {
+pub(crate) struct ResponseWaiterGuard {
     waiters: Arc<std::sync::Mutex<crate::client::ResponseWaiterMap>>,
     req_id: String,
     cleanup_generation: NonZeroU64,
+}
+
+impl ResponseWaiterGuard {
+    pub(crate) fn new(
+        waiters: Arc<std::sync::Mutex<crate::client::ResponseWaiterMap>>,
+        req_id: String,
+        cleanup_generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            waiters,
+            req_id,
+            cleanup_generation,
+        }
+    }
 }
 
 impl Drop for ResponseWaiterGuard {
@@ -190,8 +205,9 @@ impl Client {
     /// second (see [`RequestUtils::generate_message_id_at`]).
     pub(crate) fn generate_message_id_at(&self, unix_secs: u64) -> String {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        self.get_request_utils()
-            .generate_message_id_at(device_snapshot.pn.as_ref(), unix_secs)
+        // Associated function on purpose: building a RequestUtils here cloned
+        // the unique id per message, and the derivation never reads it.
+        RequestUtils::message_id_at(device_snapshot.pn.as_ref(), unix_secs)
     }
 
     fn get_request_utils(&self) -> RequestUtils {
@@ -420,7 +436,9 @@ impl Client {
             // Explicit IDs are accepted by both InfoQuery and send_iq_node. Never
             // overwrite an older waiter. The per-registration generation also
             // prevents an older guard from removing a later reuse of this ID.
-            let Some(cleanup_generation) = waiters.try_insert_guarded(req_id.clone(), tx) else {
+            let Some(cleanup_generation) =
+                waiters.try_insert_guarded(req_id.clone(), ResponseWaiter::Iq(tx))
+            else {
                 wacore::telemetry::iq("error");
                 return Err(IqError::DuplicateRequestId(req_id));
             };
@@ -430,11 +448,8 @@ impl Client {
         // dropped mid-await (cancellation), which the explicit paths can't
         // catch. So the send-fail / timeout / shutdown arms no longer remove
         // the waiter by hand; the guard does it on drop.
-        let _waiter_guard = ResponseWaiterGuard {
-            waiters: self.response_waiters.clone(),
-            req_id,
-            cleanup_generation,
-        };
+        let _waiter_guard =
+            ResponseWaiterGuard::new(self.response_waiters.clone(), req_id, cleanup_generation);
 
         // Per-connection: pending IQ requests are bound to the current socket;
         // a reconnect aborts them (sender retries on the new connection).
@@ -484,7 +499,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::{IQ_ID_ATTR, IQ_TAG, IqError, ResponseWaiterGuard};
-    use crate::client::ResponseWaiterMap;
+    use crate::client::{ResponseWaiter, ResponseWaiterMap};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use wacore_binary::builder::NodeBuilder;
@@ -507,7 +522,7 @@ mod tests {
         let (tx, _rx) = futures::channel::oneshot::channel();
         client
             .response_waiters_guard()
-            .insert(request_id.to_owned(), tx);
+            .insert(request_id.to_owned(), ResponseWaiter::Iq(tx));
 
         let error = client
             .send_iq_node(
@@ -548,7 +563,7 @@ mod tests {
         let cleanup_generation = waiters
             .lock()
             .unwrap()
-            .try_insert_guarded("req-1".to_string(), tx)
+            .try_insert_guarded("req-1".to_string(), ResponseWaiter::Iq(tx))
             .expect("unique request ID");
         assert!(waiters.lock().unwrap().contains_key("req-1"));
 
@@ -575,7 +590,7 @@ mod tests {
         let cleanup_generation = waiters
             .lock()
             .unwrap()
-            .try_insert_guarded("req-1".to_string(), tx)
+            .try_insert_guarded("req-1".to_string(), ResponseWaiter::Iq(tx))
             .expect("unique request ID");
         // Map empty = resolver already delivered + removed this request's waiter.
         waiters.lock().unwrap().remove("req-1");
@@ -596,7 +611,7 @@ mod tests {
         let old_generation = waiters
             .lock()
             .unwrap()
-            .try_insert_guarded("reused-id".to_string(), old_tx)
+            .try_insert_guarded("reused-id".to_string(), ResponseWaiter::Iq(old_tx))
             .expect("initial request ID");
         let old_guard = ResponseWaiterGuard {
             waiters: waiters.clone(),
@@ -611,7 +626,7 @@ mod tests {
         waiters
             .lock()
             .unwrap()
-            .try_insert_guarded("reused-id".to_string(), new_tx)
+            .try_insert_guarded("reused-id".to_string(), ResponseWaiter::Iq(new_tx))
             .expect("reused request ID");
 
         drop(old_guard);
@@ -628,7 +643,7 @@ mod tests {
         let old_generation = waiters
             .lock()
             .unwrap()
-            .try_insert_guarded("reused-id".to_string(), old_tx)
+            .try_insert_guarded("reused-id".to_string(), ResponseWaiter::Iq(old_tx))
             .expect("initial request ID");
         let old_guard = ResponseWaiterGuard {
             waiters: waiters.clone(),
@@ -643,7 +658,7 @@ mod tests {
         waiters
             .lock()
             .unwrap()
-            .try_insert_guarded("reused-id".to_string(), new_tx)
+            .try_insert_guarded("reused-id".to_string(), ResponseWaiter::Iq(new_tx))
             .expect("reused request ID");
 
         drop(old_guard);

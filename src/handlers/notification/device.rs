@@ -14,7 +14,7 @@ pub(crate) async fn handle_encrypt_notification(client: &Arc<Client>, nr: &NodeR
         handle_identity_change(client, nr).await;
     } else if nr
         .get_attr("from")
-        .is_some_and(|v| v.as_str() == wacore_binary::SERVER_JID)
+        .is_some_and(|v| v == wacore_binary::SERVER_JID)
     {
         let first_child_tag = nr
             .children()

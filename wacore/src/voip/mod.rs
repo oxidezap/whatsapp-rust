@@ -5,11 +5,15 @@
 //! tests pass even when both directions are wrong identically, so known-answer vectors are
 //! the only real guard.
 
+pub mod app_data;
 pub mod audio;
 pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
 pub mod engine;
+pub mod group;
+pub mod group_audio;
+pub mod group_media;
 pub mod h264;
 pub mod hbh_srtp;
 #[cfg(feature = "voip-mlow")]
@@ -32,18 +36,31 @@ pub mod warp;
 // Curated facade: the headline entry points a consumer reaches for, hoisted to `voip::`.
 // The sub-modules stay `pub` for fine-grained wire helpers (parsers, attr builders), but
 // these are the ones worth surfacing by name.
+pub use app_data::{AppDataError, CallReaction};
 pub use audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
     OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
-pub use demux::{RelayPacketKind, classify_relay_packet};
+pub use demux::{
+    GroupForwardingError, RelayPacket, RelayPacketKind, classify_relay_packet,
+    unwrap_group_forwarding_packet,
+};
 pub use driver::{
-    CallChannels, VideoControl, VideoControlReceiver, VideoControlSender, run_call,
-    video_control_channel,
+    CallChannels, GroupControl, GroupRawEpoch, VideoControl, VideoControlReceiver,
+    VideoControlSender, run_call, video_control_channel,
 };
 pub use engine::{
-    CallConfig, CallEngine, CallEvent, EngineError, Input, Millis, NEVER, Output, SetupError,
-    TxIdSource,
+    CallConfig, CallEngine, CallEvent, DirectPeer, EngineError, GroupControlKind,
+    GroupEngineConfig, Input, Millis, NEVER, Output, SetupError, TxIdSource,
+};
+pub use group::{GroupCallState, GroupStateApply};
+pub use group_audio::{
+    GROUP_MIX_CHUNK_SAMPLES, GROUP_MIX_OUTPUT_SAMPLES, GROUP_MIX_PREFILL_SAMPLES,
+    GROUP_MIX_QUEUE_CAPACITY, ParticipantAudioFramer, ParticipantAudioMixer,
+};
+pub use group_media::{
+    GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupRosterApply, ParticipantMedia,
+    ParticipantVideo,
 };
 pub use h264::{AnnexBAuSplitter, VideoFrame};
 #[cfg(feature = "voip-mlow")]

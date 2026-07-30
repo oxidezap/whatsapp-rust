@@ -257,7 +257,7 @@ where
     // Validate MACs if requested
     if validate_macs && let Some(key_id) = patch.key_id.id.as_ref() {
         let keys = get_keys(key_id)?;
-        validate_patch_macs(
+        let verdict = validate_patch_macs(
             patch,
             state,
             &keys,
@@ -265,6 +265,16 @@ where
             had_no_prior_state,
             hash_update_result.has_missing_remove,
         )?;
+        if verdict.snapshot_mac_diverged && !state.mac_mismatch_fatal {
+            log::warn!(
+                target: "AppState",
+                "Collection {collection_name} ltHash diverged at v{}: the patch is authentic \
+                 (patchMac valid) but its snapshotMac cannot match again. Applying it and \
+                 skipping the aggregate comparison from here, as WA Web does.",
+                state.version
+            );
+            state.mac_mismatch_fatal = true;
+        }
     }
 
     // Anti-tampering parity: a repeated index within the same operation of one patch
@@ -353,21 +363,52 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
     Ok(())
 }
 
-/// Validate the snapshot and patch MACs for a patch.
+/// Outcome of validating a patch's two aggregate MACs.
+///
+/// Only `patchMac` failures are errors. A `snapshotMac` failure is reported here
+/// instead, because it is not a statement about the patch — see
+/// [`validate_patch_macs`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PatchMacVerdict {
+    /// The patch's `snapshotMac` disagreed with the ltHash this client computed,
+    /// so the local aggregate state has diverged from the sender's.
+    pub snapshot_mac_diverged: bool,
+}
+
+/// Validate the patch and snapshot MACs for a patch.
 ///
 /// This is a pure function that validates the MACs without any I/O.
 ///
+/// The two MACs answer different questions, so they fail differently:
+///
+/// * `patchMac` is an HMAC over the patch's own bytes under the app-state key,
+///   which the server does not hold. It is the only proof of authorship, and a
+///   mismatch is fatal. WA Web checks it first (`WAWebSyncdAntiTampering`, `K`).
+/// * `snapshotMac` is an HMAC over the *sender's* post-patch ltHash. It agrees
+///   only while the receiver's aggregate state is byte-identical to the
+///   sender's, so once a collection diverges it can never match again — for any
+///   patch, from any device, forever. Rejecting on it would freeze the
+///   collection on the base already proven unusable, so WA Web reports it and
+///   keeps going (`z`: "skip fatal after snapshot mac mismatch"), which is what
+///   [`PatchMacVerdict::snapshot_mac_diverged`] carries back to the caller.
+///   Because `patchMac` covers `snapshotMac`, a valid `patchMac` also proves the
+///   `snapshotMac` is the one the legitimate sender wrote — a server cannot
+///   forge a divergence.
+///
 /// # Arguments
 /// * `patch` - The patch to validate
-/// * `state` - The hash state AFTER applying the patch mutations
+/// * `state` - The hash state AFTER applying the patch mutations. Its
+///   [`HashState::mac_mismatch_fatal`] flag suppresses the `snapshotMac`
+///   comparison entirely, mirroring WA Web's `if (E && k) return null`.
 /// * `keys` - The expanded app state keys for MAC computation
 /// * `collection_name` - The collection name
 /// * `had_no_prior_state` - True for the genesis patch (version 1) seeding an empty
 ///   collection. Its ltHash is the known empty baseline, so the aggregate MACs are
-///   still computable and MUST be validated (WA Web's `computeLtHashAndValidatePatch`
-///   validates them unconditionally). A genesis patch that omits either aggregate MAC
-///   is treated as tampering. The empty + non-genesis case (a patch that can't anchor
-///   the ltHash) is rejected upstream in `process_patch_list` as a retryable resync.
+///   still computable and a genesis patch that *omits* either one is treated as
+///   tampering: that is the curated-baseline attack, where a server serves a
+///   record set with the aggregate MACs stripped. The empty + non-genesis case
+///   (a patch that can't anchor the ltHash) is rejected upstream in
+///   `process_patch_list` as a retryable resync.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
 ///   WhatsApp Web reports this as MAC-failure telemetry, but it does not make
 ///   aggregate MAC mismatches acceptable.
@@ -378,35 +419,7 @@ pub fn validate_patch_macs(
     collection_name: &str,
     had_no_prior_state: bool,
     has_missing_remove: bool,
-) -> Result<(), AppStateError> {
-    // The aggregate MACs are keyed by the app-state key (which the server lacks), so
-    // validating them even for the genesis patch closes the hole where a malicious
-    // server seeds a curated baseline — dropping a delete/block/mute — that the client
-    // would otherwise accept unauthenticated. WA Web validates them on every patch.
-
-    if let Some(snap_mac) = patch.snapshot_mac.as_ref() {
-        let computed_snap = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        trace!(
-            target: "AppState",
-            "Patch {} v{} snapshotMAC: computed={}, expected={}",
-            collection_name,
-            state.version,
-            hex::encode(&computed_snap),
-            hex::encode(snap_mac)
-        );
-        if computed_snap != *snap_mac {
-            debug!(
-                target: "AppState",
-                "Patch {} v{} snapshotMAC MISMATCH! ltHash=...{}, hasMissingRemove={}",
-                collection_name,
-                state.version,
-                hex::encode(&state.hash[120..]),
-                has_missing_remove
-            );
-            return Err(AppStateError::PatchSnapshotMACMismatch);
-        }
-    }
-
+) -> Result<PatchMacVerdict, AppStateError> {
     match patch.patch_mac.as_ref() {
         Some(patch_mac) => {
             let version = patch.version.version.unwrap_or(0);
@@ -431,13 +444,43 @@ pub fn validate_patch_macs(
         None => {}
     }
 
-    // WA Web validates both aggregate MACs unconditionally, so a genesis patch
-    // that supplies patchMac but strips snapshotMac is rejected all the same.
-    if had_no_prior_state && patch.snapshot_mac.is_none() {
+    // Already known to be diverged: WA Web short-circuits before recomputing.
+    if state.mac_mismatch_fatal {
+        return Ok(PatchMacVerdict {
+            snapshot_mac_diverged: false,
+        });
+    }
+
+    if let Some(snap_mac) = patch.snapshot_mac.as_ref() {
+        let computed_snap = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
+        trace!(
+            target: "AppState",
+            "Patch {} v{} snapshotMAC: computed={}, expected={}",
+            collection_name,
+            state.version,
+            hex::encode(&computed_snap),
+            hex::encode(snap_mac)
+        );
+        if computed_snap != *snap_mac {
+            debug!(
+                target: "AppState",
+                "Patch {} v{} snapshotMAC MISMATCH! ltHash=...{}, hasMissingRemove={}",
+                collection_name,
+                state.version,
+                hex::encode(&state.hash[120..]),
+                has_missing_remove
+            );
+            return Ok(PatchMacVerdict {
+                snapshot_mac_diverged: true,
+            });
+        }
+    } else if had_no_prior_state {
+        // A genesis patch that supplies patchMac but strips snapshotMac has no
+        // aggregate to anchor at all; that is omission, not divergence.
         return Err(AppStateError::PatchSnapshotMACMismatch);
     }
 
-    Ok(())
+    Ok(PatchMacVerdict::default())
 }
 
 /// Validate a snapshot MAC.
@@ -806,68 +849,80 @@ mod tests {
         assert_eq!(state.version, 0, "version must be untouched on rejection");
     }
 
+    fn state_at(version: u64, hash: u8) -> HashState {
+        HashState {
+            version,
+            hash: [hash; 128],
+            index_value_map: HashMap::new(),
+            mac_mismatch_fatal: false,
+        }
+    }
+
+    /// A snapshotMAC mismatch is divergence, not tampering: it is reported so
+    /// the caller can latch the collection, never raised as an error. Only the
+    /// patchMAC proves authorship, and it is checked first.
     #[test]
-    fn validate_patch_macs_rejects_snapshot_mismatch_even_with_missing_remove() {
-        let master_key = [7u8; 32];
-        let keys = expand_app_state_keys(&master_key);
-        let patch = wa::SyncdPatch {
+    fn validate_patch_macs_reports_snapshot_divergence_instead_of_failing() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let mut patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             snapshot_mac: Some(vec![0u8; 32]),
             ..Default::default()
         };
-        let state = HashState {
-            version: 2,
-            hash: [3u8; 128],
-            index_value_map: HashMap::new(),
-        };
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 2));
+        let state = state_at(2, 3);
 
-        let err = validate_patch_macs(&patch, &state, &keys, "regular", false, true)
-            .expect_err("hasMissingRemove is telemetry, not a snapshotMAC bypass");
+        let verdict = validate_patch_macs(&patch, &state, &keys, "regular", false, true)
+            .expect("an authentic patch must not fail on the aggregate ltHash");
 
-        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+        assert!(verdict.snapshot_mac_diverged);
     }
 
+    /// Once the collection is latched, the comparison is skipped entirely —
+    /// WA Web's `if (E && k) return null`.
     #[test]
-    fn validate_patch_macs_rejects_patch_mismatch_even_with_missing_remove() {
-        let master_key = [7u8; 32];
-        let keys = expand_app_state_keys(&master_key);
+    fn validate_patch_macs_skips_snapshot_comparison_once_latched() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(3) }),
+            snapshot_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 3));
+        let mut state = state_at(3, 3);
+        state.mac_mismatch_fatal = true;
+
+        let verdict = validate_patch_macs(&patch, &state, &keys, "regular", false, false)
+            .expect("a latched collection must not re-raise the mismatch");
+
+        assert!(
+            !verdict.snapshot_mac_diverged,
+            "a latched collection must not re-report divergence it already acted on"
+        );
+    }
+
+    /// Latching never weakens the patchMAC: it is the only proof the server
+    /// cannot forge, so it stays fatal even for a diverged collection.
+    #[test]
+    fn validate_patch_macs_rejects_patch_mismatch_even_when_latched() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
         let patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             patch_mac: Some(vec![0u8; 32]),
             ..Default::default()
         };
-        let state = HashState {
-            version: 2,
-            hash: [5u8; 128],
-            index_value_map: HashMap::new(),
-        };
+        let mut state = state_at(2, 5);
+        state.mac_mismatch_fatal = true;
 
         let err = validate_patch_macs(&patch, &state, &keys, "regular", false, true)
-            .expect_err("hasMissingRemove is telemetry, not a patchMAC bypass");
+            .expect_err("neither latching nor hasMissingRemove is a patchMAC bypass");
 
         assert!(matches!(err, AppStateError::PatchMACMismatch));
     }
 
-    // F2: WA Web validates snapshotMac/patchMac on every patch, including the
-    // genesis (v1) patch. These lock that a genesis patch is no longer exempt.
-
-    #[test]
-    fn validate_patch_macs_rejects_genesis_tampered_snapshot_mac() {
-        let keys = expand_app_state_keys(&[7u8; 32]);
-        let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
-            snapshot_mac: Some(vec![0u8; 32]),
-            ..Default::default()
-        };
-        let state = HashState {
-            version: 1,
-            hash: [3u8; 128],
-            index_value_map: HashMap::new(),
-        };
-        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
-            .expect_err("genesis snapshotMAC must be validated, not skipped");
-        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
-    }
+    // F2: WA Web validates the aggregate MACs on every patch, genesis included.
+    // A genesis patch that OMITS one is the curated-baseline attack and stays
+    // fatal — omission is not divergence.
 
     #[test]
     fn validate_patch_macs_rejects_genesis_tampered_patch_mac() {
@@ -877,12 +932,7 @@ mod tests {
             patch_mac: Some(vec![0u8; 32]),
             ..Default::default()
         };
-        let state = HashState {
-            version: 1,
-            hash: [5u8; 128],
-            index_value_map: HashMap::new(),
-        };
-        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+        let err = validate_patch_macs(&patch, &state_at(1, 5), &keys, "regular", true, false)
             .expect_err("genesis patchMAC must be validated, not skipped");
         assert!(matches!(err, AppStateError::PatchMACMismatch));
     }
@@ -897,12 +947,7 @@ mod tests {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             ..Default::default()
         };
-        let state = HashState {
-            version: 1,
-            hash: [5u8; 128],
-            index_value_map: HashMap::new(),
-        };
-        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+        let err = validate_patch_macs(&patch, &state_at(1, 5), &keys, "regular", true, false)
             .expect_err("genesis patch without patchMAC must be rejected");
         assert!(matches!(err, AppStateError::PatchMACMismatch));
     }
@@ -910,19 +955,14 @@ mod tests {
     #[test]
     fn validate_patch_macs_rejects_genesis_missing_snapshot_mac() {
         let keys = expand_app_state_keys(&[7u8; 32]);
-        let state = HashState {
-            version: 1,
-            hash: [3u8; 128],
-            index_value_map: HashMap::new(),
-        };
-        // Valid patchMac but snapshotMac stripped: WA Web validates both, so still
-        // rejected — a server can't forge either, so neither may be omitted.
+        // Valid patchMac but snapshotMac stripped: there is no aggregate to
+        // anchor the fresh baseline to, so this is rejected rather than latched.
         let mut patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             ..Default::default()
         };
         patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
-        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+        let err = validate_patch_macs(&patch, &state_at(1, 3), &keys, "regular", true, false)
             .expect_err("genesis patch without snapshotMAC must be rejected");
         assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
     }
@@ -932,19 +972,59 @@ mod tests {
         // Regression guard: a legitimate genesis patch, whose MACs are computed over
         // the empty-seeded ltHash exactly as WA Web does, must still be accepted.
         let keys = expand_app_state_keys(&[7u8; 32]);
-        let state = HashState {
-            version: 1,
-            hash: [3u8; 128],
-            index_value_map: HashMap::new(),
-        };
+        let state = state_at(1, 3);
         let mut patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             ..Default::default()
         };
         patch.snapshot_mac = Some(state.generate_snapshot_mac("regular", &keys.snapshot_mac));
         patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
-        validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+        let verdict = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
             .expect("legitimate genesis patch with correct MACs must be accepted");
+        assert!(!verdict.snapshot_mac_diverged);
+    }
+
+    /// The `process_patch` half of the contract: a diverged-but-authentic patch
+    /// applies, and it latches the state so the next one skips the comparison.
+    #[test]
+    fn process_patch_latches_divergence_and_keeps_applying() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let key_id = b"test_key_id".to_vec();
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(6) }),
+            mutations: vec![wa::SyncdMutation {
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(create_encrypted_record(
+                    wa::syncd_mutation::SyncdOperation::SET,
+                    &[1u8; 32],
+                    &keys,
+                    &key_id,
+                    1,
+                )),
+            }],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            // Signed over an ltHash this client does not share.
+            snapshot_mac: Some(
+                state_at(6, 0xEE).generate_snapshot_mac("regular", &keys.snapshot_mac),
+            ),
+            ..Default::default()
+        };
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 6));
+
+        let gk = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let gp = |_: &[u8]| Ok(None);
+        let mut state = state_at(5, 0x11);
+        let result = process_patch(&patch, &mut state, gk, gp, true, "regular")
+            .expect("an authentic patch must apply over a diverged base");
+
+        assert_eq!(result.mutations.len(), 1);
+        assert_eq!(result.state.version, 6);
+        assert!(
+            result.state.mac_mismatch_fatal,
+            "the divergence must be latched so it is not re-detected every patch"
+        );
     }
 
     #[test]

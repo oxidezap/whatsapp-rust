@@ -23,6 +23,8 @@ const ATTR_FINGERPRINT: u16 = 0x8028;
 const ATTR_ERROR_CODE: u16 = 0x0009;
 const ATTR_RELAY_TOKEN: u16 = 0x4000;
 const STUN_ATTR_STREAM_DESCRIPTORS: u16 = 0x4024;
+const STUN_ATTR_RECEIVER_SUBSCRIPTIONS: u16 = 0x4021;
+const STUN_ATTR_PARTICIPANT_COUNT: u16 = 0x805a;
 const STUN_ATTR_WASM_RELAY_ENDPOINT: u16 = 0x0016;
 
 pub const MSG_BINDING_REQUEST: u16 = 0x0001;
@@ -158,26 +160,195 @@ const WASM_STREAM_SLOTS: [(u32, u32, u32); 9] = [
     (2, 2, 6),
 ];
 
+#[cfg(test)]
+pub(crate) fn wasm_stream_slot_words() -> [u32; 9] {
+    WASM_STREAM_SLOTS.map(|(_, _, slot)| slot)
+}
+
 /// Build call-specific WASM `StreamDescriptors` (0x4024).
 pub fn create_wasm_stream_descriptors(call_id: &str, self_participant_id: &str) -> Vec<u8> {
+    let ssrcs = WASM_STREAM_SLOTS.map(|(_, _, slot)| {
+        crate::voip::ssrc::derive_wasm_participant_ssrc(call_id, self_participant_id, slot)
+    });
+    create_wasm_stream_descriptors_from_ssrcs(&ssrcs, &[0, 0])
+}
+
+/// Build stream descriptors from an explicit collision-free local SSRC plan.
+pub fn create_wasm_stream_descriptors_from_ssrcs(
+    stream_ssrcs: &[u32; 9],
+    hbh_fec_ssrcs: &[u32; 2],
+) -> Vec<u8> {
     let mut out = Vec::new();
-    for &(stream_index, sub_type, slot) in &WASM_STREAM_SLOTS {
-        let ssrc =
-            crate::voip::ssrc::derive_wasm_participant_ssrc(call_id, self_participant_id, slot);
-        let mut d = Vec::new();
-        if stream_index != 0 {
-            pb_tag(&mut d, 1, 0);
-            pb_varint(&mut d, stream_index as u64);
+    for ((stream_index, sub_type, _), ssrc) in
+        WASM_STREAM_SLOTS.iter().zip(stream_ssrcs.iter().copied())
+    {
+        if ssrc == 0 {
+            continue;
         }
-        if sub_type != 0 {
+        let mut d = Vec::new();
+        if *stream_index != 0 {
+            pb_tag(&mut d, 1, 0);
+            pb_varint(&mut d, *stream_index as u64);
+        }
+        if *sub_type != 0 {
             pb_tag(&mut d, 2, 0);
-            pb_varint(&mut d, sub_type as u64);
+            pb_varint(&mut d, *sub_type as u64);
         }
         pb_tag(&mut d, 3, 0);
         pb_varint(&mut d, ssrc as u64);
         pb_len_delim(&mut out, 1, &d);
     }
+    for (index, ssrc) in hbh_fec_ssrcs.iter().copied().enumerate() {
+        if ssrc == 0 {
+            continue;
+        }
+        let mut descriptor = Vec::new();
+        pb_tag(&mut descriptor, 1, 0);
+        pb_varint(&mut descriptor, (index + 3) as u64);
+        pb_tag(&mut descriptor, 2, 0);
+        pb_varint(&mut descriptor, 3);
+        pb_tag(&mut descriptor, 3, 0);
+        pb_varint(&mut descriptor, ssrc as u64);
+        pb_len_delim(&mut out, 1, &descriptor);
+    }
     out
+}
+
+/// Sender subscription protobuf for group audio, video, secondary video, and app-data.
+pub fn create_wasm_group_sender_subscriptions(
+    stream_ssrcs: &[u32; 9],
+    app_data_ssrc: u32,
+    participant_pids: &[u32],
+) -> Vec<u8> {
+    let pids = normalized_pids(participant_pids);
+    let mut out = Vec::new();
+    out.extend(create_wasm_sender_subscription(
+        &stream_ssrcs[3..6],
+        &pids,
+        true,
+    ));
+    out.extend(create_wasm_sender_subscription(
+        &stream_ssrcs[6..9],
+        &[],
+        false,
+    ));
+    out.extend(create_wasm_sender_subscription(
+        &stream_ssrcs[0..3],
+        &pids,
+        false,
+    ));
+    out.extend(create_wasm_sender_subscription(
+        &[app_data_ssrc],
+        &pids,
+        false,
+    ));
+    out
+}
+
+/// Receiver subscription protobuf selecting the connected remote PIDs.
+pub fn create_wasm_group_receiver_subscriptions(participant_pids: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for pid in normalized_pids(participant_pids) {
+        let mut participant = Vec::new();
+        pb_tag(&mut participant, 1, 0);
+        pb_varint(&mut participant, pid as u64);
+        pb_len_delim(&mut out, 2, &participant);
+    }
+    out
+}
+
+fn create_wasm_sender_subscription(
+    ssrcs: &[u32],
+    participant_pids: &[u32],
+    video: bool,
+) -> Vec<u8> {
+    let mut packed_ssrcs = Vec::new();
+    for ssrc in ssrcs.iter().copied().filter(|ssrc| *ssrc != 0) {
+        pb_varint(&mut packed_ssrcs, ssrc as u64);
+    }
+    let mut subscription = Vec::new();
+    pb_len_delim(&mut subscription, 1, &packed_ssrcs);
+    for pid in participant_pids {
+        let mut participant = Vec::new();
+        pb_tag(&mut participant, 1, 0);
+        pb_varint(&mut participant, *pid as u64);
+        if video {
+            pb_tag(&mut participant, 2, 0);
+            pb_varint(&mut participant, 1);
+        }
+        pb_len_delim(&mut subscription, 2, &participant);
+    }
+    let mut wrapper = Vec::new();
+    pb_len_delim(&mut wrapper, 1, &subscription);
+    let mut out = Vec::new();
+    pb_len_delim(&mut out, 1, &wrapper);
+    out
+}
+
+fn normalized_pids(participant_pids: &[u32]) -> Vec<u32> {
+    let mut pids = participant_pids.to_vec();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Inputs for a group relay Allocate with participant subscriptions.
+pub struct WasmGroupStunAllocateRequest<'a> {
+    pub transaction_id: &'a [u8; 12],
+    pub relay_token: &'a [u8],
+    pub endpoint_xor: &'a [u8; 6],
+    pub integrity_key: &'a [u8],
+    pub stream_ssrcs: &'a [u32; 9],
+    pub app_data_ssrc: u32,
+    pub hbh_fec_ssrcs: &'a [u32; 2],
+    pub participant_pids: &'a [u32],
+}
+
+/// Build the group relay Allocate shape, including multi-PID HBH-FEC descriptors.
+pub fn build_wasm_group_stun_allocate_request(
+    request: &WasmGroupStunAllocateRequest<'_>,
+) -> Vec<u8> {
+    let pids = normalized_pids(request.participant_pids);
+    let descriptors = create_wasm_stream_descriptors_from_ssrcs(
+        request.stream_ssrcs,
+        if pids.len() > 1 {
+            request.hbh_fec_ssrcs
+        } else {
+            &[0, 0]
+        },
+    );
+    let mut attrs = stun_attr(ATTR_RELAY_TOKEN, request.relay_token);
+    if !pids.is_empty() {
+        attrs.extend_from_slice(&stun_attr(
+            ATTR_SENDER_SUBSCRIPTIONS_V2,
+            &create_wasm_group_sender_subscriptions(
+                request.stream_ssrcs,
+                request.app_data_ssrc,
+                &pids,
+            ),
+        ));
+        attrs.extend_from_slice(&stun_attr(
+            STUN_ATTR_RECEIVER_SUBSCRIPTIONS,
+            &create_wasm_group_receiver_subscriptions(&pids),
+        ));
+    }
+    attrs.extend_from_slice(&stun_attr(STUN_ATTR_STREAM_DESCRIPTORS, &descriptors));
+    if !pids.is_empty() {
+        let mut participant_count = Vec::new();
+        pb_varint(&mut participant_count, pids.len() as u64);
+        attrs.extend_from_slice(&stun_attr(STUN_ATTR_PARTICIPANT_COUNT, &participant_count));
+    }
+    attrs.extend_from_slice(&stun_attr(
+        STUN_ATTR_WASM_RELAY_ENDPOINT,
+        &create_wasm_relay_endpoint_attr(request.endpoint_xor),
+    ));
+    encode_stun_request(
+        MSG_ALLOCATE_REQUEST,
+        request.transaction_id,
+        &attrs,
+        Some(request.integrity_key),
+        false,
+    )
 }
 
 /// WASM/Web DataChannel Allocate: 0x4000 token + 0x4024 stream desc + 0x0016 endpoint + MI, no FP.
@@ -607,6 +778,95 @@ mod tests {
         assert_eq!(
             hex::encode(build_whatsapp_ping(&tx)),
             k["stun"]["ping"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn group_allocate_matches_captured_subscription_and_hbh_fec_shape() {
+        let stream_ssrcs = [
+            0x3ea2_6c0c,
+            0x0bf9_9b28,
+            0xf42e_4556,
+            0x14e8_f126,
+            0xbb16_134f,
+            0x98b1_4f00,
+            0xe0e0_4163,
+            0x74ed_8516,
+            0xdea8_a613,
+        ];
+        let tx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let endpoint = [0x2c, 0x84, 0xbc, 0xe2, 0xb5, 0xc7];
+        let packet = build_wasm_group_stun_allocate_request(&WasmGroupStunAllocateRequest {
+            transaction_id: &tx,
+            relay_token: &[1, 2, 3],
+            endpoint_xor: &endpoint,
+            integrity_key: b"0123456789abcdef",
+            stream_ssrcs: &stream_ssrcs,
+            app_data_ssrc: 0xb31d_ed3e,
+            hbh_fec_ssrcs: &[0xc1a1_7938, 0x1bb2_0c84],
+            participant_pids: &[2, 1, 2],
+        });
+        let attrs = parse_stun_attributes(&packet);
+        assert_eq!(
+            attrs.iter().map(|attr| attr.attr_type).collect::<Vec<_>>(),
+            [
+                ATTR_RELAY_TOKEN,
+                ATTR_SENDER_SUBSCRIPTIONS_V2,
+                STUN_ATTR_RECEIVER_SUBSCRIPTIONS,
+                STUN_ATTR_STREAM_DESCRIPTORS,
+                STUN_ATTR_PARTICIPANT_COUNT,
+                STUN_ATTR_WASM_RELAY_ENDPOINT,
+                ATTR_MESSAGE_INTEGRITY,
+            ]
+        );
+        assert_eq!(
+            hex::encode(attrs[1].value),
+            "0a1f0a1d0a0fa6e2a3a701cfa6d8d80b809ec5c5091204080110011204080210010a130a110a0fe38281870e968ab6a70793cca2f50d0a1a0a180a0e8cd889f503a8b6e65fd68ab9a10f12020801120208020a110a0f0a05bedaf7980b1202080112020802"
+        );
+        assert_eq!(hex::encode(attrs[2].value), "1202080112020802");
+        assert_eq!(
+            hex::encode(attrs[3].value),
+            "0a06188cd889f5030a07100118a8b6e65f0a08100218d68ab9a10f0a08080118a6e2a3a7010a0a0801100118cfa6d8d80b0a0a0801100218809ec5c5090a08080218e38281870e0a0a0802100118968ab6a7070a0a080210021893cca2f50d0a0a0803100318b8f2858d0c0a0a08041003188499c8dd01"
+        );
+        assert_eq!(attrs[4].value, [2]);
+
+        let one_pid = build_wasm_group_stun_allocate_request(&WasmGroupStunAllocateRequest {
+            transaction_id: &tx,
+            relay_token: &[1, 2, 3],
+            endpoint_xor: &endpoint,
+            integrity_key: b"0123456789abcdef",
+            stream_ssrcs: &stream_ssrcs,
+            app_data_ssrc: 0xb31d_ed3e,
+            hbh_fec_ssrcs: &[0xc1a1_7938, 0x1bb2_0c84],
+            participant_pids: &[1],
+        });
+        let one_attrs = parse_stun_attributes(&one_pid);
+        assert_eq!(
+            one_attrs[3].value,
+            create_wasm_stream_descriptors_from_ssrcs(&stream_ssrcs, &[0, 0])
+        );
+
+        let no_pids = build_wasm_group_stun_allocate_request(&WasmGroupStunAllocateRequest {
+            transaction_id: &tx,
+            relay_token: &[1, 2, 3],
+            endpoint_xor: &endpoint,
+            integrity_key: b"0123456789abcdef",
+            stream_ssrcs: &stream_ssrcs,
+            app_data_ssrc: 0xb31d_ed3e,
+            hbh_fec_ssrcs: &[0xc1a1_7938, 0x1bb2_0c84],
+            participant_pids: &[],
+        });
+        assert_eq!(
+            parse_stun_attributes(&no_pids)
+                .iter()
+                .map(|attr| attr.attr_type)
+                .collect::<Vec<_>>(),
+            [
+                ATTR_RELAY_TOKEN,
+                STUN_ATTR_STREAM_DESCRIPTORS,
+                STUN_ATTR_WASM_RELAY_ENDPOINT,
+                ATTR_MESSAGE_INTEGRITY,
+            ]
         );
     }
 

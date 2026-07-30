@@ -2,6 +2,16 @@
 
 use super::*;
 
+#[inline]
+fn delivery_receipt_burst_warning(
+    result: &crate::socket::error::EncryptSendResult,
+) -> Option<&crate::socket::error::EncryptSendError> {
+    match result {
+        Err(error) if !error.is_transport_unavailable() => Some(error),
+        Ok(()) | Err(_) => None,
+    }
+}
+
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
@@ -127,6 +137,10 @@ impl Client {
         let _ = tx.try_send((Arc::clone(info), guard));
     }
 
+    /// How many queued receipts one burst may take; mirrors the ack worker's
+    /// [`MAX_ACK_BURST`](Client::MAX_ACK_BURST), where the tradeoff is measured.
+    const MAX_RECEIPT_BURST: usize = 4;
+
     /// Worker task shared by every live delivery receipt. Holds only a `Weak`
     /// so a dropped `Client` closes the channel and ends the task instead of
     /// keeping the client alive.
@@ -138,15 +152,136 @@ impl Client {
         let client = Arc::downgrade(self);
         self.runtime
             .spawn(Box::pin(async move {
-                while let Ok((info, guard)) = rx.recv().await {
+                // Reuse the bounded control buffers for the worker's lifetime.
+                // Encoded payload allocations still move into `Bytes`; only
+                // the outer storage stays here.
+                let mut batch = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                let mut frames = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                let mut guards = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                let mut results = Vec::with_capacity(Self::MAX_RECEIPT_BURST);
+                while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
                     };
-                    client.send_delivery_receipt(&info).await;
-                    drop(guard);
+
+                    // Same reasoning as the ack worker: awaiting each receipt
+                    // before reading the next means the noise sender never has
+                    // two frames to coalesce. `try_recv` only, so nothing waits
+                    // on work that has not arrived.
+                    batch.push(first);
+                    while batch.len() < Self::MAX_RECEIPT_BURST
+                        && let Ok(next) = rx.try_recv()
+                    {
+                        batch.push(next);
+                    }
+
+                    // No teardown gate here, unlike the ack worker: the
+                    // single-receipt path never had one either (it relies on
+                    // the socket reporting NotConnected), and adding one for
+                    // symmetry would silently start dropping receipts that
+                    // today still go out.
+                    for (info, guard) in batch.drain(..) {
+                        // Building the node is synchronous, so the burst is
+                        // fully prepared before anything reaches the socket.
+                        if let Some(frame) = client.prepare_delivery_receipt(&info) {
+                            frames.push(frame);
+                            guards.push(guard);
+                        }
+                    }
+                    if frames.is_empty() {
+                        continue;
+                    }
+
+                    // Spans the await *and* the result inspection: a receipt
+                    // that stalls or fails in the transport has to show up
+                    // inside the span, not after it closed. The per-receipt
+                    // `wa.receipt.send_delivery` span stays on the
+                    // single-receipt path, which this one does not use.
+                    let frame_count = frames.len();
+                    let send_and_report = async {
+                        match client.send_raw_bytes_burst(&mut frames, &mut results).await {
+                            Ok(()) => {
+                                for result in results.drain(..) {
+                                    if let Some(error) = delivery_receipt_burst_warning(&result) {
+                                        log::warn!(target: "Client/Receipt", "Failed to send delivery receipt: {error:?}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if !matches!(e, crate::client::ClientError::NotConnected) {
+                                    log::warn!(target: "Client/Receipt", "Failed to send delivery receipt burst: {e:?}");
+                                }
+                            }
+                        }
+                    };
+                    #[cfg(feature = "tracing")]
+                    {
+                        use tracing::Instrument;
+                        send_and_report
+                            .instrument(tracing::debug_span!(
+                                "wa.receipt.delivery_burst",
+                                frames = frame_count
+                            ))
+                            .await;
+                    }
+                    #[cfg(not(feature = "tracing"))]
+                    {
+                        let _ = frame_count;
+                        send_and_report.await;
+                    }
+                    debug_assert!(
+                        frames.is_empty(),
+                        "send_raw_bytes_burst must always drain its input"
+                    );
+                    guards.clear();
                 }
             }))
             .detach();
         tx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delivery_receipt_burst_warning;
+    use crate::socket::error::EncryptSendError;
+
+    #[test]
+    fn receipt_burst_logging_is_quiet_for_success_and_reconnect_failures() {
+        let reconnect_failures = [
+            Ok(()),
+            Err(EncryptSendError::transport(anyhow::anyhow!(
+                "transport unavailable"
+            ))),
+            Err(EncryptSendError::channel_closed()),
+            Err(EncryptSendError::poisoned()),
+        ];
+
+        for result in &reconnect_failures {
+            assert!(
+                delivery_receipt_burst_warning(result).is_none(),
+                "success and reconnect-related failures must stay quiet: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_burst_logging_keeps_actionable_local_failures_visible() {
+        let actionable_failures = [
+            Err(EncryptSendError::crypto(anyhow::anyhow!(
+                "encryption failed"
+            ))),
+            Err(EncryptSendError::framing(anyhow::anyhow!("framing failed"))),
+            Err(EncryptSendError::join(anyhow::anyhow!(
+                "sender join failed"
+            ))),
+        ];
+
+        for result in &actionable_failures {
+            assert!(
+                delivery_receipt_burst_warning(result).is_some(),
+                "local send failures must remain visible: {result:?}"
+            );
+        }
     }
 }

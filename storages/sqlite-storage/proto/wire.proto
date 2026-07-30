@@ -30,4 +30,8 @@ message HashStateWire {
   uint64 version = 1;
   bytes hash = 2;
   map<string, bytes> index_value_map = 3;
+  // Set once the collection's ltHash has diverged from its peers'. Absent in
+  // rows written before this field existed, which decode to false — the same
+  // state a healthy collection is in.
+  bool mac_mismatch_fatal = 4;
 }

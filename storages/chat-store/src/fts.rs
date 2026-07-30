@@ -9,9 +9,11 @@
 //! `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`.
 
 use diesel::prelude::*;
-use log::warn;
+use wacore_binary::Jid;
 
 use crate::error::{ChatStoreError, Result, db_err};
+use crate::queries::MessageRow;
+use crate::schema;
 use crate::store::ChatStore;
 use crate::types::StoredMessage;
 
@@ -87,59 +89,161 @@ fn build_match_query(input: &str) -> Option<String> {
     (!query.is_empty()).then_some(query)
 }
 
+/// Shortest token that still earns relevance ranking.
+///
+/// `ORDER BY rank` has to score every row a term matches before `LIMIT` can
+/// discard any, so its cost tracks the size of the match set rather than the
+/// page the caller asked for. A one- or two-character prefix matches a large
+/// fraction of a real store, which is how a single keystroke turned into a
+/// multi-second query. Below this length the search orders by arrival instead:
+/// FTS5 walks its index in rowid order and stops at `LIMIT`, and "the newest
+/// things that start with this" is a defensible answer for a term that short.
+const MIN_RANKED_TERM_LEN: usize = 3;
+
+/// Max rowids per hydration statement, under SQLite's default 999
+/// host-parameter limit.
+const ID_PARAM_CHUNK: usize = 900;
+
 #[derive(QueryableByName)]
-struct FtsRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    chat_jid: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    msg_id: String,
+struct FtsHit {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    rowid: i64,
 }
 
 impl ChatStore {
     /// Full-text search over message text/captions, best match first. The
     /// query is plain words (prefix-matched); FTS5 operators are neutralized.
+    ///
+    /// A term shorter than three characters is ordered newest-first instead of
+    /// by relevance: ranking has to score every row such a prefix matches
+    /// before `limit` can discard any, which on a real store means most of it.
     pub async fn search_messages(&self, query: &str, limit: i64) -> Result<Vec<StoredMessage>> {
+        self.search(query, None, limit).await
+    }
+
+    /// The same search restricted to one chat.
+    ///
+    /// Scoping happens inside the FTS join, so a chat that ranks sparsely still
+    /// yields its hits — over-fetching globally and filtering afterwards both
+    /// costs more and silently drops them.
+    ///
+    /// A 1:1 chat may be addressed by either of the peer's identities; both
+    /// find the thread.
+    pub async fn search_messages_in_chat(
+        &self,
+        chat: &Jid,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        self.search(query, Some(chat.to_string()), limit).await
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        chat: Option<String>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
         let Some(match_query) = build_match_query(query) else {
             return Err(ChatStoreError::InvalidSearchQuery);
         };
+        let ranked = query
+            .split_whitespace()
+            .all(|token| token.chars().count() >= MIN_RANKED_TERM_LEN);
         // A negative LIMIT means "unbounded" to SQLite; never let that happen.
         let limit = limit.max(0);
         if limit == 0 {
             return Ok(Vec::new());
         }
         let device_id = self.device_id();
-        let hits: Vec<FtsRow> = self
-            .db()
-            .run(move |conn| {
-                diesel::sql_query(
-                    "SELECT m.chat_jid AS chat_jid, m.msg_id AS msg_id
-                     FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
-                     WHERE messages_fts MATCH ? AND m.device_id = ?
-                     ORDER BY rank LIMIT ?",
-                )
-                .bind::<diesel::sql_types::Text, _>(&match_query)
-                .bind::<diesel::sql_types::Integer, _>(device_id)
-                .bind::<diesel::sql_types::BigInt, _>(limit)
-                .load(conn)
-                .map_err(db_err)
-            })
-            .await?;
-
-        // Hydrate full rows through the regular path (decodes protos, parses
-        // JIDs). One extra point query per hit; hit counts are UI-page sized.
-        let mut results = Vec::with_capacity(hits.len());
-        for hit in hits {
-            match hit.chat_jid.parse() {
-                Ok(chat) => {
-                    if let Some(message) = self.message(&chat, &hit.msg_id).await? {
-                        results.push(message);
+        let rows: Vec<MessageRow> =
+            self.db()
+                .read(move |conn| {
+                    let keys = match &chat {
+                        Some(chat) => crate::lid::chat_key_candidates(conn, device_id, chat)
+                            .map_err(db_err)?,
+                        None => Vec::new(),
+                    };
+                    let hits = fts_hits(conn, device_id, &match_query, &keys, ranked, limit)?;
+                    if hits.is_empty() {
+                        return Ok(Vec::new());
                     }
-                }
-                Err(_) => warn!("chat-store: unparseable chat JID in FTS hit"),
-            }
-        }
-        Ok(results)
+                    // One statement per chunk of hits, instead of a point query
+                    // per hit (each of which used to re-resolve the chat's
+                    // identity keys first, so N hits cost ~2N serialized round
+                    // trips). `limit` is the caller's, so the id list is chunked
+                    // rather than trusted to stay under SQLite's host-parameter
+                    // ceiling.
+                    let ids: Vec<i64> = hits.iter().map(|hit| hit.rowid).collect();
+                    let mut rows: Vec<MessageRow> = Vec::with_capacity(ids.len());
+                    for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                        rows.extend(
+                            schema::messages::dsl::messages
+                                .filter(schema::messages::dsl::rowid.eq_any(chunk))
+                                .load::<MessageRow>(conn)
+                                .map_err(db_err)?,
+                        );
+                    }
+                    // `eq_any` returns table order, and chunking splits it
+                    // further; restore the order the ranking (or the recency
+                    // scan) put them in.
+                    let rank_of: std::collections::HashMap<i64, usize> =
+                        ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
+                    rows.sort_by_key(|row| rank_of.get(&row.rowid).copied().unwrap_or(usize::MAX));
+                    Ok(rows)
+                })
+                .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
+}
+
+/// Matching rowids, best first. `keys` scopes the search to one chat's storage
+/// identities; empty searches every chat.
+fn fts_hits(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    match_query: &str,
+    keys: &[String],
+    ranked: bool,
+    limit: i64,
+) -> wacore::store::error::Result<Vec<FtsHit>> {
+    use diesel::sql_types::{BigInt, Integer, Text};
+
+    // Constant fragments, never caller input. `rank` is qualified because it is
+    // only unambiguous today by accident — `messages` has no such column, and
+    // an unqualified reference would silently start resolving to it if one were
+    // ever added.
+    let order = if ranked { "f.rank" } else { "f.rowid DESC" };
+    let Some(first_key) = keys.first() else {
+        return diesel::sql_query(format!(
+            "SELECT f.rowid AS rowid
+             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+             WHERE messages_fts MATCH ? AND m.device_id = ?
+             ORDER BY {order} LIMIT ?"
+        ))
+        .bind::<Text, _>(match_query)
+        .bind::<Integer, _>(device_id)
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .map_err(db_err);
+    };
+    // A chat has at most two storage identities (PN and LID). Padding the
+    // single-key case to two placeholders keeps one statically bound statement
+    // instead of a variadic one; `IN (x, x)` is `IN (x)`.
+    let second_key = keys.get(1).unwrap_or(first_key);
+    diesel::sql_query(format!(
+        "SELECT f.rowid AS rowid
+         FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+         WHERE messages_fts MATCH ? AND m.device_id = ? AND m.chat_jid IN (?, ?)
+         ORDER BY {order} LIMIT ?"
+    ))
+    .bind::<Text, _>(match_query)
+    .bind::<Integer, _>(device_id)
+    .bind::<Text, _>(first_key)
+    .bind::<Text, _>(second_key)
+    .bind::<BigInt, _>(limit)
+    .load(conn)
+    .map_err(db_err)
 }
 
 #[cfg(test)]

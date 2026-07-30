@@ -16,3 +16,9 @@ dhat-heap*.json
 # proptest persists failure seeds next to the test on failure; these are
 # environment-local replay caches, not source.
 *.proptest-regressions
+
+# Diagnostic store snapshots tests write into the repo root
+# (PersistenceManager::create_snapshot). Generated artifacts, never sources.
+# Two spellings: the plain name and the "file:" form the sqlite URI produces.
+memdb_*.snapshot-*
+file:memdb_*.snapshot-*

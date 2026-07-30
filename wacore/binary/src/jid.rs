@@ -14,6 +14,36 @@ pub struct ParsedJidParts<'a> {
     pub integrator: u16,
 }
 
+/// Decimal-only `u16` parser for the device and agent fields.
+///
+/// Deliberately not `str::parse`: `from_str_radix` is generic over radix and
+/// signedness and carries the branches to prove it, which the JID scanner pays
+/// on every device it splits out. The accepted grammar is the same one
+/// `u16::from_str` accepts — an optional `+`, then decimal digits, rejecting
+/// empty input and anything that overflows — and `decimal_fast_path_matches_u16_from_str`
+/// holds the two together. A `-` is a non-digit here for the same reason it is
+/// one in std: the sign is only recognised for signed types.
+#[inline]
+fn parse_u16_decimal(s: &str) -> Option<u16> {
+    let mut bytes = s.as_bytes();
+    if bytes.first() == Some(&b'+') {
+        bytes = &bytes[1..];
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut value = 0u16;
+    for &byte in bytes {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(digit as u16)?;
+    }
+    Some(value)
+}
+
 /// Single-pass JID parser optimized for hot paths.
 /// Scans the input string once to find all relevant separators (@, :)
 /// and returns slices into the original string without allocation.
@@ -21,141 +51,138 @@ pub struct ParsedJidParts<'a> {
 /// Returns `None` for JIDs that need full validation (edge cases, unknown servers, etc.)
 #[inline]
 pub fn parse_jid_fast(s: &str) -> Option<ParsedJidParts<'_>> {
-    if s.is_empty() {
-        return None;
-    }
+    parse_jid_scan(s).map(|(parts, _)| parts)
+}
 
+/// Shared scanner behind [`parse_jid_fast`] and [`parse_jid_ref`]. The resolved
+/// [`Server`] comes back alongside the borrowed parts because the scan already
+/// had to classify the server to know whether dots in the user part are agent
+/// separators — returning it lets `parse_jid_ref` skip a second lookup.
+///
+/// `None` in the second slot means the server suffix is not one we know; the
+/// parts are still filled in (with the generic agent/device rules), which is
+/// what `parse_jid_fast`'s callers rely on.
+#[inline]
+fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
     let bytes = s.as_bytes();
 
-    // Single pass to find key separator positions
-    let mut at_pos: Option<usize> = None;
+    // One pass over the *user* part only: everything after `@` is the server,
+    // which carries no separators we care about, so the scan stops there.
+    let mut at = usize::MAX;
     let mut colon_pos: Option<usize> = None;
     let mut last_dot_pos: Option<usize> = None;
 
     for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'@' if at_pos.is_none() => at_pos = Some(i),
-            // Only track colon in user part (before @)
-            b':' if at_pos.is_none() => colon_pos = Some(i),
-            // Only track dots in user part (before @ and before :)
-            b'.' if at_pos.is_none() && colon_pos.is_none() => last_dot_pos = Some(i),
+            b'@' => {
+                at = i;
+                break;
+            }
+            b':' => colon_pos = Some(i),
+            // Dots after the first colon belong to the device, not the agent.
+            b'.' if colon_pos.is_none() => last_dot_pos = Some(i),
             _ => {}
         }
     }
 
-    // Extract at_pos as concrete value - after this point we know @ exists
-    let at = match at_pos {
-        Some(pos) => pos,
-        None => {
-            // Server-only JID - let the fallback validate it
-            return None;
-        }
-    };
-
-    let user_part = &s[..at];
-    let server = &s[at + 1..];
-
-    // Validate that user_part is not empty
-    if user_part.is_empty() {
+    // No `@` (server-only JID) or an empty user: let the fallback validate it.
+    if at == usize::MAX || at == 0 {
         return None;
     }
 
-    // Fast path for LID JIDs - dots in user are not agent separators
-    if server == HIDDEN_USER_SERVER {
-        let (user, device) = match colon_pos {
-            Some(pos) if pos < at => {
-                let device_slice = &s[pos + 1..at];
-                (&s[..pos], device_slice.parse::<u16>().unwrap_or(0))
-            }
-            _ => (user_part, 0),
-        };
-        return Some(ParsedJidParts {
-            user,
-            server,
-            agent: 0,
-            device,
-            integrator: 0,
-        });
-    }
+    let user_part = &s[..at];
+    let server_str = &s[at + 1..];
+    let server = Server::parse_known(server_str);
 
-    // For DEFAULT_USER_SERVER (s.whatsapp.net), handle legacy dot format as device
-    if server == DEFAULT_USER_SERVER {
-        // Check for colon format first (modern: user:device@server)
-        if let Some(pos) = colon_pos {
-            let user_end = pos;
-            let device_start = pos + 1;
-            let device_slice = &s[device_start..at];
-            let device = device_slice.parse::<u16>().unwrap_or(0);
-            return Some(ParsedJidParts {
-                user: &s[..user_end],
-                server,
-                agent: 0,
-                device,
-                integrator: 0,
-            });
-        }
-        // Check for legacy dot format (legacy: user.device@server)
-        if let Some(dot_pos) = last_dot_pos {
-            // dot_pos is absolute position in s
-            let suffix = &s[dot_pos + 1..at];
-            if let Ok(device_val) = suffix.parse::<u16>() {
-                return Some(ParsedJidParts {
-                    user: &s[..dot_pos],
-                    server,
+    match server {
+        // LID user parts may contain dots, which are not agent separators.
+        Some(Server::Lid) => {
+            let (user, device) = match colon_pos {
+                Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
+                None => (user_part, 0),
+            };
+            Some((
+                ParsedJidParts {
+                    user,
+                    server: server_str,
                     agent: 0,
-                    device: device_val,
+                    device,
                     integrator: 0,
-                });
-            }
+                },
+                server,
+            ))
         }
-        // No device component
-        return Some(ParsedJidParts {
-            user: user_part,
-            server,
-            agent: 0,
-            device: 0,
-            integrator: 0,
-        });
+        // `s.whatsapp.net` has no agent in the string form; a trailing dotted
+        // number is the legacy device spelling.
+        Some(Server::Pn) => {
+            if let Some(pos) = colon_pos {
+                return Some((
+                    ParsedJidParts {
+                        user: &s[..pos],
+                        server: server_str,
+                        agent: 0,
+                        device: parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0),
+                        integrator: 0,
+                    },
+                    server,
+                ));
+            }
+            if let Some(dot_pos) = last_dot_pos
+                && let Some(device_val) = parse_u16_decimal(&s[dot_pos + 1..at])
+            {
+                return Some((
+                    ParsedJidParts {
+                        user: &s[..dot_pos],
+                        server: server_str,
+                        agent: 0,
+                        device: device_val,
+                        integrator: 0,
+                    },
+                    server,
+                ));
+            }
+            Some((
+                ParsedJidParts {
+                    user: user_part,
+                    server: server_str,
+                    agent: 0,
+                    device: 0,
+                    integrator: 0,
+                },
+                server,
+            ))
+        }
+        // Everything else (including unknown servers): `user.agent:device`.
+        _ => {
+            let (user_before_colon, device) = match colon_pos {
+                Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
+                None => (user_part, 0),
+            };
+            // Deliberately `rfind` on the pre-colon slice rather than reusing
+            // `last_dot_pos`: the two differ for pathological users that hold a
+            // second colon (`a:1.5:2`), and this branch is cold enough that
+            // matching the historical rule is worth the extra scan.
+            let (final_user, agent) = match user_before_colon.rfind('.') {
+                Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
+                    Some(agent_val) if agent_val <= u8::MAX as u16 => {
+                        (&user_before_colon[..dot_pos], agent_val as u8)
+                    }
+                    _ => (user_before_colon, 0),
+                },
+                None => (user_before_colon, 0),
+            };
+            Some((
+                ParsedJidParts {
+                    user: final_user,
+                    server: server_str,
+                    agent,
+                    device,
+                    integrator: 0,
+                },
+                server,
+            ))
+        }
     }
-
-    // Parse device from colon separator (user:device@server)
-    let (user_before_colon, device) = match colon_pos {
-        Some(pos) => {
-            // Colon is at `pos` in the original string
-            let user_end = pos;
-            let device_start = pos + 1;
-            let device_slice = &s[device_start..at];
-            (&s[..user_end], device_slice.parse::<u16>().unwrap_or(0))
-        }
-        None => (user_part, 0),
-    };
-
-    // Parse agent from last dot in user part (for non-default, non-LID servers)
-    let user_to_check = user_before_colon;
-    let (final_user, agent) = {
-        if let Some(dot_pos) = user_to_check.rfind('.') {
-            let suffix = &user_to_check[dot_pos + 1..];
-            if let Ok(agent_val) = suffix.parse::<u16>() {
-                if agent_val <= u8::MAX as u16 {
-                    (&user_to_check[..dot_pos], agent_val as u8)
-                } else {
-                    (user_to_check, 0)
-                }
-            } else {
-                (user_to_check, 0)
-            }
-        } else {
-            (user_to_check, 0)
-        }
-    };
-
-    Some(ParsedJidParts {
-        user: final_user,
-        server,
-        agent,
-        device,
-        integrator: 0,
-    })
 }
 
 /// Parse the allocation-free JID shapes into the same borrowed type used by
@@ -166,10 +193,10 @@ pub fn parse_jid_fast(s: &str) -> Option<ParsedJidParts<'_>> {
 /// back to `s.parse::<Jid>()`; normal user/group/LID/bot JIDs stay borrowed.
 #[inline]
 pub fn parse_jid_ref(s: &str) -> Option<JidRef<'_>> {
-    let parts = parse_jid_fast(s)?;
+    let (parts, server) = parse_jid_scan(s)?;
     Some(JidRef {
         user: NodeStr::Borrowed(parts.user),
-        server: Server::try_from(parts.server).ok()?,
+        server: server?,
         agent: parts.agent,
         device: parts.device,
         integrator: parts.integrator,
@@ -277,9 +304,12 @@ impl Server {
     }
 
     /// Whether the `agent` byte is part of the rendered JID for this server.
-    /// AD-capable servers (Pn/Lid/Hosted/HostedLid) carry it as a hidden domain
-    /// byte and suppress it in display; others (e.g. `@bot`/`@interop`) render it.
-    /// Single source of truth shared by the formatter and `Jid::is_same_chat_as`.
+    /// AD-capable servers (Pn/Lid/Hosted/HostedLid) have no agent of their own —
+    /// their wire form spells the server as a domain byte, which the decoder
+    /// resolves into `server` rather than keeping — so an agent set on one is
+    /// meaningless and stays out of the rendered form. Others (e.g. `@bot`,
+    /// `@interop`) render it. Single source of truth shared by the formatter and
+    /// `Jid::is_same_chat_as`.
     #[inline]
     pub fn renders_agent(self) -> bool {
         !matches!(self, Self::Pn | Self::Lid | Self::Hosted | Self::HostedLid)
@@ -315,24 +345,36 @@ impl PartialEq<&str> for Server {
     }
 }
 
+impl Server {
+    /// Allocation-free server lookup. `TryFrom<&str>` builds a `JidError` —
+    /// and therefore a `String` — for an unknown suffix, which the JID scanner
+    /// hits on every non-JID string it is asked to classify; this returns the
+    /// same answer without paying for the message nobody reads.
+    #[inline]
+    pub fn parse_known(s: &str) -> Option<Self> {
+        Some(match s {
+            "s.whatsapp.net" => Self::Pn,
+            "lid" => Self::Lid,
+            "g.us" => Self::Group,
+            "broadcast" => Self::Broadcast,
+            "newsletter" => Self::Newsletter,
+            "hosted" => Self::Hosted,
+            "hosted.lid" => Self::HostedLid,
+            "msgr" => Self::Messenger,
+            "interop" => Self::Interop,
+            "bot" => Self::Bot,
+            "c.us" => Self::Legacy,
+            "call" => Self::Call,
+            _ => return None,
+        })
+    }
+}
+
 impl TryFrom<&str> for Server {
     type Error = JidError;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "s.whatsapp.net" => Ok(Self::Pn),
-            "lid" => Ok(Self::Lid),
-            "g.us" => Ok(Self::Group),
-            "broadcast" => Ok(Self::Broadcast),
-            "newsletter" => Ok(Self::Newsletter),
-            "hosted" => Ok(Self::Hosted),
-            "hosted.lid" => Ok(Self::HostedLid),
-            "msgr" => Ok(Self::Messenger),
-            "interop" => Ok(Self::Interop),
-            "bot" => Ok(Self::Bot),
-            "c.us" => Ok(Self::Legacy),
-            "call" => Ok(Self::Call),
-            other => Err(JidError::InvalidFormat(format!("unknown server: {other}"))),
-        }
+        Server::parse_known(s)
+            .ok_or_else(|| JidError::InvalidFormat(format!("unknown server: {s}")))
     }
 }
 
@@ -455,8 +497,30 @@ pub trait JidExt {
     }
 }
 
+/// The part of `agent` that is actually part of a JID's identity.
+///
+/// `agent` is only meaningful where the server renders it. On Pn/Lid/Hosted/
+/// HostedLid the wire spells the server as a domain byte instead, so nothing
+/// encodes an agent set there (`server_to_domain_type`), nothing prints it
+/// (`renders_agent`), and nothing hashes it (`push_phash_form_to` writes a literal `0`,
+/// matching WA Web). Two JIDs differing only there address the same device.
+///
+/// Letting it into equality anyway is what made a JID decoded from the wire
+/// unequal to the same JID read back from the store, which holds JIDs as text
+/// (see `read_ad_jid`). Equality and `Hash` both go through here so they cannot
+/// disagree, and `sort_dedup_by_device` keys on the same rule so the fan-out
+/// cannot treat one device as two.
+///
+/// `integrator` is deliberately NOT normalised here. It is only ever non-zero on
+/// interop, but `is_same_chat_as` and `jids_share_user_identity` compare it
+/// unconditionally — folding it in here would make `==` disagree with them.
+#[inline]
+fn identity_agent(server: Server, agent: u8) -> u8 {
+    if server.renders_agent() { agent } else { 0 }
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Jid {
     pub user: CompactString,
     pub server: Server,
@@ -465,7 +529,7 @@ pub struct Jid {
     pub integrator: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, yoke::Yokeable)]
+#[derive(Debug, Clone, yoke::Yokeable)]
 pub struct JidRef<'a> {
     pub user: NodeStr<'a>,
     pub server: Server,
@@ -659,6 +723,20 @@ impl Jid {
         buf
     }
 
+    /// [`Self::to_non_ad_string`] as a shareable `Arc<str>`, in exactly one
+    /// allocation. Going through the `String` first costs two — the buffer, then
+    /// the `Arc<str>` its bytes are copied into — and the message-secret rows
+    /// build two of these per message.
+    pub fn to_non_ad_arc_str(&self) -> std::sync::Arc<str> {
+        let mut writer = JidStackWriter::new();
+        if write_jid_fallible(&mut writer, &self.user, self.server, 0, 0).is_ok() {
+            return std::sync::Arc::from(writer.as_str());
+        }
+        // A user part too long for the stack buffer (never seen on the wire)
+        // still renders, just back through the heap.
+        std::sync::Arc::from(self.to_non_ad_string())
+    }
+
     /// Check if this JID matches the user or their LID.
     /// Useful for checking if a participant is "us" in group messages.
     #[inline]
@@ -666,38 +744,36 @@ impl Jid {
         self.is_same_user_as(user) || lid.is_some_and(|l| self.is_same_user_as(l))
     }
 
-    /// Normalize the JID for use in pre-key bundle storage and lookup.
-    ///
-    /// WhatsApp servers may return JIDs with varied agent fields, or we might derive them
-    /// with agent fields in some contexts. However, pre-key bundles are stored and looked up
-    /// using a normalized key where the agent is 0 for standard servers (s.whatsapp.net, lid).
-    pub fn normalize_for_prekey_bundle(&self) -> Self {
-        let mut jid = self.clone();
-        if matches!(jid.server, Server::Pn | Server::Lid) {
-            jid.agent = 0;
-        }
-        jid
-    }
-
-    pub fn to_ad_string(&self) -> String {
+    /// See [`Jid::push_phash_form_to`]. Not a general JID rendering — use
+    /// `Display`/`to_string` for that.
+    pub fn to_phash_form_string(&self) -> String {
         let mut s = String::with_capacity(self.user.len() + 20);
-        self.push_ad_to(&mut s);
+        self.push_phash_form_to(&mut s);
         s
     }
 
-    /// Append the AD-string form (`user.agent:device@server`) to `buf`, for
-    /// callers that batch many JIDs into one shared buffer instead of paying
-    /// a heap `String` per JID (see `participant_list_hash`).
+    /// Append the form the participant hash is computed over
+    /// (`user.0:device@server`) to `buf`, for callers that batch many JIDs into
+    /// one shared buffer instead of paying a heap `String` per JID (see
+    /// `participant_list_hash`).
+    ///
+    /// **This is not a general-purpose JID rendering.** The agent position is
+    /// the literal `0`, never `self.agent`, and that is deliberate: WA Web's
+    /// `formatFull` spelling hardcodes `".0"` unconditionally — there is no
+    /// per-server carve-out, and `WAWebWid` has no agent field to read one from.
+    /// The server recomputes this exact string to validate the phash, so writing
+    /// our agent would mean a rejected hash for any JID that carried one.
+    ///
+    /// If you want the JID as it is addressed, including the agent on the servers
+    /// that render it, use `Display` / [`Jid::push_to`] instead.
     #[inline]
-    pub fn push_ad_to(&self, buf: &mut String) {
+    pub fn push_phash_form_to(&self, buf: &mut String) {
         if self.user.is_empty() {
             buf.push_str(self.server.as_str());
             return;
         }
         buf.push_str(&self.user);
-        buf.push('.');
-        buf.push_str(itoa::Buffer::new().format(self.agent));
-        buf.push(':');
+        buf.push_str(".0:");
         buf.push_str(itoa::Buffer::new().format(self.device));
         buf.push('@');
         buf.push_str(self.server.as_str());
@@ -736,6 +812,18 @@ impl Jid {
     #[inline]
     pub fn device_eq(&self, other: &Jid) -> bool {
         self.user == other.user && self.server == other.server && self.device == other.device
+    }
+
+    /// The `agent` as far as identity is concerned: the field itself where the
+    /// server renders it (`@bot`, `@interop`), `0` where it does not.
+    ///
+    /// Exposed so callers that build their own key over a JID — sorting,
+    /// deduplicating, indexing — can key on the same rule `==` and `Hash` use
+    /// instead of on the raw field, which would split one device in two or, in
+    /// reverse, merge two real ones.
+    #[inline]
+    pub fn identity_agent(&self) -> u8 {
+        identity_agent(self.server, self.agent)
     }
 
     /// Get a borrowing key for O(1) HashSet lookups by device identity.
@@ -799,14 +887,76 @@ impl<'a> JidRef<'a> {
     }
 }
 
+impl PartialEq for Jid {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.user == other.user
+            && self.server == other.server
+            && self.device == other.device
+            && self.integrator == other.integrator
+            // Equal raw agents are already equal identity agents — the servers
+            // match by the check above, so both sides normalise the same way.
+            // Skipping the lookup in that case is worth it because it is the
+            // overwhelmingly common one: nothing off the wire carries an agent
+            // on the AD servers. Load-bearing on the `self.server == other.server`
+            // above; reordering these would make the shortcut wrong.
+            && (self.agent == other.agent
+                || identity_agent(self.server, self.agent)
+                    == identity_agent(other.server, other.agent))
+    }
+}
+
+impl Eq for Jid {}
+
+impl std::hash::Hash for Jid {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.user.hash(state);
+        self.server.hash(state);
+        self.device.hash(state);
+        self.integrator.hash(state);
+        identity_agent(self.server, self.agent).hash(state);
+    }
+}
+
+impl PartialEq for JidRef<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.user.as_ref() == other.user.as_ref()
+            && self.server == other.server
+            && self.device == other.device
+            && self.integrator == other.integrator
+            // See `PartialEq for Jid` for why the raw compare can short-circuit.
+            && (self.agent == other.agent
+                || identity_agent(self.server, self.agent)
+                    == identity_agent(other.server, other.agent))
+    }
+}
+
+impl Eq for JidRef<'_> {}
+
+impl std::hash::Hash for JidRef<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.user.as_ref().hash(state);
+        self.server.hash(state);
+        self.device.hash(state);
+        self.integrator.hash(state);
+        identity_agent(self.server, self.agent).hash(state);
+    }
+}
+
 impl PartialEq<JidRef<'_>> for Jid {
     #[inline]
     fn eq(&self, other: &JidRef<'_>) -> bool {
         self.user.as_str() == other.user.as_ref()
             && self.server == other.server
-            && self.agent == other.agent
             && self.device == other.device
             && self.integrator == other.integrator
+            // See `PartialEq for Jid`.
+            && (self.agent == other.agent
+                || identity_agent(self.server, self.agent)
+                    == identity_agent(other.server, other.agent))
     }
 }
 
@@ -989,9 +1139,12 @@ impl JidStackWriter {
 
     #[inline]
     fn as_str(&self) -> &str {
-        // Whole `&str` fragments are appended, never split, so the bytes
-        // stay valid UTF-8.
-        std::str::from_utf8(&self.buf[..self.len]).expect("concatenated str fragments")
+        // SAFETY: `write_str` below is the only writer, and it is all-or-nothing
+        // — it returns `Err` before copying anything that would not fit, so it
+        // can never leave a partial code point behind. `buf[..len]` is therefore
+        // always a concatenation of whole `&str` fragments. Anything that writes
+        // raw bytes here instead of going through `write_str` breaks this.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
     }
 }
 
@@ -1229,6 +1382,197 @@ mod tests {
         assert!(!Jid::from_str("0@lid").unwrap().is_psa());
         assert!(!Jid::from_str("status@broadcast").unwrap().is_psa());
         assert!(!Jid::from_str("0@g.us").unwrap().is_psa());
+    }
+
+    /// `JidStackWriter::as_str` reads its buffer back as UTF-8 without
+    /// validating it, so every shape that reaches it has to be exercised
+    /// somewhere Miri can see: multi-byte users, a user that fills the buffer
+    /// exactly, and one that overflows it into the fallback path.
+    #[test]
+    fn display_reads_back_every_stack_buffer_shape() {
+        // Multi-byte code points in the user part: a byte-wise buffer must not
+        // be able to split one, and the readback must reproduce them exactly.
+        let emoji = Jid::new("héllo→世界", Server::Lid);
+        assert_eq!(emoji.to_string(), "héllo→世界@lid");
+        assert_eq!(format!("{}", emoji.observe()), "héllo→世界@lid");
+
+        // Exactly at the 64-byte stack buffer: "@lid" is 4 bytes, so a 60-byte
+        // user is the longest that still renders through it.
+        let full = Jid::new("9".repeat(60), Server::Lid);
+        let rendered = full.to_string();
+        assert_eq!(rendered.len(), 64);
+        assert!(rendered.ends_with("@lid"));
+
+        // One byte past it: `write_str` errors and Display falls back to
+        // fragment writes, which must produce the same string.
+        let over = Jid::new("9".repeat(61), Server::Lid);
+        assert_eq!(over.to_string(), format!("{}@lid", "9".repeat(61)));
+
+        // The borrowed formatter and the Arc<str> builder share the writer.
+        let borrowed = parse_jid_ref("12025550111:7@s.whatsapp.net").unwrap();
+        assert_eq!(borrowed.to_string(), "12025550111:7@s.whatsapp.net");
+        assert_eq!(&*emoji.to_non_ad_arc_str(), "héllo→世界@lid");
+        assert_eq!(
+            &*over.to_non_ad_arc_str(),
+            &*format!("{}@lid", "9".repeat(61))
+        );
+    }
+
+    /// The phash form is recomputed and validated by the server, so
+    /// it has to match WA Web byte for byte. WA Web writes a literal `.0` in the
+    /// agent position (`formatFull`) and its Wid carries no agent at all, so ours
+    /// must not leak one in either — and two JIDs that compare equal must produce
+    /// the same string, or the phash memo (keyed by JID) can serve a hash computed
+    /// for a different one.
+    #[test]
+    fn phash_form_writes_the_agent_position_as_zero_like_wa_web() {
+        let plain = Jid {
+            user: "5511999998888".into(),
+            server: Server::Lid,
+            agent: 0,
+            device: 3,
+            integrator: 0,
+        };
+        assert_eq!(plain.to_phash_form_string(), "5511999998888.0:3@lid");
+
+        let with_agent = Jid {
+            agent: 7,
+            ..plain.clone()
+        };
+        assert_eq!(
+            with_agent.to_phash_form_string(),
+            "5511999998888.0:3@lid",
+            "the agent must not reach the hashed string"
+        );
+
+        // The pairing the phash memo relies on: equal JIDs, equal AD strings.
+        assert_eq!(plain, with_agent);
+        assert_eq!(
+            plain.to_phash_form_string(),
+            with_agent.to_phash_form_string()
+        );
+
+        // A server-only JID still degenerates to the server, and device still counts.
+        assert_eq!(
+            Jid::new("", Server::Pn).to_phash_form_string(),
+            "s.whatsapp.net"
+        );
+        assert_ne!(
+            plain.to_phash_form_string(),
+            Jid {
+                device: 4,
+                ..plain.clone()
+            }
+            .to_phash_form_string()
+        );
+    }
+
+    /// An `agent` off an agent-rendering server is inert: nothing encodes it,
+    /// prints it, or hashes it. Two JIDs differing only there address the same
+    /// device, so equality and `Hash` must both say so — and must agree with each
+    /// other, or a `HashMap<Jid, _>` gets an entry it can never look up again.
+    ///
+    /// `integrator` stays in identity: it is only non-zero on interop, but
+    /// `is_same_chat_as` compares it unconditionally, and `==` must not disagree.
+    #[test]
+    fn inert_agent_stays_out_of_identity() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(jid: &Jid) -> u64 {
+            let mut h = DefaultHasher::new();
+            jid.hash(&mut h);
+            h.finish()
+        }
+
+        // The four AD servers spell the server as a domain byte, so an agent set
+        // on one is a wire artefact, not identity.
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let clean = Jid {
+                user: "123456789012345".into(),
+                server,
+                agent: 0,
+                device: 7,
+                integrator: 0,
+            };
+            let with_agent = Jid {
+                agent: 1,
+                ..clean.clone()
+            };
+            assert_eq!(
+                clean, with_agent,
+                "{server:?}: agent must not split identity"
+            );
+            assert_eq!(
+                hash_of(&clean),
+                hash_of(&with_agent),
+                "{server:?}: Hash must agree with Eq"
+            );
+
+            // integrator is NOT normalised: `is_same_chat_as` compares it always,
+            // and `==` must not disagree with it.
+            let with_integrator = Jid {
+                integrator: 0xBEEF,
+                ..clean.clone()
+            };
+            assert_ne!(
+                clean, with_integrator,
+                "{server:?}: integrator stays in identity, matching is_same_chat_as"
+            );
+            assert_eq!(
+                clean.is_same_chat_as(&with_integrator),
+                clean == with_integrator,
+                "{server:?}: == must agree with is_same_chat_as"
+            );
+
+            // The borrowed form and the cross-type comparison follow the same rule.
+            let borrowed = JidRef {
+                user: NodeStr::Borrowed("123456789012345"),
+                server,
+                agent: 1,
+                device: 7,
+                integrator: 0,
+            };
+            assert_eq!(clean, borrowed, "{server:?}: owned == borrowed");
+            assert_eq!(borrowed, clean, "{server:?}: borrowed == owned");
+        }
+
+        // Where the server DOES render the agent it is identity, and must still split.
+        let bot = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 4,
+            device: 0,
+            integrator: 0,
+        };
+        let other_agent = Jid {
+            agent: 5,
+            ..bot.clone()
+        };
+        assert_ne!(
+            bot, other_agent,
+            "interop renders the agent, so it is identity"
+        );
+        assert_ne!(
+            bot,
+            Jid {
+                integrator: 9,
+                ..bot.clone()
+            },
+            "interop is where integrator is real"
+        );
+
+        // Fields that are always identity keep splitting.
+        let pn = Jid::new("123456789012345", Server::Pn);
+        assert_ne!(
+            pn,
+            Jid {
+                device: 1,
+                ..pn.clone()
+            }
+        );
+        assert_ne!(pn, Jid::new("123456789012346", Server::Pn));
+        assert_ne!(pn, Jid::new("123456789012345", Server::Lid));
     }
 
     #[test]
@@ -1473,6 +1817,69 @@ mod tests {
 
         assert!(parse_jid_ref("g.us").is_none(), "server-only uses fallback");
         assert!(parse_jid_ref("user@unknown").is_none());
+    }
+
+    /// `parse_u16_decimal` stands in for `u16::from_str` inside the scanner, so
+    /// it has to accept and reject exactly what std does — including the shapes
+    /// nobody writes on purpose but a malformed stanza can still carry.
+    #[test]
+    fn decimal_fast_path_matches_u16_from_str() {
+        for raw in [
+            "", "+", "-", "0", "7", "+7", "007", "33", "255", "256", "65535", "65536", "99999",
+            "-0", "-1", "1x", "x1", " 1", "1 ", "1_0", "+-1", "++1", "1.0", "٣", "𝟛",
+        ] {
+            assert_eq!(
+                parse_u16_decimal(raw),
+                raw.parse::<u16>().ok(),
+                "mismatch for {raw:?}"
+            );
+        }
+    }
+
+    /// The scan stops at the first `@` and dispatches on the resolved `Server`,
+    /// so every separator rule it folded together needs a case here: which
+    /// separator wins per server, and the pathological users where the agent
+    /// rule reads a different dot than the scan recorded.
+    ///
+    /// Asserted against written-out values rather than against `str::parse`,
+    /// which would prove nothing: `FromStr` tries `parse_jid_ref` first, so for
+    /// any server this path accepts it would be comparing the scanner with
+    /// itself. These are the values `main` produces for the same inputs.
+    #[test]
+    fn fast_parse_pins_the_separator_rules_per_server() {
+        // (input, user, agent, device)
+        let cases = [
+            // Generic servers read a trailing dotted number as the agent.
+            ("123456789.4:17@interop", "123456789", 4u8, 17u16),
+            ("123456789.4@interop", "123456789", 4, 0),
+            // ...but an agent past u8 leaves the user whole instead.
+            ("123.999@interop", "123.999", 0, 0),
+            // On s.whatsapp.net that same trailing number is the legacy device.
+            ("5511999998888.2@s.whatsapp.net", "5511999998888", 0, 2),
+            // Dots in a lid user are part of the user.
+            ("12345.678@lid", "12345.678", 0, 0),
+            ("12345.678:9@lid", "12345.678", 0, 9),
+            // `hosted.lid` and `c.us` are NOT in the lid family here — they take
+            // the generic rule, so a dotted number that fits in u8 becomes the
+            // agent. Pinned as the pre-existing behaviour, not endorsed as
+            // correct; changing it needs WA Web as ground truth, not this PR.
+            ("12345.6@hosted.lid", "12345", 6, 0),
+            ("12345.678@hosted.lid", "12345.678", 0, 0),
+            ("12345.6@c.us", "12345", 6, 0),
+            // A second colon puts the last dot after the first one, which is
+            // where reusing the scanned dot position would silently diverge.
+            ("a:1.5:2@bot", "a:1", 5, 2),
+            // Unparsable device degrades to 0 rather than rejecting the JID.
+            ("5511999998888:x@s.whatsapp.net", "5511999998888", 0, 0),
+        ];
+
+        for (raw, user, agent, device) in cases {
+            let fast =
+                parse_jid_fast(raw).unwrap_or_else(|| panic!("{raw} should take the fast path"));
+            assert_eq!(fast.user, user, "user for {raw}");
+            assert_eq!(fast.agent, agent, "agent for {raw}");
+            assert_eq!(fast.device, device, "device for {raw}");
+        }
     }
 
     #[test]
@@ -1974,6 +2381,53 @@ mod tests {
                 "mismatch for {s}"
             );
         }
+    }
+
+    /// The stack-buffered `Arc<str>` form must render exactly what the `String`
+    /// form does, including for inputs that overflow the stack buffer and fall
+    /// back to the heap, and for multibyte user parts (the buffer is bounded in
+    /// bytes, and a split fragment would be invalid UTF-8).
+    #[test]
+    fn to_non_ad_arc_str_matches_to_non_ad_string() {
+        let long_user = "9".repeat(80);
+        let multibyte_user = "ẞünïcodé-ñ".repeat(3);
+        let owned = [
+            format!("{long_user}:12@s.whatsapp.net"),
+            format!("{multibyte_user}@g.us"),
+            format!("{multibyte_user}@s.whatsapp.net"),
+        ];
+        let cases = [
+            "1234567890:33@s.whatsapp.net",
+            "1234567890@s.whatsapp.net",
+            "100000012345678:25@lid",
+            "867051314767696:0@bot",
+            // Nonzero agent on a bot JID: both forms drop the agent (matching
+            // whatsmeow's ToNonAD), while `is_same_chat_as` still treats it as
+            // identity-significant. Pinning it here keeps that asymmetry
+            // deliberate rather than something a later edit can erase quietly.
+            "867051314767696.5:10@bot",
+            "120363021033254949@g.us",
+            "status@broadcast",
+        ]
+        .into_iter()
+        .chain(owned.iter().map(String::as_str));
+
+        for s in cases {
+            let jid: Jid = s.parse().unwrap_or_else(|e| panic!("parse {s}: {e}"));
+            assert_eq!(
+                &*jid.to_non_ad_arc_str(),
+                jid.to_non_ad_string().as_str(),
+                "mismatch for {s}"
+            );
+        }
+
+        // A default (empty-user) JID has no wire form to render but must still
+        // agree with the String path rather than panic in the stack writer.
+        let empty = Jid::default();
+        assert_eq!(
+            &*empty.to_non_ad_arc_str(),
+            empty.to_non_ad_string().as_str()
+        );
     }
 
     #[test]

@@ -162,6 +162,13 @@ impl SessionStore for SessionAdapter {
         self.0.cache.complete_session_checkout().await;
     }
 
+    fn try_has_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> Option<Result<bool, SignalProtocolError>> {
+        self.0.cache.try_has_session(address).map(Ok)
+    }
+
     // Hand-desugared (see `BoxFut`): a cached answer skips the device lock
     // and returns a ready future.
     fn has_session<'life0, 'life1, 'async_trait>(
@@ -173,8 +180,8 @@ impl SessionStore for SessionAdapter {
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        if let Some(known) = self.0.cache.try_has_session(address) {
-            return Box::pin(ready(Ok(known)));
+        if let Some(answer) = SessionStore::try_has_session(self, address) {
+            return Box::pin(ready(answer));
         }
         Box::pin(async move {
             let device = self.0.device.read().await;
@@ -209,6 +216,33 @@ impl SessionStore for SessionAdapter {
     }
 }
 
+impl IdentityAdapter {
+    /// The cache-hit half of [`IdentityKeyStore::save_identity`], shared with
+    /// its sync hook so the two cannot drift.
+    ///
+    /// `None` means the caller must take the async path: either the previous
+    /// value was not cached, or a concurrent flush owns the entry. A parse
+    /// failure of the cached bytes is reported here rather than swallowed,
+    /// matching the async path in erroring BEFORE any write.
+    fn save_identity_cached(
+        &self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Option<Result<IdentityChange, SignalProtocolError>> {
+        let prev = self.0.cache.try_get_identity(address)?;
+        let change = match parse_cached_identity(prev) {
+            Ok(None) => IdentityChange::NewOrUnchanged,
+            Ok(Some(existing)) if &existing == identity => IdentityChange::NewOrUnchanged,
+            Ok(Some(_)) => IdentityChange::ReplacedExisting,
+            Err(e) => return Some(Err(e)),
+        };
+        self.0
+            .cache
+            .try_put_identity(address, identity.public_key().public_key_bytes())
+            .then_some(Ok(change))
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IdentityKeyStore for IdentityAdapter {
@@ -240,20 +274,8 @@ impl IdentityKeyStore for IdentityAdapter {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        if let Some(prev) = self.0.cache.try_get_identity(address) {
-            let change = match parse_cached_identity(prev) {
-                Ok(None) => IdentityChange::NewOrUnchanged,
-                Ok(Some(existing)) if &existing == identity => IdentityChange::NewOrUnchanged,
-                Ok(Some(_)) => IdentityChange::ReplacedExisting,
-                Err(e) => return Box::pin(ready(Err(e))),
-            };
-            if self
-                .0
-                .cache
-                .try_put_identity(address, identity.public_key().public_key_bytes())
-            {
-                return Box::pin(ready(Ok(change)));
-            }
+        if let Some(answer) = self.save_identity_cached(address, identity) {
+            return Box::pin(ready(answer));
         }
         Box::pin(async move {
             let existing_identity = self.get_identity(address).await?;
@@ -273,6 +295,25 @@ impl IdentityKeyStore for IdentityAdapter {
                 Some(_) => Ok(IdentityChange::ReplacedExisting),
             }
         })
+    }
+
+    // Boxing a future whose whole body is `Ok(true)` costs an allocation per
+    // encrypt and per decrypt; the hook lets callers skip it entirely.
+    fn try_is_trusted_identity(
+        &self,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+        _direction: Direction,
+    ) -> Option<Result<bool, SignalProtocolError>> {
+        Some(Ok(true))
+    }
+
+    fn try_save_identity(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Option<Result<IdentityChange, SignalProtocolError>> {
+        self.save_identity_cached(address, identity)
     }
 
     async fn is_trusted_identity(
@@ -471,7 +512,7 @@ mod tests {
         let cache = Arc::new(SignalStoreCache::new());
         let adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
 
-        let addr = ProtocolAddress::new("bob".to_string(), 1.into());
+        let addr = ProtocolAddress::new("bob", 1.into());
         // The real path stores the promoted session before buffering the prekey.
         cache.put_session(&addr, SessionRecord::new_fresh()).await;
         adapter
@@ -594,7 +635,7 @@ mod tests {
 
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
         let cache = Arc::new(SignalStoreCache::new());
-        let address = ProtocolAddress::new("15550006666".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550006666", 1.into());
         let (record, identity_pair) = outbound_session();
         let expected = record.serialize().expect("serialize session");
         cache.put_session(&address, record).await;
@@ -676,7 +717,7 @@ mod tests {
         let cache = Arc::new(SignalStoreCache::new());
         let device = Arc::new(RwLock::new(Device::new(backend)));
         let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
-        let address = ProtocolAddress::new("15550005555".to_string(), 1.into());
+        let address = ProtocolAddress::new("15550005555", 1.into());
         cache
             .put_session(&address, SessionRecord::new_fresh())
             .await;
@@ -702,7 +743,7 @@ mod tests {
     async fn session_store_fast_paths_round_trip() {
         use wacore::libsignal::protocol::SessionStore as _;
         let mut adapter = test_adapter();
-        let addr = ProtocolAddress::new("15550002222".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550002222", 1.into());
 
         // Cold cache: goes through the async fallback (backend consult).
         assert!(!adapter.session_store.has_session(&addr).await.unwrap());
@@ -742,7 +783,7 @@ mod tests {
     async fn identity_fast_paths_keep_change_semantics() {
         use wacore::libsignal::protocol::{IdentityKeyPair, IdentityKeyStore as _};
         let mut adapter = test_adapter();
-        let addr = ProtocolAddress::new("15550003333".to_string(), 1.into());
+        let addr = ProtocolAddress::new("15550003333", 1.into());
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let first = *IdentityKeyPair::generate(&mut rng).identity_key();
@@ -791,6 +832,118 @@ mod tests {
                 .expect("identity must be cached"),
             second,
             "get_identity must observe the fast-path write"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hook_alloc_tests {
+    use super::*;
+    use crate::store::Device;
+    use crate::test_alloc::min_allocs;
+    use wacore::libsignal::protocol::{Direction, IdentityKeyPair};
+    use wacore::store::in_memory::InMemoryBackend;
+
+    fn adapter_for_test() -> SignalProtocolStoreAdapter {
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let device = Arc::new(RwLock::new(Device::new(backend)));
+        SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
+    }
+
+    fn some_identity() -> IdentityKey {
+        *IdentityKeyPair::generate(&mut rand::rng()).identity_key()
+    }
+
+    /// `is_trusted_identity` returns an unconditional `Ok(true)`, but
+    /// `#[async_trait]` still boxes that future once per encrypt and once per
+    /// decrypt. The hook exists to skip the box, and the only way to know it
+    /// does is to count.
+    #[test]
+    fn the_trusted_identity_hook_answers_without_allocating() {
+        let adapter = adapter_for_test();
+        let address = ProtocolAddress::new("bob@s.whatsapp.net", 1.into());
+        let identity = some_identity();
+
+        // Through the resolver, not the hook directly: the point is that the
+        // whole path allocates nothing, and only the resolver can tell us that.
+        // Calling the hook alone would pass even if the resolver ignored it.
+        let allocs = min_allocs(0, || {
+            futures::FutureExt::now_or_never(wacore::libsignal::protocol::is_trusted_identity(
+                &adapter.identity_store,
+                &address,
+                &identity,
+                Direction::Sending,
+            ))
+            .expect("a hooked store answers on the first poll")
+        });
+        assert_eq!(
+            allocs, 0,
+            "the resolver must take the hook; falling through to the boxed future allocates"
+        );
+    }
+
+    /// Bad path: with nothing cached for the address, the hook must decline so
+    /// the caller takes the async path that can read the backend. Answering
+    /// from an empty cache would report every identity as new.
+    #[test]
+    fn the_save_identity_hook_declines_when_nothing_is_cached() {
+        let mut adapter = adapter_for_test();
+        let address = ProtocolAddress::new("never-seen@s.whatsapp.net", 1.into());
+        let identity = some_identity();
+
+        assert!(
+            adapter
+                .identity_store
+                .try_save_identity(&address, &identity)
+                .is_none(),
+            "an uncached address has no synchronous answer, so the hook must decline"
+        );
+    }
+
+    /// Happy path for the same hook: once the entry is cached, the whole
+    /// read-compare-write completes synchronously and reports the change
+    /// correctly, which is what lets the caller skip the box.
+    #[tokio::test]
+    async fn the_save_identity_hook_answers_once_the_entry_is_cached() {
+        let mut adapter = adapter_for_test();
+        let address = ProtocolAddress::new("bob@s.whatsapp.net", 1.into());
+        let first = some_identity();
+        let second = some_identity();
+
+        // Prime the cache through the async path.
+        adapter
+            .identity_store
+            .save_identity(&address, &first)
+            .await
+            .expect("first save");
+
+        assert!(
+            matches!(
+                adapter.identity_store.try_save_identity(&address, &first),
+                Some(Ok(IdentityChange::NewOrUnchanged))
+            ),
+            "the same key must report NewOrUnchanged"
+        );
+        assert!(
+            matches!(
+                adapter.identity_store.try_save_identity(&address, &second),
+                Some(Ok(IdentityChange::ReplacedExisting))
+            ),
+            "a different key must report ReplacedExisting, or an identity change goes unnoticed"
+        );
+    }
+
+    /// The session hook has the same contract: decline when the cache cannot
+    /// answer, rather than reporting "no session" and forcing a needless
+    /// session rebuild.
+    #[test]
+    fn the_session_hook_declines_when_the_cache_cannot_answer() {
+        let adapter = adapter_for_test();
+        let address = ProtocolAddress::new("never-seen@s.whatsapp.net", 1.into());
+
+        assert!(
+            adapter.session_store.try_has_session(&address).is_none(),
+            "an uncached address has no synchronous answer, so the hook must decline"
         );
     }
 }

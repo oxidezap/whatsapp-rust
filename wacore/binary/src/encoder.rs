@@ -299,7 +299,7 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         user_agent.len()
     };
 
-    let server_kind = jid::Server::try_from(server).ok();
+    let server_kind = jid::Server::parse_known(server);
     let domain_type = match server_kind {
         Some(jid::Server::Pn) => 0,
         Some(jid::Server::Lid) => 1,
@@ -353,6 +353,23 @@ fn server_to_domain_type(server: jid::Server) -> u8 {
         jid::Server::HostedLid => 129,
         _ => 0,
     }
+}
+
+/// Whether this JID needs the dedicated `INTEROP_JID` token to survive the
+/// round-trip.
+///
+/// An interop JID carries an `integrator` that no other wire form has a field
+/// for: `JID_PAIR` writes only user and server, so encoding one that way silently
+/// drops it. WA Web has a matching branch (`WA/Wap.js`, the `JID_INTEROP` arm of
+/// its JID writer) and its decoder reads the field back, as does ours.
+///
+/// Restricted to a non-zero integrator on purpose. An interop JID without one
+/// loses nothing through `JID_PAIR`, and that is the form we have always sent —
+/// this fixes the case that was lossy without changing the bytes for the case
+/// that was not.
+#[inline]
+fn needs_interop_jid(server: jid::Server, integrator: u16) -> bool {
+    server == jid::Server::Interop && integrator != 0
 }
 
 /// AD_JID round-trips back to a server via `domain_type` only for the four
@@ -544,32 +561,45 @@ fn parsed_jid_encoded_size_with_cache(
     }
 }
 
+/// Byte count for one encoded JID.
+///
+/// Must mirror `write_jid_ref`/`write_jid_owned` branch for branch: the exact
+/// marshal sizes its output slice from this and then writes into it, so a plan
+/// that disagrees with the writer is not a bad estimate — it is an
+/// `UnexpectedEof` on a send. Both JID flavours route through here so the two
+/// cannot drift apart.
+#[inline]
+fn jid_encoded_size_with_cache(
+    user: &str,
+    server: jid::Server,
+    device: u16,
+    integrator: u16,
+    hints: &mut StringHintCache,
+) -> usize {
+    if needs_interop_jid(server, integrator) {
+        // token + user + u16 device + u16 integrator; no server, see
+        // `write_interop_jid`.
+        return 1 + string_encoded_size_with_cache(user, hints) + 2 + 2;
+    }
+    if device > 0 && server_supports_ad_jid(server) {
+        return 3 + string_encoded_size_with_cache(user, hints);
+    }
+    let user_size = if user.is_empty() {
+        1
+    } else {
+        string_encoded_size_with_cache(user, hints)
+    };
+    1 + user_size + string_encoded_size_with_cache(server.as_str(), hints)
+}
+
 #[inline]
 fn owned_jid_encoded_size_with_cache(jid: &Jid, hints: &mut StringHintCache) -> usize {
-    if jid.device > 0 && server_supports_ad_jid(jid.server) {
-        3 + string_encoded_size_with_cache(&jid.user, hints)
-    } else {
-        let user_size = if jid.user.is_empty() {
-            1
-        } else {
-            string_encoded_size_with_cache(&jid.user, hints)
-        };
-        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
-    }
+    jid_encoded_size_with_cache(&jid.user, jid.server, jid.device, jid.integrator, hints)
 }
 
 #[inline]
 fn jid_ref_encoded_size_with_cache(jid: &JidRef<'_>, hints: &mut StringHintCache) -> usize {
-    if jid.device > 0 && server_supports_ad_jid(jid.server) {
-        3 + string_encoded_size_with_cache(&jid.user, hints)
-    } else {
-        let user_size = if jid.user.is_empty() {
-            1
-        } else {
-            string_encoded_size_with_cache(&jid.user, hints)
-        };
-        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
-    }
+    jid_encoded_size_with_cache(&jid.user, jid.server, jid.device, jid.integrator, hints)
 }
 
 #[inline]
@@ -760,7 +790,33 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
 
     /// Write a JidRef directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
+    /// `INTEROP_JID`: token, user, `u16` device, `u16` integrator — and no server.
+    ///
+    /// Mirrors WA Web's outbound writer (`WA/Wap.js`, the `JID_INTEROP` arm):
+    /// `writeUint8(S), te(user), writeUint16(device), writeUint16(integrator)`.
+    ///
+    /// Its inbound decoder reads a fourth value after those — the server — and so
+    /// does ours. That asymmetry is deliberate here rather than a bug being
+    /// copied: the fourth read describes what the *server sends us*, not what it
+    /// accepts from us, and the writer above is what actually runs against the
+    /// real server. Emitting a server the server does not expect would not merely
+    /// mis-parse the JID: the extra token would be read as the next value in the
+    /// stanza, desynchronising everything after it.
+    ///
+    /// The consequence is that this output does not round-trip through our own
+    /// `read_interop_jid`. That is a property of the protocol's two directions,
+    /// not a defect to fix by making both ends agree locally.
+    fn write_interop_jid(&mut self, user: &str, device: u16, integrator: u16) -> Result<()> {
+        self.write_u8(token::INTEROP_JID)?;
+        self.write_string(user)?;
+        self.write_u16_be(device)?;
+        self.write_u16_be(integrator)
+    }
+
     pub fn write_jid_ref(&mut self, jid: &JidRef<'_>) -> Result<()> {
+        if needs_interop_jid(jid.server, jid.integrator) {
+            return self.write_interop_jid(&jid.user, jid.device, jid.integrator);
+        }
         if jid.device > 0 && server_supports_ad_jid(jid.server) {
             // AD_JID format: domain_type, device, user
             let device = u8::try_from(jid.device).map_err(|_| {
@@ -786,6 +842,9 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
     /// Write an owned Jid directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
     pub fn write_jid_owned(&mut self, jid: &Jid) -> Result<()> {
+        if needs_interop_jid(jid.server, jid.integrator) {
+            return self.write_interop_jid(&jid.user, jid.device, jid.integrator);
+        }
         if jid.device > 0 && server_supports_ad_jid(jid.server) {
             // AD_JID format: domain_type, device, user
             let device = u8::try_from(jid.device).map_err(|_| {

@@ -48,6 +48,13 @@ pub(crate) struct PartitionedDmDevices {
     recipient_count: usize,
 }
 
+impl crate::stats::HeapSize for PartitionedDmDevices {
+    fn heap_bytes(&self) -> usize {
+        self.devices.capacity() * size_of::<Jid>()
+            + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
+    }
+}
+
 impl PartitionedDmDevices {
     pub(crate) fn valid_devices(&self) -> &[Jid] {
         &self.devices
@@ -69,7 +76,7 @@ pub struct PreparedDmStanza {
     /// Locally computed phash from the sent device set. Not sent on the
     /// wire (WA Web only sends phash for groups). Used by the caller to
     /// compare against the server's ACK phash for device-list drift detection.
-    pub phash: Option<String>,
+    pub phash: Option<CompactString>,
     /// `MessageContextInfo.message_secret` generated for this stanza so the
     /// caller can persist it for later addon (msmsg/poll/edit) decryption.
     /// `None` when the message had no reporting token (no secret was used).
@@ -78,14 +85,16 @@ pub struct PreparedDmStanza {
 
 pub struct DmStanzaRequest<'a> {
     pub own_jid: &'a Jid,
-    pub own_lid: Option<&'a Jid>,
     pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
     pub to: &'a Jid,
     pub message: &'a wa::Message,
     pub message_id: &'a str,
     pub edit: Option<&'a crate::types::message::EditAttribute>,
     pub extra_nodes: &'a [Node],
-    pub devices: Vec<Jid>,
+    /// The already-partitioned fan-out. Borrowed, not owned: the caller's
+    /// per-recipient memo hands out the same `Arc` on every repeat send, so
+    /// neither the device list nor its phash is rebuilt here.
+    pub devices: &'a ResolvedDmDevices,
     pub pre_encoded: Option<&'a [u8]>,
 }
 
@@ -101,14 +110,13 @@ pub async fn prepare_dm_stanza(
 ) -> Result<PreparedDmStanza> {
     let DmStanzaRequest {
         own_jid,
-        own_lid,
         account,
         to: to_jid,
         message,
         message_id: request_id,
         edit,
         extra_nodes: extra_stanza_nodes,
-        devices: all_devices,
+        devices: resolved_devices,
         pre_encoded,
     } = request;
     // Encode the message at most once (reusing the caller's `pre_encoded` bytes when
@@ -148,21 +156,20 @@ pub async fn prepare_dm_stanza(
     // via prepare_message_with_context just to attach two fields.
     let extra_context = reporting_result.as_ref().map(reporting_context_info);
 
-    // Partition first so phash reflects the actual sent set (sender excluded) and so
-    // the own-device plaintext can be skipped when there's nothing to send it to.
-    let partitioned_devices = partition_dm_devices(all_devices, own_jid, own_lid);
-    let valid_devices = partitioned_devices.valid_devices();
-    let recipient_devices = partitioned_devices.recipient_devices();
-    let own_other_devices = partitioned_devices.own_other_devices();
-    let total_devices = valid_devices.len();
+    // The set arrives partitioned (sender excluded) so phash reflects the actual
+    // sent set and the own-device plaintext can be skipped when there's nothing
+    // to send it to.
+    let recipient_devices = resolved_devices.recipient_devices();
+    let own_other_devices = resolved_devices.own_other_devices();
+    let total_devices = resolved_devices.devices().len();
 
-    let phash = MessageUtils::participant_list_hash(valid_devices).ok();
+    let phash = resolved_devices.phash();
 
     // Splice the shared content into the recipient plaintext and, when present, the
-    // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an
-    // account with nothing else linked), the DSM plaintext — and the destination-jid
-    // stringify it needs — would be built only to go unused, so encode just the recipient.
-    // The mci-hoist path re-encodes via `encode_dm_plaintexts` (see `shared_content`).
+    // own-device DeviceSentMessage plaintext. With no own companion devices (an
+    // account with nothing else linked), the DSM plaintext would be built only to
+    // go unused, so encode just the recipient. The mci-hoist path re-encodes via
+    // `encode_dm_plaintexts` (see `shared_content`).
     let crate::messages::DmPlaintexts {
         recipient: recipient_plaintext,
         own_devices: own_devices_plaintext,
@@ -171,14 +178,10 @@ pub async fn prepare_dm_stanza(
             recipient: MessageUtils::pad_with_context_from_encoded(content, extra_context.as_ref()),
             own_devices: Vec::new(),
         },
-        Some(content) => MessageUtils::dm_plaintexts_from_encoded(
-            content,
-            extra_context.as_ref(),
-            &to_jid.to_string(),
-        ),
-        None => {
-            MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string())
+        Some(content) => {
+            MessageUtils::dm_plaintexts_from_encoded(content, extra_context.as_ref(), to_jid)
         }
+        None => MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), to_jid),
     };
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
@@ -194,8 +197,10 @@ pub async fn prepare_dm_stanza(
     // a bare-enc mode would require refactoring the encryption layer.
     // The <participants> form is accepted by the server regardless.
 
+    // Both fan-outs append into the vector already sized for the whole
+    // participant set, so neither stages a node list of its own.
     if !recipient_devices.is_empty() {
-        let result = encrypt_for_devices(
+        let summary = encrypt_for_devices_into(
             runtime,
             stores,
             resolver,
@@ -203,14 +208,14 @@ pub async fn prepare_dm_stanza(
             &recipient_plaintext,
             hide_decrypt_fail,
             mediatype,
+            &mut participant_nodes,
         )
         .await?;
-        participant_nodes.extend(result.participant_nodes);
-        includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
+        includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
     }
 
     if !own_other_devices.is_empty() {
-        let result = encrypt_for_devices(
+        let summary = encrypt_for_devices_into(
             runtime,
             stores,
             resolver,
@@ -218,10 +223,10 @@ pub async fn prepare_dm_stanza(
             &own_devices_plaintext,
             hide_decrypt_fail,
             mediatype,
+            &mut participant_nodes,
         )
         .await?;
-        participant_nodes.extend(result.participant_nodes);
-        includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
+        includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
     }
 
     // All per-device encrypts failed: an empty <participants> would silently
@@ -233,11 +238,16 @@ pub async fn prepare_dm_stanza(
         ));
     }
 
-    let mut message_content_nodes = vec![
+    // Sized for everything that can follow `<participants>`: the optional
+    // `<device-identity>`, the optional `<reporting>`, and the caller's extra
+    // nodes. `vec![one]` reserves exactly one slot, so each later push
+    // reallocated and memcpy'd the whole (large) `Node` values.
+    let mut message_content_nodes = Vec::with_capacity(3 + extra_stanza_nodes.len());
+    message_content_nodes.push(
         NodeBuilder::new("participants")
             .children(participant_nodes)
             .build(),
-    ];
+    );
 
     // DM stays lenient when pkmsg lacks an account (no pre-flight here): map the
     // helper's error back to omission so the wire shape is unchanged.

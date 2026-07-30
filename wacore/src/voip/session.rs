@@ -5,7 +5,8 @@
 use super::audio::AudioFormat;
 use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
-    derive_srtcp_keys, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
+    derive_e2e_keys_from_raw, derive_srtcp_keys, derive_srtcp_keys_from_raw, protect_srtcp,
+    unprotect_srtcp, verify_warp_mi_tag,
 };
 use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, au_has_idr, packetize_au};
 use super::rtcp::{
@@ -19,6 +20,7 @@ use super::rtp::{
     rtp_header_byte_length,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
+use crate::types::group_call::GroupCallUpdate;
 use wacore_binary::Jid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,8 @@ pub enum CallPhase {
     Idle,
     Calling,
     Ringing,
+    /// A call-link join is alive but still awaiting administrator admission.
+    WaitingRoom,
     Connecting,
     Active,
     Ended,
@@ -62,6 +66,8 @@ pub struct CallSession {
     /// a `<terminate>` must target this device, not the bare peer, or it can miss the companion that
     /// answered. `None` until the first `<accept>`; set-once (first answerer wins, like the rekey).
     pub answering_device: Option<Jid>,
+    /// Initial group snapshot for a native group call or active-call invitation.
+    pub group: Option<GroupCallUpdate>,
     phase: CallPhase,
 }
 
@@ -76,6 +82,7 @@ impl CallSession {
             audio_format: None,
             ring_devices: Vec::new(),
             answering_device: None,
+            group: None,
             phase: CallPhase::Idle,
         }
     }
@@ -90,6 +97,7 @@ impl CallSession {
             audio_format: None,
             ring_devices: Vec::new(),
             answering_device: None,
+            group: None,
             phase: CallPhase::Ringing,
         }
     }
@@ -108,11 +116,12 @@ impl CallSession {
 
     /// Attempt a phase transition; returns false (no-op) if it is not legal from the current phase.
     ///
-    /// The lifecycle order is `Idle → Calling → Ringing → Connecting → Active`. Forward progress is
-    /// allowed and MAY skip intermediate phases: an accepted outgoing call commonly goes
-    /// `Calling → Connecting` with no observed `Ringing`, and an immediate accept can reach `Active`
-    /// directly. Backward moves are rejected. `Idle` leaves only to `Calling` (outgoing) or `Ended`.
-    /// `Ended` is a sink reachable from any live phase (`Ended → Ended` is a no-op `false`).
+    /// The lifecycle order is `Idle → Calling → Ringing/WaitingRoom → Connecting → Active`.
+    /// Forward progress is allowed and MAY skip intermediate phases: an accepted outgoing call
+    /// commonly goes `Calling → Connecting` with no observed `Ringing`, and an immediate accept can
+    /// reach `Active` directly. Backward moves are rejected. `Idle` leaves only to `Calling`
+    /// (outgoing) or `Ended`. `Ended` is a sink reachable from any live phase (`Ended → Ended` is a
+    /// no-op `false`).
     /// Self-transitions on a live phase are idempotent.
     pub fn transition_to(&mut self, next: CallPhase) -> bool {
         use CallPhase::*;
@@ -131,6 +140,29 @@ impl CallSession {
     }
 }
 
+impl crate::stats::HeapSize for CallSession {
+    fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+
+        use crate::stats::HeapSize;
+
+        self.call_id.heap_bytes()
+            + self.peer_jid.heap_bytes()
+            + self.call_creator.heap_bytes()
+            + self.ring_devices.capacity() * size_of::<Jid>()
+            + self
+                .ring_devices
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+            + self
+                .answering_device
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
 /// Lifecycle ordinal for the forward-progress check in [`CallSession::transition_to`] (higher =
 /// later in the call). `Ended` is handled separately, so its rank is never compared.
 fn phase_rank(p: CallPhase) -> u8 {
@@ -138,6 +170,7 @@ fn phase_rank(p: CallPhase) -> u8 {
         CallPhase::Idle => 0,
         CallPhase::Calling => 1,
         CallPhase::Ringing => 2,
+        CallPhase::WaitingRoom => 2,
         CallPhase::Connecting => 3,
         CallPhase::Active => 4,
         CallPhase::Ended => 5,
@@ -213,6 +246,44 @@ impl SrtcpReplayState {
     }
 }
 
+const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
+
+#[derive(Default)]
+struct SrtpReplayWindow {
+    highest: Option<u64>,
+    seen: u64,
+}
+
+impl SrtpReplayWindow {
+    fn accept(&mut self, index: u64) -> bool {
+        let Some(highest) = self.highest else {
+            self.highest = Some(index);
+            self.seen = 1;
+            return true;
+        };
+        if index > highest {
+            let forward = index - highest;
+            self.seen = if forward >= SRTP_REPLAY_WINDOW_BITS {
+                1
+            } else {
+                (self.seen << forward) | 1
+            };
+            self.highest = Some(index);
+            return true;
+        }
+        let behind = highest - index;
+        if behind >= SRTP_REPLAY_WINDOW_BITS {
+            return false;
+        }
+        let bit = 1u64 << behind;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+}
+
 /// Per-stream RTCP Sender-Report state.
 struct SrtcpSender {
     keys: E2eSrtpKeys,
@@ -256,6 +327,10 @@ impl SrtcpSender {
     fn record(&mut self, packets: u32, octets: usize) {
         self.packets_sent = self.packets_sent.wrapping_add(packets);
         self.octets_sent = self.octets_sent.wrapping_add(octets as u32);
+    }
+
+    fn replace_keys(&mut self, keys: E2eSrtpKeys) {
+        self.keys = keys;
     }
 
     fn protect(&mut self, ssrc: u32, plain: &[u8]) -> Vec<u8> {
@@ -305,9 +380,15 @@ pub struct MediaPipeline {
     rtp: RtpStream,
     send_roc: RocTracker,
     recv_roc: RecvRocTracker,
+    recv_rtp_replay: SrtpReplayWindow,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
+}
+
+pub(crate) struct SendRekey {
+    rtp: E2eSrtpKeys,
+    rtcp: E2eSrtpKeys,
 }
 
 /// Borrowed inputs for [`MediaPipeline::new`]. `self_lid`/`peer_lid` are the E2E-SRTP
@@ -354,6 +435,7 @@ impl MediaPipeline {
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
+            recv_rtp_replay: SrtpReplayWindow::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -365,6 +447,10 @@ impl MediaPipeline {
 
     pub fn send_ssrc(&self) -> u32 {
         self.rtp.ssrc
+    }
+
+    pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
+        self.rtp.ssrc = ssrc;
     }
 
     /// Select the negotiated audio RTP payload type without resetting sequence/timestamp state.
@@ -410,7 +496,47 @@ impl MediaPipeline {
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_roc = RecvRocTracker::default();
+        self.recv_rtp_replay = SrtpReplayWindow::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
+        true
+    }
+
+    /// Install a transaction-wide group epoch for outbound RTP and SRTCP.
+    ///
+    /// RTP sequence/timestamp/ROC and SRTCP index/CNAME/statistics are preserved.
+    pub fn rekey_send_from_raw(&mut self, raw_epoch: &[u8], self_lid: &str) -> bool {
+        let Some(rekey) = Self::prepare_send_rekey(raw_epoch, self_lid) else {
+            return false;
+        };
+        self.commit_send_rekey(rekey);
+        true
+    }
+
+    pub(crate) fn prepare_send_rekey(raw_epoch: &[u8], self_lid: &str) -> Option<SendRekey> {
+        let participant_id = format_e2e_srtp_participant_id(self_lid);
+        Some(SendRekey {
+            rtp: derive_e2e_keys_from_raw(raw_epoch, &participant_id)?,
+            rtcp: derive_srtcp_keys_from_raw(raw_epoch, &participant_id)?,
+        })
+    }
+
+    pub(crate) fn commit_send_rekey(&mut self, rekey: SendRekey) {
+        self.send_keys = rekey.rtp;
+        self.srtcp.replace_keys(rekey.rtcp);
+    }
+
+    /// Install a transaction-wide group epoch for one peer without resetting
+    /// its authenticated RTP ROC or SRTCP replay windows.
+    pub fn rekey_recv_from_raw_preserving_roc(&mut self, raw_epoch: &[u8], peer_lid: &str) -> bool {
+        let participant_id = format_e2e_srtp_participant_id(peer_lid);
+        let Some(recv_keys) = derive_e2e_keys_from_raw(raw_epoch, &participant_id) else {
+            return false;
+        };
+        let Some(srtcp_keys) = derive_srtcp_keys_from_raw(raw_epoch, &participant_id) else {
+            return false;
+        };
+        self.recv_keys = recv_keys;
+        self.recv_srtcp_keys = srtcp_keys;
         true
     }
 
@@ -447,6 +573,7 @@ impl MediaPipeline {
         unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
+            &mut self.recv_rtp_replay,
             self.warp_mi_tag_len,
             packet,
         )
@@ -470,6 +597,7 @@ impl MediaPipeline {
 fn unprotect_srtp_packet(
     recv_keys: &E2eSrtpKeys,
     recv_roc: &mut RecvRocTracker,
+    recv_replay: &mut SrtpReplayWindow,
     warp_mi_tag_len: usize,
     packet: &[u8],
 ) -> Option<(RtpHeader, Vec<u8>)> {
@@ -494,6 +622,10 @@ fn unprotect_srtp_packet(
     ) {
         return None;
     }
+    let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
+    if !recv_replay.accept(index) {
+        return None;
+    }
     // Authenticated: now it's safe to advance the rollover counter.
     recv_roc.commit_roc(roc, header.sequence_number);
     let cipher = &without_tag[header_len..];
@@ -512,6 +644,7 @@ pub struct VideoPipeline {
     rtp: VideoRtpStream,
     send_roc: RocTracker,
     recv_roc: RecvRocTracker,
+    recv_rtp_replay: SrtpReplayWindow,
     depacketizer: H264Depacketizer,
     pkt_scratch: Vec<Vec<u8>>,
     srtcp: SrtcpSender,
@@ -555,6 +688,7 @@ impl VideoPipeline {
             rtp: VideoRtpStream::new(p.ssrc, p.ts_stride)?,
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
+            recv_rtp_replay: SrtpReplayWindow::default(),
             depacketizer: H264Depacketizer::default(),
             pkt_scratch: Vec::new(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
@@ -575,6 +709,10 @@ impl VideoPipeline {
         self.rtp.ssrc
     }
 
+    pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
+        self.rtp.ssrc = ssrc;
+    }
+
     pub(crate) fn set_timestamp_stride(&mut self, ts_stride: u32) -> bool {
         self.rtp.set_timestamp_stride(ts_stride)
     }
@@ -592,8 +730,47 @@ impl VideoPipeline {
         };
         self.recv_keys = keys;
         self.recv_roc = RecvRocTracker::default();
+        self.recv_rtp_replay = SrtpReplayWindow::default();
         self.depacketizer.reset();
         true
+    }
+
+    /// Rotate outbound video RTP/SRTCP keys while preserving stream counters.
+    pub fn rekey_send_from_raw(&mut self, raw_epoch: &[u8], self_lid: &str) -> bool {
+        let Some(rekey) = Self::prepare_send_rekey(raw_epoch, self_lid) else {
+            return false;
+        };
+        self.commit_send_rekey(rekey);
+        true
+    }
+
+    pub(crate) fn prepare_send_rekey(raw_epoch: &[u8], self_lid: &str) -> Option<SendRekey> {
+        let participant_id = format_e2e_srtp_participant_id(self_lid);
+        Some(SendRekey {
+            rtp: derive_e2e_keys_from_raw(raw_epoch, &participant_id)?,
+            rtcp: derive_srtcp_keys_from_raw(raw_epoch, &participant_id)?,
+        })
+    }
+
+    pub(crate) fn commit_send_rekey(&mut self, rekey: SendRekey) {
+        self.send_keys = rekey.rtp;
+        self.srtcp.replace_keys(rekey.rtcp);
+    }
+
+    /// Rotate inbound video keys while preserving the peer's RTP ROC and
+    /// in-flight depacketization state.
+    pub fn rekey_recv_from_raw_preserving_roc(&mut self, raw_epoch: &[u8], peer_lid: &str) -> bool {
+        let Some(recv_keys) =
+            derive_e2e_keys_from_raw(raw_epoch, &format_e2e_srtp_participant_id(peer_lid))
+        else {
+            return false;
+        };
+        self.recv_keys = recv_keys;
+        true
+    }
+
+    pub(crate) fn reset_depacketizer(&mut self) {
+        self.depacketizer.reset();
     }
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
@@ -649,6 +826,7 @@ impl VideoPipeline {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
+            &mut self.recv_rtp_replay,
             self.warp_mi_tag_len,
             packet,
         )?;
@@ -672,6 +850,7 @@ impl VideoPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voip::e2e_srtp::SRTCP_AUTH_TAG_LEN;
     use crate::voip::warp::WARP_MI_TAG_LEN;
     use wacore_binary::Server;
 
@@ -707,6 +886,15 @@ mod tests {
         assert!(!s.transition_to(CallPhase::Calling));
         assert!(s.transition_to(CallPhase::Connecting));
         assert!(s.transition_to(CallPhase::Active));
+    }
+
+    #[test]
+    fn call_link_waiting_room_advances_to_connecting_but_not_back() {
+        let mut session = CallSession::new_outgoing("LINK", peer(), creator());
+        assert!(session.transition_to(CallPhase::Calling));
+        assert!(session.transition_to(CallPhase::WaitingRoom));
+        assert!(session.transition_to(CallPhase::Connecting));
+        assert!(!session.transition_to(CallPhase::WaitingRoom));
     }
 
     #[test]
@@ -1161,6 +1349,74 @@ mod tests {
     }
 
     #[test]
+    fn group_epoch_rotates_rtp_and_srtcp_without_resetting_stream_counters() {
+        let old_epoch = [0x11; 32];
+        let new_epoch = [0x22; 32];
+        let alice = "100001:1@lid";
+        let bob = "200002:2@lid";
+        let ssrc = 0x1234_5678;
+        let params = |key, self_lid, peer_lid| MediaPipelineParams {
+            call_key: key,
+            self_lid,
+            peer_lid,
+            ssrc,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        };
+        let mut tx = MediaPipeline::new(&params(&old_epoch, alice, bob)).unwrap();
+        let mut rx = MediaPipeline::new(&params(&old_epoch, bob, alice)).unwrap();
+        let mut old_rx = MediaPipeline::new(&params(&old_epoch, bob, alice)).unwrap();
+        let payload = [0x50, 1, 2, 3, 4, 5, 6, 7];
+
+        let before = tx.protect_audio(&payload);
+        let before_header = parse_rtp_header(&before).unwrap();
+        assert_eq!(rx.unprotect_audio(&before).unwrap().1, payload);
+        assert!(
+            rx.unprotect_audio(&before).is_none(),
+            "an authenticated RTP packet must be delivered only once"
+        );
+        let first_rtcp = tx.audio_sender_report(1_000, None);
+        assert!(rx.unprotect_rtcp(&first_rtcp).is_some());
+        let first_index = u32::from_be_bytes(
+            first_rtcp
+                [first_rtcp.len() - SRTCP_AUTH_TAG_LEN - 4..first_rtcp.len() - SRTCP_AUTH_TAG_LEN]
+                .try_into()
+                .unwrap(),
+        ) & 0x7fff_ffff;
+
+        assert!(tx.rekey_send_from_raw(&new_epoch, alice));
+        assert!(rx.rekey_recv_from_raw_preserving_roc(&new_epoch, alice));
+        let mut reset_sender = MediaPipeline::new(&params(&new_epoch, alice, bob)).unwrap();
+        assert!(
+            rx.unprotect_audio(&reset_sender.protect_audio(&[0x51; 8]))
+                .is_none(),
+            "an ordinary epoch rekey must preserve the authenticated RTP replay window"
+        );
+        let after = tx.protect_audio(&payload);
+        let after_header = parse_rtp_header(&after).unwrap();
+        assert_eq!(
+            after_header.sequence_number,
+            before_header.sequence_number.wrapping_add(1)
+        );
+        assert_eq!(
+            after_header.timestamp,
+            before_header.timestamp.wrapping_add(960)
+        );
+        assert_eq!(rx.unprotect_audio(&after).unwrap().1, payload);
+        assert!(old_rx.unprotect_audio(&after).is_none());
+
+        let second_rtcp = tx.audio_sender_report(2_000, None);
+        assert!(rx.unprotect_rtcp(&second_rtcp).is_some());
+        let second_index = u32::from_be_bytes(
+            second_rtcp[second_rtcp.len() - SRTCP_AUTH_TAG_LEN - 4
+                ..second_rtcp.len() - SRTCP_AUTH_TAG_LEN]
+                .try_into()
+                .unwrap(),
+        ) & 0x7fff_ffff;
+        assert_eq!(second_index, first_index.wrapping_add(1));
+    }
+
+    #[test]
     fn srtcp_replay_window_handles_reorder_and_index_wrap() {
         let mut window = SrtcpReplayWindow::default();
         assert!(window.accept(100));
@@ -1288,6 +1544,10 @@ mod tests {
             }
         }
         assert_eq!(got, Some(vec![au]), "AU must reassemble byte-identical");
+        assert!(
+            rx.unprotect_video(packets.last().unwrap()).is_none(),
+            "replaying the marker packet must not redeliver the completed access unit"
+        );
 
         // Second AU keeps flowing (sequencer + ROC state stay consistent).
         let au2 = video_au(100);

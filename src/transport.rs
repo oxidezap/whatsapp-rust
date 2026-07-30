@@ -47,6 +47,31 @@ pub mod mock {
         }
     }
 
+    /// Splits one transport write into the length-prefixed frames it carries,
+    /// each returned with its 3-byte prefix intact so callers keep seeing what
+    /// a single-frame write used to look like. A trailing partial frame (which
+    /// this sender never produces) is returned as-is rather than dropped.
+    fn split_framed(write: &bytes::Bytes) -> Vec<bytes::Bytes> {
+        const PREFIX: usize = 3;
+        let mut frames = Vec::new();
+        let mut offset = 0usize;
+        while offset + PREFIX <= write.len() {
+            let len = ((write[offset] as usize) << 16)
+                | ((write[offset + 1] as usize) << 8)
+                | (write[offset + 2] as usize);
+            let end = offset + PREFIX + len;
+            if end > write.len() {
+                break;
+            }
+            frames.push(write.slice(offset..end));
+            offset = end;
+        }
+        if offset < write.len() {
+            frames.push(write.slice(offset..));
+        }
+        frames
+    }
+
     /// Records every `send()` payload so a unit test can assert what the
     /// client wrote to the wire.
     pub struct CapturingMockTransport {
@@ -64,11 +89,29 @@ pub mod mock {
             }
         }
 
+        /// Every frame written, one entry each, in write-counter order.
+        ///
+        /// The noise sender coalesces queued frames into a single `send()`, so
+        /// a captured write is not necessarily one frame. Splitting here keeps
+        /// the whole assertion surface ("the Nth frame is ...", decrypted under
+        /// counter N) valid whether or not a batch happened to form.
         pub fn sent(&self) -> Vec<bytes::Bytes> {
+            self.sent_writes().iter().flat_map(split_framed).collect()
+        }
+
+        /// The raw `send()` payloads, batches included. Use this to assert on
+        /// transport-level behaviour (how many writes, how large); use
+        /// [`Self::sent`] to assert on frames.
+        pub fn sent_writes(&self) -> Vec<bytes::Bytes> {
             self.sent.lock().expect("capturing mutex").clone()
         }
 
         pub fn sent_count(&self) -> usize {
+            self.sent().len()
+        }
+
+        /// Number of `send()` calls, as opposed to frames.
+        pub fn write_count(&self) -> usize {
             self.sent.lock().expect("capturing mutex").len()
         }
 

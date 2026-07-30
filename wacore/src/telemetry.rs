@@ -57,6 +57,13 @@ mod imp {
     pub fn base_key_collision() {
         counter!("wa_base_key_collision_total").increment(1);
     }
+    /// A stored Signal session blob could not be decoded and was reported as
+    /// absent so the no-session recovery can replace it. Steady state is zero:
+    /// a non-zero rate means rows are being written in a shape this build
+    /// cannot read back.
+    pub fn session_record_quarantined() {
+        counter!("wa_session_record_quarantined_total").increment(1);
+    }
     /// IQ request completed, by result (`ok`/`timeout`/`error`). Emitted at the
     /// single request chokepoint, so it covers both raw and spec-based IQs.
     pub fn iq(result: &'static str) {
@@ -151,6 +158,11 @@ mod imp {
             "Base-key collisions that forced a fresh session"
         );
         describe_counter!(
+            "wa_session_record_quarantined_total",
+            Unit::Count,
+            "Undecodable session rows reported as absent for recovery"
+        );
+        describe_counter!(
             "wa_iq_total",
             Unit::Count,
             "IQ requests by result (ok/timeout/error)"
@@ -227,6 +239,8 @@ mod imp {
     pub fn retry_refused() {}
     #[inline]
     pub fn base_key_collision() {}
+    #[inline]
+    pub fn session_record_quarantined() {}
     #[inline]
     pub fn iq(_result: &'static str) {}
     #[inline]

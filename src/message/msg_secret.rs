@@ -31,34 +31,43 @@ impl Client {
         let class = wacore::msg_secret::classify(msg, chat_is_bot);
         let message_ts = u64::try_from(info.timestamp.timestamp()).ok();
 
-        // Build both aliases (primary, plus the bot-DM LID key) and write them
-        // in one batch so a partial write can't leave only one stored.
-        let mut entries = Vec::with_capacity(2);
-        if let Some(entry) = self.build_msg_secret_entry(
+        let primary = self.build_msg_secret_entry(
             &info.source.chat,
             &info.source.sender,
             &info.id,
             secret_bytes,
             class,
             message_ts,
-        ) {
-            entries.push(entry);
-        }
+        );
+        // The bot-DM LID key is the only alias a capture ever adds, so a plain
+        // chat writes exactly one row. Deciding that before touching a Vec keeps
+        // the common capture off the batch allocation entirely.
+        let mut bot_alias = None;
         if chat_is_bot
             && let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await
             && sender.to_non_ad() != info.source.sender.to_non_ad()
-            && let Some(entry) = self.build_msg_secret_entry(
+        {
+            bot_alias = self.build_msg_secret_entry(
                 &info.source.chat,
                 &sender,
                 &info.id,
                 secret_bytes,
                 class,
                 message_ts,
-            )
-        {
-            entries.push(entry);
+            );
         }
-        self.persist_msg_secret_entries(entries).await;
+
+        match (primary, bot_alias) {
+            // Both aliases go out in one batch so a partial write can't leave
+            // only one of them stored.
+            (Some(primary), Some(alias)) => {
+                self.persist_msg_secret_entries(vec![primary, alias]).await
+            }
+            (Some(entry), None) | (None, Some(entry)) => {
+                self.msg_secret_buffer.queue_one(entry).await
+            }
+            (None, None) => {}
+        }
     }
 
     /// Build one retention entry, applying the policy gates and computing the
@@ -92,14 +101,14 @@ impl Client {
             message_ts,
             wacore::time::now_secs(),
         );
-        Some(wacore::store::traits::MsgSecretEntry {
-            chat: chat.to_non_ad_string().into(),
-            sender: sender.to_non_ad_string().into(),
-            msg_id: msg_id.into(),
-            secret: *secret,
+        Some(wacore::store::traits::MsgSecretEntry::new(
+            chat,
+            sender,
+            msg_id,
+            *secret,
             expires_at,
-            message_ts: message_ts.and_then(|t| i64::try_from(t).ok()).unwrap_or(0),
-        })
+            message_ts.and_then(|t| i64::try_from(t).ok()).unwrap_or(0),
+        ))
     }
 
     /// Queue a batch of secret aliases on the write-behind buffer: immediately

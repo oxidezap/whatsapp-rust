@@ -1,5 +1,6 @@
 pub mod call;
 pub mod events;
+pub mod group_call;
 pub mod jid;
 pub mod lid_pn;
 pub mod message;

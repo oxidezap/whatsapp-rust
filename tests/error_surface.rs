@@ -19,6 +19,7 @@ use whatsapp_rust::features::{
     MexError, NewsletterError, PollError, PresenceError, ProfileError, StanzaResponseError,
     TcTokenError,
 };
+use whatsapp_rust::http::HttpStatusError;
 use whatsapp_rust::{ClientError, ErrorChainExt, IqError, SendError, ServerRejection};
 
 // ── Source scan ─────────────────────────────────────────────────────────────
@@ -368,6 +369,31 @@ fn server_rejection_is_recovered_the_same_way_in_every_domain() {
     }
 }
 
+/// The same for a refused HTTP exchange. The helper names no concrete error
+/// type either, so a caller handling a CDN status handles an upload one.
+fn http_status_of(err: &(dyn StdError + 'static)) -> Option<u16> {
+    err.http_status()
+}
+
+#[test]
+fn http_status_is_recovered_wherever_it_comes_from() {
+    // As the media paths build it: a message the caller can log, with the
+    // status underneath as a typed node.
+    let media = anyhow::Error::new(HttpStatusError { status: 429 })
+        .context("Download failed with status: 429");
+    let cause: &(dyn StdError + 'static) = media.as_ref();
+    assert_eq!(http_status_of(cause), Some(429));
+
+    // Nested one layer deeper, inside a domain error carrying the same anyhow.
+    let nested = GroupError::Internal(
+        anyhow::Error::new(HttpStatusError { status: 429 }).context("Upload failed 429"),
+    );
+    assert_eq!(http_status_of(&nested), Some(429));
+
+    // Reached directly, with no wrapping at all.
+    assert_eq!(HttpStatusError { status: 503 }.http_status(), Some(503));
+}
+
 #[test]
 fn timeout_is_recovered_across_domains() {
     assert!(GroupError::Iq(IqError::Timeout).is_timeout());
@@ -463,12 +489,32 @@ fn mex_extension_error_is_not_reported_as_a_server_rejection() {
     ));
 }
 
+/// An IQ `code` and an HTTP status are different layers. A stanza the chat
+/// server refused is not an HTTP exchange, and answering `http_status()` for it
+/// would tell a caller a number while hiding which thing to retry.
+#[test]
+fn an_iq_rejection_is_not_reported_as_an_http_status() {
+    let err = GroupError::Iq(rejected(403));
+    assert_eq!(code_of(&err), Some(403), "still an IQ rejection");
+    assert_eq!(err.http_status(), None);
+}
+
+/// And the converse: a CDN refusing a byte range is not the chat server
+/// refusing a stanza, so it must not surface under `server_rejection`.
+#[test]
+fn an_http_status_is_not_reported_as_a_server_rejection() {
+    let refused = HttpStatusError { status: 403 };
+    assert_eq!(refused.http_status(), Some(403));
+    assert_eq!(refused.server_rejection(), None);
+}
+
 /// Errors that carry none of the modelled facts answer `None`/`false` rather
 /// than being forced into some bucket.
 #[test]
 fn errors_without_a_modelled_category_report_nothing() {
     let err = GroupError::InvalidRequest("empty invite code".to_string());
     assert_eq!(err.server_rejection(), None);
+    assert_eq!(err.http_status(), None);
     assert!(!err.is_timeout());
     assert!(!err.is_transport_unavailable());
     assert!(err.store_failure().is_none());

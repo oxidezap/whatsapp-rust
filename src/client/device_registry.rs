@@ -6,7 +6,7 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use wacore_binary::{Jid, Server};
+use wacore_binary::{Jid, JidExt as _, Server};
 
 use super::Client;
 
@@ -34,6 +34,36 @@ impl wacore::stats::HeapSize for GroupDevicesMemo {
         // The Weak keeps only the GroupInfo allocation header alive; the memo
         // does not retain its payload.
         self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
+            + self.members.capacity() * size_of::<wacore_binary::CompactString>()
+            + self.devices.heap_bytes()
+    }
+}
+
+/// Per-recipient DM fan-out snapshot for `resolve_dm_devices_memoized`.
+/// Valid while the sending identity is unchanged AND the device-topology
+/// generation is unchanged (or every change since it provably missed
+/// [`members`](Self::members)).
+pub(crate) struct DmDevicesMemo {
+    pub(crate) generation: u64,
+    /// The sending identity the fan-out was built for. It decides self-DM
+    /// detection, which device is excluded as the sender, and the PN->LID
+    /// realignment of our own devices, so a re-pair or a first-time-known
+    /// own LID must miss instead of reusing a set built for another identity.
+    pub(crate) own_pn: Jid,
+    pub(crate) own_lid: Option<Jid>,
+    /// Every identifier a relevant topology change could be logged under, in
+    /// BOTH namespaces (recipient, self, and every resolved device user, each
+    /// with its mapped counterpart): the scoped-invalidation check tests the
+    /// topology log's touched users against this set.
+    pub(crate) members: Arc<std::collections::HashSet<wacore_binary::CompactString>>,
+    pub(crate) devices: Arc<wacore::send::ResolvedDmDevices>,
+}
+
+impl wacore::stats::HeapSize for DmDevicesMemo {
+    fn heap_bytes(&self) -> usize {
+        self.own_pn.heap_bytes()
+            + self.own_lid.as_ref().map_or(0, |lid| lid.heap_bytes())
+            + self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
             + self.members.capacity() * size_of::<wacore_binary::CompactString>()
             + self.devices.heap_bytes()
     }
@@ -130,7 +160,7 @@ impl Client {
         // processes (e.g. shared Redis across pods), which this process's
         // topology tracker cannot observe; the memo's freshness contract
         // doesn't hold there, so it is disabled and every send resolves.
-        if !self.group_devices_memo_enabled {
+        if !self.device_memos_enabled {
             return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(
                 self.resolve_group_devices_uncached(
                     group_info,
@@ -279,6 +309,263 @@ impl Client {
                 .collect();
         }
         Ok(devices)
+    }
+
+    /// Resolve the DM fan-out (recipient devices + our own companions),
+    /// memoized per recipient.
+    ///
+    /// The set is a pure function of the recipient's and our own registry
+    /// records, the LID-PN mappings those lookups resolve through, and the
+    /// sending identity. The first three are exactly what the device topology
+    /// tracks, and the last is stored in the entry, so the memo is valid while
+    /// BOTH hold: an unchanged `device_topology` generation (or one whose
+    /// every change provably missed the entry's member set) and a matching
+    /// sending identity. On a warm repeat DM this turns two registry lookups,
+    /// the list rebuild and the phash into one memo hit.
+    ///
+    /// `recipient_bare` is the resolved wire jid AND the memo key, so the
+    /// account's 1:1-LID-migration state is folded into the key: a migration
+    /// flip lands on a different entry instead of needing its own
+    /// invalidation.
+    pub(crate) async fn resolve_dm_devices_memoized(
+        &self,
+        to: &Jid,
+        recipient_bare: &Jid,
+        own_jid: &Jid,
+        own_lid: Option<&Jid>,
+        freshness: crate::cache::Freshness,
+    ) -> Result<Arc<wacore::send::ResolvedDmDevices>, anyhow::Error> {
+        // Refresh asks for the server's truth, so a memo hit would serve
+        // exactly what the caller asked to bypass. Store-backed registry or
+        // mapping caches can be written by OTHER processes (e.g. a shared
+        // Redis across pods), which this process's topology tracker cannot
+        // observe, so the memo's freshness contract does not hold there.
+        if freshness == crate::cache::Freshness::Refresh || !self.device_memos_enabled {
+            let (devices, _) = self
+                .resolve_dm_devices_uncached(to, recipient_bare, own_jid, own_lid, freshness)
+                .await?;
+            return Ok(Arc::new(wacore::send::ResolvedDmDevices::new(
+                devices, own_jid, own_lid,
+            )));
+        }
+
+        // Load the generation BEFORE resolving (do NOT move this after the
+        // registry reads): a write racing the resolve bumps it afterwards, so
+        // the memo we store is already stale by its own stamp and the next
+        // read revalidates. Loading after would stamp racing writes as seen
+        // and serve their effects stale.
+        let generation = self.device_topology.current();
+
+        if let Some(memo) = self.dm_devices_memo.get(recipient_bare).await
+            && memo.own_pn == *own_jid
+            && memo.own_lid.as_ref() == own_lid
+        {
+            // Re-read after the await above: a device-list update can land
+            // while the memo is being loaded, and validating the hit against
+            // the pre-await snapshot would serve the pre-write fan-out, which
+            // is exactly the missed-device case this memo must never cause.
+            // The store below deliberately keeps the earlier snapshot, so a
+            // racing write leaves the stored entry stale by its own stamp.
+            let observed = self.device_topology.current();
+            if memo.generation == observed {
+                // Refcount bump: the snapshot is immutable, so a hit shares
+                // it (and its warm phash) instead of rebuilding.
+                return Ok(Arc::clone(&memo.devices));
+            }
+            // Stale stamp: when every change since it only touched users
+            // outside this fan-out, re-stamp instead of recomputing, so write
+            // storms on unrelated chats don't tank the hit rate. Any doubt
+            // (log overflow, member touched) falls through to the recompute.
+            if self
+                .device_topology
+                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+            {
+                self.dm_devices_memo
+                    .insert(
+                        recipient_bare.clone(),
+                        Arc::new(DmDevicesMemo {
+                            generation: observed,
+                            own_pn: memo.own_pn.clone(),
+                            own_lid: memo.own_lid.clone(),
+                            members: Arc::clone(&memo.members),
+                            devices: Arc::clone(&memo.devices),
+                        }),
+                    )
+                    .await;
+                return Ok(Arc::clone(&memo.devices));
+            }
+        }
+
+        let (devices, complete) = self
+            .resolve_dm_devices_uncached(to, recipient_bare, own_jid, own_lid, freshness)
+            .await?;
+        let resolved = Arc::new(wacore::send::ResolvedDmDevices::new(
+            devices, own_jid, own_lid,
+        ));
+        // A partial resolution (registry miss whose network warm-up also
+        // failed) falls back to the bare recipient jid or silently drops our
+        // companions. Memoizing it would turn one failed warm-up into a
+        // permanently degraded chat, so only a complete one is stored.
+        if complete {
+            let members = self
+                .dm_memo_members(recipient_bare, own_jid, own_lid, resolved.devices())
+                .await;
+            self.dm_devices_memo
+                .insert(
+                    recipient_bare.clone(),
+                    Arc::new(DmDevicesMemo {
+                        generation,
+                        own_pn: own_jid.clone(),
+                        own_lid: own_lid.cloned(),
+                        members: Arc::new(members),
+                        devices: Arc::clone(&resolved),
+                    }),
+                )
+                .await;
+        }
+        Ok(resolved)
+    }
+
+    /// The DM memo's recompute body: all known recipient devices plus our own
+    /// companions. WAWebSendUserMsgJob reads the local device table only on
+    /// the send path; WAWebDBDeviceListFanout excludes hosted devices.
+    ///
+    /// The second return value is whether this is a COMPLETE resolution, i.e.
+    /// every registry lookup it needed answered. A partial one is degraded
+    /// (bare-jid fallback, or missing companions) and must not be memoized.
+    async fn resolve_dm_devices_uncached(
+        &self,
+        to: &Jid,
+        recipient_bare: &Jid,
+        own_jid: &Jid,
+        own_lid: Option<&Jid>,
+        freshness: crate::cache::Freshness,
+    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+        #[cfg(test)]
+        self.dm_devices_memo_recomputes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if freshness == crate::cache::Freshness::Refresh {
+            self.refresh_user_devices(vec![recipient_bare.to_non_ad(), own_jid.to_non_ad()])
+                .await?;
+        }
+
+        // Local registry first; network warm only on miss to avoid
+        // unnecessary LID-migration side effects from get_user_devices
+        let mut recipient_cached = self.get_devices_from_registry(recipient_bare).await;
+        if recipient_cached.is_none() {
+            if let Err(e) = self.get_user_devices(std::slice::from_ref(to)).await {
+                // The bare-JID fallback below can drop companion devices, so
+                // leave a trace when the warmup that would prevent it fails.
+                warn!("device-list warmup for {} failed: {e:#}", to.observe());
+            }
+            recipient_cached = self.get_devices_from_registry(recipient_bare).await;
+        }
+
+        let is_self_dm = crate::send::is_self_dm_recipient(recipient_bare, own_jid, own_lid);
+
+        // Skip the own-device lookup only when we already have the
+        // recipient's list: that record covers every own device in a
+        // single namespace. If `recipient_cached` is `None` (cache miss
+        // + warmup failed), the PN-keyed `own_cached` is the only thing
+        // standing between us and a bare-JID fallback that would drop
+        // companion devices.
+        let own_lookup_skipped = is_self_dm && recipient_cached.is_some();
+        let own_cached: Option<Vec<Jid>> = if own_lookup_skipped {
+            None
+        } else {
+            let mut cached = self.get_devices_from_registry(own_jid).await;
+            if cached.is_none() {
+                if let Err(e) = self.get_user_devices(std::slice::from_ref(own_jid)).await {
+                    warn!("own device-list warmup failed: {e:#}");
+                }
+                cached = self.get_devices_from_registry(own_jid).await;
+            }
+            cached
+        };
+
+        let complete = recipient_cached.is_some() && (own_lookup_skipped || own_cached.is_some());
+
+        // Build device list, filter hosted in-place, reuse Vecs
+        let mut all_dm_jids = match recipient_cached {
+            Some(mut devices) => {
+                devices.retain(|j| !j.is_hosted());
+                devices
+            }
+            // No record at all, so use the bare JID and let the server fan out
+            None => vec![recipient_bare.clone()],
+        };
+
+        if let Some(mut own_devices) = own_cached {
+            own_devices.retain(|j| !j.is_hosted());
+            all_dm_jids.append(&mut own_devices);
+        }
+
+        // Exclude exact sender device (WA Web: isMeDevice in getFanOutList)
+        // so ensure_e2e_sessions never creates a self-session
+        all_dm_jids.retain(|j| {
+            let is_sender = (j.is_same_user_as(own_jid) && j.device == own_jid.device)
+                || own_lid.is_some_and(|lid| j.is_same_user_as(lid) && j.device == lid.device);
+            !is_sender
+        });
+
+        // own_cached is keyed by the bot's PN, so own devices come back
+        // PN-addressed. The server rejects a stanza that mixes PN and LID
+        // participants, so align own devices to LID for a LID recipient
+        // (whatsmeow switches ownID to LID before fanout).
+        if recipient_bare.is_lid() {
+            let lid = own_lid.ok_or_else(|| {
+                anyhow::anyhow!("Cannot send a LID-addressed DM before the device LID is known")
+            })?;
+            for j in all_dm_jids.iter_mut() {
+                if j.is_pn() && j.is_same_user_as(own_jid) {
+                    *j = Jid::lid_device(lid.user.clone(), j.device);
+                }
+            }
+        }
+
+        // Same-namespace dedup only; cross-namespace overlap is avoided
+        // upstream via `is_self_dm_recipient`.
+        wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
+
+        Ok((all_dm_jids, complete))
+    }
+
+    /// Every identifier a topology change relevant to this fan-out could be
+    /// logged under. Registry writes record all lookup aliases of the user
+    /// they touch and mapping writes record both sides, so covering both
+    /// namespaces of every identity involved is what makes the scoped
+    /// revalidation sound. Over-inclusion only costs a recompute; the set
+    /// missing an identifier is what would serve stale.
+    async fn dm_memo_members(
+        &self,
+        recipient_bare: &Jid,
+        own_jid: &Jid,
+        own_lid: Option<&Jid>,
+        devices: &[Jid],
+    ) -> std::collections::HashSet<wacore_binary::CompactString> {
+        let mut members = std::collections::HashSet::with_capacity(devices.len() + 6);
+        for user in [recipient_bare.user.as_str(), own_jid.user.as_str()]
+            .into_iter()
+            .chain(own_lid.map(|lid| lid.user.as_str()))
+            .chain(devices.iter().map(|d| d.user.as_str()))
+        {
+            if !members.insert(wacore_binary::CompactString::from(user)) {
+                // Already probed on an earlier pass; the mapping relation is
+                // symmetric, so its counterpart is in too.
+                continue;
+            }
+            // Probe BOTH directions instead of trusting the jid's namespace:
+            // a hosted or unmapped identity can be keyed either way, and a
+            // mapping missed here is a change we could not prove unrelated.
+            if let Some(pn) = self.lid_pn_cache.get_phone_number(user).await {
+                members.insert(wacore_binary::CompactString::from(pn.as_str()));
+            }
+            if let Some(lid) = self.lid_pn_cache.get_current_lid(user).await {
+                members.insert(lid);
+            }
+        }
+        members
     }
 
     /// Resolve a user identifier to its lookup keys with type information.
@@ -3237,6 +3524,452 @@ mod tests {
         assert!(
             client.pending_device_sync.take_all().await.is_empty(),
             "an unresolvable hash must not refresh an unrelated contact"
+        );
+    }
+
+    // -- DM device-list memo --
+
+    /// Fictitious identities for the DM memo tests.
+    const DM_RECIPIENT_PN: &str = "5511999991001";
+    const DM_RECIPIENT_LID: &str = "100000000001001";
+    const DM_OWN_PN: &str = "5511999992002";
+    const DM_OWN_LID: &str = "100000000002002";
+    const DM_REPAIRED_OWN_PN: &str = "5511999993003";
+
+    fn dm_own_jid() -> Jid {
+        let mut own = Jid::pn(DM_OWN_PN);
+        own.device = 1;
+        own
+    }
+
+    fn dm_own_lid_jid() -> Jid {
+        let mut lid = Jid::lid(DM_OWN_LID);
+        lid.device = 1;
+        lid
+    }
+
+    /// Device ids resolved for one user, sorted, so assertions read as the
+    /// device set instead of a fan-out order that is deliberately unstable.
+    fn device_ids_of(devices: &[Jid], user: &str) -> Vec<u16> {
+        let mut ids: Vec<u16> = devices
+            .iter()
+            .filter(|jid| jid.user == user)
+            .map(|jid| jid.device)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn dm_recomputes(client: &Arc<Client>) -> u64 {
+        client
+            .dm_devices_memo_recomputes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Seed a device record straight into the registry cache WITHOUT recording a
+    /// topology change, so a memo that is really hitting must serve it stale.
+    async fn setup_hosted_device_record(client: &Arc<Client>, user: &str, devices: &[(u32, bool)]) {
+        let record = wacore::store::traits::DeviceListRecord {
+            user: user.into(),
+            devices: devices
+                .iter()
+                .map(|&(id, hosted)| {
+                    wacore::store::traits::DeviceInfo::new(id, None).with_hosting(hosted)
+                })
+                .collect(),
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+            raw_id: None,
+        };
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(user.into(), Arc::new(record))
+            .await;
+    }
+
+    /// Publish a device record through the real write path, which records the
+    /// topology change every invalidation rule depends on.
+    async fn publish_device_record(client: &Arc<Client>, user: &str, device_ids: &[u32]) {
+        let record = wacore::store::traits::DeviceListRecord {
+            user: user.into(),
+            devices: device_ids
+                .iter()
+                .map(|&id| wacore::store::traits::DeviceInfo::new(id, None))
+                .collect(),
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+            raw_id: None,
+        };
+        client
+            .update_device_list(record)
+            .await
+            .expect("device list should publish");
+    }
+
+    async fn resolve_dm(
+        client: &Arc<Client>,
+        recipient: &Jid,
+        freshness: crate::cache::Freshness,
+    ) -> Result<Arc<wacore::send::ResolvedDmDevices>> {
+        let own = dm_own_jid();
+        client
+            .resolve_dm_devices_memoized(recipient, recipient, &own, None, freshness)
+            .await
+    }
+
+    /// A repeat DM must serve the memo: proved by a raw registry write that
+    /// records NO topology change still being served stale, with the recompute
+    /// counter unmoved.
+    #[tokio::test]
+    async fn dm_devices_memo_hits_on_a_repeat_send() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 3]).await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("first resolve");
+        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 3]);
+        // Our own sending device (1) is excluded; the companions remain.
+        assert_eq!(device_ids_of(first.devices(), DM_OWN_PN), vec![0, 2]);
+        assert_eq!(dm_recomputes(&client), 1);
+
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 3, 9]).await;
+        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("second resolve");
+        assert_eq!(
+            device_ids_of(second.devices(), DM_RECIPIENT_PN),
+            vec![0, 3],
+            "an untracked raw write must be served stale, proving this was a memo hit"
+        );
+        assert_eq!(dm_recomputes(&client), 1, "a hit must not recompute");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a hit shares the snapshot instead of rebuilding it"
+        );
+    }
+
+    /// `Freshness::Refresh` must never be answered from the memo: it enters the
+    /// recompute body (and here fails on the offline usync) instead of returning
+    /// the warm entry.
+    #[tokio::test]
+    async fn dm_devices_memo_refresh_bypasses_the_memo() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 3]).await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("warm the memo");
+        assert_eq!(dm_recomputes(&client), 1);
+
+        let refreshed = resolve_dm(&client, &recipient, crate::cache::Freshness::Refresh).await;
+        assert!(
+            refreshed.is_err(),
+            "Refresh must attempt the authoritative usync, not answer from the memo"
+        );
+        assert_eq!(
+            dm_recomputes(&client),
+            2,
+            "Refresh must enter the recompute body"
+        );
+    }
+
+    /// A device added to the recipient reaches the next message.
+    #[tokio::test]
+    async fn dm_devices_memo_invalidates_on_device_add() {
+        let client = create_test_client().await;
+        publish_device_record(&client, DM_RECIPIENT_PN, &[0, 3]).await;
+        publish_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("first resolve");
+        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 3]);
+        resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("repeat resolve");
+        assert_eq!(
+            dm_recomputes(&client),
+            1,
+            "the memo must be warm to invalidate"
+        );
+
+        publish_device_record(&client, DM_RECIPIENT_PN, &[0, 3, 9]).await;
+
+        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("second resolve");
+        assert_eq!(
+            device_ids_of(second.devices(), DM_RECIPIENT_PN),
+            vec![0, 3, 9],
+            "a newly added device must not be missed by the fan-out"
+        );
+        assert_eq!(
+            dm_recomputes(&client),
+            2,
+            "the add must force exactly one recompute"
+        );
+    }
+
+    /// A device removed from the recipient stops being addressed.
+    #[tokio::test]
+    async fn dm_devices_memo_invalidates_on_device_remove() {
+        let client = create_test_client().await;
+        publish_device_record(&client, DM_RECIPIENT_PN, &[0, 3]).await;
+        publish_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("first resolve");
+        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 3]);
+        resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("repeat resolve");
+        assert_eq!(
+            dm_recomputes(&client),
+            1,
+            "the memo must be warm to invalidate"
+        );
+
+        publish_device_record(&client, DM_RECIPIENT_PN, &[0]).await;
+
+        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("second resolve");
+        assert_eq!(
+            device_ids_of(second.devices(), DM_RECIPIENT_PN),
+            vec![0],
+            "a removed device must drop out of the fan-out"
+        );
+        assert_eq!(
+            dm_recomputes(&client),
+            2,
+            "the removal must force exactly one recompute"
+        );
+    }
+
+    /// A learned PN <-> LID mapping changes which record a lookup resolves to,
+    /// so it must invalidate even though no device row was touched. Proved with
+    /// an untracked raw write that only a real recompute can observe.
+    #[tokio::test]
+    async fn dm_devices_memo_invalidates_on_lid_pn_migration() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 3]).await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("first resolve");
+        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 3]);
+        resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("repeat resolve");
+        assert_eq!(
+            dm_recomputes(&client),
+            1,
+            "the memo must be warm to invalidate"
+        );
+
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 3, 9]).await;
+        setup_lid_pn(&client, DM_RECIPIENT_LID, DM_RECIPIENT_PN).await;
+
+        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("second resolve");
+        assert_eq!(
+            device_ids_of(second.devices(), DM_RECIPIENT_PN),
+            vec![0, 3, 9],
+            "a mapping change must invalidate the memo, not re-stamp it"
+        );
+
+        // The same identity addressed as a LID resolves through the mapping to
+        // the same record, in the LID namespace.
+        let lid_recipient = Jid::lid(DM_RECIPIENT_LID);
+        let via_lid = resolve_dm(
+            &client,
+            &lid_recipient,
+            crate::cache::Freshness::CachePreferred,
+        )
+        .await;
+        assert!(
+            via_lid.is_err(),
+            "a LID-addressed DM without a known own LID must be rejected, not silently mis-addressed"
+        );
+
+        let via_lid = client
+            .resolve_dm_devices_memoized(
+                &lid_recipient,
+                &lid_recipient,
+                &dm_own_jid(),
+                Some(&dm_own_lid_jid()),
+                crate::cache::Freshness::CachePreferred,
+            )
+            .await
+            .expect("LID resolve");
+        assert_eq!(
+            device_ids_of(via_lid.devices(), DM_RECIPIENT_LID),
+            vec![0, 3, 9]
+        );
+        assert!(
+            via_lid.devices().iter().all(|jid| jid.is_lid()),
+            "a LID recipient must not be mixed with PN-addressed own devices"
+        );
+    }
+
+    /// A message to our own chat addresses each own device exactly once and
+    /// never the sending device itself.
+    #[tokio::test]
+    async fn dm_devices_memo_self_dm_stays_correct() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2, 4]).await;
+        let recipient = Jid::pn(DM_OWN_PN);
+
+        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("self-DM resolve");
+        assert_eq!(
+            device_ids_of(first.devices(), DM_OWN_PN),
+            vec![0, 2, 4],
+            "the sending device is excluded and no device is addressed twice"
+        );
+        assert_eq!(first.devices().len(), 3, "no cross-namespace duplicates");
+
+        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("repeat self-DM resolve");
+        assert_eq!(dm_recomputes(&client), 1, "a repeat self-DM hits the memo");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Hosted devices stay out of the fan-out (WAWebDBDeviceListFanout), on the
+    /// memoized path exactly as on the cold one.
+    #[tokio::test]
+    async fn dm_devices_memo_excludes_hosted_devices() {
+        let client = create_test_client().await;
+        setup_hosted_device_record(
+            &client,
+            DM_RECIPIENT_PN,
+            &[(0, false), (2, true), (5, false)],
+        )
+        .await;
+        setup_hosted_device_record(&client, DM_OWN_PN, &[(0, false), (1, false), (3, true)]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("first resolve");
+        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 5]);
+        assert_eq!(device_ids_of(first.devices(), DM_OWN_PN), vec![0]);
+
+        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("second resolve");
+        assert_eq!(dm_recomputes(&client), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// The memo is keyed by recipient only, so the sending identity it was built
+    /// for is part of its validity: a first-time-known own LID or a re-pair must
+    /// never be served an entry built as somebody else.
+    #[tokio::test]
+    async fn dm_devices_memo_pins_the_sending_identity() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0]).await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        setup_device_record(&client, DM_REPAIRED_OWN_PN, &[0]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+        let own = dm_own_jid();
+
+        let warm = client
+            .resolve_dm_devices_memoized(
+                &recipient,
+                &recipient,
+                &own,
+                None,
+                crate::cache::Freshness::CachePreferred,
+            )
+            .await
+            .expect("warm the memo");
+        assert_eq!(dm_recomputes(&client), 1);
+
+        // A first-time-known own LID changes both the sender exclusion and the
+        // PN->LID realignment rule, so the entry built without it must miss.
+        let with_lid = client
+            .resolve_dm_devices_memoized(
+                &recipient,
+                &recipient,
+                &own,
+                Some(&dm_own_lid_jid()),
+                crate::cache::Freshness::CachePreferred,
+            )
+            .await
+            .expect("resolve once the own LID is known");
+        assert_eq!(
+            dm_recomputes(&client),
+            2,
+            "a changed sending identity must recompute"
+        );
+        assert!(!Arc::ptr_eq(&warm, &with_lid));
+
+        // A re-pair under a different account must not inherit the previous
+        // account's companion devices.
+        let mut repaired_own = Jid::pn(DM_REPAIRED_OWN_PN);
+        repaired_own.device = 1;
+        let repaired = client
+            .resolve_dm_devices_memoized(
+                &recipient,
+                &recipient,
+                &repaired_own,
+                None,
+                crate::cache::Freshness::CachePreferred,
+            )
+            .await
+            .expect("resolve as the re-paired account");
+        assert_eq!(dm_recomputes(&client), 3);
+        assert!(
+            device_ids_of(repaired.devices(), DM_OWN_PN).is_empty(),
+            "the previous account's companions must not survive a re-pair"
+        );
+        assert_eq!(
+            device_ids_of(repaired.devices(), DM_REPAIRED_OWN_PN),
+            vec![0]
+        );
+    }
+
+    /// A degraded resolution (registry miss whose network warm-up also failed)
+    /// must NOT be memoized, or one failed warm-up would pin a chat to the
+    /// bare-jid fan-out for as long as the entry lives.
+    #[tokio::test]
+    async fn dm_devices_memo_skips_a_degraded_fallback() {
+        let client = create_test_client().await;
+        setup_device_record(&client, DM_OWN_PN, &[0, 1, 2]).await;
+        let recipient = Jid::pn(DM_RECIPIENT_PN);
+
+        let fallback = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("fallback resolve");
+        assert_eq!(
+            device_ids_of(fallback.devices(), DM_RECIPIENT_PN),
+            vec![0],
+            "an unknown recipient falls back to the bare jid"
+        );
+
+        // Untracked raw write: only a recompute can see it.
+        setup_device_record(&client, DM_RECIPIENT_PN, &[0, 7]).await;
+        let healed = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
+            .await
+            .expect("healed resolve");
+        assert_eq!(
+            device_ids_of(healed.devices(), DM_RECIPIENT_PN),
+            vec![0, 7],
+            "the next send must retry the resolution instead of reusing the fallback"
         );
     }
 }

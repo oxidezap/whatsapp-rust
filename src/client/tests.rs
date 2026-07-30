@@ -143,7 +143,9 @@ async fn test_ack_waiter_resolves() {
     // 1. Insert a waiter for a specific ID
     let test_id = "ack-test-123".to_string();
     let (tx, rx) = oneshot::channel();
-    client.response_waiters_guard().insert(test_id.clone(), tx);
+    client
+        .response_waiters_guard()
+        .insert(test_id.clone(), ResponseWaiter::Iq(tx));
     assert!(
         client.response_waiters_guard().contains_key(&test_id),
         "Waiter should be inserted before handling ack"
@@ -249,7 +251,7 @@ async fn ack_arc_delivery_shares_allocation() {
     let (tx, rx) = oneshot::channel();
     client
         .response_waiters_guard()
-        .insert(test_id.to_string(), tx);
+        .insert(test_id.to_string(), ResponseWaiter::Iq(tx));
 
     let node = Arc::new(owned_ack_node(test_id));
     assert!(client.handle_ack_response_arc(&node));
@@ -277,7 +279,7 @@ async fn ack_owned_delivery_resolves_waiter() {
     let (tx, rx) = oneshot::channel();
     client
         .response_waiters_guard()
-        .insert(test_id.to_string(), tx);
+        .insert(test_id.to_string(), ResponseWaiter::Iq(tx));
 
     assert!(client.handle_ack_response_owned(owned_ack_node(test_id)));
     let received = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -370,7 +372,7 @@ async fn test_ack_dispatches_server_ack_event() {
     let (tx, rx) = oneshot::channel();
     client
         .response_waiters_guard()
-        .insert("ack-evt-3".to_string(), tx);
+        .insert("ack-evt-3".to_string(), ResponseWaiter::Iq(tx));
     let waited_ack = NodeBuilder::new("ack")
         .attr("id", "ack-evt-3")
         .attr("class", "message")
@@ -1476,7 +1478,7 @@ async fn cleanup_connection_state_flushes_dirty_signal_state() {
     let client = create_offline_sync_test_client().await;
 
     // A dirty identity lives only in the write-back cache until flushed.
-    let addr = ProtocolAddress::new("5550001000@s.whatsapp.net".to_string(), 1u32.into());
+    let addr = ProtocolAddress::new("5550001000@s.whatsapp.net", 1u32.into());
     client.signal_cache.put_identity(&addr, &[7u8; 32]).await;
 
     client.cleanup_connection_state().await;
@@ -1577,7 +1579,7 @@ async fn cleanup_connection_state_keeps_state_when_flush_fails() {
 
     // A malformed identity (not 32 bytes) makes flush() error out, standing
     // in for a transient backend write failure during cleanup.
-    let bad = ProtocolAddress::new("5550002000@s.whatsapp.net".to_string(), 1u32.into());
+    let bad = ProtocolAddress::new("5550002000@s.whatsapp.net", 1u32.into());
     client.signal_cache.put_identity(&bad, &[0u8; 16]).await;
 
     // A valid dirty sender key that must not be dropped when the flush fails.
@@ -1634,6 +1636,171 @@ async fn connect_failure_403_dispatches_account_locked_logout() {
         !client.enable_auto_reconnect.load(Ordering::Relaxed),
         "a server-side lock must not auto-reconnect"
     );
+}
+
+/// An account lock states its enforcement data exactly once: the appeal token is
+/// the only route to contest the lock, and `violation_reason` / `vt` are the
+/// only description of it. WA Web ignores those attributes (its appeal flow is
+/// native), so nothing parses them here either — but dropping them makes them
+/// unrecoverable, so the whole stanza rides on the event.
+#[tokio::test]
+async fn account_lock_logout_preserves_enforcement_attributes() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "403")
+        .attr("location", "rva")
+        .attr("violation_reason", "other_harm")
+        .attr("vt", "1")
+        .attr("appeal_token", "0aFICTITIOUSappealTOKEN00")
+        .attr("logout_message_header", "Conta desconectada")
+        .attr("logout_message_subtext", "Abra o WhatsApp no celular")
+        .attr("logout_message_locale", "pt_BR")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    let evt = events.try_recv().expect("403 dispatches LoggedOut");
+    match &*evt {
+        Event::LoggedOut(lo) => {
+            let raw = lo.raw.as_ref().expect("the <failure> stanza must survive");
+            assert_eq!(
+                raw.attrs.get("appeal_token").map(|v| v.as_str()).as_deref(),
+                Some("0aFICTITIOUSappealTOKEN00"),
+                "the one-time appeal token must reach the embedder"
+            );
+            assert_eq!(
+                raw.attrs
+                    .get("violation_reason")
+                    .map(|v| v.as_str())
+                    .as_deref(),
+                Some("other_harm")
+            );
+            assert_eq!(
+                raw.attrs.get("vt").map(|v| v.as_str()).as_deref(),
+                Some("1")
+            );
+
+            // The localized copy is typed, the way WA Web parses it, with the
+            // locale that decides whether it is safe to render.
+            let msg = lo
+                .logout_message
+                .as_ref()
+                .expect("logout_message_* must be surfaced");
+            assert_eq!(msg.header.as_deref(), Some("Conta desconectada"));
+            assert_eq!(msg.subtext.as_deref(), Some("Abra o WhatsApp no celular"));
+            assert_eq!(msg.locale.as_deref(), Some("pt_BR"));
+        }
+        _ => panic!("expected Event::LoggedOut for reason=403"),
+    }
+}
+
+/// WA Web hands `code`, `expire`, `message` and `url` to its temporary-ban UI —
+/// `url` is the link it opens. All four must survive the dispatch.
+#[tokio::test]
+async fn temporary_ban_carries_message_url_and_stanza() {
+    use wacore::types::events::{ChannelEventHandler, TempBanReason};
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "402")
+        .attr("code", "101")
+        .attr("expire", "3600")
+        .attr("message", "too many messages")
+        .attr("url", "https://faq.example.invalid/ban")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events.try_recv().expect("402 dispatches TemporaryBan") {
+        Event::TemporaryBan(ban) => {
+            assert_eq!(ban.code, TempBanReason::SentToTooManyPeople);
+            assert_eq!(ban.expire, chrono::Duration::seconds(3600));
+            assert_eq!(ban.message.as_deref(), Some("too many messages"));
+            assert_eq!(ban.url.as_deref(), Some("https://faq.example.invalid/ban"));
+            assert!(ban.raw.is_some(), "the <failure> stanza must survive");
+        }
+        _ => panic!("expected Event::TemporaryBan for reason=402"),
+    }
+}
+
+/// A 402 without `expire` is not a ban that lifted at the epoch. WA Web errors
+/// out rather than reporting one, so we surface the raw failure instead of
+/// fabricating a zero duration.
+#[tokio::test]
+async fn temporary_ban_without_expire_falls_back_to_connect_failure() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "402")
+        .attr("code", "101")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events
+        .try_recv()
+        .expect("an incomplete 402 still dispatches")
+    {
+        Event::ConnectFailure(cf) => {
+            assert_eq!(cf.reason, ConnectFailureReason::TempBanned);
+            assert!(cf.raw.is_some(), "the <failure> stanza must survive");
+        }
+        other => panic!("expected Event::ConnectFailure, got {other:?}"),
+    }
+}
+
+/// An `expire` that cannot be a `Duration` is no better than a missing one: it
+/// must not reach a consumer as a ban of length zero.
+#[tokio::test]
+async fn temporary_ban_with_unrepresentable_expire_falls_back_to_connect_failure() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "402")
+        .attr("code", "101")
+        .attr("expire", u64::MAX.to_string())
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events.try_recv().expect("a garbage 402 still dispatches") {
+        Event::ConnectFailure(cf) => {
+            assert_eq!(cf.reason, ConnectFailureReason::TempBanned);
+            assert!(cf.raw.is_some(), "the <failure> stanza must survive");
+        }
+        other => panic!("expected Event::ConnectFailure, got {other:?}"),
+    }
+}
+
+/// 405 is the one branch with nothing to parse, which is exactly why it used to
+/// throw the stanza away; the client version the server rejected is in there.
+#[tokio::test]
+async fn client_outdated_carries_the_stanza() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_offline_sync_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let failure = NodeBuilder::new("failure")
+        .attr("reason", "405")
+        .attr("message", "client too old")
+        .build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    match &*events.try_recv().expect("405 dispatches ClientOutdated") {
+        Event::ClientOutdated(co) => {
+            assert!(co.raw.is_some(), "the <failure> stanza must survive")
+        }
+        _ => panic!("expected Event::ClientOutdated for reason=405"),
+    }
 }
 
 #[tokio::test]
@@ -3331,6 +3498,25 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
     );
 }
 
+async fn install_test_noise_socket(
+    client: &Arc<Client>,
+    transport: Arc<dyn crate::transport::Transport>,
+    runtime: Arc<dyn Runtime>,
+) {
+    use crate::socket::NoiseSocket;
+    use wacore::handshake::NoiseCipher;
+
+    let key = [0u8; 32];
+    let noise_socket = NoiseSocket::new(
+        runtime,
+        transport,
+        NoiseCipher::new(&key).expect("valid key"),
+        NoiseCipher::new(&key).expect("valid key"),
+    );
+    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.set_connected_for_test(true);
+}
+
 fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
     Arc::new(crate::types::message::MessageInfo {
         id: id.to_string(),
@@ -3341,6 +3527,260 @@ fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
         },
         ..Default::default()
     })
+}
+
+#[derive(Debug)]
+struct DropSpawnRuntime;
+
+#[async_trait::async_trait]
+impl Runtime for DropSpawnRuntime {
+    fn spawn(
+        &self,
+        _future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> wacore::runtime::AbortHandle {
+        // Dropping the sender future closes its receiver synchronously.
+        wacore::runtime::AbortHandle::noop()
+    }
+
+    fn sleep(&self, _duration: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
+
+    fn spawn_blocking(
+        &self,
+        operation: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move { operation() })
+    }
+
+    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_drains_and_reuses_input_on_happy_paths() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.push(vec![0x11; 32]);
+    // Sized for the largest burst below, so a reallocation here would mean the
+    // callee replaced the buffer rather than filling it.
+    let mut results = Vec::with_capacity(4);
+    // Captured before the first call, not between the two: taken after it, a
+    // replacement made on the single-frame path would already be the buffer
+    // this compares against and would go unnoticed.
+    let results_ptr = results.as_ptr();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("installed socket");
+    assert_eq!(results.len(), 1);
+    assert!(results.iter().all(|result| result.is_ok()));
+    assert_eq!(
+        results.as_ptr(),
+        results_ptr,
+        "the single-frame path must fill the caller's buffer, not replace it"
+    );
+    assert!(frames.is_empty(), "the single-frame fast path must drain");
+    assert_eq!(frames.capacity(), retained_capacity);
+
+    frames.extend((0..4).map(|index| vec![index; 32]));
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("installed socket");
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|result| result.is_ok()));
+    // Identity, not capacity: a fresh Vec of the same capacity would satisfy a
+    // capacity check while defeating the whole point of the out-parameter. The
+    // buffer is preallocated above so the second burst cannot legitimately
+    // reallocate it.
+    assert_eq!(
+        results.as_ptr(),
+        results_ptr,
+        "the caller's results buffer must be the same allocation, not an equal one"
+    );
+    assert!(frames.is_empty(), "the joined path must drain");
+    assert_eq!(frames.capacity(), retained_capacity);
+    assert_eq!(transport.sent_count(), 5, "every frame must reach the wire");
+    assert_eq!(
+        transport.write_count(),
+        2,
+        "the four-frame call must remain one coalesced transport write"
+    );
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_drains_input_when_disconnected() {
+    let client = crate::test_utils::create_test_client().await;
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.extend([vec![0x21; 32], vec![0x22; 32]]);
+
+    let mut results = Vec::new();
+    let result = client.send_raw_bytes_burst(&mut frames, &mut results).await;
+    assert!(
+        matches!(result, Err(ClientError::NotConnected)),
+        "a missing socket must remain an outer NotConnected error: {result:?}"
+    );
+    assert!(frames.is_empty(), "the outer-error path must also drain");
+    assert_eq!(frames.capacity(), retained_capacity);
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_surfaces_transport_then_poisoned_per_frame() {
+    use crate::socket::error::EncryptSendErrorKind;
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    transport.fail_next_sends(1);
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.push(vec![0x31; 32]);
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("the socket lookup itself succeeds");
+    let transport_error = results
+        .pop()
+        .expect("one result")
+        .expect_err("the transport is configured to fail");
+    assert!(matches!(
+        transport_error.kind,
+        EncryptSendErrorKind::Transport
+    ));
+    assert!(transport_error.is_transport_unavailable());
+    assert!(frames.is_empty());
+    assert_eq!(frames.capacity(), retained_capacity);
+
+    frames.push(vec![0x32; 32]);
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("the installed socket remains reachable");
+    let poisoned_error = results
+        .pop()
+        .expect("one result")
+        .expect_err("the sender must reject work after an ambiguous write");
+    assert!(matches!(
+        poisoned_error.kind,
+        EncryptSendErrorKind::Poisoned
+    ));
+    assert!(poisoned_error.is_transport_unavailable());
+    assert!(frames.is_empty());
+    assert_eq!(frames.capacity(), retained_capacity);
+    assert_eq!(transport.failed_sends(), 1);
+    assert_eq!(
+        transport.write_count(),
+        0,
+        "a poisoned sender must not attempt another transport write"
+    );
+}
+
+/// A burst hands every frame to the sender before awaiting any of them, which
+/// is what lets them coalesce into one transport write. Awaiting each before
+/// enqueueing the next would still deliver all four, in order, and produce four
+/// writes instead of one -- so the write count is the assertion that separates
+/// the two, and the ciphertext order is what pins the counter sequence the peer
+/// will decrypt against.
+#[tokio::test]
+async fn a_multi_frame_burst_stays_one_ordered_write() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    // Distinct lengths, so a reordering is visible in the frame sizes even
+    // though the payloads are encrypted on the way out.
+    let mut frames: Vec<Vec<u8>> = (1..=4).map(|n| vec![n as u8; 16 * n]).collect();
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("installed socket");
+
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|result| result.is_ok()));
+    assert!(
+        frames.is_empty(),
+        "the burst must drain its input, which the workers rely on to refill it"
+    );
+    assert_eq!(
+        transport.write_count(),
+        1,
+        "the whole burst must reach the transport as one write"
+    );
+
+    let sent = transport.sent();
+    assert_eq!(sent.len(), 4, "every frame must reach the wire");
+    // Each wire frame is its plaintext plus the AEAD tag and the length prefix,
+    // a fixed function of the plaintext length, so the sizes identify which
+    // plaintext landed where.
+    const TAG_AND_PREFIX: usize = 16 + wacore::framing::FRAME_LENGTH_SIZE;
+    let lengths: Vec<usize> = sent.iter().map(|frame| frame.len()).collect();
+    assert_eq!(
+        lengths,
+        (1..=4)
+            .map(|n| 16 * n + TAG_AND_PREFIX)
+            .collect::<Vec<usize>>(),
+        "frames must reach the wire in the order they were given"
+    );
+}
+
+#[tokio::test]
+async fn raw_bytes_burst_surfaces_a_closed_sender_per_frame() {
+    use crate::socket::error::EncryptSendErrorKind;
+
+    let client = crate::test_utils::create_test_client().await;
+    install_test_noise_socket(
+        &client,
+        Arc::new(crate::transport::mock::MockTransport),
+        Arc::new(DropSpawnRuntime),
+    )
+    .await;
+
+    let mut frames = Vec::with_capacity(4);
+    let retained_capacity = frames.capacity();
+    frames.push(vec![0x41; 32]);
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("the installed socket remains reachable");
+    let error = results
+        .pop()
+        .expect("one result")
+        .expect_err("the sender receiver was dropped at construction");
+    assert!(matches!(error.kind, EncryptSendErrorKind::ChannelClosed));
+    assert!(error.is_transport_unavailable());
+    assert!(frames.is_empty());
+    assert_eq!(frames.capacity(), retained_capacity);
 }
 
 /// Live delivery receipts flow through the persistent worker: the receipt
@@ -3402,6 +3842,39 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
         0,
         "worker must release the flush guard after the send"
     );
+}
+
+/// Transport loss and the poisoned follow-up are reconnect signals, not
+/// receipt-worker stalls: both must release their flush guards without a
+/// second write attempt.
+#[tokio::test]
+async fn delivery_receipt_worker_releases_flush_after_transport_and_poisoned_failures() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    transport.fail_next_sends(1);
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    client.ack_received_message(&receipt_test_info("RCPT-FAIL-1"));
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(client.outbound_flush.pending(), 0);
+    assert_eq!(transport.failed_sends(), 1);
+
+    client.ack_received_message(&receipt_test_info("RCPT-POISONED-2"));
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(client.outbound_flush.pending(), 0);
+    assert_eq!(
+        transport.failed_sends(),
+        1,
+        "the poisoned sender must reject locally instead of touching transport"
+    );
+    assert_eq!(transport.write_count(), 0);
 }
 
 /// A closed flush scope (disconnect in progress) drops live receipts without
@@ -3551,6 +4024,82 @@ async fn test_send_ack_for_returns_error_when_disconnected() {
         matches!(result, Err(ClientError::NotConnected)),
         "send_ack_for must return Err(NotConnected) when disconnected, got: {result:?}"
     );
+}
+
+/// The gate that `send_ack_for` applies per ack, and that the burst path
+/// applies once per burst, must agree on what counts as teardown. A burst that
+/// missed it would write stale acks into a socket that is being torn down and
+/// hold the outbound flush open until its timeout.
+#[tokio::test]
+async fn outbound_teardown_gate_covers_both_disconnect_signals() {
+    let client = crate::test_utils::create_test_client().await;
+
+    client.set_connected_for_test(true);
+    client.expected_disconnect.store(false, Ordering::Relaxed);
+    assert!(
+        !client.outbound_teardown_in_progress(),
+        "a live connection must not be treated as tearing down"
+    );
+
+    client.expected_disconnect.store(true, Ordering::Relaxed);
+    assert!(
+        client.outbound_teardown_in_progress(),
+        "an expected disconnect (an intentional close, or a 515) must gate sends"
+    );
+
+    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.set_connected_for_test(false);
+    assert!(
+        client.outbound_teardown_in_progress(),
+        "a disconnected client must gate sends even without the expected flag"
+    );
+}
+
+/// Exercise the actual deferred-ack worker, not only its predicate. Dropped
+/// teardown batches must release guards, and reusing the batch buffer must not
+/// leak either dropped ack into the next live burst.
+#[tokio::test]
+async fn deferred_ack_worker_drops_teardown_batches_and_recovers_cleanly() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+    let receipt = |id| {
+        let node = NodeBuilder::new("receipt")
+            .attr("from", "15550001111@s.whatsapp.net")
+            .attr("id", id)
+            .build();
+        crate::test_utils::node_to_owned_ref(&node)
+    };
+
+    client.expected_disconnect.store(true, Ordering::Relaxed);
+    client
+        .process_node(receipt("ACK-EXPECTED-DISCONNECT"))
+        .await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(transport.sent_count(), 0);
+
+    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.set_connected_for_test(false);
+    client.process_node(receipt("ACK-DISCONNECTED")).await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(transport.sent_count(), 0);
+
+    client.set_connected_for_test(true);
+    client.process_node(receipt("ACK-LIVE")).await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        transport.sent_count(),
+        1,
+        "only the live ack may survive into the reusable batch"
+    );
+    assert_eq!(client.outbound_flush.pending(), 0);
 }
 
 /// Verifies that `send_ack_for` returns Ok when expected_disconnect is set,
@@ -3811,6 +4360,45 @@ async fn received_stanza_handling_reads_no_clock() {
 
 /// memory_report must be callable on a fresh client and internally
 /// consistent: empty collections report zero entries and zero bytes.
+/// The Display sections are sliced by hard-coded boundaries over
+/// `collections()`, so adding a cache without moving the boundary silently
+/// prints it under the wrong heading and drops the last one of the next
+/// section. This pins the layout instead of the individual counts.
+#[tokio::test]
+async fn memory_report_display_sections_stay_aligned() {
+    let client = crate::test_utils::create_test_client_with_name("memory_report_sections").await;
+    let rendered = client.memory_report().await.to_string();
+
+    let ttl_start = rendered
+        .find("--- TTL-bounded caches ---")
+        .expect("ttl section");
+    let signal_start = rendered.find("--- Signal store").expect("signal section");
+    let ttl_block = &rendered[ttl_start..signal_start];
+
+    for name in [
+        "group_cache:",
+        "device_registry_cache:",
+        "recent_messages:",
+        "group_devices_memo:",
+        "dm_devices_memo:",
+    ] {
+        assert!(
+            ttl_block.contains(name),
+            "{name} must render under the TTL-bounded heading, got:\n{rendered}"
+        );
+    }
+    for name in [
+        "signal_sessions:",
+        "signal_identities:",
+        "signal_sender_keys:",
+    ] {
+        assert!(
+            rendered[signal_start..].contains(name),
+            "{name} must render under the Signal heading, got:\n{rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn memory_report_on_fresh_client() {
     // recent_messages is capacity-0 (disabled) by default; enable it so the
@@ -3873,13 +4461,14 @@ async fn resource_report_composes_client_and_out_of_client_components() {
         mem.total_estimated_bytes()
     );
 
-    // The SQLite backend reports its page-cache estimate — proving the storage
-    // report (workstream A) composes through `dyn Backend`.
-    assert!(
+    // The SQLite backend is intentionally best-effort and uses a non-blocking pool checkout.
+    // A concurrently held single connection may therefore report no storage sample; when a sample
+    // is available, its two SQLite-derived fields must remain coherent. The backend's dedicated
+    // resource-report test deterministically verifies the concrete page-cache calculation.
+    assert_eq!(
         report.storage.memory_bytes.is_some(),
-        "SQLite backend reports storage memory"
+        report.storage.pages.is_some()
     );
-    assert!(report.storage.pages.is_some());
 
     // No transport is connected and the mock HTTP client reports nothing.
     assert!(report.transport.is_none());
@@ -4069,4 +4658,50 @@ async fn offline_preview_defaults_absent_counts_to_zero() {
     assert_eq!(preview.total, 1);
     assert_eq!(preview.calls, 0);
     assert_eq!(preview.statuses, 0);
+}
+
+/// A phash waiter is resolved by an ack that may never arrive, and nothing
+/// polls it. The sweep has to drop the stale one, or a non-empty map reads as
+/// "IQ pending" and silences pings for the life of the connection.
+#[test]
+fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
+    use crate::client::{PhashWaiter, ResponseWaiter, ResponseWaiterMap};
+    use futures::channel::oneshot;
+
+    let mut map = ResponseWaiterMap::default();
+    let waiter = |registered_epoch: u64| {
+        ResponseWaiter::Phash(PhashWaiter {
+            expected: wacore_binary::CompactString::from("hash"),
+            jid: "13135550100@s.whatsapp.net".parse().expect("valid jid"),
+            invalidate_group_cache: false,
+            registered_epoch,
+        })
+    };
+
+    let epoch = map.current_epoch();
+    map.insert("first".to_string(), waiter(epoch));
+    let (iq_tx, _iq_rx) = oneshot::channel();
+    map.insert("iq".to_string(), ResponseWaiter::Iq(iq_tx));
+
+    // One sweep is not enough: the waiter registered in the current epoch is
+    // still within its window, so an ack in flight is not discarded early.
+    map.drop_expired_phash();
+    assert!(
+        map.remove("first").is_some(),
+        "a waiter must survive the sweep of the epoch it registered in"
+    );
+
+    // Registered before a sweep, then swept again: now it is stale.
+    let epoch = map.current_epoch();
+    map.insert("stale".to_string(), waiter(epoch));
+    map.drop_expired_phash();
+    map.drop_expired_phash();
+    assert!(
+        map.remove("stale").is_none(),
+        "a waiter that lived through a full sweep must be dropped"
+    );
+    assert!(
+        map.remove("iq").is_some(),
+        "the sweep must never touch IQ waiters, which have their own cleanup"
+    );
 }

@@ -92,7 +92,7 @@ impl<'a> Comments<'a> {
         let comment_secret: [u8; 32] = {
             use rand::Rng;
             let mut secret = [0u8; 32];
-            rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut secret);
+            rand::rng().fill_bytes(&mut secret);
             secret
         };
 

@@ -305,7 +305,7 @@ impl User {
                 .unwrap();
         });
 
-        let address = ProtocolAddress::new(name.to_string(), device_id.into());
+        let address = ProtocolAddress::new(name, device_id.into());
 
         Self {
             address,

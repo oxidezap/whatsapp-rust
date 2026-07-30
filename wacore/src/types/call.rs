@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use wacore_binary::Jid;
 
+#[cfg(feature = "voip")]
+use super::group_call::GroupCallDevice;
+use super::group_call::{GroupCallEncRekey, GroupCallUpdate, ScreenShare, WaitingRoom};
+
 /// The encrypted callKey + parsed relay carried by an `<offer>`, captured so the media facade can
 /// decrypt the callKey and connect the relay without re-walking the raw stanza. Binary/media-only,
 /// so it is kept off the `serde` shape (downstream JS consumers see only the signaling fields).
@@ -19,6 +23,10 @@ pub struct MediaOffer {
     /// Rollout metadata echoed by official callees in the video accept.
     pub peer_abtest_bucket: Option<String>,
     pub peer_abtest_bucket_id_list: Option<String>,
+    /// The offerer's active device capability. The raw capability stays private inside
+    /// [`GroupCallDevice`], but the runtime can retain it to promote this 1:1 call to ad-hoc group
+    /// media later.
+    pub peer_device: Option<GroupCallDevice>,
 }
 
 #[cfg(feature = "voip")]
@@ -126,29 +134,27 @@ impl VideoState {
 
 /// Fields kept per-variant (not a shared `BasicCallMeta`) so the `serde` shape
 /// mirrors the stanza 1:1 for downstream JS consumers.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, crate::WireEnum)]
+#[wire(tag = "type")]
 // Forward-compat: WA can add call sub-types, so an external exhaustive match must keep a wildcard.
 #[non_exhaustive]
 pub enum CallAction {
+    #[wire = "offer"]
     Offer {
         call_id: String,
         call_creator: Jid,
-        #[serde(skip_serializing_if = "Option::is_none")]
         caller_pn: Option<Jid>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         caller_country_code: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         device_class: Option<String>,
         joinable: bool,
         is_video: bool,
         audio: Vec<CallAudioCodec>,
         /// Set on group calls. Primary group signal per `WAWebVoipGatingUtils`.
-        #[serde(skip_serializing_if = "Option::is_none")]
         group_jid: Option<Jid>,
     },
     /// Group-call notification fan-out to members. No offer-receipt expected;
     /// the generic call ack is enough (router handles it via `should_ack`).
+    #[wire = "offer_notice"]
     OfferNotice {
         call_id: String,
         call_creator: Jid,
@@ -157,64 +163,85 @@ pub enum CallAction {
         /// `type == "group"` per `WAWebHandleVoipOfferNotice`.
         is_group: bool,
     },
+    #[wire = "preaccept"]
     PreAccept {
         call_id: String,
         call_creator: Jid,
         audio: Vec<CallAudioCodec>,
     },
+    #[wire = "accept"]
     Accept {
         call_id: String,
         call_creator: Jid,
         audio: Vec<CallAudioCodec>,
     },
+    #[wire = "reject"]
     Reject {
         call_id: String,
         call_creator: Jid,
         /// Why the device rejected. `busy` means THAT DEVICE cannot take the call (already in one,
         /// or a companion that does not do voice) - it is not the callee declining, and the peer's
         /// other devices keep ringing. Absent means an explicit decline by the user.
-        #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    #[wire = "terminate"]
     Terminate {
         call_id: String,
         call_creator: Jid,
         /// Why the peer ended the call. WA Web maps this to the call-log outcome:
         /// `accepted_elsewhere`/`rejected_elsewhere` mean another of the callee's devices
         /// answered/declined (NOT a missed call); `timeout`/`group_call_ended`/absent mean missed.
-        #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         duration: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         audio_duration: Option<u32>,
     },
     /// ICE/relay candidate exchange. `transport_message_type`: 1 relay candidate,
     /// 3 peer ICE (callee replies 9), 9 keepalive/reply.
+    #[wire = "transport"]
     Transport {
         call_id: String,
         call_creator: Jid,
-        #[serde(skip_serializing_if = "Option::is_none")]
         p2p_cand_round: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         transport_message_type: Option<String>,
     },
     /// Per-relay RTT probe from the peer; the client replies with a relaylatency ack.
+    #[wire = "relaylatency"]
     RelayLatency { call_id: String, call_creator: Jid },
     /// In-call `<video state=N>` signaling: the audio→video upgrade / video→audio downgrade
-    /// handshake. Serde-renamed to the wire tag (`video`), like the other variants.
-    #[serde(rename = "video")]
+    /// handshake.
+    #[wire = "video"]
     VideoState {
         call_id: String,
         call_creator: Jid,
         state: VideoState,
         /// `device_orientation` attr (0..3, ×90° rotation of the sender's camera).
-        #[serde(skip_serializing_if = "Option::is_none")]
         orientation: Option<u8>,
         /// `dec` attr: the codecs the sender can decode (`"H264"` on an upgrade request,
         /// `"H264,AV1"` on an accept).
-        #[serde(skip_serializing_if = "Option::is_none")]
         dec: Option<String>,
+    },
+    /// Transaction-ordered authoritative membership and relay snapshot.
+    #[wire = "group_update"]
+    GroupUpdate { update: Box<GroupCallUpdate> },
+    /// Signal-encrypted keygen-v2 epoch for a group call.
+    #[wire = "enc_rekey"]
+    EncRekey { rekey: Box<GroupCallEncRekey> },
+    /// Authoritative admission state for a reusable call-link call.
+    #[wire = "waiting_room_update"]
+    WaitingRoomUpdate { room: Box<WaitingRoom> },
+    /// Persistent raise/lower-hand state for one participant.
+    #[wire = "user_action"]
+    RaiseHand {
+        call_id: String,
+        call_creator: Jid,
+        raised: bool,
+    },
+    /// Screen-share state for one participant.
+    #[wire = "screen_share"]
+    ScreenShare {
+        call_id: String,
+        call_creator: Jid,
+        screen_share: ScreenShare,
     },
 }
 
@@ -229,7 +256,12 @@ impl CallAction {
             | Self::Terminate { call_id, .. }
             | Self::Transport { call_id, .. }
             | Self::RelayLatency { call_id, .. }
-            | Self::VideoState { call_id, .. } => call_id,
+            | Self::VideoState { call_id, .. }
+            | Self::RaiseHand { call_id, .. }
+            | Self::ScreenShare { call_id, .. } => call_id,
+            Self::GroupUpdate { update } => &update.call_id,
+            Self::EncRekey { rekey } => &rekey.call_id,
+            Self::WaitingRoomUpdate { room } => &room.call_id,
         }
     }
 
@@ -243,27 +275,24 @@ impl CallAction {
             | Self::Terminate { call_creator, .. }
             | Self::Transport { call_creator, .. }
             | Self::RelayLatency { call_creator, .. }
-            | Self::VideoState { call_creator, .. } => call_creator,
+            | Self::VideoState { call_creator, .. }
+            | Self::RaiseHand { call_creator, .. }
+            | Self::ScreenShare { call_creator, .. } => call_creator,
+            Self::GroupUpdate { update } => &update.call_creator,
+            Self::EncRekey { rekey } => &rekey.call_creator,
+            Self::WaitingRoomUpdate { room } => &room.call_creator,
         }
     }
 
-    /// The wire tag name of the action variant (`offer`, `accept`, ...), for logging.
+    /// Backwards-compatible name for the action's wire tag.
+    #[deprecated(since = "0.6.0", note = "use CallAction::wire_tag")]
+    #[inline]
     pub fn action_kind(&self) -> &'static str {
-        match self {
-            Self::Offer { .. } => "offer",
-            Self::OfferNotice { .. } => "offer_notice",
-            Self::PreAccept { .. } => "preaccept",
-            Self::Accept { .. } => "accept",
-            Self::Reject { .. } => "reject",
-            Self::Terminate { .. } => "terminate",
-            Self::Transport { .. } => "transport",
-            Self::RelayLatency { .. } => "relaylatency",
-            Self::VideoState { .. } => "video",
-        }
+        self.wire_tag()
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct IncomingCall {
     pub from: Jid,
@@ -275,10 +304,24 @@ pub struct IncomingCall {
     pub platform: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Companion-routing metadata copied from the outer `<call>` wrapper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant: Option<Jid>,
+    /// Companion recipient metadata copied from the outer `<call>` wrapper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<Jid>,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub timestamp: DateTime<Utc>,
     pub offline: bool,
     pub action: CallAction,
+    /// Group snapshot embedded in an initial offer or active-call invitation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<Box<GroupCallUpdate>>,
+    /// Registry generation assigned before the offer is dispatched. This is internal routing
+    /// metadata, not part of the serialized event payload.
+    #[serde(skip)]
+    #[builder(skip)]
+    pub(crate) ringing_generation: Option<u64>,
     /// Media material from an `<offer>` (the encrypted callKey + parsed relay), captured by the
     /// parser so the `voip` media facade can drive the call. `None` for non-offer actions or an
     /// offer with no `<enc>` for us. Boxed so the large `RelayData` doesn't bloat every `Event`
@@ -373,6 +416,18 @@ pub enum ElsewhereOutcome {
 }
 
 impl IncomingCall {
+    /// Attach the exact ringing generation to a dispatched offer.
+    #[doc(hidden)]
+    pub fn set_ringing_generation(&mut self, generation: u64) {
+        self.ringing_generation = Some(generation);
+    }
+
+    /// Return the exact ringing generation attached before dispatch, when available.
+    #[doc(hidden)]
+    pub fn ringing_generation(&self) -> Option<u64> {
+        self.ringing_generation
+    }
+
     /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the
     /// struct literal cross-crate, so this is the supported way to build one outside `wacore`. The
     /// optional/media fields default to absent; mutate the public fields after for other shapes.
@@ -383,17 +438,12 @@ impl IncomingCall {
         timestamp: DateTime<Utc>,
         action: CallAction,
     ) -> Self {
-        Self {
-            from,
-            stanza_id,
-            notify: None,
-            platform: None,
-            version: None,
-            timestamp,
-            offline: false,
-            action,
-            #[cfg(feature = "voip")]
-            media: None,
-        }
+        Self::builder()
+            .from(from)
+            .stanza_id(stanza_id)
+            .timestamp(timestamp)
+            .offline(false)
+            .action(action)
+            .build()
     }
 }

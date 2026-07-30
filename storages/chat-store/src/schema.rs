@@ -31,6 +31,11 @@ diesel::table! {
         starred -> Bool,
         edited_at_ms -> Nullable<BigInt>,
         revoked -> Bool,
+        // SQLite's implicit arrival counter, declared so the reader can sort
+        // and page on it. Never written: it is assigned by the INSERT and
+        // survives every UPDATE the writer does, which is exactly the
+        // "order the socket delivered this row" the message sort needs.
+        rowid -> BigInt,
     }
 }
 
@@ -57,7 +62,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    message_receipts (device_id, chat_jid, msg_id, user_jid) {
+    message_receipts (device_id, chat_jid, msg_id, user_jid, receipt_type) {
         device_id -> Integer,
         chat_jid -> Text,
         msg_id -> Text,
