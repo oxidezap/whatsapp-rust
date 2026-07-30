@@ -10,10 +10,22 @@ use crate::protocol::{
 };
 
 /// A unique identifier selecting among this client's known pre-keys.
-#[derive(
-    Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, derive_more::From, derive_more::Into,
-)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PreKeyId(u32);
+
+impl From<u32> for PreKeyId {
+    #[inline]
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<PreKeyId> for u32 {
+    #[inline]
+    fn from(id: PreKeyId) -> Self {
+        id.0
+    }
+}
 
 impl fmt::Display for PreKeyId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -12,94 +12,93 @@ use crate::{
     },
     protocol::CiphertextMessageType,
 };
-use displaydoc::Display;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, SignalProtocolError>;
 
-#[derive(Debug, Display, Error)]
+#[derive(Debug, Error)]
 pub enum SignalProtocolError {
-    /// invalid argument: {0}
+    #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    /// invalid state for call to {0} to succeed: {1}
+    #[error("invalid state for call to {0} to succeed: {1}")]
     InvalidState(&'static str, String),
 
-    /// backend store error in {0}
+    #[error("backend store error in {0}")]
     BackendError(
         &'static str,
         #[source] Box<dyn std::error::Error + Send + Sync>,
     ),
 
-    /// protobuf encoding was invalid
+    #[error("protobuf encoding was invalid")]
     InvalidProtobufEncoding,
 
-    /// ciphertext serialized bytes were too short <{0}>
+    #[error("ciphertext serialized bytes were too short <{0}>")]
     CiphertextMessageTooShort(usize),
-    /// ciphertext version was too old <{0}>
+    #[error("ciphertext version was too old <{0}>")]
     LegacyCiphertextVersion(u8),
-    /// ciphertext version was unrecognized <{0}>
+    #[error("ciphertext version was unrecognized <{0}>")]
     UnrecognizedCiphertextVersion(u8),
-    /// unrecognized message version <{0}>
+    #[error("unrecognized message version <{0}>")]
     UnrecognizedMessageVersion(u32),
 
-    /// fingerprint version number mismatch them {0} us {1}
+    #[error("fingerprint version number mismatch them {0} us {1}")]
     FingerprintVersionMismatch(u32, u32),
-    /// fingerprint parsing error
+    #[error("fingerprint parsing error")]
     FingerprintParsingError,
 
-    /// no key type identifier
+    #[error("no key type identifier")]
     NoKeyTypeIdentifier,
-    /// bad key type <{0:#04x}>
+    #[error("bad key type <{0:#04x}>")]
     BadKeyType(u8),
-    /// bad key length <{1}> for key with type <{0}>
+    #[error("bad key length <{1}> for key with type <{0}>")]
     BadKeyLength(KeyType, usize),
 
-    /// invalid signature detected
+    #[error("invalid signature detected")]
     SignatureValidationFailed,
 
-    /// untrusted identity for address {0}
+    #[error("untrusted identity for address {0}")]
     UntrustedIdentity(ProtocolAddress),
 
-    /// invalid prekey identifier
+    #[error("invalid prekey identifier")]
     InvalidPreKeyId,
-    /// invalid signed prekey identifier
+    #[error("invalid signed prekey identifier")]
     InvalidSignedPreKeyId,
 
-    /// invalid MAC key length <{0}>
+    #[error("invalid MAC key length <{0}>")]
     InvalidMacKeyLength(usize),
 
-    /// no sender key state: {0}
+    #[error("no sender key state: {0}")]
     NoSenderKeyState(String),
 
-    /// session with {0} not found
+    #[error("session with {0} not found")]
     SessionNotFound(ProtocolAddress),
-    /// invalid session: {0}
+    #[error("invalid session: {0}")]
     InvalidSessionStructure(&'static str),
-    /// invalid sender key session
+    #[error("invalid sender key session")]
     InvalidSenderKeySession,
-    /// session for {0} has invalid registration ID {1:X}
+    #[error("session for {0} has invalid registration ID {1:X}")]
     InvalidRegistrationId(ProtocolAddress, u32),
 
-    /// message with old counter {0} / {1}
+    #[error("message with old counter {0} / {1}")]
     DuplicatedMessage(u32, u32),
-    /// invalid {0:?} message: {1}
+    #[error("invalid {0:?} message: {1}")]
     InvalidMessage(CiphertextMessageType, &'static str),
-    /// MAC verification failed for {0:?} message
+    #[error("MAC verification failed for {0:?} message")]
     BadMac(CiphertextMessageType),
 
-    /// error while invoking an ffi callback: {0}
+    #[error("error while invoking an ffi callback: {0}")]
     FfiBindingError(String),
-    /// error in method call '{0}': {1}
+    #[error("error in method call '{0}': {1}")]
     ApplicationCallbackError(
         &'static str,
         #[source] Box<dyn std::error::Error + Send + Sync + UnwindSafe + 'static>,
     ),
 
-    /// invalid sealed sender message: {0}
+    #[error("invalid sealed sender message: {0}")]
     InvalidSealedSenderMessage(String),
-    /// unknown sealed sender message version {0}
+    #[error("unknown sealed sender message version {0}")]
     UnknownSealedSenderVersion(u8),
-    /// self send of a sealed sender message
+    #[error("self send of a sealed sender message")]
     SealedSenderSelfSend,
 }
 

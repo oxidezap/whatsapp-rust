@@ -5,7 +5,6 @@ use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
 use anyhow::{Result, anyhow};
 use std::num::NonZeroU32;
-use typed_builder::TypedBuilder;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
@@ -224,13 +223,10 @@ crate::define_validated_string! {
     pub struct GroupDescription(max_len = GROUP_DESCRIPTION_MAX_LENGTH, name = "Group description")
 }
 /// Options for a participant when creating a group.
-#[derive(Debug, Clone, TypedBuilder)]
-#[builder(build_method(into))]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct GroupParticipantOptions {
     pub jid: Jid,
-    #[builder(default, setter(strip_option))]
     pub phone_number: Option<Jid>,
-    #[builder(default, setter(strip_option))]
     pub privacy: Option<Vec<u8>>,
 }
 
@@ -259,20 +255,23 @@ impl GroupParticipantOptions {
 }
 
 /// Options for creating a new group.
-#[derive(Debug, Clone, TypedBuilder)]
-#[builder(build_method(into))]
+// `member_link_mode` and the three that follow default to `Some(..)` rather
+// than `None`, which bon spells only on a member marked `required` (its
+// `Option` shorthand hardcodes a `None` default). `with` restores the
+// bare-value setter that shorthand would otherwise have provided.
+#[derive(Debug, Clone, bon::Builder)]
 pub struct GroupCreateOptions {
-    #[builder(setter(into))]
+    #[builder(into)]
     pub subject: String,
     #[builder(default)]
     pub participants: Vec<GroupParticipantOptions>,
-    #[builder(default = Some(MemberLinkMode::AdminLink), setter(strip_option))]
+    #[builder(required, default = Some(MemberLinkMode::AdminLink), with = |v: MemberLinkMode| Some(v))]
     pub member_link_mode: Option<MemberLinkMode>,
-    #[builder(default = Some(MemberAddMode::AllMemberAdd), setter(strip_option))]
+    #[builder(required, default = Some(MemberAddMode::AllMemberAdd), with = |v: MemberAddMode| Some(v))]
     pub member_add_mode: Option<MemberAddMode>,
-    #[builder(default = Some(MembershipApprovalMode::Off), setter(strip_option))]
+    #[builder(required, default = Some(MembershipApprovalMode::Off), with = |v: MembershipApprovalMode| Some(v))]
     pub membership_approval_mode: Option<MembershipApprovalMode>,
-    #[builder(default = Some(0), setter(strip_option))]
+    #[builder(required, default = Some(0), with = |v: u32| Some(v))]
     pub ephemeral_expiration: Option<u32>,
     /// Create as a community (parent group). Emits `<parent/>` in the create stanza.
     #[builder(default)]
@@ -291,12 +290,12 @@ pub struct GroupCreateOptions {
     pub create_general_chat: bool,
     /// Parent community to link this subgroup to. Atomic alternative to
     /// creating then linking; mutually exclusive with `is_parent`.
-    #[builder(default, setter(strip_option, into))]
+    #[builder(into)]
     pub linked_parent: Option<Jid>,
     /// Inline description carried on the create stanza; avoids a follow-up
     /// SetGroupDescription IQ. Validation (length cap) goes through
     /// [`GroupDescription`] so both create paths share the same contract.
-    #[builder(default, setter(strip_option, into))]
+    #[builder(into)]
     pub description: Option<GroupDescription>,
 }
 

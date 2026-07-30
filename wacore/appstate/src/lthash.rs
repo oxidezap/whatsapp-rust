@@ -78,16 +78,15 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
         let (input_chunks, input_rem) = input_remaining.as_chunks::<16>();
 
         for (base_chunk, input_chunk) in base_chunks.iter_mut().zip(input_chunks) {
-            let mut base_arr: [u16; 8] = bytemuck::cast(*base_chunk);
-            let mut input_arr: [u16; 8] = bytemuck::cast(*input_chunk);
-            if cfg!(target_endian = "big") {
-                for v in &mut base_arr {
-                    *v = v.swap_bytes();
-                }
-                for v in &mut input_arr {
-                    *v = v.swap_bytes();
-                }
-            }
+            // `from_le_bytes` per lane states the wire endianness directly, so
+            // the same code is correct on either host; on little-endian it
+            // lowers to the plain 16-byte load a transmute would have emitted.
+            let base_arr: [u16; 8] = core::array::from_fn(|i| {
+                u16::from_le_bytes([base_chunk[2 * i], base_chunk[2 * i + 1]])
+            });
+            let input_arr: [u16; 8] = core::array::from_fn(|i| {
+                u16::from_le_bytes([input_chunk[2 * i], input_chunk[2 * i + 1]])
+            });
             let base_simd = u16x8::from_array(base_arr);
             let input_simd = u16x8::from_array(input_arr);
 
@@ -97,13 +96,10 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
                 base_simd + input_simd
             };
 
-            let mut out = result_simd.to_array();
-            if cfg!(target_endian = "big") {
-                for v in &mut out {
-                    *v = v.swap_bytes();
-                }
+            let out = result_simd.to_array();
+            for (base_pair, lane) in base_chunk.as_chunks_mut::<2>().0.iter_mut().zip(out) {
+                *base_pair = lane.to_le_bytes();
             }
-            *base_chunk = bytemuck::cast(out);
         }
 
         base_remaining = base_rem;

@@ -6,8 +6,6 @@
 use std::fmt;
 use std::sync::LazyLock;
 
-use arrayref::array_ref;
-
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -156,10 +154,17 @@ impl MessageKeys {
             }
         }
 
+        // `split_first_chunk` carries the window lengths in the type, so the
+        // 32/32/16 split of the 80-byte OKM is checked at compile time and the
+        // `Option` folds away against the fixed-size array.
+        let (cipher_key, rest) = okm.split_first_chunk::<32>().expect("80-byte OKM");
+        let (mac_key, rest) = rest.split_first_chunk::<32>().expect("80-byte OKM");
+        let (iv, _) = rest.split_first_chunk::<16>().expect("80-byte OKM");
+
         MessageKeys {
-            cipher_key: *array_ref![okm, 0, 32],
-            mac_key: *array_ref![okm, 32, 32],
-            iv: *array_ref![okm, 64, 16],
+            cipher_key: *cipher_key,
+            mac_key: *mac_key,
+            iv: *iv,
             counter,
         }
     }
@@ -284,12 +289,15 @@ impl RootKey {
             .expand(b"WhisperRatchet", &mut derived_secret_bytes)
             .expect("valid output length");
 
+        let (root_key, chain_key) = derived_secret_bytes
+            .split_first_chunk::<32>()
+            .expect("64-byte OKM");
+        let (chain_key, _) = chain_key.split_first_chunk::<32>().expect("64-byte OKM");
+
         Ok((
-            RootKey {
-                key: *array_ref![derived_secret_bytes, 0, 32],
-            },
+            RootKey { key: *root_key },
             ChainKey {
-                key: *array_ref![derived_secret_bytes, 32, 32],
+                key: *chain_key,
                 index: 0,
             },
         ))
@@ -326,9 +334,9 @@ mod tests {
                 .expand(b"WhisperMessageKeys", &mut okm)
                 .expect("valid output length");
 
-            assert_eq!(keys.cipher_key(), array_ref![okm, 0, 32]);
-            assert_eq!(keys.mac_key(), array_ref![okm, 32, 32]);
-            assert_eq!(keys.iv(), array_ref![okm, 64, 16]);
+            assert_eq!(&keys.cipher_key()[..], &okm[0..32]);
+            assert_eq!(&keys.mac_key()[..], &okm[32..64]);
+            assert_eq!(&keys.iv()[..], &okm[64..80]);
             assert_eq!(keys.counter(), i as u32);
         }
     }

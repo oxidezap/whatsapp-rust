@@ -221,14 +221,27 @@ pub enum CiphertextMessage {
     PlaintextContent(PlaintextContent),
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, derive_more::TryFrom)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 #[repr(u8)]
-#[try_from(repr)]
 pub enum CiphertextMessageType {
     Whisper = 2,
     PreKey = 3,
     SenderKey = 7,
     Plaintext = 8,
+}
+
+impl TryFrom<u8> for CiphertextMessageType {
+    type Error = crate::core::UnknownDiscriminant;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            2 => Ok(Self::Whisper),
+            3 => Ok(Self::PreKey),
+            7 => Ok(Self::SenderKey),
+            8 => Ok(Self::Plaintext),
+            _ => Err(crate::core::UnknownDiscriminant { value }),
+        }
+    }
 }
 
 impl CiphertextMessage {

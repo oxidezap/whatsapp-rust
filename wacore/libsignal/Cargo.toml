@@ -15,7 +15,6 @@ legacy-session-interop = []
 
 [dependencies]
 aes = { workspace = true }
-arrayref = "0.3.9"
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 buffa = { workspace = true }
@@ -24,8 +23,6 @@ cbc = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 ctr = { workspace = true }
 curve25519-dalek = "5.0.0"
-derive_more = { version = "2.1.1", features = ["from", "into", "try_from"] }
-displaydoc = "0.2.7"
 ghash = "0.6.0"
 hex = { workspace = true }
 hkdf = { workspace = true }
@@ -38,7 +35,6 @@ sha1 = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 wacore-derive = { workspace = true }
 waproto = { workspace = true }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }

@@ -18,21 +18,25 @@ use crate::protocol::{
 ///
 /// Wrapper for [`PublicKey`].
 #[derive(
-    Debug,
-    PartialOrd,
-    Ord,
-    PartialEq,
-    Eq,
-    Clone,
-    Copy,
-    derive_more::From,
-    derive_more::Into,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize,
 )]
 #[serde(transparent)]
 pub struct IdentityKey {
     public_key: PublicKey,
+}
+
+impl From<PublicKey> for IdentityKey {
+    #[inline]
+    fn from(public_key: PublicKey) -> Self {
+        Self { public_key }
+    }
+}
+
+impl From<IdentityKey> for PublicKey {
+    #[inline]
+    fn from(identity: IdentityKey) -> Self {
+        identity.public_key
+    }
 }
 
 impl IdentityKey {

@@ -83,13 +83,13 @@ impl GcmInPlaceBuffer for BytesMut {
     }
 }
 
-#[derive(Debug, displaydoc::Display, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum CryptoProviderError {
-    /// bad key/iv/nonce size or malformed input
+    #[error("bad key/iv/nonce size or malformed input")]
     BadInput,
-    /// authentication tag verification failed
+    #[error("authentication tag verification failed")]
     AuthFailed,
-    /// provider backend reported failure
+    #[error("provider backend reported failure")]
     BackendFailed,
 }
 

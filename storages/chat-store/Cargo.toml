@@ -17,7 +17,8 @@ search = []
 
 [dependencies]
 buffa = { workspace = true }
-chrono = { workspace = true, features = ["std", "clock"] }
+# `now` implies `std` and skips the local-timezone backends; only `Utc` is used.
+chrono = { workspace = true, features = ["now"] }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
 log = { workspace = true }

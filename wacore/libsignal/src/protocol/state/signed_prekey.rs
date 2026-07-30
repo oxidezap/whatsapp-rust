@@ -12,10 +12,22 @@ use crate::protocol::{
 };
 
 /// A unique identifier selecting among this client's known signed pre-keys.
-#[derive(
-    Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, derive_more::From, derive_more::Into,
-)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SignedPreKeyId(u32);
+
+impl From<u32> for SignedPreKeyId {
+    #[inline]
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<SignedPreKeyId> for u32 {
+    #[inline]
+    fn from(id: SignedPreKeyId) -> Self {
+        id.0
+    }
+}
 
 impl fmt::Display for SignedPreKeyId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

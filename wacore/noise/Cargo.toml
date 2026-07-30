@@ -35,7 +35,6 @@ waproto = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-waproto = { workspace = true }
 
 [[bench]]
 name = "noise_benchmark"

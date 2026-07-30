@@ -33,17 +33,15 @@ impl KeyType {
     }
 }
 
-#[derive(Debug, displaydoc::Display)]
+#[derive(Debug, thiserror::Error)]
 pub enum CurveError {
-    /// no key type identifier
+    #[error("no key type identifier")]
     NoKeyTypeIdentifier,
-    /// bad key type <{0:#04x}>
+    #[error("bad key type <{0:#04x}>")]
     BadKeyType(u8),
-    /// bad key length <{1}> for key with type <{0}>
+    #[error("bad key length <{1}> for key with type <{0}>")]
     BadKeyLength(KeyType, usize),
 }
-
-impl std::error::Error for CurveError {}
 
 impl TryFrom<u8> for KeyType {
     type Error = CurveError;
@@ -61,9 +59,16 @@ enum PublicKeyData {
     DjbPublicKey([u8; curve25519::PUBLIC_KEY_LENGTH]),
 }
 
-#[derive(Clone, Copy, Eq, derive_more::From)]
+#[derive(Clone, Copy, Eq)]
 pub struct PublicKey {
     key: PublicKeyData,
+}
+
+impl From<PublicKeyData> for PublicKey {
+    #[inline]
+    fn from(key: PublicKeyData) -> Self {
+        Self { key }
+    }
 }
 
 impl PublicKey {

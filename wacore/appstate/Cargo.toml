@@ -18,7 +18,6 @@ simd = ["wacore-binary/simd"]
 [dependencies]
 anyhow = { workspace = true }
 buffa = { workspace = true }
-bytemuck = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }

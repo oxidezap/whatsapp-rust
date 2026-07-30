@@ -75,7 +75,7 @@ unused_qualifications = "warn"
 
 [workspace.dependencies]
 aes = "0.9.2"
-aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "bytes"] }
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
@@ -85,7 +85,6 @@ bon = { version = "3.9.3", default-features = false, features = ["std"] }
 buffa = { version = "0.9.1", default-features = false, features = ["json"] }
 buffa-build = { version = "0.9.1", default-features = false }
 buffa-descriptor = { version = "0.9.1", default-features = false }
-bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
@@ -99,7 +98,7 @@ event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
-hashbrown = { version = "0.17.1", default-features = false, features = ["equivalent"] }
+hashbrown = { version = "0.17.1", default-features = false }
 heck = "0.5"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
@@ -207,7 +206,9 @@ base64 = { workspace = true }
 bon = { workspace = true, optional = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, features = ["clock"] }
+# `now` rather than `clock`: only `Utc::now()` is used, and `clock` exists to
+# resolve the local timezone (pulling iana-time-zone and its per-OS backends).
+chrono = { workspace = true, features = ["now"] }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 smallvec = { workspace = true }
@@ -252,7 +253,6 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 aes = { workspace = true }
-async-trait = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
 env_logger = { workspace = true }
 # `total_listeners()` (how tests observe that a waiter parked) is std-gated.

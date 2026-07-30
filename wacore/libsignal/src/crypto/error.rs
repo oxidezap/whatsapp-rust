@@ -3,19 +3,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-#[derive(displaydoc::Display, thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
-    /// "unknown {0} algorithm {1}"
+    #[error("\"unknown {0} algorithm {1}\"")]
     UnknownAlgorithm(&'static str, String),
-    /// invalid key size
+    #[error("invalid key size")]
     InvalidKeySize,
-    /// invalid nonce size
+    #[error("invalid nonce size")]
     InvalidNonceSize,
-    /// invalid input size
+    #[error("invalid input size")]
     InvalidInputSize,
-    /// invalid authentication tag
+    #[error("invalid authentication tag")]
     InvalidTag,
-    /// output buffer too small: required {required} bytes, provided {provided}
+    #[error("output buffer too small: required {required} bytes, provided {provided}")]
     OutputBufferTooSmall { required: usize, provided: usize },
 }
 

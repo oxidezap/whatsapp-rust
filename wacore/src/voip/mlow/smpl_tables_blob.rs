@@ -7,8 +7,6 @@
 //! this module. The load path is byte-identical to deserializing the JSON, so the codec output does
 //! not change.
 
-use std::io::Read;
-
 /// buffa-generated types for the table schemas (`tables.proto`), produced at
 /// build time into `OUT_DIR` (see `wacore/build.rs`). The `.bin` blobs decode
 /// against these by field number, so the format is unchanged from the prior
@@ -30,13 +28,14 @@ pub(crate) mod tables {
 #[cfg(test)]
 const GEN_ZLIB_LEVEL: u32 = 9;
 
+/// Largest table blob we will inflate. The committed `.bin` set tops out well
+/// under this; the cap only exists because the pooled inflater requires one.
+const MAX_TABLE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Inflate a zlib blob (the runtime load path for the table `.bin`).
 fn inflate(compressed: &[u8]) -> Vec<u8> {
-    let mut dec = flate2::read::ZlibDecoder::new(compressed);
-    let mut out = Vec::new();
-    dec.read_to_end(&mut out)
-        .expect("mlow table blob must zlib-inflate");
-    out
+    wacore_binary::zlib_pool::decompress_zlib_pooled(compressed, MAX_TABLE_BYTES)
+        .expect("mlow table blob must zlib-inflate")
 }
 
 /// Load a protobuf table from its embedded zlib blob.
