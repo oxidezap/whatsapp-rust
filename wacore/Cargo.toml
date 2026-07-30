@@ -102,7 +102,7 @@ divan = { workspace = true }
 # Compression only: the runtime inflates through `wacore_binary::zlib_pool`
 # (zlib-rs directly), so flate2 stays out of the release dependency set.
 flate2 = { workspace = true }
-futures = { workspace = true, features = ["executor", "thread-pool"] }
+futures = { workspace = true, features = ["executor"] }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [[bench]]
