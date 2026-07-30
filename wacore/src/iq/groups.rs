@@ -224,10 +224,20 @@ crate::define_validated_string! {
 }
 /// Options for a participant when creating a group.
 #[derive(Debug, Clone, bon::Builder)]
+#[builder(finish_fn = finish)]
 pub struct GroupParticipantOptions {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
     pub privacy: Option<Vec<u8>>,
+}
+
+/// `build()` finishes into anything the options convert into, not just `Self`.
+/// The reflexive `From` covers the plain case, so a caller that already has
+/// `impl From<GroupParticipantOptions> for T` keeps compiling.
+impl<S: group_participant_options_builder::IsComplete> GroupParticipantOptionsBuilder<S> {
+    pub fn build<T: From<GroupParticipantOptions>>(self) -> T {
+        self.finish().into()
+    }
 }
 
 impl GroupParticipantOptions {
@@ -260,6 +270,7 @@ impl GroupParticipantOptions {
 // `Option` shorthand hardcodes a `None` default). `with` restores the
 // bare-value setter that shorthand would otherwise have provided.
 #[derive(Debug, Clone, bon::Builder)]
+#[builder(finish_fn = finish)]
 pub struct GroupCreateOptions {
     #[builder(into)]
     pub subject: String,
@@ -297,6 +308,13 @@ pub struct GroupCreateOptions {
     /// [`GroupDescription`] so both create paths share the same contract.
     #[builder(into)]
     pub description: Option<GroupDescription>,
+}
+
+/// See [`GroupParticipantOptionsBuilder::build`] for why this is generic.
+impl<S: group_create_options_builder::IsComplete> GroupCreateOptionsBuilder<S> {
+    pub fn build<T: From<GroupCreateOptions>>(self) -> T {
+        self.finish().into()
+    }
 }
 
 impl GroupCreateOptions {

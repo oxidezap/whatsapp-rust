@@ -28,7 +28,7 @@ pub enum Direction {
 
 /// The result of saving a new identity key for a protocol address.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u8)]
+#[repr(C)]
 pub enum IdentityChange {
     /// The protocol address didn't have an identity key or had the same key.
     NewOrUnchanged,
@@ -36,10 +36,13 @@ pub enum IdentityChange {
     ReplacedExisting,
 }
 
-impl TryFrom<u8> for IdentityChange {
-    type Error = crate::core::UnknownDiscriminant;
+// `isize` rather than the narrower `u8` the variants fit in: `repr(C)` leaves
+// the discriminant type unspecified, so this mirrors what a repr-driven derive
+// falls back to and keeps the conversion callable with the same argument.
+impl TryFrom<isize> for IdentityChange {
+    type Error = crate::core::UnknownDiscriminant<isize>;
 
-    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: isize) -> std::result::Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::NewOrUnchanged),
             1 => Ok(Self::ReplacedExisting),

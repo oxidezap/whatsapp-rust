@@ -16,6 +16,6 @@ pub use address::{AddressBuf, DeviceId, ProtocolAddress};
 /// leaked through the public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("no variant with discriminant {value}")]
-pub struct UnknownDiscriminant {
-    pub value: u8,
+pub struct UnknownDiscriminant<T: std::fmt::Debug + std::fmt::Display> {
+    pub value: T,
 }

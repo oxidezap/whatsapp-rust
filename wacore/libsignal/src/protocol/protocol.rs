@@ -231,7 +231,7 @@ pub enum CiphertextMessageType {
 }
 
 impl TryFrom<u8> for CiphertextMessageType {
-    type Error = crate::core::UnknownDiscriminant;
+    type Error = crate::core::UnknownDiscriminant<u8>;
 
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
         match value {
