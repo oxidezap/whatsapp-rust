@@ -105,6 +105,10 @@ const PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS: u64 = 60;
 /// itself is the server acknowledging the bundle, not the primary opening it,
 /// so it arrives in one round trip or not at all.
 const PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS: u64 = 30;
+const _: () = assert!(
+    PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS < PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS,
+    "a companion_finish refusal has to land while the flow it belongs to is still the current one"
+);
 
 fn build_id_and_display(
     id: CompanionWebClientType,
@@ -636,13 +640,22 @@ impl PairCodeUtils {
     }
 }
 
-/// How the server refused a `companion_hello`, as a matchable status.
+/// How the server refused a pair-code request, as a matchable status.
 ///
 /// The five named variants are the complete set WA Web's own response parser
 /// accepts (`WASmaxInMdIqMixinErrors.parseIqMixinErrors`, reached from
 /// `WASmaxInMdCompanionHelloResponseError`); anything else makes its RPC throw
 /// "unknown error". They exist so a consumer can branch on the refusal instead
 /// of matching the formatted message, which is not a stable surface.
+///
+/// Both stages report through this, though they were read off `companion_hello`
+/// and the `companion_finish` parser is narrower — `WASmaxInMdCompanionFinishErrors`
+/// admits only `bad-request` and `internal-server-error`, and WA Web shows its
+/// generic failure for anything else. A code outside that pair is still
+/// classified here rather than discarded: what a consumer does about a refusal
+/// follows from the code, which is one namespace across both requests, and
+/// answering "nothing was refused" to a refusal we can read would be worse than
+/// naming it.
 ///
 /// The numbers are the `code` attribute, and each is the enum's whole wire form
 /// — [`code()`](Self::code) is what `Serialize` emits and what `From<i32>` reads

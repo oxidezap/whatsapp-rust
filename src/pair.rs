@@ -307,6 +307,12 @@ async fn handle_pair_success<'a>(
         (Jid::default(), Jid::default())
     };
 
+    // Taken before the secret is read, not just before the state is written: a
+    // pair-code flow being retired re-mints the adv secret under this same lock,
+    // and verifying against the old value and then completing against the new
+    // one would persist a paired device whose ADV signatures cannot validate.
+    let pair_code_state = client.pair_code_state.lock().await;
+
     let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {
         identity_key: device_snapshot.identity_key.clone(),
@@ -326,7 +332,9 @@ async fn handle_pair_success<'a>(
             // is the same mistake in the other direction: a rejected response
             // would take the displayed code down with it, and nothing puts one
             // back.
-            *client.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Completed;
+            let mut pair_code_state = pair_code_state;
+            *pair_code_state = wacore::pair_code::PairCodeState::Completed;
+            drop(pair_code_state);
             if let Some(tx) = client.pairing_cancellation_tx.lock().await.take() {
                 let _ = tx.try_send(());
                 debug!("Sent QR rotation stop signal");

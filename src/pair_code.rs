@@ -538,10 +538,10 @@ impl Client {
     /// dropped rather than answered with a bundle its holder cannot open.
     ///
     /// A flow cancelled after it reached stage 2 also gives up the adv secret
-    /// that stage derived, for the reason in [`replace_adv_secret_key`]. A
-    /// [`PairCodeState::Completed`] flow does not: that secret belongs to a
-    /// device that paired, and re-minting it would invalidate the account's own
-    /// ADV signatures.
+    /// that stage derived: it is keyed to a primary that will never link. A
+    /// [`PairCodeState::Completed`] flow does not, because that secret belongs
+    /// to a device that paired, and re-minting it would invalidate the
+    /// account's own ADV signatures.
     pub async fn cancel_pair_code(self: &Arc<Self>) {
         let mut state = self.pair_code_state.lock().await;
         if matches!(&*state, PairCodeState::Idle) {
@@ -923,7 +923,7 @@ async fn report_stage_two_failure(
     attempt: u32,
     error: IqError,
 ) {
-    if matches!(error, IqError::Timeout) {
+    if error.is_timeout() {
         warn!(
             target: "Client/PairCode",
             "companion_finish went unanswered; leaving the pair-success timer to write the code off"
@@ -1032,6 +1032,9 @@ async fn replace_adv_secret_key(client: &Arc<Client>) {
             adv_secret_key,
         ))
         .await;
+    // The QR payload embeds this key, and a code already on screen would now
+    // pair against a secret nothing matches — see `Client::refresh_pairing_qr`.
+    client.refresh_pairing_qr().await;
 }
 
 /// The server asked us to refresh the code we are displaying (WA Web
@@ -1999,6 +2002,38 @@ mod tests {
             "the replacement's adv secret must survive"
         );
         assert!(is_waiting(&client).await, "the replacement keeps the slot");
+
+        // The guard's other half: same ref, but a retry has since opened its own
+        // attempt. Covered here because a ref mismatch alone would let a
+        // regression that drops the attempt comparison pass unnoticed.
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 2).await;
+        let adv_of_retry = adv(&client);
+        report_stage_two_failure(
+            &client,
+            &[1, 2, 3, 4],
+            1,
+            IqError::ServerError {
+                code: 400,
+                text: "bad-request".to_string(),
+                error_type: None,
+                backoff: None,
+            },
+        )
+        .await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "an earlier attempt's refusal must not report the retry that replaced it"
+        );
+        assert_eq!(
+            adv(&client),
+            adv_of_retry,
+            "the retry's adv secret must survive"
+        );
+        assert!(is_waiting(&client).await, "the retry keeps the slot");
     }
 
     /// An unanswered `companion_finish` is not a refusal — it is the silence
