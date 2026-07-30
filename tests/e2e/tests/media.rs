@@ -446,6 +446,11 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
         "the CDN authorizes a download by its signed path, not by the session token"
     );
 
+    let cursor = hosts_only
+        .download_to_writer(&params, std::io::Cursor::new(Vec::<u8>::new()))
+        .await?;
+    assert_eq!(cursor.into_inner(), original);
+
     Ok(())
 }
 

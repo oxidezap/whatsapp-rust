@@ -391,6 +391,11 @@ pub struct MediaDownloader {
     route: MediaRoute,
 }
 
+/// The refresh budget for a caller with no media conn behind it. Its
+/// counterpart is [`MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS`], which the `Client`
+/// paths pass.
+const NO_MEDIA_CONN_REFRESH: usize = 0;
+
 impl MediaDownloader {
     pub fn new(
         http_client: Arc<dyn HttpClient>,
@@ -430,7 +435,7 @@ impl MediaDownloader {
     ) -> std::result::Result<Vec<u8>, MediaDownloadError> {
         let capacity = download_capacity(downloadable);
         download_media_with_retry(
-            0,
+            NO_MEDIA_CONN_REFRESH,
             |_force| async { DownloadUtils::prepare_download_requests(downloadable, &self.route) },
             || async {},
             |request| async move {
@@ -442,8 +447,10 @@ impl MediaDownloader {
         .map_err(MediaDownloadError::from)
     }
 
-    /// Mirrors [`Client::download_to_writer`]. The writer MUST start empty, for
-    /// the same reason documented there.
+    /// Mirrors [`Client::download_to_writer`], including its writer contract:
+    /// the writer MUST start empty, and host-failover can still leave a stale
+    /// tail behind a shorter successful attempt. See there for why, and prefer
+    /// [`Self::download`] when that is not acceptable.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -459,7 +466,7 @@ impl MediaDownloader {
         writer: W,
     ) -> std::result::Result<W, MediaDownloadError> {
         download_to_writer_with_retry(
-            0,
+            NO_MEDIA_CONN_REFRESH,
             writer,
             |_force| async { DownloadUtils::prepare_download_requests(downloadable, &self.route) },
             || async {},
@@ -563,11 +570,16 @@ impl Client {
     /// The entire HTTP download, decryption, and file write happen in a single
     /// blocking thread. The writer is seeked back to position 0 before returning.
     ///
-    /// The `writer` MUST start empty. Retries/host-failover seek back to 0 and
-    /// rewrite but do NOT truncate, so a writer that already held more bytes than
-    /// the decrypted payload would keep a stale tail past the valid data. (The
-    /// in-memory [`Self::download`] gives every attempt a fresh buffer for exactly
-    /// this reason.)
+    /// The `writer` MUST start empty, and MUST be truncatable by the caller on
+    /// any error. Retries/host-failover seek back to 0 and rewrite but do NOT
+    /// truncate, which `W: Write + Seek` gives no portable way to do. Two things
+    /// therefore leave a stale tail past the valid data: a writer that already
+    /// held more bytes than the decrypted payload, and a failed host that wrote
+    /// more plaintext before its MAC check than the host that then succeeded —
+    /// decryption streams out block by block and only authenticates at the end.
+    /// The in-memory [`Self::download`] gives every attempt a fresh buffer for
+    /// exactly this reason; a caller who cannot tolerate the tail should use it,
+    /// or compare the returned writer's length against the expected size.
     ///
     /// Memory usage: ~40KB regardless of file size (8KB read buffer + decrypt state).
     #[cfg_attr(

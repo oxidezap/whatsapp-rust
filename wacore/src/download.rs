@@ -289,11 +289,9 @@ impl MediaRoute {
     /// alongside do, and the CDN does not ask for one on download, so a route
     /// kept past disconnection is better off dropping it than sending a stale
     /// one and reading the refusal as an expired reference.
-    pub fn without_auth(self) -> Self {
-        Self {
-            hosts: self.hosts,
-            auth: None,
-        }
+    pub fn without_auth(mut self) -> Self {
+        self.auth = None;
+        self
     }
 
     /// [`Self::unauthenticated`] over [`DEFAULT_MEDIA_HOSTS`].
