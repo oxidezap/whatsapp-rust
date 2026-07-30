@@ -536,13 +536,22 @@ impl Client {
     /// mint a replacement — WA Web's `initializeAltDeviceLinking()`. After this
     /// the previous code can no longer complete: a `primary_hello` for it is
     /// dropped rather than answered with a bundle its holder cannot open.
+    ///
+    /// A flow cancelled after it reached stage 2 also gives up the adv secret
+    /// that stage derived, for the reason in [`replace_adv_secret_key`]. A
+    /// [`PairCodeState::Completed`] flow does not: that secret belongs to a
+    /// device that paired, and re-minting it would invalidate the account's own
+    /// ADV signatures.
     pub async fn cancel_pair_code(self: &Arc<Self>) {
-        {
-            let mut state = self.pair_code_state.lock().await;
-            if matches!(&*state, PairCodeState::Idle) {
-                return;
-            }
-            *state = PairCodeState::Idle;
+        let mut state = self.pair_code_state.lock().await;
+        if matches!(&*state, PairCodeState::Idle) {
+            return;
+        }
+        let rotated_adv_secret = state.awaiting_pair_success();
+        *state = PairCodeState::Idle;
+        if rotated_adv_secret {
+            // Held across the write for the reason in `retire_stage_two_flow`.
+            replace_adv_secret_key(self).await;
         }
     }
 }
@@ -752,6 +761,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
             ephemeral_keypair,
             primary_wrapped_ephemeral,
             primary_identity_pub,
+            attempt,
         )
         .await;
     }));
@@ -769,6 +779,11 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
 /// `SetAdvSecretKey` (last-write-wins), leaving the persisted secret out of
 /// sync with the `companion_finish` the server acts on → pair-success HMAC
 /// failure. The state is kept (not taken) so a genuine retry can reuse it.
+///
+/// The lock stops at the send, not at the answer: ordering that pair is the
+/// whole reason it is held, and the answer takes no part in it. Keeping it
+/// across the round trip would block `cancel_pair_code` on a server that never
+/// replies — exactly the case this wait exists to detect.
 #[allow(clippy::too_many_arguments)]
 async fn run_stage_two(
     client: Arc<Client>,
@@ -778,6 +793,7 @@ async fn run_stage_two(
     ephemeral_keypair: KeyPair,
     primary_wrapped_ephemeral: Vec<u8>,
     primary_identity_pub: [u8; 32],
+    attempt: u32,
 ) {
     let state_guard = client.pair_code_state.lock().await;
     // The flow can be retired while this task waits for the lock — by
@@ -855,19 +871,79 @@ async fn run_stage_two(
         req_id,
     );
 
-    if let Err(e) = client.send_node(iq).await {
-        error!(target: "Client/PairCode", "Failed to send companion_finish: {e}");
+    // Dropping the hook without calling it releases the guard too, so a send
+    // that never happened does not strand the lock either.
+    let answer = client
+        .send_iq_node_then(
+            iq,
+            Some(PairCodeUtils::companion_finish_iq_timeout()),
+            Some(Box::new(move || drop(state_guard))),
+        )
+        .await;
+
+    match answer {
+        Ok(_) => {
+            info!(
+                target: "Client/PairCode",
+                "Sent companion_finish, waiting for pair-success"
+            );
+            // State stays WaitingForPhoneConfirmation so a retry can reuse it;
+            // only pair-success (see `crate::pair`) transitions to Completed.
+            // The timeout that answers for this send was armed by the caller,
+            // on acceptance.
+        }
+        Err(e) => report_stage_two_failure(&client, &pairing_ref, attempt, e).await,
+    }
+}
+
+/// Write the flow off and tell the consumer why, when `companion_finish` itself
+/// failed.
+///
+/// WA Web treats this as terminal rather than as something to retry: its RPC
+/// raises `CompanionFinishError` for any answer that is not
+/// `CompanionFinishResponseSuccess` (`Alt/DeviceLinkingIq.js`), the throw
+/// reaches `handlePrimaryHello`, and the screen shows "Something went wrong.
+/// Please try again or link with the QR code" and returns to the number entry
+/// (`Link/DevicePhoneNumber.react.js`). So this reports and stops; it does not
+/// resend.
+///
+/// Without it the refusal was invisible: the IQ went out unanswered-for, its
+/// response matched no waiter, and the consumer learnt only from the one-minute
+/// silence timer — with no way to tell a refused bundle from a primary that
+/// went quiet.
+///
+/// A timeout is the one failure that does not retire anything. It carries no
+/// news: silence is already what
+/// [`start_pair_success_timeout`] is watching for, over a longer window, and
+/// cutting the flow short here would take a link the server may still be
+/// completing.
+async fn report_stage_two_failure(
+    client: &Arc<Client>,
+    pairing_ref: &[u8],
+    attempt: u32,
+    error: IqError,
+) {
+    if matches!(error, IqError::Timeout) {
+        warn!(
+            target: "Client/PairCode",
+            "companion_finish went unanswered; leaving the pair-success timer to write the code off"
+        );
         return;
     }
 
-    info!(
-        target: "Client/PairCode",
-        "Sent companion_finish, waiting for pair-success"
-    );
+    error!(target: "Client/PairCode", "companion_finish failed: {error}");
+    if !retire_stage_two_flow(client, pairing_ref, attempt).await {
+        return;
+    }
 
-    // State stays WaitingForPhoneConfirmation so a retry can reuse it; only
-    // pair-success (see `crate::pair`) transitions to Completed. The timeout
-    // that answers for this send was armed by the caller, on acceptance.
+    let error = PairError::from(error);
+    client.core.event_bus.dispatch(Event::PairingCodeError(
+        crate::types::events::PairingCodeError::builder()
+            .maybe_rejection(error.rejection())
+            .maybe_backoff(error.backoff())
+            .error(error.to_string())
+            .build(),
+    ));
 }
 
 /// Write the code off if `pair-success` never answers `companion_finish`.
@@ -883,29 +959,8 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
     client.clone().runtime.spawn_detached(Box::pin(async move {
         client.runtime.sleep(timeout).await;
 
-        {
-            let mut state = client.pair_code_state.lock().await;
-            // Only this flow's own timer may retire it: pair-success, a
-            // cancellation, or a replacement code all leave a state this
-            // does not match.
-            // Keyed on the attempt, not just the ref: a retry accepted partway
-            // through this window opens its own, and the earlier timer must not
-            // cut it short.
-            let still_ours = matches!(
-                &*state,
-                PairCodeState::WaitingForPhoneConfirmation {
-                    pairing_ref: r,
-                    primary_hello_attempt_count,
-                    ..
-                } if r.as_slice() == pairing_ref.as_slice()
-                    && *primary_hello_attempt_count == attempt
-            );
-            if !still_ours {
-                return;
-            }
-            // Cleared before the event so the consumer acting on it is not
-            // rejected by the very flow it was told to replace.
-            *state = PairCodeState::Idle;
+        if !retire_stage_two_flow(&client, &pairing_ref, attempt).await {
+            return;
         }
 
         warn!(
@@ -918,6 +973,65 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
                 .build(),
         ));
     }));
+}
+
+/// Retire a flow whose stage 2 will not complete, and return whether this
+/// caller is the one that retired it.
+///
+/// Keyed on the ref *and* the attempt: pair-success, a cancellation, or a
+/// replacement code all leave a state this does not match, and a retry accepted
+/// partway through the window owns its own attempt — so neither the timeout nor
+/// a failed `companion_finish` may write off a flow that moved on.
+///
+/// The state is cleared before the caller's event goes out, so a consumer
+/// acting on it is not turned away by the very flow it was told to replace.
+async fn retire_stage_two_flow(client: &Arc<Client>, pairing_ref: &[u8], attempt: u32) -> bool {
+    let mut state = client.pair_code_state.lock().await;
+    let still_ours = matches!(
+        &*state,
+        PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref: r,
+            primary_hello_attempt_count,
+            ..
+        } if r.as_slice() == pairing_ref
+            && *primary_hello_attempt_count == attempt
+    );
+    if !still_ours {
+        return false;
+    }
+    *state = PairCodeState::Idle;
+    // Under the same guard that retired the flow. `handle_pair_success` takes
+    // this lock too, so releasing it first would open a window where a late
+    // pair-success completes against the old secret and this then overwrites
+    // the secret of a device that just paired.
+    replace_adv_secret_key(client).await;
+    true
+}
+
+/// Re-mint the device's adv secret because the flow that rotated it is dead.
+///
+/// Stage 2 derives the adv secret from the key bundle and persists it before
+/// `companion_finish` goes out, so a flow that ends there leaves the device
+/// holding a secret only the primary that failed to link could ever match. WA
+/// Web sheds the same value whenever a linking flow restarts —
+/// `initializeAltDeviceLinking` clears it and `initializeQRLinking` generates a
+/// fresh one (`Alt/DeviceLinkingApi.js`).
+///
+/// Generated rather than cleared, because `Device::adv_secret_key` is a
+/// `[u8; 32]` and has no absent value: an all-zero secret would be a usable key
+/// that happens to be wrong, which is worse than an unrelated random one. A
+/// later QR flow carries whatever is stored inside the code itself, so a fresh
+/// secret is as good as the old one there.
+async fn replace_adv_secret_key(client: &Arc<Client>) {
+    use rand::RngExt as _;
+    let mut adv_secret_key = [0u8; 32];
+    rand::make_rng::<rand::rngs::StdRng>().fill(&mut adv_secret_key);
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAdvSecretKey(
+            adv_secret_key,
+        ))
+        .await;
 }
 
 /// The server asked us to refresh the code we are displaying (WA Web
@@ -1712,6 +1826,257 @@ mod tests {
         }
     }
 
+    /// Answers the `companion_finish` sitting in `frame` with the server's
+    /// `<iq>`; `error` picks between the two refusals WA Web's own parser
+    /// accepts (`WASmaxInMdCompanionFinishErrors`: bad-request and
+    /// internal-server-error).
+    async fn answer_companion_finish(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        frame: usize,
+        error: Option<(u16, &str)>,
+    ) {
+        let finish = crate::test_utils::decode_sent_iq(transport, frame).await;
+        let id = finish
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("companion_finish carries an id")
+            .into_owned();
+        let mut response = NodeBuilder::new("iq").attrs([
+            ("from", "s.whatsapp.net".to_string()),
+            ("id", id.clone()),
+            (
+                "type",
+                if error.is_some() { "error" } else { "result" }.to_string(),
+            ),
+        ]);
+        if let Some((code, text)) = error {
+            response = response.children([NodeBuilder::new("error")
+                .attrs([("code", code.to_string()), ("text", text.to_string())])
+                .build()]);
+        }
+        crate::test_utils::answer_iq(client, &id, &response.build()).await;
+    }
+
+    /// Drives a flow to the point where `companion_finish` is on the wire.
+    async fn reach_stage_two(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        pairing_ref: &[u8],
+    ) {
+        set_waiting(client, pairing_ref.to_vec(), wacore::time::now_secs(), 0).await;
+        let notif = primary_hello_notif(pairing_ref);
+        assert!(handle_pair_code_notification(client, &notif.as_node_ref()).await);
+        poll_until("companion_finish to reach the transport", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+    }
+
+    /// The happy path: the server takes the bundle, so the flow stays open for
+    /// the `pair-success` that follows. Proven against the silence timer rather
+    /// than by inspection — an accepted answer must reach the end of the window
+    /// as silence, never as a refusal.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_companion_finish_keeps_the_flow_open() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        reach_stage_two(&client, &transport, &pairing_ref).await;
+        let adv_after_stage_two = adv(&client);
+
+        answer_companion_finish(&client, &transport, 0, None).await;
+
+        advance_past(PairCodeUtils::companion_finish_iq_timeout()).await;
+        // The stage-2 task is detached, so a clock jump alone proves nothing —
+        // it needs turns of the executor to act on what it received.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            is_waiting(&client).await,
+            "an accepted bundle leaves pair-success still due"
+        );
+        assert_eq!(
+            adv(&client),
+            adv_after_stage_two,
+            "the secret pair-success will verify against must survive"
+        );
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "nothing failed, so nothing may be reported"
+        );
+    }
+
+    /// The failure this whole path exists for: the server refuses the key
+    /// bundle. WA Web raises `CompanionFinishError` for any answer that is not
+    /// `CompanionFinishResponseSuccess` (`Alt/DeviceLinkingIq.js`) and shows
+    /// "Something went wrong" rather than waiting out the silence timer. We had
+    /// been sending this IQ without reading its answer at all, so a refusal
+    /// reached the consumer only as an unexplained minute of nothing.
+    #[tokio::test]
+    async fn a_refused_companion_finish_reports_the_rejection() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        reach_stage_two(&client, &transport, &pairing_ref).await;
+        let adv_after_stage_two = adv(&client);
+
+        answer_companion_finish(&client, &transport, 0, Some((400, "bad-request"))).await;
+
+        poll_until("the refusal to reach the consumer", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_)))
+        })
+        .await;
+        let reported = collector
+            .events()
+            .iter()
+            .find_map(|e| match &**e {
+                Event::PairingCodeError(e) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("the refusal was just observed");
+        assert_eq!(
+            reported.rejection,
+            Some(PairCodeRejection::BadRequest),
+            "the consumer must be able to branch on the status, not the message"
+        );
+        assert!(
+            !is_waiting(&client).await,
+            "a refused flow must free the slot so a replacement can be requested"
+        );
+        assert_ne!(
+            adv(&client),
+            adv_after_stage_two,
+            "the secret this dead flow rotated must not outlive it"
+        );
+    }
+
+    /// A refusal that arrives for a flow already replaced belongs to nobody:
+    /// reporting it would tell the consumer the live code failed, and re-minting
+    /// the adv secret would break the replacement that is about to use it.
+    #[tokio::test]
+    async fn a_refusal_for_a_replaced_flow_is_not_reported() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        // The replacement holds the slot by the time the answer lands.
+        set_waiting(&client, vec![9, 9, 9, 9], wacore::time::now_secs(), 0).await;
+        let adv_of_replacement = adv(&client);
+        report_stage_two_failure(
+            &client,
+            &[1, 2, 3, 4],
+            1,
+            IqError::ServerError {
+                code: 500,
+                text: "internal-server-error".to_string(),
+                error_type: None,
+                backoff: None,
+            },
+        )
+        .await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "the replacement flow has not failed and must not be reported as failed"
+        );
+        assert_eq!(
+            adv(&client),
+            adv_of_replacement,
+            "the replacement's adv secret must survive"
+        );
+        assert!(is_waiting(&client).await, "the replacement keeps the slot");
+    }
+
+    /// An unanswered `companion_finish` is not a refusal — it is the silence
+    /// [`start_pair_success_timeout`] already owns, over a longer window. Ending
+    /// the flow on the shorter IQ timeout would cut a link the server may still
+    /// be completing.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_companion_finish_leaves_the_timer_in_charge() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        reach_stage_two(&client, &transport, &[1, 2, 3, 4]).await;
+
+        advance_past(PairCodeUtils::companion_finish_iq_timeout()).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            is_waiting(&client).await,
+            "the IQ giving up does not end the flow"
+        );
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "silence is not a refusal and must not be reported as one"
+        );
+
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        poll_until("the regeneration request", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if !r.force_manual))
+        })
+        .await;
+    }
+
+    /// Cancelling a flow that reached stage 2 has to give up the adv secret it
+    /// derived: it is keyed to a primary that will never link, and WA Web sheds
+    /// the same value on `initializeAltDeviceLinking` (`Alt/DeviceLinkingApi.js`).
+    #[tokio::test]
+    async fn cancelling_after_stage_two_gives_up_the_secret_it_derived() {
+        let (client, transport) = create_iq_test_client().await;
+        reach_stage_two(&client, &transport, &[1, 2, 3, 4]).await;
+        let rotated = adv(&client);
+
+        client.cancel_pair_code().await;
+
+        assert_ne!(
+            adv(&client),
+            rotated,
+            "the cancelled flow's secret must not outlive it"
+        );
+    }
+
+    /// The other side of that: a flow cancelled before stage 2 never rotated
+    /// anything, and a paired device's secret is the account's own — re-minting
+    /// either would be destructive.
+    #[tokio::test]
+    async fn cancelling_leaves_a_secret_stage_two_never_touched() {
+        let (client, _transport) = create_iq_test_client().await;
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        let before = adv(&client);
+        client.cancel_pair_code().await;
+        assert_eq!(adv(&client), before, "no stage 2 ran, so nothing rotated");
+
+        *client.pair_code_state.lock().await = PairCodeState::Completed;
+        let paired = adv(&client);
+        client.cancel_pair_code().await;
+        assert_eq!(
+            adv(&client),
+            paired,
+            "a paired device's adv secret signs its own identity"
+        );
+    }
+
     #[tokio::test]
     async fn pair_with_code_refuses_to_supersede_a_live_code() {
         let (client, _transport) = create_iq_test_client().await;
@@ -2186,6 +2551,7 @@ mod tests {
             KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
             vec![7u8; 80],
             [9u8; 32],
+            1,
         )
         .await;
 
@@ -2236,13 +2602,13 @@ mod tests {
         );
     }
 
-    /// Regression: WA Web starts the one-minute clock when the notification
-    /// arrives (`primaryHelloReceivedAltLinking` fires before
-    /// `handlePrimaryHelloInternal` runs), not when `companion_finish` lands.
-    /// Arming it after the send means stage 2 failing leaves the consumer with
-    /// no signal at all — the one case where it most needs one.
-    #[tokio::test(start_paused = true)]
-    async fn the_timeout_is_armed_even_when_stage_two_cannot_run() {
+    /// A stage 2 that cannot even reach the socket ends the flow there and
+    /// says so, rather than leaving the consumer to infer it from a minute of
+    /// silence. WA Web does the same: `sendCompanionFinish` throwing reaches
+    /// `handlePrimaryHello`, which fires `errorAltLinking` immediately
+    /// (`Alt/DeviceLinkingApi.js`).
+    #[tokio::test]
+    async fn a_stage_two_that_cannot_send_reports_the_failure_at_once() {
         // No transport, so the companion_finish send fails.
         let client = create_test_client().await;
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
@@ -2253,14 +2619,17 @@ mod tests {
         let notif = primary_hello_notif(&pairing_ref);
         assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
 
-        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
-        poll_until("the regeneration request", || {
+        poll_until("the failure to reach the consumer", || {
             collector
                 .events()
                 .iter()
-                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if !r.force_manual))
+                .any(|e| matches!(&**e, Event::PairingCodeError(_)))
         })
         .await;
+        assert!(
+            !is_waiting(&client).await,
+            "a flow that could not send its bundle must not keep the slot"
+        );
     }
 
     /// The timer must not fire once pairing actually completed, or a freshly

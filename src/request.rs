@@ -28,6 +28,18 @@ type IqSendFuture<'a> =
 type IqSendFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + 'a>>;
 
+/// Runs once the request is on the wire and before the response is awaited.
+///
+/// A caller that must hold a lock across the send — the waiter has to be in the
+/// map before the stanza leaves, or a fast response is dropped as unmatched —
+/// releases it here instead of holding it through the whole round trip. Boxed
+/// rather than generic for the same reason [`IqSendFuture`] is, and `None` on
+/// every other path costs nothing.
+#[cfg(not(target_arch = "wasm32"))]
+type IqOnSent<'a> = Box<dyn FnOnce() + Send + 'a>;
+#[cfg(target_arch = "wasm32")]
+type IqOnSent<'a> = Box<dyn FnOnce() + 'a>;
+
 /// Removes a pending `response_waiters` entry when dropped.
 ///
 /// `send_and_wait_iq` can be cancelled mid-await — e.g. the losing side of a
@@ -302,6 +314,7 @@ impl Client {
             req_id,
             iq_timeout,
             Box::pin(async { self.send_node(node).await }),
+            None,
         )
         .await
     }
@@ -311,14 +324,25 @@ impl Client {
     /// The stanza ID is preserved when supplied and generated otherwise. The
     /// same waiter, cancellation, timeout and response validation path used by
     /// typed IQ specifications handles the request.
+    pub async fn send_iq_node(
+        &self,
+        node: Node,
+        timeout: Option<Duration>,
+    ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        self.send_iq_node_then(node, timeout, None).await
+    }
+
+    /// [`Self::send_iq_node`] with a hook that runs between the send and the
+    /// wait. See [`IqOnSent`] for why a caller would want one.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.iq.node", level = "debug", skip_all, err(Debug))
     )]
-    pub async fn send_iq_node(
+    pub(crate) async fn send_iq_node_then(
         &self,
         mut node: Node,
         timeout: Option<Duration>,
+        on_sent: Option<IqOnSent<'_>>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
@@ -342,6 +366,7 @@ impl Client {
             req_id,
             timeout.unwrap_or(DEFAULT_IQ_TIMEOUT),
             Box::pin(async { self.send_node(node).await }),
+            on_sent,
         )
         .await
     }
@@ -395,6 +420,7 @@ impl Client {
                     req_id,
                     DEFAULT_IQ_TIMEOUT,
                     Box::pin(async { self.send_raw_bytes(buf).await }),
+                    None,
                 )
                 .await
             }
@@ -423,6 +449,7 @@ impl Client {
         req_id: String,
         timeout: Duration,
         send_fn: IqSendFuture<'_>,
+        on_sent: Option<IqOnSent<'_>>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
         if !self.is_running.load(Ordering::Relaxed) {
@@ -471,6 +498,10 @@ impl Client {
                 // surfaced as a client-state failure.
                 other => Err(IqError::ClientState(Box::new(other))),
             };
+        }
+
+        if let Some(on_sent) = on_sent {
+            on_sent();
         }
 
         let request_utils = self.get_request_utils();

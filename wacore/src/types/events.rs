@@ -1240,7 +1240,7 @@ pub struct PairingCodeRefresh {
     pub force_manual: bool,
 }
 
-/// A phone-number pair-code request failed, so no code will be shown.
+/// A phone-number pair-code flow failed, so no linking will come of it.
 ///
 /// The counterpart to [`PairingCode`] on the failure path, and the only surface
 /// that reports it when pairing is driven by `BotBuilder::with_pair_code` —
@@ -1248,6 +1248,13 @@ pub struct PairingCodeRefresh {
 /// caller. `Client::pair_with_code` dispatches this in addition to returning
 /// `Err`, matching how the success path both returns the code and emits
 /// [`PairingCode`].
+///
+/// Both of the flow's server round trips report here, and the consumer's move
+/// is the same either way — this code is finished, request another or fall back
+/// to the QR. The later one arrives after a code was already displayed and
+/// entered: the phone answered, but the server refused the key bundle that
+/// answer produced. Silence at that stage is not this event, because nothing
+/// was refused; it surfaces as [`PairingCodeRefresh`] once the timer runs out.
 ///
 /// Fires for every failure, including local validation (a phone number that is
 /// too short never reaches the server): a consumer waiting on a code needs to

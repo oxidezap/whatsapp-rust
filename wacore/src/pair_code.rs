@@ -95,6 +95,17 @@ const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
 /// goes quiet — no error ever reaches the companion.
 const PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS: u64 = 60;
 
+/// How long the `companion_finish` IQ waits for its own answer.
+///
+/// Deliberately inside
+/// [`PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS`], which is the whole
+/// budget stage 2 has: a refusal that only landed after that window would be
+/// reported against a flow already written off, so the request has to be able
+/// to fail while the flow it belongs to is still the current one. The answer
+/// itself is the server acknowledging the bundle, not the primary opening it,
+/// so it arrives in one round trip or not at all.
+const PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS: u64 = 30;
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -617,6 +628,11 @@ impl PairCodeUtils {
     /// off — WA Web's one-minute `primary_hello_expire` timer.
     pub fn primary_hello_pair_success_timeout() -> std::time::Duration {
         std::time::Duration::from_secs(PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS)
+    }
+
+    /// How long the `companion_finish` IQ waits for its answer.
+    pub fn companion_finish_iq_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS)
     }
 }
 
