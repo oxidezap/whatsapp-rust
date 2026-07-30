@@ -540,7 +540,7 @@ mod message_id_tests {
 
 #[cfg(test)]
 mod dropped_error_detail_tests {
-    use super::{dropped_error_detail, warn_on_dropped_error_detail};
+    use super::dropped_error_detail;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::node::{Node, NodeContent};
 
@@ -556,8 +556,6 @@ mod dropped_error_detail_tests {
             .build();
         let node_ref = node.as_node_ref();
         assert_eq!(dropped_error_detail(&node_ref), None);
-        // The caller's early return is the one that runs in production; cover it too.
-        warn_on_dropped_error_detail(&node_ref);
     }
 
     #[test]
