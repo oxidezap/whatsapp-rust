@@ -390,10 +390,10 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
 /// download after the client is gone.
 ///
 /// The hosts are injected from the media conn the mock server handed out, which
-/// is what makes this reach the mock's CDN instead of the real one. Whether the
-/// CDN also accepts the URL with no `auth` parameter is the mock's policy to
-/// decide, not the library's, so the auth-free URL shape is pinned in wacore's
-/// unit tests instead.
+/// is what makes this reach the mock's CDN instead of the real one. Both route
+/// kinds are exercised: with the auth token the session had, and with
+/// `without_auth`, which is the shape a caller outliving its session should use
+/// and the one the official client's download URL builder emits.
 #[tokio::test]
 async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -425,7 +425,7 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
     let downloader = MediaDownloader::new(
         Arc::new(UreqHttpClient::new()),
         Arc::new(TokioRuntime),
-        route,
+        route.clone(),
     );
     let downloaded = downloader.download(&params).await?;
     assert_eq!(downloaded, original);
@@ -434,6 +434,17 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
         .download_to_writer(&params, std::io::Cursor::new(Vec::<u8>::new()))
         .await?;
     assert_eq!(cursor.into_inner(), original);
+
+    let hosts_only = MediaDownloader::new(
+        Arc::new(UreqHttpClient::new()),
+        Arc::new(TokioRuntime),
+        route.without_auth(),
+    );
+    let downloaded = hosts_only.download(&params).await?;
+    assert_eq!(
+        downloaded, original,
+        "the CDN authorizes a download by its signed path, not by the session token"
+    );
 
     Ok(())
 }

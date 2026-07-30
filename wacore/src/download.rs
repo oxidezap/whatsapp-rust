@@ -251,10 +251,21 @@ pub const DEFAULT_MEDIA_HOSTS: [&str; 2] = ["mmg.whatsapp.net", "mmg-fallback.wh
 /// download URL builder attaches no auth parameter at all, while its upload URL
 /// builder does. A caller already holding the decryption references can name
 /// the hosts itself and download with no session behind it.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MediaRoute {
     pub hosts: Vec<MediaHost>,
     pub auth: Option<String>,
+}
+
+/// Hand-written so the auth token, a live session credential, cannot reach a log
+/// through a `{:?}` or a tracing field that captured a route.
+impl std::fmt::Debug for MediaRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaRoute")
+            .field("hosts", &self.hosts)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl MediaRoute {
@@ -270,6 +281,19 @@ impl MediaRoute {
     /// Route through caller-provided hosts, with no auth token.
     pub fn unauthenticated(hosts: Vec<MediaHost>) -> Self {
         Self { hosts, auth: None }
+    }
+
+    /// The same hosts without the auth token.
+    ///
+    /// A token outlives its session by less than the references it was fetched
+    /// alongside do, and the CDN does not ask for one on download, so a route
+    /// kept past disconnection is better off dropping it than sending a stale
+    /// one and reading the refusal as an expired reference.
+    pub fn without_auth(self) -> Self {
+        Self {
+            hosts: self.hosts,
+            auth: None,
+        }
     }
 
     /// [`Self::unauthenticated`] over [`DEFAULT_MEDIA_HOSTS`].
@@ -662,8 +686,9 @@ mod tests {
         MediaRoute::authenticated(mock_hosts(), "test-auth-token".into())
     }
 
-    /// Every variant, so a new one has to be named here rather than falling
-    /// into whatever the URL builder does by default.
+    /// Every variant. The exhaustive match in
+    /// `every_media_type_builds_urls_for_both_route_kinds` is what forces a new
+    /// one to be named here instead of silently skipping the URL assertions.
     const ALL_MEDIA_TYPES: [MediaType; 11] = [
         MediaType::Image,
         MediaType::Video,
@@ -818,6 +843,30 @@ mod tests {
     }
 
     #[test]
+    fn without_auth_keeps_the_hosts_and_drops_the_token() {
+        let route = authenticated_route().without_auth();
+        assert!(route.auth.is_none());
+        assert_eq!(
+            route
+                .hosts
+                .iter()
+                .map(|h| h.hostname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cdn1.example.com", "cdn2.example.com"],
+        );
+    }
+
+    #[test]
+    fn route_debug_redacts_the_auth_token() {
+        let rendered = format!("{:?}", authenticated_route());
+        assert!(!rendered.contains("test-auth-token"), "{rendered}");
+        assert!(rendered.contains("cdn1.example.com"), "{rendered}");
+
+        let rendered = format!("{:?}", MediaRoute::unauthenticated(mock_hosts()));
+        assert!(rendered.contains("auth: None"), "{rendered}");
+    }
+
+    #[test]
     fn default_route_uses_the_known_cdn_hosts_without_auth() {
         let route = MediaRoute::default_hosts();
         assert!(route.auth.is_none());
@@ -834,6 +883,23 @@ mod tests {
     #[test]
     fn every_media_type_builds_urls_for_both_route_kinds() {
         for media_type in ALL_MEDIA_TYPES {
+            // No wildcard arm: a new variant stops compiling here until it is
+            // added to ALL_MEDIA_TYPES, which is the only thing that makes the
+            // array's length a guarantee rather than a hand-kept count.
+            match media_type {
+                MediaType::Image
+                | MediaType::Video
+                | MediaType::Audio
+                | MediaType::Document
+                | MediaType::History
+                | MediaType::AppState
+                | MediaType::Sticker
+                | MediaType::StickerPack
+                | MediaType::StickerPackThumbnail
+                | MediaType::LinkThumbnail
+                | MediaType::ProductCatalogImage => {}
+            }
+
             let d = MockDownloadable {
                 direct_path: Some("/v/t1/media.enc".into()),
                 static_url: None,

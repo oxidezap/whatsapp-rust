@@ -104,7 +104,9 @@ pub enum MediaDownloadError {
     /// The route named no hosts, so nothing was ever contacted.
     #[error("the media route names no hosts")]
     NoHosts,
-    #[error(transparent)]
+    /// No host was contacted and none could be: the reference is too incomplete
+    /// to build a URL from, so the fix is the metadata, not the network.
+    #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
 
@@ -115,6 +117,7 @@ impl From<DownloadRequestError> for MediaDownloadError {
                 Self::ReferenceRejected(e)
             }
             DownloadRequestError::Other(e) => Self::HostsUnreachable(e),
+            DownloadRequestError::Prepare(e) => Self::Other(e),
             DownloadRequestError::NoHosts => Self::NoHosts,
         }
     }
@@ -127,14 +130,11 @@ enum DownloadRequestError {
     /// Matches WA Web's `MediaNotFoundError` handling.
     NotFound(anyhow::Error),
     Other(anyhow::Error),
+    /// The request list could not be built, so no host was ever contacted and
+    /// no host ever could be: the reference itself is incomplete.
+    Prepare(anyhow::Error),
     /// No request was ever executed: the route carried no hosts.
     NoHosts,
-}
-
-impl From<anyhow::Error> for DownloadRequestError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Other(err)
-    }
 }
 
 impl DownloadRequestError {
@@ -164,7 +164,7 @@ impl DownloadRequestError {
 
     fn into_anyhow(self) -> anyhow::Error {
         match self {
-            Self::Auth(err) | Self::NotFound(err) | Self::Other(err) => err,
+            Self::Auth(err) | Self::NotFound(err) | Self::Other(err) | Self::Prepare(err) => err,
             Self::NoHosts => anyhow!("Failed to download from all available media hosts"),
         }
     }
@@ -235,7 +235,9 @@ where
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=max_refresh_attempts {
-        let requests = prepare_requests(force_refresh).await?;
+        let requests = prepare_requests(force_refresh)
+            .await
+            .map_err(DownloadRequestError::Prepare)?;
         let mut retry_with_fresh_auth = false;
 
         for request in requests {
@@ -302,11 +304,15 @@ where
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=max_refresh_attempts {
-        let requests = prepare_requests(force_refresh).await?;
+        let requests = prepare_requests(force_refresh)
+            .await
+            .map_err(DownloadRequestError::Prepare)?;
         let mut retry_with_fresh_auth = false;
 
         for request in requests {
-            let (next_writer, result) = execute_request(request.clone(), writer).await?;
+            let (next_writer, result) = execute_request(request.clone(), writer)
+                .await
+                .map_err(DownloadRequestError::Other)?;
             writer = next_writer;
 
             match result {
@@ -1332,7 +1338,9 @@ mod tests {
     struct RoutedHttpClient {
         routes: Vec<(&'static str, u16, Vec<u8>)>,
         fallback: (u16, Vec<u8>),
-        seen_urls: Mutex<Vec<String>>,
+        streaming: bool,
+        // std, not async: `execute_streaming` is a blocking call.
+        seen_urls: std::sync::Mutex<Vec<String>>,
     }
 
     impl RoutedHttpClient {
@@ -1340,8 +1348,45 @@ mod tests {
             Arc::new(Self {
                 routes,
                 fallback,
-                seen_urls: Mutex::new(Vec::new()),
+                streaming: false,
+                seen_urls: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        fn streaming(
+            routes: Vec<(&'static str, u16, Vec<u8>)>,
+            fallback: (u16, Vec<u8>),
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                routes,
+                fallback,
+                streaming: true,
+                seen_urls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl RoutedHttpClient {
+        fn record(&self, url: &str) {
+            self.seen_urls
+                .lock()
+                .expect("test mutex is never poisoned")
+                .push(url.to_string());
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.seen_urls
+                .lock()
+                .expect("test mutex is never poisoned")
+                .clone()
+        }
+
+        fn respond(&self, url: &str) -> (u16, Vec<u8>) {
+            self.routes
+                .iter()
+                .find(|(needle, _, _)| url.contains(needle))
+                .map(|(_, status, body)| (*status, body.clone()))
+                .unwrap_or_else(|| self.fallback.clone())
         }
     }
 
@@ -1351,14 +1396,27 @@ mod tests {
             &self,
             request: crate::http::HttpRequest,
         ) -> Result<crate::http::HttpResponse> {
-            self.seen_urls.lock().await.push(request.url.clone());
-            let (status_code, body) = self
-                .routes
-                .iter()
-                .find(|(needle, _, _)| request.url.contains(needle))
-                .map(|(_, status, body)| (*status, body.clone()))
-                .unwrap_or_else(|| self.fallback.clone());
+            self.record(&request.url);
+            let (status_code, body) = self.respond(&request.url);
             Ok(crate::http::HttpResponse { status_code, body })
+        }
+
+        // Implemented so `download_to_writer` exercises the streaming branch
+        // rather than silently falling back to the buffered one.
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+
+        fn execute_streaming(
+            &self,
+            request: crate::http::HttpRequest,
+        ) -> Result<wacore::net::StreamingHttpResponse> {
+            self.record(&request.url);
+            let (status_code, body) = self.respond(&request.url);
+            Ok(wacore::net::StreamingHttpResponse {
+                status_code,
+                body: Box::new(Cursor::new(body)),
+            })
         }
     }
 
@@ -1402,7 +1460,7 @@ mod tests {
         .expect("an injected host list is all a download needs");
 
         assert_eq!(downloaded, original);
-        let seen = http.seen_urls.lock().await.clone();
+        let seen = http.urls();
         assert_eq!(seen.len(), 2, "the failing host must fail over to the next");
         assert!(
             seen[0].starts_with("https://bad-host.example.com/v/t62.7118-24/no-session?token=")
@@ -1417,14 +1475,56 @@ mod tests {
     async fn media_downloader_streams_to_a_writer_without_a_session() {
         let original = b"streamed without a session".to_vec();
         let (params, encrypted) = encrypted_params(&original);
-        let http = RoutedHttpClient::new(Vec::new(), (200, encrypted));
+        let http = RoutedHttpClient::streaming(Vec::new(), (200, encrypted.clone()));
+        assert!(
+            http.supports_streaming(),
+            "this must not fall back to buffered"
+        );
 
         let writer = downloader(http, &["cdn.example.com"])
             .download_to_writer(&params, Cursor::new(Vec::new()))
             .await
             .expect("the streaming path must work without a session too");
-
         assert_eq!(writer.into_inner(), original);
+
+        // Same request over a client without streaming, to keep the buffered
+        // fallback covered as well.
+        let buffered = RoutedHttpClient::new(Vec::new(), (200, encrypted));
+        let writer = downloader(buffered, &["cdn.example.com"])
+            .download_to_writer(&params, Cursor::new(Vec::new()))
+            .await
+            .expect("the buffered fallback must work too");
+        assert_eq!(writer.into_inner(), original);
+    }
+
+    // A reference too incomplete to build a URL from never contacts a host, so
+    // it must not be reported as though every host had failed.
+    #[tokio::test]
+    async fn media_downloader_separates_an_unbuildable_reference_from_a_dead_host() {
+        let params = DownloadParams {
+            direct_path: "/v/t62.7118-24/incomplete".to_string(),
+            media_key: Some(vec![1u8; 32]),
+            file_sha256: vec![2u8; 32],
+            file_enc_sha256: None,
+            file_length: 16,
+            media_type: MediaType::Image,
+        };
+        let http = RoutedHttpClient::new(Vec::new(), (200, Vec::new()));
+
+        let err = downloader(http.clone(), &["cdn1.example.com", "cdn2.example.com"])
+            .download(&params)
+            .await
+            .expect_err("an incomplete reference cannot succeed");
+
+        assert!(
+            matches!(err, MediaDownloadError::Other(_)),
+            "a reference that cannot build a URL is not a host failure, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Missing file_enc_sha256"),
+            "the cause must survive the classification, got: {err}"
+        );
+        assert!(http.urls().is_empty());
     }
 
     #[tokio::test]
@@ -1441,7 +1541,7 @@ mod tests {
             "expected a rejected reference, got {err:?}"
         );
         assert_eq!(
-            expired.seen_urls.lock().await.len(),
+            expired.urls().len(),
             1,
             "no host rotation and no refresh: nothing here can re-sign the reference"
         );
@@ -1455,7 +1555,7 @@ mod tests {
             matches!(err, MediaDownloadError::HostsUnreachable(_)),
             "expected unreachable hosts, got {err:?}"
         );
-        assert_eq!(dead.seen_urls.lock().await.len(), 2, "every host is tried");
+        assert_eq!(dead.urls().len(), 2, "every host is tried");
     }
 
     #[tokio::test]
@@ -1490,7 +1590,7 @@ mod tests {
             matches!(err, MediaDownloadError::NoHosts),
             "expected NoHosts, got {err:?}"
         );
-        assert!(http.seen_urls.lock().await.is_empty());
+        assert!(http.urls().is_empty());
     }
 
     // Regression: a `static_url` download used to fetch a media conn over the
