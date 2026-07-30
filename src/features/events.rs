@@ -56,7 +56,7 @@ impl<'a> Events<'a> {
         let message_secret: Vec<u8> = {
             use rand::Rng;
             let mut secret = vec![0u8; 32];
-            rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut secret);
+            rand::rng().fill_bytes(&mut secret);
             secret
         };
         message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
