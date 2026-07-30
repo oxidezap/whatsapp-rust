@@ -1956,6 +1956,37 @@ mod tests {
         assert_eq!(EventKind::PairingCodeError as u8, 59);
     }
 
+    /// Every rejection a consumer can be handed must survive being persisted
+    /// and read back as itself.
+    ///
+    /// The wire form of `PairCodeRejection` is its `code()`, so an `Unknown`
+    /// carrying a *named* code would serialize to that code and rehydrate as the
+    /// named arm — silently upgrading a value we declined to classify. Nothing
+    /// may construct such a value; `from_server` returns `None` instead, and
+    /// this pins that the reachable ones round-trip.
+    #[test]
+    fn pair_code_rejections_do_not_alias_on_a_round_trip() {
+        use crate::pair_code::PairCodeRejection as R;
+
+        for original in [
+            R::BadRequest,
+            R::Forbidden,
+            R::RateOverlimit,
+            R::FeatureNotAvailable,
+            R::InternalServerError,
+            R::Unknown(418),
+        ] {
+            let json = serde_json::to_string(&original).expect("serializes");
+            let back: R = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, original, "{original:?} rehydrated as {back:?}");
+        }
+
+        // The aliasing that forced `from_server` to return `None`: kept as a
+        // live demonstration so the reason cannot be lost to a refactor.
+        assert_eq!(R::Unknown(429).code(), R::RateOverlimit.code());
+        assert_eq!(R::from_server(429, "something-else"), None);
+    }
+
     #[test]
     fn group_update_builder_defaults_additive_scalar_fields() {
         let update = GroupUpdate::builder()

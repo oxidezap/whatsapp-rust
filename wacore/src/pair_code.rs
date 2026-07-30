@@ -698,28 +698,34 @@ impl PairCodeRejection {
         })
     }
 
-    /// Classify a server `<error>` from both of its attributes.
+    /// Classify a server `<error>` from both of its attributes, or `None` when
+    /// the two disagree and no classification is honest.
     ///
-    /// A `text` that *contradicts* the code demotes the result to
-    /// [`Unknown`](Self::Unknown): WA Web asserts the two as a pair
-    /// (`literal(attrInt, …, "code", 429)` beside
+    /// WA Web asserts the pair (`literal(attrInt, …, "code", 429)` beside
     /// `literal(attrString, …, "text", "rate-overlimit")`) and drops to its
-    /// generic error path when they disagree, so a changed pairing must not
-    /// keep reading as the named arm.
+    /// generic error path when they disagree, so a changed pairing must not keep
+    /// reading as the named arm.
     ///
-    /// An **absent** `text` is treated as no contradiction and the code alone
-    /// decides. That is deliberately laxer than WA Web, which would reject it:
-    /// demoting a bare `429` to `Unknown` would also clear
+    /// `None` rather than `Unknown(code)` for that case, because `Unknown` could
+    /// not carry it: the wire form of this enum **is** `code()`, so
+    /// `Unknown(429)` serializes to `429` and rehydrates as
+    /// [`RateOverlimit`](Self::RateOverlimit) — a consumer that persisted or
+    /// forwarded the value would get the demotion silently undone and apply
+    /// throttling anyway. There is no in-band value that both records the code
+    /// and refuses to alias the arm it came from. The code is not lost: the
+    /// caller still has the error's own rendering, which names it.
+    ///
+    /// An **absent** `text` is not a contradiction, and the code alone decides.
+    /// Deliberately laxer than WA Web, which would reject it: refusing to
+    /// classify a bare `429` would also clear
     /// [`is_throttled`](Self::is_throttled), turning the one refusal a consumer
     /// most needs to act on back into a silent one. A missing attribute is not
     /// evidence that the code means something else.
-    pub fn from_server(code: u16, text: &str) -> Self {
+    pub fn from_server(code: u16, text: &str) -> Option<Self> {
         let by_code = Self::from(i32::from(code));
         match by_code.text() {
-            Some(expected) if !text.is_empty() && text != expected => {
-                Self::Unknown(i32::from(code))
-            }
-            _ => by_code,
+            Some(expected) if !text.is_empty() && text != expected => None,
+            _ => Some(by_code),
         }
     }
 }

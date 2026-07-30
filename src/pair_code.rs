@@ -110,13 +110,15 @@ impl PairError {
     /// is not a stable surface.
     ///
     /// Classified from the `code` and `text` together, so a pairing WA Web
-    /// would not accept reads as
-    /// [`PairCodeRejection::Unknown`] rather than as the named arm — see
-    /// [`PairCodeRejection::from_server`].
+    /// would not accept yields `None` rather than the named arm — see
+    /// [`PairCodeRejection::from_server`]. The refused-but-unclassifiable case
+    /// is therefore indistinguishable here from "nothing was refused"; both
+    /// mean the same thing to a consumer, which is that there is no typed
+    /// status to act on and the message is all there is.
     pub fn rejection(&self) -> Option<PairCodeRejection> {
         use crate::error::ErrorChainExt;
         self.server_rejection()
-            .map(|rejection| PairCodeRejection::from_server(rejection.code, rejection.text))
+            .and_then(|rejection| PairCodeRejection::from_server(rejection.code, rejection.text))
     }
 
     /// Whether this request lost the pairing flow to someone else rather than
@@ -425,6 +427,16 @@ impl Client {
         let response = match self.send_iq(query).await {
             Ok(response) => response,
             Err(e) => {
+                // The same ownership recheck the success path does below, and
+                // for the same reason. A 30s IQ timeout easily outlives a
+                // `cancel_pair_code` plus its replacement, and reporting this
+                // request's transport failure would then put an uncorrelated
+                // error on the bus against the flow that now owns the slot.
+                // Losing the slot outranks how this request happened to end.
+                if !self.owns_code_claim(claim).await {
+                    claim_guard.armed = false;
+                    return Err(PairCodeError::Cancelled.into());
+                }
                 claim_guard.release_now().await;
                 return Err(e.into());
             }
@@ -1052,11 +1064,75 @@ mod tests {
         );
     }
 
+    /// The same suppression must hold when the withdrawn request ends in an *IQ
+    /// failure* rather than a late success. A 30 s timeout or a server rejection
+    /// easily outlives a `cancel_pair_code` plus its replacement, and reporting
+    /// this request's transport failure would then land on the flow that now
+    /// owns the slot.
+    #[tokio::test]
+    async fn a_withdrawn_request_reports_cancellation_not_its_iq_failure() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the companion_hello to be on the wire", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        client.cancel_pair_code().await;
+
+        // Refuse the withdrawn request's IQ, rather than answering it.
+        let hello = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = hello
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("companion_hello carries an id")
+            .into_owned();
+        let refusal = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net".to_string()),
+                ("type", "error".to_string()),
+                ("id", id.clone()),
+            ])
+            .children([NodeBuilder::new("error")
+                .attrs([
+                    ("code", "429".to_string()),
+                    ("text", "rate-overlimit".to_string()),
+                ])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &refusal).await;
+
+        let err = pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("a withdrawn request must not report a usable code");
+        assert!(
+            err.lost_the_flow_to_another_request(),
+            "losing the slot outranks how the request ended, got {err:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a withdrawn request's IQ failure must not report against its replacement"
+        );
+    }
+
     /// WA Web asserts `code` and `text` as a pair and falls to its generic
     /// error path when they disagree, so a contradicting text must not keep
     /// reading as the named arm.
     #[test]
-    fn a_contradicting_text_demotes_to_unknown() {
+    fn a_contradicting_text_yields_no_classification() {
         let pe: PairError = IqError::ServerError {
             code: 429,
             text: "something-else".into(),
@@ -1065,11 +1141,14 @@ mod tests {
         }
         .into();
 
-        assert_eq!(pe.rejection(), Some(PairCodeRejection::Unknown(429)));
-        assert!(
-            !pe.rejection().is_some_and(PairCodeRejection::is_throttled),
+        assert_eq!(
+            pe.rejection(),
+            None,
             "a pairing WA Web would reject must not drive throttle handling"
         );
+        // The code is still recoverable from the rendering, so refusing to
+        // classify does not lose it.
+        assert!(pe.to_string().contains("429"), "got: {pe}");
     }
 
     /// An absent `text` is not a contradiction. Deliberately laxer than WA Web:
