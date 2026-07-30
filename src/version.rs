@@ -1,7 +1,7 @@
 use crate::http::{HTTP_STATUS_REDIRECTION_START, HttpClient, HttpRequest};
 use crate::store::commands::DeviceCommand;
 use crate::store::persistence_manager::PersistenceManager;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use log::debug;
 use std::sync::Arc;
 
@@ -69,9 +69,13 @@ pub async fn resolve_and_update_version(
 
     if needs_fetch {
         debug!("WhatsApp version is stale or missing, fetching latest...");
+        // `.context`, not `anyhow!("… {e}")`: reformatting builds a new error
+        // and drops the chain, so the `HttpStatusError` the fetch attached
+        // would never reach a caller holding a `ConnectError::Version`. The
+        // message is the same either way; only the recoverability differs.
         let (p, s, t) = fetch_latest_app_version(http_client)
             .await
-            .map_err(|e| anyhow!("Failed to fetch latest WhatsApp version: {}", e))?;
+            .context("Failed to fetch latest WhatsApp version")?;
         debug!("Fetched latest version: {}.{}.{}", p, s, t);
         persistence_manager
             .process_command(DeviceCommand::SetAppVersion((p, s, t)))
@@ -89,6 +93,7 @@ pub async fn resolve_and_update_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorChainExt;
     use crate::http::HttpResponse;
 
     struct StatusOnlyHttpClient(u16);
@@ -103,6 +108,32 @@ mod tests {
         }
     }
 
+    /// The status has to survive the layer a real caller actually goes through.
+    /// `Client::connect()` reaches this fetch via `resolve_and_update_version`,
+    /// which used to reformat the error into a new one — the message kept the
+    /// status while the typed cause was dropped, so `http_status()` answered
+    /// `None` on the only path that matters.
+    #[tokio::test]
+    async fn the_version_status_survives_resolve_and_update() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let http_client: Arc<dyn HttpClient> = Arc::new(StatusOnlyHttpClient(403));
+
+        let err = resolve_and_update_version(&persistence_manager, &http_client, None)
+            .await
+            .expect_err("a 403 must not resolve a version");
+
+        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        assert_eq!(
+            cause.http_status(),
+            Some(403),
+            "the wrap must add context, not rebuild the error, got: {err:?}"
+        );
+    }
+
     /// A non-2xx sw.js fetch arrives as a response, so the status has to be
     /// named here — not swallowed into a "no client_revision" parse failure.
     #[tokio::test]
@@ -111,6 +142,10 @@ mod tests {
         let err = fetch_latest_app_version(&http_client)
             .await
             .expect_err("a 403 must not be parsed as a version document");
+        // Recoverable by type, not only readable — the same contract the media
+        // paths answer, so a caller does not have to know which fetch it was.
+        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        assert_eq!(cause.http_status(), Some(403), "got: {err:?}");
         assert!(
             err.to_string().contains("403"),
             "the error must name the status, got: {err}"

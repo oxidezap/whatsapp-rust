@@ -1,8 +1,13 @@
 use e2e_tests::TestClient;
 use log::info;
-use whatsapp_rust::download::{DownloadParams, Downloadable, MediaType};
+use std::sync::Arc;
+use whatsapp_rust::TokioRuntime;
+use whatsapp_rust::download::{
+    DownloadParams, Downloadable, MediaDownloader, MediaRoute, MediaType,
+};
 use whatsapp_rust::upload::UploadResponse;
 use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
 struct UploadedMediaParts {
     url: String,
@@ -375,6 +380,77 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
     assert_eq!(result_cursor.into_inner(), original);
 
     client.disconnect().await;
+    Ok(())
+}
+
+// ─── Download Without A Connected Session ────────────────────────────
+
+/// The media route is the only part of a download that needs a session, so a
+/// caller holding the route and the decryption references must be able to
+/// download after the client is gone.
+///
+/// The hosts are injected from the media conn the mock server handed out, which
+/// is what makes this reach the mock's CDN instead of the real one. Both route
+/// kinds are exercised: with the auth token the session had, and with
+/// `without_auth`, which is the shape a caller outliving its session should use
+/// and the one the official client's download URL builder emits.
+#[tokio::test]
+async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let client = TestClient::connect("e2e_dl_no_session").await?;
+
+    let original = b"media that outlives the session".to_vec();
+    let upload = client
+        .client
+        .upload(original.clone(), MediaType::Image, Default::default())
+        .await?;
+    let route = MediaRoute::from(&client.client.refresh_media_conn(false).await?);
+    assert!(
+        !route.hosts.is_empty(),
+        "the mock server must hand out at least one media host"
+    );
+
+    let params = DownloadParams::encrypted(
+        &upload.direct_path,
+        &upload.media_key,
+        &upload.file_sha256,
+        &upload.file_enc_sha256,
+        upload.file_length,
+        MediaType::Image,
+    );
+
+    client.disconnect().await;
+
+    let downloader = MediaDownloader::new(
+        Arc::new(UreqHttpClient::new()),
+        Arc::new(TokioRuntime),
+        route.clone(),
+    );
+    let downloaded = downloader.download(&params).await?;
+    assert_eq!(downloaded, original);
+
+    let cursor = downloader
+        .download_to_writer(&params, std::io::Cursor::new(Vec::<u8>::new()))
+        .await?;
+    assert_eq!(cursor.into_inner(), original);
+
+    let hosts_only = MediaDownloader::new(
+        Arc::new(UreqHttpClient::new()),
+        Arc::new(TokioRuntime),
+        route.without_auth(),
+    );
+    let downloaded = hosts_only.download(&params).await?;
+    assert_eq!(
+        downloaded, original,
+        "the CDN authorizes a download by its signed path, not by the session token"
+    );
+
+    let cursor = hosts_only
+        .download_to_writer(&params, std::io::Cursor::new(Vec::<u8>::new()))
+        .await?;
+    assert_eq!(cursor.into_inner(), original);
+
     Ok(())
 }
 
