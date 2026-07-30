@@ -5,7 +5,6 @@ use crate::http::{
 };
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_auth_error};
 use anyhow::{Result, anyhow};
-use std::io::SeekFrom;
 use std::sync::Arc;
 use wacore::runtime::Runtime;
 
@@ -314,6 +313,7 @@ async fn download_to_writer_with_retry<
     ExecuteRequestFut,
 >(
     max_refresh_attempts: usize,
+    runtime: &Arc<dyn Runtime>,
     mut writer: W,
     mut prepare_requests: PrepareRequests,
     mut invalidate_media_conn: InvalidateMediaConn,
@@ -335,7 +335,7 @@ where
         let requests = match prepare_requests(force_refresh).await {
             Ok(requests) => requests,
             Err(err) => {
-                discard_failed_write(&mut writer);
+                discard_failed_write(runtime, writer).await;
                 return Err(DownloadRequestError::Prepare(err));
             }
         };
@@ -361,7 +361,7 @@ where
                     break;
                 }
                 Err(err) if err.is_auth() || err.is_not_found() => {
-                    discard_failed_write(&mut writer);
+                    discard_failed_write(runtime, writer).await;
                     return Err(err);
                 }
                 Err(err) => {
@@ -381,7 +381,7 @@ where
         }
     }
 
-    discard_failed_write(&mut writer);
+    discard_failed_write(runtime, writer).await;
     match last_err {
         Some(err) => Err(DownloadRequestError::Other(err)),
         None => Err(DownloadRequestError::NoHosts),
@@ -504,6 +504,7 @@ impl MediaDownloader {
     ) -> std::result::Result<W, MediaDownloadError> {
         download_to_writer_with_retry(
             NO_MEDIA_CONN_REFRESH,
+            &self.runtime,
             writer,
             |_force| async { DownloadUtils::prepare_download_requests(downloadable, &self.route) },
             || async {},
@@ -606,13 +607,17 @@ impl Client {
     /// The entire HTTP download, decryption, and file write happen in a single
     /// blocking thread. The writer is seeked back to position 0 before returning.
     ///
-    /// On success the writer holds exactly the decrypted media and nothing else;
-    /// on failure it is left empty. Neither a writer that arrived with content
-    /// nor a host that streamed out plaintext before failing its MAC can leave a
-    /// tail behind the media, because the writer is cut back to the length the
-    /// verified attempt actually wrote. That guarantee is what
-    /// [`DownloadWriter`] exists to provide, and why this does not take a plain
-    /// `Write + Seek`.
+    /// On success the writer holds exactly the decrypted media and nothing else.
+    /// Every attempt starts by emptying it, so neither content the caller left
+    /// behind nor a host that streamed out plaintext before failing its MAC can
+    /// survive into the result. Providing that is what [`DownloadWriter`] is for,
+    /// and why this does not take a plain `Write + Seek`.
+    ///
+    /// On failure the writer is emptied too, on a best-effort basis: a sink that
+    /// refuses to empty is logged rather than replacing the download's own error,
+    /// and a writer lost to a panicking executor cannot be reached to be cleaned
+    /// at all. Both leave unverified bytes only in a sink the caller reaches
+    /// through a handle it kept, since this otherwise consumes the writer.
     ///
     /// Memory usage: ~40KB regardless of file size (8KB read buffer + decrypt state).
     #[cfg_attr(
@@ -631,6 +636,7 @@ impl Client {
     ) -> Result<W> {
         download_to_writer_with_retry(
             MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
+            &self.runtime,
             writer,
             |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
@@ -655,33 +661,55 @@ impl Client {
     }
 }
 
-/// Cut a verified download back to exactly what it wrote, then rewind it.
+/// Empty a writer and rewind it, so whatever is written next is all it holds.
 ///
-/// The current position is the authoritative length: every byte of plaintext went
-/// through this writer, so wherever it now sits is where the media ends. Anything
-/// past that belongs to a longer attempt this one replaced — a host whose body
-/// only failed its MAC after streaming out plaintext, or content the caller left
-/// in the writer.
+/// Emptying rather than only rewinding is what makes the length of a finished
+/// attempt knowable. It also keeps the guarantee independent of how the sink
+/// treats position: a [`std::fs::File`] opened for appending ignores seeks and
+/// writes at the end, so only a sink whose end has been brought back to zero
+/// puts an append-mode write where the media belongs.
+fn clear_writer<W: DownloadWriter>(writer: &mut W) -> std::io::Result<()> {
+    writer.truncate(0)?;
+    writer.rewind()?;
+    Ok(())
+}
+
+/// Rewind a verified attempt for the caller to read back.
+///
+/// No truncation here: the attempt began on a sink [`clear_writer`] had emptied,
+/// so the bytes it wrote are the only bytes present. That is what lets a host
+/// which streamed out plaintext before failing its MAC be replaced by a shorter
+/// one without leaving a tail behind the media.
 fn finish_verified_write<W: DownloadWriter>(
     writer: &mut W,
 ) -> std::result::Result<(), DownloadRequestError> {
-    let verified_len = writer
-        .stream_position()
-        .map_err(DownloadRequestError::other)?;
-    writer
-        .truncate(verified_len)
-        .map_err(DownloadRequestError::other)?;
     writer.rewind().map_err(DownloadRequestError::other)
 }
 
 /// Empty a writer whose download is not coming back.
 ///
-/// Errors are swallowed deliberately: this runs on a path that is already
-/// failing, and the caller is owed the original cause, not an I/O error raised
-/// while cleaning up after it.
-fn discard_failed_write<W: DownloadWriter>(writer: &mut W) {
-    let _ = writer.truncate(0);
-    let _ = writer.rewind();
+/// Runs on the blocking pool because it can reach a filesystem — or a
+/// third-party [`DownloadWriter`] — and this is the async retry future, which
+/// shares its runtime with the read loop.
+///
+/// Cleanup is best-effort: the caller is owed the failure that caused this, not
+/// an I/O error raised while tidying up after it. A sink that refuses to empty
+/// is logged, because the bytes it kept are unauthenticated and the caller has
+/// no other way to learn they are there.
+async fn discard_failed_write<W: DownloadWriter + Send + 'static>(
+    runtime: &Arc<dyn Runtime>,
+    writer: W,
+) {
+    let mut writer = writer;
+    wacore::runtime::blocking(&**runtime, move || {
+        if let Err(e) = clear_writer(&mut writer) {
+            log::warn!(
+                "Failed to empty the writer after a failed media download: {e}. \
+                 It may still hold unverified bytes."
+            );
+        }
+    })
+    .await
 }
 
 /// Download + decrypt to a writer. Uses streaming when available,
@@ -703,7 +731,7 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + Send + 'static>(
     Ok(wacore::runtime::blocking(&**runtime, move || {
         let mut writer = writer;
 
-        if let Err(e) = writer.seek(SeekFrom::Start(0)) {
+        if let Err(e) = clear_writer(&mut writer) {
             return (writer, Err(DownloadRequestError::other(e)));
         }
 
@@ -764,9 +792,7 @@ async fn buffered_download_and_decrypt<W: DownloadWriter + Send + 'static>(
         let mut writer = writer;
         let result = (|| {
             decrypt_or_validate_buffered_body(&mut body, &decryption)?;
-            writer
-                .seek(SeekFrom::Start(0))
-                .map_err(DownloadRequestError::other)?;
+            clear_writer(&mut writer).map_err(DownloadRequestError::other)?;
             writer
                 .write_all(&body)
                 .map_err(DownloadRequestError::other)?;
@@ -814,7 +840,7 @@ mod tests {
     use crate::error::ErrorChainExt;
     use crate::mediaconn::{MediaConn, MediaConnHost};
     use async_lock::Mutex;
-    use std::io::{Cursor, Seek, Write};
+    use std::io::{Cursor, Seek, SeekFrom, Write};
     use std::sync::Arc;
     use wacore::time::Instant;
     use waproto::whatsapp as wa;
@@ -1462,8 +1488,10 @@ mod tests {
         let invalidations = Arc::new(Mutex::new(0usize));
         let seen_urls = Arc::new(Mutex::new(Vec::new()));
 
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
         let writer = download_to_writer_with_retry(
             MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
+            &runtime,
             Cursor::new(Vec::<u8>::new()),
             {
                 let refresh_calls = Arc::clone(&refresh_calls);
@@ -1721,6 +1749,39 @@ mod tests {
             .expect("download should succeed");
 
         assert_eq!(writer.into_inner(), original);
+    }
+
+    /// A file opened for appending writes at the end no matter where it was
+    /// seeked, so rewinding alone would leave the media behind whatever the file
+    /// already held. Emptying the sink is what puts an append-mode write at the
+    /// start, and a real `File` is the only way to prove it — `Cursor` honours
+    /// seeks and cannot express the mode.
+    #[tokio::test]
+    async fn an_append_mode_file_still_ends_up_holding_only_the_media() {
+        let original = b"appended, yet exact".to_vec();
+        let (params, encrypted) = encrypted_params(&original);
+
+        let path = std::env::temp_dir().join(format!(
+            "wa-rust-append-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"stale bytes the caller left behind")
+            .expect("fixture write should succeed");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append open should succeed");
+
+        let http = RoutedHttpClient::streaming(Vec::new(), (200, encrypted));
+        downloader(http, &["cdn.example.com"])
+            .download_to_writer(&params, file)
+            .await
+            .expect("download should succeed");
+
+        let written = std::fs::read(&path).expect("read back should succeed");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, original);
     }
 
     /// A [`DownloadWriter`] whose bytes outlive it.
