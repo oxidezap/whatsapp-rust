@@ -628,10 +628,14 @@ impl PairCodeUtils {
 /// "unknown error". They exist so a consumer can branch on the refusal instead
 /// of matching the formatted message, which is not a stable surface.
 ///
-/// The numbers are the `code` attribute. WA Web pairs each with a literal
-/// `text` (`429`/`rate-overlimit`, `452`/`feature-not-available`, …) and
-/// rejects a response whose two disagree, so the code alone identifies the
-/// refusal.
+/// The numbers are the `code` attribute, and each is the enum's whole wire form
+/// — [`code()`](Self::code) is what `Serialize` emits and what `From<i32>` reads
+/// back. WA Web pairs each code with a literal `text`
+/// (`429`/`rate-overlimit`, `452`/`feature-not-available`, …) and rejects a
+/// response whose two disagree, so construct these through
+/// [`from_server`](Self::from_server) rather than from a code alone: it is the
+/// only constructor that sees both attributes, and the only one that can decline
+/// to classify.
 ///
 /// WA Web branches on exactly two of them (`DevicePhoneNumberCodeScreen`, on
 /// `CompanionHelloError.type.name`): [`RateOverlimit`](Self::RateOverlimit)
