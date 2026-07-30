@@ -1,6 +1,7 @@
 use crate::client::Client;
 use crate::http::{
     HTTP_STATUS_GONE, HTTP_STATUS_NOT_FOUND, HTTP_STATUS_OK, HTTP_STATUS_REDIRECTION_START,
+    HttpStatusError,
 };
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_auth_error};
 use anyhow::{Result, anyhow};
@@ -96,16 +97,44 @@ enum DownloadRequestError {
 
 impl DownloadRequestError {
     fn auth(status_code: u16) -> Self {
-        Self::Auth(anyhow!("Download failed with status: {}", status_code))
-    }
-
-    fn not_found(status_code: u16) -> Self {
-        Self::NotFound(anyhow!(
-            "Download media not found/expired with status: {}",
-            status_code
+        Self::Auth(Self::refused(
+            status_code,
+            format!("Download failed with status: {status_code}"),
         ))
     }
 
+    fn not_found(status_code: u16) -> Self {
+        Self::NotFound(Self::refused(
+            status_code,
+            format!("Download media not found/expired with status: {status_code}"),
+        ))
+    }
+
+    /// A status this path does not act on itself (429, 5xx, …). Still carries
+    /// the status: the retry loop ignoring it does not mean the caller will,
+    /// and "back off" and "upstream is broken" are its calls to make.
+    fn refused_status(status_code: u16) -> Self {
+        Self::Other(Self::refused(
+            status_code,
+            format!("Download failed with status: {status_code}"),
+        ))
+    }
+
+    /// The message stays what it was; the status also becomes a typed node in
+    /// the chain so [`ErrorChainExt::http_status`] can recover it instead of a
+    /// consumer parsing this text.
+    ///
+    /// [`ErrorChainExt::http_status`]: crate::error::ErrorChainExt::http_status
+    fn refused(status_code: u16, context: String) -> anyhow::Error {
+        HttpStatusError {
+            status: status_code,
+        }
+        .into_error(context)
+    }
+
+    /// For failures with no HTTP status at all — a socket that never connected,
+    /// a body that would not decrypt. `http_status()` reports `None` for these,
+    /// which is how a caller tells our bug from the CDN's.
     fn other(err: impl Into<anyhow::Error>) -> Self {
         Self::Other(err.into())
     }
@@ -136,7 +165,7 @@ fn validate_download_status(status_code: u16) -> std::result::Result<(), Downloa
     } else if matches!(status_code, HTTP_STATUS_NOT_FOUND | HTTP_STATUS_GONE) {
         DownloadRequestError::not_found(status_code)
     } else {
-        DownloadRequestError::other(anyhow!("Download failed with status: {status_code}"))
+        DownloadRequestError::refused_status(status_code)
     };
     Err(error)
 }
@@ -355,10 +384,9 @@ impl Client {
             .await
             .map_err(|e| anyhow!("sticker pack request failed: {e}"))?;
         if response.status_code != HTTP_STATUS_OK {
-            return Err(anyhow!(
-                "sticker pack endpoint returned status {}",
-                response.status_code
-            ));
+            let status = response.status_code;
+            return Err(HttpStatusError { status }
+                .into_error(format!("sticker pack endpoint returned status {status}")));
         }
         wacore::sticker_pack::parse_sticker_pack_response(&response.body)
     }
@@ -557,6 +585,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorChainExt;
     use crate::mediaconn::{MediaConn, MediaConnHost};
     use async_lock::Mutex;
     use std::io::Cursor;
@@ -782,6 +811,117 @@ mod tests {
             *attempts.lock().await,
             vec![false, true],
             "the second attempt must ask for a refreshed media conn"
+        );
+    }
+
+    /// Regression (#1193): the retry loop classified the CDN status correctly
+    /// and then dropped the classification on the way out — `into_anyhow`
+    /// unwrapped every variant to the same bare message, so a consumer of the
+    /// public path could only recover the status by parsing `Display`.
+    ///
+    /// Driven through the real loop against a real socket rather than by
+    /// building the error here: #1185 was a classifier that was unit-tested
+    /// while unreachable, and a test that constructs its own error would repeat
+    /// exactly that mistake.
+    #[cfg(feature = "ureq-client")]
+    #[tokio::test]
+    async fn the_cdn_status_survives_to_the_public_error() {
+        // One per branch of `validate_download_status`, since each built its
+        // error by a different route: auth, not-found, and the `Other` arm that
+        // the loop does not act on but a caller still has to tell apart.
+        for (status, reason) in [
+            (403u16, "Forbidden"),
+            (410, "Gone"),
+            (429, "Too Many Requests"),
+        ] {
+            // Each server answers once. 403 and 410 make the loop refresh the
+            // media conn and try again, so the retry needs a host of its own —
+            // still refusing, which is the case where the caller finally sees
+            // the error.
+            let first = spawn_cdn_status_server(status, reason);
+            let refreshed = spawn_cdn_status_server(status, reason);
+            let client = ureq_client().await;
+
+            let err = download_media_with_retry(
+                move |force| {
+                    let url = if force {
+                        refreshed.clone()
+                    } else {
+                        first.clone()
+                    };
+                    async move { Ok(vec![plaintext_request(url)]) }
+                },
+                || async {},
+                |request| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        match client
+                            .streaming_download_and_decrypt(&request, Cursor::new(Vec::new()))
+                            .await
+                        {
+                            Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+                            Ok((_, Err(e))) => Err(e),
+                            Err(e) => Err(DownloadRequestError::other(e)),
+                        }
+                    }
+                },
+            )
+            .await
+            .expect_err("a non-2xx CDN response must fail the download");
+
+            let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+            assert_eq!(
+                cause.http_status(),
+                Some(status),
+                "the consumer must recover {status} by type, got: {err:?}"
+            );
+            // The status stayed in the message too, so nothing that logs the
+            // error today reads differently.
+            assert!(
+                format!("{err}").contains(&status.to_string()),
+                "the message should still name the status, got: {err}"
+            );
+        }
+    }
+
+    /// A failure with no HTTP status must not acquire one. That is the
+    /// difference between "the CDN says this is gone" and "we broke", and a
+    /// caller passing a status upstream needs it to be the CDN's.
+    #[cfg(feature = "ureq-client")]
+    #[tokio::test]
+    async fn a_failure_with_no_exchange_reports_no_status() {
+        let client = ureq_client().await;
+        // Nothing is listening, so the exchange never completes.
+        let request = plaintext_request("http://127.0.0.1:1".to_string());
+
+        let err = download_media_with_retry(
+            move |_force| {
+                let request = request.clone();
+                async move { Ok(vec![request]) }
+            },
+            || async {},
+            |request| {
+                let client = Arc::clone(&client);
+                async move {
+                    match client
+                        .streaming_download_and_decrypt(&request, Cursor::new(Vec::new()))
+                        .await
+                    {
+                        Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+                        Ok((_, Err(e))) => Err(e),
+                        Err(e) => Err(DownloadRequestError::other(e)),
+                    }
+                }
+            },
+        )
+        .await
+        .expect_err("a refused connection must fail the download");
+
+        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        assert_eq!(
+            cause.http_status(),
+            None,
+            "a transport failure must not be laundered into an upstream status, got: {err:?}"
         );
     }
 

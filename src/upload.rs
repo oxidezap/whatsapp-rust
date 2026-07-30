@@ -6,7 +6,7 @@ use wacore::net::WHATSAPP_WEB_ORIGIN;
 use wacore::sync_marker::MaybeSend;
 
 use crate::client::Client;
-use crate::http::{HttpRequest, HttpResponse};
+use crate::http::{HttpRequest, HttpResponse, HttpStatusError};
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, is_media_auth_error};
 
 /// Files >= 5 MiB check for existing/partial upload before sending.
@@ -92,14 +92,17 @@ fn build_resume_check_request(
 }
 
 fn upload_error_from_response(response: HttpResponse) -> anyhow::Error {
-    match response.body_string() {
-        Ok(body) => anyhow!("Upload failed {} body={}", response.status_code, body),
-        Err(body_err) => anyhow!(
-            "Upload failed {} and failed to read response body: {}",
-            response.status_code,
-            body_err
-        ),
-    }
+    let status = response.status_code;
+    let context = match response.body_string() {
+        Ok(body) => format!("Upload failed {status} body={body}"),
+        Err(body_err) => {
+            format!("Upload failed {status} and failed to read response body: {body_err}")
+        }
+    };
+    // The status also goes in as a typed node, not only into the message: the
+    // host-rotation loop below reads it via `is_media_auth_error`, and the
+    // caller that ends up with `last_error` needs the same answer.
+    HttpStatusError { status }.into_error(context)
 }
 
 /// Crypto metadata needed to finalize an upload, independent of how the
@@ -673,6 +676,56 @@ mod tests {
         assert!(seen_urls[1].contains("cdn2.example.com"));
         assert_eq!(result.direct_path, "/v/t62.7118-24/456");
         assert_eq!(result.media_key_timestamp, 0);
+    }
+
+    /// Regression (#1193): upload put the host's status only into a formatted
+    /// message, so a caller that ran out of hosts got "Upload failed 507 …" as
+    /// text and no way to tell a throttle from a broken upstream by type.
+    ///
+    /// Every host refuses here, which is the case whose error actually reaches
+    /// the caller — the failover tests above only cover the ones it recovers
+    /// from.
+    #[tokio::test]
+    async fn the_upload_status_survives_to_the_public_error() {
+        use crate::error::ErrorChainExt;
+
+        let enc = wacore::upload::encrypt_media(b"nowhere to go", MediaType::Image)
+            .expect("encryption should succeed");
+        let len = enc.data_to_upload.len() as u64;
+        let conn = media_conn("shared-auth", &["cdn1.example.com", "cdn2.example.com"]);
+
+        let err = upload_media_with_retry(
+            crypto_from(&enc),
+            MediaType::Image,
+            10,
+            len,
+            0,
+            move |_force| {
+                let conn = conn.clone();
+                async move { Ok(conn) }
+            },
+            || async {},
+            unreachable_check,
+            move |_request: HttpRequest, _offset, _remaining| async move {
+                Ok(HttpResponse {
+                    status_code: 507,
+                    body: b"insufficient storage".to_vec(),
+                })
+            },
+        )
+        .await
+        .expect_err("every host refusing must fail the upload");
+
+        let cause: &(dyn std::error::Error + 'static) = err.as_ref();
+        assert_eq!(
+            cause.http_status(),
+            Some(507),
+            "the consumer must recover the host's status by type, got: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("507"),
+            "the message should still name the status, got: {err}"
+        );
     }
 
     /// Above the threshold, a server `resume=<offset>` must drive `send_body` to

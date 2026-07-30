@@ -41,6 +41,13 @@
 //! extension code, a different space from the IQ `code` attribute, and merging
 //! the two would make the number meaningless.
 //!
+//! An HTTP status is kept apart from an IQ `code` for the same reason, but it
+//! *is* recoverable — under its own question, [`ErrorChainExt::http_status`].
+//! The media paths refuse a CDN or upload host on a status the caller often has
+//! to act on differently from a stanza rejection, so the fact is modelled; what
+//! is avoided is one accessor that answers for both layers and leaves the
+//! caller unable to tell which refused.
+//!
 //! # Rendering
 //!
 //! A wrapping variant renders exactly what it wraps, so each error's own
@@ -51,6 +58,7 @@
 
 use std::error::Error as StdError;
 
+use crate::http::HttpStatusError;
 use crate::request::IqError as ClientIqError;
 use wacore::request::{IqError as CoreIqError, ServerErrorCode};
 use wacore::store::error::StoreError;
@@ -115,6 +123,27 @@ pub trait ErrorChainExt {
     /// MEX extension errors are excluded.
     fn server_rejection(&self) -> Option<ServerRejection<'_>> {
         self.sources().find_map(server_rejection_of)
+    }
+
+    /// The HTTP status behind this error, if any.
+    ///
+    /// Reports a status the client refused a *completed* HTTP exchange on —
+    /// today the media download and upload paths. `None` means no HTTP
+    /// exchange got that far: the request never left, or the failure was ours.
+    /// That distinction is the point. A caller serving media onwards has to
+    /// tell "the CDN says this is gone" from "we broke", and only the first is
+    /// an upstream status it may pass on.
+    ///
+    /// Separate from [`server_rejection`](Self::server_rejection), which
+    /// answers for IQ stanzas. The two numbers come from different layers, and
+    /// a `403` from a CDN and a `403` from the chat server call for different
+    /// things; merging them would name the number while hiding which one to
+    /// act on. Same reasoning the [module docs](self) give for leaving
+    /// `MexError`'s GraphQL code out of `server_rejection`.
+    fn http_status(&self) -> Option<u16> {
+        self.sources()
+            .find_map(|cause| cause.downcast_ref::<HttpStatusError>())
+            .map(|refused| refused.status)
     }
 
     /// Whether the operation ran out of time waiting for the server.

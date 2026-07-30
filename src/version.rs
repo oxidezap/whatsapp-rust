@@ -26,11 +26,9 @@ pub async fn fetch_latest_app_version(
     // instead of letting an error page fall through to a "no client_revision"
     // parse failure.
     if response.status_code >= HTTP_STATUS_REDIRECTION_START {
-        return Err(anyhow!(
-            "HTTP request to {} returned status {}",
-            SW_URL,
-            response.status_code
-        ));
+        let status = response.status_code;
+        return Err(crate::http::HttpStatusError { status }
+            .into_error(format!("HTTP request to {SW_URL} returned status {status}")));
     }
 
     let body_str = response
