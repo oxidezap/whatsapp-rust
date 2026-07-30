@@ -25,7 +25,7 @@ chrono = { workspace = true, features = ["now"] }
 ctr = { workspace = true }
 curve25519-dalek = "5.0.0"
 derive_more = { version = "2.1.1", features = ["from", "into", "try_from"] }
-displaydoc = "0.2.6"
+displaydoc = "0.2.7"
 ghash = "0.6.0"
 hex = { workspace = true }
 hkdf = { workspace = true }
