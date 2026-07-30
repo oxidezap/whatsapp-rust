@@ -233,13 +233,7 @@ impl Client {
         // twice, and a `with_pair_code` consumer sees it at all.
         match self.pair_with_code_inner(options).await {
             Ok(code) => Ok(code),
-            // Two failures do not mean "no code is coming", so dispatching them
-            // would say the opposite of what happened — see the predicate. The
-            // dangerous one is `Cancelled`: a superseded request can return it
-            // *after* its replacement has taken the slot, so the event would
-            // arrive uncorrelated and let a consumer tear down the live code the
-            // replacement is about to deliver.
-            Err(e) if e.lost_the_flow_to_another_request() => Err(e),
+            Err(e) if self.failure_is_not_this_flows_to_report(&e).await => Err(e),
             Err(e) => {
                 self.core.event_bus.dispatch(Event::PairingCodeError(
                     crate::types::events::PairingCodeError::builder()
@@ -251,6 +245,32 @@ impl Client {
                 Err(e)
             }
         }
+    }
+
+    /// Whether reporting this failure would speak for a flow that is not the
+    /// failed request's to speak for.
+    ///
+    /// The event means "no code is coming", so the question is not *how* the
+    /// request failed but whether a code is nonetheless on its way. Answered on
+    /// the state, not on the error variant: the variants that can reach here
+    /// while a flow is live are open-ended — a duplicate request, a withdrawn
+    /// one, its IQ timing out, or a second caller simply passing a bad phone
+    /// number while the first code is still on screen — and enumerating them
+    /// has already been wrong four times.
+    ///
+    /// [`PairCodeError::Cancelled`] is still matched explicitly, because a
+    /// cancellation with no replacement leaves the slot idle: nothing is live,
+    /// yet the caller asked for exactly this and does not need telling.
+    async fn failure_is_not_this_flows_to_report(self: &Arc<Self>, e: &PairError) -> bool {
+        if e.lost_the_flow_to_another_request() {
+            return true;
+        }
+        // A failing request that still owned the slot has released it by now, so
+        // an outstanding flow here belongs to somebody else.
+        self.pair_code_state
+            .lock()
+            .await
+            .is_outstanding(wacore::time::now_secs())
     }
 
     async fn pair_with_code_inner(
@@ -1125,6 +1145,43 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&**e, Event::PairingCodeError(_))),
             "a withdrawn request's IQ failure must not report against its replacement"
+        );
+    }
+
+    /// Validation runs before the outstanding-flow check, so a second caller
+    /// with a bad number fails as `PhoneNumberTooShort` and never reaches the
+    /// suppressed variants. It must still stay silent while a code is live —
+    /// which is why the suppression asks the state, not the error.
+    #[tokio::test]
+    async fn a_validation_failure_beside_a_live_code_is_not_reported() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
+            code_generation_ts: wacore::time::now_secs(),
+            claim: wacore::pair_code::PairCodeClaim::next(),
+        };
+
+        let err = client
+            .pair_with_code(PairCodeOptions {
+                phone_number: "123".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 3-digit number must be refused");
+        assert!(
+            matches!(err, PairError::PairCode(PairCodeError::PhoneNumberTooShort)),
+            "validation must still win the race it already wins, got {err:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a live code must not be reported as failed by an unrelated bad request"
         );
     }
 
