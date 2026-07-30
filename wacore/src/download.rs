@@ -306,6 +306,69 @@ impl MediaRoute {
     }
 }
 
+/// A sink a media download can be streamed into.
+///
+/// [`Self::truncate`] is the entire reason this is not simply `Write + Seek`.
+/// Media carries a single MAC over the whole ciphertext, so
+/// [`DownloadUtils::decrypt_stream_to_writer`] has necessarily written plaintext
+/// by the time it can tell the payload was forged, and the retry that follows may
+/// write fewer bytes than the attempt it replaces. Rewinding alone would then
+/// leave verified media followed by a tail of stale bytes from the failed host.
+/// `Write + Seek` cannot express the fix: shortening a sink lives on concrete
+/// types (`File::set_len`, `Vec::truncate`), not on any std trait.
+///
+/// Implementations are provided for the sinks a download realistically targets —
+/// [`std::fs::File`], an in-memory [`std::io::Cursor`], and the `BufWriter` and
+/// `&mut` wrappers around them.
+pub trait DownloadWriter: std::io::Write + std::io::Seek {
+    /// Shorten the sink to `len` bytes, discarding anything beyond it.
+    ///
+    /// Only ever called with a length the sink already reaches, so an
+    /// implementation never has to decide what extending would mean.
+    fn truncate(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl DownloadWriter for std::fs::File {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+/// Saturating rather than fallible: `Vec::truncate` past the end is a no-op, which
+/// is exactly the right answer when the length cannot be represented locally.
+fn truncate_vec(buf: &mut Vec<u8>, len: u64) {
+    buf.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+}
+
+impl DownloadWriter for std::io::Cursor<Vec<u8>> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        truncate_vec(self.get_mut(), len);
+        Ok(())
+    }
+}
+
+impl DownloadWriter for std::io::Cursor<&mut Vec<u8>> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        truncate_vec(self.get_mut(), len);
+        Ok(())
+    }
+}
+
+/// Buffered bytes are part of the sink's length, so they have to reach it before
+/// it can be measured against `len`.
+impl<W: DownloadWriter> DownloadWriter for std::io::BufWriter<W> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        std::io::Write::flush(self)?;
+        self.get_mut().truncate(len)
+    }
+}
+
+impl<W: DownloadWriter + ?Sized> DownloadWriter for &mut W {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        (**self).truncate(len)
+    }
+}
+
 pub struct DownloadUtils;
 
 impl DownloadUtils {
