@@ -119,18 +119,28 @@ impl PairError {
             .map(|rejection| PairCodeRejection::from_server(rejection.code, rejection.text))
     }
 
-    /// Whether this failure left an earlier code live rather than ending the
-    /// flow.
+    /// Whether this request lost the pairing flow to someone else rather than
+    /// ending it — so its failure says nothing about whether a code arrives.
     ///
-    /// True only for [`PairCodeError::CodeAlreadyOutstanding`]: the request was
-    /// refused *because* a previous code is still within its validity window, so
-    /// unlike every other failure a code is on screen and may yet be entered.
-    /// Retrying is futile until [`Client::cancel_pair_code`] runs or the window
-    /// closes, which is why no [`Event::PairingCodeError`] is dispatched for it.
-    pub fn leaves_a_code_outstanding(&self) -> bool {
+    /// These are the failures [`Event::PairingCodeError`] must stay silent for,
+    /// because its meaning is "no code is coming" and here that is not what
+    /// happened:
+    ///
+    /// - [`PairCodeError::CodeAlreadyOutstanding`] — refused *because* an
+    ///   earlier code is still inside its validity window. That code is on
+    ///   screen and may yet be entered; the consumer already has it from the
+    ///   [`Event::PairingCode`] that minted it.
+    /// - [`PairCodeError::Cancelled`] — the caller withdrew this request via
+    ///   [`Client::cancel_pair_code`], and a replacement may already own the
+    ///   slot. Reporting the *predecessor* would let a consumer read the live
+    ///   replacement as failed and tear down a code that is about to arrive.
+    ///
+    /// Both are consequences of something the caller did, so neither is news to
+    /// them, and a direct caller still receives the `Err` either way.
+    pub fn lost_the_flow_to_another_request(&self) -> bool {
         matches!(
             self,
-            Self::PairCode(PairCodeError::CodeAlreadyOutstanding { .. })
+            Self::PairCode(PairCodeError::CodeAlreadyOutstanding { .. } | PairCodeError::Cancelled)
         )
     }
 
@@ -221,15 +231,13 @@ impl Client {
         // twice, and a `with_pair_code` consumer sees it at all.
         match self.pair_with_code_inner(options).await {
             Ok(code) => Ok(code),
-            // `CodeAlreadyOutstanding` is the one failure that does not mean
-            // "no code is coming", so dispatching it would say the opposite of
-            // what happened: a code *is* live, and the consumer was handed it by
-            // the `PairingCode` that minted it. A concurrent request that has
-            // not got there yet still resolves on its own — into `PairingCode`
-            // or into this event — so refusing the duplicate strands nobody.
-            // Reporting it here would instead invite a retry loop against a code
-            // that only `cancel_pair_code` or expiry can clear.
-            Err(e) if e.leaves_a_code_outstanding() => Err(e),
+            // Two failures do not mean "no code is coming", so dispatching them
+            // would say the opposite of what happened — see the predicate. The
+            // dangerous one is `Cancelled`: a superseded request can return it
+            // *after* its replacement has taken the slot, so the event would
+            // arrive uncorrelated and let a consumer tear down the live code the
+            // replacement is about to deliver.
+            Err(e) if e.lost_the_flow_to_another_request() => Err(e),
             Err(e) => {
                 self.core.event_bus.dispatch(Event::PairingCodeError(
                     crate::types::events::PairingCodeError::builder()
@@ -988,7 +996,7 @@ mod tests {
             .await
             .expect_err("a second code must be refused while one is live");
         assert!(
-            err.leaves_a_code_outstanding(),
+            err.lost_the_flow_to_another_request(),
             "expected CodeAlreadyOutstanding, got: {err:?}"
         );
 
@@ -1000,6 +1008,47 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&**e, Event::PairingCodeError(_))),
             "a still-live code must not be reported as 'no code is coming'"
+        );
+    }
+
+    /// A request cancelled while its `companion_hello` is in flight must not
+    /// report either. It resolves *after* a replacement may already own the
+    /// slot, so the event would be uncorrelated with the flow actually running
+    /// and could make a consumer tear down a live code.
+    #[tokio::test]
+    async fn a_superseded_request_is_not_reported_as_a_failure() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the companion_hello to be on the wire", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        client.cancel_pair_code().await;
+        answer_companion_hello(&client, &transport, 0, b"3@2:late").await;
+
+        let err = pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("a cancelled request must not report a usable code");
+        assert!(
+            err.lost_the_flow_to_another_request(),
+            "expected Cancelled, got {err:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a withdrawn request must not report against the flow that replaced it"
         );
     }
 

@@ -1258,12 +1258,21 @@ pub struct PairingCodeRefresh {
 /// A claim the failed request itself took is released before this fires, so
 /// nothing is left holding the flow and `pair_with_code` can be called again.
 ///
-/// The one failure that does **not** arrive here is `CodeAlreadyOutstanding`:
-/// it is refused precisely because an earlier code is still live, so a code *is*
-/// coming — the consumer already has it from the [`PairingCode`] that minted it
-/// — and this event would say the opposite. Retrying is futile there until
-/// `cancel_pair_code` runs or the window closes, and a direct caller still gets
-/// it as `Err`.
+/// Two failures do **not** arrive here, because for them a code may still be on
+/// its way and this event would say the opposite — a consumer acting on it
+/// would tear down a code that is about to arrive:
+///
+/// - `CodeAlreadyOutstanding` — refused precisely because an earlier code is
+///   still live, and the consumer already has it from the [`PairingCode`] that
+///   minted it. Retrying is futile until `cancel_pair_code` runs or the window
+///   closes.
+/// - `Cancelled` — the caller withdrew this request, and a replacement may
+///   already own the slot. A superseded request can return this *after* its
+///   replacement started, so the event would be uncorrelated with the flow that
+///   is actually running.
+///
+/// Both follow from something the caller did, so neither is news, and a direct
+/// caller still gets the `Err`.
 ///
 /// Whether to retry at all is the point of the fields: back off on
 /// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled),
