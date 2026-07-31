@@ -758,6 +758,31 @@ fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySy
     }
 }
 
+/// `Pushname.id` is a JID string (`15551234567@s.whatsapp.net`), while
+/// `own_user` is the bare user part of our own JID. Compare on the user so the
+/// entry is recognisable; whatsmeow parses the same field with `ParseJID`.
+///
+/// Only a phone-namespaced entry can carry our PN user. A `@lid` entry whose
+/// user happens to be the same digits belongs to a different addressing space,
+/// and taking its name as our own would be wrong — so any other server is
+/// rejected rather than compared.
+///
+/// Parsing is left to `parse_jid_ref` rather than split by hand: it borrows
+/// (no allocation for the entries we discard) and it already knows the forms
+/// this field can take — the legacy `@c.us` spelling of the phone namespace,
+/// and both device suffixes, `user:3` and the legacy dotted `user.3`.
+fn pushname_id_is(id: &str, own_user: &str) -> bool {
+    if !id.contains('@') {
+        // Pre-JID bare form, still accepted.
+        return id == own_user;
+    }
+    let Some(jid) = wacore_binary::jid::parse_jid_ref(id) else {
+        return false;
+    };
+    (jid.server.is_pn_family() || jid.server == wacore_binary::jid::Server::Legacy)
+        && &*jid.user == own_user
+}
+
 // Best-effort: a malformed pushname (optional metadata) must not abort the sync.
 fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     let mut pos = 0;
@@ -777,7 +802,7 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
                 let id = smoothutf8::from_utf8(data.get(pos..end)?)?;
-                id_match = id == own_user;
+                id_match = pushname_id_is(id, own_user);
                 if !id_match {
                     return None; // wrong user, skip entirely
                 }
@@ -3038,17 +3063,91 @@ mod tests {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             nct_salt: Some(salt.clone()),
             pushnames: vec![wa::Pushname {
-                id: Some("0000000000".into()),
+                id: Some("15550000000@s.whatsapp.net".into()),
                 pushname: Some("TestUser".into()),
             }],
             ..Default::default()
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, Some("0000000000"), false).unwrap();
+        let result = process_history_sync(compressed, Some("15550000000"), false).unwrap();
 
         assert_eq!(result.nct_salt, Some(salt));
         assert_eq!(result.own_pushname.as_deref(), Some("TestUser"));
+    }
+
+    /// The server sends `Pushname.id` as a JID, and `own_user` is the bare user
+    /// part, so comparing the two verbatim never matches and the whole
+    /// history-sync path to our own push name is dead.
+    #[test]
+    fn own_pushname_matches_a_jid_id() {
+        let own = "15550000000";
+        for id in [
+            "15550000000@s.whatsapp.net",
+            "15550000000",                  // pre-JID form, still accepted
+            "15550000000@c.us",             // legacy spelling of the same namespace
+            "15550000000:3@s.whatsapp.net", // device suffix
+            "15550000000.3@s.whatsapp.net", // legacy dotted device suffix
+            "15550000000.3@c.us",
+        ] {
+            let hs = wa::HistorySync {
+                sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
+                pushnames: vec![wa::Pushname {
+                    id: Some(id.into()),
+                    pushname: Some("TestUser".into()),
+                }],
+                ..Default::default()
+            };
+            let result = process_history_sync(encode_and_compress(&hs), Some(own), false).unwrap();
+            assert_eq!(
+                result.own_pushname.as_deref(),
+                Some("TestUser"),
+                "id {id} must match own user {own}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_users_pushname_is_not_taken_as_our_own() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
+            pushnames: vec![wa::Pushname {
+                id: Some("15551111111@s.whatsapp.net".into()),
+                pushname: Some("Someone Else".into()),
+            }],
+            ..Default::default()
+        };
+        let result =
+            process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
+        assert_eq!(result.own_pushname, None);
+    }
+
+    /// The user part alone does not identify an account: a `@lid` entry lives in
+    /// a different addressing space, so identical digits are not us. `@c.us` is
+    /// NOT in this list — it is the legacy spelling of the phone namespace, not
+    /// a different one.
+    #[test]
+    fn a_non_phone_namespace_is_not_our_entry() {
+        for id in [
+            "15550000000@lid",
+            "15550000000@newsletter",
+            "15550000000@g.us",
+        ] {
+            let hs = wa::HistorySync {
+                sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
+                pushnames: vec![wa::Pushname {
+                    id: Some(id.into()),
+                    pushname: Some("Not Us".into()),
+                }],
+                ..Default::default()
+            };
+            let result =
+                process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
+            assert_eq!(
+                result.own_pushname, None,
+                "id {id} must not match our PN user"
+            );
+        }
     }
 
     #[test]
