@@ -427,6 +427,22 @@ impl Client {
                     .await;
             }
             MajorSyncTask::AppStateSync { name, full_sync } => {
+                // Reserve the collection like every other sync path does.
+                // Unreserved, this writes the same version and mutation-MAC
+                // rows as a concurrent `sync_collections_batched`, leaving the
+                // ltHash disagreeing with the MAC store.
+                //
+                // Waits rather than skipping, like the patch send and unlike
+                // the batched path. `try_begin`'s "an in-flight one already
+                // does the work" holds only when the holder is an equivalent
+                // sync, and neither condition is guaranteed here: the holder
+                // may be a patch send, which does not fetch at all, and a full
+                // sync asks for the snapshot while an incremental one asks for
+                // patches after the persisted version. Skipping on either
+                // mismatch turns the caller's request into a silent no-op.
+                // Cancelling the wait strands nothing — the reservation only
+                // exists once the guard is returned.
+                let _guard = self.app_state_syncing.begin(name).await;
                 if let Err(e) = self.process_app_state_sync_task(name, full_sync).await {
                     log::warn!("App state sync task for {name:?} failed: {e}");
                 }
@@ -1964,6 +1980,95 @@ mod send_patch_response_tests {
 #[cfg(test)]
 mod sync_in_flight_tests {
     use super::*;
+
+    /// A consumer-issued full sync must not run alongside a sync already
+    /// writing the collection's version and mutation MACs — and must not be
+    /// dropped either, since the snapshot it asks for is not what an
+    /// incremental sync in flight is fetching.
+    #[tokio::test]
+    async fn a_full_sync_task_waits_for_the_collection() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-task-wait").await;
+        let held = client
+            .app_state_syncing
+            .try_begin(WAPatchName::CriticalBlock)
+            .expect("reserve the collection first");
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name: WAPatchName::CriticalBlock,
+                        full_sync: true,
+                    })
+                    .await;
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task ran while the collection was reserved"
+        );
+        assert_eq!(
+            client.app_state_syncing.len(),
+            1,
+            "only the held reservation"
+        );
+
+        drop(held);
+        // The client has no socket, so the sync itself fails fast with
+        // NotConnected; what matters is that it got to run and released.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released collection must let the task proceed")
+            .expect("task panicked");
+        assert_eq!(
+            client.app_state_syncing.len(),
+            0,
+            "the task's own reservation must be released"
+        );
+    }
+
+    /// An incremental task waits too: the holder may be a patch send, which
+    /// never fetches, so skipping would drop the requested sync entirely.
+    #[tokio::test]
+    async fn an_incremental_sync_task_also_waits() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-task-skip").await;
+        let held = client
+            .app_state_syncing
+            .try_begin(WAPatchName::Regular)
+            .expect("reserve the collection first");
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name: WAPatchName::Regular,
+                        full_sync: false,
+                    })
+                    .await;
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task ran while the collection was reserved"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released collection must let the task proceed")
+            .expect("task panicked");
+        assert_eq!(client.app_state_syncing.len(), 0, "reservation released");
+    }
 
     #[test]
     fn second_begin_blocked_until_release() {
