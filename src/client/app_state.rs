@@ -659,6 +659,7 @@ impl Client {
                 .await?;
 
             let mut needs_refetch = Vec::new();
+            let mut unsynced: Vec<WAPatchName> = Vec::new();
 
             for (mutations, new_state, list) in results {
                 let name = list.name;
@@ -681,6 +682,7 @@ impl Client {
                         }
                         CollectionSyncError::Fatal { code, text } => {
                             warn!(target: "Client/AppState", "Collection {:?} fatal error {}: {}", name, code, text);
+                            unsynced.push(name);
                             continue;
                         }
                         CollectionSyncError::Retry { code, text } => {
@@ -728,6 +730,19 @@ impl Client {
                 );
             }
 
+            // A collection the server refused outright is not synced, and the
+            // caller must not be told otherwise: the initial-bootstrap path
+            // reads Ok as permission to cancel its retry watchdog and dispatch
+            // Connected. A critical_block that fails here that way leaves the
+            // session with no push name and no scheduled retry — the same
+            // reasoning as the missing-key branch above.
+            if !unsynced.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "app-state collection(s) {unsynced:?} returned a fatal error; \
+                     reporting the batched sync as failed"
+                ));
+            }
+
             pending = needs_refetch;
         }
 
@@ -737,6 +752,10 @@ impl Client {
                 "Batched sync: max iterations ({}) reached for {:?}",
                 MAX_ITERATIONS, pending
             );
+            return Err(anyhow::anyhow!(
+                "app-state collection(s) {pending:?} still had patches after \
+                 {MAX_ITERATIONS} iterations; reporting the batched sync as failed"
+            ));
         }
 
         Ok(())
