@@ -1175,6 +1175,15 @@ pub struct Client {
     /// Notifier for when the client is fully connected and logged in.
     /// Triggered after Event::Connected is dispatched.
     pub(crate) connected_notifier: Arc<event_listener::Event>,
+    /// The `connection_generation` that `<success>` finished publishing.
+    ///
+    /// `is_logged_in` is set by the dedup swap that has to come *before* the
+    /// generation is incremented, so between those two stores a reader sees an
+    /// authenticated client whose generation is about to change underneath it.
+    /// Work that bound a scope in that window had every attempt rejected as
+    /// retired. This lags `connection_generation` by exactly that window, so
+    /// equality means the generation a caller is about to bind is the final one.
+    pub(crate) authenticated_generation: Arc<AtomicU64>,
     /// Fired whenever the answer to *can work reach the server, and is it still
     /// worth waiting* may have changed: the session authenticated, or the client
     /// became terminal.

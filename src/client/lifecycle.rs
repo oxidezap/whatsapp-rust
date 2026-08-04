@@ -423,6 +423,7 @@ impl Client {
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
+            authenticated_generation: Arc::new(AtomicU64::new(0)),
             session_state_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
@@ -1342,8 +1343,17 @@ impl Client {
     /// under; and a supervision loop, because `send_and_wait_iq` refuses without
     /// one — a direct-connect client has no reader, so its every request would
     /// time out.
+    ///
+    /// Authentication is read as *the generation is final*, not as
+    /// `is_logged_in` alone: that flag is set by the duplicate-`<success>` guard
+    /// one step before the increment, and a caller that binds a scope in between
+    /// binds a generation the next instruction retires.
     pub(crate) fn can_reach_server(&self) -> bool {
-        self.is_connected() && self.is_logged_in() && self.is_running.load(Ordering::Relaxed)
+        self.is_connected()
+            && self.is_logged_in()
+            && self.authenticated_generation.load(Ordering::SeqCst)
+                == self.connection_generation.load(Ordering::SeqCst)
+            && self.is_running.load(Ordering::Relaxed)
     }
 }
 

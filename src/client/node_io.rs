@@ -957,11 +957,17 @@ impl Client {
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation
         );
-        // The generation this connection will be admitted under is now final, so
-        // work waiting for a connection it can actually use is released here and
-        // not at `socket_ready_notifier` — that one fires before login, and an
-        // IQ sent in the gap is answered by nobody and retired by this very
-        // increment.
+        // The generation this connection will be admitted under is now final.
+        // Published here, after the increment, and not by `is_logged_in` above —
+        // that one is the duplicate-`<success>` guard and has to be set first,
+        // which leaves a window where the client looks authenticated on a
+        // generation that is about to change. Work binding a scope in that
+        // window had every attempt rejected as retired.
+        self.authenticated_generation
+            .store(current_generation, Ordering::SeqCst);
+        // Only now is there something worth waking for: released here and not at
+        // `socket_ready_notifier`, which fires before login, so an IQ sent in
+        // that gap is answered by nobody.
         self.notify_session_state();
         // Record the auth time but DON'T reset the backoff counter yet: WA Web
         // resets only after the connection has been stable for ~30s
