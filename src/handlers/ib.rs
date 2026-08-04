@@ -82,12 +82,10 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 );
 
                 let client_clone = client.clone();
-                // Captured before the wait below, so the outcome is attributed
-                // to the connection that asked for the re-sync rather than to
-                // whichever one is live when it finishes.
-                let generation = client
-                    .connection_generation
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                // Opened before the wait below, so everything this task does is
+                // attributed to the connection that asked for the re-sync rather
+                // than to whichever one is live when it finishes.
+                let scope = client.sync_scope(None);
 
                 // Groups/newsletter_metadata: wait for offline sync per WAWebHandleDirtyBits.
                 client
@@ -99,21 +97,13 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         if client_clone.is_shutting_down() {
                             return;
                         }
-                        // The wait above can outlast the connection that asked
-                        // for this. Stopping here rather than after the sync
-                        // matters: the report is keyed to the generation
-                        // captured before the wait, so a task that ran on the
-                        // replacement socket would do the work and then have its
-                        // result thrown away, taking the retry with it.
-                        if client_clone
-                            .connection_generation
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            != generation
-                        {
-                            debug!(
-                                target: "Client/AppState",
-                                "Dirty-bit task cancelled: connection generation changed during the offline wait"
-                            );
+                        // The wait above can outlast the connection that asked for
+                        // this, and the report is keyed to the scope opened
+                        // before it — so a task that ran on the replacement
+                        // socket would do the work only to have it thrown away,
+                        // taking the retry with it. Stop before doing any.
+                        if let Err(lost) = client_clone.admits(scope) {
+                            debug!(target: "Client/AppState", "Dirty-bit task cancelled after the offline wait: {lost:?}");
                             return;
                         }
                         if let Err(e) = client_clone.clean_dirty_bits(bit).await
@@ -122,20 +112,12 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                             warn!("Failed to send clean dirty bits IQ: {e:?}");
                         }
 
-                        // Checked again after the clean IQ: an ordinary reconnect
+                        // Asked again after the clean IQ: an ordinary reconnect
                         // does not set `is_shutting_down`, so that guard alone
                         // would let the re-sync run on a socket this task no
-                        // longer belongs to and then lose its outcome to the
-                        // generation check at reporting time.
-                        if client_clone
-                            .connection_generation
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            != generation
-                        {
-                            debug!(
-                                target: "Client/AppState",
-                                "Dirty-bit task cancelled: connection generation changed while cleaning"
-                            );
+                        // longer belongs to.
+                        if let Err(lost) = client_clone.admits(scope) {
+                            debug!(target: "Client/AppState", "Dirty-bit task cancelled while cleaning: {lost:?}");
                             return;
                         }
 
@@ -149,12 +131,12 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                                 WAPatchName::Regular,
                             ];
                             let result = client_clone
-                                .sync_collections_batched(requested.clone(), None)
+                                .sync_collections_batched(requested.clone(), scope)
                                 .await;
                             if !client_clone.is_shutting_down() {
                                 client_clone.report_background_sync(
                                     "app state re-sync after dirty notification",
-                                    generation,
+                                    scope,
                                     crate::client::SyncSettles::JustTheCollections,
                                     &requested,
                                     result,

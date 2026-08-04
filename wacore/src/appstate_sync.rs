@@ -212,33 +212,48 @@ impl AppStateProcessor {
     ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let mut results = Vec::with_capacity(patch_lists.len());
 
-        for mut pl in patch_lists {
-            // Skip collections with errors — caller handles them via pl.error
-            if pl.error.is_some() {
-                let state = self.backend.get_version(pl.name.as_str()).await?;
-                results.push((Vec::new(), state, pl));
-                continue;
-            }
-
-            // A failed external-blob fetch must not advance the version with an empty
-            // patch (silent data loss). Mark the collection retryable and skip it, so
-            // the caller re-fetches it instead of persisting partial state.
-            if let Err(e) = download_external_blobs(&mut pl, download) {
-                log::warn!(target: "AppState", "External blob fetch failed for {:?}, will refetch: {e:#}", pl.name);
-                pl.error = Some(CollectionSyncError::Retry {
-                    code: 0,
-                    text: e.to_string(),
-                });
-                let state = self.backend.get_version(pl.name.as_str()).await?;
-                results.push((Vec::new(), state, pl));
-                continue;
-            }
-
-            let (mutations, state, pl) = self.process_patch_list(pl, validate_macs).await?;
-            results.push((mutations, state, pl));
+        for pl in patch_lists {
+            results.push(
+                self.process_one_patch_list(pl, download, validate_macs)
+                    .await?,
+            );
         }
 
         Ok(results)
+    }
+
+    /// One collection's share of [`process_patch_lists`], exposed on its own.
+    ///
+    /// Each call persists what it applies, so a caller that must not write past
+    /// some boundary — a connection being replaced, a deadline running out —
+    /// needs to be able to stop between collections rather than hand over a
+    /// batch it can no longer take back.
+    pub async fn process_one_patch_list(
+        &self,
+        mut pl: PatchList,
+        download: &BlobDownloadFn<'_>,
+        validate_macs: bool,
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        // Skip collections with errors — caller handles them via pl.error
+        if pl.error.is_some() {
+            let state = self.backend.get_version(pl.name.as_str()).await?;
+            return Ok((Vec::new(), state, pl));
+        }
+
+        // A failed external-blob fetch must not advance the version with an empty
+        // patch (silent data loss). Mark the collection retryable and skip it, so
+        // the caller re-fetches it instead of persisting partial state.
+        if let Err(e) = download_external_blobs(&mut pl, download) {
+            log::warn!(target: "AppState", "External blob fetch failed for {:?}, will refetch: {e:#}", pl.name);
+            pl.error = Some(CollectionSyncError::Retry {
+                code: 0,
+                text: e.to_string(),
+            });
+            let state = self.backend.get_version(pl.name.as_str()).await?;
+            return Ok((Vec::new(), state, pl));
+        }
+
+        self.process_patch_list(pl, validate_macs).await
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]

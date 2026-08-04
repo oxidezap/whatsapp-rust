@@ -1341,10 +1341,11 @@ impl Client {
                 // reconnect and the two would loop for good. So they ride along
                 // with the background sync instead of being dropped.
                 let mut critical_retry: Vec<WAPatchName> = Vec::new();
+                let critical_scope = client_clone.sync_scope(Some(critical_deadline));
                 match client_clone
                     .sync_collections_batched(
                         vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
-                        Some(critical_deadline),
+                        critical_scope,
                     )
                     .await
                 {
@@ -1432,18 +1433,15 @@ impl Client {
                         // the watchdog handle, which aborts it — correct for a
                         // generation that already has its own.
                         check_generation!();
-                        // Armed before returning, because the watchdog is not
-                        // the whole guarantee. This path can be reached with the
-                        // flag false — an empty push name alone opens the
+                        // Armed before returning, because the watchdog is not the
+                        // whole guarantee. This path is reachable with the flag
+                        // already false — an empty push name alone opens the
                         // bootstrap — and a mixed response can apply
                         // `critical_block`, push name included, while leaving
-                        // `critical_unblock_low` behind. The reconnect the
-                        // watchdog forces would then see a populated name and a
-                        // clear flag, take the ordinary path, and never retry the
-                        // collection that is still missing.
-                        client_clone
-                            .needs_initial_full_sync
-                            .store(true, Ordering::Relaxed);
+                        // `critical_unblock_low` behind. The forced reconnect
+                        // would then see a populated name and a clear flag, take
+                        // the ordinary path, and never retry what is missing.
+                        client_clone.settle_bootstrap(critical_scope, true);
                         client_clone.dispatch_app_state_sync_failed(&outcome, false);
                         critical_sync_timeout_handle.detach();
                         return;
@@ -1457,17 +1455,7 @@ impl Client {
                         // would then find a populated push name and a clear flag
                         // and take the ordinary path, never retrying the rest.
                         //
-                        // Only for this connection: a late error from a socket
-                        // that has already been replaced would otherwise re-arm
-                        // a gate the replacement just stood down, costing it a
-                        // 180s bootstrap it does not need.
-                        if client_clone.connection_generation.load(Ordering::SeqCst)
-                            == task_generation
-                        {
-                            client_clone
-                                .needs_initial_full_sync
-                                .store(true, Ordering::Relaxed);
-                        }
+                        client_clone.settle_bootstrap(critical_scope, true);
                         // The sync failed — the watchdog must stay alive to force a reconnect.
                         critical_sync_timeout_handle.detach();
                         return;
@@ -1492,71 +1480,27 @@ impl Client {
                         WAPatchName::Regular,
                     ]);
                     let requested = to_sync.clone();
-                    let result = sync_client.sync_collections_batched(to_sync, None).await;
+                    let scope = sync_client.sync_scope(None);
+                    let result = sync_client.sync_collections_batched(to_sync, scope).await;
 
                     let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
 
-                    // Settled before the report, not after. Reporting dispatches
-                    // `AppStateSyncFailed` to consumer handlers synchronously,
-                    // and one of them disconnecting would retire the generation
-                    // and take this decision with it — leaving an unfinished
-                    // bootstrap unarmed, which is the failure this whole path
-                    // exists to prevent.
-                    if sync_client.connection_generation.load(Ordering::SeqCst) == sync_generation {
-                        if complete {
-                            sync_client
-                                .needs_initial_full_sync
-                                .store(false, Ordering::Relaxed);
-                            // Clearing is the unsafe direction to lose a race
-                            // in: a reconnect between the check and the store
-                            // means this retired task just told the replacement
-                            // its bootstrap is done, and if the replacement's
-                            // own critical sync fails, a later connection with a
-                            // populated push name skips it entirely. Re-arm
-                            // rather than leave that behind — the cost of being
-                            // wrong the other way is one redundant bootstrap.
-                            if sync_client.connection_generation.load(Ordering::SeqCst)
-                                != sync_generation
-                            {
-                                sync_client
-                                    .needs_initial_full_sync
-                                    .store(true, Ordering::Relaxed);
-                                warn!(
-                                    target: "Client/AppState",
-                                    "Connection retired while settling the bootstrap; re-arming it"
-                                );
-                            } else {
-                                debug!(target: "Client/AppState", "Initial App State Sync Completed.");
-                            }
-                        } else {
-                            // Armed, not merely left alone. This path is also
-                            // reached with the flag already false, because an
-                            // empty persisted push name is enough to enter the
-                            // bootstrap on its own. Once the critical sync
-                            // supplies the name, the next connection would see a
-                            // non-empty name and a false flag and skip the
-                            // unfinished bootstrap entirely, while the retries
-                            // scheduled here retire with this generation.
-                            sync_client
-                                .needs_initial_full_sync
-                                .store(true, Ordering::Relaxed);
-                        }
-                    }
+                    // Settled before the report, because reporting dispatches to
+                    // consumer handlers synchronously and one of them
+                    // disconnecting would retire the scope and take this
+                    // decision with it — leaving an unfinished bootstrap
+                    // unarmed, which is the failure this path exists to prevent.
+                    // `settle_bootstrap` is what makes the "only for this
+                    // connection" part impossible to forget.
+                    sync_client.settle_bootstrap(scope, !complete);
 
                     sync_client.report_background_sync(
                         "non-critical app state sync",
-                        sync_generation,
+                        scope,
                         SyncSettles::InitialSync,
                         &requested,
                         result,
                     );
-
-                    if !complete {
-                        warn!(
-                            target: "Client/AppState",
-                            "Initial App State Sync incomplete; arming the bootstrap for the next connection"
-                        );
-                    }
                 }));
             } else {
                 // === Reconnection path ===
