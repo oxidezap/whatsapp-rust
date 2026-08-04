@@ -579,7 +579,10 @@ impl Client {
                 // Waits for any holder: this is a consumer asking for one named
                 // collection, and a sync already in flight is not necessarily
                 // fetching what it asked for.
-                let _guard = match self.reserve_for_sync(name, ReservationWait::Always).await {
+                let _guard = match self
+                    .reserve_for_sync(name, ReservationWait::Always, None)
+                    .await
+                {
                     Ok(guard) => guard,
                     Err(ReservationSkip::EquivalentSyncInFlight) => {
                         debug!(target: "Client/AppState", "Skipping app state sync task {name:?}: an equivalent sync holds it");
@@ -749,7 +752,7 @@ impl Client {
                     debug!(target: "Client/AppState", "App state task retry cancelled: connection retired");
                     return;
                 }
-                let guard = match client.reserve_for_sync(name, ReservationWait::Always).await {
+                let guard = match client.reserve_for_sync(name, ReservationWait::Always, None).await {
                     Ok(guard) => guard,
                     // Someone equivalent picked it up, so the request is covered.
                     Err(ReservationSkip::EquivalentSyncInFlight) => return,
@@ -840,14 +843,15 @@ impl Client {
                         // the next connect. That is the safe direction to be
                         // wrong in, and settling it properly means tracking the
                         // holder's completion, which is its own change.
-                        // Sticky across rounds, not per round: one round can
-                        // strand a collection as fatal or skipped while another
-                        // stays retryable, and if that last one then succeeds
-                        // its own `all_synced()` is true even though the first
-                        // never synced. Settling on that would let the next
-                        // connection skip the bootstrap for a collection nobody
-                        // recovered.
-                        if !outcome.all_synced() {
+                        // Sticky across rounds, but only for misses that do not
+                        // come back: one round can strand a collection as fatal
+                        // or skipped while another stays retryable, and if that
+                        // last one then succeeds its own `all_synced()` is true
+                        // even though the first never synced. Retryable ones are
+                        // not sticky — they are exactly what the next round
+                        // carries, so counting them here would keep the gate
+                        // armed forever after any transient first round.
+                        if !outcome.fatal.is_empty() || !outcome.skipped.is_empty() {
                             left_unresolved = true;
                         }
                         // Only the retryable ones come back around: a refusal is
@@ -905,10 +909,14 @@ impl Client {
     /// [`APP_STATE_RESERVATION_WAIT`], because the sync worker's intake loop
     /// runs non-history tasks inline and a wedged holder would otherwise stall
     /// everything queued behind it.
+    /// `deadline`, when given, caps the wait further: the critical bootstrap runs
+    /// under a watchdog that reconnects on wall-clock, so waiting past it only
+    /// guarantees the work lands on a socket that is already gone.
     async fn reserve_for_sync(
         &self,
         name: WAPatchName,
         wait: ReservationWait,
+        deadline: Option<wacore::time::Instant>,
     ) -> Result<SyncInFlightGuard, ReservationSkip> {
         match self.app_state_syncing.try_begin_as(name, SyncHolder::Sync) {
             Ok(guard) => return Ok(guard),
@@ -919,9 +927,14 @@ impl Client {
                 debug!(target: "Client/AppState", "Waiting for the {holder:?} holding {name:?}");
             }
         }
+        let bound = match deadline {
+            Some(deadline) => APP_STATE_RESERVATION_WAIT
+                .min(deadline.saturating_duration_since(wacore::time::Instant::now())),
+            None => APP_STATE_RESERVATION_WAIT,
+        };
         rt_timeout(
             &*self.runtime,
-            APP_STATE_RESERVATION_WAIT,
+            bound,
             self.app_state_syncing.begin(name, SyncHolder::Sync),
         )
         .await
@@ -951,13 +964,43 @@ impl Client {
         // cancellation. A collection we could not reserve is reported skipped
         // rather than silently dropped: this call did nothing for it, and only
         // the caller knows whether that is acceptable.
+        // A caller can name the same collection twice — a `server_sync`
+        // notification may repeat a `<collection>` child. Reserving it once and
+        // then hitting our own reservation on the second pass would file one
+        // collection under both `synced` and `skipped`, making `all_synced()`
+        // false and publishing a failure that blames a writer who never existed.
+        let mut seen = HashSet::with_capacity(collections.len());
+        let collections: Vec<WAPatchName> = collections
+            .into_iter()
+            .filter(|name| seen.insert(*name))
+            .collect();
+
+        // The bootstrap cannot skip: it has to know the collection is synced
+        // before it dispatches Connected, and an equivalent sync in flight only
+        // tells it someone else is trying. So when a deadline is supplied — which
+        // is what marks the critical path — it waits for whoever holds it, and
+        // finding the collection already synced afterwards is the fast case.
+        // Background callers still skip, because for them the in-flight sync
+        // genuinely does the work.
+        let wait = match key_wait_deadline {
+            Some(_) => ReservationWait::Always,
+            None => ReservationWait::SkipBehindSync,
+        };
+
         let mut guards = Vec::with_capacity(collections.len());
         let mut pending = Vec::with_capacity(collections.len());
         for name in collections {
-            match self
-                .reserve_for_sync(name, ReservationWait::SkipBehindSync)
-                .await
+            // Checked per reservation, not once for the batch: each wait can
+            // burn the remaining deadline, and the bootstrap's watchdog fires on
+            // wall-clock regardless of which collection we are stuck on.
+            if let Some(deadline) = key_wait_deadline
+                && wacore::time::Instant::now() >= deadline
             {
+                warn!(target: "Client/AppState", "Deadline reached before reserving {name:?}");
+                outcome.retryable.push(name);
+                continue;
+            }
+            match self.reserve_for_sync(name, wait, key_wait_deadline).await {
                 Ok(guard) => {
                     guards.push(guard);
                     pending.push(name);
@@ -1074,10 +1117,23 @@ impl Client {
             // version — so two entries for one collection would be applied
             // twice, and the second could advance the MAC store past the version
             // the first then writes back, leaving the ltHash disagreeing with
-            // the MACs. Checking after the fact only fixes the bookkeeping.
+            // the MACs. A collection outside `pending` is worse still: nothing
+            // reserved it, so applying it can interleave with a concurrent sync
+            // or patch send for that collection, and it dispatches mutations
+            // nobody asked for. Checking after the fact only fixes the
+            // bookkeeping.
             {
+                let requested: HashSet<WAPatchName> = pending.iter().copied().collect();
                 let mut seen: HashSet<WAPatchName> = HashSet::new();
                 patch_lists.retain(|pl| {
+                    if !requested.contains(&pl.name) {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: response carried unrequested collection {:?}; dropping it",
+                            pl.name
+                        );
+                        return false;
+                    }
                     if seen.insert(pl.name) {
                         return true;
                     }
@@ -2821,7 +2877,7 @@ pub(crate) mod batched_sync_outcome_tests {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
                 client
-                    .reserve_for_sync(WAPatchName::Regular, ReservationWait::SkipBehindSync)
+                    .reserve_for_sync(WAPatchName::Regular, ReservationWait::SkipBehindSync, None)
                     .await
                     .map(drop)
             })
@@ -3115,5 +3171,51 @@ mod retry_gate_tests {
             APP_STATE_RETRY_BACKOFF_MAX,
             "an absurd round must clamp, not overflow"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_hygiene_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::sync_against;
+
+    /// A `server_sync` notification can repeat a `<collection>` child. Reserving
+    /// the name once and then tripping over our own reservation on the second
+    /// pass filed one collection under both `synced` and `skipped`, which made
+    /// `all_synced()` false and published a failure blaming a writer that never
+    /// existed.
+    #[tokio::test]
+    async fn a_collection_requested_twice_is_reserved_once() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular, WAPatchName::Regular],
+            &[("regular", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::Regular]);
+        assert!(
+            outcome.skipped.is_empty(),
+            "the only holder was this same call"
+        );
+        assert!(outcome.all_synced());
+    }
+
+    /// Nothing reserved a collection we did not ask for, so applying it can
+    /// interleave with a concurrent writer for that collection — and it would
+    /// dispatch mutations nobody requested.
+    #[tokio::test]
+    async fn an_unrequested_collection_in_the_response_is_dropped() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular],
+            &[("regular", None), ("critical_block", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::Regular]);
+        assert!(
+            !outcome.synced.contains(&WAPatchName::CriticalBlock),
+            "an unrequested collection must not be applied or reported"
+        );
+        assert!(outcome.all_synced());
     }
 }
