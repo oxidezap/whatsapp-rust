@@ -274,6 +274,7 @@ pub enum EventKind {
     ServerAck,
     PairingQrCodesExhausted,
     PairingCodeError,
+    AppStateSyncFailed,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -287,7 +288,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::PairingCodeError as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::AppStateSyncFailed as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -628,6 +629,33 @@ pub struct SelfPushNameUpdated {
     pub new_name: String,
 }
 
+/// A batched app-state sync finished without leaving every collection synced.
+///
+/// Collections are named as they appear on the wire (`critical_block`,
+/// `regular_high`, …) rather than as an enum, so the payload stays stable if the
+/// set of collections changes.
+///
+/// `fatal` is the one a consumer usually has to act on: the server refused the
+/// collection, and repeating the request gets the same answer. WhatsApp Web
+/// treats that as grounds to notify the primary device and log out; this
+/// library will not end a session on its own, so it reports the refusal and
+/// keeps the connection. When `connected` is true the client dispatched
+/// [`Event::Connected`] anyway and is usable, minus whatever those collections
+/// carry — for `critical_block` that includes the push name, so presence stays
+/// unavailable until it syncs.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct AppStateSyncFailed {
+    /// Refused outright by the server (400/404). Terminal for this connection.
+    pub fatal: Vec<String>,
+    /// Did not sync, but a later attempt can.
+    pub retryable: Vec<String>,
+    /// Another writer held the collection, so this sync did nothing for it.
+    pub skipped: Vec<String>,
+    /// Whether the client went on to dispatch [`Event::Connected`].
+    pub connected: bool,
+}
+
 /// Type of device list update notification.
 /// Matches WhatsApp Web's device notification types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
@@ -879,6 +907,11 @@ pub enum Event {
 
     PushNameUpdate(PushNameUpdate),
     SelfPushNameUpdated(SelfPushNameUpdated),
+
+    /// A batched app-state sync left one or more collections unsynced. See
+    /// [`AppStateSyncFailed`] for what each bucket means and when the client
+    /// connected anyway.
+    AppStateSyncFailed(AppStateSyncFailed),
     PinUpdate(PinUpdate),
     MuteUpdate(MuteUpdate),
     ArchiveUpdate(ArchiveUpdate),
@@ -1019,6 +1052,7 @@ impl Event {
             Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
             Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
+            Event::AppStateSyncFailed(_) => EventKind::AppStateSyncFailed,
             Event::PinUpdate(_) => EventKind::PinUpdate,
             Event::MuteUpdate(_) => EventKind::MuteUpdate,
             Event::ArchiveUpdate(_) => EventKind::ArchiveUpdate,

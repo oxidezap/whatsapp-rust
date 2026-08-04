@@ -783,6 +783,11 @@ fn pushname_id_is(id: &str, own_user: &str) -> bool {
         && &*jid.user == own_user
 }
 
+/// History sync's placeholder for an entry that carries no push name. It is a
+/// real value on the wire, not an empty field, so it has to be filtered by
+/// content.
+const PUSHNAME_ABSENT_SENTINEL: &str = "-";
+
 // Best-effort: a malformed pushname (optional metadata) must not abort the sync.
 fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     let mut pos = 0;
@@ -823,7 +828,16 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
         }
     }
 
-    if id_match { pushname } else { None }
+    if !id_match {
+        return None;
+    }
+    // Storing the sentinel is worse than having no name: the client persists
+    // whatever comes back here, which makes `push_name.is_empty()` false for
+    // good, so the bootstrap stops treating the account as still needing its
+    // name and re-announces `-` on every reconnect. whatsmeow skips the same
+    // value. The authoritative `setting_pushName` mutation does not come
+    // through this path, so an account whose name really is `-` still gets it.
+    pushname.filter(|name| name != PUSHNAME_ABSENT_SENTINEL)
 }
 
 /// One PN↔LID pair from `HistorySync.phoneNumberToLidMappings`, reduced to
@@ -3122,6 +3136,44 @@ mod tests {
         assert_eq!(result.own_pushname, None);
     }
 
+    /// `-` is history sync's "no push name" placeholder, not a name. Accepting
+    /// it is worse than returning nothing: the client persists what it gets, so
+    /// `push_name` stops being empty, the bootstrap stops trying to fetch the
+    /// real name, and the account announces `-` on every reconnect.
+    #[test]
+    fn the_absent_pushname_sentinel_is_not_a_name() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
+            pushnames: vec![wa::Pushname {
+                id: Some("15550000000@s.whatsapp.net".into()),
+                pushname: Some("-".into()),
+            }],
+            ..Default::default()
+        };
+        let result =
+            process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
+        assert_eq!(
+            result.own_pushname, None,
+            "the sentinel must not become our push name"
+        );
+    }
+
+    /// A name that merely contains the sentinel is a real name.
+    #[test]
+    fn a_name_containing_a_dash_is_kept() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
+            pushnames: vec![wa::Pushname {
+                id: Some("15550000000@s.whatsapp.net".into()),
+                pushname: Some("Jean-Luc".into()),
+            }],
+            ..Default::default()
+        };
+        let result =
+            process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
+        assert_eq!(result.own_pushname.as_deref(), Some("Jean-Luc"));
+    }
+
     /// The user part alone does not identify an account: a `@lid` entry lives in
     /// a different addressing space, so identical digits are not us. `@c.us` is
     /// NOT in this list — it is the legacy spelling of the phone namespace, not
@@ -3744,7 +3796,9 @@ mod tests {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![big_conv, group_conv],
             pushnames: vec![wa::Pushname {
-                id: Some(own.to_string()),
+                // JID form, the way the server actually sends it, so the parity
+                // walk exercises the same path production does.
+                id: Some(format!("{own}@s.whatsapp.net")),
                 pushname: Some("Me".into()),
             }],
             nct_salt: Some(vec![0x01, 0x02, 0x03, 0x04]),

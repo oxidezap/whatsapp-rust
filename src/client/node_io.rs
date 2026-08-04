@@ -1341,7 +1341,7 @@ impl Client {
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(outcome) if outcome.all_synced() => {
                         // Critical sync completed — signal the watchdog, then cancel it.
                         critical_sync_done.store(true, Ordering::SeqCst);
                         critical_sync_timeout_handle.abort();
@@ -1360,13 +1360,55 @@ impl Client {
                         // criticalSyncDone. Our setting_pushName handler already does this.
                         client_clone.dispatch_connected(task_generation).await;
                     }
+                    // The server refused a critical collection outright, and it
+                    // will refuse the same request again. Reconnecting cannot
+                    // clear a 400/404, and `needs_initial_full_sync` is only
+                    // cleared further down, so leaving the watchdog armed here
+                    // would reconnect into this same state every 180s — for
+                    // good, since `needs_pushname_from_sync` is derived from the
+                    // persisted push name and survives a restart.
+                    //
+                    // WA Web's answer is to notify the primary and log out
+                    // (`WAWebSyncdFatal`), which a library must not do on a
+                    // consumer's behalf. So: stop retrying, connect without the
+                    // collection, and hand the decision over as an event. The
+                    // account is reachable but missing whatever that collection
+                    // carried — for `critical_block` that includes the push
+                    // name, so presence stays unavailable until it arrives.
+                    Ok(outcome) if !outcome.fatal.is_empty() => {
+                        critical_sync_timeout_handle.abort();
+                        warn!(
+                            target: "Client/AppState",
+                            "Critical app state sync refused for {:?}; connecting without it",
+                            outcome.fatal
+                        );
+                        client_clone.dispatch_app_state_sync_failed(&outcome, true);
+
+                        check_generation!();
+                        client_clone
+                            .resubscribe_presence_subscriptions(task_generation)
+                            .await;
+                        check_generation!();
+                        client_clone.dispatch_connected(task_generation).await;
+                    }
+                    // Nothing terminal: a retryable error, a decode key that
+                    // never landed, or a collection held by another writer. The
+                    // watchdog stays alive to force the reconnect that retries.
+                    // detach() so this early return doesn't abort it on drop
+                    // (AbortHandle aborts the task when dropped).
+                    Ok(outcome) => {
+                        warn!(
+                            target: "Client/AppState",
+                            "Critical app state sync incomplete (retryable={:?} skipped={:?}); will retry",
+                            outcome.retryable, outcome.skipped
+                        );
+                        client_clone.dispatch_app_state_sync_failed(&outcome, false);
+                        critical_sync_timeout_handle.detach();
+                        return;
+                    }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
                         // The sync failed — the watchdog must stay alive to force a reconnect.
-                        // detach() so this early return doesn't abort it on drop (AbortHandle
-                        // aborts the task when dropped); without this the watchdog would be
-                        // cancelled exactly when the deadline-bound wait fails, and no
-                        // reconnect would happen.
                         critical_sync_timeout_handle.detach();
                         return;
                     }
@@ -1381,7 +1423,7 @@ impl Client {
                         return;
                     }
 
-                    if let Err(e) = sync_client
+                    let result = sync_client
                         .sync_collections_batched(
                             vec![
                                 WAPatchName::RegularLow,
@@ -1390,10 +1432,8 @@ impl Client {
                             ],
                             None,
                         )
-                        .await
-                    {
-                        sync_client.log_sync_error("non-critical app state sync", &e);
-                    }
+                        .await;
+                    sync_client.report_background_sync("non-critical app state sync", result);
 
                     sync_client
                         .needs_initial_full_sync
