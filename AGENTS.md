@@ -14,11 +14,13 @@ Ground truth for protocol behavior is WhatsApp Web itself: query the structured 
 
 ```bash
 cargo fmt --all
-cargo test -p <touched crate> --lib                     # fast local loop
+cargo nextest run -p <touched crate> --lib              # fast local loop
 cargo clippy --workspace --all-targets -- -D warnings   # what CI enforces
 ```
 
-Workspace clippy takes minutes — pushing and letting CI parallelize the matrix is usually faster. E2E tests (`cargo test -p e2e-tests`) need the mock server running; see `agent_docs/e2e_testing.md`.
+CI runs tests through [cargo-nextest](https://nexte.st) (`--profile ci`, config in `.config/nextest.toml`); install it from a [pre-built binary](https://nexte.st/docs/installation/pre-built-binaries/) to reproduce a CI failure locally. `cargo test` still works — with one gap in the other direction: nextest cannot run **doctests**, so CI runs `cargo test --doc` as its own step and a doc example you add is only covered there.
+
+Workspace clippy takes minutes — pushing and letting CI parallelize the matrix is usually faster. E2E tests (`cargo nextest run --profile e2e -p e2e-tests`) need the mock server running; see `agent_docs/e2e_testing.md`.
 
 Touching `unsafe` — the `Yokeable`/`StableDeref` impls in `wacore-binary`'s `node.rs`, the `set_len` in `zlib_pool.rs` — means CI's Miri gate (`.github/workflows/miri.yml`) is what proves it, since neither clippy nor a native test observes an aliasing violation or an uninit read. Locally: `rustup component add miri rust-src && cargo miri test -p wacore-binary --lib`. Interpretation is ~100× native, so a fixture that only makes sense at hundreds of KB (zlib window refill, buffer growth) belongs behind `#[cfg_attr(miri, ignore)]` with a small twin that keeps the `unsafe` covered.
 

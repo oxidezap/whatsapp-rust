@@ -1,0 +1,43 @@
+# cargo-nextest configuration — https://nexte.st/docs/configuration/
+#
+# nextest gives each test its own process, so a test that aborts, installs a
+# process-wide signal handler, or leaks a global (dhat's allocator, env_logger's
+# once-init, the SIGINT/SIGTERM cases in tests/shutdown_signal.rs) can no longer
+# perturb the rest of its binary. It also schedules across binaries instead of
+# one binary at a time, which is where the workspace's wall-clock win comes from.
+#
+# Doctests are the one thing it cannot run (nextest-rs/nextest#16), so CI keeps a
+# separate `cargo test --doc` step. An example asserted only in a doc comment is
+# covered by that step and nothing else — do not drop it.
+
+# The `ci` profile below uses `terminate-after`, which older releases parse but
+# ignore; fail loudly instead of silently losing the hang guard.
+nextest-version = { required = "0.9.70" }
+
+[profile.default]
+# Warn, don't kill: a unit test past a minute is a hang or an accidental network
+# call, and naming it in the log is enough — the local loop is where you want the
+# process left alive to attach to.
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+# CI logs are read after the fact, not watched. Run everything so one broken test
+# doesn't hide the other twenty, and repeat the failures at the end so the verdict
+# is the last thing in the log rather than something to scroll back for.
+fail-fast = false
+failure-output = "immediate-final"
+# A PASS line per test is thousands of lines of nothing; the trailing summary
+# carries the count. Retries and flakes still get their line.
+status-level = "fail"
+final-status-level = "flaky"
+
+[profile.e2e]
+# The e2e suite talks to the bartender mock server, so its failure mode is a wait
+# that never ends (a stanza that never arrives), not a panic. In-test waits top out
+# at 60s, so warn at 60s and terminate at 4 minutes: a hung test then costs one
+# test's wall clock and reports as a timeout, instead of sitting on the job until
+# GitHub's 6-hour ceiling with no verdict.
+slow-timeout = { period = "60s", terminate-after = 4 }
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "flaky"
