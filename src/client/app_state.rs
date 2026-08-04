@@ -41,11 +41,18 @@ const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// this is what a single connection can promise, and the doubling already puts
 /// the last wait minutes out.
 const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
-/// How many extra rounds the loop may burn on waiting — for a socket, or for a
-/// writer to release a collection — before the attempt budget is spent. The
-/// reconnect backoff alone reaches minutes, well past the sum of the delays
-/// below, so a wait has to be able to outlast several of them.
+/// How many extra rounds the loop may burn waiting for a writer to release a
+/// collection before the attempt budget is spent.
 const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
+/// How long a retry waits for a connection before giving the collections back to
+/// the next trigger.
+///
+/// Waiting is not polled against the round budget: the reconnect loop uses a
+/// Fibonacci backoff capped at 900s, so any fixed number of short rounds is
+/// outlasted by an unstable link and the work is dropped without one attempt
+/// ever reaching the server. This waits on the connection itself and is sized
+/// past that ceiling.
+const APP_STATE_RETRY_CONNECTION_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Delay before the attempt after `attempts` failures, doubling from
 /// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
@@ -908,6 +915,24 @@ impl Client {
         }
     }
 
+    /// Wait until there is a connection to work on, or `bound` elapses.
+    ///
+    /// Returns whether one arrived. Waiting on the notifier rather than polling
+    /// is what keeps a slow reconnect from consuming a retry budget that is
+    /// counted in attempts, not in seconds.
+    pub(crate) async fn await_connection(&self, bound: Duration) -> bool {
+        if self.is_connected() {
+            return true;
+        }
+        // Registered before the re-check, so a connection landing in the gap is
+        // not missed.
+        let connected = self.connected_notifier.listen();
+        if self.is_connected() {
+            return true;
+        }
+        rt_timeout(&*self.runtime, bound, connected).await.is_ok() && self.is_connected()
+    }
+
     /// Open a scope for work starting now on the live connection.
     pub(crate) fn sync_scope(&self, deadline: Option<wacore::time::Instant>) -> SyncScope {
         SyncScope {
@@ -1020,10 +1045,6 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                // Indexed by attempts, not by rounds: a round spent waiting for
-                // a socket is not a failure to back off from, and letting it
-                // advance the exponent would push the next real attempt an hour
-                // out once the clamp is reached.
                 client.runtime.sleep(app_state_retry_backoff(attempts)).await;
                 if client.is_terminal() {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
@@ -1041,13 +1062,13 @@ impl Client {
                 // `expected_disconnect` makes that guard true for a reconnect as
                 // well as a stop — so attempting here would read a no-op as a
                 // completed sync and drop the request for good.
-                // Held on the socket being usable rather than on any particular
-                // reason it is not. `reconnect()` tears down without setting
-                // `expected_disconnect`, so asking about the reason misses the
-                // ordinary case; asking whether there is a connection does not.
-                if !client.is_connected() {
-                    debug!(target: "Client/AppState", "Holding the {name:?} retry: no connection");
-                    continue;
+                // Waited on rather than polled, and on the connection itself
+                // rather than on any particular reason there is not one:
+                // `reconnect()` tears down without setting `expected_disconnect`,
+                // so asking about the reason misses the ordinary case.
+                if !client.await_connection(APP_STATE_RETRY_CONNECTION_WAIT).await {
+                    warn!(target: "Client/AppState", "No connection for the {name:?} retry; giving it back");
+                    break;
                 }
 
                 let guard = match client
@@ -1146,10 +1167,6 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                // Indexed by attempts, not by rounds: a round spent waiting for
-                // a socket is not a failure to back off from, and letting it
-                // advance the exponent would push the next real attempt an hour
-                // out once the clamp is reached.
                 client.runtime.sleep(app_state_retry_backoff(attempts)).await;
                 // Only a terminal state ends this. A planned reconnect must not:
                 // the trigger that asked for these collections is already
@@ -1159,11 +1176,7 @@ impl Client {
                     debug!(target: "Client/AppState", "App state retry cancelled: client is finished");
                     return;
                 }
-                // Held on the socket, not on the reason there is not one.
-                if !client.is_connected() {
-                    debug!(target: "Client/AppState", "Holding the {pending:?} retry: no connection");
-                    continue;
-                }
+
                 if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
                     // The work carries over; the authority to settle does not.
                     // This run no longer belongs to the bootstrap that scheduled
@@ -4002,41 +4015,38 @@ mod lifecycle_signal_tests {
 }
 
 #[cfg(test)]
-mod direct_connect_tests {
+mod connection_guard_tests {
     use super::*;
 
-    /// A client that calls `connect()` without `run()` never starts the
-    /// supervision loop, so `is_running` stays false for its whole life. The
-    /// entry guard read that through `is_shutting_down()` and answered `Ok(())`
-    /// without syncing anything, which made app-state sync silently
-    /// unavailable to every direct-connect embedder.
+    /// The guards ask whether the client is finished and whether there is a
+    /// socket, rather than `is_shutting_down()`.
+    ///
+    /// The point is the reconnect: `is_shutting_down()` is true for a planned
+    /// one, so a task reading it stops for a connection that is coming back.
+    ///
+    /// Not a claim about direct-connect clients. `connect()` without `run()`
+    /// leaves `is_running` false, and `send_and_wait_iq` rejects every IQ in
+    /// that state (`request.rs`), so no such client can reach the server at all
+    /// — for app state or anything else. An earlier version of this test
+    /// asserted the sync errored and called that support; it errored one layer
+    /// down, for that reason, and proved nothing.
     #[tokio::test]
-    async fn a_direct_connect_client_is_eligible_to_sync() {
-        let client = crate::test_utils::create_test_client_with_name("direct-connect").await;
+    async fn a_planned_reconnect_does_not_look_like_a_stop() {
+        let client = crate::test_utils::create_test_client_with_name("conn-guard").await;
+        client.is_running.store(true, Ordering::Relaxed);
         client.set_connected_for_test(true);
 
-        assert!(
-            !client.is_running.load(Ordering::Relaxed),
-            "no supervision loop, which is the whole point of this client"
-        );
+        assert!(!client.is_terminal() && client.is_connected());
+
+        // The state `reconnect_immediately()` leaves behind.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
         assert!(
             client.is_shutting_down(),
-            "the old guard saw that as shutting down"
+            "which the old guard could not tell from a stop"
         );
         assert!(
-            !client.is_terminal() && client.is_connected(),
-            "while it is neither finished nor disconnected"
-        );
-
-        // Reaches the wire rather than short-circuiting: the sync fails with
-        // NotConnected only because this fixture has no transport, which is one
-        // step further than the guard used to allow.
-        assert!(
-            client
-                .process_app_state_sync_task(WAPatchName::Regular, false)
-                .await
-                .is_err(),
-            "it must attempt the sync, not report success without trying"
+            !client.is_terminal(),
+            "so work that outlives a connection stays alive"
         );
     }
 }
