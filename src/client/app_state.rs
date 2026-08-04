@@ -914,30 +914,50 @@ impl Client {
     /// followed by a handshake — there is no honest constant. Terminal is the
     /// condition that actually means "stop waiting", and it is already tracked.
     ///
-    /// Waits on socket readiness, not on `Connected`. The caller's question is
-    /// whether an IQ can be sent, which is [`Self::is_connected`]; the readiness
+    /// Waits for [`Self::can_reach_server`], not for `Connected`: the caller's
+    /// question is whether its IQ can be sent and answered, and the `Connected`
     /// notifier additionally waits for the critical sync, so a retry would sit
-    /// through a bootstrap it is not part of.
+    /// through a bootstrap it may itself be part of.
     pub(crate) async fn await_connection(&self) -> bool {
         loop {
-            if self.is_connected() {
-                return true;
+            if let Some(verdict) = self.connection_wait_verdict() {
+                return verdict;
             }
-            if self.is_terminal() {
-                return false;
-            }
-            // Registered before the re-checks, so a socket landing in the gap is
-            // not missed. A notification that does not leave a live connection
-            // simply loops: the wait ends on the state, never on one event.
+            // Both registered before the re-check, so a transition landing in the
+            // gap is not missed. Socket readiness alone is not enough to wait on:
+            // it fires before login, and nothing fires at all when the client
+            // stops without a replacement socket — a wait on it alone parks
+            // forever, holding the `Arc<Client>` whose drop is the only other
+            // way this task ends.
             let ready = self.socket_ready_notifier.listen();
-            if self.is_connected() {
-                return true;
+            let session = self.session_state_notifier.listen();
+            if let Some(verdict) = self.connection_wait_verdict() {
+                return verdict;
             }
-            if self.is_terminal() {
-                return false;
-            }
-            ready.await;
+            futures::pin_mut!(ready);
+            futures::pin_mut!(session);
+            // A notification that does not settle the question simply loops: the
+            // wait ends on the state, never on one event.
+            futures::future::select(ready, session).await;
         }
+    }
+
+    /// Whether [`Self::await_connection`] can stop, and with what answer.
+    fn connection_wait_verdict(&self) -> Option<bool> {
+        if self.can_reach_server() {
+            return Some(true);
+        }
+        if self.is_terminal() {
+            return Some(false);
+        }
+        // A client with no supervision loop has no reader, so nothing will ever
+        // answer an IQ and no `<success>` will ever arrive. That is not terminal
+        // — the connection is fine and the application may still use it — but it
+        // is unwaitable, and the alternative is parking until the process ends.
+        if !self.is_running.load(Ordering::Relaxed) {
+            return Some(false);
+        }
+        None
     }
 
     /// Open a scope for work starting now on the live connection.
@@ -1746,13 +1766,11 @@ impl Client {
         name: WAPatchName,
         full_sync: bool,
     ) -> Result<()> {
-        // Three separate questions, where `is_shutting_down()` answered a blend
-        // of two of them. Is the client finished; is there a socket; and can an
-        // IQ actually be sent — `send_and_wait_iq` refuses while `is_running` is
-        // false, so admitting a client without it only reaches the wire to fail.
-        // A planned reconnect is none of these: it leaves `is_running` set and
-        // clears `is_connected`, so the work waits instead of stopping.
-        if self.is_terminal() || !self.is_connected() || !self.is_running.load(Ordering::Relaxed) {
+        // Two questions, where `is_shutting_down()` answered a blend of them: is
+        // the client finished, and can a request reach the server at all. A
+        // planned reconnect is neither — it clears `is_connected` and leaves
+        // everything else alone — so the work waits instead of stopping.
+        if self.is_terminal() || !self.can_reach_server() {
             debug!(
                 target: "Client/AppState",
                 "Skipping app state sync task {name:?}: no usable connection"
@@ -1776,7 +1794,7 @@ impl Client {
         let mut iteration = 0u32;
 
         while has_more {
-            if self.is_terminal() || !self.is_connected() {
+            if self.is_terminal() || !self.can_reach_server() {
                 debug!(target: "Client/AppState", "Stopping app state sync task {name:?}: no usable connection");
                 break;
             }
@@ -1810,7 +1828,7 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
-            if self.is_terminal() || !self.is_connected() {
+            if self.is_terminal() || !self.can_reach_server() {
                 debug!(target: "Client/AppState", "Discarding app state sync response for {name:?}: no usable connection");
                 break;
             }
@@ -4017,12 +4035,24 @@ mod lifecycle_signal_tests {
         // And the run loop's own exit: it stops by clearing `is_running` alone,
         // without firing the notifier or setting `expected_disconnect`, so that
         // pairing has to count too or retries wait for a connection that is
-        // never coming.
+        // never coming. `cleanup_connection_state` has already run by then, which
+        // is why the socket is down here.
         client.is_running.store(false, Ordering::Relaxed);
+        client.set_connected_for_test(false);
         assert!(
             client.is_terminal(),
             "the supervision loop ending with auto-reconnect off is terminal"
         );
+
+        // But `is_running` is false for a direct-connect client too, which never
+        // had a loop to end. One of those with a live socket is not finished, and
+        // reading it as finished is what the first version of this predicate did.
+        client.set_connected_for_test(true);
+        assert!(
+            !client.is_terminal(),
+            "a live direct-connect client never started the loop that would have ended"
+        );
+        client.set_connected_for_test(false);
 
         client.enable_auto_reconnect.store(true, Ordering::Relaxed);
         client.is_running.store(true, Ordering::Relaxed);
@@ -4104,12 +4134,25 @@ mod await_connection_tests {
             "an event without a connection is not an answer"
         );
 
+        // Nor is a socket on its own. `connect()` announces one before login, and
+        // an IQ sent in that gap is answered by nobody and retired by the
+        // `<success>` that follows.
         client.set_connected_for_test(true);
         client.socket_ready_notifier.notify(usize::MAX);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a socket without an authenticated session is not one either"
+        );
+
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.notify_session_state();
         assert!(
             tokio::time::timeout(Duration::from_secs(5), waiter)
                 .await
-                .expect("a real connection must end the wait")
+                .expect("a usable connection must end the wait")
                 .expect("the waiter should not panic"),
             "and it reports that one arrived"
         );
@@ -4118,6 +4161,12 @@ mod await_connection_tests {
     /// The wait has no duration bound, so the terminal state is the only thing
     /// that ends it when no connection is coming. Every duration tried here was
     /// wrong in one direction or the other.
+    ///
+    /// Shutdown alone has to end it. An earlier version of this test nudged
+    /// `socket_ready_notifier` afterwards and passed on that nudge, hiding a wait
+    /// that in production had nothing left to wake it — no socket is ever
+    /// announced again after a shutdown, and the parked task holds the
+    /// `Arc<Client>` whose drop would otherwise have been the way out.
     #[tokio::test]
     async fn a_finished_client_ends_the_wait() {
         let client = crate::test_utils::create_test_client_with_name("await-terminal").await;
@@ -4134,13 +4183,65 @@ mod await_connection_tests {
         .await;
 
         client.signal_shutdown_sync();
-        client.socket_ready_notifier.notify(usize::MAX);
         assert!(
             !tokio::time::timeout(Duration::from_secs(5), waiter)
                 .await
-                .expect("a finished client must end the wait")
+                .expect("a finished client must end the wait, with nothing else nudging it")
                 .expect("the waiter should not panic"),
             "and it reports that none arrived"
+        );
+    }
+
+    /// The run loop's own exit is the terminal transition with no signal of its
+    /// own: it fires no notifier and announces no socket, so a wait parked
+    /// through it is parked for good unless that branch says so itself.
+    #[tokio::test]
+    async fn the_run_loop_giving_up_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-runloop").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // The branch itself, not a re-enactment of it: `run()` reads this flag
+        // and calls exactly this, and a version of the transition that forgets
+        // to announce itself fails here.
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.stop_supervision_loop();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the supervision loop ending must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that none arrived"
+        );
+    }
+
+    /// A direct-connect client is not finished — its connection is fine and its
+    /// application may still use it — but no `<success>` will ever arrive without
+    /// a reader, so waiting for one is waiting forever.
+    #[tokio::test]
+    async fn a_client_without_a_reader_is_not_worth_waiting_for() {
+        let client = crate::test_utils::create_test_client_with_name("await-direct").await;
+        client.set_connected_for_test(true);
+
+        assert!(
+            !client.is_terminal(),
+            "a live direct-connect client is fine"
+        );
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), client.await_connection())
+                .await
+                .expect("the wait must not park on a connection that cannot answer"),
+            "it just cannot carry the work"
         );
     }
 }

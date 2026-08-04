@@ -41,6 +41,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        self.notify_session_state();
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.signal_shutdown_sync();
@@ -94,9 +95,15 @@ impl Client {
     /// and set `expected_disconnect` together, which is what tells them apart
     /// from an application merely turning auto-reconnect off.
     ///
-    /// Not `is_running`: that tracks whether `run()`'s supervision loop is
-    /// active, which a direct-connect client never starts, so a healthy one
-    /// would look permanently stopped.
+    /// Not `is_running` on its own: that tracks whether `run()`'s supervision
+    /// loop is active, which a direct-connect client never starts, so a healthy
+    /// one would look permanently stopped the moment its application expressed a
+    /// reconnect preference.
+    ///
+    /// Every transition that can make this true fires
+    /// [`session_state_notifier`](Client::session_state_notifier), because a
+    /// waiter parked on a connection that is never coming has no other way to
+    /// learn that it should stop.
     pub(crate) fn is_terminal(&self) -> bool {
         if self.shutdown_signal().is_fired() {
             return true;
@@ -107,14 +114,41 @@ impl Client {
         // end the session — conflict, 516, an unrecoverable connect failure —
         // always set `expected_disconnect` alongside it, so the pair is what
         // separates a policy from a verdict.
-        // Paired with a signal that the current connection is over, because the
-        // flag alone is a preference. Either the disconnect was deliberate, or
-        // the supervision loop has already stopped — which is how the run loop
-        // itself exits when auto-reconnect is off: it sets `is_running` and
-        // breaks, without firing the notifier or touching `expected_disconnect`.
+        //
+        // The second half is the run loop's own exit: it stops by clearing
+        // `is_running` and breaking, without firing the notifier or touching
+        // `expected_disconnect`, so that pairing has to count too. It is read
+        // together with a dead socket, because `is_running` is also false for a
+        // direct-connect client that never started a supervision loop — and one
+        // of those with a live connection is not finished, it just never had a
+        // loop to end. By the time the run loop breaks, `cleanup_connection_state`
+        // has already cleared `is_connected`, so the real exit still reads as one.
         !self.enable_auto_reconnect.load(Ordering::Relaxed)
             && (self.expected_disconnect.load(Ordering::Relaxed)
-                || !self.is_running.load(Ordering::Relaxed))
+                || (!self.is_running.load(Ordering::Relaxed) && !self.is_connected()))
+    }
+
+    /// Wake everything waiting on whether this client can still do work.
+    ///
+    /// Call after any store that may have flipped [`is_terminal`](Self::is_terminal)
+    /// or completed authentication. Spurious calls are free: every waiter
+    /// re-reads the state and parks again, so this is only ever a hint that the
+    /// answer is worth asking for again.
+    pub(crate) fn notify_session_state(&self) {
+        self.session_state_notifier.notify(usize::MAX);
+    }
+
+    /// The supervision loop giving up for good.
+    ///
+    /// A named transition rather than two stores at the branch, because the
+    /// notify is not optional here and there is nowhere else to learn of it:
+    /// this is the only terminal transition that fires no notifier — a later
+    /// `run()` must stay possible, so the shutdown one is deliberately left
+    /// alone — and announces no socket, ever again. Work parked waiting for a
+    /// connection finds out here or not at all.
+    pub(crate) fn stop_supervision_loop(&self) {
+        self.is_running.store(false, Ordering::Relaxed);
+        self.notify_session_state();
     }
 
     /// Returns `true` when the client has completed its full startup:
@@ -389,6 +423,7 @@ impl Client {
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
+            session_state_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
@@ -585,7 +620,7 @@ impl Client {
 
             if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
                 info!("Auto-reconnect disabled, shutting down.");
-                self.is_running.store(false, Ordering::Relaxed);
+                self.stop_supervision_loop();
                 break;
             }
 
@@ -835,6 +870,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        self.notify_session_state();
         #[cfg(feature = "client-lifecycle")]
         self.request_lifecycle_shutdown();
 
@@ -1295,6 +1331,19 @@ impl Client {
 
     pub fn is_logged_in(&self) -> bool {
         self.is_logged_in.load(Ordering::Relaxed)
+    }
+
+    /// Whether an IQ sent right now could actually be answered.
+    ///
+    /// Three separate conditions that were once asked as one, each of which
+    /// alone admits a request that cannot come back: a socket, so there is
+    /// somewhere to send it; authentication, because `<success>` both makes the
+    /// server willing to answer and fixes the generation the answer is admitted
+    /// under; and a supervision loop, because `send_and_wait_iq` refuses without
+    /// one — a direct-connect client has no reader, so its every request would
+    /// time out.
+    pub(crate) fn can_reach_server(&self) -> bool {
+        self.is_connected() && self.is_logged_in() && self.is_running.load(Ordering::Relaxed)
     }
 }
 

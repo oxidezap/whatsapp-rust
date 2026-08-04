@@ -957,6 +957,12 @@ impl Client {
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation
         );
+        // The generation this connection will be admitted under is now final, so
+        // work waiting for a connection it can actually use is released here and
+        // not at `socket_ready_notifier` — that one fires before login, and an
+        // IQ sent in the gap is answered by nobody and retired by this very
+        // increment.
+        self.notify_session_state();
         // Record the auth time but DON'T reset the backoff counter yet: WA Web
         // resets only after the connection has been stable for ~30s
         // (`resetDelay`). Resetting on <success> alone lets a server that
