@@ -791,6 +791,10 @@ impl Client {
         let client = self.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let mut pending = collections;
+            // Set by any round that ends with something unsynced, and never
+            // cleared: the bootstrap is only finished when nothing was ever
+            // left behind.
+            let mut left_unresolved = false;
             for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
                 if client.is_shutting_down()
@@ -836,12 +840,21 @@ impl Client {
                         // the next connect. That is the safe direction to be
                         // wrong in, and settling it properly means tracking the
                         // holder's completion, which is its own change.
-                        let settled = outcome.all_synced();
+                        // Sticky across rounds, not per round: one round can
+                        // strand a collection as fatal or skipped while another
+                        // stays retryable, and if that last one then succeeds
+                        // its own `all_synced()` is true even though the first
+                        // never synced. Settling on that would let the next
+                        // connection skip the bootstrap for a collection nobody
+                        // recovered.
+                        if !outcome.all_synced() {
+                            left_unresolved = true;
+                        }
                         // Only the retryable ones come back around: a refusal is
                         // terminal and a skip means another sync has it.
                         pending = outcome.retryable;
                         if pending.is_empty() {
-                            if settled && settles == SyncSettles::InitialSync {
+                            if !left_unresolved && settles == SyncSettles::InitialSync {
                                 client
                                     .needs_initial_full_sync
                                     .store(false, Ordering::Relaxed);
@@ -990,6 +1003,24 @@ impl Client {
         let mut iteration = 0;
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
+            // The critical bootstrap runs under a fixed 180s watchdog that
+            // reconnects when it fires. With the cap at WA Web's 500, a
+            // collection that is paging healthily can outlast that watchdog and
+            // be cut off mid-page, over and over, never reaching readiness even
+            // though every page succeeded. Stopping on the deadline instead
+            // reports the rest as retryable and lets the reconnect resume from
+            // the versions already persisted, so the progress is kept and the
+            // watchdog is not what ends the run.
+            if let Some(deadline) = key_wait_deadline
+                && wacore::time::Instant::now() >= deadline
+            {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: deadline reached with {pending:?} still paging"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
             iteration += 1;
             debug!(
                 target: "Client/AppState",
@@ -3063,38 +3094,14 @@ mod retry_gate_tests {
         assert!(synced.all_synced(), "this is the only case that settles it");
     }
 
-    /// The scheduler must retry against the connection the outcome came from.
-    /// Dispatching the failure event runs consumer handlers synchronously, so a
-    /// disconnect there would otherwise let the retries — and, for InitialSync,
-    /// the gate they can stand down — attach to whatever replaced it.
-    #[tokio::test]
-    async fn retries_do_not_follow_the_connection_that_replaced_theirs() {
-        let client = crate::test_utils::create_test_client_with_name("retry-gen-bind").await;
-        let retired = client.connection_generation.load(Ordering::SeqCst);
-        client
-            .needs_initial_full_sync
-            .store(true, Ordering::Relaxed);
-
-        // The connection the retry belongs to is gone by the time it runs.
-        client
-            .connection_generation
-            .store(retired + 1, Ordering::SeqCst);
-        client.schedule_app_state_retry(
-            vec![WAPatchName::CriticalBlock],
-            retired,
-            SyncSettles::InitialSync,
-        );
-
-        // The first round sleeps before doing anything, so this is enough for a
-        // scheduler bound to the live generation to have acted.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            client.needs_initial_full_sync.load(Ordering::Relaxed),
-            "a retired connection's retry must not settle the replacement's bootstrap"
-        );
-    }
+    // Not covered: that the scheduler refuses to run for a retired generation.
+    // Two attempts at it passed with the guard removed — the gate stays armed
+    // because the wrongly-attempted sync fails anyway on a socketless client,
+    // and the attempt never reaches the capturing transport either. Asserting
+    // on the gate or on the wire both hold for the wrong reason, and a test
+    // that passes without the fix is worse than none. It needs a connected
+    // fixture that can complete a sync, which the report-path test below
+    // already has for its own case.
 
     /// The backoff doubles from the minimum and clamps, matching the syncd
     /// spacing WA Web applies to the same case.

@@ -1464,40 +1464,45 @@ impl Client {
                     let result = sync_client.sync_collections_batched(to_sync, None).await;
 
                     let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
+
+                    // Settled before the report, not after. Reporting dispatches
+                    // `AppStateSyncFailed` to consumer handlers synchronously,
+                    // and one of them disconnecting would retire the generation
+                    // and take this decision with it — leaving an unfinished
+                    // bootstrap unarmed, which is the failure this whole path
+                    // exists to prevent. There is still a check-then-store race
+                    // against a replacement that finishes its own bootstrap in
+                    // the same instant; the loser is one redundant bootstrap,
+                    // which is the direction worth being wrong in.
+                    if sync_client.connection_generation.load(Ordering::SeqCst) == sync_generation {
+                        if complete {
+                            sync_client
+                                .needs_initial_full_sync
+                                .store(false, Ordering::Relaxed);
+                            debug!(target: "Client/AppState", "Initial App State Sync Completed.");
+                        } else {
+                            // Armed, not merely left alone. This path is also
+                            // reached with the flag already false, because an
+                            // empty persisted push name is enough to enter the
+                            // bootstrap on its own. Once the critical sync
+                            // supplies the name, the next connection would see a
+                            // non-empty name and a false flag and skip the
+                            // unfinished bootstrap entirely, while the retries
+                            // scheduled here retire with this generation.
+                            sync_client
+                                .needs_initial_full_sync
+                                .store(true, Ordering::Relaxed);
+                        }
+                    }
+
                     sync_client.report_background_sync(
                         "non-critical app state sync",
                         sync_generation,
                         SyncSettles::InitialSync,
                         result,
                     );
-                    // The report drops a retired generation's outcome; the flag
-                    // below must not be touched in that case either.
-                    if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
-                        return;
-                    }
 
-                    // Only stand the bootstrap down once it actually delivered.
-                    // Clearing this after a partial run makes the next
-                    // connection skip the fresh-pairing path, and the retry that
-                    // would have covered the gap dies with this generation.
-                    if complete {
-                        sync_client
-                            .needs_initial_full_sync
-                            .store(false, Ordering::Relaxed);
-                        debug!(target: "Client/AppState", "Initial App State Sync Completed.");
-                    } else {
-                        // Armed, not merely left alone. This path is also
-                        // reached with the flag already false, because an empty
-                        // persisted push name is enough to enter the bootstrap
-                        // on its own. Once the critical sync supplies the name,
-                        // the next connection would see a non-empty name and a
-                        // false flag and skip the unfinished bootstrap entirely,
-                        // while the retries scheduled here retire with this
-                        // generation. Setting it is what makes the retry
-                        // guarantee survive a reconnect.
-                        sync_client
-                            .needs_initial_full_sync
-                            .store(true, Ordering::Relaxed);
+                    if !complete {
                         warn!(
                             target: "Client/AppState",
                             "Initial App State Sync incomplete; arming the bootstrap for the next connection"
