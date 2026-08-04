@@ -1459,16 +1459,17 @@ impl Client {
                     ]);
                     let result = sync_client.sync_collections_batched(to_sync, None).await;
 
-                    // Re-checked after the round trip, not just before it: this
-                    // publishes an event and schedules retries, and both would
-                    // otherwise be attributed to whatever socket is live now.
+                    let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
+                    sync_client.report_background_sync(
+                        "non-critical app state sync",
+                        sync_generation,
+                        result,
+                    );
+                    // The report drops a retired generation's outcome; the flag
+                    // below must not be touched in that case either.
                     if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
-                        debug!("App state sync outcome dropped: connection generation changed");
                         return;
                     }
-
-                    let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
-                    sync_client.report_background_sync("non-critical app state sync", result);
 
                     // Only stand the bootstrap down once it actually delivered.
                     // Clearing this after a partial run makes the next

@@ -82,6 +82,12 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 );
 
                 let client_clone = client.clone();
+                // Captured before the wait below, so the outcome is attributed
+                // to the connection that asked for the re-sync rather than to
+                // whichever one is live when it finishes.
+                let generation = client
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::SeqCst);
 
                 // Groups/newsletter_metadata: wait for offline sync per WAWebHandleDirtyBits.
                 client
@@ -116,6 +122,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                             if !client_clone.is_shutting_down() {
                                 client_clone.report_background_sync(
                                     "app state re-sync after dirty notification",
+                                    generation,
                                     result,
                                 );
                             }

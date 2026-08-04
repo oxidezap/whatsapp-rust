@@ -655,11 +655,22 @@ impl Client {
     /// Readiness is read, not assumed: a `syncd_app_state` dirty bit can start a
     /// sync while offline stanzas are still being processed, so this can run
     /// before the connection ever reaches `Connected`.
+    ///
+    /// `generation` is the connection the sync was started on. Checking it here
+    /// rather than at each call site is deliberate: every caller awaits a round
+    /// trip before reporting, and one that forgot would publish a retired
+    /// socket's refusal to a consumer whose documented response is to log out or
+    /// force a recovery — on the live session.
     pub(crate) fn report_background_sync(
         self: &Arc<Self>,
         label: &str,
+        generation: u64,
         result: Result<BatchedSyncOutcome>,
     ) {
+        if self.connection_generation.load(Ordering::SeqCst) != generation {
+            debug!(target: "Client/AppState", "{label}: outcome dropped, connection retired");
+            return;
+        }
         match result {
             Ok(outcome) if outcome.all_synced() => {}
             Ok(outcome) => {
@@ -2862,5 +2873,56 @@ mod duplicate_collection_tests {
 
         assert!(outcome.retryable.is_empty(), "both were answered");
         assert!(outcome.all_synced());
+    }
+}
+
+#[cfg(test)]
+mod background_report_tests {
+    use super::*;
+    use crate::types::events::{EventHandler, EventInterest, EventKind};
+
+    struct FailureCounter(Arc<AtomicU64>);
+
+    impl EventHandler for FailureCounter {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::AppStateSyncFailed(_)) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A background sync awaits a round trip before it reports, so its outcome
+    /// can belong to a socket that has since been replaced. Publishing it would
+    /// hand a consumer a refusal whose documented response — logout, or forcing
+    /// a recovery — would land on the healthy session that took its place.
+    #[tokio::test]
+    async fn an_outcome_from_a_retired_connection_is_not_published() {
+        let client = crate::test_utils::create_test_client_with_name("bg-report-gen").await;
+        let started_on = client.connection_generation.load(Ordering::SeqCst);
+
+        let seen = Arc::new(AtomicU64::new(0));
+        let _subscription = client.subscribe(
+            EventInterest::of(&[EventKind::AppStateSyncFailed]),
+            Arc::new(FailureCounter(Arc::clone(&seen))),
+        );
+
+        let mut outcome = BatchedSyncOutcome::default();
+        outcome.fatal.push(WAPatchName::CriticalBlock);
+
+        // The connection this sync belonged to is gone.
+        client
+            .connection_generation
+            .store(started_on + 1, Ordering::SeqCst);
+        client.report_background_sync("test", started_on, Ok(outcome.clone()));
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            0,
+            "a retired connection's refusal must not reach consumers"
+        );
+
+        // The live one still reports.
+        let live = client.connection_generation.load(Ordering::SeqCst);
+        client.report_background_sync("test", live, Ok(outcome));
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
     }
 }
