@@ -2769,18 +2769,39 @@ mod batched_sync_reconciliation_tests {
         assert!(outcome.all_synced());
     }
 
-    /// A wait that ran out leaves the collection uncovered by anyone, so it is a
-    /// miss worth retrying rather than a skip someone else is handling.
-    #[test]
-    fn a_timed_out_wait_is_retryable_not_skipped() {
-        // The distinction the buckets encode, asserted directly: `skipped` is
-        // "another sync has it", which is the only case a caller may ignore.
-        let mut outcome = BatchedSyncOutcome::default();
-        outcome.skipped.push(WAPatchName::Regular);
-        assert!(!outcome.all_synced());
+    /// A wait that runs out leaves the collection uncovered by anyone, so it is
+    /// a miss worth retrying rather than a skip someone else is handling.
+    ///
+    /// Paused time so the bound actually elapses instead of the test sitting
+    /// there for [`APP_STATE_RESERVATION_WAIT`]; the holder never releases, so
+    /// the timeout is the only way out.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_runs_out_reports_the_collection_retryable() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        // A patch send is never equivalent work, so the batched sync waits for
+        // it rather than skipping — which is what puts the bound in play.
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let outcome = client
+            .sync_collections_batched(vec![WAPatchName::Regular], None)
+            .await
+            .expect("a wait that ran out is an outcome, not a transport failure");
+
+        assert_eq!(
+            outcome.retryable,
+            vec![WAPatchName::Regular],
+            "nobody is covering it, so it has to come back around"
+        );
         assert!(
-            outcome.retryable.is_empty(),
-            "an equivalent sync in flight is covered, not retryable"
+            outcome.skipped.is_empty(),
+            "skipped means an equivalent sync has it, which is not the case here"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "the sync never got its turn, so nothing should reach the wire"
         );
     }
 

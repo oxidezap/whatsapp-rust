@@ -13,10 +13,10 @@ use wacore_binary::Node;
 
 pub use wacore::request::{InfoQuery, InfoQueryType, RequestUtils};
 
-/// How long an IQ waits for its answer when the caller does not say. Also the
-/// ceiling on how long one attempt of anything built on `send_iq` can hold a
-/// resource, which is what lets other waits be derived from it rather than
-/// guessed.
+/// How long an IQ waits for its answer when the caller does not pass a timeout
+/// of its own. Callers may pass a longer one, so this bounds the default path
+/// rather than every request; app-state derives its reservation wait from it on
+/// that basis, since the sends it waits behind take the default.
 pub(crate) const DEFAULT_IQ_TIMEOUT: Duration = Duration::from_secs(75);
 const IQ_ID_ATTR: &str = "id";
 const IQ_TAG: &str = "iq";
