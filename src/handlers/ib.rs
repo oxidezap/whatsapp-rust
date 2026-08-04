@@ -122,6 +122,23 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                             warn!("Failed to send clean dirty bits IQ: {e:?}");
                         }
 
+                        // Checked again after the clean IQ: an ordinary reconnect
+                        // does not set `is_shutting_down`, so that guard alone
+                        // would let the re-sync run on a socket this task no
+                        // longer belongs to and then lose its outcome to the
+                        // generation check at reporting time.
+                        if client_clone
+                            .connection_generation
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            != generation
+                        {
+                            debug!(
+                                target: "Client/AppState",
+                                "Dirty-bit task cancelled: connection generation changed while cleaning"
+                            );
+                            return;
+                        }
+
                         if needs_resync && !client_clone.is_shutting_down() {
                             info!("syncd_app_state dirty -- re-syncing all app state collections");
                             let result = client_clone

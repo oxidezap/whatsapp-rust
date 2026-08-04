@@ -42,6 +42,15 @@ const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// the last wait minutes out.
 const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
 
+/// Delay before retry `round` (zero-based), doubling from
+/// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
+/// [`APP_STATE_RETRY_BACKOFF_MAX`].
+fn app_state_retry_backoff(round: u32) -> Duration {
+    APP_STATE_RETRY_BACKOFF_MIN
+        .saturating_mul(2u32.saturating_pow(round))
+        .min(APP_STATE_RETRY_BACKOFF_MAX)
+}
+
 /// What kind of work holds a collection's reservation.
 ///
 /// Skipping behind a holder is only sound when that holder is doing the same
@@ -577,11 +586,15 @@ impl Client {
                         return;
                     }
                     // The bound ran out, so nobody is covering this collection
-                    // and the consumer asked for it. Hand it to the retry
-                    // scheduler rather than dropping the request.
+                    // and the consumer asked for it. Retried as the task it was,
+                    // not as a plain collection sync: the batched path asks for a
+                    // snapshot only when the persisted version is zero, so
+                    // rescheduling a `full_sync` request that way would quietly
+                    // downgrade it to incremental and the snapshot would never
+                    // happen.
                     Err(ReservationSkip::WaitTimedOut) => {
                         warn!(target: "Client/AppState", "Gave up waiting to sync {name:?}; scheduling a retry");
-                        self.schedule_app_state_retry(vec![name], SyncSettles::JustTheCollections);
+                        self.schedule_app_state_task_retry(name, full_sync);
                         return;
                     }
                 };
@@ -717,6 +730,46 @@ impl Client {
     /// bootstrap, which supersedes anything queued here, so a stale round must
     /// not fire against the new socket.
     ///
+    /// Retry one consumer-issued sync task, preserving the mode it asked for.
+    ///
+    /// Separate from [`schedule_app_state_retry`](Self::schedule_app_state_retry)
+    /// because a task carries `full_sync`, and the batched path cannot express
+    /// it: that one requests a snapshot only when the persisted version is zero,
+    /// so a full sync routed through it becomes incremental and the caller's
+    /// snapshot silently never happens.
+    fn schedule_app_state_task_retry(self: &Arc<Self>, name: WAPatchName, full_sync: bool) {
+        let generation = self.connection_generation.load(Ordering::SeqCst);
+        let client = self.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
+                client.runtime.sleep(app_state_retry_backoff(round)).await;
+                if client.is_shutting_down()
+                    || client.connection_generation.load(Ordering::SeqCst) != generation
+                {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: connection retired");
+                    return;
+                }
+                let guard = match client.reserve_for_sync(name, ReservationWait::Always).await {
+                    Ok(guard) => guard,
+                    // Someone equivalent picked it up, so the request is covered.
+                    Err(ReservationSkip::EquivalentSyncInFlight) => return,
+                    Err(ReservationSkip::WaitTimedOut) => continue,
+                };
+                match client.process_app_state_sync_task(name, full_sync).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        drop(guard);
+                        client.log_sync_error("app state task retry", &e);
+                    }
+                }
+            }
+            warn!(
+                target: "Client/AppState",
+                "App state task for {name:?} still unsynced after {APP_STATE_RETRY_MAX_ROUNDS} retries"
+            );
+        }));
+    }
+
     /// `settles` says what recovering these collections finishes; see
     /// [`SyncSettles`].
     pub(crate) fn schedule_app_state_retry(
@@ -732,10 +785,7 @@ impl Client {
         self.runtime.spawn_detached(Box::pin(async move {
             let mut pending = collections;
             for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
-                let delay = APP_STATE_RETRY_BACKOFF_MIN
-                    .saturating_mul(2u32.saturating_pow(round))
-                    .min(APP_STATE_RETRY_BACKOFF_MAX);
-                client.runtime.sleep(delay).await;
+                client.runtime.sleep(app_state_retry_backoff(round)).await;
                 if client.is_shutting_down()
                     || client.connection_generation.load(Ordering::SeqCst) != generation
                 {
@@ -766,11 +816,25 @@ impl Client {
                                 client.is_ready.load(Ordering::Relaxed),
                             );
                         }
+                        // The gate stands down on proof of sync, not on an empty
+                        // retryable bucket: a round that ends in a refusal, or
+                        // behind another sync, also leaves nothing to retry
+                        // while the collection is still not synced. Clearing on
+                        // that would let the next connection skip the bootstrap
+                        // that is the only thing guaranteeing another attempt.
+                        //
+                        // The converse — a collection skipped behind an
+                        // equivalent sync leaves the gate armed even if that
+                        // sync then succeeds — costs one redundant bootstrap on
+                        // the next connect. That is the safe direction to be
+                        // wrong in, and settling it properly means tracking the
+                        // holder's completion, which is its own change.
+                        let settled = outcome.all_synced();
                         // Only the retryable ones come back around: a refusal is
                         // terminal and a skip means another sync has it.
                         pending = outcome.retryable;
                         if pending.is_empty() {
-                            if settles == SyncSettles::InitialSync {
+                            if settled && settles == SyncSettles::InitialSync {
                                 client
                                     .needs_initial_full_sync
                                     .store(false, Ordering::Relaxed);
@@ -2957,5 +3021,52 @@ mod background_report_tests {
         let live = client.connection_generation.load(Ordering::SeqCst);
         client.report_background_sync("test", live, SyncSettles::JustTheCollections, Ok(outcome));
         assert_eq!(seen.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod retry_gate_tests {
+    use super::*;
+
+    /// The bootstrap gate stands down on proof of sync, not on an empty
+    /// retryable bucket. A round that ends in a refusal, or behind another sync,
+    /// also leaves nothing to retry while the collection is still not synced,
+    /// and clearing there lets the next connection skip the only thing that
+    /// guarantees another attempt.
+    #[test]
+    fn only_a_fully_synced_outcome_settles_the_bootstrap() {
+        let mut fatal = BatchedSyncOutcome::default();
+        fatal.fatal.push(WAPatchName::CriticalBlock);
+        assert!(fatal.retryable.is_empty(), "nothing left to retry");
+        assert!(
+            !fatal.all_synced(),
+            "but the collection is not synced, so the gate must stay armed"
+        );
+
+        let mut skipped = BatchedSyncOutcome::default();
+        skipped.skipped.push(WAPatchName::CriticalBlock);
+        assert!(skipped.retryable.is_empty());
+        assert!(
+            !skipped.all_synced(),
+            "another sync holding it is not proof it succeeded"
+        );
+
+        let mut synced = BatchedSyncOutcome::default();
+        synced.synced.push(WAPatchName::CriticalBlock);
+        assert!(synced.all_synced(), "this is the only case that settles it");
+    }
+
+    /// The backoff doubles from the minimum and clamps, matching the syncd
+    /// spacing WA Web applies to the same case.
+    #[test]
+    fn retry_backoff_doubles_then_clamps() {
+        assert_eq!(app_state_retry_backoff(0), APP_STATE_RETRY_BACKOFF_MIN);
+        assert_eq!(app_state_retry_backoff(1), APP_STATE_RETRY_BACKOFF_MIN * 2);
+        assert_eq!(app_state_retry_backoff(3), APP_STATE_RETRY_BACKOFF_MIN * 8);
+        assert_eq!(
+            app_state_retry_backoff(u32::MAX),
+            APP_STATE_RETRY_BACKOFF_MAX,
+            "an absurd round must clamp, not overflow"
+        );
     }
 }
