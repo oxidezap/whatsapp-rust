@@ -473,9 +473,7 @@ async fn handle_pair_success<'a>(
 
             // --- START: FIX ---
             // Set the flag to trigger a full sync on the next successful connection.
-            client
-                .needs_initial_full_sync
-                .store(true, Ordering::Relaxed);
+            client.needs_initial_full_sync.arm_for_pairing();
             // --- END: FIX ---
 
             client.expected_disconnect.store(true, Ordering::Relaxed);

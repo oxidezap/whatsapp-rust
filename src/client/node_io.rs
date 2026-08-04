@@ -1245,7 +1245,7 @@ impl Client {
 
             check_generation!();
 
-            let flag_set = client_clone.needs_initial_full_sync.load(Ordering::Relaxed);
+            let flag_set = client_clone.needs_initial_full_sync.is_armed();
             let needs_initial_sync = flag_set || needs_pushname_from_sync;
 
             if needs_initial_sync {
@@ -1513,11 +1513,16 @@ impl Client {
                     // connection" part impossible to forget.
                     sync_client.settle_bootstrap(scope, !complete);
 
-                    sync_client.report_background_sync(
+                    // A refused critical collection is not in `requested` and
+                    // never will be retried, but it is why the bootstrap is
+                    // unfinished. Handing that to the scheduler keeps a later
+                    // clean round from standing the gate down on its behalf.
+                    sync_client.report_background_sync_stranded(
                         "non-critical app state sync",
                         scope,
                         SyncSettles::InitialSync,
                         &requested,
+                        critical_refused,
                         result,
                     );
                 }));

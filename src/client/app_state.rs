@@ -113,6 +113,67 @@ impl SyncScope {
     }
 }
 
+/// The initial-bootstrap flag, tagged with the connection that last wrote it.
+///
+/// A plain flag cannot be settled safely. Deciding whether the writer still owns
+/// the connection and then writing are two operations, and every attempt to
+/// bridge them failed a different way: checking first missed a retirement in the
+/// gap, and rolling back afterwards clobbered whatever the replacement had
+/// written in the meantime. Packing the generation into the same word makes the
+/// pair a single compare-and-swap, so a writer from a retired connection simply
+/// loses — there is no window left to lose in.
+#[derive(Debug)]
+pub(crate) struct BootstrapGate(AtomicU64);
+
+impl BootstrapGate {
+    /// Armed by pairing before any connection exists, so generation zero owns
+    /// the first write and every later connection outranks it.
+    pub(crate) fn new(outstanding: bool) -> Self {
+        Self(AtomicU64::new(Self::encode(0, outstanding)))
+    }
+
+    const fn encode(generation: u64, outstanding: bool) -> u64 {
+        (generation << 1) | outstanding as u64
+    }
+
+    /// Whether the bootstrap still owes work, whoever last said so.
+    pub(crate) fn is_armed(&self) -> bool {
+        self.0.load(Ordering::Acquire) & 1 == 1
+    }
+
+    /// Arm unconditionally, for pairing: there is no scope yet, and a fresh
+    /// pairing owes a bootstrap no matter what any connection thinks.
+    pub(crate) fn arm_for_pairing(&self) {
+        self.0
+            .store(Self::encode(u64::MAX >> 1, true), Ordering::Release);
+    }
+
+    /// Record `outstanding` on behalf of `generation`, unless a newer connection
+    /// has already had its say.
+    ///
+    /// Returns whether the write took. A stale writer losing here is the point,
+    /// not a failure.
+    pub(crate) fn settle(&self, generation: u64, outstanding: bool) -> bool {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            // Strictly newer wins. Equal is the same connection revising its own
+            // answer, which it is entitled to do.
+            if (current >> 1) > generation {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                Self::encode(generation, outstanding),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 /// What kind of work holds a collection's reservation.
 ///
 /// Skipping behind a holder is only sound when that holder is doing the same
@@ -766,6 +827,24 @@ impl Client {
         requested: &[WAPatchName],
         result: Result<BatchedSyncOutcome>,
     ) {
+        self.report_background_sync_stranded(label, scope, settles, requested, false, result)
+    }
+
+    /// [`report_background_sync`](Self::report_background_sync) for a caller that
+    /// already knows something is unrecoverable outside this result.
+    ///
+    /// A collection the server refused is not in `requested` — retrying it is
+    /// pointless — but it is still why the bootstrap is unfinished, and a later
+    /// clean round would otherwise settle the gate on its behalf.
+    pub(crate) fn report_background_sync_stranded(
+        self: &Arc<Self>,
+        label: &str,
+        scope: SyncScope,
+        settles: SyncSettles,
+        requested: &[WAPatchName],
+        stranded_elsewhere: bool,
+        result: Result<BatchedSyncOutcome>,
+    ) {
         if let Err(lost) = self.admits(scope) {
             debug!(target: "Client/AppState", "{label}: outcome dropped ({lost:?})");
             return;
@@ -787,7 +866,8 @@ impl Client {
                 // scheduler carries, so without this the scheduler would start
                 // clean and let a later successful round settle the bootstrap
                 // for collections that never synced and will not be retried.
-                let already_stranded = !outcome.fatal.is_empty() || !outcome.skipped.is_empty();
+                let already_stranded =
+                    stranded_elsewhere || !outcome.fatal.is_empty() || !outcome.skipped.is_empty();
                 self.schedule_app_state_retry(outcome.retryable, scope, settles, already_stranded);
             }
             Err(e) => {
@@ -802,7 +882,12 @@ impl Client {
                 // Unasserted: the observable is a detached task that sleeps
                 // before doing anything, and the two probes tried for it both
                 // passed with the requeue removed.
-                self.schedule_app_state_retry(requested.to_vec(), scope, settles, false);
+                self.schedule_app_state_retry(
+                    requested.to_vec(),
+                    scope,
+                    settles,
+                    stranded_elsewhere,
+                );
             }
         }
     }
@@ -841,6 +926,19 @@ impl Client {
     /// write through here is what keeps that check from being the caller's job —
     /// it was forgotten twice when it was.
     pub(crate) fn settle_bootstrap(&self, scope: SyncScope, outstanding: bool) {
+        // Two guards, closing two different holes, which is why neither alone
+        // was enough on the previous attempts.
+        //
+        // The admission check keeps a writer whose connection is already gone
+        // from having a say at all. The compare-and-swap keeps any write from
+        // clobbering one made on behalf of a newer connection. Between them the
+        // worst case is a stale write that slips through the check and lands
+        // before the replacement settles — and the replacement's own settle then
+        // outranks it permanently, because the tag only ever moves forward.
+        //
+        // Expiry is deliberately not consulted: running out of time is exactly
+        // when the bootstrap has to stay armed, and that is a write this
+        // connection is still entitled to make.
         if self.admits(scope) == Err(ScopeLost::Retired) {
             debug!(
                 target: "Client/AppState",
@@ -848,25 +946,13 @@ impl Client {
             );
             return;
         }
-        let previous = self
+        if !self
             .needs_initial_full_sync
-            .swap(outstanding, Ordering::Relaxed);
-        // The check and the store are two operations, and the generation moves
-        // under a lock this does not hold, so a connection that retires between
-        // them would keep a write meant for it. Undoing on that discovery is
-        // what makes the pair converge: the live connection ends up with the
-        // value it had, rather than one a dead one chose for it.
-        //
-        // Unasserted: reaching it needs the generation to move between the swap
-        // and this line, which no test can schedule deterministically. Closing
-        // it properly means the teardown bump and this write taking one lock,
-        // which is a lifecycle change rather than an app-state one.
-        if self.admits(scope) == Err(ScopeLost::Retired) {
-            self.needs_initial_full_sync
-                .store(previous, Ordering::Relaxed);
+            .settle(scope.generation, outstanding)
+        {
             debug!(
                 target: "Client/AppState",
-                "Bootstrap gate restored: connection {} retired mid-settle", scope.generation
+                "Bootstrap gate left to a newer connection than {}", scope.generation
             );
             return;
         }
@@ -919,7 +1005,7 @@ impl Client {
                     break;
                 }
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
-                if !client.is_running.load(Ordering::Relaxed) {
+                if client.is_stopping() {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client stopped");
                     return;
                 }
@@ -935,7 +1021,7 @@ impl Client {
                 // `expected_disconnect` makes that guard true for a reconnect as
                 // well as a stop — so attempting here would read a no-op as a
                 // completed sync and drop the request for good.
-                if client.is_shutting_down() {
+                if client.is_reconnecting() {
                     debug!(target: "Client/AppState", "Holding the {name:?} retry: a reconnect is in flight");
                     continue;
                 }
@@ -964,7 +1050,15 @@ impl Client {
                 }
                 attempts += 1;
                 match client.process_app_state_sync_task(name, full_sync).await {
-                    Ok(()) => return,
+                    // An `Ok` only counts when the connection held throughout.
+                    // The callee breaks its pagination and answers `Ok(())` the
+                    // moment it observes a shutdown, so a reconnect starting
+                    // mid-attempt would otherwise end the scheduler and lose the
+                    // request — the `full_sync` snapshot included.
+                    Ok(()) if !client.is_shutting_down() && client.admits(scope).is_ok() => return,
+                    Ok(()) => {
+                        debug!(target: "Client/AppState", "The {name:?} attempt was cut short; keeping it queued");
+                    }
                     Err(e) => {
                         drop(guard);
                         client.log_sync_error("app state task retry", &e);
@@ -1025,7 +1119,7 @@ impl Client {
                 // the collections for good: the trigger that asked for them is
                 // already consumed, and the reconnection path runs no bootstrap
                 // once the push name is known.
-                if !client.is_running.load(Ordering::Relaxed) {
+                if client.is_stopping() {
                     debug!(target: "Client/AppState", "App state retry cancelled: client stopped");
                     return;
                 }
@@ -1226,6 +1320,26 @@ impl Client {
 
         self.sync_collections_batched_inner(pending, scope, &mut outcome)
             .await?;
+
+        // A run that crossed its deadline is not a clean one, even if every
+        // collection it touched came back applied. Reporting it as fully synced
+        // would let the bootstrap abort its watchdog and dispatch Connected on a
+        // scope that has already expired, which is the outcome the deadline
+        // exists to prevent. Moving the synced names to `retryable` sends it
+        // down the retry path instead; the versions are persisted, so the next
+        // attempt resumes rather than repeats.
+        if !outcome.synced.is_empty()
+            && let Err(lost @ ScopeLost::Expired) = self.admits(scope)
+        {
+            warn!(
+                target: "Client/AppState",
+                "Batched sync: {:?} applied but the run outlived its scope ({lost:?})",
+                outcome.synced
+            );
+            let applied = std::mem::take(&mut outcome.synced);
+            outcome.retryable.extend(applied);
+        }
+
         Ok(outcome)
     }
 
@@ -3560,12 +3674,15 @@ mod sync_scope_tests {
             .store(retired.generation() + 1, Ordering::SeqCst);
 
         for armed in [true, false] {
+            // Seeded as the connection that is live at seeding time, so the
+            // retired scope below is genuinely outranked rather than merely
+            // equal to the tag it left behind.
             client
                 .needs_initial_full_sync
-                .store(armed, Ordering::Relaxed);
+                .settle(client.connection_generation.load(Ordering::SeqCst), armed);
             client.settle_bootstrap(retired, !armed);
             assert_eq!(
-                client.needs_initial_full_sync.load(Ordering::Relaxed),
+                client.needs_initial_full_sync.is_armed(),
                 armed,
                 "a retired scope must leave the gate exactly as it found it"
             );
@@ -3574,9 +3691,9 @@ mod sync_scope_tests {
         // The live connection still owns it, both ways.
         let live = client.sync_scope(None);
         client.settle_bootstrap(live, true);
-        assert!(client.needs_initial_full_sync.load(Ordering::Relaxed));
+        assert!(client.needs_initial_full_sync.is_armed());
         client.settle_bootstrap(live, false);
-        assert!(!client.needs_initial_full_sync.load(Ordering::Relaxed));
+        assert!(!client.needs_initial_full_sync.is_armed());
     }
 
     /// An expired scope still owns its connection, so it may settle the gate —
@@ -3587,11 +3704,11 @@ mod sync_scope_tests {
         let expired = client.sync_scope(Some(wacore::time::Instant::now()));
         client
             .needs_initial_full_sync
-            .store(false, Ordering::Relaxed);
+            .settle(expired.generation(), false);
 
         client.settle_bootstrap(expired, true);
         assert!(
-            client.needs_initial_full_sync.load(Ordering::Relaxed),
+            client.needs_initial_full_sync.is_armed(),
             "an expired bootstrap is unfinished, and must say so"
         );
     }
@@ -3711,5 +3828,64 @@ mod apply_boundary_tests {
             "and must never also be queued for a retry that cannot re-fetch it"
         );
         assert_eq!(outcome.retryable, vec![WAPatchName::CriticalUnblockLow]);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_gate_tests {
+    use super::*;
+
+    /// The tag only moves forward, so a write on behalf of an older connection
+    /// can never overwrite one made for a newer. This is the half that the
+    /// admission check cannot provide: by the time a stale writer is inside
+    /// `settle`, the replacement may already have had its say.
+    #[test]
+    fn an_older_connection_cannot_overwrite_a_newer_one() {
+        let gate = BootstrapGate::new(false);
+
+        assert!(gate.settle(7, true), "the newest writer wins");
+        assert!(gate.is_armed());
+
+        assert!(
+            !gate.settle(6, false),
+            "an older connection is refused outright"
+        );
+        assert!(gate.is_armed(), "and leaves the newer answer standing");
+
+        assert!(
+            gate.settle(7, false),
+            "the same connection may revise itself"
+        );
+        assert!(!gate.is_armed());
+
+        assert!(gate.settle(8, true), "and a newer one always may");
+        assert!(gate.is_armed());
+    }
+
+    /// Pairing has no connection to speak for, and a fresh pairing owes a
+    /// bootstrap no matter what any live connection last concluded.
+    #[test]
+    fn pairing_arms_over_any_connection() {
+        let gate = BootstrapGate::new(false);
+        assert!(gate.settle(9, false));
+        assert!(!gate.is_armed());
+
+        gate.arm_for_pairing();
+        assert!(gate.is_armed());
+        assert!(
+            !gate.settle(9, false),
+            "and an ordinary connection cannot undo it"
+        );
+        assert!(gate.is_armed());
+    }
+
+    /// The flag survives the round trip through the tag, which is the only part
+    /// readers see.
+    #[test]
+    fn the_armed_bit_round_trips() {
+        let gate = BootstrapGate::new(true);
+        assert!(gate.is_armed());
+        let gate = BootstrapGate::new(false);
+        assert!(!gate.is_armed());
     }
 }

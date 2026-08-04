@@ -79,6 +79,25 @@ impl Client {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
     }
 
+    /// Whether the client is going away for good, as opposed to between
+    /// connections.
+    ///
+    /// [`is_shutting_down`](Self::is_shutting_down) answers both at once, and
+    /// that conflation is a trap for anything that outlives a connection: a
+    /// planned reconnect makes it true, so work that treats it as "stop" throws
+    /// itself away instead of waiting for the replacement. Callers that must
+    /// survive a reconnect want this; callers that must not touch the socket
+    /// right now want `is_shutting_down`.
+    pub(crate) fn is_stopping(&self) -> bool {
+        !self.is_running.load(Ordering::Relaxed)
+    }
+
+    /// Whether a planned reconnect is in flight: the client is staying, but the
+    /// socket is not usable and anything sent now is a no-op.
+    pub(crate) fn is_reconnecting(&self) -> bool {
+        self.expected_disconnect.load(Ordering::Relaxed) && !self.is_stopping()
+    }
+
     /// Returns `true` when the client has completed its full startup:
     /// transport connected, server authenticated, and critical app state synced.
     /// This is the condition `wait_for_connected` uses to resolve.
@@ -328,7 +347,7 @@ impl Client {
             connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
 
-            needs_initial_full_sync: Arc::new(AtomicBool::new(false)),
+            needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(false)),
 
             app_state_processor: Mutex::new(None),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),

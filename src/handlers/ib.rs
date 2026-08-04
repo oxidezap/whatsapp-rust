@@ -157,7 +157,13 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                                     .connection_generation
                                     .load(std::sync::atomic::Ordering::SeqCst),
                             );
-                            if !client_clone.is_shutting_down() {
+                            // Reported unless the client is going away for
+                            // good. A planned reconnect used to drop this, which
+                            // took the retry with it — and the server already
+                            // considers the dirty bit clean, so nothing would
+                            // ask again. The scheduler rebinds once the
+                            // replacement is live.
+                            if !client_clone.is_stopping() {
                                 client_clone.report_background_sync(
                                     "app state re-sync after dirty notification",
                                     scope,
