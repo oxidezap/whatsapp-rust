@@ -70,6 +70,18 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .notify();
+        // Also the session signal, because this is the one point every
+        // connection ends through — planned or fatal. `handle_stream_error`
+        // makes a client terminal by setting `enable_auto_reconnect` and
+        // `expected_disconnect` and then calling only this; work parked in
+        // `await_connection` would otherwise wait for the run loop to unwind far
+        // enough to announce it, and the invariant on `is_terminal` promises
+        // better than "eventually, if some other loop gets there".
+        //
+        // A teardown that a reconnect follows wakes the wait for nothing, which
+        // costs a state re-read and a re-park. That is the trade this notifier
+        // is built for.
+        self.notify_session_state();
     }
 
     /// Reset the per-connection notifier. Call at the start of each new

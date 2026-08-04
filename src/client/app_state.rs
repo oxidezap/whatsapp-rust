@@ -4496,3 +4496,45 @@ mod sync_owed_tests {
         ))));
     }
 }
+
+#[cfg(test)]
+mod terminal_wake_tests {
+    use super::*;
+
+    /// A fatal stream error — conflict, 516, 401, 409 — makes the client
+    /// terminal by setting two flags and then firing only the per-connection
+    /// shutdown. Nothing else on that path announces anything.
+    ///
+    /// The wait must end there, not when the run loop eventually unwinds far
+    /// enough to notice. The invariant on `is_terminal` is that every transition
+    /// into it announces itself; "some other loop gets there first" is not that,
+    /// and if that loop is what is wedged, it never gets there at all.
+    #[tokio::test]
+    async fn a_fatal_stream_error_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-fatal").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // Exactly what `handle_stream_error` does, in its order.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.notify_connection_shutdown();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a fatal stream error must end the wait where it happens")
+                .expect("the waiter should not panic"),
+            "and it reports that no connection arrived"
+        );
+    }
+}
