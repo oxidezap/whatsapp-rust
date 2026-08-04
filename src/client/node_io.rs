@@ -1456,9 +1456,18 @@ impl Client {
                         // persisted `setting_pushName`. The watchdog's reconnect
                         // would then find a populated push name and a clear flag
                         // and take the ordinary path, never retrying the rest.
-                        client_clone
-                            .needs_initial_full_sync
-                            .store(true, Ordering::Relaxed);
+                        //
+                        // Only for this connection: a late error from a socket
+                        // that has already been replaced would otherwise re-arm
+                        // a gate the replacement just stood down, costing it a
+                        // 180s bootstrap it does not need.
+                        if client_clone.connection_generation.load(Ordering::SeqCst)
+                            == task_generation
+                        {
+                            client_clone
+                                .needs_initial_full_sync
+                                .store(true, Ordering::Relaxed);
+                        }
                         // The sync failed — the watchdog must stay alive to force a reconnect.
                         critical_sync_timeout_handle.detach();
                         return;

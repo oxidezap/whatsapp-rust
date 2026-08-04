@@ -774,6 +774,7 @@ impl Client {
         let generation = self.connection_generation.load(Ordering::SeqCst);
         let client = self.clone();
         self.runtime.spawn_detached(Box::pin(async move {
+            let mut generation = generation;
             // Attempts and rounds are counted separately. A wait that ran out
             // never reached the server, so spending an attempt on it would let a
             // writer that holds the collection for a long time burn the whole
@@ -786,11 +787,21 @@ impl Client {
                     break;
                 }
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
-                if client.is_shutting_down()
-                    || client.connection_generation.load(Ordering::SeqCst) != generation
-                {
-                    debug!(target: "Client/AppState", "App state task retry cancelled: connection retired");
+                if !client.is_running.load(Ordering::Relaxed) {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client stopped");
                     return;
+                }
+                // Rebound rather than discarded. Nothing on the replacement
+                // connection re-issues a consumer's task, and a `full_sync: true`
+                // one is the snapshot request this scheduler exists to keep
+                // alive, so a reconnect must not be what silently loses it.
+                let current = client.connection_generation.load(Ordering::SeqCst);
+                if current != generation {
+                    debug!(
+                        target: "Client/AppState",
+                        "App state task retry rebinding to connection {current} (was {generation})"
+                    );
+                    generation = current;
                 }
                 let guard = match client.reserve_for_sync(name, ReservationWait::Always, None).await {
                     Ok(guard) => guard,
@@ -852,8 +863,13 @@ impl Client {
             let mut left_unresolved = already_stranded;
             for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
-                if client.is_shutting_down() {
-                    debug!(target: "Client/AppState", "App state retry cancelled: shutting down");
+                // `is_shutting_down()` is also true for a planned reconnect
+                // (515, reconnect_immediately), and giving up there would drop
+                // these collections for good — the rebind below is exactly what
+                // that case needs, and it never gets reached. Only an actual
+                // stop ends the retry.
+                if !client.is_running.load(Ordering::Relaxed) {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client stopped");
                     return;
                 }
                 // A reconnect must not quietly bin this work. The collections
