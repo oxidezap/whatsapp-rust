@@ -1470,16 +1470,33 @@ impl Client {
                     // and one of them disconnecting would retire the generation
                     // and take this decision with it — leaving an unfinished
                     // bootstrap unarmed, which is the failure this whole path
-                    // exists to prevent. There is still a check-then-store race
-                    // against a replacement that finishes its own bootstrap in
-                    // the same instant; the loser is one redundant bootstrap,
-                    // which is the direction worth being wrong in.
+                    // exists to prevent.
                     if sync_client.connection_generation.load(Ordering::SeqCst) == sync_generation {
                         if complete {
                             sync_client
                                 .needs_initial_full_sync
                                 .store(false, Ordering::Relaxed);
-                            debug!(target: "Client/AppState", "Initial App State Sync Completed.");
+                            // Clearing is the unsafe direction to lose a race
+                            // in: a reconnect between the check and the store
+                            // means this retired task just told the replacement
+                            // its bootstrap is done, and if the replacement's
+                            // own critical sync fails, a later connection with a
+                            // populated push name skips it entirely. Re-arm
+                            // rather than leave that behind — the cost of being
+                            // wrong the other way is one redundant bootstrap.
+                            if sync_client.connection_generation.load(Ordering::SeqCst)
+                                != sync_generation
+                            {
+                                sync_client
+                                    .needs_initial_full_sync
+                                    .store(true, Ordering::Relaxed);
+                                warn!(
+                                    target: "Client/AppState",
+                                    "Connection retired while settling the bootstrap; re-arming it"
+                                );
+                            } else {
+                                debug!(target: "Client/AppState", "Initial App State Sync Completed.");
+                            }
                         } else {
                             // Armed, not merely left alone. This path is also
                             // reached with the flag already false, because an

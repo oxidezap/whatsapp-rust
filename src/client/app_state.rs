@@ -714,7 +714,18 @@ impl Client {
                     &outcome,
                     self.is_ready.load(Ordering::Relaxed),
                 );
-                self.schedule_app_state_retry(outcome.retryable, generation, settles);
+                // Seeded with what this outcome already stranded. A fatal or
+                // skipped collection here is not in the retryable list the
+                // scheduler carries, so without this the scheduler would start
+                // clean and let a later successful round settle the bootstrap
+                // for collections that never synced and will not be retried.
+                let already_stranded = !outcome.fatal.is_empty() || !outcome.skipped.is_empty();
+                self.schedule_app_state_retry(
+                    outcome.retryable,
+                    generation,
+                    settles,
+                    already_stranded,
+                );
             }
             Err(e) => self.log_sync_error(label, &e),
         }
@@ -782,29 +793,55 @@ impl Client {
     /// a retired connection's retries to whatever replaced it — and for
     /// [`SyncSettles::InitialSync`], let them stand down the replacement's
     /// bootstrap gate.
+    ///
+    /// `already_stranded` carries forward whatever the originating outcome left
+    /// behind but did not hand over — a refusal or a collection another writer
+    /// held. Those are not in `collections`, so the scheduler would otherwise
+    /// believe a clean run settled everything.
     pub(crate) fn schedule_app_state_retry(
         self: &Arc<Self>,
         collections: Vec<WAPatchName>,
         generation: u64,
         settles: SyncSettles,
+        already_stranded: bool,
     ) {
         if collections.is_empty() {
             return;
         }
         let client = self.clone();
         self.runtime.spawn_detached(Box::pin(async move {
+            let mut generation = generation;
+            let mut settles = settles;
             let mut pending = collections;
             // Set by any round that ends with something unsynced, and never
             // cleared: the bootstrap is only finished when nothing was ever
             // left behind.
-            let mut left_unresolved = false;
+            let mut left_unresolved = already_stranded;
             for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
-                if client.is_shutting_down()
-                    || client.connection_generation.load(Ordering::SeqCst) != generation
-                {
-                    debug!(target: "Client/AppState", "App state retry cancelled: connection retired");
+                if client.is_shutting_down() {
+                    debug!(target: "Client/AppState", "App state retry cancelled: shutting down");
                     return;
+                }
+                // A reconnect must not quietly bin this work. The collections
+                // are still stale, the dirty bit that asked for them is already
+                // marked clean, and the reconnection path does no app-state
+                // bootstrap once the push name is known — so cancelling here
+                // leaves them stale until some unrelated notification comes
+                // along. Rebind to the live connection and carry on.
+                //
+                // What does not carry over is settlement: this run no longer
+                // belongs to the bootstrap that scheduled it, so it must never
+                // stand that gate down, and its outcome is reported against the
+                // connection that actually did the work.
+                let current = client.connection_generation.load(Ordering::SeqCst);
+                if current != generation {
+                    debug!(
+                        target: "Client/AppState",
+                        "App state retry rebinding to connection {current} (was {generation})"
+                    );
+                    generation = current;
+                    settles = SyncSettles::JustTheCollections;
                 }
                 debug!(
                     target: "Client/AppState",
@@ -1106,6 +1143,23 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
+
+            // The IQ and its blob downloads can outrun the deadline that the
+            // watchdog is measuring against, so checking only at the top of the
+            // loop lets a whole round land after the connection was replaced.
+            // Stopping before anything is applied keeps this round from writing
+            // versions and MACs on behalf of a socket that is already gone; the
+            // versions from earlier rounds are persisted, so the retry resumes.
+            if let Some(deadline) = key_wait_deadline
+                && wacore::time::Instant::now() >= deadline
+            {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: deadline reached before applying {pending:?}"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
 
             // Parse the response once here for pre-download; the same parsed
             // lists are handed to the processor below (no second parse).
@@ -3217,5 +3271,45 @@ mod request_hygiene_tests {
             "an unrequested collection must not be applied or reported"
         );
         assert!(outcome.all_synced());
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// An expired deadline stops the batch before it reserves anything, so no
+    /// collection is reported synced and nothing reaches the wire.
+    ///
+    /// Covers the pre-reservation check only. The second check — after the IQ
+    /// returns and before the response is applied — needs a deadline that
+    /// expires mid-round, which takes a responder driving a paused clock; that
+    /// path is unasserted.
+    #[tokio::test]
+    async fn an_expired_deadline_stops_the_batch_before_it_reserves() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let deadline = wacore::time::Instant::now();
+                client
+                    .sync_collections_batched(vec![WAPatchName::Regular], Some(deadline))
+                    .await
+            })
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), sync)
+            .await
+            .expect("an expired deadline must not block")
+            .expect("the sync task should not panic")
+            .expect("a deadline is an outcome, not a transport failure");
+
+        assert_eq!(outcome.retryable, vec![WAPatchName::Regular]);
+        assert!(outcome.synced.is_empty());
+        assert!(
+            transport.sent().is_empty(),
+            "nothing may reach the wire past the deadline"
+        );
     }
 }
