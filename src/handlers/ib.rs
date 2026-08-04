@@ -99,6 +99,23 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         if client_clone.is_shutting_down() {
                             return;
                         }
+                        // The wait above can outlast the connection that asked
+                        // for this. Stopping here rather than after the sync
+                        // matters: the report is keyed to the generation
+                        // captured before the wait, so a task that ran on the
+                        // replacement socket would do the work and then have its
+                        // result thrown away, taking the retry with it.
+                        if client_clone
+                            .connection_generation
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            != generation
+                        {
+                            debug!(
+                                target: "Client/AppState",
+                                "Dirty-bit task cancelled: connection generation changed during the offline wait"
+                            );
+                            return;
+                        }
                         if let Err(e) = client_clone.clean_dirty_bits(bit).await
                             && !client_clone.is_shutting_down()
                         {
