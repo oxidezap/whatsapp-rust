@@ -1383,6 +1383,12 @@ impl Client {
             && self.authenticated_generation.load(Ordering::SeqCst)
                 == self.connection_generation.load(Ordering::SeqCst)
             && self.is_running.load(Ordering::Relaxed)
+            // A socket already marked for retirement will answer, and then the
+            // answer will be thrown away. `reconnect_immediately` sets this
+            // before its bounded flushes and closes the transport only after,
+            // so the window is wide enough to admit a whole sync that the
+            // replacement generation then retires — attempt charged, work lost.
+            && !self.expected_disconnect.load(Ordering::Relaxed)
     }
 }
 

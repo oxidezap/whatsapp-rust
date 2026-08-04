@@ -183,17 +183,28 @@ impl BootstrapGate {
         self.0.load(Ordering::Acquire) & 1 == 1
     }
 
-    /// Arm for a fresh pairing, which happens before any connection exists.
+    /// Arm for a fresh pairing, above every connection that already exists.
     ///
-    /// Tagged with generation zero on purpose, matching the contract on
-    /// [`Self::new`]. Pairing has to outrank whatever a previous session
-    /// concluded, but it must not outrank the connection that is about to run
-    /// the bootstrap it is asking for. Tagging it above every real generation
-    /// made the gate unclearable: a freshly paired client would re-run the 180s
-    /// critical bootstrap on every connect for the life of the session, however
-    /// many times that bootstrap succeeded.
-    pub(crate) fn arm_for_pairing(&self) {
-        self.0.store(Self::encode(0, true), Ordering::Release);
+    /// Both bounds matter, and each was wrong on its own:
+    ///
+    /// Tagging above *every* generation made the gate unclearable. A freshly
+    /// paired client re-ran the 180s critical bootstrap on every connect for the
+    /// life of the session, however many times that bootstrap succeeded.
+    ///
+    /// Tagging at zero made it clearable by anything, including a scope opened
+    /// on the connection that is live when `pair-success` arrives. Its
+    /// `settle_bootstrap(scope, false)` would clear the arm before the pairing
+    /// reconnect ever happens, and the replacement connection would find nothing
+    /// owed and skip the sync pairing exists to request.
+    ///
+    /// One past the current generation is the bound that says what is meant:
+    /// nothing already in flight can clear this, and the next connection — the
+    /// one the forced 515 brings up — can.
+    pub(crate) fn arm_for_pairing(&self, current_generation: u64) {
+        self.0.store(
+            Self::encode(current_generation.saturating_add(1), true),
+            Ordering::Release,
+        );
     }
 
     /// Record `outstanding` on behalf of `generation`, unless a newer connection
@@ -4039,19 +4050,34 @@ mod bootstrap_gate_tests {
         assert!(gate.is_armed());
     }
 
-    /// Pairing has no connection to speak for, and a fresh pairing owes a
-    /// bootstrap no matter what any live connection last concluded.
+    /// A fresh pairing owes a bootstrap whatever the live connection concluded,
+    /// and only the connection that comes *after* it may say otherwise.
+    ///
+    /// Both halves have been wrong here. Arming above every generation left the
+    /// gate unclearable and re-ran the 180s critical bootstrap on every connect
+    /// forever; arming at zero let a scope already in flight on the pairing
+    /// connection clear it before the forced reconnect, so the connection that
+    /// was supposed to run the sync found nothing owed.
     #[test]
-    fn pairing_arms_over_any_connection() {
+    fn pairing_arms_over_live_connections_but_not_the_next_one() {
         let gate = BootstrapGate::new(false);
         assert!(gate.settle(9, false));
         assert!(!gate.is_armed());
 
-        gate.arm_for_pairing();
+        // `pair-success` arrives while connection 9 is live.
+        gate.arm_for_pairing(9);
         assert!(gate.is_armed());
+
         assert!(
-            gate.settle(9, false),
-            "and the connection that runs the bootstrap it asked for can clear it"
+            !gate.settle(9, false),
+            "a bootstrap already in flight on the pairing connection must not \
+             answer for the sync pairing just asked for"
+        );
+        assert!(gate.is_armed(), "so the arm survives it");
+
+        assert!(
+            gate.settle(10, false),
+            "and the connection the forced 515 brings up can clear it"
         );
         assert!(
             !gate.is_armed(),
@@ -4415,21 +4441,29 @@ mod sync_outcome_tests {
         let client = reachable_client("verdict-order").await;
 
         // A conflict or 516: both flags set together, and the socket not yet
-        // torn down. `signal_shutdown_sync()` would not reproduce this — it also
-        // clears `is_running`, which makes the client unreachable by a second
-        // route and so proves nothing about the ordering.
+        // torn down. This used to be a window where `is_terminal()` and
+        // `can_reach_server()` were both true, which is why the verdict checks
+        // terminal first.
         client.enable_auto_reconnect.store(false, Ordering::Relaxed);
         client.expected_disconnect.store(true, Ordering::Relaxed);
 
+        assert!(client.is_terminal());
+        assert_eq!(client.connection_wait_verdict(), Some(false));
+
+        // The window is now closed at the source rather than ordered around:
+        // `can_reach_server()` rejects a socket marked for retirement, and every
+        // route into `is_terminal()` marks one — `expected_disconnect` here,
+        // `is_running` cleared by shutdown, a dead socket for the run loop's
+        // exit. The ordering stays as belt and braces; this is what makes it
+        // moot, and what fails if the retirement check is dropped.
         assert!(
-            client.is_terminal() && client.can_reach_server(),
-            "both true at once is the window this orders around"
+            !client.can_reach_server(),
+            "a finished client is never a reachable one"
         );
-        assert_eq!(
-            client.connection_wait_verdict(),
-            Some(false),
-            "terminal has to win, whatever the socket still says"
-        );
+
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.signal_shutdown_sync();
+        assert!(client.is_terminal() && !client.can_reach_server());
     }
 
     /// `<success>` sets `is_logged_in` one step before it increments the
@@ -4595,6 +4629,54 @@ mod reconnect_wake_tests {
                 .await
                 .expect("the replacement connection must end the wait")
                 .expect("the waiter should not panic")
+        );
+    }
+}
+
+#[cfg(test)]
+mod retiring_socket_tests {
+    use super::*;
+
+    /// A socket already marked for retirement is not one work can be sent on.
+    ///
+    /// `reconnect_immediately()` sets `expected_disconnect` before its bounded
+    /// flushes and closes the transport only afterwards. Every other signal
+    /// still reads healthy through that window — socket up, session
+    /// authenticated, generation final — so a wait released there hands its IQ
+    /// to a connection the run loop has already decided to retire. The server
+    /// answers, `handle_success` on the replacement retires the scope, the
+    /// answer is dropped and the attempt is charged anyway.
+    #[tokio::test]
+    async fn a_socket_marked_for_reconnect_cannot_carry_work() {
+        let client = crate::test_utils::create_test_client_with_name("retiring").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "healthy to begin with");
+
+        // The first thing `reconnect_immediately()` does, before any teardown.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        assert!(
+            client.is_connected() && client.is_logged_in(),
+            "and every other signal still says the socket is fine"
+        );
+        assert!(
+            !client.can_reach_server(),
+            "but it is going away, so nothing sent on it comes back"
+        );
+        assert!(
+            !client.is_terminal(),
+            "which is not the same as the client being finished"
+        );
+        assert_eq!(
+            client.connection_wait_verdict(),
+            None,
+            "so the wait carries on to the replacement"
         );
     }
 }
