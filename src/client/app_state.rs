@@ -323,17 +323,30 @@ pub(crate) struct BatchedSyncOutcome {
     pub(crate) retryable: Vec<WAPatchName>,
     /// Another holder had it reserved, so this call did nothing for it.
     pub(crate) skipped: Vec<WAPatchName>,
+    /// Whether a collection IQ actually went out.
+    ///
+    /// Recorded at the send, not inferred from the buckets above. Inferring it
+    /// was wrong in a way that is worth keeping written down: `retryable` looks
+    /// like it means "the server was asked and the answer was retryable", and it
+    /// does hold those — but it also holds the collections a scope loss or a
+    /// reservation timeout dropped *before* the wire. A batch of nothing but
+    /// those reads as a real attempt under any bucket-based test.
+    reached_server: bool,
 }
 
 impl BatchedSyncOutcome {
     /// Whether this call got as far as asking the server about anything.
     ///
-    /// False when every collection was held by another writer: nothing was
-    /// reserved, no IQ went out, and the call learned nothing. A retry that
-    /// charges an attempt for that spends its budget on the holder's patch
-    /// send — waiting again, dressed as trying.
+    /// A round that reserved nothing sent no IQ and learned nothing. A retry
+    /// that charges an attempt for it spends its budget on whoever is holding
+    /// the collection — waiting again, dressed as trying.
     pub(crate) fn reached_server(&self) -> bool {
-        !self.synced.is_empty() || !self.fatal.is_empty() || !self.retryable.is_empty()
+        self.reached_server
+    }
+
+    /// Record that a collection IQ went out. The single place that decides it.
+    fn note_reached_server(&mut self) {
+        self.reached_server = true;
     }
 
     /// Every collection this call did not leave synced, whatever the reason.
@@ -1629,6 +1642,10 @@ impl Client {
                 timeout: Some(Duration::from_secs(30)),
             };
 
+            // Before the await, not after: the send is what spends an attempt,
+            // and an IQ that errors or times out spent one just as much as one
+            // that answered.
+            outcome.note_reached_server();
             let resp = self.send_iq(iq).await?;
 
             // The IQ can outrun the scope, so the round is re-admitted before
@@ -4760,51 +4777,55 @@ mod retiring_socket_tests {
 mod batched_attempt_tests {
     use super::*;
 
-    /// A batch that reserved nothing never asked the server anything, and must
-    /// not spend an attempt.
+    /// Only a round that sent a collection IQ may spend an attempt.
     ///
-    /// The batched retry charged before the call, so eight rounds against a
-    /// collection another writer was holding — a long patch send — exhausted
-    /// the budget without a single IQ, and dropped a dirty-bit or server-sync
-    /// trigger the server already considers handled. The task retry never had
-    /// this: its `ReservationSkip::WaitTimedOut` arm continues without
-    /// charging. The two loops now agree.
+    /// The first version of this asked the outcome buckets — "anything in
+    /// `synced`, `fatal` or `retryable` means the wire was reached" — and that
+    /// is false. `retryable` also collects the collections a scope loss or a
+    /// `ReservationSkip::WaitTimedOut` dropped *before* the send, and the
+    /// timeout is exactly the case this predicate exists for: a long patch send
+    /// holding the collection. The bucket test called that a real attempt and
+    /// burned the budget anyway.
+    ///
+    /// So the flag is recorded at the send and nowhere else. Buckets describe
+    /// what happened to each collection; only the send knows whether anything
+    /// was asked.
     #[test]
-    fn a_batch_that_only_waited_did_not_reach_the_server() {
-        let held = BatchedSyncOutcome {
-            skipped: vec![WAPatchName::Regular, WAPatchName::RegularHigh],
+    fn only_a_sent_iq_counts_as_reaching_the_server() {
+        // What a batch whose every reservation timed out looks like. Under the
+        // bucket test this said true.
+        let timed_out = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular, WAPatchName::RegularHigh],
             ..Default::default()
         };
         assert!(
-            !held.reached_server(),
-            "every collection was held by another writer, so no IQ went out"
+            !timed_out.reached_server(),
+            "a reservation timeout never reached the wire, whatever bucket it lands in"
         );
 
-        // Any one of the three says an IQ was sent and answered.
-        for outcome in [
-            BatchedSyncOutcome {
-                synced: vec![WAPatchName::Regular],
-                skipped: vec![WAPatchName::RegularHigh],
-                ..Default::default()
-            },
-            BatchedSyncOutcome {
-                retryable: vec![WAPatchName::Regular],
-                ..Default::default()
-            },
-            BatchedSyncOutcome {
-                fatal: vec![WAPatchName::Regular],
-                ..Default::default()
-            },
-        ] {
-            assert!(
-                outcome.reached_server(),
-                "reserving even one collection means the round was really tried"
-            );
-        }
+        // Nor does a scope lost before reserving, which lands in the same one.
+        let scope_lost = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        assert!(!scope_lost.reached_server());
 
-        assert!(
-            !BatchedSyncOutcome::default().reached_server(),
-            "and an empty request asked nothing"
-        );
+        // And an equivalent sync holding it, which lands in `skipped`.
+        let held = BatchedSyncOutcome {
+            skipped: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        assert!(!held.reached_server());
+        assert!(!BatchedSyncOutcome::default().reached_server());
+
+        // The send is the only thing that sets it, and it survives whatever the
+        // response turns out to be — including an error, which spent the
+        // attempt just as much as an answer did.
+        let mut sent = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        sent.note_reached_server();
+        assert!(sent.reached_server());
     }
 }
