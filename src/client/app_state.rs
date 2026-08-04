@@ -502,8 +502,7 @@ impl Client {
     }
 
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
-    /// Matches WA Web's `serverSync()` outer loop (`3JJWKHeu5-P.js:54278-54305`).
-    /// Max 5 iterations (WA Web's `C=5` constant).
+    /// Mirrors WA Web's `serverSync()` outer loop (`WAWebSyncdServerSync`).
     ///
     /// `key_wait_deadline` bounds how long a missing app-state decode key may be
     /// awaited. The initial critical bootstrap passes the shared 180s critical-sync
@@ -550,6 +549,14 @@ impl Client {
         key_wait_deadline: Option<wacore::time::Instant>,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
+        // Not WA Web's number, despite the shape being the same: its outer loop
+        // bounds at `C = 500`, and the `y = 5` sitting beside it never bites
+        // because the `||` between them keeps 500 the only real limit.
+        // Exhausting it there marks the collections retryable and hands them to
+        // a backoff state machine rather than giving up. We have neither that
+        // state nor the spacing, so raising this on its own would only buy up to
+        // 500 back-to-back IQ rounds; the cap and the backoff belong in one
+        // change.
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
 
