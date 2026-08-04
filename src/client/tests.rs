@@ -4705,3 +4705,44 @@ fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
         "the sweep must never touch IQ waiters, which have their own cleanup"
     );
 }
+
+/// A non-reconnectable connect failure must be terminal by the time it is
+/// announced.
+///
+/// `handle_connect_failure` announces the teardown, and that announcement is
+/// what wakes work parked in `await_connection`. The work answers by reading
+/// the state, so announcing before the classification offers it a client that
+/// has not yet decided — and the decision that follows makes no sound of its
+/// own. Later notifications do exist, from `cleanup_connection_state` and the
+/// run loop's exit, but a wait with no duration bound must not be left
+/// depending on another loop reaching them.
+#[tokio::test]
+async fn a_terminal_connect_failure_releases_a_parked_wait() {
+    let client = create_offline_sync_test_client().await;
+    client.is_running.store(true, Ordering::Relaxed);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.await_connection().await })
+    };
+    crate::test_utils::poll_until("the waiter to park on the notifier", || {
+        client.session_state_notifier.total_listeners() >= 1
+    })
+    .await;
+
+    // 403 is REASON_LOCKED: not transient, so no replacement is coming.
+    let failure = NodeBuilder::new("failure").attr("reason", "403").build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    assert!(
+        client.is_terminal(),
+        "the failure decided the session is over"
+    );
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("and the wait must end on that decision")
+            .expect("the waiter should not panic"),
+        "reporting that no connection arrived"
+    );
+}

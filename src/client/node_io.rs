@@ -1898,7 +1898,6 @@ impl Client {
     )]
     pub(crate) async fn handle_connect_failure(&self, node: &wacore_binary::NodeRef<'_>) {
         self.expected_disconnect.store(true, Ordering::Relaxed);
-        self.notify_connection_shutdown();
 
         let failure = wacore::stanza::connect_failure::ConnectFailureStanza::parse(node);
         // A `<failure>` with no usable `reason` is not a failure we can classify:
@@ -1912,6 +1911,13 @@ impl Client {
         } else {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
         }
+        // Announced after the classification, not before it. This notify is what
+        // wakes work parked in `await_connection`, and that work answers by
+        // reading the state — so announcing first offers it the state of a
+        // client that has not yet decided, and the decision that follows makes
+        // no sound of its own. Nothing awaits between the stores and here, so
+        // the pair is what a waiter observes.
+        self.notify_connection_shutdown();
 
         // Every branch below keeps the stanza on its event. The server states
         // things here exactly once — an account lock's one-time `appeal_token`,
