@@ -1341,6 +1341,10 @@ impl Client {
                 // reconnect and the two would loop for good. So they ride along
                 // with the background sync instead of being dropped.
                 let mut critical_retry: Vec<WAPatchName> = Vec::new();
+                // Whether a critical collection was refused outright. Terminal,
+                // so it is not retried, but it still means the bootstrap never
+                // finished.
+                let mut critical_refused = false;
                 let critical_scope = client_clone.sync_scope(Some(critical_deadline));
                 match client_clone
                     .sync_collections_batched(
@@ -1385,11 +1389,25 @@ impl Client {
                     // name, so presence stays unavailable until it arrives.
                     Ok(outcome) if !outcome.fatal.is_empty() => {
                         critical_sync_timeout_handle.abort();
+                        // Armed first, before anything a consumer handler can
+                        // interrupt. A refusal means the bootstrap is unfinished
+                        // whatever happens next, and everything below —
+                        // resubscribe, `Connected`, the failure event — can
+                        // retire this generation and take the decision with it,
+                        // leaving the flag false with the push name already
+                        // populated so the replacement skips what it still owes.
+                        client_clone.settle_bootstrap(critical_scope, true);
                         // A refusal does not make the batch's other misses
                         // terminal, and leaving them to the watchdog is not an
                         // option once we connect. Retry them below instead.
                         critical_retry
                             .extend(outcome.retryable.iter().chain(&outcome.skipped).copied());
+                        // The refusal is not in `critical_retry` — retrying it
+                        // is pointless — but the bootstrap is still unfinished
+                        // because of it. Without carrying that, a clean
+                        // background run would stand the gate down for a
+                        // collection that never synced.
+                        critical_refused = true;
                         warn!(
                             target: "Client/AppState",
                             "Critical app state sync refused for {:?}; connecting without it (retrying {:?})",
@@ -1412,15 +1430,6 @@ impl Client {
                         // two dispatches — long enough to hand the next session
                         // a refusal it never earned.
                         check_generation!();
-                        // Armed before the event, not after. Publishing runs
-                        // consumer handlers synchronously, and one that forces a
-                        // reconnect would retire the background task that
-                        // settles this — leaving the flag false while the
-                        // critical sync has already populated the push name, so
-                        // the replacement takes the ordinary path and skips the
-                        // bootstrap it still owes. The background task settles
-                        // it properly once it knows the whole picture.
-                        client_clone.settle_bootstrap(critical_scope, true);
                         client_clone.dispatch_app_state_sync_failed(
                             &outcome,
                             client_clone.is_ready.load(Ordering::Relaxed),
@@ -1492,7 +1501,8 @@ impl Client {
                     let scope = sync_client.sync_scope(None);
                     let result = sync_client.sync_collections_batched(to_sync, scope).await;
 
-                    let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
+                    let complete = !critical_refused
+                        && result.as_ref().is_ok_and(|outcome| outcome.all_synced());
 
                     // Settled before the report, because reporting dispatches to
                     // consumer handlers synchronously and one of them

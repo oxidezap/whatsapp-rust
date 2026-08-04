@@ -143,6 +143,20 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                             let result = client_clone
                                 .sync_collections_batched(requested.clone(), scope)
                                 .await;
+                            // Rebound again after the batch. The scope was
+                            // pinned before it, so a reconnect during the sync
+                            // would have `report_background_sync` discard the
+                            // outcome — and with it the retry — for collections
+                            // whose dirty bit the server already considers
+                            // clean. Reporting against the live connection keeps
+                            // the retry, and the outcome describes the
+                            // collections either way.
+                            let mut scope = scope;
+                            scope.rebind(
+                                client_clone
+                                    .connection_generation
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                            );
                             if !client_clone.is_shutting_down() {
                                 client_clone.report_background_sync(
                                     "app state re-sync after dirty notification",

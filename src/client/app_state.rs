@@ -1446,20 +1446,15 @@ impl Client {
                 let name = list.name;
                 answered.insert(name);
 
-                // Applying is one boundary, dispatching and persisting is
-                // another: `process_one_patch_list` awaits, so the scope can
-                // have been lost between the collection being decoded and its
-                // mutations reaching consumers or its version reaching the
-                // store. Everything decoded so far is already persisted by its
-                // own call, so stopping here leaves a consistent prefix.
-                if let Err(lost) = self.admits(scope) {
-                    warn!(
-                        target: "Client/AppState",
-                        "Batched sync: not dispatching {name:?} ({lost:?})"
-                    );
-                    outcome.retryable.push(name);
-                    continue;
-                }
+                // No admission check here, deliberately. `process_one_patch_list`
+                // persists the collection's version and mutation MACs before it
+                // returns, so by this point the cursor has already moved. A
+                // collection dropped here would never be re-sent — the retry
+                // asks from the advanced version — and its mutations would be
+                // lost for good, `setting_pushName` and the NCT salt included.
+                // The scope is checked before the apply, which is the last
+                // moment a collection can still be declined; after it,
+                // dispatching is not optional.
 
                 // Handle per-collection errors
                 if let Some(ref err) = list.error {
@@ -3673,5 +3668,48 @@ mod task_retry_tests {
             !client.is_shutting_down(),
             "and the hold lifts once the reconnect settles"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_boundary_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::sync_against;
+
+    /// `process_one_patch_list` persists the version and mutation MACs before it
+    /// returns, so once a collection is applied its cursor has moved and the
+    /// server will not send those mutations again. Declining it after that point
+    /// loses them for good — `setting_pushName` and the NCT salt included — so
+    /// the admission check has to sit before the apply, and dispatching after it
+    /// is not optional.
+    ///
+    /// Asserted as the property that matters: a collection the batch applied is
+    /// reported synced, never retryable, because "retry" cannot recover it.
+    ///
+    /// This pins the invariant, not the race that violated it. Reproducing that
+    /// needs the scope to be lost between two collections' applies, and the only
+    /// hook for it would be inside the loop; a scope retired any earlier is
+    /// caught by the pre-apply check and nothing is applied at all.
+    #[tokio::test]
+    async fn an_applied_collection_is_never_reported_retryable() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[
+                ("critical_block", None),
+                ("critical_unblock_low", Some("500")),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.synced,
+            vec![WAPatchName::CriticalBlock],
+            "an applied collection is synced"
+        );
+        assert!(
+            !outcome.retryable.contains(&WAPatchName::CriticalBlock),
+            "and must never also be queued for a retry that cannot re-fetch it"
+        );
+        assert_eq!(outcome.retryable, vec![WAPatchName::CriticalUnblockLow]);
     }
 }
