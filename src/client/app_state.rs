@@ -909,6 +909,17 @@ impl Client {
                 // planned reconnect must not be what loses it.
                 scope.rebind(client.connection_generation.load(Ordering::SeqCst));
 
+                // Wait the planned reconnect out rather than spending an attempt
+                // on it. `process_app_state_sync_task` answers `Ok(())` at its
+                // own shutdown guard without contacting the server, and
+                // `expected_disconnect` makes that guard true for a reconnect as
+                // well as a stop — so attempting here would read a no-op as a
+                // completed sync and drop the request for good.
+                if client.is_shutting_down() {
+                    debug!(target: "Client/AppState", "Holding the {name:?} retry: a reconnect is in flight");
+                    continue;
+                }
+
                 let guard = match client
                     .reserve_for_sync(name, ReservationWait::Always, scope)
                     .await
@@ -3558,6 +3569,49 @@ mod sync_scope_tests {
             client
                 .sync_scope(Some(wacore::time::Instant::now()))
                 .is_bootstrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_retry_tests {
+    use super::*;
+
+    /// `process_app_state_sync_task` answers `Ok(())` at its own shutdown guard
+    /// without contacting the server, and `expected_disconnect` makes that guard
+    /// true for an ordinary reconnect as well as a stop. A retry that attempted
+    /// there would read the no-op as a completed sync and drop the consumer's
+    /// request — a `full_sync` snapshot included — without ever asking for it.
+    #[tokio::test]
+    async fn a_planned_reconnect_is_not_a_completed_sync() {
+        let client = crate::test_utils::create_test_client_with_name("task-retry-reconnect").await;
+
+        // A live client with a planned reconnect in flight: the run loop is up,
+        // and only `expected_disconnect` is set. This is the state
+        // `reconnect_immediately()` leaves behind, and the one the retry loop
+        // used to walk straight through.
+        client.is_running.store(true, Ordering::Relaxed);
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_running.load(Ordering::Relaxed),
+            "the retry loop's own guard still admits this state"
+        );
+        assert!(
+            client.is_shutting_down(),
+            "but it does make the callee's shutdown guard true"
+        );
+        assert!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .await
+                .is_ok(),
+            "the callee reports Ok without doing anything, which is the trap"
+        );
+
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        assert!(
+            !client.is_shutting_down(),
+            "and the hold lifts once the reconnect settles"
         );
     }
 }
