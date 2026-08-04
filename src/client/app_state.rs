@@ -18,13 +18,16 @@ const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
 /// How long a sync waits for another writer to release a collection.
 ///
-/// This is a backstop against a leaked reservation, not a limit on how long a
-/// send may take, so it has to sit above what a healthy patch send can spend:
-/// [`APP_STATE_PATCH_SEND_ATTEMPTS`] attempts, each bounded by
-/// [`DEFAULT_IQ_TIMEOUT`], plus room for the re-syncs between them. Cutting in
-/// below that would abandon syncs that were about to get their turn. It exists
-/// at all because the sync worker's intake loop runs non-history tasks inline,
-/// so a reservation that never releases would stall everything queued behind it.
+/// A holder's honest worst case is not derivable: a patch send keeps the
+/// reservation across `fetch_app_state_with_retry_inner`, which may page up to
+/// `MAX_PAGINATION_ITERATIONS` IQs, so any bound short enough to be useful can
+/// expire on healthy work. What makes the bound safe is not its size but that
+/// running out is never lossy — the collection comes back `retryable` and the
+/// retry scheduler picks it up. This value covers the common case
+/// ([`APP_STATE_PATCH_SEND_ATTEMPTS`] attempts of [`DEFAULT_IQ_TIMEOUT`], plus
+/// one) so the scheduler is the exception rather than the rule. The bound exists
+/// because the sync worker's intake loop runs non-history tasks inline, so a
+/// reservation that never releases would stall everything queued behind it.
 const APP_STATE_RESERVATION_WAIT: Duration =
     Duration::from_secs(DEFAULT_IQ_TIMEOUT.as_secs() * (APP_STATE_PATCH_SEND_ATTEMPTS as u64 + 1));
 /// Spacing between re-syncs of a collection a run left retryable, mirroring the
@@ -555,8 +558,16 @@ impl Client {
                 // fetching what it asked for.
                 let _guard = match self.reserve_for_sync(name, ReservationWait::Always).await {
                     Ok(guard) => guard,
-                    Err(skip) => {
-                        debug!(target: "Client/AppState", "Skipping app state sync task {name:?}: {skip:?}");
+                    Err(ReservationSkip::EquivalentSyncInFlight) => {
+                        debug!(target: "Client/AppState", "Skipping app state sync task {name:?}: an equivalent sync holds it");
+                        return;
+                    }
+                    // The bound ran out, so nobody is covering this collection
+                    // and the consumer asked for it. Hand it to the retry
+                    // scheduler rather than dropping the request.
+                    Err(ReservationSkip::WaitTimedOut) => {
+                        warn!(target: "Client/AppState", "Gave up waiting to sync {name:?}; scheduling a retry");
+                        self.schedule_app_state_retry(vec![name]);
                         return;
                     }
                 };
@@ -704,10 +715,26 @@ impl Client {
                     round + 1
                 );
                 match client.sync_collections_batched(pending.clone(), None).await {
-                    // Only the retryable ones come back around. A refusal is
-                    // terminal and a skip means another sync has it, so neither
-                    // is this loop's to chase.
                     Ok(outcome) => {
+                        // A round can turn a transient failure into a refusal,
+                        // and that is the outcome a consumer has to act on. It
+                        // would otherwise be dropped here, leaving them holding
+                        // only the earlier transient report. Re-check the
+                        // generation first: this awaited a round trip, and an
+                        // outcome from a retired socket must not reach a
+                        // consumer that would apply it to the live one.
+                        if client.connection_generation.load(Ordering::SeqCst) != generation {
+                            debug!(target: "Client/AppState", "App state retry outcome dropped: connection retired");
+                            return;
+                        }
+                        if !outcome.all_synced() {
+                            client.dispatch_app_state_sync_failed(
+                                &outcome,
+                                client.is_ready.load(Ordering::Relaxed),
+                            );
+                        }
+                        // Only the retryable ones come back around: a refusal is
+                        // terminal and a skip means another sync has it.
                         pending = outcome.retryable;
                         if pending.is_empty() {
                             return;
@@ -901,6 +928,27 @@ impl Client {
             let mut patch_lists =
                 wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
 
+            // Drop a repeated collection before anything is applied. The
+            // processor persists each list it is handed — mutation MACs and the
+            // version — so two entries for one collection would be applied
+            // twice, and the second could advance the MAC store past the version
+            // the first then writes back, leaving the ltHash disagreeing with
+            // the MACs. Checking after the fact only fixes the bookkeeping.
+            {
+                let mut seen: HashSet<WAPatchName> = HashSet::new();
+                patch_lists.retain(|pl| {
+                    if seen.insert(pl.name) {
+                        return true;
+                    }
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: response repeated collection {:?}; dropping the duplicate",
+                        pl.name
+                    );
+                    false
+                });
+            }
+
             let proc = self.get_app_state_processor().await;
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
@@ -964,17 +1012,13 @@ impl Client {
             // fine, so without this the collection lands in no bucket at all and
             // `all_synced()` reports a batch that never covered it. Track what
             // the response actually accounted for and reconcile below.
+            // Duplicates are already gone, dropped above before anything applied
+            // them.
             let mut answered: HashSet<WAPatchName> = HashSet::new();
 
             for (mutations, new_state, list) in results {
                 let name = list.name;
-                if !answered.insert(name) {
-                    warn!(
-                        target: "Client/AppState",
-                        "Batched sync: response repeated collection {name:?}; ignoring the duplicate"
-                    );
-                    continue;
-                }
+                answered.insert(name);
 
                 // Handle per-collection errors
                 if let Some(ref err) = list.error {
@@ -2752,5 +2796,50 @@ mod batched_sync_reconciliation_tests {
             collection.attrs().optional_string("type").as_deref(),
             Some("error")
         );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_collection_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::sync_against;
+
+    /// The processor persists every list it is handed, so a repeated collection
+    /// has to be dropped before it is processed, not reconciled afterwards.
+    /// Reconciling late still applies the collection twice, and the second
+    /// application can move the MAC store past the version the first writes
+    /// back.
+    #[tokio::test]
+    async fn a_duplicate_collection_is_dropped_before_it_is_applied() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular],
+            &[("regular", None), ("regular", None)],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.synced,
+            vec![WAPatchName::Regular],
+            "the collection is accounted for exactly once"
+        );
+        assert!(outcome.all_synced());
+    }
+
+    /// A duplicate must not make the batch look incomplete either: it is the
+    /// same collection, already answered.
+    #[tokio::test]
+    async fn a_duplicate_does_not_leave_the_batch_unsynced() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[
+                ("critical_block", None),
+                ("critical_block", None),
+                ("critical_unblock_low", None),
+            ],
+        )
+        .await;
+
+        assert!(outcome.retryable.is_empty(), "both were answered");
+        assert!(outcome.all_synced());
     }
 }

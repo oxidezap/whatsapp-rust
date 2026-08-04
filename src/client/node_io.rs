@@ -1394,19 +1394,23 @@ impl Client {
                             "Critical app state sync refused for {:?}; connecting without it (retrying {:?})",
                             outcome.fatal, critical_retry
                         );
-                        // Before publishing, not after: a consumer acting on a
-                        // fatal report may log out or force a recovery, and this
-                        // outcome belongs to a socket that may already have been
-                        // replaced. Applying it to the live session would be
-                        // worse than losing the report.
                         check_generation!();
-                        client_clone.dispatch_app_state_sync_failed(&outcome, true);
-
                         client_clone
                             .resubscribe_presence_subscriptions(task_generation)
                             .await;
                         check_generation!();
                         client_clone.dispatch_connected(task_generation).await;
+                        // After the readiness transition, not before: the report
+                        // claims the session is usable, and until `Connected` is
+                        // actually published that claim can still be falsified by
+                        // a disconnect during the resubscribe above. The
+                        // generation checks on the way here also keep a retired
+                        // socket's refusal from reaching a consumer who would
+                        // apply its logout policy to the live one.
+                        client_clone.dispatch_app_state_sync_failed(
+                            &outcome,
+                            client_clone.is_ready.load(Ordering::Relaxed),
+                        );
                     }
                     // Nothing terminal: a retryable error, a decode key that
                     // never landed, or a collection held by another writer. The
@@ -1454,12 +1458,33 @@ impl Client {
                         WAPatchName::Regular,
                     ]);
                     let result = sync_client.sync_collections_batched(to_sync, None).await;
+
+                    // Re-checked after the round trip, not just before it: this
+                    // publishes an event and schedules retries, and both would
+                    // otherwise be attributed to whatever socket is live now.
+                    if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
+                        debug!("App state sync outcome dropped: connection generation changed");
+                        return;
+                    }
+
+                    let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
                     sync_client.report_background_sync("non-critical app state sync", result);
 
-                    sync_client
-                        .needs_initial_full_sync
-                        .store(false, Ordering::Relaxed);
-                    debug!(target: "Client/AppState", "Initial App State Sync Completed.");
+                    // Only stand the bootstrap down once it actually delivered.
+                    // Clearing this after a partial run makes the next
+                    // connection skip the fresh-pairing path, and the retry that
+                    // would have covered the gap dies with this generation.
+                    if complete {
+                        sync_client
+                            .needs_initial_full_sync
+                            .store(false, Ordering::Relaxed);
+                        debug!(target: "Client/AppState", "Initial App State Sync Completed.");
+                    } else {
+                        warn!(
+                            target: "Client/AppState",
+                            "Initial App State Sync incomplete; keeping the bootstrap armed for the next connection"
+                        );
+                    }
                 }));
             } else {
                 // === Reconnection path ===

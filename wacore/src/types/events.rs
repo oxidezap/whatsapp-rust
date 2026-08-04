@@ -907,11 +907,6 @@ pub enum Event {
 
     PushNameUpdate(PushNameUpdate),
     SelfPushNameUpdated(SelfPushNameUpdated),
-
-    /// A batched app-state sync left one or more collections unsynced. See
-    /// [`AppStateSyncFailed`] for what each bucket means and when the client
-    /// connected anyway.
-    AppStateSyncFailed(AppStateSyncFailed),
     PinUpdate(PinUpdate),
     MuteUpdate(MuteUpdate),
     ArchiveUpdate(ArchiveUpdate),
@@ -976,6 +971,16 @@ pub enum Event {
     /// SHORTCAKE_PASSKEY: the passkey link failed. `continuation` distinguishes a
     /// failure during the continuation/verification stage from the initial request.
     PairPasskeyError(PairPasskeyError),
+
+    /// A batched app-state sync left one or more collections unsynced. See
+    /// [`AppStateSyncFailed`] for what each bucket means and when the client
+    /// connected anyway.
+    ///
+    /// Appended, not inserted: `Event` derives `Serialize`, and an index-based
+    /// format (bincode, postcard) keys variants by position, so slotting one in
+    /// beside its relatives would renumber every variant after it and change how
+    /// already-stored events decode.
+    AppStateSyncFailed(AppStateSyncFailed),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
