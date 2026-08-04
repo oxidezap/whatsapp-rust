@@ -79,23 +79,25 @@ impl Client {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
     }
 
-    /// Whether the client is going away for good, as opposed to between
+    /// Whether the client is finished for good, as opposed to being between
     /// connections.
     ///
-    /// [`is_shutting_down`](Self::is_shutting_down) answers both at once, and
-    /// that conflation is a trap for anything that outlives a connection: a
-    /// planned reconnect makes it true, so work that treats it as "stop" throws
-    /// itself away instead of waiting for the replacement. Callers that must
-    /// survive a reconnect want this; callers that must not touch the socket
-    /// right now want `is_shutting_down`.
-    pub(crate) fn is_stopping(&self) -> bool {
-        !self.is_running.load(Ordering::Relaxed)
-    }
-
-    /// Whether a planned reconnect is in flight: the client is staying, but the
-    /// socket is not usable and anything sent now is a no-op.
-    pub(crate) fn is_reconnecting(&self) -> bool {
-        self.expected_disconnect.load(Ordering::Relaxed) && !self.is_stopping()
+    /// [`is_shutting_down`](Self::is_shutting_down) answers both at once, which
+    /// is a trap for work that outlives a connection: a planned reconnect makes
+    /// it true, so anything reading it as "stop" throws itself away instead of
+    /// waiting for the replacement.
+    ///
+    /// Built from the two signals that actually mean *terminal*. The shutdown
+    /// notifier is deliberately left untouched by reconnects, and
+    /// `enable_auto_reconnect` going false is how logout and an unrecoverable
+    /// stream error say the supervision loop is about to end — it is cleared
+    /// before `is_running`, so reading that instead would miss the window.
+    ///
+    /// Not `is_running`: that tracks whether `run()`'s supervision loop is
+    /// active, which a direct-connect client never starts, so a healthy one
+    /// would look permanently stopped.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.shutdown_signal().is_fired() || !self.enable_auto_reconnect.load(Ordering::Relaxed)
     }
 
     /// Returns `true` when the client has completed its full startup:

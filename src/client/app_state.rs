@@ -41,6 +41,11 @@ const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// this is what a single connection can promise, and the doubling already puts
 /// the last wait minutes out.
 const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
+/// How many extra rounds the loop may burn on waiting — for a socket, or for a
+/// writer to release a collection — before the attempt budget is spent. The
+/// reconnect backoff alone reaches minutes, well past the sum of the delays
+/// below, so a wait has to be able to outlast several of them.
+const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
 
 /// Delay before retry `round` (zero-based), doubling from
 /// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
@@ -141,11 +146,17 @@ impl BootstrapGate {
         self.0.load(Ordering::Acquire) & 1 == 1
     }
 
-    /// Arm unconditionally, for pairing: there is no scope yet, and a fresh
-    /// pairing owes a bootstrap no matter what any connection thinks.
+    /// Arm for a fresh pairing, which happens before any connection exists.
+    ///
+    /// Tagged with generation zero on purpose, matching the contract on
+    /// [`Self::new`]. Pairing has to outrank whatever a previous session
+    /// concluded, but it must not outrank the connection that is about to run
+    /// the bootstrap it is asking for. Tagging it above every real generation
+    /// made the gate unclearable: a freshly paired client would re-run the 180s
+    /// critical bootstrap on every connect for the life of the session, however
+    /// many times that bootstrap succeeded.
     pub(crate) fn arm_for_pairing(&self) {
-        self.0
-            .store(Self::encode(u64::MAX >> 1, true), Ordering::Release);
+        self.0.store(Self::encode(0, true), Ordering::Release);
     }
 
     /// Record `outstanding` on behalf of `generation`, unless a newer connection
@@ -1000,13 +1011,13 @@ impl Client {
             // long-lived holder burn the budget without the sync being tried
             // once. Rounds still bound the loop overall.
             let mut attempts = 0u32;
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * 2 {
+            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
-                if client.is_stopping() {
-                    debug!(target: "Client/AppState", "App state task retry cancelled: client stopped");
+                if client.is_terminal() {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
                     return;
                 }
                 // Rebound, not discarded: nothing on the replacement connection
@@ -1021,8 +1032,12 @@ impl Client {
                 // `expected_disconnect` makes that guard true for a reconnect as
                 // well as a stop — so attempting here would read a no-op as a
                 // completed sync and drop the request for good.
-                if client.is_reconnecting() {
-                    debug!(target: "Client/AppState", "Holding the {name:?} retry: a reconnect is in flight");
+                // Held on the socket being usable rather than on any particular
+                // reason it is not. `reconnect()` tears down without setting
+                // `expected_disconnect`, so asking about the reason misses the
+                // ordinary case; asking whether there is a connection does not.
+                if !client.is_connected() {
+                    debug!(target: "Client/AppState", "Holding the {name:?} retry: no connection");
                     continue;
                 }
 
@@ -1112,16 +1127,29 @@ impl Client {
             // exactly what the next round carries, so counting them would keep
             // the gate armed forever after any transient round.
             let mut left_unresolved = already_stranded;
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
+            // Attempts and rounds are counted separately. A round spent waiting
+            // for a socket never reached the server, and the reconnect backoff
+            // runs far longer than these delays do, so charging it as an attempt
+            // would exhaust the budget before the replacement connection exists
+            // and drop a trigger that is already consumed.
+            let mut attempts = 0u32;
+            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
+                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
+                    break;
+                }
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
-                // Only an actual stop ends this. `is_shutting_down()` is also
-                // true for a planned reconnect, and giving up there would drop
-                // the collections for good: the trigger that asked for them is
-                // already consumed, and the reconnection path runs no bootstrap
-                // once the push name is known.
-                if client.is_stopping() {
-                    debug!(target: "Client/AppState", "App state retry cancelled: client stopped");
+                // Only a terminal state ends this. A planned reconnect must not:
+                // the trigger that asked for these collections is already
+                // consumed, and the reconnection path runs no bootstrap once the
+                // push name is known.
+                if client.is_terminal() {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client is finished");
                     return;
+                }
+                // Held on the socket, not on the reason there is not one.
+                if !client.is_connected() {
+                    debug!(target: "Client/AppState", "Holding the {pending:?} retry: no connection");
+                    continue;
                 }
                 if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
                     // The work carries over; the authority to settle does not.
@@ -1130,10 +1158,10 @@ impl Client {
                     settles = SyncSettles::JustTheCollections;
                 }
 
+                attempts += 1;
                 debug!(
                     target: "Client/AppState",
-                    "Retrying app state {pending:?} (round {}/{APP_STATE_RETRY_MAX_ROUNDS})",
-                    round + 1
+                    "Retrying app state {pending:?} (attempt {attempts}/{APP_STATE_RETRY_MAX_ROUNDS})"
                 );
                 let result = client
                     .sync_collections_batched(pending.clone(), scope)
@@ -1172,7 +1200,7 @@ impl Client {
             }
             warn!(
                 target: "Client/AppState",
-                "App state {pending:?} still unsynced after {APP_STATE_RETRY_MAX_ROUNDS} retries; \
+                "App state {pending:?} still unsynced after {attempts} attempts; \
                  leaving them to the next sync trigger"
             );
             // Consumers heard about every round that produced buckets, but a
@@ -3873,10 +3901,14 @@ mod bootstrap_gate_tests {
         gate.arm_for_pairing();
         assert!(gate.is_armed());
         assert!(
-            !gate.settle(9, false),
-            "and an ordinary connection cannot undo it"
+            gate.settle(9, false),
+            "and the connection that runs the bootstrap it asked for can clear it"
         );
-        assert!(gate.is_armed());
+        assert!(
+            !gate.is_armed(),
+            "a pairing that outranked every connection would never clear, and the \
+             client would re-run the critical bootstrap forever"
+        );
     }
 
     /// The flag survives the round trip through the tag, which is the only part
@@ -3887,5 +3919,47 @@ mod bootstrap_gate_tests {
         assert!(gate.is_armed());
         let gate = BootstrapGate::new(false);
         assert!(!gate.is_armed());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_signal_tests {
+    use super::*;
+
+    /// The predicate app-state retries end on. It has to mean "finished", not
+    /// "not currently connected": a planned reconnect, or a direct-connect
+    /// client that never starts the supervision loop, must not look terminal or
+    /// the retries throw away work nothing else will redo.
+    #[tokio::test]
+    async fn only_a_finished_client_looks_terminal() {
+        let client = crate::test_utils::create_test_client_with_name("lifecycle-terminal").await;
+
+        // A direct-connect client never runs the supervision loop. Reading
+        // `is_running` here would call a perfectly healthy client stopped.
+        assert!(
+            !client.is_running.load(Ordering::Relaxed),
+            "the fixture models a client that never called run()"
+        );
+        assert!(!client.is_terminal(), "which is not the same as finished");
+
+        // A planned reconnect is not the end either.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_shutting_down(),
+            "the old predicate cannot tell this apart"
+        );
+        assert!(!client.is_terminal(), "the new one can");
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+
+        // Logout and unrecoverable stream errors clear this before the
+        // supervision loop winds down, so it is the earliest honest signal.
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        assert!(client.is_terminal());
+        client.enable_auto_reconnect.store(true, Ordering::Relaxed);
+        assert!(!client.is_terminal());
+
+        // And an explicit shutdown, which reconnects deliberately leave alone.
+        client.signal_shutdown_sync();
+        assert!(client.is_terminal());
     }
 }
