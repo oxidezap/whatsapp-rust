@@ -200,11 +200,31 @@ impl BootstrapGate {
     /// One past the current generation is the bound that says what is meant:
     /// nothing already in flight can clear this, and the next connection — the
     /// one the forced 515 brings up — can.
+    ///
+    /// A floor rather than an assignment, because `current_generation` is a
+    /// sample and the tag is shared with [`Self::settle`]. An unconditional
+    /// store can lower a tag a newer connection already set — the one case where
+    /// arming would make the gate *easier* to clear — and it broke the rule
+    /// `settle_bootstrap` relies on, that the tag only ever moves forward. Both
+    /// writers now obey it.
     pub(crate) fn arm_for_pairing(&self, current_generation: u64) {
-        self.0.store(
-            Self::encode(current_generation.saturating_add(1), true),
-            Ordering::Release,
-        );
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            // One past *both*, not just past the sample. `settle` admits an
+            // equal generation — that is a connection revising its own answer,
+            // which it is entitled to do — so a tag merely level with an
+            // existing one still lets that connection clear the arm.
+            let generation = (current >> 1).max(current_generation).saturating_add(1);
+            match self.0.compare_exchange_weak(
+                current,
+                Self::encode(generation, true),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Record `outstanding` on behalf of `generation`, unless a newer connection
@@ -4084,6 +4104,30 @@ mod bootstrap_gate_tests {
             "a pairing that outranked every connection would never clear, and the \
              client would re-run the critical bootstrap forever"
         );
+    }
+
+    /// The arm is a floor, never an assignment.
+    ///
+    /// `current_generation` is a sample, and the tag is shared with `settle`. An
+    /// unconditional store could lower a tag a newer connection had already set,
+    /// which is the one way arming could make the gate *easier* to clear than it
+    /// was. It also broke the rule `settle_bootstrap` leans on — that the tag
+    /// only ever moves forward — for one of the two writers.
+    #[test]
+    fn pairing_never_lowers_the_gate() {
+        let gate = BootstrapGate::new(false);
+        assert!(gate.settle(20, false));
+
+        // A `pair-success` carrying a sample from well before that.
+        gate.arm_for_pairing(3);
+
+        assert!(gate.is_armed(), "pairing always owes a bootstrap");
+        assert!(
+            !gate.settle(20, false),
+            "and connection 20 still cannot answer for it"
+        );
+        assert!(gate.settle(21, false), "only something newer can");
+        assert!(!gate.is_armed());
     }
 
     /// The flag survives the round trip through the tag, which is the only part
