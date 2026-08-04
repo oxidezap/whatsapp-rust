@@ -326,6 +326,16 @@ pub(crate) struct BatchedSyncOutcome {
 }
 
 impl BatchedSyncOutcome {
+    /// Whether this call got as far as asking the server about anything.
+    ///
+    /// False when every collection was held by another writer: nothing was
+    /// reserved, no IQ went out, and the call learned nothing. A retry that
+    /// charges an attempt for that spends its budget on the holder's patch
+    /// send — waiting again, dressed as trying.
+    pub(crate) fn reached_server(&self) -> bool {
+        !self.synced.is_empty() || !self.fatal.is_empty() || !self.retryable.is_empty()
+    }
+
     /// Every collection this call did not leave synced, whatever the reason.
     pub(crate) fn unsynced(&self) -> impl Iterator<Item = WAPatchName> + '_ {
         self.fatal
@@ -1314,14 +1324,35 @@ impl Client {
                     settles = SyncSettles::JustTheCollections;
                 }
 
-                attempts += 1;
+                // The same guard the task retry makes, and for the same reason:
+                // the wait can resolve just as a planned reconnect begins, and
+                // the generation does not bump until cleanup. `admits(scope)` is
+                // fresh from the rebind above and would say yes to that retiring
+                // socket, so reachability is the question that catches it.
+                if !client.can_reach_server() {
+                    debug!(target: "Client/AppState", "Dropping the batched {pending:?} attempt: the connection is retiring");
+                    continue;
+                }
+
                 debug!(
                     target: "Client/AppState",
-                    "Retrying app state {pending:?} (attempt {attempts}/{APP_STATE_RETRY_MAX_ROUNDS})"
+                    "Retrying app state {pending:?} (attempt {}/{APP_STATE_RETRY_MAX_ROUNDS})",
+                    attempts + 1
                 );
                 let result = client
                     .sync_collections_batched(pending.clone(), scope)
                     .await;
+                // Charged after the call, for what reached the server. A round
+                // where every collection was held by another writer sent no IQ;
+                // eight of those in a row would otherwise spend the whole budget
+                // on someone else's patch send and drop a consumed trigger.
+                let reached_server = match &result {
+                    Ok(outcome) => outcome.reached_server(),
+                    Err(_) => true,
+                };
+                if reached_server {
+                    attempts += 1;
+                }
 
                 // Rebinding here drops the outcome, not the work: publishing a
                 // retired socket's refusal could have a consumer log out the
@@ -4721,6 +4752,59 @@ mod retiring_socket_tests {
             client.connection_wait_verdict(),
             None,
             "so the wait carries on to the replacement"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batched_attempt_tests {
+    use super::*;
+
+    /// A batch that reserved nothing never asked the server anything, and must
+    /// not spend an attempt.
+    ///
+    /// The batched retry charged before the call, so eight rounds against a
+    /// collection another writer was holding — a long patch send — exhausted
+    /// the budget without a single IQ, and dropped a dirty-bit or server-sync
+    /// trigger the server already considers handled. The task retry never had
+    /// this: its `ReservationSkip::WaitTimedOut` arm continues without
+    /// charging. The two loops now agree.
+    #[test]
+    fn a_batch_that_only_waited_did_not_reach_the_server() {
+        let held = BatchedSyncOutcome {
+            skipped: vec![WAPatchName::Regular, WAPatchName::RegularHigh],
+            ..Default::default()
+        };
+        assert!(
+            !held.reached_server(),
+            "every collection was held by another writer, so no IQ went out"
+        );
+
+        // Any one of the three says an IQ was sent and answered.
+        for outcome in [
+            BatchedSyncOutcome {
+                synced: vec![WAPatchName::Regular],
+                skipped: vec![WAPatchName::RegularHigh],
+                ..Default::default()
+            },
+            BatchedSyncOutcome {
+                retryable: vec![WAPatchName::Regular],
+                ..Default::default()
+            },
+            BatchedSyncOutcome {
+                fatal: vec![WAPatchName::Regular],
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                outcome.reached_server(),
+                "reserving even one collection means the round was really tried"
+            );
+        }
+
+        assert!(
+            !BatchedSyncOutcome::default().reached_server(),
+            "and an empty request asked nothing"
         );
     }
 }
