@@ -98,6 +98,7 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
                         client_clone.report_background_sync(
                             "app state sync from server_sync",
                             generation,
+                            crate::client::SyncSettles::JustTheCollections,
                             result,
                         );
                     }

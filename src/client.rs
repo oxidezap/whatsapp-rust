@@ -1,6 +1,7 @@
 mod accessors;
 mod adapters;
 mod app_state;
+pub(crate) use app_state::SyncSettles;
 mod builder;
 mod context_impl;
 mod device_registry;

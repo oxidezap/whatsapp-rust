@@ -1403,10 +1403,14 @@ impl Client {
                         // After the readiness transition, not before: the report
                         // claims the session is usable, and until `Connected` is
                         // actually published that claim can still be falsified by
-                        // a disconnect during the resubscribe above. The
-                        // generation checks on the way here also keep a retired
-                        // socket's refusal from reaching a consumer who would
-                        // apply its logout policy to the live one.
+                        // a disconnect during the resubscribe above.
+                        //
+                        // Re-checked once more here because publishing
+                        // `Connected` runs consumer handlers, and one of them
+                        // disconnecting would retire this generation between the
+                        // two dispatches — long enough to hand the next session
+                        // a refusal it never earned.
+                        check_generation!();
                         client_clone.dispatch_app_state_sync_failed(
                             &outcome,
                             client_clone.is_ready.load(Ordering::Relaxed),
@@ -1463,6 +1467,7 @@ impl Client {
                     sync_client.report_background_sync(
                         "non-critical app state sync",
                         sync_generation,
+                        SyncSettles::InitialSync,
                         result,
                     );
                     // The report drops a retired generation's outcome; the flag

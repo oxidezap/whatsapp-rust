@@ -65,6 +65,20 @@ pub(crate) enum ReservationSkip {
     WaitTimedOut,
 }
 
+/// What finishing a sync, or the retries it schedules, settles beyond the
+/// collections themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncSettles {
+    /// Only the collections. Every trigger except the initial bootstrap: a
+    /// `server_sync` or a dirty bit says nothing about whether the first full
+    /// sync ever finished.
+    JustTheCollections,
+    /// The initial bootstrap too. Its gate stays armed while anything it asked
+    /// for is still outstanding, so recovering the last of them — even rounds
+    /// later — is what stands it down.
+    InitialSync,
+}
+
 /// What a sync should do when the collection is already reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservationWait {
@@ -567,7 +581,7 @@ impl Client {
                     // scheduler rather than dropping the request.
                     Err(ReservationSkip::WaitTimedOut) => {
                         warn!(target: "Client/AppState", "Gave up waiting to sync {name:?}; scheduling a retry");
-                        self.schedule_app_state_retry(vec![name]);
+                        self.schedule_app_state_retry(vec![name], SyncSettles::JustTheCollections);
                         return;
                     }
                 };
@@ -665,6 +679,7 @@ impl Client {
         self: &Arc<Self>,
         label: &str,
         generation: u64,
+        settles: SyncSettles,
         result: Result<BatchedSyncOutcome>,
     ) {
         if self.connection_generation.load(Ordering::SeqCst) != generation {
@@ -683,7 +698,7 @@ impl Client {
                     &outcome,
                     self.is_ready.load(Ordering::Relaxed),
                 );
-                self.schedule_app_state_retry(outcome.retryable);
+                self.schedule_app_state_retry(outcome.retryable, settles);
             }
             Err(e) => self.log_sync_error(label, &e),
         }
@@ -701,7 +716,14 @@ impl Client {
     /// Bound to the connection it was scheduled on: a reconnect re-runs the
     /// bootstrap, which supersedes anything queued here, so a stale round must
     /// not fire against the new socket.
-    pub(crate) fn schedule_app_state_retry(self: &Arc<Self>, collections: Vec<WAPatchName>) {
+    ///
+    /// `settles` says what recovering these collections finishes; see
+    /// [`SyncSettles`].
+    pub(crate) fn schedule_app_state_retry(
+        self: &Arc<Self>,
+        collections: Vec<WAPatchName>,
+        settles: SyncSettles,
+    ) {
         if collections.is_empty() {
             return;
         }
@@ -748,6 +770,12 @@ impl Client {
                         // terminal and a skip means another sync has it.
                         pending = outcome.retryable;
                         if pending.is_empty() {
+                            if settles == SyncSettles::InitialSync {
+                                client
+                                    .needs_initial_full_sync
+                                    .store(false, Ordering::Relaxed);
+                                debug!(target: "Client/AppState", "Initial App State Sync completed on retry.");
+                            }
                             return;
                         }
                     }
@@ -2913,7 +2941,12 @@ mod background_report_tests {
         client
             .connection_generation
             .store(started_on + 1, Ordering::SeqCst);
-        client.report_background_sync("test", started_on, Ok(outcome.clone()));
+        client.report_background_sync(
+            "test",
+            started_on,
+            SyncSettles::JustTheCollections,
+            Ok(outcome.clone()),
+        );
         assert_eq!(
             seen.load(Ordering::Relaxed),
             0,
@@ -2922,7 +2955,7 @@ mod background_report_tests {
 
         // The live one still reports.
         let live = client.connection_generation.load(Ordering::SeqCst);
-        client.report_background_sync("test", live, Ok(outcome));
+        client.report_background_sync("test", live, SyncSettles::JustTheCollections, Ok(outcome));
         assert_eq!(seen.load(Ordering::Relaxed), 1);
     }
 }

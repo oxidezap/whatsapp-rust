@@ -123,6 +123,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                                 client_clone.report_background_sync(
                                     "app state re-sync after dirty notification",
                                     generation,
+                                    crate::client::SyncSettles::JustTheCollections,
                                     result,
                                 );
                             }
