@@ -47,12 +47,17 @@ const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
 /// below, so a wait has to be able to outlast several of them.
 const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
 
-/// Delay before retry `round` (zero-based), doubling from
+/// Delay before the attempt after `attempts` failures, doubling from
 /// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
 /// [`APP_STATE_RETRY_BACKOFF_MAX`].
-fn app_state_retry_backoff(round: u32) -> Duration {
+///
+/// Indexed by failed attempts rather than by loop iterations: rounds also pass
+/// while waiting for a socket or for another writer, and those are not failures
+/// to back off from. Letting them advance the exponent would put the next real
+/// attempt an hour away once the clamp is reached.
+fn app_state_retry_backoff(attempts: u32) -> Duration {
     APP_STATE_RETRY_BACKOFF_MIN
-        .saturating_mul(2u32.saturating_pow(round))
+        .saturating_mul(2u32.saturating_pow(attempts))
         .min(APP_STATE_RETRY_BACKOFF_MAX)
 }
 
@@ -1011,11 +1016,15 @@ impl Client {
             // long-lived holder burn the budget without the sync being tried
             // once. Rounds still bound the loop overall.
             let mut attempts = 0u32;
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
+            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(round)).await;
+                // Indexed by attempts, not by rounds: a round spent waiting for
+                // a socket is not a failure to back off from, and letting it
+                // advance the exponent would push the next real attempt an hour
+                // out once the clamp is reached.
+                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
                 if client.is_terminal() {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
                     return;
@@ -1133,11 +1142,15 @@ impl Client {
             // would exhaust the budget before the replacement connection exists
             // and drop a trigger that is already consumed.
             let mut attempts = 0u32;
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
+            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(round)).await;
+                // Indexed by attempts, not by rounds: a round spent waiting for
+                // a socket is not a failure to back off from, and letting it
+                // advance the exponent would push the next real attempt an hour
+                // out once the clamp is reached.
+                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
                 // Only a terminal state ends this. A planned reconnect must not:
                 // the trigger that asked for these collections is already
                 // consumed, and the reconnection path runs no bootstrap once the
@@ -1711,8 +1724,17 @@ impl Client {
         name: WAPatchName,
         full_sync: bool,
     ) -> Result<()> {
-        if self.is_shutting_down() {
-            debug!(target: "Client/AppState", "Skipping app state sync task {:?}: client is shutting down", name);
+        // Not `is_shutting_down()`: that is true whenever `run()`'s supervision
+        // loop is not active, which a direct-connect client never starts — so it
+        // reported every one of them as shutting down and this returned `Ok(())`
+        // without ever syncing. What actually matters here is whether there is a
+        // socket to ask and whether the client is finished with it.
+        if self.is_terminal() || !self.is_connected() {
+            debug!(
+                target: "Client/AppState",
+                "Skipping app state sync task {name:?}: terminal={} connected={}",
+                self.is_terminal(), self.is_connected()
+            );
             return Ok(());
         }
 
@@ -1732,8 +1754,11 @@ impl Client {
         let mut iteration = 0u32;
 
         while has_more {
-            if self.is_shutting_down() {
-                debug!(target: "Client/AppState", "Stopping app state sync task {:?}: shutdown detected", name);
+            // Same reason as the entry guard: `is_shutting_down()` is true for
+            // every direct-connect client, which would end the loop before its
+            // first page.
+            if self.is_terminal() || !self.is_connected() {
+                debug!(target: "Client/AppState", "Stopping app state sync task {name:?}: no usable connection");
                 break;
             }
             iteration += 1;
@@ -1766,8 +1791,8 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
-            if self.is_shutting_down() {
-                debug!(target: "Client/AppState", "Discarding app state sync response for {:?}: shutdown detected", name);
+            if self.is_terminal() || !self.is_connected() {
+                debug!(target: "Client/AppState", "Discarding app state sync response for {name:?}: no usable connection");
                 break;
             }
             debug!(target: "Client/AppState", "Received IQ response for {:?}; decoding patches", name);
@@ -3951,15 +3976,67 @@ mod lifecycle_signal_tests {
         assert!(!client.is_terminal(), "the new one can");
         client.expected_disconnect.store(false, Ordering::Relaxed);
 
-        // Logout and unrecoverable stream errors clear this before the
-        // supervision loop winds down, so it is the earliest honest signal.
+        // Turning auto-reconnect off is a preference an application may express
+        // on a healthy connection — "do not come back after this one ends" — and
+        // the run loop does not act on it until the socket exits. On its own it
+        // says nothing about the session being over.
         client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        assert!(
+            !client.is_terminal(),
+            "a reconnect preference is not a verdict on the current session"
+        );
+
+        // The stream errors that really do end one — conflict, 516, an
+        // unrecoverable connect failure — set both, and the pair is what
+        // separates them from the preference above.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
         assert!(client.is_terminal());
         client.enable_auto_reconnect.store(true, Ordering::Relaxed);
+        client.expected_disconnect.store(false, Ordering::Relaxed);
         assert!(!client.is_terminal());
 
         // And an explicit shutdown, which reconnects deliberately leave alone.
         client.signal_shutdown_sync();
         assert!(client.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod direct_connect_tests {
+    use super::*;
+
+    /// A client that calls `connect()` without `run()` never starts the
+    /// supervision loop, so `is_running` stays false for its whole life. The
+    /// entry guard read that through `is_shutting_down()` and answered `Ok(())`
+    /// without syncing anything, which made app-state sync silently
+    /// unavailable to every direct-connect embedder.
+    #[tokio::test]
+    async fn a_direct_connect_client_is_eligible_to_sync() {
+        let client = crate::test_utils::create_test_client_with_name("direct-connect").await;
+        client.set_connected_for_test(true);
+
+        assert!(
+            !client.is_running.load(Ordering::Relaxed),
+            "no supervision loop, which is the whole point of this client"
+        );
+        assert!(
+            client.is_shutting_down(),
+            "the old guard saw that as shutting down"
+        );
+        assert!(
+            !client.is_terminal() && client.is_connected(),
+            "while it is neither finished nor disconnected"
+        );
+
+        // Reaches the wire rather than short-circuiting: the sync fails with
+        // NotConnected only because this fixture has no transport, which is one
+        // step further than the guard used to allow.
+        assert!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, false)
+                .await
+                .is_err(),
+            "it must attempt the sync, not report success without trying"
+        );
     }
 }

@@ -87,17 +87,28 @@ impl Client {
     /// it true, so anything reading it as "stop" throws itself away instead of
     /// waiting for the replacement.
     ///
-    /// Built from the two signals that actually mean *terminal*. The shutdown
-    /// notifier is deliberately left untouched by reconnects, and
-    /// `enable_auto_reconnect` going false is how logout and an unrecoverable
-    /// stream error say the supervision loop is about to end — it is cleared
-    /// before `is_running`, so reading that instead would miss the window.
+    /// Built from the signals that actually mean *terminal*. The shutdown
+    /// notifier is deliberately left untouched by reconnects, and it is fired by
+    /// `disconnect`, `logout` and `signal_shutdown_sync`. The stream errors that
+    /// end a session without going through those clear `enable_auto_reconnect`
+    /// and set `expected_disconnect` together, which is what tells them apart
+    /// from an application merely turning auto-reconnect off.
     ///
     /// Not `is_running`: that tracks whether `run()`'s supervision loop is
     /// active, which a direct-connect client never starts, so a healthy one
     /// would look permanently stopped.
     pub(crate) fn is_terminal(&self) -> bool {
-        self.shutdown_signal().is_fired() || !self.enable_auto_reconnect.load(Ordering::Relaxed)
+        if self.shutdown_signal().is_fired() {
+            return true;
+        }
+        // `enable_auto_reconnect` alone is a preference, not proof: it is public,
+        // and an application may clear it on a healthy connection to mean "do
+        // not come back after this one ends". The internal paths that really do
+        // end the session — conflict, 516, an unrecoverable connect failure —
+        // always set `expected_disconnect` alongside it, so the pair is what
+        // separates a policy from a verdict.
+        !self.enable_auto_reconnect.load(Ordering::Relaxed)
+            && self.expected_disconnect.load(Ordering::Relaxed)
     }
 
     /// Returns `true` when the client has completed its full startup:
