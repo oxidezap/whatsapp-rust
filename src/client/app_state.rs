@@ -4538,3 +4538,63 @@ mod terminal_wake_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod reconnect_wake_tests {
+    use super::*;
+
+    /// A teardown that a reconnect follows wakes the wait and must not end it.
+    ///
+    /// The wake carries no verdict: it only says the state is worth re-reading.
+    /// A parked waiter is parked *because* `can_reach_server()` was false, and
+    /// nothing about a teardown makes it true — so the re-read parks it again.
+    ///
+    /// The reverse case cannot arise either. For the wake to release a waiter
+    /// onto a dying socket, the state would have to go unusable → usable while
+    /// it was parked; every transition that does that announces itself, and the
+    /// waiter would have left on that announcement, when the connection really
+    /// was usable.
+    #[tokio::test]
+    async fn a_planned_reconnect_teardown_does_not_end_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-replan").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.session_state_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // What `reconnect_immediately()` does: a planned teardown, auto-reconnect
+        // still on, so the client is not finished and a socket is coming back.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.notify_connection_shutdown();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a teardown is not a connection, however loudly it is announced"
+        );
+
+        // And the replacement still ends it.
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        client.notify_session_state();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the replacement connection must end the wait")
+                .expect("the waiter should not panic")
+        );
+    }
+}
