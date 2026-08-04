@@ -13,7 +13,11 @@ use wacore_binary::Node;
 
 pub use wacore::request::{InfoQuery, InfoQueryType, RequestUtils};
 
-const DEFAULT_IQ_TIMEOUT: Duration = Duration::from_secs(75);
+/// How long an IQ waits for its answer when the caller does not say. Also the
+/// ceiling on how long one attempt of anything built on `send_iq` can hold a
+/// resource, which is what lets other waits be derived from it rather than
+/// guessed.
+pub(crate) const DEFAULT_IQ_TIMEOUT: Duration = Duration::from_secs(75);
 const IQ_ID_ATTR: &str = "id";
 const IQ_TAG: &str = "iq";
 

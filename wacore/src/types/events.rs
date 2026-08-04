@@ -1995,6 +1995,7 @@ mod tests {
         assert_eq!(EventKind::ServerAck as u8, 57);
         assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
         assert_eq!(EventKind::PairingCodeError as u8, 59);
+        assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

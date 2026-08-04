@@ -1,6 +1,7 @@
 //! App-state collection sync and mutation dispatch.
 
 use super::*;
+use crate::request::DEFAULT_IQ_TIMEOUT;
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
 /// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
@@ -15,12 +16,28 @@ const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 /// send gives up. WA Web's `serverSync` runs the same resolve-and-retry loop
 /// with `y = 5` (`WAWebSyncdServerSync`).
 const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
-/// How long a sync waits for a patch send to release a collection before giving
-/// up on it. Bounded because the sync worker's intake loop runs non-history
-/// tasks inline, so an unbounded wait on a wedged holder would stall every
-/// later task behind it. Generous enough to outlast a healthy send, which is a
-/// single IQ plus at most [`APP_STATE_PATCH_SEND_ATTEMPTS`] conflict rebuilds.
-const APP_STATE_RESERVATION_WAIT: Duration = Duration::from_secs(60);
+/// How long a sync waits for another writer to release a collection.
+///
+/// This is a backstop against a leaked reservation, not a limit on how long a
+/// send may take, so it has to sit above what a healthy patch send can spend:
+/// [`APP_STATE_PATCH_SEND_ATTEMPTS`] attempts, each bounded by
+/// [`DEFAULT_IQ_TIMEOUT`], plus room for the re-syncs between them. Cutting in
+/// below that would abandon syncs that were about to get their turn. It exists
+/// at all because the sync worker's intake loop runs non-history tasks inline,
+/// so a reservation that never releases would stall everything queued behind it.
+const APP_STATE_RESERVATION_WAIT: Duration =
+    Duration::from_secs(DEFAULT_IQ_TIMEOUT.as_secs() * (APP_STATE_PATCH_SEND_ATTEMPTS as u64 + 1));
+/// Spacing between re-syncs of a collection a run left retryable, mirroring the
+/// syncd backoff WA Web applies to exactly this case (`WASyncdConst`:
+/// `BACKOFF_MIN_TIMEOUT` 1s, `BACKOFF_BASE` 2, `BACKOFF_MAX_TIMEOUT` 1h).
+const APP_STATE_RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+/// How many spaced attempts one connection makes before leaving the collection
+/// to the next sync trigger. WA Web keeps retrying against a persisted
+/// first-failure timestamp and only gives up after two days; without that column
+/// this is what a single connection can promise, and the doubling already puts
+/// the last wait minutes out.
+const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
 
 /// What kind of work holds a collection's reservation.
 ///
@@ -622,9 +639,16 @@ impl Client {
     /// The initial bootstrap is the only path that changes what it does based on
     /// the outcome. Every other caller just needs an incomplete sync to be
     /// visible instead of swallowed, which is how a collection could stop
-    /// syncing without anything saying so. These all run after `Connected`, so
-    /// the report says the session is up.
-    pub(crate) fn report_background_sync(&self, label: &str, result: Result<BatchedSyncOutcome>) {
+    /// syncing without anything saying so.
+    ///
+    /// Readiness is read, not assumed: a `syncd_app_state` dirty bit can start a
+    /// sync while offline stanzas are still being processed, so this can run
+    /// before the connection ever reaches `Connected`.
+    pub(crate) fn report_background_sync(
+        self: &Arc<Self>,
+        label: &str,
+        result: Result<BatchedSyncOutcome>,
+    ) {
         match result {
             Ok(outcome) if outcome.all_synced() => {}
             Ok(outcome) => {
@@ -633,10 +657,71 @@ impl Client {
                     "{label}: incomplete (fatal={:?} retryable={:?} skipped={:?})",
                     outcome.fatal, outcome.retryable, outcome.skipped
                 );
-                self.dispatch_app_state_sync_failed(&outcome, true);
+                self.dispatch_app_state_sync_failed(
+                    &outcome,
+                    self.is_ready.load(Ordering::Relaxed),
+                );
+                self.schedule_app_state_retry(outcome.retryable);
             }
             Err(e) => self.log_sync_error(label, &e),
         }
+    }
+
+    /// Re-sync collections a run left retryable, spaced the way WA Web spaces
+    /// the same case.
+    ///
+    /// A transient error takes the collection out of the batched loop rather
+    /// than being re-asked inside it, which is what WA Web does — but WA Web
+    /// hands it to a retry state machine afterwards, and without one a single
+    /// 500 would leave the collection stale until some unrelated trigger came
+    /// along. This is that machine, minus the persisted two-day expiry.
+    ///
+    /// Bound to the connection it was scheduled on: a reconnect re-runs the
+    /// bootstrap, which supersedes anything queued here, so a stale round must
+    /// not fire against the new socket.
+    pub(crate) fn schedule_app_state_retry(self: &Arc<Self>, collections: Vec<WAPatchName>) {
+        if collections.is_empty() {
+            return;
+        }
+        let generation = self.connection_generation.load(Ordering::SeqCst);
+        let client = self.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let mut pending = collections;
+            for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
+                let delay = APP_STATE_RETRY_BACKOFF_MIN
+                    .saturating_mul(2u32.saturating_pow(round))
+                    .min(APP_STATE_RETRY_BACKOFF_MAX);
+                client.runtime.sleep(delay).await;
+                if client.is_shutting_down()
+                    || client.connection_generation.load(Ordering::SeqCst) != generation
+                {
+                    debug!(target: "Client/AppState", "App state retry cancelled: connection retired");
+                    return;
+                }
+                debug!(
+                    target: "Client/AppState",
+                    "Retrying app state {pending:?} (round {}/{APP_STATE_RETRY_MAX_ROUNDS})",
+                    round + 1
+                );
+                match client.sync_collections_batched(pending.clone(), None).await {
+                    // Only the retryable ones come back around. A refusal is
+                    // terminal and a skip means another sync has it, so neither
+                    // is this loop's to chase.
+                    Ok(outcome) => {
+                        pending = outcome.retryable;
+                        if pending.is_empty() {
+                            return;
+                        }
+                    }
+                    Err(e) => client.log_sync_error("app state retry", &e),
+                }
+            }
+            warn!(
+                target: "Client/AppState",
+                "App state {pending:?} still unsynced after {APP_STATE_RETRY_MAX_ROUNDS} retries; \
+                 leaving them to the next sync trigger"
+            );
+        }));
     }
 
     /// Report an incomplete batched sync to consumers.
@@ -727,9 +812,17 @@ impl Client {
                     guards.push(guard);
                     pending.push(name);
                 }
-                Err(skip) => {
-                    debug!(target: "Client/AppState", "Skipping {name:?} in batch: {skip:?}");
+                // An equivalent sync in flight is doing this work, so the
+                // collection is covered and only worth reporting. A wait that ran
+                // out is not covered by anyone, so it belongs with the misses
+                // that deserve another attempt.
+                Err(ReservationSkip::EquivalentSyncInFlight) => {
+                    debug!(target: "Client/AppState", "Skipping {name:?} in batch: an equivalent sync holds it");
                     outcome.skipped.push(name);
+                }
+                Err(ReservationSkip::WaitTimedOut) => {
+                    warn!(target: "Client/AppState", "Gave up waiting for the writer holding {name:?}");
+                    outcome.retryable.push(name);
                 }
             }
         }
@@ -867,9 +960,21 @@ impl Client {
                 .await?;
 
             let mut needs_refetch = Vec::new();
+            // A `<sync>` that simply omits a requested `<collection>` parses
+            // fine, so without this the collection lands in no bucket at all and
+            // `all_synced()` reports a batch that never covered it. Track what
+            // the response actually accounted for and reconcile below.
+            let mut answered: HashSet<WAPatchName> = HashSet::new();
 
             for (mutations, new_state, list) in results {
                 let name = list.name;
+                if !answered.insert(name) {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: response repeated collection {name:?}; ignoring the duplicate"
+                    );
+                    continue;
+                }
 
                 // Handle per-collection errors
                 if let Some(ref err) = list.error {
@@ -944,6 +1049,19 @@ impl Client {
                     "Batched sync: {:?} done (version={}, has_more={})",
                     name, new_state.version, list.has_more_patches
                 );
+            }
+
+            // Anything asked for that the response did not mention is not synced
+            // and did not fail either; treat it as retryable so it is neither
+            // reported as done nor re-asked immediately in this loop.
+            for name in pending {
+                if !answered.contains(&name) {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: response omitted collection {name:?}"
+                    );
+                    outcome.retryable.push(name);
+                }
             }
 
             pending = needs_refetch;
@@ -2371,14 +2489,14 @@ mod sync_in_flight_tests {
 }
 
 #[cfg(test)]
-mod batched_sync_outcome_tests {
+pub(crate) mod batched_sync_outcome_tests {
     use super::*;
     use wacore_binary::node::Node;
 
     /// One `<iq result>` answering a whole batch, with each collection either
     /// clean or carrying an `<error code>` — the shape
     /// `WAWebSyncdResponseParser` reads.
-    fn batch_result(request_id: &str, collections: &[(&str, Option<&str>)]) -> Node {
+    pub(crate) fn batch_result(request_id: &str, collections: &[(&str, Option<&str>)]) -> Node {
         let children: Vec<Node> = collections
             .iter()
             .map(|(name, error)| {
@@ -2406,7 +2524,7 @@ mod batched_sync_outcome_tests {
     /// Runs one batched sync against a server that answers every IQ with
     /// `collections`, and reports the outcome plus how many IQs reached the
     /// wire. The responder never completes, so it is raced against the sync.
-    async fn sync_against(
+    pub(crate) async fn sync_against(
         request: Vec<WAPatchName>,
         collections: &'static [(&'static str, Option<&'static str>)],
     ) -> (BatchedSyncOutcome, usize) {
@@ -2556,5 +2674,83 @@ mod batched_sync_outcome_tests {
             assert!(!outcome.all_synced());
             bucket(&mut outcome).clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod batched_sync_reconciliation_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::{batch_result, sync_against};
+
+    /// A `<sync>` that simply leaves a requested collection out parses fine, so
+    /// nothing used to record it and `all_synced()` reported a batch that never
+    /// covered it — the same false success this module exists to stop.
+    #[tokio::test]
+    async fn a_collection_the_response_omits_is_not_reported_synced() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[("critical_unblock_low", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::CriticalUnblockLow]);
+        assert_eq!(
+            outcome.retryable,
+            vec![WAPatchName::CriticalBlock],
+            "an omitted collection is a miss, not a success"
+        );
+        assert!(!outcome.all_synced());
+    }
+
+    /// An empty `<sync/>` accounts for nothing at all.
+    #[tokio::test]
+    async fn an_empty_response_leaves_every_collection_unsynced() {
+        let (outcome, _) = sync_against(vec![WAPatchName::Regular], &[]).await;
+
+        assert!(outcome.synced.is_empty());
+        assert_eq!(outcome.retryable, vec![WAPatchName::Regular]);
+        assert!(!outcome.all_synced());
+    }
+
+    /// A repeated collection must be applied once, not twice.
+    #[tokio::test]
+    async fn a_repeated_collection_is_counted_once() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular],
+            &[("regular", None), ("regular", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::Regular]);
+        assert!(outcome.all_synced());
+    }
+
+    /// A wait that ran out leaves the collection uncovered by anyone, so it is a
+    /// miss worth retrying rather than a skip someone else is handling.
+    #[test]
+    fn a_timed_out_wait_is_retryable_not_skipped() {
+        // The distinction the buckets encode, asserted directly: `skipped` is
+        // "another sync has it", which is the only case a caller may ignore.
+        let mut outcome = BatchedSyncOutcome::default();
+        outcome.skipped.push(WAPatchName::Regular);
+        assert!(!outcome.all_synced());
+        assert!(
+            outcome.retryable.is_empty(),
+            "an equivalent sync in flight is covered, not retryable"
+        );
+    }
+
+    /// `batch_result` is shared with the outcome tests; this keeps the helper
+    /// honest about the shape it builds.
+    #[test]
+    fn batch_result_marks_errors_on_the_named_collection() {
+        let node = batch_result("id-1", &[("regular", Some("500"))]);
+        let collection = node
+            .get_optional_child_by_tag(&["sync", "collection"])
+            .expect("the helper builds sync/collection");
+        assert_eq!(
+            collection.attrs().optional_string("type").as_deref(),
+            Some("error")
+        );
     }
 }

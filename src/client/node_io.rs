@@ -1334,6 +1334,13 @@ impl Client {
                 // The deadline lets the missing-key fallback recover a late/never-shared
                 // key on this connection instead of stalling to the watchdog.
                 check_generation!();
+                // Critical collections that missed for a reason a retry can still
+                // fix. Only filled on the refused path below, which connects
+                // anyway: the watchdog cannot be the retry there, because the
+                // collection the server refused would fail again on every
+                // reconnect and the two would loop for good. So they ride along
+                // with the background sync instead of being dropped.
+                let mut critical_retry: Vec<WAPatchName> = Vec::new();
                 match client_clone
                     .sync_collections_batched(
                         vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
@@ -1377,14 +1384,24 @@ impl Client {
                     // name, so presence stays unavailable until it arrives.
                     Ok(outcome) if !outcome.fatal.is_empty() => {
                         critical_sync_timeout_handle.abort();
+                        // A refusal does not make the batch's other misses
+                        // terminal, and leaving them to the watchdog is not an
+                        // option once we connect. Retry them below instead.
+                        critical_retry
+                            .extend(outcome.retryable.iter().chain(&outcome.skipped).copied());
                         warn!(
                             target: "Client/AppState",
-                            "Critical app state sync refused for {:?}; connecting without it",
-                            outcome.fatal
+                            "Critical app state sync refused for {:?}; connecting without it (retrying {:?})",
+                            outcome.fatal, critical_retry
                         );
+                        // Before publishing, not after: a consumer acting on a
+                        // fatal report may log out or force a recovery, and this
+                        // outcome belongs to a socket that may already have been
+                        // replaced. Applying it to the live session would be
+                        // worse than losing the report.
+                        check_generation!();
                         client_clone.dispatch_app_state_sync_failed(&outcome, true);
 
-                        check_generation!();
                         client_clone
                             .resubscribe_presence_subscriptions(task_generation)
                             .await;
@@ -1402,6 +1419,11 @@ impl Client {
                             "Critical app state sync incomplete (retryable={:?} skipped={:?}); will retry",
                             outcome.retryable, outcome.skipped
                         );
+                        // Same reason as the arm above: never publish an outcome
+                        // that belongs to a retired socket. Returning here drops
+                        // the watchdog handle, which aborts it — correct for a
+                        // generation that already has its own.
+                        check_generation!();
                         client_clone.dispatch_app_state_sync_failed(&outcome, false);
                         critical_sync_timeout_handle.detach();
                         return;
@@ -1423,16 +1445,15 @@ impl Client {
                         return;
                     }
 
-                    let result = sync_client
-                        .sync_collections_batched(
-                            vec![
-                                WAPatchName::RegularLow,
-                                WAPatchName::RegularHigh,
-                                WAPatchName::Regular,
-                            ],
-                            None,
-                        )
-                        .await;
+                    // Any critical collection the refused path handed over goes
+                    // first: it is the one the account actually needs.
+                    let mut to_sync = critical_retry;
+                    to_sync.extend([
+                        WAPatchName::RegularLow,
+                        WAPatchName::RegularHigh,
+                        WAPatchName::Regular,
+                    ]);
+                    let result = sync_client.sync_collections_batched(to_sync, None).await;
                     sync_client.report_background_sync("non-critical app state sync", result);
 
                     sync_client
