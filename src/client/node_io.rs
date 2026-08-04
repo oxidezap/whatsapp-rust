@@ -1412,6 +1412,15 @@ impl Client {
                         // two dispatches — long enough to hand the next session
                         // a refusal it never earned.
                         check_generation!();
+                        // Armed before the event, not after. Publishing runs
+                        // consumer handlers synchronously, and one that forces a
+                        // reconnect would retire the background task that
+                        // settles this — leaving the flag false while the
+                        // critical sync has already populated the push name, so
+                        // the replacement takes the ordinary path and skips the
+                        // bootstrap it still owes. The background task settles
+                        // it properly once it knows the whole picture.
+                        client_clone.settle_bootstrap(critical_scope, true);
                         client_clone.dispatch_app_state_sync_failed(
                             &outcome,
                             client_clone.is_ready.load(Ordering::Relaxed),

@@ -112,13 +112,23 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                             warn!("Failed to send clean dirty bits IQ: {e:?}");
                         }
 
-                        // Asked again after the clean IQ: an ordinary reconnect
-                        // does not set `is_shutting_down`, so that guard alone
-                        // would let the re-sync run on a socket this task no
-                        // longer belongs to.
-                        if let Err(lost) = client_clone.admits(scope) {
-                            debug!(target: "Client/AppState", "Dirty-bit task cancelled while cleaning: {lost:?}");
-                            return;
+                        // Rebound, not dropped. The server has already accepted
+                        // the dirty bit as clean, so it will not raise it again,
+                        // and an ordinary reconnect with a known push name runs
+                        // no app-state bootstrap — returning here would leave
+                        // these collections stale until something unrelated
+                        // asked. The work carries over to the live connection;
+                        // only the retired generation's outcome would not.
+                        let mut scope = scope;
+                        if scope.rebind(
+                            client_clone
+                                .connection_generation
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        ) {
+                            debug!(
+                                target: "Client/AppState",
+                                "Dirty-bit resync rebinding after the clean IQ"
+                            );
                         }
 
                         if needs_resync && !client_clone.is_shutting_down() {

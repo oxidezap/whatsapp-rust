@@ -848,8 +848,28 @@ impl Client {
             );
             return;
         }
-        self.needs_initial_full_sync
-            .store(outstanding, Ordering::Relaxed);
+        let previous = self
+            .needs_initial_full_sync
+            .swap(outstanding, Ordering::Relaxed);
+        // The check and the store are two operations, and the generation moves
+        // under a lock this does not hold, so a connection that retires between
+        // them would keep a write meant for it. Undoing on that discovery is
+        // what makes the pair converge: the live connection ends up with the
+        // value it had, rather than one a dead one chose for it.
+        //
+        // Unasserted: reaching it needs the generation to move between the swap
+        // and this line, which no test can schedule deterministically. Closing
+        // it properly means the teardown bump and this write taking one lock,
+        // which is a lifecycle change rather than an app-state one.
+        if self.admits(scope) == Err(ScopeLost::Retired) {
+            self.needs_initial_full_sync
+                .store(previous, Ordering::Relaxed);
+            debug!(
+                target: "Client/AppState",
+                "Bootstrap gate restored: connection {} retired mid-settle", scope.generation
+            );
+            return;
+        }
         if outstanding {
             warn!(target: "Client/AppState", "Initial App State Sync incomplete; bootstrap stays armed");
         } else {
@@ -932,6 +952,16 @@ impl Client {
                         continue;
                     }
                 };
+                // The reservation wait is itself an await, so the reconnect can
+                // start inside it and the guard above is already stale. Asked
+                // again before an attempt is counted, because the callee would
+                // answer `Ok(())` at its own shutdown guard and this loop would
+                // read that no-op as the sync having happened.
+                if client.is_shutting_down() || client.admits(scope).is_err() {
+                    debug!(target: "Client/AppState", "Dropping the {name:?} attempt: state moved while reserving");
+                    drop(guard);
+                    continue;
+                }
                 attempts += 1;
                 match client.process_app_state_sync_task(name, full_sync).await {
                     Ok(()) => return,
@@ -1051,6 +1081,21 @@ impl Client {
                 "App state {pending:?} still unsynced after {APP_STATE_RETRY_MAX_ROUNDS} retries; \
                  leaving them to the next sync trigger"
             );
+            // Consumers heard about every round that produced buckets, but a
+            // sequence that ends here — or one whose rounds all failed before
+            // producing any — would otherwise finish in silence, with the
+            // collections still stale. `retryable` is exactly what these are:
+            // not synced, and a later trigger can still fix them.
+            if client.admits(scope).is_ok() {
+                let exhausted = BatchedSyncOutcome {
+                    retryable: pending,
+                    ..Default::default()
+                };
+                client.dispatch_app_state_sync_failed(
+                    &exhausted,
+                    client.is_ready.load(Ordering::Relaxed),
+                );
+            }
         }));
     }
 
@@ -1400,6 +1445,21 @@ impl Client {
             for (mutations, new_state, list) in results {
                 let name = list.name;
                 answered.insert(name);
+
+                // Applying is one boundary, dispatching and persisting is
+                // another: `process_one_patch_list` awaits, so the scope can
+                // have been lost between the collection being decoded and its
+                // mutations reaching consumers or its version reaching the
+                // store. Everything decoded so far is already persisted by its
+                // own call, so stopping here leaves a consistent prefix.
+                if let Err(lost) = self.admits(scope) {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: not dispatching {name:?} ({lost:?})"
+                    );
+                    outcome.retryable.push(name);
+                    continue;
+                }
 
                 // Handle per-collection errors
                 if let Some(ref err) = list.error {

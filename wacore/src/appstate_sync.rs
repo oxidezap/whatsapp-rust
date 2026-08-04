@@ -222,7 +222,7 @@ impl AppStateProcessor {
         Ok(results)
     }
 
-    /// One collection's share of [`process_patch_lists`], exposed on its own.
+    /// One collection's share of [`Self::process_patch_lists`], exposed on its own.
     ///
     /// Each call persists what it applies, so a caller that must not write past
     /// some boundary — a connection being replaced, a deadline running out —
