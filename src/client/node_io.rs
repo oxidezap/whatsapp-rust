@@ -1450,6 +1450,15 @@ impl Client {
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
+                        // Armed for the same reason as the incomplete arm above,
+                        // and it matters just as much here: a batch can fail
+                        // partway, after `critical_block` already dispatched and
+                        // persisted `setting_pushName`. The watchdog's reconnect
+                        // would then find a populated push name and a clear flag
+                        // and take the ordinary path, never retrying the rest.
+                        client_clone
+                            .needs_initial_full_sync
+                            .store(true, Ordering::Relaxed);
                         // The sync failed — the watchdog must stay alive to force a reconnect.
                         critical_sync_timeout_handle.detach();
                         return;

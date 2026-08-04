@@ -774,7 +774,17 @@ impl Client {
         let generation = self.connection_generation.load(Ordering::SeqCst);
         let client = self.clone();
         self.runtime.spawn_detached(Box::pin(async move {
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
+            // Attempts and rounds are counted separately. A wait that ran out
+            // never reached the server, so spending an attempt on it would let a
+            // writer that holds the collection for a long time burn the whole
+            // budget without the sync ever being tried once — and the caller's
+            // request would then be dropped for a reason that has nothing to do
+            // with it. Rounds still bound the loop overall.
+            let mut attempts = 0u32;
+            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * 2 {
+                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
+                    break;
+                }
                 client.runtime.sleep(app_state_retry_backoff(round)).await;
                 if client.is_shutting_down()
                     || client.connection_generation.load(Ordering::SeqCst) != generation
@@ -786,8 +796,12 @@ impl Client {
                     Ok(guard) => guard,
                     // Someone equivalent picked it up, so the request is covered.
                     Err(ReservationSkip::EquivalentSyncInFlight) => return,
-                    Err(ReservationSkip::WaitTimedOut) => continue,
+                    Err(ReservationSkip::WaitTimedOut) => {
+                        warn!(target: "Client/AppState", "Still waiting on the writer holding {name:?}");
+                        continue;
+                    }
                 };
+                attempts += 1;
                 match client.process_app_state_sync_task(name, full_sync).await {
                     Ok(()) => return,
                     Err(e) => {
@@ -798,7 +812,7 @@ impl Client {
             }
             warn!(
                 target: "Client/AppState",
-                "App state task for {name:?} still unsynced after {APP_STATE_RETRY_MAX_ROUNDS} retries"
+                "App state task for {name:?} still unsynced after {attempts} attempts"
             );
         }));
     }
