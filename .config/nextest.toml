@@ -10,7 +10,7 @@
 # separate `cargo test --doc` step. An example asserted only in a doc comment is
 # covered by that step and nothing else — do not drop it.
 
-# The `ci` profile below uses `terminate-after`, which older releases parse but
+# The `e2e` profile below uses `terminate-after`, which older releases parse but
 # ignore; fail loudly instead of silently losing the hang guard.
 nextest-version = { required = "0.9.70" }
 
