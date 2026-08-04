@@ -141,23 +141,22 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
 
                         if needs_resync && !client_clone.is_shutting_down() {
                             info!("syncd_app_state dirty -- re-syncing all app state collections");
+                            let requested = vec![
+                                WAPatchName::CriticalBlock,
+                                WAPatchName::CriticalUnblockLow,
+                                WAPatchName::RegularLow,
+                                WAPatchName::RegularHigh,
+                                WAPatchName::Regular,
+                            ];
                             let result = client_clone
-                                .sync_collections_batched(
-                                    vec![
-                                        WAPatchName::CriticalBlock,
-                                        WAPatchName::CriticalUnblockLow,
-                                        WAPatchName::RegularLow,
-                                        WAPatchName::RegularHigh,
-                                        WAPatchName::Regular,
-                                    ],
-                                    None,
-                                )
+                                .sync_collections_batched(requested.clone(), None)
                                 .await;
                             if !client_clone.is_shutting_down() {
                                 client_clone.report_background_sync(
                                     "app state re-sync after dirty notification",
                                     generation,
                                     crate::client::SyncSettles::JustTheCollections,
+                                    &requested,
                                     result,
                                 );
                             }

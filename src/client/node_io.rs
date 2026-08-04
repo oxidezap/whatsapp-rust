@@ -1432,6 +1432,18 @@ impl Client {
                         // the watchdog handle, which aborts it — correct for a
                         // generation that already has its own.
                         check_generation!();
+                        // Armed before returning, because the watchdog is not
+                        // the whole guarantee. This path can be reached with the
+                        // flag false — an empty push name alone opens the
+                        // bootstrap — and a mixed response can apply
+                        // `critical_block`, push name included, while leaving
+                        // `critical_unblock_low` behind. The reconnect the
+                        // watchdog forces would then see a populated name and a
+                        // clear flag, take the ordinary path, and never retry the
+                        // collection that is still missing.
+                        client_clone
+                            .needs_initial_full_sync
+                            .store(true, Ordering::Relaxed);
                         client_clone.dispatch_app_state_sync_failed(&outcome, false);
                         critical_sync_timeout_handle.detach();
                         return;
@@ -1461,6 +1473,7 @@ impl Client {
                         WAPatchName::RegularHigh,
                         WAPatchName::Regular,
                     ]);
+                    let requested = to_sync.clone();
                     let result = sync_client.sync_collections_batched(to_sync, None).await;
 
                     let complete = result.as_ref().is_ok_and(|outcome| outcome.all_synced());
@@ -1516,6 +1529,7 @@ impl Client {
                         "non-critical app state sync",
                         sync_generation,
                         SyncSettles::InitialSync,
+                        &requested,
                         result,
                     );
 

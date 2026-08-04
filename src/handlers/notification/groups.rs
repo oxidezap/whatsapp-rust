@@ -93,12 +93,14 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
                         log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
                         return;
                     }
+                    let requested = to_sync.clone();
                     let result = client_clone.sync_collections_batched(to_sync, None).await;
                     if !client_clone.is_shutting_down() {
                         client_clone.report_background_sync(
                             "app state sync from server_sync",
                             generation,
                             crate::client::SyncSettles::JustTheCollections,
+                            &requested,
                             result,
                         );
                     }

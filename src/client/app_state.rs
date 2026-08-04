@@ -691,11 +691,17 @@ impl Client {
     /// trip before reporting, and one that forgot would publish a retired
     /// socket's refusal to a consumer whose documented response is to log out or
     /// force a recovery — on the live session.
+    ///
+    /// `requested` is what the sync was asked to cover. It is only needed for
+    /// the failure arm: a top-level error produces no outcome at all, so there
+    /// are no per-collection buckets to retry from, and for a dirty-bit request
+    /// the trigger is already consumed — nothing would ask again.
     pub(crate) fn report_background_sync(
         self: &Arc<Self>,
         label: &str,
         generation: u64,
         settles: SyncSettles,
+        requested: &[WAPatchName],
         result: Result<BatchedSyncOutcome>,
     ) {
         if self.connection_generation.load(Ordering::SeqCst) != generation {
@@ -727,7 +733,20 @@ impl Client {
                     already_stranded,
                 );
             }
-            Err(e) => self.log_sync_error(label, &e),
+            Err(e) => {
+                self.log_sync_error(label, &e);
+                // An IQ timeout, a malformed response, a failed blob fetch or a
+                // store error takes the whole batch down without producing
+                // buckets, so nothing above reaches the scheduler. Retry what
+                // was asked for: the collections are no less stale for the
+                // failure having been global, and the request that prompted it
+                // is not coming back.
+                //
+                // Unasserted: the observable is a detached task that sleeps
+                // before doing anything, and the two probes tried for it both
+                // passed with the requeue removed.
+                self.schedule_app_state_retry(requested.to_vec(), generation, settles, false);
+            }
         }
     }
 
@@ -857,9 +876,21 @@ impl Client {
                         // generation first: this awaited a round trip, and an
                         // outcome from a retired socket must not reach a
                         // consumer that would apply it to the live one.
-                        if client.connection_generation.load(Ordering::SeqCst) != generation {
-                            debug!(target: "Client/AppState", "App state retry outcome dropped: connection retired");
-                            return;
+                        // The outcome is dropped, not the work. Returning here
+                        // would strand the collections exactly as cancelling the
+                        // round would: nothing else retries a dirty-bit or
+                        // server_sync request once its trigger is consumed. So
+                        // the stale result goes unpublished, the loop rebinds,
+                        // and the same names are tried again on the live socket.
+                        let current = client.connection_generation.load(Ordering::SeqCst);
+                        if current != generation {
+                            debug!(
+                                target: "Client/AppState",
+                                "App state retry outcome dropped and rebound to connection {current}"
+                            );
+                            generation = current;
+                            settles = SyncSettles::JustTheCollections;
+                            continue;
                         }
                         if !outcome.all_synced() {
                             client.dispatch_app_state_sync_failed(
@@ -1248,6 +1279,23 @@ impl Client {
                 warn!(
                     target: "Client/AppState",
                     "Batched sync: decode key(s) still missing after re-request, deferring {pending:?}"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
+
+            // The last gate before anything is written. The blob downloads and
+            // the key wait above are both unbounded relative to the deadline, so
+            // the earlier checks can all have passed and this response still be
+            // arriving after the watchdog replaced the connection. Applying it
+            // then writes versions and mutation MACs on behalf of a socket that
+            // is gone.
+            if let Some(deadline) = key_wait_deadline
+                && wacore::time::Instant::now() >= deadline
+            {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: deadline reached while preparing {pending:?}; not applying"
                 );
                 outcome.retryable.extend(pending);
                 return Ok(());
@@ -3157,6 +3205,7 @@ mod background_report_tests {
             "test",
             started_on,
             SyncSettles::JustTheCollections,
+            &[],
             Ok(outcome.clone()),
         );
         assert_eq!(
@@ -3167,7 +3216,13 @@ mod background_report_tests {
 
         // The live one still reports.
         let live = client.connection_generation.load(Ordering::SeqCst);
-        client.report_background_sync("test", live, SyncSettles::JustTheCollections, Ok(outcome));
+        client.report_background_sync(
+            "test",
+            live,
+            SyncSettles::JustTheCollections,
+            &[],
+            Ok(outcome),
+        );
         assert_eq!(seen.load(Ordering::Relaxed), 1);
     }
 }
