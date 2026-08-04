@@ -81,6 +81,18 @@ pub(crate) enum SyncOutcome {
     Deferred,
 }
 
+/// Whether an attempt that ended this way leaves the collection still owed a
+/// sync.
+///
+/// One function rather than a condition rewritten at each caller, and phrased
+/// so that only [`SyncOutcome::Completed`] discharges the request: a deferral,
+/// an error, a variant added later — all keep it. The alternative is to
+/// enumerate the ways to fail, and the ways to fail is exactly the list that
+/// kept turning out to be one short.
+fn sync_still_owed(outcome: &Result<SyncOutcome>) -> bool {
+    !matches!(outcome, Ok(SyncOutcome::Completed))
+}
+
 /// The connection a piece of app-state work belongs to, and the clock it runs
 /// against.
 ///
@@ -760,16 +772,22 @@ impl Client {
                         return;
                     }
                 };
-                match self.process_app_state_sync_task(name, full_sync).await {
-                    Ok(SyncOutcome::Completed) => {}
-                    // The connection went away before the request was honoured.
-                    // The consumer asked once and nothing else will ask again,
-                    // so this is the point that has to keep it alive.
+                // The consumer asked once and nothing else will ask again, so
+                // this is the point that has to keep the request alive — for
+                // every way of not having synced, not just the ones the guards
+                // catch. A connection lost while the collection IQ is in flight
+                // is reported by `send_iq` as an error rather than as a
+                // deferral, and an error here used to be logged and dropped.
+                let outcome = self.process_app_state_sync_task(name, full_sync).await;
+                match &outcome {
+                    Err(e) => self.log_sync_error(&format!("app state sync for {name:?}"), e),
                     Ok(SyncOutcome::Deferred) => {
-                        debug!(target: "Client/AppState", "App state sync task for {name:?} was deferred; scheduling a retry");
-                        self.schedule_app_state_task_retry(name, full_sync);
+                        debug!(target: "Client/AppState", "App state sync for {name:?} was deferred")
                     }
-                    Err(e) => log::warn!("App state sync task for {name:?} failed: {e}"),
+                    Ok(SyncOutcome::Completed) => {}
+                }
+                if sync_still_owed(&outcome) {
+                    self.schedule_app_state_task_retry(name, full_sync);
                 }
             }
         }
@@ -1160,36 +1178,34 @@ impl Client {
                         continue;
                     }
                 };
-                // The reservation wait is itself an await, so the reconnect can
-                // start inside it and the guard above is already stale. Asked
-                // again before an attempt is counted, because the callee would
-                // answer `Ok(())` at its own shutdown guard and this loop would
-                // read that no-op as the sync having happened.
-                if client.is_shutting_down() || client.admits(scope).is_err() {
+                // The reservation wait is itself an await, so the connection can
+                // go inside it and the answer above is already stale. Asked
+                // again before an attempt is counted, so a round spent waiting
+                // is not charged as one spent asking.
+                if !client.can_reach_server() || client.admits(scope).is_err() {
                     debug!(target: "Client/AppState", "Dropping the {name:?} attempt: state moved while reserving");
                     drop(guard);
                     continue;
                 }
                 attempts += 1;
-                match client.process_app_state_sync_task(name, full_sync).await {
-                    // The callee now says which of the two happened, so this no
-                    // longer reconstructs it from lifecycle flags. That proxy
-                    // read `Ok(())` as done for every cut-short run whose reason
-                    // it did not model — a 429 or 503 clears `is_logged_in`
-                    // without setting `expected_disconnect`, and the request was
-                    // lost with the `full_sync` snapshot it carried.
-                    //
-                    // `admits` still gates it: a run that completed against a
-                    // retired socket completed for somebody else.
-                    Ok(SyncOutcome::Completed) if client.admits(scope).is_ok() => return,
-                    Ok(_) => {
-                        debug!(target: "Client/AppState", "The {name:?} attempt was cut short; keeping it queued");
-                    }
-                    Err(e) => {
-                        drop(guard);
-                        client.log_sync_error("app state task retry", &e);
-                    }
+                let outcome = client.process_app_state_sync_task(name, full_sync).await;
+                if let Err(e) = &outcome {
+                    drop(guard);
+                    client.log_sync_error("app state task retry", e);
                 }
+                // The callee says which happened, so this no longer
+                // reconstructs it from lifecycle flags. That proxy read `Ok(())`
+                // as done for every cut-short run whose reason it did not model
+                // — a 429 or 503 clears `is_logged_in` without setting
+                // `expected_disconnect` — and the request was lost with the
+                // `full_sync` snapshot it carried.
+                //
+                // `admits` still gates it: a run that completed against a
+                // retired socket completed for somebody else.
+                if !sync_still_owed(&outcome) && client.admits(scope).is_ok() {
+                    return;
+                }
+                debug!(target: "Client/AppState", "The {name:?} attempt did not settle it; keeping it queued");
             }
             warn!(
                 target: "Client/AppState",
@@ -1860,9 +1876,17 @@ impl Client {
             iteration += 1;
             if iteration > MAX_PAGINATION_ITERATIONS {
                 warn!(target: "Client/AppState", "App state sync for {:?} exceeded {} iterations, aborting", name, MAX_PAGINATION_ITERATIONS);
-                // Not deferred: the server is answering, it is just not
-                // advancing. Retrying would re-run the same 500 round trips
-                // against the same non-progress.
+                // `has_more` is still set, so the persisted version is below the
+                // server's head — which is the definition of deferred, whatever
+                // the reason for stopping. Reporting completion here would have
+                // callers drop the trigger and leave it there for good.
+                //
+                // The cost is a retry that may re-page against the same
+                // non-progress, bounded by the attempt budget and its backoff.
+                // That is the cheaper mistake: this cap is a should-never-happen
+                // guard, and if it fires because the server was briefly wedged,
+                // a later attempt is the only thing that ever fixes it.
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             debug!(target: "Client/AppState", "Fetching app state patch batch: name={:?} want_snapshot={want_snapshot} version={} full_sync={} has_more_previous={}", name, state.version, full_sync, has_more);
@@ -4210,7 +4234,15 @@ mod await_connection_tests {
             "a socket without an authenticated session is not one either"
         );
 
+        // Both stores that `handle_success` makes, in that order: the session,
+        // then the generation it is authenticated under. Only the pair is an
+        // answer — the marker alone would leave the wait on a socket that has
+        // not authenticated, which is the state above.
         client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         client.notify_session_state();
         assert!(
             tokio::time::timeout(Duration::from_secs(5), waiter)
@@ -4406,20 +4438,29 @@ mod sync_outcome_tests {
     /// and every attempt it then makes is rejected.
     #[tokio::test]
     async fn the_gap_inside_success_is_not_an_authenticated_connection() {
-        let client = reachable_client("auth-window").await;
+        let client = crate::test_utils::create_test_client_with_name("auth-window").await;
+        client.is_running.store(true, Ordering::Relaxed);
 
-        // The instant between the two stores in `handle_success`.
+        client.set_connected_for_test(true);
+
+        // First half of the window: `handle_success` has set `is_logged_in` and
+        // has not yet incremented the generation. The marker here is whatever
+        // the constructor left, unretouched — and a marker that starts at a real
+        // generation equals the one a fresh client is on, so equality alone
+        // admits the window on the very first connection.
         client.is_logged_in.store(true, Ordering::Relaxed);
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
-
         assert!(
             client.is_logged_in() && client.is_connected(),
             "which is why the flags alone said yes"
         );
         assert!(
             !client.can_reach_server(),
-            "the generation is not final yet, so neither is the answer"
+            "this connection has not authenticated anything yet"
         );
+
+        // Second half: generation incremented, marker not yet stored.
+        let current = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!client.can_reach_server());
         assert_eq!(
             client.connection_wait_verdict(),
             None,
@@ -4427,10 +4468,31 @@ mod sync_outcome_tests {
         );
 
         // And once `<success>` finishes publishing, it is a real connection.
-        client.authenticated_generation.store(
-            client.connection_generation.load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
+        client
+            .authenticated_generation
+            .store(current, Ordering::SeqCst);
         assert_eq!(client.connection_wait_verdict(), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod sync_owed_tests {
+    use super::*;
+
+    /// Only a completed sync discharges the request.
+    ///
+    /// The first version of this seam listed the ways to fail and requeued for
+    /// those — which put the deferral next to an `Err` branch that still only
+    /// logged, so a connection lost while the collection IQ was in flight was
+    /// reported by `send_iq` as an error and dropped there. Every list of
+    /// failure modes written so far has been one short; this asks the other
+    /// question, which has one answer.
+    #[test]
+    fn everything_that_is_not_a_completed_sync_is_still_owed() {
+        assert!(!sync_still_owed(&Ok(SyncOutcome::Completed)));
+        assert!(sync_still_owed(&Ok(SyncOutcome::Deferred)));
+        assert!(sync_still_owed(&Err(anyhow::anyhow!(
+            "the socket died under the collection IQ"
+        ))));
     }
 }

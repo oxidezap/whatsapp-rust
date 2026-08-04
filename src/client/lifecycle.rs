@@ -11,6 +11,13 @@ const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 /// entry is only the device list plus its member set.
 const DM_DEVICES_MEMO_CAPACITY: u64 = 512;
 
+/// `authenticated_generation` when no connection has published one.
+///
+/// Not zero: that is a real generation, the one a freshly built client is on,
+/// so zero would read as authenticated before anything had authenticated.
+/// `connection_generation` only ever counts up, so this can never collide.
+pub(crate) const NO_AUTHENTICATED_GENERATION: u64 = u64::MAX;
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.signal_shutdown_sync();
@@ -423,7 +430,7 @@ impl Client {
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
-            authenticated_generation: Arc::new(AtomicU64::new(0)),
+            authenticated_generation: Arc::new(AtomicU64::new(NO_AUTHENTICATED_GENERATION)),
             session_state_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
@@ -812,6 +819,16 @@ impl Client {
         // connection see a clean signal; the previous notifier was already
         // fired on the prior cleanup_connection_state.
         self.reset_connection_shutdown();
+
+        // Invalidated before the socket is published, not after `<success>`
+        // lands. `handle_success` sets `is_logged_in` one step before it
+        // increments the generation, and the value left behind by the *previous*
+        // connection equals the generation still in place during that step — so
+        // without this the window reads as authenticated on a generation the
+        // next instruction retires. Nothing is authenticated until this
+        // connection says so itself.
+        self.authenticated_generation
+            .store(NO_AUTHENTICATED_GENERATION, Ordering::SeqCst);
 
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
