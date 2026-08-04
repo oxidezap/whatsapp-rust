@@ -1486,9 +1486,21 @@ impl Client {
                             .store(false, Ordering::Relaxed);
                         debug!(target: "Client/AppState", "Initial App State Sync Completed.");
                     } else {
+                        // Armed, not merely left alone. This path is also
+                        // reached with the flag already false, because an empty
+                        // persisted push name is enough to enter the bootstrap
+                        // on its own. Once the critical sync supplies the name,
+                        // the next connection would see a non-empty name and a
+                        // false flag and skip the unfinished bootstrap entirely,
+                        // while the retries scheduled here retire with this
+                        // generation. Setting it is what makes the retry
+                        // guarantee survive a reconnect.
+                        sync_client
+                            .needs_initial_full_sync
+                            .store(true, Ordering::Relaxed);
                         warn!(
                             target: "Client/AppState",
-                            "Initial App State Sync incomplete; keeping the bootstrap armed for the next connection"
+                            "Initial App State Sync incomplete; arming the bootstrap for the next connection"
                         );
                     }
                 }));

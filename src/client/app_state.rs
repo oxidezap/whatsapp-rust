@@ -711,7 +711,7 @@ impl Client {
                     &outcome,
                     self.is_ready.load(Ordering::Relaxed),
                 );
-                self.schedule_app_state_retry(outcome.retryable, settles);
+                self.schedule_app_state_retry(outcome.retryable, generation, settles);
             }
             Err(e) => self.log_sync_error(label, &e),
         }
@@ -772,15 +772,22 @@ impl Client {
 
     /// `settles` says what recovering these collections finishes; see
     /// [`SyncSettles`].
+    ///
+    /// `generation` is passed in rather than read here: callers validate it
+    /// before deciding to schedule, and dispatching the failure event in between
+    /// runs consumer handlers synchronously. Re-reading it after that would bind
+    /// a retired connection's retries to whatever replaced it — and for
+    /// [`SyncSettles::InitialSync`], let them stand down the replacement's
+    /// bootstrap gate.
     pub(crate) fn schedule_app_state_retry(
         self: &Arc<Self>,
         collections: Vec<WAPatchName>,
+        generation: u64,
         settles: SyncSettles,
     ) {
         if collections.is_empty() {
             return;
         }
-        let generation = self.connection_generation.load(Ordering::SeqCst);
         let client = self.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let mut pending = collections;
@@ -3054,6 +3061,39 @@ mod retry_gate_tests {
         let mut synced = BatchedSyncOutcome::default();
         synced.synced.push(WAPatchName::CriticalBlock);
         assert!(synced.all_synced(), "this is the only case that settles it");
+    }
+
+    /// The scheduler must retry against the connection the outcome came from.
+    /// Dispatching the failure event runs consumer handlers synchronously, so a
+    /// disconnect there would otherwise let the retries — and, for InitialSync,
+    /// the gate they can stand down — attach to whatever replaced it.
+    #[tokio::test]
+    async fn retries_do_not_follow_the_connection_that_replaced_theirs() {
+        let client = crate::test_utils::create_test_client_with_name("retry-gen-bind").await;
+        let retired = client.connection_generation.load(Ordering::SeqCst);
+        client
+            .needs_initial_full_sync
+            .store(true, Ordering::Relaxed);
+
+        // The connection the retry belongs to is gone by the time it runs.
+        client
+            .connection_generation
+            .store(retired + 1, Ordering::SeqCst);
+        client.schedule_app_state_retry(
+            vec![WAPatchName::CriticalBlock],
+            retired,
+            SyncSettles::InitialSync,
+        );
+
+        // The first round sleeps before doing anything, so this is enough for a
+        // scheduler bound to the live generation to have acted.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            client.needs_initial_full_sync.load(Ordering::Relaxed),
+            "a retired connection's retry must not settle the replacement's bootstrap"
+        );
     }
 
     /// The backoff doubles from the minimum and clamps, matching the syncd
