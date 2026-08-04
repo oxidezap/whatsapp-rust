@@ -107,8 +107,14 @@ impl Client {
         // end the session — conflict, 516, an unrecoverable connect failure —
         // always set `expected_disconnect` alongside it, so the pair is what
         // separates a policy from a verdict.
+        // Paired with a signal that the current connection is over, because the
+        // flag alone is a preference. Either the disconnect was deliberate, or
+        // the supervision loop has already stopped — which is how the run loop
+        // itself exits when auto-reconnect is off: it sets `is_running` and
+        // breaks, without firing the notifier or touching `expected_disconnect`.
         !self.enable_auto_reconnect.load(Ordering::Relaxed)
-            && self.expected_disconnect.load(Ordering::Relaxed)
+            && (self.expected_disconnect.load(Ordering::Relaxed)
+                || !self.is_running.load(Ordering::Relaxed))
     }
 
     /// Returns `true` when the client has completed its full startup:

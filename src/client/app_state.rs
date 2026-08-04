@@ -44,15 +44,6 @@ const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
 /// How many extra rounds the loop may burn waiting for a writer to release a
 /// collection before the attempt budget is spent.
 const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
-/// How long a retry waits for a connection before giving the collections back to
-/// the next trigger.
-///
-/// Waiting is not polled against the round budget: the reconnect loop uses a
-/// Fibonacci backoff capped at 900s, so any fixed number of short rounds is
-/// outlasted by an unstable link and the work is dropped without one attempt
-/// ever reaching the server. This waits on the connection itself and is sized
-/// past that ceiling.
-const APP_STATE_RETRY_CONNECTION_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Delay before the attempt after `attempts` failures, doubling from
 /// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
@@ -915,22 +906,38 @@ impl Client {
         }
     }
 
-    /// Wait until there is a connection to work on, or `bound` elapses.
+    /// Wait until there is a connection to work on, or the client is finished.
     ///
-    /// Returns whether one arrived. Waiting on the notifier rather than polling
-    /// is what keeps a slow reconnect from consuming a retry budget that is
-    /// counted in attempts, not in seconds.
-    pub(crate) async fn await_connection(&self, bound: Duration) -> bool {
-        if self.is_connected() {
-            return true;
+    /// Returns whether one arrived. Bounded by the client's own lifetime rather
+    /// than by a duration: every number tried here was wrong in one direction or
+    /// the other, because the reconnect backoff is jittered, capped at 900s, and
+    /// followed by a handshake — there is no honest constant. Terminal is the
+    /// condition that actually means "stop waiting", and it is already tracked.
+    ///
+    /// Waits on socket readiness, not on `Connected`. The caller's question is
+    /// whether an IQ can be sent, which is [`Self::is_connected`]; the readiness
+    /// notifier additionally waits for the critical sync, so a retry would sit
+    /// through a bootstrap it is not part of.
+    pub(crate) async fn await_connection(&self) -> bool {
+        loop {
+            if self.is_connected() {
+                return true;
+            }
+            if self.is_terminal() {
+                return false;
+            }
+            // Registered before the re-checks, so a socket landing in the gap is
+            // not missed. A notification that does not leave a live connection
+            // simply loops: the wait ends on the state, never on one event.
+            let ready = self.socket_ready_notifier.listen();
+            if self.is_connected() {
+                return true;
+            }
+            if self.is_terminal() {
+                return false;
+            }
+            ready.await;
         }
-        // Registered before the re-check, so a connection landing in the gap is
-        // not missed.
-        let connected = self.connected_notifier.listen();
-        if self.is_connected() {
-            return true;
-        }
-        rt_timeout(&*self.runtime, bound, connected).await.is_ok() && self.is_connected()
     }
 
     /// Open a scope for work starting now on the live connection.
@@ -1066,9 +1073,9 @@ impl Client {
                 // rather than on any particular reason there is not one:
                 // `reconnect()` tears down without setting `expected_disconnect`,
                 // so asking about the reason misses the ordinary case.
-                if !client.await_connection(APP_STATE_RETRY_CONNECTION_WAIT).await {
-                    warn!(target: "Client/AppState", "No connection for the {name:?} retry; giving it back");
-                    break;
+                if !client.await_connection().await {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
+                    return;
                 }
 
                 let guard = match client
@@ -1168,15 +1175,17 @@ impl Client {
                     break;
                 }
                 client.runtime.sleep(app_state_retry_backoff(attempts)).await;
-                // Only a terminal state ends this. A planned reconnect must not:
-                // the trigger that asked for these collections is already
-                // consumed, and the reconnection path runs no bootstrap once the
-                // push name is known.
-                if client.is_terminal() {
+                // Waited for, not charged for. Without this the loop spends an
+                // attempt on every offline round, and the whole budget is gone
+                // long before a reconnect that backs off in minutes returns —
+                // taking a trigger the server already considers handled.
+                if !client.await_connection().await {
                     debug!(target: "Client/AppState", "App state retry cancelled: client is finished");
                     return;
                 }
 
+                // Rebound after the wait, not before: the connection that
+                // arrives is the one this attempt belongs to.
                 if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
                     // The work carries over; the authority to settle does not.
                     // This run no longer belongs to the bootstrap that scheduled
@@ -1737,16 +1746,16 @@ impl Client {
         name: WAPatchName,
         full_sync: bool,
     ) -> Result<()> {
-        // Not `is_shutting_down()`: that is true whenever `run()`'s supervision
-        // loop is not active, which a direct-connect client never starts — so it
-        // reported every one of them as shutting down and this returned `Ok(())`
-        // without ever syncing. What actually matters here is whether there is a
-        // socket to ask and whether the client is finished with it.
-        if self.is_terminal() || !self.is_connected() {
+        // Three separate questions, where `is_shutting_down()` answered a blend
+        // of two of them. Is the client finished; is there a socket; and can an
+        // IQ actually be sent — `send_and_wait_iq` refuses while `is_running` is
+        // false, so admitting a client without it only reaches the wire to fail.
+        // A planned reconnect is none of these: it leaves `is_running` set and
+        // clears `is_connected`, so the work waits instead of stopping.
+        if self.is_terminal() || !self.is_connected() || !self.is_running.load(Ordering::Relaxed) {
             debug!(
                 target: "Client/AppState",
-                "Skipping app state sync task {name:?}: terminal={} connected={}",
-                self.is_terminal(), self.is_connected()
+                "Skipping app state sync task {name:?}: no usable connection"
             );
             return Ok(());
         }
@@ -1767,9 +1776,6 @@ impl Client {
         let mut iteration = 0u32;
 
         while has_more {
-            // Same reason as the entry guard: `is_shutting_down()` is true for
-            // every direct-connect client, which would end the loop before its
-            // first page.
             if self.is_terminal() || !self.is_connected() {
                 debug!(target: "Client/AppState", "Stopping app state sync task {name:?}: no usable connection");
                 break;
@@ -3992,7 +3998,9 @@ mod lifecycle_signal_tests {
         // Turning auto-reconnect off is a preference an application may express
         // on a healthy connection — "do not come back after this one ends" — and
         // the run loop does not act on it until the socket exits. On its own it
-        // says nothing about the session being over.
+        // says nothing about the session being over, so the supervision loop has
+        // to be up for the scenario to be the one described.
+        client.is_running.store(true, Ordering::Relaxed);
         client.enable_auto_reconnect.store(false, Ordering::Relaxed);
         assert!(
             !client.is_terminal(),
@@ -4004,8 +4012,20 @@ mod lifecycle_signal_tests {
         // separates them from the preference above.
         client.expected_disconnect.store(true, Ordering::Relaxed);
         assert!(client.is_terminal());
-        client.enable_auto_reconnect.store(true, Ordering::Relaxed);
         client.expected_disconnect.store(false, Ordering::Relaxed);
+
+        // And the run loop's own exit: it stops by clearing `is_running` alone,
+        // without firing the notifier or setting `expected_disconnect`, so that
+        // pairing has to count too or retries wait for a connection that is
+        // never coming.
+        client.is_running.store(false, Ordering::Relaxed);
+        assert!(
+            client.is_terminal(),
+            "the supervision loop ending with auto-reconnect off is terminal"
+        );
+
+        client.enable_auto_reconnect.store(true, Ordering::Relaxed);
+        client.is_running.store(true, Ordering::Relaxed);
         assert!(!client.is_terminal());
 
         // And an explicit shutdown, which reconnects deliberately leave alone.
@@ -4047,6 +4067,80 @@ mod connection_guard_tests {
         assert!(
             !client.is_terminal(),
             "so work that outlives a connection stays alive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod await_connection_tests {
+    use super::*;
+
+    /// A notification that does not leave a live connection must not end the
+    /// wait. The socket can be announced and gone again before the check reads
+    /// it, and treating that as an answer dropped the retry while the client was
+    /// still perfectly able to reconnect.
+    #[tokio::test]
+    async fn a_stale_notification_does_not_end_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-stale").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // Announced, but nothing is connected: the wait has to carry on.
+        client.socket_ready_notifier.notify(usize::MAX);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "an event without a connection is not an answer"
+        );
+
+        client.set_connected_for_test(true);
+        client.socket_ready_notifier.notify(usize::MAX);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a real connection must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that one arrived"
+        );
+    }
+
+    /// The wait has no duration bound, so the terminal state is the only thing
+    /// that ends it when no connection is coming. Every duration tried here was
+    /// wrong in one direction or the other.
+    #[tokio::test]
+    async fn a_finished_client_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-terminal").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        client.signal_shutdown_sync();
+        client.socket_ready_notifier.notify(usize::MAX);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a finished client must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that none arrived"
         );
     }
 }
