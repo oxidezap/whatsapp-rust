@@ -5,8 +5,18 @@
 //! pays off for a caller that keeps the record between operations. These
 //! benches contrast the two shapes: a store that hands back the cached record
 //! (what this repository does) against one that rebuilds it from components on
-//! every load. `rebuild_only` isolates the conversion cost so the difference
-//! between the two group benches can be attributed.
+//! every load. `component_round_trip` isolates the conversion a component-backed
+//! store pays per operation, in both directions, so what is left of the
+//! difference between the two group benches can be attributed to the cold memo.
+//!
+//! The decrypt benches unwrap: a replayed ciphertext would return
+//! `DuplicatedMessage` and time the error path instead, which no assertion on a
+//! `black_box`ed `Result` would catch.
+//!
+//! Pin a core when reading these locally (`taskset -c <n> <bench binary>`) and
+//! compare `fastest`. Unpinned, the absolute figures move by 2x between runs
+//! while the ratios hold, which is enough to invent an environment difference
+//! that is not there.
 
 use async_trait::async_trait;
 use divan::Bencher;
@@ -153,11 +163,10 @@ fn group_decrypt_warm_record(bencher: Bencher) {
             (receiver, message)
         })
         .bench_refs(|(receiver, message)| {
-            black_box(futures::executor::block_on(group_decrypt(
-                message,
-                receiver,
-                &sender_key_name,
-            )))
+            black_box(
+                futures::executor::block_on(group_decrypt(message, receiver, &sender_key_name))
+                    .expect("decrypt must succeed on every timed iteration"),
+            )
         });
 }
 
@@ -178,24 +187,33 @@ fn group_decrypt_rebuilt_record(bencher: Bencher) {
             (rebuilt, message)
         })
         .bench_refs(|(receiver, message)| {
-            black_box(futures::executor::block_on(group_decrypt(
-                message,
-                receiver,
-                &sender_key_name,
-            )))
+            black_box(
+                futures::executor::block_on(group_decrypt(message, receiver, &sender_key_name))
+                    .expect("decrypt must succeed on every timed iteration"),
+            )
         });
 }
 
-/// The component round trip on its own. Subtract this from the rebuilt-record
-/// benches to attribute what is left to the cold memo.
+/// Both conversions a component-backed store pays per operation: `from_components`
+/// on load and `into_components` on store. Subtract this from the rebuilt-record
+/// benches to attribute what is left to the cold memo. Measuring only the load
+/// side would leave the export attributed to re-derivation.
 #[divan::bench]
-fn rebuild_only(bencher: Bencher) {
+fn component_round_trip(bencher: Bencher) {
     let sender_key_name = name();
     bencher
         .with_inputs(|| rebuilding_pair().0)
         .bench_refs(|store| {
-            black_box(futures::executor::block_on(
-                store.load_sender_key(&sender_key_name),
-            ))
+            futures::executor::block_on(async {
+                let record = store
+                    .load_sender_key(&sender_key_name)
+                    .await
+                    .expect("load")
+                    .expect("record present");
+                store
+                    .store_sender_key(&sender_key_name, black_box(record))
+                    .await
+                    .expect("store");
+            })
         });
 }
