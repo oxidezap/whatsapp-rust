@@ -139,6 +139,10 @@ name = "appstate_sync_benchmark"
 harness = false
 
 [[bench]]
+name = "sender_key_derivation_benchmark"
+harness = false
+
+[[bench]]
 name = "voip_benchmark"
 harness = false
 required-features = ["voip-mlow"]

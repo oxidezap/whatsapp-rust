@@ -217,12 +217,16 @@ pub struct SenderKeyState {
     /// `as_protobuf`. `None` only for a structurally invalid state.
     sender_chain: Option<SenderChainKey>,
     /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
-    /// per-send signature skips a basepoint multiplication (~18% of a warm
-    /// group send when re-derived from bytes every message). Clones carry the
-    /// warm value, and the record cache stores this object back after every
+    /// per-send signature skips a basepoint multiplication. Clones carry the
+    /// warm value, and a record cache stores this object back after every
     /// send, so the memo persists for the cache lifetime. Never persisted;
     /// rebuilt lazily after a cold load. If a signing-key setter is ever
     /// added, it must reset this memo.
+    ///
+    /// The payoff is the caller's to collect: a caller that discards the record
+    /// between operations, as one persisting through `into_components` does,
+    /// re-derives per message. `benches/sender_key_derivation_benchmark.rs` in
+    /// `wacore` measures both shapes.
     signing_key_memo: std::sync::OnceLock<PrivateKey>,
     /// Receive-side mirror of `signing_key_memo`: cached verifier whose
     /// Edwards derivations are reused across every incoming message under
@@ -851,6 +855,42 @@ impl SenderKeyRecord {
 mod tests {
     use super::*;
     use crate::protocol::KeyPair;
+
+    /// A record cache hands out a clone on every load, so the memo has to
+    /// survive one. If it did not, a long-lived cache would re-derive per
+    /// message exactly like a caller that rebuilds the record from components.
+    #[test]
+    fn a_cloned_state_carries_the_warm_signing_memo() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let pair = KeyPair::generate(&mut rng);
+        let state =
+            SenderKeyState::new(3, 7, 0, &[9u8; 32], pair.public_key, Some(pair.private_key))
+                .expect("valid state");
+        assert!(state.signing_key_memo.get().is_some(), "new() warms it");
+
+        let clone = state.clone();
+        assert!(
+            clone.signing_key_memo.get().is_some(),
+            "the clone must carry the warm memo, not a cold OnceLock"
+        );
+    }
+
+    /// The other half of the same invariant: a state rebuilt from its protobuf
+    /// starts cold, which is what makes the export round trip re-derive.
+    #[test]
+    fn a_state_rebuilt_from_protobuf_starts_cold() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let pair = KeyPair::generate(&mut rng);
+        let state =
+            SenderKeyState::new(3, 7, 0, &[9u8; 32], pair.public_key, Some(pair.private_key))
+                .expect("valid state");
+
+        let rebuilt = SenderKeyState::from_protobuf(state.as_protobuf());
+        assert!(rebuilt.signing_key_memo.get().is_none());
+        assert!(rebuilt.verifying_key_memo.get().is_none());
+        // Still correct, just paid for again.
+        assert!(rebuilt.signing_key_private().is_ok());
+    }
 
     /// Test SenderMessageKey derivation is deterministic
     #[test]
