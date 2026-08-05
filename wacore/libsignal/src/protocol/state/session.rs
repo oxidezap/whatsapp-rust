@@ -849,14 +849,28 @@ impl SessionRecord {
     /// persistence is synchronous and durable before the ciphertext reaches
     /// the wire.
     ///
-    /// The consumer applies this to every record it loads; nothing is inferred
-    /// from the stored representation. A snapshot written while the lease was
-    /// in force still carries a reservation that may already have been
-    /// published, so it is materialized once here before the lease goes away.
-    /// The guarantee being given up is stated on [`CounterLease`].
+    /// By default the record leases outbound counters in batches, so the send
+    /// path needs a durable flush only when a batch runs out and any reload
+    /// fast-forwards past the whole lease. A consumer that persists before the
+    /// wire gets nothing from that and pays for it, since every export has to
+    /// burn the reserved range.
+    ///
+    /// **This gives up a real guarantee.** Message keys and IVs are derived
+    /// deterministically from the counter, so without the lease a crash between
+    /// the encrypt and the write can reissue a counter and with it the
+    /// (key, IV) pair. Only a consumer whose writes are durable before the wire
+    /// can make that trade.
+    ///
+    /// Apply this to every record loaded; nothing is inferred from the stored
+    /// representation, because the same representation can be persisted by a
+    /// consumer that wants the lease and by one that does not. A snapshot
+    /// written while the lease was in force still carries a reservation that
+    /// may already have been published, so it is materialized once here before
+    /// the lease goes away.
     pub fn waive_counter_lease(&mut self) {
-        let ceiling = self.lease.waive();
+        let ceiling = self.lease.ceiling();
         if ceiling == 0 {
+            self.lease.waive();
             return;
         }
         // Every state the lease covered has to burn it, archived ones included:
@@ -870,6 +884,7 @@ impl SessionRecord {
             state.fast_forward_sender_chain_or_drop(ceiling);
             *session = state.session;
         }
+        self.lease.waive();
     }
 
     /// Lease a fresh batch of sender-chain counters after `spent_counter` was

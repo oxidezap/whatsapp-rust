@@ -572,21 +572,22 @@ impl SenderKeyRecord {
         self.lease.ceiling()
     }
 
-    /// Waive counter leasing on this record, declaring that the consumer's
-    /// persistence is synchronous and durable before the ciphertext reaches
-    /// the wire.
+    /// Waive counter leasing on this record.
     ///
-    /// The group counterpart of `SessionRecord::waive_counter_lease`, applied
-    /// per load and never inferred. A snapshot written under the lease is
-    /// materialized once here, since its reservation may already have been
-    /// published. The guarantee being given up is stated on `CounterLease`.
+    /// The group counterpart of
+    /// [`SessionRecord::waive_counter_lease`](crate::protocol::SessionRecord::waive_counter_lease),
+    /// including the guarantee it gives up.
     pub fn waive_counter_lease(&mut self) -> Result<(), SignalProtocolError> {
-        let ceiling = self.lease.waive();
+        // Materialize before dropping the ceiling: a chain too stale to advance
+        // leaves the record on its lease rather than free to reissue the
+        // iterations that ceiling covers.
+        let ceiling = self.lease.ceiling();
         if ceiling > 0
             && let Some(state) = self.states.front_mut()
         {
             state.fast_forward_sender_chain(ceiling)?;
         }
+        self.lease.waive();
         Ok(())
     }
 

@@ -1,22 +1,9 @@
 //! Whether a record leases outbound counters ahead of durability.
 //!
-//! Message keys and IVs are derived deterministically from an outbound
-//! counter, so republishing one after a crash reuses a (key, IV) pair. The
-//! default guards that by leasing counters in batches: the send path needs a
-//! durable flush only when a batch runs out, and any reload fast-forwards past
-//! the whole lease.
-//!
-//! A consumer whose persistence is already synchronous and durable before the
-//! ciphertext reaches the wire gets nothing from the lease and pays for it,
-//! because every export has to burn the reserved range. [`CounterLease::Waived`]
-//! is that consumer's declaration, and it is never inferred: the same record
-//! shape can be persisted by a consumer that wants the lease and by one that
-//! does not, so tying the policy to the representation would turn a storage
-//! change into a silent change of guarantee.
-//!
-//! Waiving gives up a real guarantee. Without the lease, a crash between the
-//! encrypt and the write can reissue a counter and with it the (key, IV) pair.
-//! Only a consumer that persists before the wire can make that trade.
+//! Shared by `SessionRecord` and `SenderKeyRecord`, which lease the same way
+//! over different units. What the policy means to a consumer, and what waiving
+//! costs it, is documented on `SessionRecord::waive_counter_lease`, the public
+//! surface that offers the choice.
 
 use crate::protocol::consts;
 
@@ -112,17 +99,15 @@ impl CounterLease {
         }
     }
 
-    /// Waive the lease, returning any ceiling the caller must still materialize.
+    /// Drop the lease.
     ///
-    /// A record loaded from a snapshot written while the lease was in force
-    /// carries a reservation that may already have been published. Waiving does
-    /// not make that untrue, so the caller advances past it once; from then on
-    /// counters are consecutive. Refusing such a record instead would strand
-    /// the address for good.
-    pub(crate) fn waive(&mut self) -> u32 {
-        let ceiling = self.ceiling();
+    /// The caller materializes [`Self::ceiling`] first and only gets here once
+    /// that succeeded: a record loaded from a snapshot written while the lease
+    /// was in force carries a reservation that may already have been published,
+    /// and dropping the ceiling before advancing past it would leave the record
+    /// free to reissue those counters.
+    pub(crate) fn waive(&mut self) {
         *self = Self::Waived;
-        ceiling
     }
 }
 
@@ -164,13 +149,14 @@ mod tests {
     }
 
     #[test]
-    fn waiving_hands_back_the_ceiling_to_materialize_once() {
+    fn waiving_reports_nothing_left_to_materialize() {
         let mut lease = CounterLease::from_persisted_ceiling(512);
+        assert_eq!(lease.ceiling(), 512);
 
-        assert_eq!(lease.waive(), 512);
+        lease.waive();
         assert_eq!(lease, CounterLease::Waived);
-        // Converged: a second waive has nothing left to materialize.
-        assert_eq!(lease.waive(), 0);
+        // Converged: nothing left for a later load to advance past.
+        assert_eq!(lease.ceiling(), 0);
     }
 
     #[test]

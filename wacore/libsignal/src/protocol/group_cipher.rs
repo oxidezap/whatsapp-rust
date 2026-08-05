@@ -690,6 +690,33 @@ mod tests {
         assert_eq!(second.iteration(), ceiling + 1);
     }
 
+    /// A ceiling too far ahead to advance past must leave the record on its
+    /// lease: dropping it there would free the record to reissue exactly the
+    /// iterations the ceiling says may already be on the wire.
+    #[test]
+    fn a_waiver_that_cannot_materialize_keeps_the_lease() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("distribution message");
+
+        let record = bob.keys.get_mut(&name).expect("record");
+        record.reserve_iterations(consts::MAX_RESERVATION_FAST_FORWARD + 1);
+        let ceiling = record.reserved_iteration();
+
+        assert!(record.waive_counter_lease().is_err());
+        assert_eq!(
+            record.reserved_iteration(),
+            ceiling,
+            "a failed waiver must not drop the ceiling"
+        );
+    }
+
     /// A store that emulates the real signal-cache gate: it records whether each
     /// stored advance was wire-gated and clears the transient flag, so a run of
     /// sends can be counted for gate frequency.
