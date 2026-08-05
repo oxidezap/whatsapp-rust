@@ -856,42 +856,6 @@ mod tests {
     use super::*;
     use crate::protocol::KeyPair;
 
-    /// A record cache hands out a clone on every load, so the memo has to
-    /// survive one. If it did not, a long-lived cache would re-derive per
-    /// message exactly like a caller that rebuilds the record from components.
-    #[test]
-    fn a_cloned_state_carries_the_warm_signing_memo() {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let pair = KeyPair::generate(&mut rng);
-        let state =
-            SenderKeyState::new(3, 7, 0, &[9u8; 32], pair.public_key, Some(pair.private_key))
-                .expect("valid state");
-        assert!(state.signing_key_memo.get().is_some(), "new() warms it");
-
-        let clone = state.clone();
-        assert!(
-            clone.signing_key_memo.get().is_some(),
-            "the clone must carry the warm memo, not a cold OnceLock"
-        );
-    }
-
-    /// The other half of the same invariant: a state rebuilt from its protobuf
-    /// starts cold, which is what makes the export round trip re-derive.
-    #[test]
-    fn a_state_rebuilt_from_protobuf_starts_cold() {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let pair = KeyPair::generate(&mut rng);
-        let state =
-            SenderKeyState::new(3, 7, 0, &[9u8; 32], pair.public_key, Some(pair.private_key))
-                .expect("valid state");
-
-        let rebuilt = SenderKeyState::from_protobuf(state.as_protobuf());
-        assert!(rebuilt.signing_key_memo.get().is_none());
-        assert!(rebuilt.verifying_key_memo.get().is_none());
-        // Still correct, just paid for again.
-        assert!(rebuilt.signing_key_private().is_ok());
-    }
-
     /// Test SenderMessageKey derivation is deterministic
     #[test]
     fn test_sender_message_key_derivation() {

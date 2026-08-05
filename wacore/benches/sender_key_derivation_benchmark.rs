@@ -13,10 +13,16 @@
 //! `DuplicatedMessage` and time the error path instead, which no assertion on a
 //! `black_box`ed `Result` would catch.
 //!
+//! Both stores waive the counter lease. Without that, only the rebuilding side
+//! materializes a reservation on export, and the roughly 63 chain-KDF steps
+//! that costs land in the delta as if they were re-derivation.
+//!
 //! Pin a core when reading these locally (`taskset -c <n> <bench binary>`) and
 //! compare `fastest`. Unpinned, the absolute figures move by 2x between runs
 //! while the ratios hold, which is enough to invent an environment difference
-//! that is not there.
+//! that is not there. CI reads them by instruction count instead, which is why
+//! the RNG below is fixed-seed: scalar bits change instruction counts, so an
+//! entropy-seeded key would move the numbers with no code change.
 
 use async_trait::async_trait;
 use divan::Bencher;
@@ -29,6 +35,16 @@ use wacore_libsignal::protocol::{
 };
 
 type SigResult<T> = wacore_libsignal::protocol::error::Result<T>;
+
+/// Fixed seeds, distinct per call, so instruction counts depend on the code
+/// rather than on which scalars the OS entropy happened to produce.
+fn bench_rng() -> rand::rngs::StdRng {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CTR: AtomicU32 = AtomicU32::new(0);
+    <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
+        0x5E4D_0000 + u64::from(CTR.fetch_add(1, Ordering::Relaxed)),
+    )
+}
 
 fn main() {
     divan::main();
@@ -46,7 +62,12 @@ impl SenderKeyStore for WarmStore {
         Ok(())
     }
     async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
-        Ok(self.0.get(n).cloned())
+        let mut record = match self.0.get(n) {
+            Some(record) => record.clone(),
+            None => return Ok(None),
+        };
+        record.waive_counter_lease()?;
+        Ok(Some(record))
     }
 }
 
@@ -62,10 +83,12 @@ impl SenderKeyStore for RebuildingStore {
         Ok(())
     }
     async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
-        self.0
-            .get(n)
-            .map(|components| SenderKeyRecord::from_components(components.clone()))
-            .transpose()
+        let Some(components) = self.0.get(n) else {
+            return Ok(None);
+        };
+        let mut record = SenderKeyRecord::from_components(components.clone())?;
+        record.waive_counter_lease()?;
+        Ok(Some(record))
     }
 }
 
@@ -76,7 +99,7 @@ fn name() -> SenderKeyName {
 /// A sender that has already sent once (memo warm, chain past its first
 /// advance) and a receiver that has already received once.
 fn warm_pair() -> (WarmStore, WarmStore) {
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
     let sender_key_name = name();
     let mut sender = WarmStore::default();
     let mut receiver = WarmStore::default();
@@ -118,13 +141,16 @@ fn rebuilding_pair() -> (RebuildingStore, RebuildingStore) {
 fn group_encrypt_warm_record(bencher: Bencher) {
     let sender_key_name = name();
     bencher.with_inputs(warm_pair).bench_refs(|(sender, _)| {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        black_box(futures::executor::block_on(group_encrypt(
-            sender,
-            &sender_key_name,
-            b"payload",
-            &mut rng,
-        )))
+        let mut rng = bench_rng();
+        black_box(
+            futures::executor::block_on(group_encrypt(
+                sender,
+                &sender_key_name,
+                b"payload",
+                &mut rng,
+            ))
+            .expect("encrypt must succeed on every timed iteration"),
+        )
     });
 }
 
@@ -134,19 +160,22 @@ fn group_encrypt_rebuilt_record(bencher: Bencher) {
     bencher
         .with_inputs(rebuilding_pair)
         .bench_refs(|(sender, _)| {
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-            black_box(futures::executor::block_on(group_encrypt(
-                sender,
-                &sender_key_name,
-                b"payload",
-                &mut rng,
-            )))
+            let mut rng = bench_rng();
+            black_box(
+                futures::executor::block_on(group_encrypt(
+                    sender,
+                    &sender_key_name,
+                    b"payload",
+                    &mut rng,
+                ))
+                .expect("encrypt must succeed on every timed iteration"),
+            )
         });
 }
 
 /// Ciphertext the decrypt benches consume, produced outside the timed region.
 fn ciphertext(sender: &mut WarmStore, sender_key_name: &SenderKeyName) -> Vec<u8> {
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
     futures::executor::block_on(group_encrypt(sender, sender_key_name, b"payload", &mut rng))
         .expect("encrypt")
         .serialized()
