@@ -732,9 +732,11 @@ impl From<&SessionState> for SessionStructure {
 
 /// Record-level field number carrying the sender-chain counter reservation in
 /// the serialized `RecordStructure`. The upstream (whatspec) proto cannot be
-/// edited to add local fields, so the record encoder — already hand-rolled in
-/// [`SessionRecord::serialize_into`] — writes it directly; the number sits far
-/// above RecordStructure's fields (1, 2) so a future upstream addition cannot
+/// edited to add local fields — `waproto/build.rs` splices those into the
+/// descriptor instead, via `LOCAL_FIELDS` — but this one is written directly
+/// by the record encoder, already hand-rolled in
+/// [`SessionRecord::serialize_into`]; the number sits far above
+/// RecordStructure's fields (1, 2) so a future upstream addition cannot
 /// collide. Standard unknown-field skipping keeps old readers compatible.
 ///
 /// That compatibility is one-way: a build without lease support silently
@@ -1651,6 +1653,7 @@ mod tests {
                     cipher_key: Some(vec![seed.wrapping_add(idx); 32].into()),
                     mac_key: Some(vec![seed.wrapping_add(idx).wrapping_add(1); 32].into()),
                     iv: Some(vec![seed.wrapping_add(idx).wrapping_add(2); 16].into()),
+                    seed: Some(vec![seed.wrapping_add(idx).wrapping_add(3); 32].into()),
                 }
             })
             .collect();
@@ -1884,6 +1887,40 @@ mod tests {
         seed[0] = counter as u8;
         seed[1] = (counter >> 8) as u8;
         MessageKeyGenerator::new_from_seed(&seed, counter)
+    }
+
+    /// The seed is additive: a record written before it existed must still
+    /// deserialize and hand back exactly the keys it stored.
+    #[test]
+    fn seedless_persisted_message_keys_still_load_and_decrypt() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let mut state = create_test_session_state(3, &base_key);
+        let sender_key = KeyPair::generate(&mut rng()).public_key;
+        state.add_receiver_chain(&sender_key, &ChainKey::new([7u8; 32], 0));
+        state
+            .set_message_keys(&sender_key, create_test_message_key_generator(5))
+            .expect("skipped key stored");
+        let expected = create_test_message_key_generator(5).generate_keys();
+
+        let mut structure = SessionStructure::from(&state);
+        assert!(structure.receiver_chains[0].message_keys[0].seed.is_some());
+        structure.receiver_chains[0].message_keys[0].seed = None;
+        let bytes = SessionRecord::new(SessionState::from(structure))
+            .serialize()
+            .expect("serialize");
+
+        let mut record = SessionRecord::deserialize(&bytes).expect("deserialize");
+        let keys = record
+            .session_state_mut()
+            .expect("current state")
+            .get_message_keys(&sender_key, 5)
+            .expect("valid session")
+            .expect("skipped key survives")
+            .generate_keys();
+
+        assert_eq!(keys.cipher_key(), expected.cipher_key());
+        assert_eq!(keys.mac_key(), expected.mac_key());
+        assert_eq!(keys.iv(), expected.iv());
     }
 
     #[test]

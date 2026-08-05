@@ -569,8 +569,10 @@ impl SessionRecord {
     /// is an inert placeholder. Local identity and registration values remain
     /// external because v1 does not persist them.
     ///
-    /// Derived skipped-message keys have no inverse to their v1 seed, so their
-    /// presence returns [`LegacySessionInteropError::NotRepresentable`].
+    /// Skipped message keys carry the seed v1 expects. A record persisted
+    /// before that seed was retained has only the derived keys, which have no
+    /// inverse, so it returns
+    /// [`LegacySessionInteropError::ChainNotRepresentable`].
     pub fn into_legacy_session_v1_operational(
         self,
     ) -> Result<LegacySessionRecordV1, LegacySessionInteropError> {
@@ -961,7 +963,10 @@ fn chain_into_components(
             .into_iter()
             .map(|key| SessionMessageKeyComponents {
                 index: key.index,
-                material: SessionMessageKeyMaterial::Seed(key.seed.into()),
+                material: SessionMessageKeyMaterial::Seed(
+                    <[u8; LEGACY_KEY_MATERIAL_LEN]>::try_from(key.seed.as_ref())
+                        .expect("validated skipped message-key seed"),
+                ),
             })
             .collect(),
     }
@@ -1208,28 +1213,24 @@ fn project_chain_parts(
             chain: chain_index,
             field: LegacySessionFieldV1::ChainKeyIndex,
         })?;
-    if message_keys
-        .iter()
-        .any(|key| matches!(key.material, SessionMessageKeyMaterial::Derived { .. }))
-    {
-        return Err(LegacySessionInteropError::ChainNotRepresentable {
-            session,
-            chain: chain_index,
-            field: LegacySessionUnrepresentableFieldV1::DerivedMessageKey,
-        });
-    }
+    // Exhaustive so a new material variant has to state its v1 form here
+    // instead of compiling into a silent projection.
     let message_keys = message_keys
         .into_iter()
-        .map(|key| {
-            let SessionMessageKeyMaterial::Seed(seed) = key.material else {
-                unreachable!("derived message-key material was rejected before allocation")
-            };
-            LegacySessionMessageKeyV1 {
+        .map(|key| match key.material {
+            SessionMessageKeyMaterial::Seed(seed) => Ok(LegacySessionMessageKeyV1 {
                 index: key.index,
-                seed: seed.into(),
+                seed: Bytes::copy_from_slice(&seed),
+            }),
+            SessionMessageKeyMaterial::Derived { .. } => {
+                Err(LegacySessionInteropError::ChainNotRepresentable {
+                    session,
+                    chain: chain_index,
+                    field: LegacySessionUnrepresentableFieldV1::DerivedMessageKey,
+                })
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(LegacySessionChainV1 {
         ratchet_key,
@@ -1659,27 +1660,58 @@ mod tests {
             seed: Bytes::copy_from_slice(&seed),
         }];
 
-        let components = record(vec![session])
+        let native = record(vec![session])
             .into_session_record(local_context())
-            .expect("import")
+            .expect("import");
+        let persisted = crate::protocol::stores::SessionStructure::from(
+            native.session_state().expect("current state"),
+        );
+        let stored = &persisted.receiver_chains[0].message_keys[0];
+        let expected = MessageKeyGenerator::new_from_seed(&seed, 0).generate_keys();
+        assert_eq!(
+            stored.cipher_key.as_deref(),
+            Some(&expected.cipher_key()[..])
+        );
+        assert_eq!(stored.mac_key.as_deref(), Some(&expected.mac_key()[..]));
+        assert_eq!(stored.iv.as_deref(), Some(&expected.iv()[..]));
+        assert_eq!(stored.seed.as_deref(), Some(&seed[..]));
+
+        let material = &native
             .into_components()
-            .expect("components");
-        let material = &components.current_session.expect("current").receiver_chains[0]
+            .expect("components")
+            .current_session
+            .expect("current")
+            .receiver_chains[0]
             .message_keys[0]
             .material;
-        let expected = MessageKeyGenerator::new_from_seed(&seed, 0).generate_keys();
-        match material {
-            SessionMessageKeyMaterial::Derived {
-                cipher_key,
-                mac_key,
-                iv,
-            } => {
-                assert_eq!(cipher_key, expected.cipher_key());
-                assert_eq!(mac_key, expected.mac_key());
-                assert_eq!(iv, expected.iv());
-            }
-            SessionMessageKeyMaterial::Seed(_) => panic!("seed must be derived on import"),
-        }
+        assert_eq!(material, &SessionMessageKeyMaterial::Seed(seed));
+    }
+
+    /// Regression: a session holding a skipped key used to be unprojectable
+    /// from the first cycle, because import kept only the derived keys.
+    #[test]
+    fn a_retained_skipped_key_projects_back_to_its_seed() {
+        let seed = vec![0x77; 32];
+        let mut session = reference_session(63, LegacySessionDispositionV1::Current);
+        session.chains[1].message_keys = vec![LegacySessionMessageKeyV1 {
+            index: 0,
+            seed: seed.clone().into(),
+        }];
+
+        let projected = record(vec![session])
+            .into_session_record(local_context())
+            .expect("import")
+            .into_legacy_session_v1_operational()
+            .expect("skipped key stays projectable");
+
+        let chains = &projected.sessions[0].session.chains;
+        let receiving = chains
+            .iter()
+            .find(|chain| chain.role == LegacySessionChainRoleV1::Receiving)
+            .expect("receiving chain");
+        assert_eq!(receiving.message_keys.len(), 1);
+        assert_eq!(receiving.message_keys[0].index, 0);
+        assert_eq!(receiving.message_keys[0].seed, seed);
     }
 
     #[test]
@@ -1813,9 +1845,31 @@ mod tests {
             index: 0,
             seed: vec![0x44; 32].into(),
         }];
-        let native = record(vec![session])
+        // Skipped keys persisted before the seed was retained come back as
+        // `Derived`; strip the seed to reproduce one of those records.
+        let mut components = record(vec![session])
             .into_session_record(local_context())
-            .expect("import");
+            .expect("import")
+            .into_components()
+            .expect("components");
+        let key = &mut components
+            .current_session
+            .as_mut()
+            .expect("current")
+            .receiver_chains[0]
+            .message_keys[0];
+        let SessionMessageKeyMaterial::Seed(seed) = &key.material else {
+            panic!("imported skipped key must retain its seed")
+        };
+        let seed = <[u8; 32]>::try_from(seed.as_slice()).expect("32-byte seed");
+        let keys = MessageKeyGenerator::new_from_seed(&seed, key.index).generate_keys();
+        key.material = SessionMessageKeyMaterial::Derived {
+            cipher_key: *keys.cipher_key(),
+            mac_key: *keys.mac_key(),
+            iv: *keys.iv(),
+        };
+
+        let native = SessionRecord::from_components(components).expect("seedless record");
         assert!(matches!(
             native.into_legacy_session_v1_operational(),
             Err(LegacySessionInteropError::ChainNotRepresentable {

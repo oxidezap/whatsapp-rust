@@ -14,9 +14,43 @@
 //! codegen time (word boundaries match heck/prost), so the Rust API keeps the
 //! prost-style names. Attribute/override paths below therefore use the
 //! *proto* (camelCase) field names.
+//!
+//! Fields this crate persists but upstream does not declare go in
+//! [`LOCAL_FIELDS`], never in the `.proto`.
 
 use buffa::Message as _;
-use buffa_descriptor::generated::descriptor::{DescriptorProto, FileDescriptorSet};
+use buffa_descriptor::generated::descriptor::{
+    DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
+};
+
+/// A field this crate persists that the upstream proto does not declare.
+struct LocalField {
+    /// Message path inside the `whatsapp` package, e.g. `Outer.Inner`.
+    message: &'static str,
+    name: &'static str,
+    number: i32,
+    kind: field_descriptor_proto::Type,
+}
+
+/// Local additions to the upstream schema, spliced into the descriptor at
+/// build time. `src/whatsapp.proto` and `src/whatsapp.desc` are regenerated
+/// wholesale from whatspec, so a field declared there would be lost on the
+/// next sync; declared here it survives, and a sync that lands on one of these
+/// numbers fails the build instead of silently reinterpreting records already
+/// written.
+///
+/// Numbers stay far above what upstream uses — it appends low ones without
+/// notice, the way `kyberPreKeyId = 4` and `kyberCiphertext = 5` arrived on
+/// `SessionStructure.PendingPreKey`.
+const LOCAL_FIELDS: &[LocalField] = &[LocalField {
+    // Deriving the stored cipher/mac/iv from this seed is one-way, so a
+    // skipped message key that kept only the derived material could never be
+    // projected back into a seed-based external format.
+    message: "SessionStructure.Chain.MessageKey",
+    name: "seed",
+    number: 100,
+    kind: field_descriptor_proto::Type::TYPE_BYTES,
+}];
 
 fn main() -> std::io::Result<()> {
     // Rerun on desc change (new codegen) and proto change (so the staleness
@@ -31,15 +65,28 @@ fn main() -> std::io::Result<()> {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
     let out_path = std::path::PathBuf::from(&out_dir);
 
-    // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     // Build-time descriptor decode — nothing to pin in waproto::codec.
     #[allow(clippy::disallowed_methods)]
-    let fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
+    let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
         .map_err(std::io::Error::other)?;
+    apply_local_fields(&mut fds)?;
+
+    // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;
 
+    // Codegen reads the spliced descriptor, so local fields reach the Rust API
+    // with the same guarantees as upstream ones. `buffa_build` registers this
+    // path as rerun-if-changed, so rewriting it unconditionally would bump its
+    // mtime on every build and leave the crate permanently dirty.
+    let descriptor = out_path.join("whatsapp.local.desc");
+    #[allow(clippy::disallowed_methods)]
+    let encoded = fds.encode_to_vec();
+    if !std::fs::read(&descriptor).is_ok_and(|current| current == encoded) {
+        std::fs::write(&descriptor, &encoded)?;
+    }
+
     buffa_build::Config::new()
-        .descriptor_set("src/whatsapp.desc")
+        .descriptor_set(&descriptor)
         .files(&["whatsapp.proto"])
         // snake_case Rust idents from the upstream camelCase proto (see module
         // docs); wire format and descriptor names are untouched.
@@ -137,6 +184,10 @@ fn main() -> std::io::Result<()> {
             "#[serde(skip)]",
         )
         .field_attribute(
+            ".whatsapp.SessionStructure.Chain.MessageKey.seed",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
             ".whatsapp.SenderKeyStateStructure.SenderChainKey.seed",
             "#[serde(skip)]",
         )
@@ -163,6 +214,61 @@ fn main() -> std::io::Result<()> {
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    Ok(())
+}
+
+/// Splice [`LOCAL_FIELDS`] into the descriptor decoded from `whatsapp.desc`.
+///
+/// Fails rather than resolves when upstream already occupies the name or the
+/// number: silently winning that race would change what an existing field
+/// decodes as, and every record already on disk with it.
+fn apply_local_fields(fds: &mut FileDescriptorSet) -> std::io::Result<()> {
+    for local in LOCAL_FIELDS {
+        let mut messages = fds
+            .file
+            .iter_mut()
+            .filter(|file| file.package.as_deref() == Some("whatsapp"))
+            .flat_map(|file| file.message_type.iter_mut());
+        let mut message = None;
+        for segment in local.message.split('.') {
+            message = match message {
+                None => messages.find(|msg| msg.name.as_deref() == Some(segment)),
+                Some(parent) => {
+                    let parent: &mut DescriptorProto = parent;
+                    parent
+                        .nested_type
+                        .iter_mut()
+                        .find(|msg| msg.name.as_deref() == Some(segment))
+                }
+            };
+            if message.is_none() {
+                break;
+            }
+        }
+        let message = message.ok_or_else(|| {
+            std::io::Error::other(format!("local field target {} not found", local.message))
+        })?;
+
+        if let Some(existing) = message
+            .field
+            .iter()
+            .find(|f| f.number == Some(local.number) || f.name.as_deref() == Some(local.name))
+        {
+            return Err(std::io::Error::other(format!(
+                "local field {}.{} = {} collides with upstream {:?} = {:?}",
+                local.message, local.name, local.number, existing.name, existing.number
+            )));
+        }
+
+        message.field.push(FieldDescriptorProto {
+            name: Some(local.name.to_owned()),
+            number: Some(local.number),
+            label: Some(field_descriptor_proto::Label::LABEL_OPTIONAL),
+            r#type: Some(local.kind),
+            json_name: Some(local.name.to_owned()),
+            ..Default::default()
+        });
+    }
     Ok(())
 }
 

@@ -157,6 +157,10 @@ jobs:
         run: |
           cargo nextest run --profile ci -p wacore --features voip --lib
           cargo nextest run --profile ci -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
+      # legacy-session-interop is off by default, so every other test job
+      # compiles its module away and never runs a single one of its tests.
+      - name: Test (legacy-session-interop)
+        run: cargo nextest run --profile ci -p wacore-libsignal --features legacy-session-interop
 
   rustdoc:
     name: Rustdoc

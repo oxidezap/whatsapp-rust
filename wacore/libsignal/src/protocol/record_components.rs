@@ -14,6 +14,7 @@ use bytes::Bytes;
 use crate::core::curve::PublicKey;
 use crate::protocol::error::{Result, SignalProtocolError};
 use crate::protocol::ratchet::MessageKeyGenerator;
+use crate::protocol::ratchet::keys::MessageKeys;
 use crate::protocol::stores::{
     SenderKeyStateStructure, SessionStructure, sender_key_state_structure, session_structure,
 };
@@ -76,15 +77,17 @@ pub struct SessionMessageKeyComponents {
 
 /// Secret material used by a skipped session message key.
 ///
-/// `Seed` is accepted as a compact import form and is expanded with the
-/// protocol's canonical derivation. Exported records always use `Derived`.
-#[derive(Clone, PartialEq, Eq)]
+/// `Seed` is the compact form: importing it expands the derived keys with the
+/// protocol's canonical derivation, and exporting a record that retained the
+/// seed returns it. `Derived` is what remains when there is no seed to return,
+/// which is the case for keys persisted before the seed was retained.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SessionMessageKeyMaterial {
-    Seed(Vec<u8>),
+    Seed([u8; SYMMETRIC_KEY_BYTES]),
     Derived {
-        cipher_key: Vec<u8>,
-        mac_key: Vec<u8>,
-        iv: Vec<u8>,
+        cipher_key: [u8; SYMMETRIC_KEY_BYTES],
+        mac_key: [u8; SYMMETRIC_KEY_BYTES],
+        iv: [u8; MESSAGE_IV_BYTES],
     },
 }
 
@@ -297,70 +300,72 @@ fn required_exact_bytes(
     )
 }
 
+/// Fixed-width key material, copied out of the persisted `Bytes` without
+/// allocating.
+fn key_material<const N: usize>(value: Bytes, field: &'static str) -> Result<[u8; N]> {
+    <[u8; N]>::try_from(value.as_ref())
+        .map_err(|_| SignalProtocolError::InvalidArgument(format!("{field} must be {N} bytes")))
+}
+
+fn required_key_material<const N: usize>(
+    value: Option<Bytes>,
+    field: &'static str,
+) -> Result<[u8; N]> {
+    key_material(value.ok_or_else(|| invalid(field, "present"))?, field)
+}
+
 impl SessionMessageKeyComponents {
-    fn into_structure(self) -> Result<session_structure::chain::MessageKey> {
+    fn into_structure(self) -> session_structure::chain::MessageKey {
         match self.material {
             SessionMessageKeyMaterial::Seed(seed) => {
-                let seed: [u8; SYMMETRIC_KEY_BYTES] = seed
-                    .try_into()
-                    .map_err(|_| invalid("session message-key seed", "32 bytes"))?;
-                Ok(MessageKeyGenerator::new_from_seed(&seed, self.index).into_pb())
+                MessageKeyGenerator::new_from_seed(&seed, self.index).into_pb()
             }
             SessionMessageKeyMaterial::Derived {
                 cipher_key,
                 mac_key,
                 iv,
-            } => Ok(session_structure::chain::MessageKey {
+            } => session_structure::chain::MessageKey {
                 index: Some(self.index),
-                cipher_key: Some(Bytes::from(exact_bytes(
-                    cipher_key,
-                    SYMMETRIC_KEY_BYTES,
-                    "session message cipher key",
-                )?)),
-                mac_key: Some(Bytes::from(exact_bytes(
-                    mac_key,
-                    SYMMETRIC_KEY_BYTES,
-                    "session message MAC key",
-                )?)),
-                iv: Some(Bytes::from(exact_bytes(
-                    iv,
-                    MESSAGE_IV_BYTES,
-                    "session message IV",
-                )?)),
-            }),
+                cipher_key: Some(Bytes::copy_from_slice(&cipher_key)),
+                mac_key: Some(Bytes::copy_from_slice(&mac_key)),
+                iv: Some(Bytes::copy_from_slice(&iv)),
+                seed: None,
+            },
         }
     }
 
-    fn from_structure(value: session_structure::chain::MessageKey) -> Result<Self> {
+    fn from_structure(mut value: session_structure::chain::MessageKey) -> Result<Self> {
+        let index = value
+            .index
+            .ok_or_else(|| invalid("session message-key index", "present"))?;
+        // A persisted seed supersedes the derived triple on export rather than
+        // complementing it, so one that does not reproduce that triple would
+        // hand a consumer a key decrypting nothing, undetectably. Both are
+        // written from the same material; disagreeing means the record is
+        // corrupt.
+        if let Some(seed) = value.seed.take() {
+            let seed = key_material(seed, "session message-key seed")?;
+            let derived = MessageKeys::derive_keys(&seed, None, index);
+            if value.cipher_key.as_deref() != Some(derived.cipher_key())
+                || value.mac_key.as_deref() != Some(derived.mac_key())
+                || value.iv.as_deref() != Some(derived.iv())
+            {
+                return Err(invalid(
+                    "session message-key seed",
+                    "consistent with the derived keys stored beside it",
+                ));
+            }
+            return Ok(Self {
+                index,
+                material: SessionMessageKeyMaterial::Seed(seed),
+            });
+        }
         Ok(Self {
-            index: value
-                .index
-                .ok_or_else(|| invalid("session message-key index", "present"))?,
+            index,
             material: SessionMessageKeyMaterial::Derived {
-                cipher_key: exact_bytes(
-                    value
-                        .cipher_key
-                        .ok_or_else(|| invalid("session message cipher key", "present"))?
-                        .to_vec(),
-                    SYMMETRIC_KEY_BYTES,
-                    "session message cipher key",
-                )?,
-                mac_key: exact_bytes(
-                    value
-                        .mac_key
-                        .ok_or_else(|| invalid("session message MAC key", "present"))?
-                        .to_vec(),
-                    SYMMETRIC_KEY_BYTES,
-                    "session message MAC key",
-                )?,
-                iv: exact_bytes(
-                    value
-                        .iv
-                        .ok_or_else(|| invalid("session message IV", "present"))?
-                        .to_vec(),
-                    MESSAGE_IV_BYTES,
-                    "session message IV",
-                )?,
+                cipher_key: required_key_material(value.cipher_key, "session message cipher key")?,
+                mac_key: required_key_material(value.mac_key, "session message MAC key")?,
+                iv: required_key_material(value.iv, "session message IV")?,
             },
         })
     }
@@ -437,7 +442,7 @@ impl SessionChainComponents {
                 .message_keys
                 .into_iter()
                 .map(SessionMessageKeyComponents::into_structure)
-                .collect::<Result<_>>()?,
+                .collect(),
         })
     }
 
@@ -464,7 +469,7 @@ impl SessionChainComponents {
                 .message_keys
                 .into_iter()
                 .map(SessionMessageKeyComponents::into_structure)
-                .collect::<Result<_>>()?,
+                .collect(),
         })
     }
 
@@ -931,9 +936,9 @@ mod tests {
                 message_keys: vec![SessionMessageKeyComponents {
                     index: 1,
                     material: SessionMessageKeyMaterial::Derived {
-                        cipher_key: vec![16; 32],
-                        mac_key: vec![17; 32],
-                        iv: vec![18; 16],
+                        cipher_key: [16; 32],
+                        mac_key: [17; 32],
+                        iv: [18; 16],
                     },
                 }],
             }),
@@ -947,9 +952,9 @@ mod tests {
                 message_keys: vec![SessionMessageKeyComponents {
                     index: 3,
                     material: SessionMessageKeyMaterial::Derived {
-                        cipher_key: vec![19; 32],
-                        mac_key: vec![20; 32],
-                        iv: vec![21; 16],
+                        cipher_key: [19; 32],
+                        mac_key: [20; 32],
+                        iv: [21; 16],
                     },
                 }],
             }],
@@ -1037,9 +1042,9 @@ mod tests {
             key: Some(vec![42; 32]),
         };
         let material = SessionMessageKeyMaterial::Derived {
-            cipher_key: vec![1; 32],
-            mac_key: vec![2; 32],
-            iv: vec![3; 16],
+            cipher_key: [1; 32],
+            mac_key: [2; 32],
+            iv: [3; 16],
         };
 
         assert_eq!(
@@ -1058,23 +1063,81 @@ mod tests {
         let expected = MessageKeyGenerator::new_from_seed(&seed, 17).into_pb();
         let actual = SessionMessageKeyComponents {
             index: 17,
-            material: SessionMessageKeyMaterial::Seed(seed.to_vec()),
+            material: SessionMessageKeyMaterial::Seed(seed),
         }
-        .into_structure()
-        .expect("valid seed");
+        .into_structure();
 
         assert_eq!(actual, expected);
     }
 
+    /// The symptom this field exists for: a record imported with a seed used
+    /// to come back as `Derived`, which no seed-based format can express.
     #[test]
-    fn invalid_seed_length_is_rejected() {
-        let error = SessionMessageKeyComponents {
-            index: 1,
-            material: SessionMessageKeyMaterial::Seed(vec![0; 31]),
-        }
-        .into_structure()
-        .expect_err("short seed must fail");
+    fn seed_material_survives_the_record_round_trip() {
+        let expected = SessionMessageKeyComponents {
+            index: 17,
+            material: SessionMessageKeyMaterial::Seed([9; SYMMETRIC_KEY_BYTES]),
+        };
+        let actual = SessionMessageKeyComponents::from_structure(expected.clone().into_structure())
+            .expect("valid persisted key");
 
+        assert_eq!(actual, expected);
+    }
+
+    /// Keys persisted before the seed was retained carry only the derived
+    /// triple and must keep projecting as `Derived`.
+    #[test]
+    fn a_persisted_key_without_a_seed_projects_as_derived() {
+        let mut persisted = SessionMessageKeyComponents {
+            index: 3,
+            material: SessionMessageKeyMaterial::Seed([9; SYMMETRIC_KEY_BYTES]),
+        }
+        .into_structure();
+        persisted.seed = None;
+
+        let actual =
+            SessionMessageKeyComponents::from_structure(persisted).expect("seedless key projects");
+
+        assert!(matches!(
+            actual.material,
+            SessionMessageKeyMaterial::Derived { .. }
+        ));
+    }
+
+    /// The seed supersedes the derived triple, so a corrupt one must fail the
+    /// projection instead of exporting key material that derives nothing.
+    #[test]
+    fn a_malformed_persisted_seed_is_rejected() {
+        for length in [0, SYMMETRIC_KEY_BYTES - 1, SYMMETRIC_KEY_BYTES + 1] {
+            let mut persisted = SessionMessageKeyComponents {
+                index: 3,
+                material: SessionMessageKeyMaterial::Seed([9; SYMMETRIC_KEY_BYTES]),
+            }
+            .into_structure();
+            persisted.seed = Some(Bytes::from(vec![0; length]));
+
+            let error = SessionMessageKeyComponents::from_structure(persisted)
+                .expect_err("malformed seed must fail");
+            assert!(
+                matches!(error, SignalProtocolError::InvalidArgument(_)),
+                "{length}-byte seed: {error}"
+            );
+        }
+    }
+
+    /// A well-formed seed that derives something else is the dangerous case:
+    /// the export would look fine and the exported key would decrypt nothing.
+    #[test]
+    fn a_persisted_seed_that_derives_other_keys_is_rejected() {
+        let mut persisted = SessionMessageKeyComponents {
+            index: 3,
+            material: SessionMessageKeyMaterial::Seed([9; SYMMETRIC_KEY_BYTES]),
+        }
+        .into_structure();
+        persisted.seed = Some(Bytes::copy_from_slice(&[10; SYMMETRIC_KEY_BYTES]));
+
+        let error = SessionMessageKeyComponents::from_structure(persisted)
+            .expect_err("inconsistent seed must fail");
         assert!(matches!(error, SignalProtocolError::InvalidArgument(_)));
     }
 
