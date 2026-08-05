@@ -142,12 +142,10 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
     // sends ride the coalesced write-behind; only the send that reaches the
     // ceiling re-reserves and gates the ciphertext on a synchronous flush (which
     // fast-forwards past the reservation after any reload). Decrypt-side advances
-    // stay ungated (they re-derive forward). Mirrors the DM counter lease in
-    // SessionRecord.
-    let spent_iteration = message_keys.iteration();
-    if spent_iteration >= record.reserved_iteration() {
-        record.reserve_iterations(spent_iteration);
-    }
+    // stay ungated (they re-derive forward). A consumer that waived the lease
+    // persists before the wire and reserves nothing. Mirrors the DM counter
+    // lease in SessionRecord.
+    record.reserve_iterations(message_keys.iteration());
 
     sender_key_store
         .store_sender_key(sender_key_name, record)
@@ -558,6 +556,138 @@ mod tests {
                 .expect("alice decrypts across the fast-forwarded iteration gap"),
             b"after"
         );
+    }
+
+    /// A store whose persistence is a component export, the group counterpart
+    /// of the DM case in `tests/counter_lease.rs`: it rebuilds the record from
+    /// components on every load, which is exactly what materializes a
+    /// reservation and burns the batch.
+    struct ComponentStore {
+        states: HashMap<SenderKeyName, crate::protocol::SenderKeyRecordComponents>,
+        waive: bool,
+    }
+    #[async_trait]
+    impl SenderKeyStore for ComponentStore {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            record: SenderKeyRecord,
+        ) -> Result<()> {
+            self.states.insert(name.clone(), record.into_components()?);
+            Ok(())
+        }
+        async fn load_sender_key(&self, name: &SenderKeyName) -> Result<Option<SenderKeyRecord>> {
+            let Some(components) = self.states.get(name) else {
+                return Ok(None);
+            };
+            let mut record = SenderKeyRecord::from_components(components.clone())?;
+            if self.waive {
+                record.waive_counter_lease()?;
+            }
+            Ok(Some(record))
+        }
+    }
+
+    /// Iterations the group sender put on the wire over `count` sends, and the
+    /// skipped keys the receiver had to buffer for them.
+    fn exported_group_run(count: usize, waive: bool) -> (Vec<u32>, usize) {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = ComponentStore {
+            states: HashMap::new(),
+            waive,
+        };
+        let skdm = block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("bob creates his distribution message");
+        let mut alice = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(process_sender_key_distribution_message(
+            &name, &skdm, &mut alice,
+        ))
+        .expect("alice processes it");
+
+        let iterations = (0..count)
+            .map(|_| {
+                let msg =
+                    block_on(group_encrypt(&mut bob, &name, b"m", &mut rng)).expect("bob encrypts");
+                let iteration = msg.iteration();
+                block_on(group_decrypt(msg.serialized(), &mut alice, &name))
+                    .expect("alice decrypts");
+                iteration
+            })
+            .collect();
+
+        let skipped = alice
+            .keys
+            .remove(&name)
+            .expect("alice has a record")
+            .into_components()
+            .expect("components")
+            .states
+            .iter()
+            .map(|state| state.message_keys.len())
+            .sum();
+        (iterations, skipped)
+    }
+
+    /// The group symptom, and its fix: exporting components burns a batch per
+    /// send, so iterations stride by 64 and the receiver buffers the gap.
+    #[test]
+    fn a_waived_lease_keeps_group_iterations_consecutive() {
+        let (iterations, skipped) = exported_group_run(8, true);
+
+        assert_eq!(iterations, (0..8).collect::<Vec<u32>>());
+        assert_eq!(skipped, 0);
+    }
+
+    /// The default is untouched: same run, same batch stride, same backlog.
+    #[test]
+    fn the_default_group_lease_still_burns_a_batch_per_export() {
+        let (iterations, skipped) = exported_group_run(8, false);
+
+        let expected: Vec<u32> = (0..8)
+            .map(|i| i as u32 * SENDER_CHAIN_RESERVATION_BATCH)
+            .collect();
+        assert_eq!(iterations, expected);
+        assert!(
+            skipped > 0,
+            "the leased run must leave the receiver with skipped keys"
+        );
+    }
+
+    /// A record written under the lease may already have published iterations
+    /// below its ceiling; waiving materializes that ceiling once, then runs
+    /// consecutively.
+    #[test]
+    fn waiving_materializes_a_previously_reserved_group_ceiling_once() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("distribution message");
+        block_on(group_encrypt(&mut bob, &name, b"m0", &mut rng)).expect("first send reserves");
+
+        let record = bob.keys.get_mut(&name).expect("record");
+        let ceiling = record.reserved_iteration();
+        assert_eq!(ceiling, SENDER_CHAIN_RESERVATION_BATCH);
+        record
+            .waive_counter_lease()
+            .expect("waive materializes once");
+        assert_eq!(record.reserved_iteration(), 0);
+
+        let first = block_on(group_encrypt(&mut bob, &name, b"after", &mut rng))
+            .expect("send after waiving");
+        assert_eq!(first.iteration(), ceiling);
+        let second =
+            block_on(group_encrypt(&mut bob, &name, b"next", &mut rng)).expect("the next send");
+        assert_eq!(second.iteration(), ceiling + 1);
     }
 
     /// A store that emulates the real signal-cache gate: it records whether each

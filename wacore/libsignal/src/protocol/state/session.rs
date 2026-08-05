@@ -11,6 +11,7 @@ use buffa::{Message, MessageField};
 use subtle::ConstantTimeEq;
 
 use crate::core::curve::KeyType;
+use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
 use crate::protocol::record_components::{
@@ -752,17 +753,13 @@ const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
 pub struct SessionRecord {
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<SessionStructure>>,
-    /// Durability lease: ceiling (exclusive) of sender-chain counters this
-    /// record's durable snapshots may already have spent on the wire. Any
-    /// state entering service from such a snapshot must fast-forward its
-    /// sender chain here first — message keys and IVs are derived
-    /// deterministically from the counter, so re-deriving a spent counter
-    /// reuses a (key, IV) pair.
-    reserved_sender_chain_index: u32,
-    /// A reservation was raised but not yet durably flushed. While set, the
-    /// owning ciphertext must not reach the wire; the store layer transfers
-    /// this into its flush gating. Transient — never serialized.
-    pending_reservation: bool,
+    /// Durability lease over sender-chain counters, or the consumer's
+    /// declaration that it persists before the wire and needs none. Any state
+    /// entering service from a snapshot must fast-forward past a live lease
+    /// first — message keys and IVs are derived deterministically from the
+    /// counter, so re-deriving a spent counter reuses a (key, IV) pair. The
+    /// pending flag it carries is transient and never serialized.
+    lease: CounterLease,
 }
 
 impl SessionRecord {
@@ -770,8 +767,7 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         }
     }
 
@@ -779,8 +775,7 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         }
     }
 
@@ -805,8 +800,7 @@ impl SessionRecord {
         Ok(Self {
             current_session,
             previous_sessions: Arc::new(previous_sessions),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         })
     }
 
@@ -815,9 +809,10 @@ impl SessionRecord {
     /// Any durably reserved sender range is advanced to its exclusive ceiling
     /// before export so rebuilding the record cannot derive a possibly spent
     /// message key again. A chain too stale to advance is dropped fail-closed
-    /// without discarding the rest of the record.
+    /// without discarding the rest of the record. A waived lease reserves
+    /// nothing, so there is nothing to advance past.
     pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
-        let reserved_sender_chain_index = self.reserved_sender_chain_index;
+        let reserved_sender_chain_index = self.lease.ceiling();
         if reserved_sender_chain_index > 0
             && let Some(state) = self.current_session.as_mut()
         {
@@ -847,17 +842,43 @@ impl SessionRecord {
     }
 
     pub fn reserved_sender_chain_index(&self) -> u32 {
-        self.reserved_sender_chain_index
+        self.lease.ceiling()
+    }
+
+    /// Waive counter leasing on this record, declaring that the consumer's
+    /// persistence is synchronous and durable before the ciphertext reaches
+    /// the wire.
+    ///
+    /// The consumer applies this to every record it loads; nothing is inferred
+    /// from the stored representation. A snapshot written while the lease was
+    /// in force still carries a reservation that may already have been
+    /// published, so it is materialized once here before the lease goes away.
+    /// The guarantee being given up is stated on [`CounterLease`].
+    pub fn waive_counter_lease(&mut self) {
+        let ceiling = self.lease.waive();
+        if ceiling == 0 {
+            return;
+        }
+        // Every state the lease covered has to burn it, archived ones included:
+        // once the ceiling is gone, a later promotion has nothing left to tell
+        // it those counters may already be on the wire.
+        if let Some(state) = self.current_session.as_mut() {
+            state.fast_forward_sender_chain_or_drop(ceiling);
+        }
+        for session in Arc::make_mut(&mut self.previous_sessions) {
+            let mut state = SessionState::from_session_structure(std::mem::take(session));
+            state.fast_forward_sender_chain_or_drop(ceiling);
+            *session = state.session;
+        }
     }
 
     /// Lease a fresh batch of sender-chain counters after `spent_counter` was
     /// issued past the current reservation. Marks the record pending: the
     /// caller's ciphertext must not hit the wire until a flush persists the
-    /// raised ceiling.
+    /// raised ceiling. A counter still inside the batch, or a waived lease,
+    /// leaves both untouched.
     pub fn reserve_sender_chain_counters(&mut self, spent_counter: u32) {
-        self.reserved_sender_chain_index =
-            spent_counter.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
-        self.pending_reservation = true;
+        self.lease.reserve(spent_counter);
     }
 
     /// Rebase the lease after a DH ratchet replaced the leased sender chain
@@ -883,19 +904,17 @@ impl SessionRecord {
         // Never raises: a counter must not be published under a ceiling that
         // is not yet durable. An in-chain lease is always within one batch of
         // the live index, so this is a no-op outside a chain replacement.
-        self.reserved_sender_chain_index = self
-            .reserved_sender_chain_index
-            .min(consts::SENDER_CHAIN_RESERVATION_BATCH);
+        self.lease.rebase();
     }
 
     pub fn has_pending_reservation(&self) -> bool {
-        self.pending_reservation
+        self.lease.is_pending_flush()
     }
 
     /// The store layer takes ownership of the wire gate (it tracks the address
     /// until a successful flush), so the transient flag is dropped here.
     pub fn clear_pending_reservation(&mut self) {
-        self.pending_reservation = false;
+        self.lease.set_pending_flush(false);
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
@@ -947,8 +966,7 @@ impl SessionRecord {
                 .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
                 .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
-            reserved_sender_chain_index: local_fields.reservation,
-            pending_reservation: false,
+            lease: CounterLease::from_persisted_ceiling(local_fields.reservation),
         };
 
         let trusted_reload =
@@ -956,10 +974,10 @@ impl SessionRecord {
 
         // An untrusted snapshot may predate sends covered by its lease.
         if !trusted_reload
-            && record.reserved_sender_chain_index > 0
+            && record.lease.ceiling() > 0
             && let Some(state) = record.current_session.as_mut()
         {
-            state.fast_forward_sender_chain(record.reserved_sender_chain_index)?;
+            state.fast_forward_sender_chain(record.lease.ceiling())?;
         }
 
         Ok(record)
@@ -1105,8 +1123,8 @@ impl SessionRecord {
     pub fn promote_state(&mut self, new_state: SessionState) {
         self.archive_current_state_inner();
         let mut state = new_state;
-        if self.reserved_sender_chain_index > 0 {
-            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+        if self.lease.ceiling() > 0 {
+            state.fast_forward_sender_chain_or_drop(self.lease.ceiling());
         }
         self.current_session = Some(state);
     }
@@ -1117,14 +1135,14 @@ impl SessionRecord {
     /// archived before resetting it for the fresh chain; otherwise the archive
     /// could later reissue a counter covered by the discarded lease.
     pub fn promote_fresh_state(&mut self, new_state: SessionState) {
-        if self.reserved_sender_chain_index > 0
+        if self.lease.ceiling() > 0
             && let Some(state) = self.current_session.as_mut()
         {
-            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+            state.fast_forward_sender_chain_or_drop(self.lease.ceiling());
         }
         self.archive_current_state_inner();
         self.current_session = Some(new_state);
-        self.reserved_sender_chain_index = 0;
+        self.lease.clear_reservation();
     }
 
     fn archive_current_state_inner(&mut self) -> bool {
@@ -1203,7 +1221,7 @@ impl SessionRecord {
             })
             .sum();
 
-        let reserved = self.reserved_sender_chain_index;
+        let reserved = self.lease.ceiling();
         let incarnation = incarnation.filter(|_| reserved > 0);
         let reserved_len = if reserved > 0 {
             2 + varint_len(reserved as u64)
@@ -2075,8 +2093,7 @@ mod tests {
         let record = SessionRecord {
             current_session: Some(SessionState::from_session_structure(current.clone())),
             previous_sessions: Arc::new(previous_sessions.clone()),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         };
         let expected = waproto::whatsapp::RecordStructure {
             current_session: MessageField::some(current),

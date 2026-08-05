@@ -10,6 +10,7 @@ use buffa::{Message, MessageField};
 use hmac::{HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
+use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
     SenderKeyRecordComponents, sender_state_components_from_structure,
@@ -493,21 +494,16 @@ impl SenderKeyState {
 #[derive(Debug, Clone)]
 pub struct SenderKeyRecord {
     states: VecDeque<SenderKeyState>,
-    /// An outbound chain advance not yet known durable. Sender-key message
-    /// keys/IVs derive deterministically from the iteration, so the advance
-    /// must reach storage before its ciphertext reaches the wire (unlike
-    /// decrypt advances, which re-derive forward). Transient — never
-    /// serialized; the store layer converts it into flush gating.
-    wire_gated: bool,
-    /// Durably-reserved iteration ceiling for the current state's sender chain,
-    /// mirroring `SessionRecord::reserved_sender_chain_index` for DM. Iterations
-    /// below this ceiling are covered by a persisted reservation, so their sends
-    /// skip the synchronous pre-wire flush and ride the coalesced write-behind;
-    /// only the send that raises the ceiling gates. A reload fast-forwards the
-    /// current chain past this ceiling so no possibly-spent iteration is
-    /// re-derivable. Reset to 0 on any state change (rotation/promotion), which
-    /// forces the next send to re-reserve and gate; never reuses an iteration.
-    reserved_iteration: u32,
+    /// Durability lease over sender-chain iterations, mirroring
+    /// `SessionRecord`'s for DM, or the consumer's declaration that it needs
+    /// none. Iterations below the reserved ceiling ride the coalesced
+    /// write-behind; only the send that raises it gates the wire, and a reload
+    /// fast-forwards past it so no possibly-spent iteration is re-derivable.
+    /// Reset to 0 on any state change (rotation/promotion), which forces the
+    /// next send to re-reserve and gate. The wire-gate flag it carries is
+    /// transient and never serialized; the store layer converts it into flush
+    /// gating.
+    lease: CounterLease,
 }
 
 /// Local-only field appended to the serialized record for `reserved_iteration`.
@@ -520,8 +516,7 @@ impl SenderKeyRecord {
     pub fn new_empty() -> Self {
         Self {
             states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),
-            wire_gated: false,
-            reserved_iteration: 0,
+            lease: CounterLease::default(),
         }
     }
 
@@ -542,8 +537,7 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
-            wire_gated: false,
-            reserved_iteration: 0,
+            lease: CounterLease::default(),
         })
     }
 
@@ -553,10 +547,11 @@ impl SenderKeyRecord {
     /// before export so rebuilding the record cannot derive a possibly spent
     /// message key again.
     pub fn into_components(mut self) -> Result<SenderKeyRecordComponents, SignalProtocolError> {
-        if self.reserved_iteration > 0
+        let reserved_iteration = self.lease.ceiling();
+        if reserved_iteration > 0
             && let Some(state) = self.states.front_mut()
         {
-            state.fast_forward_sender_chain(self.reserved_iteration)?;
+            state.fast_forward_sender_chain(reserved_iteration)?;
         }
         let states = self
             .states
@@ -574,7 +569,25 @@ impl SenderKeyRecord {
     /// Iterations strictly below this ceiling are covered by a durable
     /// reservation and their sends need no synchronous flush.
     pub fn reserved_iteration(&self) -> u32 {
-        self.reserved_iteration
+        self.lease.ceiling()
+    }
+
+    /// Waive counter leasing on this record, declaring that the consumer's
+    /// persistence is synchronous and durable before the ciphertext reaches
+    /// the wire.
+    ///
+    /// The group counterpart of `SessionRecord::waive_counter_lease`, applied
+    /// per load and never inferred. A snapshot written under the lease is
+    /// materialized once here, since its reservation may already have been
+    /// published. The guarantee being given up is stated on `CounterLease`.
+    pub fn waive_counter_lease(&mut self) -> Result<(), SignalProtocolError> {
+        let ceiling = self.lease.waive();
+        if ceiling > 0
+            && let Some(state) = self.states.front_mut()
+        {
+            state.fast_forward_sender_chain(ceiling)?;
+        }
+        Ok(())
     }
 
     /// Lease a fresh batch of iterations after `spent_iteration` reached the
@@ -582,9 +595,7 @@ impl SenderKeyRecord {
     /// must not hit the wire until a flush persists the raised ceiling. Mirrors
     /// `SessionRecord::reserve_sender_chain_counters`.
     pub fn reserve_iterations(&mut self, spent_iteration: u32) {
-        self.reserved_iteration =
-            spent_iteration.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
-        self.wire_gated = true;
+        self.lease.reserve(spent_iteration);
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<SenderKeyRecord, SignalProtocolError> {
@@ -645,23 +656,22 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
-            wire_gated: false,
-            reserved_iteration,
+            lease: CounterLease::from_persisted_ceiling(reserved_iteration),
         })
     }
 
     /// Flag an outbound chain advance; cleared by the store layer once it
     /// owns the durability gate.
     pub fn mark_wire_gated(&mut self) {
-        self.wire_gated = true;
+        self.lease.set_pending_flush(true);
     }
 
     pub fn is_wire_gated(&self) -> bool {
-        self.wire_gated
+        self.lease.is_pending_flush()
     }
 
     pub fn clear_wire_gated(&mut self) {
-        self.wire_gated = false;
+        self.lease.set_pending_flush(false);
     }
 
     pub fn sender_key_state(&self) -> Result<&SenderKeyState, InvalidSenderKeySessionError> {
@@ -739,7 +749,7 @@ impl SenderKeyRecord {
         // the sending record only reaches here on first creation (reservation
         // already 0, warm sends reuse the record without re-adding), and receiver
         // records never carry a reservation.
-        self.reserved_iteration = 0;
+        self.lease.clear_reservation();
         Ok(())
     }
 
@@ -794,9 +804,10 @@ impl SenderKeyRecord {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
         let mut buf = waproto::codec::sender_key_record_to_vec(&self.as_protobuf());
-        let incarnation = incarnation.filter(|_| self.reserved_iteration > 0);
-        let reservation_len = if self.reserved_iteration > 0 {
-            2 + varint_len(self.reserved_iteration as u64)
+        let reserved_iteration = self.lease.ceiling();
+        let incarnation = incarnation.filter(|_| reserved_iteration > 0);
+        let reservation_len = if reserved_iteration > 0 {
+            2 + varint_len(reserved_iteration as u64)
         } else {
             0
         };
@@ -807,9 +818,9 @@ impl SenderKeyRecord {
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
         // stay byte-identical. Mirrors SessionRecord::serialize_into.
-        if self.reserved_iteration > 0 {
+        if reserved_iteration > 0 {
             Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut buf);
-            encode_varint(self.reserved_iteration as u64, &mut buf);
+            encode_varint(reserved_iteration as u64, &mut buf);
         }
         if let Some(incarnation) = incarnation {
             super::local_field::encode_store_incarnation(&mut buf, incarnation);

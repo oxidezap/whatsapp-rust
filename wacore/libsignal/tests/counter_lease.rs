@@ -710,3 +710,193 @@ fn a_rebased_lease_never_republishes_a_counter_across_a_crash() {
     let pt = receive(&mut bob, &alice.address, &ct).expect("bob decrypts across the burned gap");
     assert_eq!(&pt[..], b"after crash");
 }
+
+// ---- waiver -----------------------------------------------------------------
+
+/// Stand in for a consumer whose persistence is a component export: it rebuilds
+/// the record from components on every load, and waives the lease because its
+/// writes are durable before the ciphertext reaches the wire.
+fn components_roundtrip(peer: &mut Peer, remote: &ProtocolAddress, waive: bool) {
+    let record = peer.session_store.0.remove(remote).expect("session exists");
+    let mut rebuilt =
+        SessionRecord::from_components(record.into_components().expect("export")).expect("import");
+    if waive {
+        rebuilt.waive_counter_lease();
+    }
+    peer.session_store.0.insert(remote.clone(), rebuilt);
+}
+
+/// Skipped message keys the peer had to buffer, across every receiver chain.
+fn skipped_keys(peer: &Peer, remote: &ProtocolAddress) -> usize {
+    record_of(peer, remote)
+        .into_components()
+        .expect("components")
+        .current_session
+        .expect("current session")
+        .receiver_chains
+        .iter()
+        .map(|chain| chain.message_keys.len())
+        .sum()
+}
+
+/// Drive `count` sends, exporting and reimporting components between each, and
+/// return the wire counters the peer saw.
+fn exported_send_run(alice: &mut Peer, bob: &mut Peer, count: u32, waive: bool) -> Vec<u32> {
+    let bob_address = bob.address.clone();
+    let alice_address = alice.address.clone();
+    process_bundle(alice, &bob_address);
+    components_roundtrip(alice, &bob_address, waive);
+
+    let mut counters = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let ct = send(alice, &bob_address, b"m");
+        counters.push(wire_counter(&ct));
+        receive(bob, &alice_address, &ct).expect("peer decrypts");
+        components_roundtrip(alice, &bob_address, waive);
+    }
+    counters
+}
+
+/// The symptom: a consumer that exports components burns a whole batch per
+/// export, so consecutive sends land 64 apart and the peer buffers 63 skipped
+/// keys for each one. Under a waived lease the counters are consecutive and
+/// nothing is skipped.
+#[test]
+fn a_waived_lease_keeps_exported_counters_consecutive() {
+    let mut alice = Peer::new("alice-waived");
+    let mut bob = Peer::new("bob-waived");
+
+    let counters = exported_send_run(&mut alice, &mut bob, 8, true);
+
+    assert_eq!(counters, (0..8).collect::<Vec<_>>());
+    assert_eq!(skipped_keys(&bob, &alice.address.clone()), 0);
+}
+
+/// The default is untouched: the reservation is still created, so an export
+/// still materializes it and the counters still stride by a batch.
+#[test]
+fn the_default_lease_still_burns_a_batch_per_export() {
+    let mut alice = Peer::new("alice-leased");
+    let mut bob = Peer::new("bob-leased");
+
+    let counters = exported_send_run(&mut alice, &mut bob, 4, false);
+
+    let batch = SENDER_CHAIN_RESERVATION_BATCH;
+    assert_eq!(counters, vec![0, batch, batch * 2, batch * 3]);
+    assert!(
+        skipped_keys(&bob, &alice.address.clone()) > 0,
+        "the leased run must leave the peer with skipped keys"
+    );
+}
+
+/// The waiver removes the reservation, not just its materialization: a send
+/// under it must not gate the ciphertext on a flush that no longer protects
+/// anything.
+#[test]
+fn a_waived_lease_never_gates_the_wire() {
+    let mut alice = Peer::new("alice-ungated");
+    let mut bob = Peer::new("bob-ungated");
+    let bob_address = bob.address.clone();
+
+    process_bundle(&mut alice, &bob_address);
+    components_roundtrip(&mut alice, &bob_address, true);
+    for _ in 0..3 {
+        let ct = send(&mut alice, &bob_address, b"m");
+        receive(&mut bob, &alice.address.clone(), &ct).expect("peer decrypts");
+        let record = record_of(&alice, &bob_address);
+        assert_eq!(record.reserved_sender_chain_index(), 0);
+        assert!(!record.has_pending_reservation());
+    }
+}
+
+/// Under the default, the same run keeps gating and reserving.
+#[test]
+fn the_default_lease_still_gates_the_wire() {
+    let mut alice = Peer::new("alice-gated");
+    let mut bob = Peer::new("bob-gated");
+    let bob_address = bob.address.clone();
+
+    process_bundle(&mut alice, &bob_address);
+    let ct = send(&mut alice, &bob_address, b"m");
+    receive(&mut bob, &alice.address.clone(), &ct).expect("peer decrypts");
+
+    let record = record_of(&alice, &bob_address);
+    assert_eq!(
+        record.reserved_sender_chain_index(),
+        SENDER_CHAIN_RESERVATION_BATCH
+    );
+    assert!(record.has_pending_reservation());
+}
+
+/// A record written while the lease was in force may already have published
+/// counters below its ceiling, and waiving does not make that untrue. The
+/// ceiling is materialized once, then counters run consecutively from there.
+#[test]
+fn waiving_materializes_a_previously_reserved_ceiling_once() {
+    let mut alice = Peer::new("alice-preexisting");
+    let mut bob = Peer::new("bob-preexisting");
+    let bob_address = bob.address.clone();
+    let alice_address = alice.address.clone();
+
+    // Build up a real reservation under the default lease.
+    establish(&mut alice, &mut bob);
+    let ceiling = record_of(&alice, &bob_address).reserved_sender_chain_index();
+    assert_eq!(ceiling, SENDER_CHAIN_RESERVATION_BATCH);
+
+    // The consumer turns the waiver on and reloads the record it already had.
+    let record = alice
+        .session_store
+        .0
+        .get_mut(&bob_address)
+        .expect("session");
+    record.waive_counter_lease();
+    assert_eq!(record.reserved_sender_chain_index(), 0);
+
+    let first = send(&mut alice, &bob_address, b"after waiving");
+    assert_eq!(wire_counter(&first), ceiling);
+    receive(&mut bob, &alice_address, &first).expect("peer decrypts across the burn");
+
+    let second = send(&mut alice, &bob_address, b"and the next");
+    assert_eq!(wire_counter(&second), ceiling + 1);
+    receive(&mut bob, &alice_address, &second).expect("peer decrypts");
+}
+
+/// Archived states were covered by the same ceiling, so waiving has to burn
+/// them too: once the lease is gone, a promotion has nothing left telling it
+/// those counters may already be on the wire.
+#[test]
+fn waiving_burns_the_ceiling_into_archived_states_too() {
+    let mut alice = Peer::new("alice-archived");
+    let mut bob = Peer::new("bob-archived");
+    let bob_address = bob.address.clone();
+
+    establish(&mut alice, &mut bob);
+    let ceiling = record_of(&alice, &bob_address).reserved_sender_chain_index();
+    assert_eq!(ceiling, SENDER_CHAIN_RESERVATION_BATCH);
+
+    // Archive the leased state, then waive.
+    let record = alice
+        .session_store
+        .0
+        .get_mut(&bob_address)
+        .expect("session");
+    record
+        .archive_current_state()
+        .expect("archive the leased state");
+    record.waive_counter_lease();
+
+    let archived_index = record_of(&alice, &bob_address)
+        .into_components()
+        .expect("components")
+        .previous_sessions
+        .first()
+        .expect("archived state")
+        .sender_chain
+        .as_ref()
+        .expect("sender chain")
+        .chain_key
+        .as_ref()
+        .expect("chain key")
+        .index;
+    assert_eq!(archived_index, Some(ceiling));
+}

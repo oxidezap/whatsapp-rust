@@ -18,6 +18,7 @@
 #![deny(unsafe_code)]
 
 pub mod consts;
+mod counter_lease;
 mod crypto;
 pub mod error;
 mod group_cipher;
