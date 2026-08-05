@@ -5,9 +5,10 @@
 //! pays off for a caller that keeps the record between operations. These
 //! benches contrast the two shapes: a store that hands back the cached record
 //! (what this repository does) against one that rebuilds it from components on
-//! every load. `component_round_trip` isolates the conversion a component-backed
-//! store pays per operation, in both directions, so what is left of the
-//! difference between the two group benches can be attributed to the cold memo.
+//! every load. The two `store_round_trip_*` controls bound how much of that gap
+//! is the store shape rather than the memo; what remains is not decomposed
+//! further, because doing so credibly needs a control per side and per
+//! direction, and the answer does not turn on it.
 //!
 //! The decrypt benches unwrap: a replayed ciphertext would return
 //! `DuplicatedMessage` and time the error path instead, which no assertion on a
@@ -36,14 +37,16 @@ use wacore_libsignal::protocol::{
 
 type SigResult<T> = wacore_libsignal::protocol::error::Result<T>;
 
-/// Fixed seeds, distinct per call, so instruction counts depend on the code
-/// rather than on which scalars the OS entropy happened to produce.
-fn bench_rng() -> rand::rngs::StdRng {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CTR: AtomicU32 = AtomicU32::new(0);
-    <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
-        0x5E4D_0000 + u64::from(CTR.fetch_add(1, Ordering::Relaxed)),
-    )
+/// Fixed per purpose, never from a shared counter: the compared benchmarks have
+/// to see the same key material and the same signature nonce, or the delta
+/// carries the cost difference between two sets of scalars. A counter would
+/// also make every stream depend on how many benchmarks ran before it.
+const FIXTURE_SEED: u64 = 0x5E4D_0001;
+const OPERATION_SEED: u64 = 0x5E4D_0002;
+const CIPHERTEXT_SEED: u64 = 0x5E4D_0003;
+
+fn seeded(seed: u64) -> rand::rngs::StdRng {
+    <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed)
 }
 
 fn main() {
@@ -99,7 +102,7 @@ fn name() -> SenderKeyName {
 /// A sender that has already sent once (memo warm, chain past its first
 /// advance) and a receiver that has already received once.
 fn warm_pair() -> (WarmStore, WarmStore) {
-    let mut rng = bench_rng();
+    let mut rng = seeded(FIXTURE_SEED);
     let sender_key_name = name();
     let mut sender = WarmStore::default();
     let mut receiver = WarmStore::default();
@@ -140,33 +143,33 @@ fn rebuilding_pair() -> (RebuildingStore, RebuildingStore) {
 #[divan::bench]
 fn group_encrypt_warm_record(bencher: Bencher) {
     let sender_key_name = name();
-    bencher.with_inputs(warm_pair).bench_refs(|(sender, _)| {
-        let mut rng = bench_rng();
-        black_box(
-            futures::executor::block_on(group_encrypt(
-                sender,
-                &sender_key_name,
-                b"payload",
-                &mut rng,
-            ))
-            .expect("encrypt must succeed on every timed iteration"),
-        )
-    });
+    bencher
+        .with_inputs(|| (warm_pair().0, seeded(OPERATION_SEED)))
+        .bench_refs(|(sender, rng)| {
+            black_box(
+                futures::executor::block_on(group_encrypt(
+                    sender,
+                    &sender_key_name,
+                    b"payload",
+                    rng,
+                ))
+                .expect("encrypt must succeed on every timed iteration"),
+            )
+        });
 }
 
 #[divan::bench]
 fn group_encrypt_rebuilt_record(bencher: Bencher) {
     let sender_key_name = name();
     bencher
-        .with_inputs(rebuilding_pair)
-        .bench_refs(|(sender, _)| {
-            let mut rng = bench_rng();
+        .with_inputs(|| (rebuilding_pair().0, seeded(OPERATION_SEED)))
+        .bench_refs(|(sender, rng)| {
             black_box(
                 futures::executor::block_on(group_encrypt(
                     sender,
                     &sender_key_name,
                     b"payload",
-                    &mut rng,
+                    rng,
                 ))
                 .expect("encrypt must succeed on every timed iteration"),
             )
@@ -175,7 +178,7 @@ fn group_encrypt_rebuilt_record(bencher: Bencher) {
 
 /// Ciphertext the decrypt benches consume, produced outside the timed region.
 fn ciphertext(sender: &mut WarmStore, sender_key_name: &SenderKeyName) -> Vec<u8> {
-    let mut rng = bench_rng();
+    let mut rng = seeded(CIPHERTEXT_SEED);
     futures::executor::block_on(group_encrypt(sender, sender_key_name, b"payload", &mut rng))
         .expect("encrypt")
         .serialized()
@@ -223,26 +226,38 @@ fn group_decrypt_rebuilt_record(bencher: Bencher) {
         });
 }
 
-/// Both conversions a component-backed store pays per operation: `from_components`
-/// on load and `into_components` on store. Subtract this from the rebuilt-record
-/// benches to attribute what is left to the cold memo. Measuring only the load
-/// side would leave the export attributed to re-derivation.
+/// Store overhead on the sender side, one control per shape, so the pair can be
+/// differenced. `RebuildingStore` pays `from_components` plus `into_components`
+/// on top of what `WarmStore` pays; subtracting the rebuilding control alone
+/// would also remove the map lookup and handoff the warm path pays too. These
+/// bound the encrypt comparison only: the receiver record carries no private
+/// signing key, so its conversions are cheaper than the sender's.
 #[divan::bench]
-fn component_round_trip(bencher: Bencher) {
+fn store_round_trip_warm(bencher: Bencher) {
+    let sender_key_name = name();
+    bencher
+        .with_inputs(|| warm_pair().0)
+        .bench_refs(|store| round_trip(store, &sender_key_name));
+}
+
+#[divan::bench]
+fn store_round_trip_rebuilt(bencher: Bencher) {
     let sender_key_name = name();
     bencher
         .with_inputs(|| rebuilding_pair().0)
-        .bench_refs(|store| {
-            futures::executor::block_on(async {
-                let record = store
-                    .load_sender_key(&sender_key_name)
-                    .await
-                    .expect("load")
-                    .expect("record present");
-                store
-                    .store_sender_key(&sender_key_name, black_box(record))
-                    .await
-                    .expect("store");
-            })
-        });
+        .bench_refs(|store| round_trip(store, &sender_key_name));
+}
+
+fn round_trip<S: SenderKeyStore>(store: &mut S, sender_key_name: &SenderKeyName) {
+    futures::executor::block_on(async {
+        let record = store
+            .load_sender_key(sender_key_name)
+            .await
+            .expect("load")
+            .expect("record present");
+        store
+            .store_sender_key(sender_key_name, black_box(record))
+            .await
+            .expect("store");
+    })
 }
