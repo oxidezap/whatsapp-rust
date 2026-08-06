@@ -449,4 +449,38 @@ fn a_refused_agreement_survives_the_decrypt_candidate_search() {
             .expect("the archived session still reads it"),
         b"read me from the archive"
     );
+
+    // A refusal in one candidate must not end the search: the backend is asked
+    // with that candidate's own ratchet key, and a sibling with an open
+    // receiver chain reads the message without agreeing anything.
+    let first = send(&mut bob, &alice.address, b"same chain, first");
+    let second = send(&mut bob, &alice.address, b"same chain, second");
+    assert_eq!(
+        receive(&mut alice, &bob.address, &first).expect("opens the chain"),
+        b"same chain, first"
+    );
+
+    // Rebuilding archives that session and installs a fresh one, which knows
+    // nothing about Bob's ratchet key and has to agree keys to try.
+    let fresh_bundle = bob.bundle();
+    futures::executor::block_on(async {
+        process_prekey_bundle(
+            &bob.address,
+            &mut alice.session_store,
+            &mut alice.identity_store,
+            &fresh_bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("bundle accepted");
+    });
+
+    REFUSING.store(true, Ordering::SeqCst);
+    let plaintext = receive(&mut alice, &bob.address, &second);
+    REFUSING.store(false, Ordering::SeqCst);
+    assert_eq!(
+        plaintext.expect("the archived chain needs no agreement"),
+        b"same chain, second"
+    );
 }

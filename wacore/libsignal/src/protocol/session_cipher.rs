@@ -758,6 +758,18 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     Ok((decrypt.commit(), identity_change))
 }
 
+/// A refused agreement is a local failure, not a verdict about the message, so
+/// it outranks the MAC-based classifications: the caller has to be able to tell
+/// "this backend is down" from "this message is corrupt". Kept in the pile
+/// rather than returned on the spot, since a sibling session with an open
+/// receiver chain needs no agreement and may still read the message.
+fn take_key_agreement_failure(errs: &mut Vec<SignalProtocolError>) -> Option<SignalProtocolError> {
+    let at = errs
+        .iter()
+        .position(|e| matches!(e, SignalProtocolError::KeyAgreementFailed(_)))?;
+    Some(errs.remove(at))
+}
+
 fn create_decryption_failure_log(
     remote_address: &ProtocolAddress,
     mut errs: &[SignalProtocolError],
@@ -1091,14 +1103,6 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 record.set_session_state(current_state);
                 return Err(error);
             }
-            Err(e @ SignalProtocolError::KeyAgreementFailed(_)) => {
-                // A refused agreement says nothing about this message: every
-                // other session would ask the same backend and get the same
-                // answer, and collapsing it into the aggregate verdict below
-                // would have the caller treat a live message as corrupt.
-                record.set_session_state(current_state);
-                return Err(e);
-            }
             Err(e) if !ciphertext.is_available() => {
                 // Authentication succeeded, but the provider rejected the
                 // caller-owned body after it had been consumed for in-place
@@ -1126,6 +1130,9 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                                 ciphertext.signal_message()
                             )?
                         );
+                        if let Some(refused) = take_key_agreement_failure(&mut errs) {
+                            return Err(refused);
+                        }
                         // Preserve BadMac so it maps to WA Web error code 7 in retry receipts.
                         if errs
                             .iter()
@@ -1208,10 +1215,6 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 record.restore_previous_session(idx, previous);
                 return Err(error);
             }
-            Err(e @ SignalProtocolError::KeyAgreementFailed(_)) => {
-                record.restore_previous_session(idx, previous);
-                return Err(e);
-            }
             Err(e) if !ciphertext.is_available() => {
                 record.restore_previous_session(idx, previous);
                 return Err(e);
@@ -1260,6 +1263,9 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         _ => None,
     }) {
         return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
+    }
+    if let Some(refused) = take_key_agreement_failure(&mut errs) {
+        return Err(refused);
     }
     // Otherwise, if any session state produced a BadMac error, propagate it rather
     // than the generic InvalidMessage. BadMac means at least one state derived a
