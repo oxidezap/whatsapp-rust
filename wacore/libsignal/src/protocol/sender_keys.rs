@@ -442,12 +442,15 @@ impl SenderKeyState {
                 "prewarmed verifier belongs to another state",
             ));
         }
-        // Same contract as the signing side: what goes in warm comes out warm,
-        // so a caller can hand over a freshly built verifier. Cheaper to get
-        // wrong than the signing key, since clones share these entries, but not
-        // free, and the asymmetry would be a trap.
-        verifier.precompute();
+        // Warm whichever instance is retained, not the one passed in: a lazy
+        // first use installs a verifier without deriving its entries, and that
+        // one stays when this `set` finds the memo already populated. The
+        // signing side needs no such care, since its lazy path warms before it
+        // memoizes.
         let _ = self.verifying_key_memo.set(verifier);
+        if let Some(retained) = self.verifying_key_memo.get() {
+            retained.precompute();
+        }
         Ok(())
     }
 
@@ -1093,9 +1096,16 @@ mod tests {
         .expect("valid inputs");
         let state = SenderKeyState::from_protobuf(state.as_protobuf());
 
-        // Warm it the lazy way first.
+        // Warm it the lazy way first. The lazy verifier is installed without
+        // its entries derived, so the inert path still has to leave the
+        // retained one warm.
         let _ = state.signing_key_private().expect("lazy warm");
-        let _ = state.signing_key_verifier().expect("lazy warm");
+        assert!(
+            !state
+                .signing_key_verifier()
+                .expect("lazy verifier")
+                .is_precomputed()
+        );
 
         let derived = PrivateKey::deserialize(&private_bytes).expect("key");
         derived.precompute_signing_cache();
@@ -1108,6 +1118,13 @@ mod tests {
             ))
             .expect("no-op, not error");
 
+        assert!(
+            state
+                .signing_key_verifier()
+                .expect("verifier")
+                .is_precomputed(),
+            "the retained verifier must be warm even when the set was inert"
+        );
         assert_eq!(
             *state.signing_key_private().expect("key").serialize(),
             private_bytes
