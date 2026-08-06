@@ -294,6 +294,16 @@ impl PreparedVerifyingKey {
         }
     }
 
+    /// Whether this verifier was built for `key`.
+    ///
+    /// Comparing the Montgomery bytes it already holds is the whole check, so a
+    /// holder can accept a pre-derived verifier without redoing the derivation
+    /// it is trying to skip.
+    pub fn is_for(&self, key: &PublicKey) -> bool {
+        let PublicKeyData::DjbPublicKey(mont) = key.key;
+        self.mont == mont
+    }
+
     /// Derives both sign-bit entries now. The signature's sign bit is fixed
     /// per signer but unknowable from the Montgomery key alone, so a
     /// receive-side holder warms both once instead of paying the derivation

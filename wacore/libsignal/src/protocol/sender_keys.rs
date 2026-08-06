@@ -223,10 +223,13 @@ pub struct SenderKeyState {
     /// rebuilt lazily after a cold load. If a signing-key setter is ever
     /// added, it must reset this memo.
     ///
-    /// The payoff is the caller's to collect: a caller that discards the record
-    /// between operations, as one persisting through `into_components` does,
-    /// re-derives per message. `benches/sender_key_derivation_benchmark.rs` in
-    /// `wacore` measures both shapes.
+    /// The payoff is the caller's to collect, in one of two ways: keep the
+    /// record, or keep the derivation and hand it back through
+    /// [`SenderKeyState::prewarm_signing_key`]. A caller that does neither, as
+    /// one persisting through `into_components` and rebuilding per operation
+    /// does, re-derives per message.
+    /// `benches/sender_key_derivation_benchmark.rs` in `wacore` measures all
+    /// three shapes.
     signing_key_memo: std::sync::OnceLock<PrivateKey>,
     /// Receive-side mirror of `signing_key_memo`: cached verifier whose
     /// Edwards derivations are reused across every incoming message under
@@ -398,6 +401,61 @@ impl SenderKeyState {
             .verifying_key_memo
             .get()
             .expect("set on the line above"))
+    }
+
+    /// Hand this state a signing key whose XEdDSA cache is already derived,
+    /// skipping the basepoint multiplication the lazy path would pay.
+    ///
+    /// For a caller that rebuilds the record per operation, the memo never
+    /// survives to be reused; this lets it keep the derivation instead of the
+    /// record. Doing so makes the caller the owner of that cache, of how long
+    /// it lives, and of the private material in it, which the state would
+    /// otherwise hold only for its own lifetime.
+    ///
+    /// The key must be this state's own; one that is not is rejected and the
+    /// state keeps deriving for itself. A memo already warmed by use is left
+    /// alone, since it holds the same derivation.
+    pub fn prewarm_signing_key(&self, key: PrivateKey) -> Result<(), InvalidSenderKeySessionError> {
+        if self.signing_key_bytes()? != *key.serialize() {
+            return Err(InvalidSenderKeySessionError(
+                "prewarmed signing key belongs to another state",
+            ));
+        }
+        let _ = self.signing_key_memo.set(key);
+        Ok(())
+    }
+
+    /// Receive-side counterpart of [`Self::prewarm_signing_key`], carrying the
+    /// verifier's Edwards derivations. The verifier holds only public material,
+    /// so the caller takes on its lifetime and nothing else.
+    pub fn prewarm_verifying_key(
+        &self,
+        verifier: crate::core::curve::PreparedVerifyingKey,
+    ) -> Result<(), InvalidSenderKeySessionError> {
+        if !verifier.is_for(&self.signing_key_public()?) {
+            return Err(InvalidSenderKeySessionError(
+                "prewarmed verifier belongs to another state",
+            ));
+        }
+        let _ = self.verifying_key_memo.set(verifier);
+        Ok(())
+    }
+
+    /// This state's private signing key in the clamped form `PrivateKey` uses,
+    /// so a caller's key compares equal to it without either side deriving.
+    fn signing_key_bytes(&self) -> Result<[u8; 32], InvalidSenderKeySessionError> {
+        let signing_key = self
+            .state
+            .sender_signing_key
+            .as_option()
+            .ok_or(InvalidSenderKeySessionError("missing signing key"))?;
+        let private = signing_key
+            .private
+            .as_ref()
+            .ok_or(InvalidSenderKeySessionError("missing private key bytes"))?;
+        Ok(*PrivateKey::deserialize(private)
+            .map_err(|_| InvalidSenderKeySessionError("invalid private signing key"))?
+            .serialize())
     }
 
     pub fn signing_key_private(&self) -> Result<PrivateKey, InvalidSenderKeySessionError> {
@@ -855,6 +913,148 @@ impl SenderKeyRecord {
 mod tests {
     use super::*;
     use crate::protocol::KeyPair;
+
+    /// An injected derivation has to be indistinguishable from the one the
+    /// state would have produced, or the API trades correctness for speed.
+    #[test]
+    fn a_prewarmed_state_signs_and_verifies_exactly_like_a_cold_one() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let private_bytes = *signing.private_key.serialize();
+        let fresh = || {
+            let key = PrivateKey::deserialize(&private_bytes).expect("key");
+            let state = SenderKeyState::new(3, 1, 0, &[7u8; 32], signing.public_key, Some(key))
+                .expect("valid inputs");
+            SenderKeyState::from_protobuf(state.as_protobuf())
+        };
+
+        // Cold: derives for itself on first use.
+        let lazy = fresh();
+        assert!(!lazy.signing_key_memo_initialized());
+
+        // Prewarmed: same key, derived outside and handed in.
+        let prewarmed = fresh();
+        let derived = PrivateKey::deserialize(&private_bytes).expect("key");
+        derived.precompute_signing_cache();
+        prewarmed
+            .prewarm_signing_key(derived)
+            .expect("own key is accepted");
+        assert!(prewarmed.signing_key_memo_initialized());
+        prewarmed
+            .prewarm_verifying_key(crate::core::curve::PreparedVerifyingKey::new(
+                &signing.public_key,
+            ))
+            .expect("own verifier is accepted");
+
+        let message = b"skmsg";
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let from_lazy = lazy
+            .signing_key_private()
+            .expect("lazy key")
+            .calculate_signature(message, &mut rng)
+            .expect("sign");
+        let from_prewarmed = prewarmed
+            .signing_key_private()
+            .expect("prewarmed key")
+            .calculate_signature(message, &mut rng)
+            .expect("sign");
+
+        // Signatures are randomized, so each verifier checks both.
+        for signature in [&from_lazy, &from_prewarmed] {
+            assert!(
+                lazy.signing_key_verifier()
+                    .expect("lazy verifier")
+                    .verify_signature(message, signature)
+            );
+            assert!(
+                prewarmed
+                    .signing_key_verifier()
+                    .expect("prewarmed verifier")
+                    .verify_signature(message, signature)
+            );
+        }
+    }
+
+    /// Material from another key must not be installed, and refusing it must
+    /// leave the state able to derive for itself.
+    #[test]
+    fn prewarming_with_another_states_material_is_refused() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mine = KeyPair::generate(&mut rng);
+        let theirs = KeyPair::generate(&mut rng);
+        let mine_bytes = *mine.private_key.serialize();
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &[7u8; 32],
+            mine.public_key,
+            Some(PrivateKey::deserialize(&mine_bytes).expect("key")),
+        )
+        .expect("valid inputs");
+        let state = SenderKeyState::from_protobuf(state.as_protobuf());
+
+        assert!(state.prewarm_signing_key(theirs.private_key).is_err());
+        assert!(
+            state
+                .prewarm_verifying_key(crate::core::curve::PreparedVerifyingKey::new(
+                    &theirs.public_key
+                ))
+                .is_err()
+        );
+
+        // Still cold, and still able to get there on its own.
+        assert!(!state.signing_key_memo_initialized());
+        assert_eq!(
+            *state.signing_key_private().expect("own key").serialize(),
+            mine_bytes
+        );
+        assert!(
+            state
+                .signing_key_verifier()
+                .expect("own verifier")
+                .is_for(&mine.public_key)
+        );
+    }
+
+    /// Injecting over a memo that already warmed by use is a no-op: the value
+    /// in place is the same derivation.
+    #[test]
+    fn prewarming_an_already_warm_state_is_inert() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let private_bytes = *signing.private_key.serialize();
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &[7u8; 32],
+            signing.public_key,
+            Some(PrivateKey::deserialize(&private_bytes).expect("key")),
+        )
+        .expect("valid inputs");
+        let state = SenderKeyState::from_protobuf(state.as_protobuf());
+
+        // Warm it the lazy way first.
+        let _ = state.signing_key_private().expect("lazy warm");
+        let _ = state.signing_key_verifier().expect("lazy warm");
+
+        let derived = PrivateKey::deserialize(&private_bytes).expect("key");
+        derived.precompute_signing_cache();
+        state
+            .prewarm_signing_key(derived)
+            .expect("no-op, not error");
+        state
+            .prewarm_verifying_key(crate::core::curve::PreparedVerifyingKey::new(
+                &signing.public_key,
+            ))
+            .expect("no-op, not error");
+
+        assert_eq!(
+            *state.signing_key_private().expect("key").serialize(),
+            private_bytes
+        );
+    }
 
     /// Test SenderMessageKey derivation is deterministic
     #[test]

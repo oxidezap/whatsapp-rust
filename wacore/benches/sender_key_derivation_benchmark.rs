@@ -5,10 +5,11 @@
 //! pays off for a caller that keeps the record between operations. These
 //! benches contrast the two shapes: a store that hands back the cached record
 //! (what this repository does) against one that rebuilds it from components on
-//! every load. The two `store_round_trip_*` controls bound how much of that gap
-//! is the store shape rather than the memo; what remains is not decomposed
-//! further, because doing so credibly needs a control per side and per
-//! direction, and the answer does not turn on it.
+//! every load, and a third that rebuilds but hands the derivations back through
+//! the prewarm API. The two `store_round_trip_*` controls bound how much of the
+//! rebuilt gap is the store shape rather than the memo; what remains is not
+//! decomposed further, because doing so credibly needs a control per side and
+//! per direction, and the answer does not turn on it.
 //!
 //! The decrypt benches unwrap: a replayed ciphertext would return
 //! `DuplicatedMessage` and time the error path instead, which no assertion on a
@@ -30,8 +31,8 @@ use divan::Bencher;
 use std::collections::HashMap;
 use std::hint::black_box;
 use wacore_libsignal::protocol::{
-    SenderKeyName, SenderKeyRecord, SenderKeyRecordComponents, SenderKeyStore,
-    create_sender_key_distribution_message, group_decrypt, group_encrypt,
+    PreparedVerifyingKey, PrivateKey, SenderKeyName, SenderKeyRecord, SenderKeyRecordComponents,
+    SenderKeyStore, create_sender_key_distribution_message, group_decrypt, group_encrypt,
     process_sender_key_distribution_message,
 };
 
@@ -95,6 +96,40 @@ impl SenderKeyStore for RebuildingStore {
     }
 }
 
+/// Rebuilds the record like `RebuildingStore`, but hands the derivations back
+/// through the prewarm API instead of letting the state re-derive them. This is
+/// the shape a caller gets by caching the derivation rather than the record.
+struct PrewarmedStore {
+    states: HashMap<SenderKeyName, SenderKeyRecordComponents>,
+    signing: HashMap<SenderKeyName, PrivateKey>,
+    verifying: HashMap<SenderKeyName, PreparedVerifyingKey>,
+}
+
+#[async_trait]
+impl SenderKeyStore for PrewarmedStore {
+    async fn store_sender_key(&mut self, n: &SenderKeyName, r: SenderKeyRecord) -> SigResult<()> {
+        self.states.insert(n.clone(), r.into_components()?);
+        Ok(())
+    }
+    async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
+        let Some(components) = self.states.get(n) else {
+            return Ok(None);
+        };
+        let mut record = SenderKeyRecord::from_components(components.clone())?;
+        record.waive_counter_lease()?;
+        let state = record.sender_key_state().expect("state present");
+        if let Some(key) = self.signing.get(n) {
+            state.prewarm_signing_key(key.clone()).expect("own key");
+        }
+        if let Some(verifier) = self.verifying.get(n) {
+            state
+                .prewarm_verifying_key(verifier.clone())
+                .expect("own verifier");
+        }
+        Ok(Some(record))
+    }
+}
+
 fn name() -> SenderKeyName {
     SenderKeyName::new("group@g.us".to_string(), "sender.0".to_string())
 }
@@ -138,6 +173,73 @@ fn rebuilding_pair() -> (RebuildingStore, RebuildingStore) {
         )
     };
     (convert(sender), convert(receiver))
+}
+
+/// The rebuilding pair, plus the derivations a caller would have cached, warmed
+/// once outside the timed region exactly as that caller would hold them.
+fn prewarmed_pair() -> (PrewarmedStore, PrewarmedStore) {
+    let (sender, receiver) = warm_pair();
+    let convert = |store: WarmStore| {
+        let mut signing = HashMap::new();
+        let mut verifying = HashMap::new();
+        let states = store
+            .0
+            .into_iter()
+            .map(|(n, r)| {
+                let state = r.sender_key_state().expect("state present");
+                if let Ok(key) = state.signing_key_private() {
+                    key.precompute_signing_cache();
+                    signing.insert(n.clone(), key);
+                }
+                let verifier =
+                    PreparedVerifyingKey::new(&state.signing_key_public().expect("public key"));
+                verifier.precompute();
+                verifying.insert(n.clone(), verifier);
+                (n, r.into_components().expect("export"))
+            })
+            .collect();
+        PrewarmedStore {
+            states,
+            signing,
+            verifying,
+        }
+    };
+    (convert(sender), convert(receiver))
+}
+
+#[divan::bench]
+fn group_encrypt_prewarmed_record(bencher: Bencher) {
+    let sender_key_name = name();
+    bencher
+        .with_inputs(|| (prewarmed_pair().0, seeded(OPERATION_SEED)))
+        .bench_refs(|(sender, rng)| {
+            black_box(
+                futures::executor::block_on(group_encrypt(
+                    sender,
+                    &sender_key_name,
+                    b"payload",
+                    rng,
+                ))
+                .expect("encrypt must succeed on every timed iteration"),
+            )
+        });
+}
+
+#[divan::bench]
+fn group_decrypt_prewarmed_record(bencher: Bencher) {
+    let sender_key_name = name();
+    bencher
+        .with_inputs(|| {
+            let (mut sender, _) = warm_pair();
+            let message = ciphertext(&mut sender, &name());
+            (prewarmed_pair().1, message)
+        })
+        .bench_refs(|(receiver, message)| {
+            black_box(
+                futures::executor::block_on(group_decrypt(message, receiver, &sender_key_name))
+                    .expect("decrypt must succeed on every timed iteration"),
+            )
+        });
 }
 
 #[divan::bench]
