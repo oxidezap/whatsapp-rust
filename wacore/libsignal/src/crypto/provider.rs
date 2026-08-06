@@ -1,8 +1,9 @@
 //! Pluggable Signal crypto provider.
 //!
 //! Default uses RustCrypto (soft). Override via [`set_crypto_provider`] to
-//! delegate hot-path primitives to a faster backend (e.g. `node:crypto`
-//! over a WASM bridge). Must be set before any crypto call.
+//! delegate the primitives to another backend: AES-256-CBC, AES-256-GCM,
+//! HMAC-SHA256, the transport AEAD and the X25519 agreement. Must be set
+//! before any crypto call, key agreement included.
 
 use std::sync::OnceLock;
 
@@ -218,6 +219,17 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
         input.extend_from_slice(first);
         input.extend_from_slice(second);
         self.hmac_sha256(key, &input)
+    }
+
+    /// X25519 key agreement over the raw 32-byte keys as this crate stores
+    /// them; an implementation clamps the private key itself, as X25519
+    /// requires (clamping is idempotent, so repeating it is safe). Overriding
+    /// this replaces the primitive for every agreement the crate performs.
+    ///
+    /// The default is this crate's own implementation, so a provider that
+    /// leaves it alone keeps today's result byte for byte.
+    fn x25519_agreement(&self, private_key: &[u8; 32], their_public_key: &[u8; 32]) -> [u8; 32] {
+        crate::core::curve::x25519_agreement(private_key, their_public_key)
     }
 
     /// In-place AES-256-GCM seal. On entry `buffer` holds the plaintext; on
@@ -572,6 +584,96 @@ mod tests {
             provider.hmac_sha256_two_part(key, first, second),
             provider.hmac_sha256(key, b"message body")
         );
+    }
+
+    /// A provider written before the agreement joined the trait: it implements
+    /// only the required methods and must keep agreeing keys correctly.
+    struct SymmetricOnlyProvider;
+
+    impl SignalCryptoProvider for SymmetricOnlyProvider {
+        fn aes_256_cbc_encrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            plaintext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            RustCryptoProvider.aes_256_cbc_encrypt(key, iv, plaintext, out)
+        }
+
+        fn aes_256_cbc_decrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            ciphertext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            RustCryptoProvider.aes_256_cbc_decrypt(key, iv, ciphertext, out)
+        }
+
+        fn aes_256_gcm_encrypt(
+            &self,
+            key: &[u8; 32],
+            nonce: &[u8; 12],
+            aad: &[u8],
+            plaintext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            RustCryptoProvider.aes_256_gcm_encrypt(key, nonce, aad, plaintext, out)
+        }
+
+        fn aes_256_gcm_decrypt(
+            &self,
+            key: &[u8; 32],
+            nonce: &[u8; 12],
+            aad: &[u8],
+            ciphertext_with_tag: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            RustCryptoProvider.aes_256_gcm_decrypt(key, nonce, aad, ciphertext_with_tag, out)
+        }
+
+        fn hmac_sha256(&self, key: &[u8], input: &[u8]) -> [u8; 32] {
+            RustCryptoProvider.hmac_sha256(key, input)
+        }
+    }
+
+    /// RFC 7748 section 6.1, reached through the trait default.
+    #[test]
+    fn provider_without_agreement_override_keeps_the_pure_path() {
+        let alice_private = [
+            0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+            0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+            0x1d, 0xb9, 0x2c, 0x2a,
+        ];
+        let bob_public = [
+            0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4,
+            0x35, 0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14,
+            0x6f, 0x88, 0x2b, 0x4f,
+        ];
+        let expected = [
+            0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35,
+            0x0f, 0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0, 0x9b, 0x3c,
+            0x1e, 0x16, 0x17, 0x42,
+        ];
+
+        assert_eq!(
+            SymmetricOnlyProvider.x25519_agreement(&alice_private, &bob_public),
+            expected
+        );
+        assert_eq!(
+            RustCryptoProvider.x25519_agreement(&alice_private, &bob_public),
+            expected
+        );
+    }
+
+    /// A public key of low order agrees to the all-zero secret; the primitive
+    /// reports it as bytes rather than failing, and callers must not read that
+    /// as a usable secret.
+    #[test]
+    fn provider_agreement_with_low_order_point_is_all_zero() {
+        let agreement = RustCryptoProvider.x25519_agreement(&[0x42; 32], &[0u8; 32]);
+        assert_eq!(agreement, [0u8; 32]);
     }
 
     /// NIST SP 800-38D Test Case 14: all-zero key/nonce, 128-bit plaintext.
