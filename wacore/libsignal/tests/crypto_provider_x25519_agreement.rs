@@ -293,7 +293,7 @@ impl Peer {
     fn bundle(&self) -> PreKeyBundle {
         PreKeyBundle::new(
             self.identity_store.registration_id,
-            1u32.into(),
+            self.address.device_id(),
             Some((self.prekey_id, self.prekey_pair.public_key)),
             self.signed_prekey_id,
             self.signed_prekey_pair.public_key,
