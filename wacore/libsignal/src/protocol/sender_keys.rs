@@ -422,9 +422,15 @@ impl SenderKeyState {
                 "prewarmed signing key belongs to another state",
             ));
         }
+        // Check the slot before deriving: whatever is already there is warm,
+        // since the lazy path warms before it memoizes, and deriving first
+        // would spend a basepoint multiplication only to find `set` refuse it.
+        if self.signing_key_memo.get().is_some() {
+            return Ok(());
+        }
         // Every read of the memo hands out a clone, and clones of a cold key
         // each re-derive, so accepting one as passed would cost a derivation
-        // per message rather than none. Idempotent when already warm.
+        // per message rather than none.
         key.precompute_signing_cache();
         let _ = self.signing_key_memo.set(key);
         Ok(())
