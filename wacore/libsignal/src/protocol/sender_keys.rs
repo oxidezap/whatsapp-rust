@@ -404,8 +404,8 @@ impl SenderKeyState {
             .expect("set on the line above"))
     }
 
-    /// Hand this state a signing key whose XEdDSA cache is already derived,
-    /// skipping the basepoint multiplication the lazy path would pay.
+    /// Hand this state a signing key, so it skips the basepoint multiplication
+    /// the lazy path would pay.
     ///
     /// For a caller that rebuilds the record per operation, the memo never
     /// survives to be reused; this lets it keep the derivation instead of the
@@ -413,9 +413,15 @@ impl SenderKeyState {
     /// it lives, and of the private material in it, which the state would
     /// otherwise hold only for its own lifetime.
     ///
+    /// **Hold the key warm to collect anything.** A cold one is warmed here
+    /// rather than refused, because every read of the memo hands out a clone
+    /// and clones of a cold key each re-derive; but warming it costs the
+    /// derivation this call exists to skip, once per handover. Warm it once
+    /// when it enters your cache, with [`PrivateKey::precompute_signing_cache`].
+    ///
     /// The key must be this state's own; one that is not is rejected and the
-    /// state keeps deriving for itself. A memo already warmed by use is left
-    /// alone, since it holds the same derivation.
+    /// state keeps deriving for itself. A memo already populated is left alone,
+    /// since it holds the same derivation.
     pub fn prewarm_signing_key(&self, key: PrivateKey) -> Result<(), InvalidSenderKeySessionError> {
         if !bool::from(self.signing_key_bytes()?.ct_eq(key.serialize())) {
             return Err(InvalidSenderKeySessionError(
@@ -439,6 +445,10 @@ impl SenderKeyState {
     /// Receive-side counterpart of [`Self::prewarm_signing_key`], carrying the
     /// verifier's Edwards derivations. The verifier holds only public material,
     /// so the caller takes on its lifetime and nothing else.
+    ///
+    /// Same rule about holding it warm, with one difference in the caller's
+    /// favour: a verifier's entries sit behind a shared handle, so warming a
+    /// cold one warms every clone of it, including the copy in your cache.
     pub fn prewarm_verifying_key(
         &self,
         verifier: crate::core::curve::PreparedVerifyingKey,
