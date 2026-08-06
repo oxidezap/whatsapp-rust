@@ -20,6 +20,7 @@ use crate::protocol::stores::{
     SenderKeyRecordStructure, SenderKeyStateStructure, sender_key_state_structure,
 };
 use crate::protocol::{PrivateKey, PublicKey, SignalProtocolError, consts};
+use subtle::ConstantTimeEq;
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
 #[derive(Debug)]
@@ -416,11 +417,15 @@ impl SenderKeyState {
     /// state keeps deriving for itself. A memo already warmed by use is left
     /// alone, since it holds the same derivation.
     pub fn prewarm_signing_key(&self, key: PrivateKey) -> Result<(), InvalidSenderKeySessionError> {
-        if self.signing_key_bytes()? != *key.serialize() {
+        if !bool::from(self.signing_key_bytes()?.ct_eq(key.serialize())) {
             return Err(InvalidSenderKeySessionError(
                 "prewarmed signing key belongs to another state",
             ));
         }
+        // Every read of the memo hands out a clone, and clones of a cold key
+        // each re-derive, so accepting one as passed would cost a derivation
+        // per message rather than none. Idempotent when already warm.
+        key.precompute_signing_cache();
         let _ = self.signing_key_memo.set(key);
         Ok(())
     }
@@ -973,6 +978,41 @@ mod tests {
                     .verify_signature(message, signature)
             );
         }
+    }
+
+    /// Accepting a cold key as passed would be worse than not injecting at all:
+    /// every read of the memo hands out a clone, and clones of a cold key each
+    /// re-derive, so the caller would pay a derivation per message instead of
+    /// none. The setter warms what it is given.
+    #[test]
+    fn prewarming_with_a_cold_key_still_leaves_the_memo_warm() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let private_bytes = *signing.private_key.serialize();
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &[7u8; 32],
+            signing.public_key,
+            Some(PrivateKey::deserialize(&private_bytes).expect("key")),
+        )
+        .expect("valid inputs");
+        let state = SenderKeyState::from_protobuf(state.as_protobuf());
+
+        // Deliberately not precomputed, the way a caller reconstructing from
+        // stored bytes would hand it over.
+        let cold = PrivateKey::deserialize(&private_bytes).expect("key");
+        assert!(!cold.has_warm_signing_cache());
+        state.prewarm_signing_key(cold).expect("own key");
+
+        assert!(
+            state
+                .signing_key_private()
+                .expect("memo key")
+                .has_warm_signing_cache(),
+            "a clone taken from the memo must carry the warm cache"
+        );
     }
 
     /// Material from another key must not be installed, and refusing it must
