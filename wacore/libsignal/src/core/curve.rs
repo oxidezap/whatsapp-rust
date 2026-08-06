@@ -41,6 +41,9 @@ pub enum CurveError {
     BadKeyType(u8),
     #[error("bad key length <{1}> for key with type <{0}>")]
     BadKeyLength(KeyType, usize),
+    /// Only a substituted agreement can produce this: the default never fails.
+    #[error("the active crypto provider failed the key agreement")]
+    AgreementFailed(#[from] crate::crypto::CryptoProviderError),
 }
 
 impl TryFrom<u8> for KeyType {
@@ -519,7 +522,7 @@ impl PrivateKey {
             // The single place the agreement is decided, so a consumer that
             // supplies the primitive replaces it for every caller at once.
             (PrivateKeyData::DjbPrivateKey { key, .. }, PublicKeyData::DjbPublicKey(pub_key)) => {
-                Ok(crate::crypto::x25519_agreement(key, &pub_key))
+                Ok(crate::crypto::x25519_agreement(key, &pub_key)?)
             }
         }
     }

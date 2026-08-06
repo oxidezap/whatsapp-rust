@@ -11,9 +11,9 @@ use wacore_libsignal::crypto::{
     CryptoProviderError, RustCryptoProvider, SignalCryptoProvider, set_crypto_provider,
 };
 use wacore_libsignal::protocol::{
-    CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
+    CiphertextMessage, CurveError, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
     IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore,
-    ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
+    ProtocolAddress, PublicKey, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
     SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet, message_decrypt,
     message_encrypt, process_prekey_bundle,
 };
@@ -28,6 +28,10 @@ static AGREEMENTS: AtomicUsize = AtomicUsize::new(0);
 fn substituted_agreement(private_key: &[u8; 32], their_public_key: &[u8; 32]) -> [u8; 32] {
     RustCryptoProvider.hmac_sha256(private_key, their_public_key)
 }
+
+/// Peer key that makes the provider below report a backend failure, standing in
+/// for the moment an external module refuses the operation.
+const UNAVAILABLE_PEER_KEY: [u8; 32] = [0xee; 32];
 
 struct SubstitutedAgreementProvider;
 
@@ -78,9 +82,16 @@ impl SignalCryptoProvider for SubstitutedAgreementProvider {
         RustCryptoProvider.hmac_sha256(key, input)
     }
 
-    fn x25519_agreement(&self, private_key: &[u8; 32], their_public_key: &[u8; 32]) -> [u8; 32] {
+    fn x25519_agreement(
+        &self,
+        private_key: &[u8; 32],
+        their_public_key: &[u8; 32],
+    ) -> Result<[u8; 32], CryptoProviderError> {
         AGREEMENTS.fetch_add(1, Ordering::Relaxed);
-        substituted_agreement(private_key, their_public_key)
+        if their_public_key == &UNAVAILABLE_PEER_KEY {
+            return Err(CryptoProviderError::BackendFailed);
+        }
+        Ok(substituted_agreement(private_key, their_public_key))
     }
 }
 
@@ -406,4 +417,32 @@ fn inconsistent_agreement_fails_the_session_with_a_typed_error() {
         ),
         "expected a typed decrypt failure, got {err:?}"
     );
+}
+
+/// A backend that refuses the operation surfaces as an error the caller can
+/// match on, all the way up to the protocol error type, and never as bytes the
+/// session would then build keys from.
+#[test]
+fn provider_backend_failure_surfaces_as_a_typed_error() {
+    install_provider();
+
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let ours = KeyPair::generate(&mut rng);
+    let unavailable =
+        PublicKey::from_djb_public_key_bytes(&UNAVAILABLE_PEER_KEY).expect("peer key");
+
+    let err = ours
+        .calculate_agreement(&unavailable)
+        .expect_err("the backend refused");
+    assert!(
+        matches!(
+            err,
+            CurveError::AgreementFailed(CryptoProviderError::BackendFailed)
+        ),
+        "expected a typed agreement failure, got {err:?}"
+    );
+    assert!(matches!(
+        SignalProtocolError::from(err),
+        SignalProtocolError::KeyAgreementFailed(CryptoProviderError::BackendFailed)
+    ));
 }

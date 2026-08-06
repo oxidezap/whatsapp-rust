@@ -10,6 +10,7 @@ use crate::{
         ProtocolAddress,
         curve::{CurveError, KeyType},
     },
+    crypto::CryptoProviderError,
     protocol::CiphertextMessageType,
 };
 use thiserror::Error;
@@ -55,6 +56,9 @@ pub enum SignalProtocolError {
 
     #[error("invalid signature detected")]
     SignatureValidationFailed,
+
+    #[error("the active crypto provider failed the key agreement")]
+    KeyAgreementFailed(#[source] CryptoProviderError),
 
     #[error("untrusted identity for address {0}")]
     UntrustedIdentity(ProtocolAddress),
@@ -108,6 +112,7 @@ impl From<CurveError> for SignalProtocolError {
             CurveError::NoKeyTypeIdentifier => Self::NoKeyTypeIdentifier,
             CurveError::BadKeyType(raw) => Self::BadKeyType(raw),
             CurveError::BadKeyLength(key_type, len) => Self::BadKeyLength(key_type, len),
+            CurveError::AgreementFailed(source) => Self::KeyAgreementFailed(source),
         }
     }
 }

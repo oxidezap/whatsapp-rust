@@ -226,10 +226,19 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
     /// requires (clamping is idempotent, so repeating it is safe). Overriding
     /// this replaces the primitive for every agreement the crate performs.
     ///
-    /// The default is this crate's own implementation, so a provider that
-    /// leaves it alone keeps today's result byte for byte.
-    fn x25519_agreement(&self, private_key: &[u8; 32], their_public_key: &[u8; 32]) -> [u8; 32] {
-        crate::core::curve::x25519_agreement(private_key, their_public_key)
+    /// A backend that can fail reports it here instead of panicking or
+    /// answering with fabricated bytes, which would let a session advance on
+    /// key material nobody agreed to. The default is this crate's own
+    /// implementation: it cannot fail, and keeps today's result byte for byte.
+    fn x25519_agreement(
+        &self,
+        private_key: &[u8; 32],
+        their_public_key: &[u8; 32],
+    ) -> Result<[u8; 32], CryptoProviderError> {
+        Ok(crate::core::curve::x25519_agreement(
+            private_key,
+            their_public_key,
+        ))
     }
 
     /// In-place AES-256-GCM seal. On entry `buffer` holds the plaintext; on
@@ -658,11 +667,15 @@ mod tests {
         ];
 
         assert_eq!(
-            SymmetricOnlyProvider.x25519_agreement(&alice_private, &bob_public),
+            SymmetricOnlyProvider
+                .x25519_agreement(&alice_private, &bob_public)
+                .expect("the default cannot fail"),
             expected
         );
         assert_eq!(
-            RustCryptoProvider.x25519_agreement(&alice_private, &bob_public),
+            RustCryptoProvider
+                .x25519_agreement(&alice_private, &bob_public)
+                .expect("the default cannot fail"),
             expected
         );
     }
@@ -672,7 +685,9 @@ mod tests {
     /// as a usable secret.
     #[test]
     fn provider_agreement_with_low_order_point_is_all_zero() {
-        let agreement = RustCryptoProvider.x25519_agreement(&[0x42; 32], &[0u8; 32]);
+        let agreement = RustCryptoProvider
+            .x25519_agreement(&[0x42; 32], &[0u8; 32])
+            .expect("the default cannot fail");
         assert_eq!(agreement, [0u8; 32]);
     }
 
