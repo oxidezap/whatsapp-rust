@@ -1091,6 +1091,14 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 record.set_session_state(current_state);
                 return Err(error);
             }
+            Err(e @ SignalProtocolError::KeyAgreementFailed(_)) => {
+                // A refused agreement says nothing about this message: every
+                // other session would ask the same backend and get the same
+                // answer, and collapsing it into the aggregate verdict below
+                // would have the caller treat a live message as corrupt.
+                record.set_session_state(current_state);
+                return Err(e);
+            }
             Err(e) if !ciphertext.is_available() => {
                 // Authentication succeeded, but the provider rejected the
                 // caller-owned body after it had been consumed for in-place
@@ -1199,6 +1207,10 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                 log_decryption_failure(ciphertext.signal_message(), &previous, &error);
                 record.restore_previous_session(idx, previous);
                 return Err(error);
+            }
+            Err(e @ SignalProtocolError::KeyAgreementFailed(_)) => {
+                record.restore_previous_session(idx, previous);
+                return Err(e);
             }
             Err(e) if !ciphertext.is_available() => {
                 record.restore_previous_session(idx, previous);
