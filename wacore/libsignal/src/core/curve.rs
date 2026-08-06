@@ -304,6 +304,13 @@ impl PreparedVerifyingKey {
         self.mont == mont
     }
 
+    /// Test-only visibility into the lazy entries, mirroring the signing-key
+    /// hook so both prewarm paths can be pinned the same way.
+    #[cfg(test)]
+    pub(crate) fn is_precomputed(&self) -> bool {
+        self.cached.iter().all(|entry| entry.get().is_some())
+    }
+
     /// Derives both sign-bit entries now. The signature's sign bit is fixed
     /// per signer but unknowable from the Montgomery key alone, so a
     /// receive-side holder warms both once instead of paying the derivation

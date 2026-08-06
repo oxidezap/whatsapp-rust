@@ -442,6 +442,11 @@ impl SenderKeyState {
                 "prewarmed verifier belongs to another state",
             ));
         }
+        // Same contract as the signing side: what goes in warm comes out warm,
+        // so a caller can hand over a freshly built verifier. Cheaper to get
+        // wrong than the signing key, since clones share these entries, but not
+        // free, and the asymmetry would be a trap.
+        verifier.precompute();
         let _ = self.verifying_key_memo.set(verifier);
         Ok(())
     }
@@ -985,7 +990,7 @@ mod tests {
     /// re-derive, so the caller would pay a derivation per message instead of
     /// none. The setter warms what it is given.
     #[test]
-    fn prewarming_with_a_cold_key_still_leaves_the_memo_warm() {
+    fn prewarming_with_cold_material_still_leaves_the_memos_warm() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let signing = KeyPair::generate(&mut rng);
         let private_bytes = *signing.private_key.serialize();
@@ -1012,6 +1017,19 @@ mod tests {
                 .expect("memo key")
                 .has_warm_signing_cache(),
             "a clone taken from the memo must carry the warm cache"
+        );
+
+        // The verifier is cheaper to get wrong, since clones share its entries,
+        // but the contract is the same: warm on the way out.
+        let cold = crate::core::curve::PreparedVerifyingKey::new(&signing.public_key);
+        assert!(!cold.is_precomputed());
+        state.prewarm_verifying_key(cold).expect("own verifier");
+        assert!(
+            state
+                .signing_key_verifier()
+                .expect("memo verifier")
+                .is_precomputed(),
+            "the memoized verifier must have its entries derived"
         );
     }
 
