@@ -401,4 +401,52 @@ fn a_refused_agreement_survives_the_decrypt_candidate_search() {
         receive(&mut alice, &bob.address, &ratcheted).expect("decrypts once the backend returns"),
         b"new ratchet"
     );
+
+    // Same refusal, reached through the archived-session half of the search:
+    // with no current state the candidate loop is the only path, and the
+    // session it borrowed has to be back in place afterwards.
+    let after = send(&mut alice, &bob.address, b"after recovery");
+    assert_eq!(
+        receive(&mut bob, &alice.address, &after).expect("decrypts"),
+        b"after recovery"
+    );
+    let for_the_archive = send(&mut bob, &alice.address, b"read me from the archive");
+
+    {
+        let record = alice
+            .session_store
+            .0
+            .get_mut(&bob.address)
+            .expect("alice has a session");
+        record.archive_current_state().expect("archive");
+        assert!(record.session_state().is_none());
+        assert_eq!(record.previous_session_count(), 1);
+    }
+
+    REFUSING.store(true, Ordering::SeqCst);
+    let err = receive(&mut alice, &bob.address, &for_the_archive).expect_err("the backend refused");
+    REFUSING.store(false, Ordering::SeqCst);
+
+    assert!(
+        matches!(
+            err,
+            SignalProtocolError::KeyAgreementFailed(CryptoProviderError::BackendFailed)
+        ),
+        "expected the backend failure to survive the archived-session search, got {err:?}"
+    );
+    assert_eq!(
+        alice
+            .session_store
+            .0
+            .get(&bob.address)
+            .expect("record")
+            .previous_session_count(),
+        1,
+        "the archived session must still be there after the refusal"
+    );
+    assert_eq!(
+        receive(&mut alice, &bob.address, &for_the_archive)
+            .expect("the archived session still reads it"),
+        b"read me from the archive"
+    );
 }
