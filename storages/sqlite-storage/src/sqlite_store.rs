@@ -97,6 +97,10 @@ const ID_PARAM_CHUNK: usize = 900;
 /// limit while bounding Diesel's temporary insert-expression allocation.
 const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
 
+/// A read-only closure with its type erased, so the read path monomorphizes
+/// once per return type rather than once per call site.
+type ReadQuery<T> = Box<dyn FnOnce(&mut SqliteConnection) -> Result<T> + Send>;
+
 /// Reader connections and the permits that bound how many run at once.
 #[derive(Clone)]
 pub(crate) struct ReadPool {
@@ -616,10 +620,17 @@ impl SqliteStore {
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let Some(reads) = self.reads.clone() else {
-            // No reader connections: the write permit is still held for the
-            // whole query, so the snapshot comes for free and a transaction
-            // would only add statements.
+        // Erase the closure before the real body: two dozen read methods
+        // through a generic body carrying Diesel's transaction machinery
+        // monomorphizes per call site, and that is ~90 KiB of .text.
+        self.read_erased(Box::new(f)).await
+    }
+
+    async fn read_erased<T: Send + 'static>(&self, f: ReadQuery<T>) -> Result<T> {
+        if self.reads.is_none() {
+            // No reader connections: the single pooled connection is what no
+            // writer can be holding while this query runs, so the snapshot
+            // comes for free and a transaction would only add statements.
             let pool = self.pool.clone();
             return self
                 .with_semaphore(move || {
@@ -629,23 +640,10 @@ impl SqliteStore {
                     f(&mut conn)
                 })
                 .await;
-        };
-        let ReadPool { pool, semaphore } = reads;
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // A deferred transaction pins one snapshot across a multi-statement
-            // read now that a writer can commit between its statements.
-            crate::shared::read_snapshot(&mut conn, f)
-        })
-        .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
+        }
+        // One implementation of acquire-checkout-snapshot, shared with the
+        // sibling-crate read path.
+        self.shared().read(f).await
     }
 
     /// The write queue: one permit, so two writers can never deadlock on the
@@ -1580,24 +1578,29 @@ impl SqliteStore {
                 // Each row has 5 columns. 100 rows * 5 = 500 params, which is safe.
                 const CHUNK_SIZE: usize = 100;
 
-                for chunk in records.chunks(CHUNK_SIZE) {
-                    diesel::insert_into(app_state_mutation_macs::table)
-                        .values(chunk)
-                        .on_conflict((
-                            app_state_mutation_macs::name,
-                            app_state_mutation_macs::index_mac,
-                            app_state_mutation_macs::device_id,
-                        ))
-                        .do_update()
-                        .set((
-                            app_state_mutation_macs::version
-                                .eq(excluded(app_state_mutation_macs::version)),
-                            app_state_mutation_macs::value_mac
-                                .eq(excluded(app_state_mutation_macs::value_mac)),
-                        ))
-                        .execute(conn)?;
-                }
-                Ok(())
+                // Chunking is a parameter-limit workaround, not a commit
+                // boundary: a reader that lands between two chunks must not see
+                // half a batch.
+                conn.transaction(|conn| {
+                    for chunk in records.chunks(CHUNK_SIZE) {
+                        diesel::insert_into(app_state_mutation_macs::table)
+                            .values(chunk)
+                            .on_conflict((
+                                app_state_mutation_macs::name,
+                                app_state_mutation_macs::index_mac,
+                                app_state_mutation_macs::device_id,
+                            ))
+                            .do_update()
+                            .set((
+                                app_state_mutation_macs::version
+                                    .eq(excluded(app_state_mutation_macs::version)),
+                                app_state_mutation_macs::value_mac
+                                    .eq(excluded(app_state_mutation_macs::value_mac)),
+                            ))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
             })
         })
         .await
@@ -1622,18 +1625,20 @@ impl SqliteStore {
                 // We use a safe chunk size to stay well within limits.
                 const CHUNK_SIZE: usize = 500;
 
-                for chunk in index_macs.chunks(CHUNK_SIZE) {
-                    diesel::delete(
-                        app_state_mutation_macs::table.filter(
-                            app_state_mutation_macs::name
-                                .eq(&name)
-                                .and(app_state_mutation_macs::index_mac.eq_any(chunk))
-                                .and(app_state_mutation_macs::device_id.eq(device_id)),
-                        ),
-                    )
-                    .execute(conn)?;
-                }
-                Ok(())
+                conn.transaction(|conn| {
+                    for chunk in index_macs.chunks(CHUNK_SIZE) {
+                        diesel::delete(
+                            app_state_mutation_macs::table.filter(
+                                app_state_mutation_macs::name
+                                    .eq(&name)
+                                    .and(app_state_mutation_macs::index_mac.eq_any(chunk))
+                                    .and(app_state_mutation_macs::device_id.eq(device_id)),
+                            ),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
             })
         })
         .await
@@ -2103,16 +2108,18 @@ impl SignalStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 // Stay under SQLite's host-parameter limit (999 by default);
                 // the upload batch is configurable up to u16::MAX ids.
-                for chunk in ids.chunks(ID_PARAM_CHUNK) {
-                    diesel::update(
-                        prekeys::table
-                            .filter(prekeys::id.eq_any(chunk.to_vec()))
-                            .filter(prekeys::device_id.eq(device_id)),
-                    )
-                    .set(prekeys::uploaded.eq(true))
-                    .execute(conn)?;
-                }
-                Ok(())
+                conn.transaction(|conn| {
+                    for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                        diesel::update(
+                            prekeys::table
+                                .filter(prekeys::id.eq_any(chunk.to_vec()))
+                                .filter(prekeys::device_id.eq(device_id)),
+                        )
+                        .set(prekeys::uploaded.eq(true))
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
             })
         })
         .await
@@ -2488,22 +2495,25 @@ impl ProtocolStore for SqliteStore {
 
                 const CHUNK_SIZE: usize = 190;
 
-                for chunk in values.chunks(CHUNK_SIZE) {
-                    diesel::insert_into(sender_key_devices::table)
-                        .values(chunk)
-                        .on_conflict((
-                            sender_key_devices::group_jid,
-                            sender_key_devices::device_jid,
-                            sender_key_devices::device_id,
-                        ))
-                        .do_update()
-                        .set((
-                            sender_key_devices::has_key.eq(excluded(sender_key_devices::has_key)),
-                            sender_key_devices::updated_at.eq(now),
-                        ))
-                        .execute(conn)?;
-                }
-                Ok(())
+                conn.transaction(|conn| {
+                    for chunk in values.chunks(CHUNK_SIZE) {
+                        diesel::insert_into(sender_key_devices::table)
+                            .values(chunk)
+                            .on_conflict((
+                                sender_key_devices::group_jid,
+                                sender_key_devices::device_jid,
+                                sender_key_devices::device_id,
+                            ))
+                            .do_update()
+                            .set((
+                                sender_key_devices::has_key
+                                    .eq(excluded(sender_key_devices::has_key)),
+                                sender_key_devices::updated_at.eq(now),
+                            ))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
             })
         })
         .await
@@ -2551,15 +2561,17 @@ impl ProtocolStore for SqliteStore {
             let owned = Arc::clone(&owned);
             Box::new(move |conn: &mut SqliteConnection| {
                 const CHUNK: usize = 190;
-                for chunk in owned.chunks(CHUNK) {
-                    diesel::delete(
-                        sender_key_devices::table
-                            .filter(sender_key_devices::device_jid.eq_any(chunk))
-                            .filter(sender_key_devices::device_id.eq(device_id)),
-                    )
-                    .execute(conn)?;
-                }
-                Ok(())
+                conn.transaction(|conn| {
+                    for chunk in owned.chunks(CHUNK) {
+                        diesel::delete(
+                            sender_key_devices::table
+                                .filter(sender_key_devices::device_jid.eq_any(chunk))
+                                .filter(sender_key_devices::device_id.eq(device_id)),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
             })
         })
         .await
@@ -5988,6 +6000,112 @@ mod read_routing_tests {
         assert_eq!(got.as_deref(), Some(&b"blob"[..]));
     }
 
+    /// An uncommitted write is not a lock error and not a phantom miss: the
+    /// reader sees the last committed state and returns it. This is the case
+    /// the msg-secret reads were kept on the write queue for, so it has to hold
+    /// with a real write transaction open, not just an idle permit.
+    #[tokio::test]
+    async fn a_read_sees_the_last_commit_while_a_write_transaction_is_open() {
+        let db = TempDb::new("in_flight");
+        let store = store_with(2, &db).await;
+        store.put_session(ADDR, b"committed").await.unwrap();
+
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let shared = store.shared();
+            tokio::spawn(async move {
+                shared
+                    .run(move |conn| {
+                        conn.immediate_transaction(|conn| {
+                            diesel::update(sessions::table)
+                                .set(sessions::record.eq(&b"uncommitted"[..]))
+                                .execute(conn)?;
+                            let _ = open_tx.send(());
+                            // Bounded: a parked blocking task cannot be aborted,
+                            // so an unreleased one would hang shutdown.
+                            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+                            Ok(())
+                        })
+                        .map_err(|e: diesel::result::Error| StoreError::Database(Box::new(e)))
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), open_rx.recv())
+            .await
+            .expect("the write transaction must open")
+            .expect("writer alive");
+
+        let read = tokio::time::timeout(Duration::from_secs(10), store.get_session(ADDR)).await;
+        let _ = release_tx.send(());
+        let got = read
+            .expect("a read must not block on an open write transaction")
+            .expect("a read must not fail on an open write transaction");
+        assert_eq!(
+            got.as_deref(),
+            Some(&b"committed"[..]),
+            "the reader sees the last commit, never the open transaction"
+        );
+        writer.await.expect("join").expect("write commits");
+
+        // And the committed value once the writer lands.
+        assert_eq!(
+            store.get_session(ADDR).await.unwrap().as_deref(),
+            Some(&b"uncommitted"[..])
+        );
+    }
+
+    /// Chunking exists for SQLite's host-parameter limit, not as a commit
+    /// boundary. Once reads stop sharing the write permit a reader can land
+    /// between two chunks, so the batch has to be atomic on its own; racing the
+    /// two is what shows it. Samples the count while the write is in flight and
+    /// fails on any value that is neither the before nor the after.
+    #[tokio::test]
+    async fn a_chunked_batch_write_is_never_observed_half_applied() {
+        // Four chunks at set_sender_key_status's CHUNK_SIZE of 190.
+        const ENTRIES: usize = 760;
+        let db = TempDb::new("chunk_atomic");
+        let store = store_with(4, &db).await;
+        let jids: Arc<Vec<String>> = Arc::new(
+            (0..ENTRIES)
+                .map(|i| format!("55999{i:07}:0@s.whatsapp.net"))
+                .collect(),
+        );
+
+        for _ in 0..8 {
+            store.clear_sender_key_devices(GROUP).await.unwrap();
+            let writer = {
+                let store = store.clone();
+                let jids = Arc::clone(&jids);
+                tokio::spawn(async move {
+                    let entries: Vec<(&str, bool)> =
+                        jids.iter().map(|j| (j.as_str(), true)).collect();
+                    store.set_sender_key_status(GROUP, &entries).await.unwrap();
+                })
+            };
+
+            // Poll rather than sleep, and bound it so a failure reports instead
+            // of hanging the runtime.
+            let sampled = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let n = store.get_sender_key_devices(GROUP).await.unwrap().len();
+                    assert!(
+                        n == 0 || n == ENTRIES,
+                        "a chunked batch was observed {n}/{ENTRIES} applied"
+                    );
+                    if n == ENTRIES {
+                        return;
+                    }
+                }
+            })
+            .await;
+            writer.await.unwrap();
+            sampled.expect("the batch must land");
+        }
+    }
+
     /// Read-only methods left on the write queue on purpose, with the reason.
     /// Anything else matching a read-shaped name has to route through
     /// `read_query` or this test fails.
@@ -6041,9 +6159,12 @@ mod read_routing_tests {
                 continue;
             };
             let name = rest.split(['(', '<']).next().unwrap_or_default();
-            if ["get_", "load_", "has_"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            const READ_PREFIXES: &[&str] = &[
+                "get_", "load_", "has_", "is_", "list_", "count_", "find_", "fetch_",
+            ];
+            if READ_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+                || name.ends_with("_exists")
+                || name == "exists"
             {
                 current = Some((name, String::new()));
                 scanned += 1;
