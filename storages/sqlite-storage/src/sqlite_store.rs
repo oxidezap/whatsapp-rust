@@ -627,13 +627,11 @@ impl SqliteStore {
     }
 
     async fn read_erased<T: Send + 'static>(&self, f: ReadQuery<T>) -> Result<T> {
-        if self.reads.is_none() {
-            // No reader connections: at the default `pool_size = 1` the single
-            // pooled connection is what no writer can hold while this query
-            // runs, so the snapshot is free and a transaction would only add
-            // statements. Raising `pool_size` breaks that — the writers that
-            // check out a connection without the permit could then commit
-            // mid-read — but it also deadlocks writes, so it stays unsupported.
+        // At the default `pool_size = 1` with no reader connections, holding the
+        // one pooled connection is itself the snapshot: no writer can be on it,
+        // including the several that skip the permit and check one out directly.
+        // A transaction would only add statements to every read.
+        if self.reads.is_none() && self.pool.max_size() <= 1 {
             let pool = self.pool.clone();
             return self
                 .with_semaphore(move || {
@@ -644,8 +642,9 @@ impl SqliteStore {
                 })
                 .await;
         }
-        // One implementation of acquire-checkout-snapshot, shared with the
-        // sibling-crate read path.
+        // Otherwise the deferred read transaction is what pins the snapshot,
+        // whether the concurrency comes from reader connections or from a wider
+        // write pool. One implementation, shared with the sibling-crate path.
         self.shared().read(f).await
     }
 
@@ -6006,6 +6005,43 @@ mod read_routing_tests {
             .expect("a read must not queue behind the write permit")
             .expect("read succeeds");
         assert_eq!(got.as_deref(), Some(&b"blob"[..]));
+    }
+
+    /// `pool_size > 1` with no reader connections is reachable config, and there
+    /// the permit no longer implies an exclusive connection: the writers that
+    /// check one out directly can commit between a multi-statement read's
+    /// queries. The deferred transaction has to cover that case too.
+    #[tokio::test]
+    async fn a_multi_statement_read_is_snapshot_isolated_with_a_wider_write_pool() {
+        let db = TempDb::new("wide_pool");
+        let store = SqliteStore::with_config(
+            &db.url(),
+            SqliteStoreConfig {
+                pool_size: 2,
+                read_pool_size: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("store opens");
+        assert!(store.reads.is_none(), "no reader connections requested");
+        store.create_new_device().await.expect("device row");
+        store.put_session(ADDR, b"blob").await.unwrap();
+
+        // has_signal_state_for_user issues two EXISTS; both must see one
+        // snapshot even though a second write connection is available.
+        assert!(
+            store
+                .has_signal_state_for_user("559990000001")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_signal_state_for_user("559990000009")
+                .await
+                .unwrap()
+        );
     }
 
     /// An uncommitted write is not a lock error and not a phantom miss: the
