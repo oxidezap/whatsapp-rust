@@ -6207,7 +6207,6 @@ mod read_routing_tests {
             "and must decline the deferred read transaction with it"
         );
 
-        // Still fully operational on the plain path.
         store.create_new_device().await.expect("device row");
         store.put_session(ADDR, b"blob").await.unwrap();
         assert!(
@@ -6215,6 +6214,58 @@ mod read_routing_tests {
                 .has_signal_state_for_user("559990000001")
                 .await
                 .unwrap()
+        );
+
+        // The flags above are only the mechanism. What has to hold is that a
+        // write still commits with a read parked mid-flight: on the snapshot
+        // path the writer meets the reader's table lock as
+        // `SQLITE_LOCKED_SHAREDCACHE`, which `busy_timeout` cannot absorb. The
+        // park outlasts `with_retry`'s ~310ms budget, so that lock is fatal
+        // rather than retried away.
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .read_query(move |conn| {
+                        let first = sessions::table
+                            .select(sessions::record)
+                            .filter(sessions::address.eq(ADDR))
+                            .first::<Vec<u8>>(conn)
+                            .optional()
+                            .map_err(|e| StoreError::Database(Box::new(e)))?;
+                        let _ = open_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+                        Ok(first)
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), open_rx.recv())
+            .await
+            .expect("the read must reach its query")
+            .expect("reader alive");
+
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = release_tx.send(());
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.put_session(ADDR, b"committed-under-shared-cache"),
+        )
+        .await
+        .expect("the write must not stall behind the parked read")
+        .expect("the write must commit, not meet a shared-cache lock");
+
+        releaser.await.expect("join releaser");
+        reader.await.expect("join").expect("read");
+        assert_eq!(
+            store.get_session(ADDR).await.unwrap().as_deref(),
+            Some(&b"committed-under-shared-cache"[..])
         );
     }
 
