@@ -68,6 +68,21 @@ fn type_idents(ty: &syn::Type, out: &mut Vec<String>) {
     }
 }
 
+/// Whether `name` occurs in `text` as a whole identifier. A plain substring
+/// search would let a field called `cache` pass on any mention of `group_cache`;
+/// requiring the boundaries keeps that from counting.
+fn mentions(text: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back().is_none_or(|c| !ident(c));
+        let after = text[at + name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !ident(c));
+        before && after
+    })
+}
+
 fn client_struct(text: &str) -> syn::ItemStruct {
     let file = syn::parse_file(text).expect("parse src/client.rs");
     file.items
@@ -99,7 +114,7 @@ fn every_growable_client_field_reaches_the_memory_report() {
         if EXEMPT.iter().any(|(exempt, _)| *exempt == name) {
             continue;
         }
-        if !accessors.contains(&name) {
+        if !mentions(&accessors, &name) {
             missing.push(format!("  {name}: {}", idents.join("<")));
         }
     }
@@ -111,6 +126,24 @@ fn every_growable_client_field_reaches_the_memory_report() {
          this file with the reason they are not a per-session memory question.",
         missing.join("\n"),
     );
+}
+
+#[test]
+fn a_mention_is_a_whole_identifier() {
+    assert!(mentions(
+        "let recent_messages = self.recent_messages",
+        "recent_messages"
+    ));
+    assert!(mentions(
+        "self\n    .pending_outgoing_calls\n",
+        "pending_outgoing_calls"
+    ));
+    // The case the boundary check exists for.
+    assert!(!mentions(
+        "group_cache: self.group_cache.entry_count(),",
+        "cache"
+    ));
+    assert!(!mentions("self.group_devices_memo", "devices_memo"));
 }
 
 /// An exemption must name a field that still exists, so the list cannot rot
