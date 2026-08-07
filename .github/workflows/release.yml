@@ -68,12 +68,21 @@ jobs:
         id: version
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # This string becomes a git tag, a crates.io release and an image tag.
+          # Reject anything that is not a plain semver here, where the failure is
+          # one line to read, instead of downstream where it is a git error.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Refusing to release a malformed version: '$VERSION'" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create tag
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          TAG="${{ steps.version.outputs.tag }}"
+          TAG="$RELEASE_TAG"
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
             echo "Tag $TAG already exists on origin, skipping."
           else
@@ -83,9 +92,10 @@ jobs:
 
       - name: Create GitHub Release
         env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.version.outputs.tag }}"
+          TAG="$RELEASE_TAG"
           # Hand-written notes win when the release has them: --generate-notes
           # emits one bullet per PR, which for a release this size is thousands
           # of lines with no structure. Falls back to the generated list so a
