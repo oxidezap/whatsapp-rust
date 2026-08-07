@@ -69,6 +69,7 @@ enum Action {
     DeleteGroupDurable,
     CheckoutDuringFlush,
     RecoverGroup,
+    ColdDmReadAcrossFlush,
 }
 
 #[derive(Clone, Copy)]
@@ -90,7 +91,7 @@ impl SplitMix64 {
     }
 
     fn action(&mut self) -> Action {
-        match self.next() % 27 {
+        match self.next() % 28 {
             0 => Action::DmSend { fail_gate: true },
             1..=6 => Action::DmSend { fail_gate: false },
             7 => Action::GroupSend { fail_gate: true },
@@ -110,6 +111,7 @@ impl SplitMix64 {
             24 => Action::RecoverGroup,
             25 => Action::DmRatchet,
             26 => Action::DeleteGroupDurable,
+            27 => Action::ColdDmReadAcrossFlush,
             _ => unreachable!(),
         }
     }
@@ -193,6 +195,7 @@ impl ChaosHarness {
             }
             Action::CheckoutDuringFlush => self.checkout_during_flush().await?,
             Action::RecoverGroup => self.recover_group().await?,
+            Action::ColdDmReadAcrossFlush => self.cold_dm_read_across_flush().await?,
         }
         self.assert_invariants().await
     }
@@ -662,6 +665,95 @@ impl ChaosHarness {
         Ok(())
     }
 
+    /// A cold session read that spans a flush and the removal after it. The
+    /// read leaves the lock, a newer record is committed, made durable and
+    /// dropped as a clean entry, so the slot is absent again when the read
+    /// returns and only the removal stamp separates that from "never written".
+    /// The record it hands back then drives a real send, which is where
+    /// adopting pre-flush bytes surfaces as a republished key.
+    async fn cold_dm_read_across_flush(&mut self) -> Result<()> {
+        self.flush_successfully().await?;
+        let Some(current) = self
+            .cache
+            .peek_session(&self.dm_address, &self.backend)
+            .await?
+        else {
+            return Ok(());
+        };
+        // That peek warmed the slot; a cold read needs it empty again.
+        self.cache
+            .drop_clean_session_for_test(self.dm_address.as_str())
+            .await;
+
+        // The racing send, derived up front: inside the race it may only touch
+        // the cache, never the harness.
+        let mut newer = (*current).clone();
+        let racing_chain = newer
+            .session_state()
+            .context("DM session state missing")?
+            .get_sender_chain_key()
+            .map_err(|_| anyhow::anyhow!("DM sender chain missing"))?;
+        let racing_keys = racing_chain.message_keys().generate_keys();
+        let racing_fingerprint = (*racing_keys.cipher_key(), *racing_keys.iv());
+        let racing_next = racing_chain.next_chain_key()?;
+        newer
+            .session_state_mut()
+            .context("DM session state missing")?
+            .set_sender_chain_key(&racing_next)
+            .map_err(|_| anyhow::anyhow!("DM sender chain update failed"))?;
+        if racing_chain.index() >= newer.reserved_sender_chain_index() {
+            newer.reserve_sender_chain_counters(racing_chain.index());
+        }
+
+        let gated = GatedSessionRead::new(&self.backend);
+        let cache = &self.cache;
+        let backend = &self.backend;
+        let address = &self.dm_address;
+        let (read, written) = tokio::join!(cache.checkout_session(address, &gated), async {
+            gated.wait_for_read().await;
+            cache.put_session(address, newer).await;
+            let flushed = cache.flush(backend).await;
+            cache.drop_clean_session_for_test(address.as_str()).await;
+            gated.release_read().await;
+            flushed
+        });
+        written?;
+        ensure!(
+            self.published_dm.insert(racing_fingerprint),
+            "DM key/IV was published twice at counter {}",
+            racing_chain.index()
+        );
+
+        let (record, checkout) = read?;
+        let had_session = record.is_some();
+        let mut record = record.unwrap_or_else(|| fresh_session(&mut self.crypto_rng));
+        let chain = record
+            .session_state()
+            .context("DM session state missing")?
+            .get_sender_chain_key()
+            .map_err(|_| anyhow::anyhow!("DM sender chain missing"))?;
+        let keys = chain.message_keys().generate_keys();
+        let fingerprint = (*keys.cipher_key(), *keys.iv());
+        let next = chain.next_chain_key()?;
+        record
+            .session_state_mut()
+            .context("DM session state missing")?
+            .set_sender_chain_key(&next)
+            .map_err(|_| anyhow::anyhow!("DM sender chain update failed"))?;
+        if chain.index() >= record.reserved_sender_chain_index() {
+            record.reserve_sender_chain_counters(chain.index());
+        }
+        self.commit_dm(record, checkout, had_session).await?;
+        if self.release_wire_gate(FlushFailure::None).await? {
+            ensure!(
+                self.published_dm.insert(fingerprint),
+                "raced cold read resumed a DM chain at published counter {}",
+                chain.index()
+            );
+        }
+        Ok(())
+    }
+
     async fn assert_invariants(&self) -> Result<()> {
         let sessions = self.cache.lock_sessions().await;
         ensure!(
@@ -714,6 +806,112 @@ impl ChaosHarness {
             "wire-gate query disagrees with cache state"
         );
         Ok(())
+    }
+}
+
+/// Backend view that parks the first session read after it has sampled its
+/// bytes, so one task can hold a cold read open across a whole write, flush and
+/// removal cycle. Everything else, including the retry that follows a rejected
+/// install, passes straight through to the real backend.
+struct GatedSessionRead<'a> {
+    inner: &'a InMemoryBackend,
+    gated: AtomicBool,
+    arrived: async_lock::Barrier,
+    release: async_lock::Barrier,
+}
+
+impl<'a> GatedSessionRead<'a> {
+    fn new(inner: &'a InMemoryBackend) -> Self {
+        Self {
+            inner,
+            gated: AtomicBool::new(false),
+            arrived: async_lock::Barrier::new(2),
+            release: async_lock::Barrier::new(2),
+        }
+    }
+
+    async fn wait_for_read(&self) {
+        self.arrived.wait().await;
+    }
+
+    async fn release_read(&self) {
+        self.release.wait().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl SignalStore for GatedSessionRead<'_> {
+    async fn get_session(
+        &self,
+        address: &str,
+    ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+        let sampled = self.inner.get_session(address).await?;
+        if !self.gated.swap(true, Ordering::Relaxed) {
+            self.arrived.wait().await;
+            self.release.wait().await;
+        }
+        Ok(sampled)
+    }
+
+    async fn put_identity(&self, address: &str, key: [u8; 32]) -> crate::store::error::Result<()> {
+        self.inner.put_identity(address, key).await
+    }
+    async fn load_identity(&self, address: &str) -> crate::store::error::Result<Option<[u8; 32]>> {
+        self.inner.load_identity(address).await
+    }
+    async fn delete_identity(&self, address: &str) -> crate::store::error::Result<()> {
+        self.inner.delete_identity(address).await
+    }
+    async fn put_session(&self, address: &str, session: &[u8]) -> crate::store::error::Result<()> {
+        self.inner.put_session(address, session).await
+    }
+    async fn delete_session(&self, address: &str) -> crate::store::error::Result<()> {
+        self.inner.delete_session(address).await
+    }
+    async fn store_prekey(
+        &self,
+        id: u32,
+        record: &[u8],
+        uploaded: bool,
+    ) -> crate::store::error::Result<()> {
+        self.inner.store_prekey(id, record, uploaded).await
+    }
+    async fn load_prekey(&self, id: u32) -> crate::store::error::Result<Option<bytes::Bytes>> {
+        self.inner.load_prekey(id).await
+    }
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+        self.inner.mark_prekeys_uploaded(ids).await
+    }
+    async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+        self.inner.remove_prekey(id).await
+    }
+    async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
+        self.inner.get_max_prekey_id().await
+    }
+    async fn store_signed_prekey(&self, id: u32, record: &[u8]) -> crate::store::error::Result<()> {
+        self.inner.store_signed_prekey(id, record).await
+    }
+    async fn load_signed_prekey(&self, id: u32) -> crate::store::error::Result<Option<Vec<u8>>> {
+        self.inner.load_signed_prekey(id).await
+    }
+    async fn load_all_signed_prekeys(&self) -> crate::store::error::Result<Vec<(u32, Vec<u8>)>> {
+        self.inner.load_all_signed_prekeys().await
+    }
+    async fn remove_signed_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+        self.inner.remove_signed_prekey(id).await
+    }
+    async fn put_sender_key(
+        &self,
+        address: &str,
+        record: &[u8],
+    ) -> crate::store::error::Result<()> {
+        self.inner.put_sender_key(address, record).await
+    }
+    async fn get_sender_key(&self, address: &str) -> crate::store::error::Result<Option<Vec<u8>>> {
+        self.inner.get_sender_key(address).await
+    }
+    async fn delete_sender_key(&self, address: &str) -> crate::store::error::Result<()> {
+        self.inner.delete_sender_key(address).await
     }
 }
 

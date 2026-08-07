@@ -87,10 +87,12 @@ const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000;
 /// state that a cancelled read could strand.
 const RECENT_REMOVALS: usize = 64;
 
-/// Unlocked cold sender-key reads to try before falling back to reading under
-/// the lock. Losing twice means a removal landed in both windows, which needs a
-/// flush plus an eviction each time; the fallback keeps that bounded.
-const SENDER_KEY_UNLOCKED_READ_ATTEMPTS: usize = 2;
+/// Unlocked cold reads to try before falling back to reading under the lock.
+/// Shared by every store: sessions, identities and sender keys all run the same
+/// probe/read/re-check shape. Losing twice means a removal landed in both
+/// windows, which needs a flush plus an eviction each time; the fallback keeps
+/// that bounded.
+const UNLOCKED_COLD_READ_ATTEMPTS: usize = 2;
 
 /// Slack above `max_entries` the cache may grow to before an eviction scan
 /// fires, expressed as a divisor of `max_entries` (1/8th here). Trimming back
@@ -939,6 +941,25 @@ impl SignalStoreCache {
         state.cache.remove(cache_key);
     }
 
+    /// The session-store twin of [`Self::drop_clean_sender_key_for_test`].
+    #[cfg(test)]
+    async fn drop_clean_session_for_test(&self, address: &str) {
+        let mut state = self.lock_sessions().await;
+        state.dirty.remove(address);
+        state.deleted.remove(address);
+        state.reservation_pending.remove(address);
+        state.cache.remove(address);
+    }
+
+    /// The identity-store twin of [`Self::drop_clean_sender_key_for_test`].
+    #[cfg(test)]
+    async fn drop_clean_identity_for_test(&self, address: &str) {
+        let mut state = self.identities.lock().await;
+        state.dirty.remove(address);
+        state.deleted.remove(address);
+        state.cache.remove(address);
+    }
+
     /// Whether any session or identity is known for `user` (across device ids),
     /// checking the in-memory cache first, then the durable backend. Lets a
     /// caller skip a per-device migration scan for a user we've never had Signal
@@ -1031,21 +1052,47 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<(Option<SessionRecord>, SessionCheckoutKey)> {
         let key = address.as_str();
-        {
+        for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
+            let (incarnation, since) = {
+                let mut state = self.lock_sessions().await;
+                match state.checkout(key) {
+                    CachedSessionCheckout::Present(record, checkout) => {
+                        return Ok((Some(record), checkout));
+                    }
+                    CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
+                    CachedSessionCheckout::Busy => {
+                        anyhow::bail!("session is already checked out")
+                    }
+                    CachedSessionCheckout::Missing(_) => {}
+                }
+                (state.incarnation, state.cache.removal_seq())
+            };
+            // Backend I/O outside the lock
+            let backend_result = backend.get_session(key).await?;
             let mut state = self.lock_sessions().await;
-            match state.checkout(key) {
+            let checkout = match state.checkout(key) {
                 CachedSessionCheckout::Present(record, checkout) => {
                     return Ok((Some(record), checkout));
                 }
                 CachedSessionCheckout::Absent(checkout) => return Ok((None, checkout)),
-                CachedSessionCheckout::Busy => {
-                    anyhow::bail!("session is already checked out")
-                }
-                CachedSessionCheckout::Missing(_) => {}
+                CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
+                CachedSessionCheckout::Missing(checkout) => checkout,
+            };
+            // See `UserIndexedCache::removal_seq`: absence alone cannot rule
+            // out a newer record written and dropped behind us, whose chain
+            // index this checkout would then rewind past.
+            if state.incarnation != incarnation || state.cache.removed_since(key, since) {
+                continue;
             }
+            return Ok(self.checkout_loaded_session(
+                &mut state,
+                key,
+                backend_result.as_deref(),
+                checkout,
+            ));
         }
-        // Backend I/O outside the lock
-        let backend_result = backend.get_session(key).await?;
+
+        // Repeatedly raced. Read under the lock, which cannot be raced at all.
         let mut state = self.lock_sessions().await;
         let checkout = match state.checkout(key) {
             CachedSessionCheckout::Present(record, checkout) => {
@@ -1055,33 +1102,29 @@ impl SignalStoreCache {
             CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
             CachedSessionCheckout::Missing(checkout) => checkout,
         };
-        match backend_result
-            .as_deref()
-            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
-        {
-            Some(record) => {
-                state.cache.insert(
-                    Arc::from(key),
-                    SessionEntry::CheckedOut {
-                        had_session: true,
-                        token: checkout.token(),
-                    },
-                );
-                state.evict_if_needed(self.max_entries);
-                Ok((Some(record), checkout))
-            }
-            None => {
-                state.cache.insert(
-                    Arc::from(key),
-                    SessionEntry::CheckedOut {
-                        had_session: false,
-                        token: checkout.token(),
-                    },
-                );
-                state.evict_if_needed(self.max_entries);
-                Ok((None, checkout))
-            }
-        }
+        let backend_result = backend.get_session(key).await?;
+        Ok(self.checkout_loaded_session(&mut state, key, backend_result.as_deref(), checkout))
+    }
+
+    /// Decode what a cold checkout read and leave the address checked out by it.
+    fn checkout_loaded_session(
+        &self,
+        state: &mut SessionStoreState,
+        key: &str,
+        bytes: Option<&[u8]>,
+        checkout: SessionCheckoutKey,
+    ) -> (Option<SessionRecord>, SessionCheckoutKey) {
+        let record =
+            bytes.and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation));
+        state.cache.insert(
+            Arc::from(key),
+            SessionEntry::CheckedOut {
+                had_session: record.is_some(),
+                token: checkout.token(),
+            },
+        );
+        state.evict_if_needed(self.max_entries);
+        (record, checkout)
     }
 
     /// A warm checkout avoids the device lock and boxed async store future.
@@ -1109,17 +1152,35 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<Option<Arc<SessionRecord>>> {
         let key = address.as_str();
-        {
-            let state = self.lock_sessions().await;
+        for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
+            let (incarnation, since) = {
+                let state = self.lock_sessions().await;
+                if let Some(entry) = state.cache.get(key) {
+                    return match entry {
+                        SessionEntry::Present(record) => Ok(Some(record.clone())),
+                        _ => Ok(None),
+                    };
+                }
+                (state.incarnation, state.cache.removal_seq())
+            };
+            // Backend I/O outside the lock
+            let backend_result = backend.get_session(key).await?;
+            let mut state = self.lock_sessions().await;
             if let Some(entry) = state.cache.get(key) {
                 return match entry {
                     SessionEntry::Present(record) => Ok(Some(record.clone())),
-                    _ => Ok(None),
+                    SessionEntry::Absent | SessionEntry::CheckedOut { .. } => Ok(None),
                 };
             }
+            // Same stamp as the checkout above (`UserIndexedCache::removal_seq`):
+            // a stale record cached here is what the next checkout hands over.
+            if state.incarnation != incarnation || state.cache.removed_since(key, since) {
+                continue;
+            }
+            return Ok(self.install_loaded_session(&mut state, key, backend_result.as_deref()));
         }
-        // Backend I/O outside the lock
-        let backend_result = backend.get_session(key).await?;
+
+        // Repeatedly raced. Read under the lock, which cannot be raced at all.
         let mut state = self.lock_sessions().await;
         if let Some(entry) = state.cache.get(key) {
             return match entry {
@@ -1127,24 +1188,27 @@ impl SignalStoreCache {
                 SessionEntry::Absent | SessionEntry::CheckedOut { .. } => Ok(None),
             };
         }
-        match backend_result
-            .as_deref()
+        let backend_result = backend.get_session(key).await?;
+        Ok(self.install_loaded_session(&mut state, key, backend_result.as_deref()))
+    }
+
+    /// Decode what a cold read fetched and cache it, positively or negatively.
+    fn install_loaded_session(
+        &self,
+        state: &mut SessionStoreState,
+        key: &str,
+        bytes: Option<&[u8]>,
+    ) -> Option<Arc<SessionRecord>> {
+        let record = bytes
             .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
-        {
-            Some(record) => {
-                let record = Arc::new(record);
-                state
-                    .cache
-                    .insert(Arc::from(key), SessionEntry::Present(record.clone()));
-                state.evict_if_needed(self.max_entries);
-                Ok(Some(record))
-            }
-            None => {
-                state.cache.insert(Arc::from(key), SessionEntry::Absent);
-                state.evict_if_needed(self.max_entries);
-                Ok(None)
-            }
-        }
+            .map(Arc::new);
+        let entry = match &record {
+            Some(record) => SessionEntry::Present(record.clone()),
+            None => SessionEntry::Absent,
+        };
+        state.cache.insert(Arc::from(key), entry);
+        state.evict_if_needed(self.max_entries);
+        record
     }
 
     pub async fn put_session(&self, address: &ProtocolAddress, record: SessionRecord) {
@@ -1204,29 +1268,40 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<bool> {
         let key = address.as_str();
-        {
-            let state = self.lock_sessions().await;
+        for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
+            let (incarnation, since) = {
+                let state = self.lock_sessions().await;
+                if let Some(entry) = state.cache.get(key) {
+                    return Ok(entry.exists());
+                }
+                (state.incarnation, state.cache.removal_seq())
+            };
+            // Backend I/O outside the lock
+            let backend_result = backend.get_session(key).await?;
+            let mut state = self.lock_sessions().await;
             if let Some(entry) = state.cache.get(key) {
                 return Ok(entry.exists());
             }
+            // The probe caches the record it decoded, so `peek_session`'s
+            // reasoning applies; a negative answer over a session that now
+            // exists is the other direction, and replaces a live session.
+            if state.incarnation != incarnation || state.cache.removed_since(key, since) {
+                continue;
+            }
+            return Ok(self
+                .install_loaded_session(&mut state, key, backend_result.as_deref())
+                .is_some());
         }
-        // Backend I/O outside the lock
-        let backend_result = backend.get_session(key).await?;
+
+        // Repeatedly raced. Read under the lock, which cannot be raced at all.
         let mut state = self.lock_sessions().await;
         if let Some(entry) = state.cache.get(key) {
             return Ok(entry.exists());
         }
-        let entry = match backend_result
-            .as_deref()
-            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
-        {
-            Some(record) => SessionEntry::Present(Arc::new(record)),
-            None => SessionEntry::Absent,
-        };
-        let exists = entry.exists();
-        state.cache.insert(Arc::from(key), entry);
-        state.evict_if_needed(self.max_entries);
-        Ok(exists)
+        let backend_result = backend.get_session(key).await?;
+        Ok(self
+            .install_loaded_session(&mut state, key, backend_result.as_deref())
+            .is_some())
     }
 
     // === Identities ===
@@ -1239,20 +1314,41 @@ impl SignalStoreCache {
         let key = address.as_str();
         // Cache check inside scoped lock so concurrent callers don't queue on
         // the mutex during the backend roundtrip. Mirrors get_session/has_session.
-        {
-            let state = self.identities.lock().await;
+        for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
+            let since = {
+                let state = self.identities.lock().await;
+                if let Some(cached) = state.cache.get(key) {
+                    return Ok(cached.clone());
+                }
+                // No incarnation to pair with the stamp: identities carry no
+                // counters, and this store's lossy reset goes through
+                // `UserIndexedCache::clear`, which is an opaque removal.
+                state.cache.removal_seq()
+            };
+            // Backend I/O outside the lock.
+            let data = backend.load_identity(key).await?;
+            let arc_data = data.map(Arc::from);
+            let mut state = self.identities.lock().await;
+            // Re-check: another task may have populated the cache while we awaited.
             if let Some(cached) = state.cache.get(key) {
                 return Ok(cached.clone());
             }
+            // See `UserIndexedCache::removal_seq`: caching a superseded
+            // identity key hides the peer's change from the next comparison.
+            if state.cache.removed_since(key, since) {
+                continue;
+            }
+            state.cache.insert(Arc::from(key), arc_data.clone());
+            state.evict_if_needed(self.max_entries);
+            return Ok(arc_data);
         }
-        // Backend I/O outside the lock.
-        let data = backend.load_identity(key).await?;
-        let arc_data = data.map(Arc::from);
+
+        // Repeatedly raced. Read under the lock, which cannot be raced at all.
         let mut state = self.identities.lock().await;
-        // Re-check: another task may have populated the cache while we awaited.
         if let Some(cached) = state.cache.get(key) {
             return Ok(cached.clone());
         }
+        let arc_data = backend.load_identity(key).await?.map(Arc::from);
         state.cache.insert(Arc::from(key), arc_data.clone());
         state.evict_if_needed(self.max_entries);
         Ok(arc_data)
@@ -1302,7 +1398,7 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<Option<Arc<SenderKeyRecord>>> {
         let key = name.cache_key();
-        for _ in 0..SENDER_KEY_UNLOCKED_READ_ATTEMPTS {
+        for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
             let (incarnation, since) = {
                 let state = self.sender_keys.lock().await;
                 if let Some(cached) = state.cache.get(key) {
@@ -2526,7 +2622,7 @@ mod sender_key_lock_tests {
             1,
             // Gate exactly the unlocked attempts; the locked fallback then runs
             // ungated, as a real backend would.
-            SENDER_KEY_UNLOCKED_READ_ATTEMPTS,
+            UNLOCKED_COLD_READ_ATTEMPTS,
             Some(
                 sender_key_record_with_chain(1)
                     .serialize()
@@ -2544,7 +2640,7 @@ mod sender_key_lock_tests {
         });
 
         // Invalidate this key on every attempt, so no unlocked install survives.
-        for chain in 2..=(SENDER_KEY_UNLOCKED_READ_ATTEMPTS as u32 + 1) {
+        for chain in 2..=(UNLOCKED_COLD_READ_ATTEMPTS as u32 + 1) {
             backend.arrived.wait().await;
             cache
                 .put_sender_key(&name, sender_key_record_with_chain(chain))
@@ -2563,14 +2659,14 @@ mod sender_key_lock_tests {
             .expect("reader task")
             .expect("cold load")
             .expect("record present");
-        let latest = SENDER_KEY_UNLOCKED_READ_ATTEMPTS as u32 + 1;
+        let latest = UNLOCKED_COLD_READ_ATTEMPTS as u32 + 1;
         assert_eq!(
             chain_id_of(&observed),
             latest,
             "the locked fallback must return the current record"
         );
         assert!(
-            backend.hits() > SENDER_KEY_UNLOCKED_READ_ATTEMPTS,
+            backend.hits() > UNLOCKED_COLD_READ_ATTEMPTS,
             "the locked fallback must have read the backend itself"
         );
     }
@@ -5328,6 +5424,581 @@ mod pre_wire_gate_tests {
             .expect("the writer must finish");
             writer.await.expect("writer task");
         }
+    }
+}
+
+/// The cold-read race, driven against every store that runs it: a read leaves
+/// the lock, a newer record is written and made durable, the entry is dropped
+/// as a clean one, and the read comes back to a slot that is absent again.
+/// Existence alone cannot separate that from "never written", so each of these
+/// asserts that the pre-write bytes do not land.
+#[cfg(test)]
+mod cold_read_race_tests {
+    use super::*;
+    use crate::libsignal::protocol::{ChainKey, IdentityKey, KeyPair, RootKey, SessionState};
+    use crate::store::error::Result as StoreResult;
+    use bytes::Bytes;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Backend whose reads park on a rendezvous once they have sampled their
+    /// bytes, so a test can run a whole write/flush/remove cycle while a reader
+    /// sits between its unlocked read and its re-check. Sampling before parking
+    /// is what makes those bytes predate the write, as a real backend behaves.
+    struct GatedColdRead {
+        arrived: async_lock::Barrier,
+        release: async_lock::Barrier,
+        gated_reads: usize,
+        reads: AtomicUsize,
+        session: SyncMutex<Option<Vec<u8>>>,
+        identity: SyncMutex<Option<[u8; 32]>>,
+    }
+
+    impl GatedColdRead {
+        fn new(gated_reads: usize) -> Self {
+            Self {
+                arrived: async_lock::Barrier::new(2),
+                release: async_lock::Barrier::new(2),
+                gated_reads,
+                reads: AtomicUsize::new(0),
+                session: SyncMutex::new(None),
+                identity: SyncMutex::new(None),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+
+        /// Park this read if it is one of the gated rounds. The retry that
+        /// follows a rejected install must not wait on a rendezvous the test
+        /// has already passed through.
+        async fn gate(&self) {
+            if self.reads.fetch_add(1, Ordering::Relaxed) < self.gated_reads {
+                self.arrived.wait().await;
+                self.release.wait().await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SignalStore for GatedColdRead {
+        async fn get_session(&self, _: &str) -> StoreResult<Option<Bytes>> {
+            let sampled = self
+                .session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            self.gate().await;
+            Ok(sampled.map(Bytes::from))
+        }
+
+        async fn put_session(&self, _: &str, session: &[u8]) -> StoreResult<()> {
+            *self.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.to_vec());
+            Ok(())
+        }
+
+        async fn delete_session(&self, _: &str) -> StoreResult<()> {
+            *self.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            Ok(())
+        }
+
+        async fn load_identity(&self, _: &str) -> StoreResult<Option<[u8; 32]>> {
+            let sampled = *self.identity.lock().unwrap_or_else(|p| p.into_inner());
+            self.gate().await;
+            Ok(sampled)
+        }
+
+        async fn put_identity(&self, _: &str, key: [u8; 32]) -> StoreResult<()> {
+            *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
+            Ok(())
+        }
+
+        async fn delete_identity(&self, _: &str) -> StoreResult<()> {
+            *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            Ok(())
+        }
+
+        async fn store_prekey(&self, _: u32, _: &[u8], _: bool) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn load_prekey(&self, _: u32) -> StoreResult<Option<Bytes>> {
+            unreachable!()
+        }
+        async fn mark_prekeys_uploaded(&self, _: &[u32]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn remove_prekey(&self, _: u32) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn get_max_prekey_id(&self) -> StoreResult<u32> {
+            unreachable!()
+        }
+        async fn store_signed_prekey(&self, _: u32, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn load_signed_prekey(&self, _: u32) -> StoreResult<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        async fn load_all_signed_prekeys(&self) -> StoreResult<Vec<(u32, Vec<u8>)>> {
+            unreachable!()
+        }
+        async fn remove_signed_prekey(&self, _: u32) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn put_sender_key(&self, _: &str, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn get_sender_key(&self, _: &str) -> StoreResult<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+    }
+
+    fn session_at_index(index: u32) -> SessionRecord {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let base_key = KeyPair::generate(&mut rng).public_key;
+        let mut state = SessionState::new(3, &local, &remote, &RootKey::new([4u8; 32]), &base_key);
+        state.set_sender_chain(
+            &KeyPair::generate(&mut rng),
+            &ChainKey::new([7u8; 32], index),
+        );
+        SessionRecord::new(state)
+    }
+
+    fn chain_index_of(record: &SessionRecord) -> u32 {
+        record
+            .session_state()
+            .expect("session state")
+            .get_sender_chain_key()
+            .expect("sender chain")
+            .index()
+    }
+
+    fn signal_address(user: &str) -> ProtocolAddress {
+        ProtocolAddress::new(&format!("{user}@s.whatsapp.net"), 0.into())
+    }
+
+    /// Write a record, make it durable, and let it leave the cache as a clean
+    /// entry. Both the starting point of a cold read and, run again while one
+    /// is in flight, the race it has to survive: the bytes it holds are now a
+    /// version behind, and the slot it left is empty either way.
+    async fn commit_and_drop_session(
+        cache: &SignalStoreCache,
+        backend: &GatedColdRead,
+        address: &ProtocolAddress,
+        index: u32,
+    ) {
+        cache.put_session(address, session_at_index(index)).await;
+        cache.flush(backend).await.expect("flush");
+        cache.drop_clean_session_for_test(address.as_str()).await;
+    }
+
+    async fn commit_and_drop_identity(
+        cache: &SignalStoreCache,
+        backend: &GatedColdRead,
+        address: &ProtocolAddress,
+        key: [u8; 32],
+    ) {
+        cache.put_identity(address, &key).await;
+        cache.flush(backend).await.expect("flush");
+        cache.drop_clean_identity_for_test(address.as_str()).await;
+    }
+
+    #[tokio::test]
+    async fn a_cold_checkout_does_not_install_a_record_that_predates_a_flush() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553001"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.checkout_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        commit_and_drop_session(&cache, &backend, &address, 40).await;
+        backend.release.wait().await;
+
+        let (record, _checkout) = reader.await.expect("reader task").expect("cold checkout");
+        let record = record.expect("record present");
+        assert_eq!(
+            chain_index_of(&record),
+            40,
+            "a checkout handed the cipher a record from before the flush"
+        );
+    }
+
+    /// The property the guard exists for, stated where it bites: the record a
+    /// checkout hands back drives the ratchet, so an index below what has
+    /// already been published is a repeated message key and IV.
+    #[tokio::test]
+    async fn a_checkout_after_the_race_never_rewinds_the_chain() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553002"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.get_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        // Chain index 41 means every index below it has been on the wire.
+        let published_through = 40;
+        commit_and_drop_session(&cache, &backend, &address, published_through + 1).await;
+        backend.release.wait().await;
+
+        let record = reader
+            .await
+            .expect("reader task")
+            .expect("cold load")
+            .expect("record present");
+        let index = chain_index_of(&record);
+        assert!(
+            index > published_through,
+            "the cipher would resume at index {index}, republishing keys through {published_through}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_peek_does_not_install_a_record_that_predates_a_flush() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553003"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.peek_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        commit_and_drop_session(&cache, &backend, &address, 40).await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold peek")
+            .expect("record present");
+        assert_eq!(
+            chain_index_of(&observed),
+            40,
+            "the peek returned stale bytes"
+        );
+
+        let reads = backend.reads();
+        let cached = cache
+            .peek_session(&address, &*backend)
+            .await
+            .expect("warm peek")
+            .expect("record present");
+        assert_eq!(chain_index_of(&cached), 40, "stale bytes reached the cache");
+        assert_eq!(backend.reads(), reads, "the install must serve later reads");
+    }
+
+    /// `has_session` answers `true` either way here, so the damage is what it
+    /// leaves behind: the record it decodes is cached for the checkout that
+    /// follows, which is the same key-reuse path by one more step.
+    #[tokio::test]
+    async fn a_cold_probe_does_not_cache_a_record_that_predates_a_flush() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553004"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.has_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        commit_and_drop_session(&cache, &backend, &address, 40).await;
+        backend.release.wait().await;
+
+        assert!(reader.await.expect("reader task").expect("cold probe"));
+        let reads = backend.reads();
+        let cached = cache
+            .peek_session(&address, &*backend)
+            .await
+            .expect("warm peek")
+            .expect("record present");
+        assert_eq!(
+            chain_index_of(&cached),
+            40,
+            "the probe cached a record from before the flush"
+        );
+        assert_eq!(
+            backend.reads(),
+            reads,
+            "the probe must have cached a record"
+        );
+    }
+
+    /// The other direction of the same race: the read found no row, and a
+    /// session was written and made durable behind it. Negative-caching that
+    /// answer sends the next send to fetch a pre-key bundle and replace a live
+    /// session, throwing away the peer's chain.
+    #[tokio::test]
+    async fn a_cold_probe_does_not_negative_cache_over_a_new_session() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553005"));
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.has_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        commit_and_drop_session(&cache, &backend, &address, 7).await;
+        backend.release.wait().await;
+
+        assert!(
+            reader.await.expect("reader task").expect("cold probe"),
+            "a session written behind the probe was reported absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_identity_read_does_not_install_bytes_that_predate_a_flush() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553006"));
+        commit_and_drop_identity(&cache, &backend, &address, [1u8; 32]).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.get_identity(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        commit_and_drop_identity(&cache, &backend, &address, [2u8; 32]).await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold load")
+            .expect("identity present");
+        assert_eq!(
+            observed.as_ref(),
+            &[2u8; 32],
+            "a superseded identity key would hide the peer's change"
+        );
+        let reads = backend.reads();
+        let cached = cache
+            .get_identity(&address, &*backend)
+            .await
+            .expect("warm load")
+            .expect("identity present");
+        assert_eq!(cached.as_ref(), &[2u8; 32], "stale bytes reached the cache");
+        assert_eq!(backend.reads(), reads, "the install must serve later reads");
+    }
+
+    /// `clear_after_flush` cannot name the keys it drops, so it takes the
+    /// opaque branch. Driven through the real teardown sequence rather than a
+    /// synthetic removal.
+    #[tokio::test]
+    async fn a_write_dropped_by_clear_after_flush_does_not_lose_to_a_cold_reader() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553007"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.peek_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        cache.put_session(&address, session_at_index(40)).await;
+        cache.flush(&*backend).await.expect("flush");
+        cache.clear_after_flush().await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold peek")
+            .expect("record present");
+        assert_eq!(
+            chain_index_of(&observed),
+            40,
+            "an unnamed removal must still reject bytes that predate the write"
+        );
+    }
+
+    /// A reader older than the retained window gets "removed" without its key
+    /// being in it. Here the removal that matters has already aged out, so only
+    /// the window-overflow branch can reject these bytes.
+    #[tokio::test]
+    async fn a_reader_older_than_the_removal_window_rereads() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553008"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.peek_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        commit_and_drop_session(&cache, &backend, &address, 40).await;
+        // Push this key's own removal out of the window, so the reader can only
+        // be saved by being older than the window itself.
+        for i in 0..RECENT_REMOVALS {
+            let other = signal_address(&format!("199955540{i:02}"));
+            cache.put_session(&other, session_at_index(1)).await;
+            cache.drop_clean_session_for_test(other.as_str()).await;
+        }
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold peek")
+            .expect("record present");
+        assert_eq!(
+            chain_index_of(&observed),
+            40,
+            "a reader past the window must re-read rather than install"
+        );
+    }
+
+    /// Losing every unlocked attempt drops through to the read taken under the
+    /// lock. That path installs without a stamp precisely because nothing can
+    /// intervene, so it needs its own coverage.
+    #[tokio::test]
+    async fn a_checkout_that_loses_every_race_falls_back_to_the_locked_path() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(UNLOCKED_COLD_READ_ATTEMPTS));
+        let address = Arc::new(signal_address("19995553009"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.checkout_session(&address, &*backend).await }
+        });
+
+        // Exactly the gated rounds: invalidate every unlocked attempt, then
+        // leave the locked fallback to read ungated as a real backend would.
+        let latest = 39 + UNLOCKED_COLD_READ_ATTEMPTS as u32;
+        for index in 40..=latest {
+            backend.arrived.wait().await;
+            commit_and_drop_session(&cache, &backend, &address, index).await;
+            backend.release.wait().await;
+        }
+
+        let (record, _checkout) = reader.await.expect("reader task").expect("cold checkout");
+        assert_eq!(
+            chain_index_of(&record.expect("record present")),
+            latest,
+            "the locked fallback must return the current record"
+        );
+        assert!(
+            backend.reads() > UNLOCKED_COLD_READ_ATTEMPTS,
+            "the locked fallback must have read the backend itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unraced_cold_read_installs_and_serves_later_reads() {
+        let cache = SignalStoreCache::new();
+        let backend = GatedColdRead::new(0);
+        let address = signal_address("19995553010");
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+        commit_and_drop_identity(&cache, &backend, &address, [3u8; 32]).await;
+
+        let reads = backend.reads();
+        for _ in 0..2 {
+            let record = cache
+                .peek_session(&address, &backend)
+                .await
+                .expect("peek")
+                .expect("record present");
+            assert_eq!(chain_index_of(&record), 5);
+            let identity = cache
+                .get_identity(&address, &backend)
+                .await
+                .expect("identity")
+                .expect("identity present");
+            assert_eq!(identity.as_ref(), &[3u8; 32]);
+        }
+        assert_eq!(
+            backend.reads() - reads,
+            2,
+            "an unraced cold read installs once and the warm hits stay in memory"
+        );
+    }
+
+    /// A racer that lands a value while a cold read is out owns the slot: the
+    /// read must yield to it rather than overwrite it with what it fetched.
+    #[tokio::test]
+    async fn a_racer_that_wins_keeps_its_value() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553011"));
+        commit_and_drop_session(&cache, &backend, &address, 5).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.peek_session(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        // Written but not flushed and not dropped: the slot is occupied at the
+        // re-check, which is the branch that answers from the racer's value.
+        cache.put_session(&address, session_at_index(40)).await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold peek")
+            .expect("record present");
+        assert_eq!(chain_index_of(&observed), 40, "the reader must yield");
+        let cached = cache
+            .peek_session(&address, &*backend)
+            .await
+            .expect("warm peek")
+            .expect("record present");
+        assert_eq!(
+            chain_index_of(&cached),
+            40,
+            "the racer's value must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_racer_that_wins_keeps_its_value() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553012"));
+        commit_and_drop_identity(&cache, &backend, &address, [1u8; 32]).await;
+
+        let reader = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.get_identity(&address, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        cache.put_identity(&address, &[2u8; 32]).await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold load")
+            .expect("identity present");
+        assert_eq!(observed.as_ref(), &[2u8; 32], "the reader must yield");
     }
 }
 
