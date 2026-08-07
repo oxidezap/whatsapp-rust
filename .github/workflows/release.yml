@@ -16,6 +16,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Everything downstream is keyed on this version, and publishing to crates.io
+  # cannot be undone. Read and check it before that point, not after, so a bad
+  # version costs a failed job instead of published crates with no tag, no
+  # release and no image.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract and validate version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # Deliberately no stricter than Cargo: a version Cargo accepts must
+          # not fail here, or the release stops between publish and tag. Forms
+          # Cargo itself rejects (leading zeros, empty prerelease identifiers)
+          # never reach the publish step, so they need no guard of their own.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "Refusing to release a malformed version: '$VERSION'" >&2
+            exit 1
+          fi
+          echo "Releasing $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
   validate:
     name: Validate
     uses: ./.github/workflows/main.yml
@@ -27,7 +56,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: [validate, validate-e2e]
+    needs: [preflight, validate, validate-e2e]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -55,32 +84,16 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: publish
+    needs: [preflight, publish]
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Extract version
-        id: version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          # This string becomes a git tag, a crates.io release and an image tag.
-          # Reject anything that is not a plain semver here, where the failure is
-          # one line to read, instead of downstream where it is a git error.
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "Refusing to release a malformed version: '$VERSION'" >&2
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Create tag
         env:
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           TAG="$RELEASE_TAG"
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
@@ -92,7 +105,7 @@ jobs:
 
       - name: Create GitHub Release
         env:
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="$RELEASE_TAG"
@@ -113,11 +126,11 @@ jobs:
   # so invoke it directly and pass the version for the :X.Y.Z image tag.
   publish-docker:
     name: Publish Docker image
-    needs: github-release
+    needs: [preflight, github-release]
     # docker.yml logs into GHCR and pushes the multi-arch image manifest.
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/docker.yml
     with:
-      version: ${{ needs.github-release.outputs.version }}
+      version: ${{ needs.preflight.outputs.version }}
