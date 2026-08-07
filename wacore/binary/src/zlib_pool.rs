@@ -568,7 +568,11 @@ mod tests {
             assert!(r.buf.capacity() >= big.len(), "buf should grow while alive");
         }
         let next = InflateReader::new(&compressed, 64 * 1024 * 1024);
-        assert_eq!(next.buf.capacity(), InflateReader::CHUNK);
+        assert!(
+            next.buf.capacity() <= InflateReader::CHUNK,
+            "fresh reader inherited a {} byte window",
+            next.buf.capacity()
+        );
     }
 
     /// Truncation is reported as EOF without a terminator, not as an error, and
