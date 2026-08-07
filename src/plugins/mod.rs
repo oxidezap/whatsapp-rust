@@ -731,20 +731,29 @@ impl PluginResources {
                 interest,
             }),
         });
+        self.retain_weakly(&self.subscriptions, registration)
+            .map(|inner| PluginCoreEventSubscription { inner })
+    }
+
+    /// Index a registration weakly, refusing once this plugin is closing.
+    ///
+    /// Weakly, so terminal shutdown can invalidate a token a plugin API
+    /// retained without keeping alive one the plugin already released. Dead and
+    /// closed entries are swept here, which is the only place the index grows.
+    fn retain_weakly<T: WeaklyIndexed>(
+        &self,
+        index: &Mutex<Vec<Weak<T>>>,
+        registration: Arc<T>,
+    ) -> Result<Arc<T>, PluginResourceError> {
         let rejected = {
-            let mut subscriptions = self
-                .subscriptions
+            let mut index = index
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.closed.load(Ordering::Acquire) {
                 true
             } else {
-                subscriptions.retain(|subscription| {
-                    subscription
-                        .upgrade()
-                        .is_some_and(|subscription| subscription.is_active())
-                });
-                subscriptions.push(Arc::downgrade(&registration));
+                index.retain(|entry| entry.upgrade().is_some_and(|entry| entry.is_active()));
+                index.push(Arc::downgrade(&registration));
                 false
             }
         };
@@ -752,66 +761,31 @@ impl PluginResources {
             registration.close();
             Err(PluginResourceError::ShuttingDown)
         } else {
-            Ok(PluginCoreEventSubscription {
-                inner: registration,
-            })
+            Ok(registration)
         }
     }
 
     fn retain_interceptor(
         &self,
         resources: Weak<PluginResources>,
+        plugin_id: Arc<str>,
         handle: InterceptorHandle,
     ) -> Result<PluginInterceptorRegistration, PluginResourceError> {
         let registration = Arc::new(PluginInterceptorRegistrationInner {
             resources,
+            plugin_id,
             handle: Mutex::new(Some(handle)),
         });
-        let rejected = {
-            let mut interceptors = self
-                .interceptors
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.closed.load(Ordering::Acquire) {
-                true
-            } else {
-                interceptors.retain(|interceptor| {
-                    interceptor
-                        .upgrade()
-                        .is_some_and(|interceptor| interceptor.is_active())
-                });
-                interceptors.push(Arc::downgrade(&registration));
-                false
-            }
-        };
-        if rejected {
-            registration.close();
-            Err(PluginResourceError::ShuttingDown)
-        } else {
-            Ok(PluginInterceptorRegistration {
-                inner: registration,
-            })
-        }
+        self.retain_weakly(&self.interceptors, registration)
+            .map(|inner| PluginInterceptorRegistration { inner })
     }
 
     fn forget_interceptor(&self, registration: &PluginInterceptorRegistrationInner) {
-        let registration_ptr = std::ptr::from_ref(registration);
-        self.interceptors
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|candidate| {
-                candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), registration_ptr)
-            });
+        forget_weakly(&self.interceptors, registration);
     }
 
     fn forget_subscription(&self, subscription: &PluginCoreEventSubscriptionInner) {
-        let subscription_ptr = std::ptr::from_ref(subscription);
-        self.subscriptions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|candidate| {
-                candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), subscription_ptr)
-            });
+        forget_weakly(&self.subscriptions, subscription);
     }
 
     fn connection_task_tracker(&self, generation: u64) -> (Arc<TaskTracker>, bool) {
@@ -910,31 +884,82 @@ impl PluginResources {
             tracker.close();
         }
         self.shutdown.notify();
-        let subscriptions = {
-            let mut subscriptions = self
-                .subscriptions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *subscriptions)
-        };
-        for subscription in subscriptions {
-            if let Some(subscription) = subscription.upgrade() {
-                subscription.close();
-            }
-        }
-        let interceptors = {
-            let mut interceptors = self
-                .interceptors
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *interceptors)
-        };
-        for interceptor in interceptors {
-            if let Some(interceptor) = interceptor.upgrade() {
-                interceptor.close();
-            }
+        close_weakly(&self.subscriptions);
+        close_weakly(&self.interceptors);
+    }
+}
+
+/// A registration the host holds weakly and can invalidate on shutdown.
+///
+/// Core-event subscriptions and stanza interceptors are the same object with
+/// different contents: an owned token the plugin drops, indexed weakly so the
+/// host can close it first. One implementation of the indexing keeps the two
+/// from drifting.
+trait WeaklyIndexed {
+    /// Whether this registration is still installed.
+    fn is_active(&self) -> bool;
+    /// Remove it, returning whether it was installed. Must not unwind.
+    fn close(&self) -> bool;
+}
+
+// Both forward to the inherent method of the same name. Naming the type is not
+// redundant: `self.is_active()` inside a trait impl resolves to the inherent
+// method only because inherent methods win, and a later refactor that removed
+// one would turn the call into infinite recursion instead of a compile error.
+impl WeaklyIndexed for PluginCoreEventSubscriptionInner {
+    fn is_active(&self) -> bool {
+        PluginCoreEventSubscriptionInner::is_active(self)
+    }
+
+    fn close(&self) -> bool {
+        PluginCoreEventSubscriptionInner::close(self)
+    }
+}
+
+impl WeaklyIndexed for PluginInterceptorRegistrationInner {
+    fn is_active(&self) -> bool {
+        PluginInterceptorRegistrationInner::is_active(self)
+    }
+
+    fn close(&self) -> bool {
+        PluginInterceptorRegistrationInner::close(self)
+    }
+}
+
+/// Drop `registration` from its index, along with any entry already dead.
+fn forget_weakly<T: WeaklyIndexed>(index: &Mutex<Vec<Weak<T>>>, registration: &T) {
+    let registration_ptr = std::ptr::from_ref(registration);
+    index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|candidate| {
+            candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), registration_ptr)
+        });
+}
+
+/// Close every live registration in an index and empty it.
+fn close_weakly<T: WeaklyIndexed>(index: &Mutex<Vec<Weak<T>>>) {
+    let entries = {
+        let mut index = index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *index)
+    };
+    for entry in entries {
+        if let Some(entry) = entry.upgrade() {
+            entry.close();
         }
     }
+}
+
+fn count_active<T: WeaklyIndexed>(index: &Mutex<Vec<Weak<T>>>) -> usize {
+    index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|entry| entry.is_active())
+        .count()
 }
 
 fn close_plugin_resources(plugin_id: &str, resources: &PluginResources) {
@@ -965,22 +990,8 @@ impl PluginResources {
             install_tasks: self.install_tasks.active(),
             connection_tasks,
             connection_generations,
-            core_event_subscriptions: self
-                .subscriptions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter(|subscription| subscription.is_active())
-                .count(),
-            stanza_interceptors: self
-                .interceptors
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter(|interceptor| interceptor.is_active())
-                .count(),
+            core_event_subscriptions: count_active(&self.subscriptions),
+            stanza_interceptors: count_active(&self.interceptors),
             teardown_panics: self.teardown_panics.load(Ordering::Relaxed),
         }
     }
@@ -1331,8 +1342,11 @@ impl PluginStanzaInterception {
             inner: interceptor,
             diagnostics: Arc::clone(&self.diagnostics),
         }));
-        self.resources
-            .retain_interceptor(Arc::downgrade(&self.resources), handle)
+        self.resources.retain_interceptor(
+            Arc::downgrade(&self.resources),
+            Arc::clone(&self.plugin_id),
+            handle,
+        )
     }
 }
 
@@ -1365,6 +1379,7 @@ impl StanzaInterceptor for GuardedStanzaInterceptor {
 
 struct PluginInterceptorRegistrationInner {
     resources: Weak<PluginResources>,
+    plugin_id: Arc<str>,
     handle: Mutex<Option<InterceptorHandle>>,
 }
 
@@ -1377,14 +1392,27 @@ impl PluginInterceptorRegistrationInner {
     }
 
     fn close(&self) -> bool {
+        let resources = self.resources.upgrade();
         let handle = self
             .handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         let active = handle.is_some();
-        drop(handle);
-        if let Some(resources) = self.resources.upgrade() {
+        // Dropping the handle drops the plugin's interceptor, whose destructor
+        // is the plugin's code. An unwind here during shutdown would leave
+        // every later registration open, so it is isolated like the
+        // core-event subscription path isolates its own.
+        if std::panic::catch_unwind(AssertUnwindSafe(|| drop(handle))).is_err() {
+            if let Some(resources) = &resources {
+                resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            log::warn!(
+                "Plugin `{}` stanza interceptor panicked while being dropped",
+                self.plugin_id
+            );
+        }
+        if let Some(resources) = resources {
             resources.forget_interceptor(self);
         }
         active
@@ -5620,7 +5648,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(node.tag().to_string());
-            if node.tag() == "vendor:thing" {
+            if node.tag() == "vendor:thing" || node.tag() == "receipt" {
                 Interception::Handled
             } else {
                 Interception::Pass
@@ -5727,12 +5755,12 @@ mod tests {
         assert!(client.has_stanza_interceptors());
         assert!(api.registration.is_active());
 
-        for tag in ["receipt", "vendor:thing"] {
+        for tag in ["ib", "vendor:thing"] {
             client.process_node(stanza(tag)).await;
         }
         assert_eq!(
             *api.seen.lock().expect("recorder lock"),
-            ["receipt", "vendor:thing"],
+            ["ib", "vendor:thing"],
             "offered both; only the second was claimed"
         );
 
@@ -5741,6 +5769,59 @@ mod tests {
         assert_eq!(plugin.stanza_interceptors, 1);
         assert_eq!(plugin.stanza_interception_panics, 0);
         assert_eq!(plugin.health, PluginHealth::Healthy);
+        assert_eq!(
+            client.memory_report().await.plugin_stanza_interceptors,
+            1,
+            "a retained registration is attributable, like every other one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_claim_actually_suppresses_the_built_in_handler() {
+        // The claim has to reach the client, not just be recorded. A <receipt>
+        // is modelled by the built-in pipeline and dispatches an event, so the
+        // absence of that event is what proves the decision was honoured.
+        use wacore::types::events::ChannelEventHandler;
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+        let (handler, events) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+
+        client
+            .process_node(crate::test_utils::node_to_owned_ref(
+                &wacore_binary::builder::NodeBuilder::new("receipt")
+                    .attr("from", "5511999998888@s.whatsapp.net")
+                    .attr("id", "RCPT-PLUGIN")
+                    .build(),
+            ))
+            .await;
+
+        assert_eq!(api.seen.lock().expect("recorder lock").len(), 1, "it ran");
+        assert!(
+            events.try_recv().is_err(),
+            "the built-in receipt handler must not have dispatched"
+        );
+
+        // Unclaimed, the same stanza still reaches the built-in handler, so the
+        // assertion above is about the claim and not about the harness.
+        api.registration.unregister();
+        client
+            .process_node(crate::test_utils::node_to_owned_ref(
+                &wacore_binary::builder::NodeBuilder::new("receipt")
+                    .attr("from", "5511999998888@s.whatsapp.net")
+                    .attr("id", "RCPT-PLUGIN-2")
+                    .build(),
+            ))
+            .await;
+        assert!(events.try_recv().is_ok(), "dispatched without the claim");
     }
 
     #[tokio::test]
@@ -5801,6 +5882,49 @@ mod tests {
                 .stanza_interceptors,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_second_registration_removes_only_that_one() {
+        // `unregister()` is the explicit path; `Drop` is the one a plugin gets
+        // by forgetting the token, and it is the one that has to work.
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        let extra = api
+            .interception
+            .register(Arc::new(RecordingInterceptor {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }))
+            .expect("a second interceptor");
+        assert_eq!(active_interceptors(&client), 2);
+
+        drop(extra);
+        assert_eq!(
+            active_interceptors(&client),
+            1,
+            "dropping the token removed its own registration and no other"
+        );
+        assert!(api.registration.is_active());
+        assert!(client.has_stanza_interceptors());
+    }
+
+    fn active_interceptors(client: &Arc<Client>) -> u64 {
+        client
+            .plugin_stats()
+            .expect("plugin stats")
+            .plugins
+            .first()
+            .expect("plugin stats entry")
+            .stanza_interceptors
     }
 
     #[tokio::test]

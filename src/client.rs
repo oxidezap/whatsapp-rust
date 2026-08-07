@@ -355,6 +355,8 @@ pub struct MemoryReport {
     #[cfg(feature = "plugins")]
     pub plugin_core_event_subscriptions: u64,
     #[cfg(feature = "plugins")]
+    pub plugin_stanza_interceptors: u64,
+    #[cfg(feature = "plugins")]
     pub plugin_event_endpoints: u64,
     #[cfg(feature = "plugins")]
     pub plugin_event_endpoint_capacity: u64,
@@ -522,6 +524,11 @@ impl std::fmt::Display for MemoryReport {
                 f,
                 "  core subscriptions:     {}",
                 self.plugin_core_event_subscriptions
+            )?;
+            writeln!(
+                f,
+                "  stanza interceptors:    {}",
+                self.plugin_stanza_interceptors
             )?;
             writeln!(
                 f,

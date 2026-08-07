@@ -318,6 +318,7 @@ impl Client {
             plugin_connection_tasks,
             plugin_connection_generations,
             plugin_core_event_subscriptions,
+            plugin_stanza_interceptors,
         ) = plugin_stats
             .as_ref()
             .map(|host| {
@@ -328,14 +329,17 @@ impl Client {
                         0u64,
                         0u64,
                         0u64,
+                        0u64,
                     ),
-                    |(plugins, install, connection, generations, subscriptions), plugin| {
+                    |(plugins, install, connection, generations, subscriptions, interceptors),
+                     plugin| {
                         (
                             plugins,
                             install.saturating_add(plugin.install_tasks),
                             connection.saturating_add(plugin.connection_tasks),
                             generations.saturating_add(plugin.connection_generations),
                             subscriptions.saturating_add(plugin.core_event_subscriptions),
+                            interceptors.saturating_add(plugin.stanza_interceptors),
                         )
                     },
                 )
@@ -399,6 +403,8 @@ impl Client {
             plugin_connection_generations,
             #[cfg(feature = "plugins")]
             plugin_core_event_subscriptions,
+            #[cfg(feature = "plugins")]
+            plugin_stanza_interceptors,
             #[cfg(feature = "plugins")]
             plugin_event_endpoints: plugin_event_router.active_endpoints,
             #[cfg(feature = "plugins")]
