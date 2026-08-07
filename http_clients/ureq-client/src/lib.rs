@@ -56,6 +56,22 @@ const EMPTY_POOL_REPORT: HttpResourceReport = HttpResourceReport {
     inflight_bytes: None,
 };
 
+/// Latches that a request reached the wire, or at least tried to.
+///
+/// A bad URI or an invalid header is rejected while building the request, so no
+/// socket ever exists and the pool stays provably empty. Every other outcome,
+/// a failed connect included, leaves the pool in a state only ureq can see.
+/// Relaxed: the flag feeds an on-demand estimate, not a happens-before.
+fn note_dispatch<T>(
+    requested: &AtomicBool,
+    outcome: Result<T, ureq::Error>,
+) -> Result<T, ureq::Error> {
+    if !matches!(outcome, Err(ureq::Error::BadUri(_) | ureq::Error::Http(_))) {
+        requested.store(true, Ordering::Relaxed);
+    }
+    outcome
+}
+
 impl UreqHttpClient {
     pub fn new() -> Self {
         Self {
@@ -64,12 +80,6 @@ impl UreqHttpClient {
             pool_report: Some(default_pool_report()),
             requested: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Relaxed: the flag only feeds an on-demand estimate, and the path that
-    /// sets it is about to open a socket.
-    fn mark_requested(&self) {
-        self.requested.store(true, Ordering::Relaxed);
     }
 
     /// Create a client with a pre-configured [`ureq::Agent`].
@@ -190,24 +200,23 @@ impl HttpClient for UreqHttpClient {
         tokio::task::spawn_blocking(move || {
             let response = match request.method.as_str() {
                 "GET" => {
-                    requested.store(true, Ordering::Relaxed);
                     let mut req = status_as_response(agent.get(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
-                    req.call()?
+                    note_dispatch(&requested, req.call())?
                 }
                 "POST" => {
-                    requested.store(true, Ordering::Relaxed);
                     let mut req = status_as_response(agent.post(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
-                    if let Some(body) = request.body {
-                        req.send(&body[..])?
+                    let sent = if let Some(body) = request.body {
+                        req.send(&body[..])
                     } else {
-                        req.send(&[])?
-                    }
+                        req.send(&[])
+                    };
+                    note_dispatch(&requested, sent)?
                 }
                 method => {
                     return Err(anyhow::anyhow!("Unsupported HTTP method: {}", method));
@@ -232,12 +241,11 @@ impl HttpClient for UreqHttpClient {
         // in one blocking thread.
         let response = match request.method.as_str() {
             "GET" => {
-                self.mark_requested();
                 let mut req = status_as_response(self.agent.get(&request.url));
                 for (key, value) in &request.headers {
                     req = req.header(key, value);
                 }
-                req.call()?
+                note_dispatch(&self.requested, req.call())?
             }
             method => {
                 return Err(anyhow::anyhow!(
@@ -281,7 +289,6 @@ impl HttpClient for UreqHttpClient {
             ));
         }
 
-        self.mark_requested();
         let mut req = status_as_response(self.agent.post(&request.url));
         for (key, value) in &request.headers {
             req = req.header(key, value);
@@ -291,7 +298,10 @@ impl HttpClient for UreqHttpClient {
         let content_length = content_length.to_string();
         req = req.header("content-length", content_length.as_str());
 
-        let response = req.send(ureq::SendBody::from_owned_reader(body))?;
+        let response = note_dispatch(
+            &self.requested,
+            req.send(ureq::SendBody::from_owned_reader(body)),
+        )?;
 
         let status_code = response.status().as_u16();
         let body = read_body(response, self.max_body_bytes)?;
@@ -645,6 +655,31 @@ mod tests {
             client.resource_report().and_then(|r| r.pool_buffer_bytes),
             Some(0),
             "nothing connected, so nothing is pooled"
+        );
+    }
+
+    /// A supported method is not enough: a request ureq rejects while building
+    /// it never reaches a socket either, so the pool stays reported empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_rejected_before_the_wire_leaves_the_pool_reported_empty() {
+        let client = UreqHttpClient::new();
+        client
+            .execute(get("not-a-uri".into()))
+            .await
+            .expect_err("a URI with no scheme or host cannot be sent");
+        client
+            .execute(
+                HttpRequest::post("http://127.0.0.1:1/never")
+                    .with_header("bad header name", "v")
+                    .with_body(b"x".to_vec()),
+            )
+            .await
+            .expect_err("an invalid header name cannot be sent");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing was built, so nothing connected"
         );
     }
 
