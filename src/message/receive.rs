@@ -648,7 +648,7 @@ impl Client {
         // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
         let mut local_identity_reacted = false;
 
-        for payload in payloads {
+        for (enc_index, payload) in payloads.into_iter().enumerate() {
             let EncPayload {
                 ciphertext,
                 enc_type,
@@ -776,6 +776,7 @@ impl Client {
                         enc_type,
                         plaintext: decrypted.plaintext,
                         padding_version,
+                        enc_index,
                     });
                 }
                 Err(e) => {
@@ -886,6 +887,7 @@ impl Client {
                                     enc_type,
                                     plaintext: decrypted.plaintext,
                                     padding_version,
+                                    enc_index,
                                 });
                             }
                             Err(retry_err) => {
@@ -916,6 +918,7 @@ impl Client {
                                             &mut rng,
                                             enc_type,
                                             padding_version,
+                                            enc_index,
                                             info,
                                             &session_mutex,
                                             &mut session_guard,
@@ -999,6 +1002,7 @@ impl Client {
                                 &mut rng,
                                 enc_type,
                                 padding_version,
+                                enc_index,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1043,6 +1047,7 @@ impl Client {
                                 &mut rng,
                                 enc_type,
                                 padding_version,
+                                enc_index,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1096,6 +1101,7 @@ impl Client {
                                 &mut rng,
                                 enc_type,
                                 padding_version,
+                                enc_index,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1191,10 +1197,11 @@ impl Client {
             enc_type,
             plaintext,
             padding_version,
+            enc_index,
         } in deferred
         {
             match self
-                .handle_decrypted_plaintext(enc_type, plaintext, padding_version, info)
+                .handle_decrypted_plaintext(enc_type, plaintext, padding_version, enc_index, info)
                 .await
             {
                 Ok(plaintext_outcome) => {
@@ -1248,7 +1255,7 @@ impl Client {
             .sender_key_lock(&sender_key_name)
             .await;
 
-        for payload in payloads {
+        for (enc_index, payload) in payloads.iter().enumerate() {
             let ciphertext = &payload.ciphertext[..];
             let padding_version = payload.padding_version;
 
@@ -1284,6 +1291,7 @@ impl Client {
                             "skmsg",
                             padded_plaintext,
                             padding_version,
+                            enc_index,
                             info,
                         )
                         .await
@@ -1439,16 +1447,30 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
     pub(crate) async fn handle_decrypted_plaintext(
         self: &Arc<Self>,
-        enc_type: &str,
+        enc_type: &'static str,
         padded_plaintext: Vec<u8>,
         padding_version: u8,
+        enc_index: usize,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+        let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
+
+        // Emitted before decoding, so a payload this build cannot decode still
+        // reaches a consumer that wants it. Nothing is cloned while no lease is
+        // held, and a `Bytes` clone is a refcount bump when one is.
+        if self.decrypted_payload_forwarding_enabled() {
+            self.core.event_bus.dispatch(Event::DecryptedPayload(
+                wacore::types::events::DecryptedPayload::builder()
+                    .info(Arc::clone(info))
+                    .enc_index(enc_index)
+                    .enc_type(enc_type)
+                    .payload(source.clone())
+                    .build(),
+            ));
+        }
+
         let (original_msg, history_sync_taken) =
-            wacore::messages::decode_plaintext_detached_history_sync(
-                padded_plaintext,
-                padding_version,
-            )?;
+            wacore::messages::decode_plaintext_detached_history_sync(source)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
@@ -1637,6 +1659,7 @@ impl Client {
         rng: &mut rand::rngs::StdRng,
         enc_type: &'static str,
         padding_version: u8,
+        enc_index: usize,
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
@@ -1696,6 +1719,7 @@ impl Client {
                     enc_type,
                     plaintext: decrypted.plaintext,
                     padding_version,
+                    enc_index,
                 });
                 MigrationDecryptResult::Decrypted
             }

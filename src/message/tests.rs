@@ -8577,7 +8577,7 @@ async fn duplicate_message_is_acked_with_delivery_receipt() {
     }
 
     // A real (padded) Message so the success path also emits its receipt.
-    let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message {
+    let plaintext = MessageUtils::encode_and_pad(&wa::Message {
         conversation: Some("hi".to_string()),
         ..Default::default()
     });
@@ -9082,7 +9082,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9106,7 +9106,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9257,7 +9257,13 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     let info = Arc::new(info);
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
+        client.handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&request),
+            2,
+            0,
+            &info,
+        ),
     )
     .await
     .expect("the inbound lane must not wait for offline sync")
@@ -9275,7 +9281,13 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     );
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
+        client.handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&request),
+            2,
+            0,
+            &info,
+        ),
     )
     .await
     .expect("the redelivery must not wait for offline sync")
@@ -9581,7 +9593,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9597,7 +9609,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert_eq!(
@@ -12875,5 +12887,165 @@ async fn newsletter_status_stanza_is_nacked_once() {
     assert!(
         !extra_frame_appears(&transport, 1).await,
         "the nack replaces the ack; the server must not get both"
+    );
+}
+
+// --- decrypted-payload forwarding ------------------------------------------
+
+use wacore::messages::MessageUtils;
+
+/// A payload this build cannot decode, but which unpads cleanly.
+///
+/// Field 1 of `Message` is `conversation`, a string. Declaring it as a varint
+/// makes the decode fail on a wire-type mismatch — the shape a protobuf change
+/// takes — while the bytes stay perfectly good.
+fn undecodable_payload() -> Vec<u8> {
+    MessageUtils::pad_message_v2(vec![0x08, 0x01])
+}
+
+#[tokio::test]
+async fn decrypted_payloads_are_not_forwarded_without_a_lease() {
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-off").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-1",
+        "5510000@s.whatsapp.net",
+    ));
+    let padded = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some("hello".to_string()),
+        ..Default::default()
+    });
+    client
+        .handle_decrypted_plaintext("msg", padded, 2, 0, &info)
+        .await
+        .expect("decodes");
+
+    assert!(
+        events.try_recv().is_err(),
+        "nothing is emitted while no lease is held"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_forwards_the_payload_before_it_is_decoded() {
+    use wacore::types::events::{ChannelEventHandler, Event, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-on").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+    let _lease = client.acquire_decrypted_payload_forwarding();
+
+    let message = wa::Message {
+        conversation: Some("hello".to_string()),
+        ..Default::default()
+    };
+    let unpadded = waproto::codec::message_to_vec(&message);
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-2",
+        "5510000@s.whatsapp.net",
+    ));
+
+    client
+        .handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&message), 2, 3, &info)
+        .await
+        .expect("decodes");
+
+    let event = events.try_recv().expect("the payload was forwarded");
+    let Event::DecryptedPayload(payload) = &*event else {
+        panic!("expected a DecryptedPayload");
+    };
+    assert_eq!(
+        payload.payload.as_ref(),
+        unpadded.as_slice(),
+        "the bytes are the unpadded plaintext, exactly as decoding receives them"
+    );
+    assert_eq!(payload.enc_type, "msg");
+    assert_eq!(payload.enc_index, 3, "which <enc> produced it");
+    assert_eq!(payload.info.id, info.id);
+}
+
+#[tokio::test]
+async fn a_payload_that_fails_to_decode_is_still_forwarded() {
+    // The reason this event exists. A payload the client cannot decode is
+    // logged and dropped, and the ratchet has already advanced — so the same
+    // ciphertext will never decrypt again and those bytes are gone for good.
+    use wacore::types::events::{ChannelEventHandler, Event, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-undecodable").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+    let _lease = client.acquire_decrypted_payload_forwarding();
+
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-3",
+        "5510000@s.whatsapp.net",
+    ));
+    let outcome = client
+        .handle_decrypted_plaintext("msg", undecodable_payload(), 2, 0, &info)
+        .await;
+
+    assert!(outcome.is_err(), "the fixture must actually fail to decode");
+    let event = events.try_recv().expect("forwarded despite the failure");
+    let Event::DecryptedPayload(payload) = &*event else {
+        panic!("expected a DecryptedPayload");
+    };
+    assert_eq!(payload.payload.as_ref(), &[0x08, 0x01]);
+}
+
+#[tokio::test]
+async fn forwarding_stops_when_the_last_lease_drops() {
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-lease").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-4",
+        "5510000@s.whatsapp.net",
+    ));
+    let payload = || {
+        MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("x".to_string()),
+            ..Default::default()
+        })
+    };
+
+    let first = client.acquire_decrypted_payload_forwarding();
+    let second = client.acquire_decrypted_payload_forwarding();
+    client
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .await
+        .expect("decodes");
+    assert!(events.try_recv().is_ok());
+
+    // One lease left: still on.
+    drop(first);
+    client
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .await
+        .expect("decodes");
+    assert!(events.try_recv().is_ok(), "one lease still holds it open");
+
+    drop(second);
+    client
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .await
+        .expect("decodes");
+    assert!(
+        events.try_recv().is_err(),
+        "the last lease dropping turns it back off"
     );
 }

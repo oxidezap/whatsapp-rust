@@ -61,6 +61,32 @@ impl Client {
         self.raw_node_forwarding.load(Ordering::Relaxed) != 0
     }
 
+    /// Acquire decrypted-payload forwarding for one consumer.
+    ///
+    /// [`Event::DecryptedPayload`] remains enabled until every acquired lease
+    /// is dropped. Until then nothing is emitted and nothing is cloned.
+    ///
+    /// [`Event::DecryptedPayload`]: wacore::types::events::Event::DecryptedPayload
+    pub fn acquire_decrypted_payload_forwarding(self: &Arc<Self>) -> DecryptedPayloadLease {
+        let incremented = self
+            .decrypted_payload_forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(
+            incremented,
+            "decrypted-payload forwarding lease counter overflow"
+        );
+        DecryptedPayloadLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn decrypted_payload_forwarding_enabled(&self) -> bool {
+        self.decrypted_payload_forwarding.load(Ordering::Relaxed) != 0
+    }
+
     /// Register an interceptor that sees each decoded stanza before the
     /// built-in pipeline, and may take it.
     ///

@@ -571,8 +571,19 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
     }
 }
 
-/// Decode an owned plaintext while detaching an inline history-sync payload as
-/// a zero-copy `Bytes` slice.
+/// Strip the padding a decrypted payload arrives with.
+///
+/// Separate from decoding because the two fail for unrelated reasons and the
+/// bytes in between are worth having on their own: a payload that unpads
+/// cleanly but does not decode is a protocol change, while one that fails here
+/// is a corrupt frame. Returns `Bytes`, so passing it on costs a refcount bump.
+pub fn unpad_plaintext(padded_plaintext: Vec<u8>, padding_version: u8) -> Result<bytes::Bytes> {
+    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
+    Ok(bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len))
+}
+
+/// Decode an unpadded plaintext while detaching an inline history-sync payload
+/// as a zero-copy `Bytes` slice.
 ///
 /// Only the generated schema tags needed to reach the inline byte field are
 /// inspected. The field is removed from a lazily rewritten wire buffer before
@@ -580,13 +591,11 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
 /// into the owned protobuf tree. Every other field is still decoded by Buffa's
 /// generated implementation, keeping protobuf merge and unknown-field
 /// semantics in one place.
+///
+/// Takes the plaintext already unpadded — see [`unpad_plaintext`].
 pub fn decode_plaintext_detached_history_sync(
-    padded_plaintext: Vec<u8>,
-    padding_version: u8,
+    source: bytes::Bytes,
 ) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
-    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
-    let source = bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
-
     // Mirror `unwrap_device_sent`: once a DSM carries an inner message, only
     // that message is dispatched. Inspecting just this generated-tag path
     // avoids decoding/materializing the complete MessageView graph.
@@ -1366,8 +1375,9 @@ mod plaintext_view_tests {
         let plaintext_start = padded.as_ptr() as usize;
         let plaintext_end = plaintext_start + padded.len();
 
-        let (decoded, detached) = decode_plaintext_detached_history_sync(padded, 2)
-            .expect("owned view decode should succeed");
+        let (decoded, detached) =
+            decode_plaintext_detached_history_sync(unpad_plaintext(padded, 2).expect("unpads"))
+                .expect("owned view decode should succeed");
         let detached = detached.expect("history notification should be detached");
         let payload = detached
             .inline_payload
@@ -1403,8 +1413,10 @@ mod plaintext_view_tests {
             ..Default::default()
         });
 
-        let (decoded, detached) = decode_plaintext_detached_history_sync(padded(&wrapped), 2)
-            .expect("device-sent message should decode");
+        let (decoded, detached) = decode_plaintext_detached_history_sync(
+            unpad_plaintext(padded(&wrapped), 2).expect("unpads"),
+        )
+        .expect("device-sent message should decode");
         let decoded = unwrap_device_sent(decoded);
         let detached = detached.expect("inner history notification should be detached");
 

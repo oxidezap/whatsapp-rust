@@ -267,6 +267,7 @@ pub enum EventKind {
     DisappearingModeChanged,
     NewsletterLiveUpdate,
     RawNode,
+    DecryptedPayload,
     MexNotification,
     PairPasskeyRequest,
     PairPasskeyConfirmation,
@@ -945,6 +946,13 @@ pub enum Event {
     /// Newsletter live update (reaction counts changed, message updates, etc.).
     NewsletterLiveUpdate(NewsletterLiveUpdate),
 
+    /// One decrypted `<enc>` payload, emitted before it is decoded.
+    ///
+    /// Library extension — no WA Web equivalent. Gated by
+    /// `Client::acquire_decrypted_payload_forwarding()` so nothing is cloned
+    /// while unused.
+    DecryptedPayload(DecryptedPayload),
+
     /// Raw decoded stanza, emitted before router dispatch.
     /// Library extension — no WA Web equivalent (WA Web has no raw stanza observer).
     /// Gated by `Client::acquire_raw_node_forwarding()` to avoid overhead when unused.
@@ -1083,6 +1091,7 @@ impl Event {
             Event::DisappearingModeChanged(_) => EventKind::DisappearingModeChanged,
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
+            Event::DecryptedPayload(_) => EventKind::DecryptedPayload,
             Event::MexNotification(_) => EventKind::MexNotification,
             Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
             Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
@@ -1627,6 +1636,44 @@ impl UnavailableType {
     pub fn is_unrecoverable_fanout(&self) -> bool {
         matches!(self, Self::ViewOnce | Self::Hosted | Self::Bot)
     }
+}
+
+/// Payload of [`Event::DecryptedPayload`]: what Signal produced for one
+/// `<enc>`, before this build tried to make sense of it.
+///
+/// The client decodes a plaintext into [`wa::Message`] and dispatches that. A
+/// payload it cannot decode — a field this build predates, a message type it
+/// does not model — is logged and dropped, and with it goes something that cost
+/// a real decryption and advanced the ratchet. Nothing can ask for it back:
+/// the ratchet has moved on, so the same ciphertext will never decrypt again.
+///
+/// This event is that payload, handed over before decoding is attempted. It
+/// arrives whether or not the decode goes on to succeed.
+///
+/// Reasons to want it: recording traffic for faithful replay (re-encoding a
+/// decoded `Message` does not reproduce the original bytes), decoding with a
+/// newer protobuf than this build carries, and looking at a payload that failed
+/// to decode instead of only reading that it did.
+///
+/// Gated by `Client::acquire_decrypted_payload_forwarding()`: nothing is
+/// emitted, and nothing is cloned, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DecryptedPayload {
+    /// Which message this came from.
+    pub info: Arc<MessageInfo>,
+    /// Position of the `<enc>` within the stanza, counting from zero.
+    ///
+    /// A message to several devices carries several, and this says which one
+    /// produced these bytes.
+    pub enc_index: usize,
+    /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
+    pub enc_type: &'static str,
+    /// The plaintext, unpadded, exactly as decoding will receive it.
+    ///
+    /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
+    #[serde(skip)]
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]

@@ -195,6 +195,11 @@ struct DeferredPlaintext {
     enc_type: &'static str,
     plaintext: Vec<u8>,
     padding_version: u8,
+    /// Which `<enc>` in the stanza produced this, counting from zero.
+    ///
+    /// Carried here because the buffer drains after the decrypt loop, by which
+    /// point the position is gone.
+    enc_index: usize,
 }
 
 fn should_process_skmsg_after_session(

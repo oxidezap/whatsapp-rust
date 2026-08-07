@@ -63,6 +63,27 @@ use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+/// Lease that keeps decrypted-payload events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+#[must_use = "dropping the lease immediately releases decrypted-payload forwarding"]
+pub struct DecryptedPayloadLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for DecryptedPayloadLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let previous = client
+            .decrypted_payload_forwarding
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "decrypted-payload forwarding lease underflow");
+    }
+}
+
 /// Lease that keeps raw decoded stanza events enabled for one consumer.
 ///
 /// Dropping the final lease disables forwarding. The lease holds only a weak
@@ -1420,6 +1441,10 @@ pub struct Client {
 
     /// Number of consumers currently requesting `Event::RawNode` forwarding.
     raw_node_forwarding: AtomicUsize,
+
+    /// Number of consumers currently requesting `Event::DecryptedPayload`
+    /// forwarding.
+    decrypted_payload_forwarding: AtomicUsize,
 
     /// Stanza interceptors, behind the same copy-on-write snapshot the event
     /// bus uses: reading one costs a refcount bump, so the read loop allocates

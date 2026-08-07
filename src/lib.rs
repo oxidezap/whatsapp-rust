@@ -126,7 +126,9 @@ pub use client::{
     StatsSnapshot, StorageResourceReport, TransportResourceReport,
 };
 pub use client::{CallError, Voip};
-pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError, RawNodeLease};
+pub use client::{
+    Client, ClientBuild, ClientBuilder, ClientBuilderError, DecryptedPayloadLease, RawNodeLease,
+};
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
