@@ -32,7 +32,9 @@ use wacore_binary::Jid;
 use waproto::whatsapp::Message;
 
 use crate::Client;
-use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState, RawNodeLease};
+use crate::client::{
+    ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease, RawNodeLease,
+};
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
 
@@ -469,9 +471,69 @@ impl Drop for TaskLease {
     }
 }
 
+/// Forwarding leases held on behalf of one subscription's interest.
+///
+/// A few events are gated: the client produces them only while a consumer asks,
+/// so subscribing to one is not enough — the subscription has to hold the lease
+/// for as long as its interest names the kind, and give it up as soon as it
+/// stops. Adding a gated kind means adding it here; nothing else in the
+/// subscription path knows which kinds are gated.
+#[derive(Default)]
+struct GatedForwarding {
+    raw_node: Option<RawNodeLease>,
+    decrypted_payload: Option<DecryptedPayloadLease>,
+}
+
+impl GatedForwarding {
+    /// Whether `interest` names a gated kind this does not already cover.
+    ///
+    /// Checked before upgrading the client so an interest change that needs no
+    /// lease cannot fail on a client that is going away.
+    fn is_short_for(&self, interest: EventInterest) -> bool {
+        (interest.wants(EventKind::RawNode) && self.raw_node.is_none())
+            || (interest.wants(EventKind::DecryptedPayload) && self.decrypted_payload.is_none())
+    }
+
+    /// Acquire what `interest` needs and this does not hold yet.
+    ///
+    /// Kept separate from committing it: the caller may still abandon the
+    /// interest change, and dropping the result is then the whole rollback.
+    fn acquire_missing(&self, client: &Arc<Client>, interest: EventInterest) -> Self {
+        Self {
+            raw_node: (interest.wants(EventKind::RawNode) && self.raw_node.is_none())
+                .then(|| client.acquire_raw_node_forwarding()),
+            decrypted_payload: (interest.wants(EventKind::DecryptedPayload)
+                && self.decrypted_payload.is_none())
+            .then(|| client.acquire_decrypted_payload_forwarding()),
+        }
+    }
+
+    /// Take over leases from [`Self::acquire_missing`], keeping those held.
+    fn commit(&mut self, acquired: Self) {
+        self.raw_node = self.raw_node.take().or(acquired.raw_node);
+        self.decrypted_payload = self.decrypted_payload.take().or(acquired.decrypted_payload);
+    }
+
+    /// Give up what `interest` no longer asks for.
+    ///
+    /// Returned rather than dropped so the caller releases it outside the state
+    /// lock, where a consumer's `Drop` cannot deadlock against this one.
+    #[must_use]
+    fn retire_unwanted(&mut self, interest: EventInterest) -> Self {
+        Self {
+            raw_node: (!interest.wants(EventKind::RawNode))
+                .then(|| self.raw_node.take())
+                .flatten(),
+            decrypted_payload: (!interest.wants(EventKind::DecryptedPayload))
+                .then(|| self.decrypted_payload.take())
+                .flatten(),
+        }
+    }
+}
+
 struct PluginCoreEventSubscriptionState {
     subscription: Option<Subscription>,
-    raw_node_lease: Option<RawNodeLease>,
+    leases: GatedForwarding,
     interest: EventInterest,
 }
 
@@ -504,36 +566,30 @@ impl PluginCoreEventSubscriptionInner {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let wants_raw_node = interest.wants(EventKind::RawNode);
-        let acquired_raw_node_lease = if wants_raw_node && state.raw_node_lease.is_none() {
-            Some(
-                self.client
-                    .upgrade()
-                    .ok_or(PluginResourceError::ClientUnavailable)?
-                    .acquire_raw_node_forwarding(),
-            )
+        let acquired = if state.leases.is_short_for(interest) {
+            let client = self
+                .client
+                .upgrade()
+                .ok_or(PluginResourceError::ClientUnavailable)?;
+            state.leases.acquire_missing(&client, interest)
         } else {
-            None
+            GatedForwarding::default()
         };
         let Some(subscription) = state.subscription.as_ref() else {
             return Ok(false);
         };
         if !subscription.update_interest(interest) {
             drop(state);
-            drop(acquired_raw_node_lease);
+            drop(acquired);
             self.close();
             return Ok(false);
         }
 
         state.interest = interest;
-        if let Some(lease) = acquired_raw_node_lease {
-            state.raw_node_lease = Some(lease);
-        }
-        let retired_raw_node_lease = (!wants_raw_node)
-            .then(|| state.raw_node_lease.take())
-            .flatten();
+        state.leases.commit(acquired);
+        let retired = state.leases.retire_unwanted(interest);
         drop(state);
-        drop(retired_raw_node_lease);
+        drop(retired);
         Ok(true)
     }
 
@@ -544,7 +600,7 @@ impl PluginCoreEventSubscriptionInner {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (state.subscription.take(), state.raw_node_lease.take())
+            (state.subscription.take(), std::mem::take(&mut state.leases))
         };
         let active = registration.0.is_some();
         if std::panic::catch_unwind(AssertUnwindSafe(|| drop(registration))).is_err() {
@@ -652,7 +708,7 @@ impl PluginResources {
         plugin_id: Arc<str>,
         interest: EventInterest,
         subscription: Subscription,
-        raw_node_lease: Option<RawNodeLease>,
+        leases: GatedForwarding,
     ) -> Result<PluginCoreEventSubscription, PluginResourceError> {
         let registration = Arc::new(PluginCoreEventSubscriptionInner {
             client,
@@ -660,7 +716,7 @@ impl PluginResources {
             plugin_id,
             state: Mutex::new(PluginCoreEventSubscriptionState {
                 subscription: Some(subscription),
-                raw_node_lease,
+                leases,
                 interest,
             }),
         });
@@ -1127,9 +1183,7 @@ impl PluginCoreEvents {
             .client
             .upgrade()
             .ok_or(PluginResourceError::ClientUnavailable)?;
-        let raw_node_lease = interest
-            .wants(EventKind::RawNode)
-            .then(|| client.acquire_raw_node_forwarding());
+        let leases = GatedForwarding::default().acquire_missing(&client, interest);
         let handler = Arc::new(PluginCoreEventHandler {
             plugin_id: Arc::clone(&self.plugin_id),
             inner: Some(handler),
@@ -1143,7 +1197,7 @@ impl PluginCoreEvents {
             Arc::clone(&self.plugin_id),
             interest,
             subscription,
-            raw_node_lease,
+            leases,
         )
     }
 }
@@ -5321,6 +5375,58 @@ mod tests {
         client.disconnect().await;
         assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    #[tokio::test]
+    async fn each_gated_kind_holds_its_own_lease() {
+        // Subscribing to a gated kind is not enough on its own: the client only
+        // produces those events while a lease is held, so a subscription that
+        // acquired the wrong one would deliver nothing and look correct.
+        let client = complete_builder()
+            .await
+            .with_plugin(EventSubscriptionPlugin)
+            .build()
+            .await
+            .expect("event subscription plugin")
+            .into_client();
+        let subscription = client
+            .plugin::<EventSubscriptionPlugin>()
+            .expect("subscription API");
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::DecryptedPayload]))
+                .expect("interest update")
+        );
+        assert!(client.decrypted_payload_forwarding_enabled());
+        assert!(
+            !client.raw_node_forwarding_enabled(),
+            "the kind that is no longer wanted releases its own lease"
+        );
+
+        // Both at once, then each removed on its own.
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[
+                    EventKind::RawNode,
+                    EventKind::DecryptedPayload,
+                ]))
+                .expect("interest update")
+        );
+        assert!(client.raw_node_forwarding_enabled());
+        assert!(client.decrypted_payload_forwarding_enabled());
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::RawNode]))
+                .expect("interest update")
+        );
+        assert!(client.raw_node_forwarding_enabled(), "kept");
+        assert!(!client.decrypted_payload_forwarding_enabled(), "released");
+
+        assert!(subscription.unsubscribe());
+        assert!(!client.raw_node_forwarding_enabled());
+        assert!(!client.decrypted_payload_forwarding_enabled());
     }
 
     #[tokio::test]

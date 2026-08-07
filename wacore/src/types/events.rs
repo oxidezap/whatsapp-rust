@@ -267,7 +267,6 @@ pub enum EventKind {
     DisappearingModeChanged,
     NewsletterLiveUpdate,
     RawNode,
-    DecryptedPayload,
     MexNotification,
     PairPasskeyRequest,
     PairPasskeyConfirmation,
@@ -276,6 +275,7 @@ pub enum EventKind {
     PairingQrCodesExhausted,
     PairingCodeError,
     AppStateSyncFailed,
+    DecryptedPayload,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -289,7 +289,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::AppStateSyncFailed as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::DecryptedPayload as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
