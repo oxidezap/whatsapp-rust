@@ -550,17 +550,17 @@ impl Client {
             && !session_had_duplicates
             && !session_payloads_empty
         {
-            // Edge case: message with only msg/pkmsg that failed to decrypt, no skmsg
-            log::log!(
-                decrypt_fail_log_level(decrypt_fail_mode),
-                "Message {} from {} failed to decrypt and has no group content. Dispatching UndecryptableMessage event.",
-                info.id,
-                info.source.sender.observe()
-            );
-            // Dispatch UndecryptableMessage event for messages that failed to decrypt
-            // (This should not cause double-dispatching since process_session_enc_batch
-            // already returned dispatched_undecryptable=false for this case)
+            // Edge case: message with only msg/pkmsg that failed to decrypt, no skmsg.
+            // The announcement shares the guard with the dispatch it announces:
+            // when the session batch already dispatched for this id, nothing is
+            // emitted here and the line would otherwise contradict the batch.
             if !session_dispatched_undecryptable {
+                log::log!(
+                    decrypt_fail_log_level(decrypt_fail_mode),
+                    "Message {} from {} failed to decrypt and has no group content. Dispatching UndecryptableMessage event.",
+                    info.id,
+                    info.source.sender.observe()
+                );
                 self.dispatch_undecryptable_event(
                     Arc::clone(&info),
                     false,

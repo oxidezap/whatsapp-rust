@@ -5089,6 +5089,230 @@ async fn test_undecryptable_deduped_across_resends() {
     }
 }
 
+/// Buffers what `message::receive` announced, so a test can assert that a
+/// branch's log describes what the branch actually did. `log`'s global logger
+/// is install-once per process: `cargo nextest` (what CI runs) gives every test
+/// its own process and the install always wins, while a threaded
+/// `cargo test --lib` run can find the slot already taken by a sibling test's
+/// `env_logger`. Callers keep their event assertions either way.
+#[derive(Default)]
+struct ReceiveLogCapture {
+    records: std::sync::Mutex<Vec<(log::Level, String)>>,
+}
+
+impl log::Log for ReceiveLogCapture {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == "whatsapp_rust::message::receive"
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static RECEIVE_LOG_CAPTURE: std::sync::LazyLock<ReceiveLogCapture> =
+    std::sync::LazyLock::new(ReceiveLogCapture::default);
+
+/// `true` once this process's logger is the capture above. Idempotent: the
+/// install is attempted once per process and the verdict cached.
+fn receive_log_capture_installed() -> bool {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        let installed = log::set_logger(&*RECEIVE_LOG_CAPTURE).is_ok();
+        if installed {
+            log::set_max_level(log::LevelFilter::Trace);
+        }
+        installed
+    })
+}
+
+/// The captured `message::receive` records that name `msg_id`.
+fn receive_logs_for(msg_id: &str) -> Vec<(log::Level, String)> {
+    RECEIVE_LOG_CAPTURE
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, message)| message.contains(msg_id))
+        .cloned()
+        .collect()
+}
+
+const DISPATCH_ANNOUNCEMENT: &str = "Dispatching UndecryptableMessage event.";
+
+/// The ordinary shape: a message whose only payload is a session ciphertext
+/// that fails to decrypt, with no group content. `process_session_enc_batch`
+/// owns the dispatch here (every session failure routes through
+/// `handle_decrypt_failure`), so the no-group-content branch downstream must
+/// stay silent instead of announcing a dispatch it does not perform — the
+/// contradictory pair seen in production. The event still fires exactly once,
+/// which is what keeps the silencing from turning into a dropped failure.
+#[tokio::test]
+async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
+
+    let capturing = receive_log_capture_installed();
+    let client = create_test_client_for_retry_with_id("undec_log_batch").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+
+    let sender: Jid = "5511900000001@s.whatsapp.net"
+        .parse()
+        .expect("test JID should be valid");
+    let msg_id = "UNDEC_LOG_BATCH_OWNS_DISPATCH";
+    let info = Arc::new(MessageInfo {
+        id: msg_id.to_string(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    // A well-formed SignalMessage for a session we have never established:
+    // parses, then fails to decrypt with SessionNotFound.
+    let sender_ratchet = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
+    let sender_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let receiver_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let signal_message = SignalMessage::new(
+        4,
+        &[0u8; 32],
+        sender_ratchet,
+        0,
+        0,
+        b"test",
+        sender_identity.identity_key(),
+        receiver_identity.identity_key(),
+    )
+    .expect("SignalMessage::new should succeed with valid inputs");
+    let enc = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(signal_message.serialized().to_vec())
+        .build();
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.undecryptable().len(),
+        1,
+        "the batch's dispatch must still be the one UndecryptableMessage for this id",
+    );
+
+    if capturing {
+        let logs = receive_logs_for(msg_id);
+        assert!(
+            !logs.is_empty(),
+            "the decrypt failure must leave a receive-side record for this id",
+        );
+        assert!(
+            !logs.iter().any(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT)),
+            "nothing dispatches here, so nothing may announce a dispatch: {logs:?}",
+        );
+    }
+
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The branch's own case: the session batch never ran (a group-addressed
+/// sender's session payloads are skipped, so its outcome carries no dispatch),
+/// leaving this branch as the dispatcher. Then the announcement is accurate,
+/// fires once, and keeps taking its level from `decrypt_fail_mode`.
+#[tokio::test]
+async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
+    let capturing = receive_log_capture_installed();
+    let client = create_test_client_for_retry_with_id("undec_log_branch").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+
+    let group: Jid = "120363000000000001@g.us"
+        .parse()
+        .expect("test JID should be valid");
+    let participant: Jid = "5511900000002@s.whatsapp.net"
+        .parse()
+        .expect("test JID should be valid");
+    let msg_id = "UNDEC_LOG_BRANCH_DISPATCHES";
+    let info = Arc::new(MessageInfo {
+        id: msg_id.to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant,
+            chat: group.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let enc = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(vec![0xFF, 0x00, 0x03])
+        .build();
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: group,
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.undecryptable().len(),
+        1,
+        "the branch must dispatch exactly one UndecryptableMessage",
+    );
+
+    if capturing {
+        let announcements: Vec<_> = receive_logs_for(msg_id)
+            .into_iter()
+            .filter(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT))
+            .collect();
+        assert_eq!(
+            announcements.len(),
+            1,
+            "the performed dispatch must be announced exactly once: {announcements:?}",
+        );
+        assert_eq!(
+            announcements[0].0,
+            decrypt_fail_log_level(DecryptFailMode::Show),
+            "the announcement keeps taking its level from decrypt_fail_mode",
+        );
+    }
+
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
 /// Status posts must flow through PDO — excluding them drops any
 /// InvalidPreKeyId status permanently (WA Web recovers them).
 #[tokio::test]
