@@ -619,9 +619,10 @@ impl SqliteStore {
     /// merely overlap a write see either state, which is what the single permit
     /// already gave them (it ordered them arbitrarily, not causally).
     ///
-    /// Only correct for statements that cannot write: reader connections carry
-    /// `PRAGMA query_only`, so a write sent here fails instead of escaping the
-    /// serialization the store depends on.
+    /// Only correct for statements that cannot write. Reader connections carry
+    /// `PRAGMA query_only`, so a write sent here fails loudly -- but the
+    /// fallback hands out an ordinary write connection, so with no reader pool
+    /// (the default) that net is absent and the routing scan is the only guard.
     async fn read_query<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
@@ -634,14 +635,11 @@ impl SqliteStore {
     }
 
     async fn read_erased<T: Send + 'static>(&self, f: ReadQuery<T>) -> Result<T> {
-        // At the default `pool_size = 1` with no reader connections, holding the
-        // one pooled connection is itself the snapshot: no writer can be on it,
-        // including the several that skip the permit and check one out directly.
-        // A transaction would only add statements to every read.
-        // The snapshot is only worth opening where it is safe: at
-        // `pool_size = 1` the exclusive connection already gives it, and under
-        // shared cache or without WAL a read transaction would lock out the
-        // writer instead.
+        // Skip the deferred snapshot only where it is redundant or unsafe: at
+        // `pool_size = 1` with no readers the exclusive pooled connection is
+        // itself the snapshot (no writer can be on it, including the ones that
+        // skip the permit), and under shared cache or without WAL a read
+        // transaction would lock the writer out instead.
         if self.reads.is_none() && (self.pool.max_size() <= 1 || !self.snapshot_safe) {
             let pool = self.pool.clone();
             return self
@@ -2945,6 +2943,8 @@ impl ProtocolStore for SqliteStore {
         // On the write queue: a miss here is promoted into
         // `device_registry_cache` unconditionally, so a stale row overwrites a
         // newer entry and later sends omit a linked device until a refresh.
+        // `update_device_list` skips the permit, so at the default `pool_size`
+        // the single connection is what orders them, not the permit itself.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let user = user.to_string();
@@ -3079,7 +3079,9 @@ impl ProtocolStore for SqliteStore {
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
         // On the write queue: `prepare_privacy_token` schedules off this
         // timestamp, so reading before a concurrent touch commits issues a
-        // duplicate token and bypasses the configured interval.
+        // duplicate token and bypasses the configured interval. The touch skips
+        // the permit, so at the default `pool_size` the single connection is
+        // what orders them, not the permit itself.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
@@ -6001,25 +6003,37 @@ mod read_routing_tests {
         exercise_reads(4).await;
     }
 
-    /// The safety net: reader connections are `query_only`, so a write that
-    /// slips into `read_query` fails loudly instead of escaping the write
-    /// serialization and deadlocking against the real writer.
+    /// The safety net, and its limit. A reader connection is `query_only`, so a
+    /// write that slips into `read_query` fails loudly there. The fallback hands
+    /// out an ordinary write connection and has no such net, which is why the
+    /// routing scan exists; asserted here so the gap is recorded rather than
+    /// assumed away.
     #[tokio::test]
-    async fn a_write_through_read_query_is_refused() {
-        let db = TempDb::new("query_only");
-        let store = store_with(1, &db).await;
+    async fn a_write_through_read_query_is_refused_only_on_reader_connections() {
+        let write_a_row = |store: SqliteStore| async move {
+            store
+                .read_query(|conn| {
+                    diesel::delete(sessions::table)
+                        .execute(conn)
+                        .map_err(|e| StoreError::Database(Box::new(e)))?;
+                    Ok(())
+                })
+                .await
+        };
 
-        let result = store
-            .read_query(|conn| {
-                diesel::delete(sessions::table)
-                    .execute(conn)
-                    .map_err(|e| StoreError::Database(Box::new(e)))?;
-                Ok(())
-            })
-            .await;
+        let with_readers = TempDb::new("query_only_readers");
+        let store = store_with(1, &with_readers).await;
         assert!(
-            matches!(result, Err(StoreError::Database(_))),
-            "query_only must reject a write on the read path"
+            matches!(write_a_row(store).await, Err(StoreError::Database(_))),
+            "query_only must reject a write on a reader connection"
+        );
+
+        let no_readers = TempDb::new("query_only_fallback");
+        let store = store_with(0, &no_readers).await;
+        assert!(
+            write_a_row(store).await.is_ok(),
+            "the fallback has no query_only net; if this ever starts failing the \
+             doc on read_query and this test both need updating"
         );
     }
 
