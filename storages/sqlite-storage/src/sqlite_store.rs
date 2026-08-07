@@ -2715,6 +2715,8 @@ impl ProtocolStore for SqliteStore {
         // On the write queue: the startup warm-up feeds these rows into
         // `LidPnCache::add_guarded`, whose LID side replaces unconditionally, so
         // a stale row read during a live learn reverts reverse resolution.
+        // `put_lid_mappings` takes the permit; at the default `pool_size` the
+        // single connection is what orders them either way.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         self.with_semaphore(move || -> Result<Vec<LidPnMappingEntry>> {
