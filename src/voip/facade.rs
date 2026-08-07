@@ -2851,12 +2851,15 @@ impl VideoShared {
             ended,
         };
         let handle = client.runtime.spawn(Box::pin(feed.run()));
-        if let Some(old) = self
+        // Abort outside the guard: edition 2024 keeps an `if let` scrutinee temporary
+        // alive for the whole matching arm, and a `Runtime` that cancels synchronously
+        // would drop the task inline and re-enter this non-reentrant mutex.
+        let old = self
             .feed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .replace(handle)
-        {
+            .replace(handle);
+        if let Some(old) = old {
             old.abort();
         }
     }
@@ -2865,7 +2868,8 @@ impl VideoShared {
     /// dropped, and the drive loop's video plane is disabled so it stops emitting/decoding video.
     fn detach_endpoints(&self) {
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Some(feed) = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let feed = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(feed) = feed {
             feed.abort();
         }
         self.send_control(VideoControl::Disable);
@@ -8674,6 +8678,114 @@ mod tests {
             after.is_err(),
             "an AU sent after ended must not be forwarded (feed stopped)"
         );
+    }
+
+    /// Runs a caller-supplied hook inline on `abort()`, standing in for a `Runtime` that
+    /// finishes cancellation synchronously and therefore drops the task on the spot.
+    #[derive(Clone, Default)]
+    struct AbortHook(Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>);
+
+    struct ReentrantAbortRuntime {
+        handle: tokio::runtime::Handle,
+        hook: AbortHook,
+    }
+
+    impl wacore::runtime::Runtime for ReentrantAbortRuntime {
+        fn spawn(
+            &self,
+            future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> wacore::runtime::AbortHandle {
+            let task = self.handle.spawn(future);
+            let hook = self.hook.clone();
+            wacore::runtime::AbortHandle::new(move || {
+                task.abort();
+                if let Some(reenter) = hook.0.get() {
+                    reenter();
+                }
+            })
+        }
+
+        fn spawn_detached(
+            &self,
+            future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) {
+            self.handle.spawn(future);
+        }
+
+        fn sleep(&self, duration: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+
+        fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    /// The old feed must be aborted with the `feed` mutex already released: cancellation runs
+    /// runtime-supplied code, and on a runtime that cancels synchronously that code runs the
+    /// task's drop inline, re-entering this non-reentrant mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn feed_swap_does_not_abort_while_holding_the_feed_lock() {
+        let hook = AbortHook::default();
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let client = Client::builder()
+            .with_runtime_arc(Arc::new(ReentrantAbortRuntime {
+                handle: tokio::runtime::Handle::current(),
+                hook: hook.clone(),
+            }))
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+
+        let shared = Arc::new(VideoShared::new());
+        let _receivers = shared.take_receivers();
+        hook.0
+            .set({
+                let shared = Arc::clone(&shared);
+                Box::new(move || {
+                    let _guard = shared.feed.lock().unwrap_or_else(|e| e.into_inner());
+                })
+            })
+            .ok()
+            .expect("the hook is installed once");
+
+        let (src_rx, vout_tx) = video_endpoints();
+        let source: Arc<dyn VideoSource> = Arc::new(src_rx);
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        let ended = Arc::new(EndedFlag::default());
+
+        // A re-entrant lock parks its thread for good, so drive the sequence on a thread of its
+        // own and let the timeout report the deadlock instead of hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            shared.attach_endpoints(&client, &source, &sink, ended.clone());
+            // Replacing an existing feed aborts it...
+            shared.attach_endpoints(&client, &source, &sink, ended.clone());
+            // ...and so does releasing the endpoints.
+            shared.detach_endpoints();
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attach/detach must not hold the feed lock while aborting the old feed");
     }
 
     // A second take is defensive: it must yield closed channels (their driver arms self-disable),
