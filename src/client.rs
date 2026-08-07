@@ -288,6 +288,11 @@ pub struct MemoryReport {
     /// Cumulative attempts that kept a live lane and temporarily exceeded capacity.
     pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
+    /// Peers whose session was recently recreated, keyed to rate-limit the next
+    /// recreate. Counts only: the entries are a JID and an instant.
+    pub session_recreate_history: u64,
+    /// Groups whose sender-key distribution is memoised as already warm.
+    pub skdm_warm_memo: u64,
     // -- Unbounded collections --
     /// Deferred acks queued for the transport-ack worker. Unbounded, and each
     /// entry retains the full inbound node plus a flush guard, so a stalled
@@ -310,6 +315,10 @@ pub struct MemoryReport {
     /// Active/ringing calls and bounded pre-offer group controls, including their snapshots/queues.
     #[cfg(feature = "voip-runtime")]
     pub active_calls: CollectionStats,
+    /// Outgoing calls parked until the server sends the relay that owns them.
+    /// Each entry retains the material needed to spawn one media engine.
+    #[cfg(feature = "voip-runtime")]
+    pub pending_outgoing_calls: u64,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -409,6 +418,12 @@ impl std::fmt::Display for MemoryReport {
             "  resend_rl_chats:        {}",
             self.resend_rate_limiter_chats
         )?;
+        writeln!(
+            f,
+            "  session_recreate_hist:  {}",
+            self.session_recreate_history
+        )?;
+        writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
         writeln!(
@@ -439,6 +454,11 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "--- VoIP state ---")?;
             line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
             line(f, "active_calls:", &self.active_calls)?;
+            writeln!(
+                f,
+                "  pending_outgoing_calls: {}",
+                self.pending_outgoing_calls
+            )?;
         }
         writeln!(f, "--- In-flight history sync ---")?;
         line(

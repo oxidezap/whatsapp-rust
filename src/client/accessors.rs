@@ -204,6 +204,12 @@ impl Client {
             .memory_stats();
         #[cfg(feature = "voip-runtime")]
         let active_calls = self.call_registry.memory_stats();
+        #[cfg(feature = "voip-runtime")]
+        let pending_outgoing_calls = self
+            .pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]
@@ -264,6 +270,8 @@ impl Client {
             group_distribution_lock_evictions: group_distribution_locks.evictions,
             group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            session_recreate_history: self.session_recreate_history.entry_count(),
+            skdm_warm_memo: self.skdm_warm_memo.entry_count(),
             transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
@@ -279,6 +287,8 @@ impl Client {
             pending_call_link_updates,
             #[cfg(feature = "voip-runtime")]
             active_calls,
+            #[cfg(feature = "voip-runtime")]
+            pending_outgoing_calls,
             #[cfg(feature = "plugins")]
             plugins,
             #[cfg(feature = "plugins")]
