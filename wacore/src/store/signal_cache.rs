@@ -1106,7 +1106,7 @@ impl SignalStoreCache {
         Ok(self.checkout_loaded_session(&mut state, key, backend_result.as_deref(), checkout))
     }
 
-    /// Decode what a cold checkout read and leave the address checked out by it.
+    /// Decode what a cold checkout fetched and leave the address checked out by it.
     fn checkout_loaded_session(
         &self,
         state: &mut SessionStoreState,
@@ -1158,7 +1158,7 @@ impl SignalStoreCache {
                 if let Some(entry) = state.cache.get(key) {
                     return match entry {
                         SessionEntry::Present(record) => Ok(Some(record.clone())),
-                        _ => Ok(None),
+                        SessionEntry::Absent | SessionEntry::CheckedOut { .. } => Ok(None),
                     };
                 }
                 (state.incarnation, state.cache.removal_seq())
