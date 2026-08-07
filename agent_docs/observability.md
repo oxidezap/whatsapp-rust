@@ -142,8 +142,17 @@ what a component can introspect — absent means "not reported", not zero):
   WebSocket transport fills best-effort static estimates (tokio-websockets and
   rustls don't surface live buffer sizes).
 - **HTTP** — `HttpClient::resource_report() -> Option<HttpResourceReport>`,
-  defaulted. The `ureq` client reports its idle-pool buffer estimate (`None`
-  when built from a custom agent whose config is opaque).
+  defaulted. The `ureq` client reports `Some(0)` connections and `Some(0)` pool
+  bytes until its first request, then its idle-pool buffer estimate (`None` from
+  that point on when built from a custom agent whose config is opaque). ureq
+  allocates per connection, not per agent (`LazyBuffers` and the pool both start
+  empty), so an agent that has never connected costs ~2.8 KiB of RSS against the
+  96 KiB the cap advertises, and reporting the cap there put ~28% of a session's
+  `total_estimated_bytes()` on memory that was not resident. `Some(0)` rather
+  than `None` because an empty pool is a measured fact, not an absence of
+  introspection. Once a request has gone out the cap is a floor, not a ceiling:
+  a pooled TLS connection measures ~98 KiB, of which the 32 KiB of ureq buffers
+  is all this field claims.
 - **Alloc churn** — an `AllocSnapshot` from an `AllocMeter` (below), when one is
   installed.
 
@@ -152,6 +161,28 @@ what a component can introspect — absent means "not reported", not zero):
 `alloc` is churn, not residency, and is excluded. The future is `Send` (compile
 guard in `accessors.rs`, per #964) so multi-session consumers can await it off a
 worker.
+
+### Sharing one HTTP client across sessions
+
+A process running many sessions should build **one** `UreqHttpClient` and hand a
+clone to each `BotBuilder::with_http_client`. Cloning shares the `ureq::Agent`,
+and therefore the connection pool, so the pooled connections are paid once for
+the process instead of once per session.
+
+That is worth doing because `connect()` fetches `sw.js` over TLS through
+`version::resolve_and_update_version` unless `with_version` is set or the cached
+version is under 24h old. A session that never touches media still opens one TLS
+connection, and ureq retains it: its pool purges on age only when the pool is
+next touched, and `max_idle_age` never fires anyway because `Connection::age()`
+returns zero. Measured at ~98 KiB held for the session's lifetime, against a
+~440 KiB marginal RSS per client, so sharing takes back about a fifth of it from
+roughly ten sessions up.
+
+Isolation: `sw.js` is unauthenticated and identical for every session, and media
+URLs carry their auth per request, so a shared connection carries nothing between
+sessions that the shared source IP does not already carry. Concurrency is
+unaffected, because ureq opens a new connection whenever no idle one matches the
+authority. The pool caps idle retention, not throughput.
 
 ### `AllocMeter` — per-client allocation attribution (opt-in)
 

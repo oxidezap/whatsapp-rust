@@ -4,6 +4,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
 use wacore::stats::HttpResourceReport;
 
@@ -30,11 +32,15 @@ pub struct UreqHttpClient {
     /// Best-effort pool footprint for `resource_report`. `None` when a custom
     /// agent is supplied (its buffer/pool config is opaque to us).
     pool_report: Option<HttpResourceReport>,
+    /// Set by the first request. Shared, because cloning shares the agent and
+    /// therefore the pool. Read by [`UreqHttpClient::resource_report`].
+    requested: Arc<AtomicBool>,
 }
 
-/// Pool footprint of the default agent: each idle connection keeps an input and
-/// an output buffer. ureq exposes neither the live pool size nor in-flight
-/// buffering, so this is an upper-bound estimate, not a measurement.
+/// Pool footprint of the default agent once it has connected: each idle
+/// connection keeps an input and an output buffer. ureq exposes neither the live
+/// pool size nor in-flight buffering, so this is an upper-bound estimate, not a
+/// measurement.
 fn default_pool_report() -> HttpResourceReport {
     HttpResourceReport {
         pool_connections: Some(MAX_IDLE_CONNECTIONS),
@@ -43,13 +49,27 @@ fn default_pool_report() -> HttpResourceReport {
     }
 }
 
+/// What the pool holds before the first request: nothing.
+const EMPTY_POOL_REPORT: HttpResourceReport = HttpResourceReport {
+    pool_connections: Some(0),
+    pool_buffer_bytes: Some(0),
+    inflight_bytes: None,
+};
+
 impl UreqHttpClient {
     pub fn new() -> Self {
         Self {
             agent: build_agent(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             pool_report: Some(default_pool_report()),
+            requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Relaxed: the flag only feeds an on-demand estimate, and the path that
+    /// sets it is about to open a socket.
+    fn mark_requested(&self) {
+        self.requested.store(true, Ordering::Relaxed);
     }
 
     /// Create a client with a pre-configured [`ureq::Agent`].
@@ -62,6 +82,7 @@ impl UreqHttpClient {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             // A custom agent's buffer/pool sizes are opaque — don't guess.
             pool_report: None,
+            requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -164,10 +185,12 @@ impl HttpClient for UreqHttpClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
         let agent = self.agent.clone();
         let max_body_bytes = self.max_body_bytes;
+        let requested = self.requested.clone();
         // Since ureq is blocking, we must use spawn_blocking
         tokio::task::spawn_blocking(move || {
             let response = match request.method.as_str() {
                 "GET" => {
+                    requested.store(true, Ordering::Relaxed);
                     let mut req = status_as_response(agent.get(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
@@ -175,6 +198,7 @@ impl HttpClient for UreqHttpClient {
                     req.call()?
                 }
                 "POST" => {
+                    requested.store(true, Ordering::Relaxed);
                     let mut req = status_as_response(agent.post(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
@@ -208,6 +232,7 @@ impl HttpClient for UreqHttpClient {
         // in one blocking thread.
         let response = match request.method.as_str() {
             "GET" => {
+                self.mark_requested();
                 let mut req = status_as_response(self.agent.get(&request.url));
                 for (key, value) in &request.headers {
                     req = req.header(key, value);
@@ -256,6 +281,7 @@ impl HttpClient for UreqHttpClient {
             ));
         }
 
+        self.mark_requested();
         let mut req = status_as_response(self.agent.post(&request.url));
         for (key, value) in &request.headers {
             req = req.header(key, value);
@@ -273,7 +299,18 @@ impl HttpClient for UreqHttpClient {
         Ok(HttpResponse { status_code, body })
     }
 
+    /// An empty pool before the first request, the configured cap after it.
+    ///
+    /// ureq allocates per connection, not per agent, so an agent that has never
+    /// connected holds no buffers at all: 2.8 KiB of measured RSS against the
+    /// 96 KiB the cap advertises. Reporting the cap there put a quarter of a
+    /// session's estimate on memory that was not resident, and
+    /// [`wacore::stats::ResourceReport::total_estimated_bytes`] promises a lower
+    /// bound.
     fn resource_report(&self) -> Option<HttpResourceReport> {
+        if !self.requested.load(Ordering::Relaxed) {
+            return Some(EMPTY_POOL_REPORT);
+        }
         self.pool_report
     }
 }
@@ -499,11 +536,15 @@ mod tests {
         assert_eq!(body, payload);
     }
 
-    /// Workstream D: the default agent reports its idle-pool buffer estimate;
-    /// a custom agent (opaque config) reports nothing.
-    #[test]
-    fn resource_report_estimates_default_pool() {
-        let report = UreqHttpClient::new()
+    /// Workstream D: once it has connected, the default agent reports its
+    /// idle-pool buffer estimate; a custom agent (opaque config) reports nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_report_estimates_default_pool_after_a_request() {
+        let url = spawn_status_server(200, "OK");
+        let client = UreqHttpClient::new();
+        client.execute(get(url)).await.expect("request should run");
+
+        let report = client
             .resource_report()
             .expect("default agent reports a pool estimate");
         assert_eq!(report.pool_connections, Some(MAX_IDLE_CONNECTIONS));
@@ -515,19 +556,112 @@ mod tests {
         assert!(report.total_bytes() > 0);
 
         // A custom agent's buffer/pool config is opaque — don't guess.
+        let custom = UreqHttpClient::with_agent(build_agent());
+        custom
+            .execute(get(spawn_status_server(200, "OK")))
+            .await
+            .expect("request should run");
         assert!(
-            UreqHttpClient::with_agent(build_agent())
-                .resource_report()
-                .is_none(),
+            custom.resource_report().is_none(),
             "custom-agent client reports no estimate"
         );
 
         // with_max_body_bytes preserves the pool estimate.
-        assert!(
-            UreqHttpClient::new()
-                .with_max_body_bytes(1024)
+        let capped = UreqHttpClient::new().with_max_body_bytes(1024);
+        capped
+            .execute(get(spawn_status_server(200, "OK")))
+            .await
+            .expect("request should run");
+        assert!(capped.resource_report().is_some());
+    }
+
+    /// A client that has never connected holds no pool buffers, so it reports
+    /// the measured `Some(0)` rather than the cap. `Some(0)` and not `None`
+    /// because an empty pool is knowable here, unlike a component that cannot
+    /// introspect itself at all.
+    #[test]
+    fn resource_report_is_empty_before_the_first_request() {
+        for client in [
+            UreqHttpClient::new(),
+            UreqHttpClient::new().with_max_body_bytes(1024),
+            UreqHttpClient::with_agent(build_agent()),
+        ] {
+            let report = client
                 .resource_report()
-                .is_some()
+                .expect("an empty pool is a fact, not an absence");
+            assert_eq!(report.pool_connections, Some(0));
+            assert_eq!(report.pool_buffer_bytes, Some(0));
+            assert_eq!(report.total_bytes(), 0);
+        }
+    }
+
+    /// Cloning shares the agent and therefore the pool, so it has to share the
+    /// latch too. Otherwise the original keeps reporting an empty pool while a
+    /// clone fills it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clone_that_requests_marks_the_original() {
+        let client = UreqHttpClient::new();
+        let clone = client.clone();
+        clone
+            .execute(get(spawn_status_server(200, "OK")))
+            .await
+            .expect("request should run");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS),
+            "the original shares the clone's pool, so it must share its estimate"
+        );
+    }
+
+    /// A request that never reaches the wire must not move the report: an
+    /// unsupported method is rejected before any connection is attempted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_request_leaves_the_pool_reported_empty() {
+        let client = UreqHttpClient::new();
+        client
+            .execute(HttpRequest {
+                method: "PATCH".into(),
+                url: "http://127.0.0.1:0/never".into(),
+                headers: std::collections::HashMap::new(),
+                body: None,
+            })
+            .await
+            .expect_err("PATCH is not supported");
+        client
+            .execute_upload(
+                HttpRequest {
+                    method: "GET".into(),
+                    url: "http://127.0.0.1:0/never".into(),
+                    headers: std::collections::HashMap::new(),
+                    body: None,
+                },
+                Box::new(std::io::Cursor::new(vec![1u8])),
+                1,
+            )
+            .expect_err("upload streaming is POST-only");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing connected, so nothing is pooled"
+        );
+    }
+
+    /// A transport failure still attempts a connection, so the estimate must
+    /// switch on: what the pool holds after a failed connect is ureq's business,
+    /// not something this client can rule out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_request_still_switches_the_estimate_on() {
+        let client = UreqHttpClient::new();
+        client
+            .execute(get("http://127.0.0.1:1/nothing-listens".into()))
+            .await
+            .expect_err("nothing is listening on port 1");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS)
         );
     }
 
