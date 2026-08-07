@@ -5090,11 +5090,7 @@ async fn test_undecryptable_deduped_across_resends() {
 }
 
 /// Buffers what `message::receive` announced, so a test can assert that a
-/// branch's log describes what the branch actually did. `log`'s global logger
-/// is install-once per process: `cargo nextest` (what CI runs) gives every test
-/// its own process and the install always wins, while a threaded
-/// `cargo test --lib` run can find the slot already taken by a sibling test's
-/// `env_logger`. Callers keep their event assertions either way.
+/// branch's log describes what the branch actually did.
 #[derive(Default)]
 struct ReceiveLogCapture {
     records: std::sync::Mutex<Vec<(log::Level, String)>>,
@@ -5133,6 +5129,40 @@ fn receive_log_capture_installed() -> bool {
     })
 }
 
+/// Hands a test's log assertions to a fresh process when this one's `log` slot
+/// is already owned by a sibling test's `env_logger`. `log`'s global logger is
+/// install-once, so a threaded `cargo test --lib` run cannot be relied on to
+/// leave it free, and skipping the assertions there would let a regression in
+/// the very behaviour under test go unseen. `cargo nextest` gives every test
+/// its own process, so this never fires under CI.
+///
+/// `true` means the caller should return immediately: the child already ran the
+/// real assertions and its failure, if any, has been propagated.
+fn log_assertions_delegated_to_child(test_name: &str) -> bool {
+    const CHILD_MARKER: &str = "WA_RUST_OWNS_LOG_CAPTURE";
+
+    if receive_log_capture_installed() {
+        return false;
+    }
+    assert!(
+        std::env::var_os(CHILD_MARKER).is_none(),
+        "{test_name}: a single-test child must own the log capture, and did not",
+    );
+    let output =
+        std::process::Command::new(std::env::current_exe().expect("running test binary path"))
+            .args([test_name, "--exact", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("re-running the test in its own process");
+    assert!(
+        output.status.success(),
+        "{test_name} failed in its own process:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}
+
 /// The captured `message::receive` records that name `msg_id`.
 fn receive_logs_for(msg_id: &str) -> Vec<(log::Level, String)> {
     RECEIVE_LOG_CAPTURE
@@ -5158,7 +5188,11 @@ const DISPATCH_ANNOUNCEMENT: &str = "Dispatching UndecryptableMessage event.";
 async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
 
-    let capturing = receive_log_capture_installed();
+    if log_assertions_delegated_to_child(
+        "message::tests::undecryptable_receive_branch_stays_silent_when_batch_dispatched",
+    ) {
+        return;
+    }
     let client = create_test_client_for_retry_with_id("undec_log_batch").await;
     let recorder = Arc::new(EventRecorder::default());
     client.subscribe_handler(recorder.clone()).detach();
@@ -5221,17 +5255,15 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
         "the batch's dispatch must still be the one UndecryptableMessage for this id",
     );
 
-    if capturing {
-        let logs = receive_logs_for(msg_id);
-        assert!(
-            !logs.is_empty(),
-            "the decrypt failure must leave a receive-side record for this id",
-        );
-        assert!(
-            !logs.iter().any(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT)),
-            "nothing dispatches here, so nothing may announce a dispatch: {logs:?}",
-        );
-    }
+    let logs = receive_logs_for(msg_id);
+    assert!(
+        !logs.is_empty(),
+        "the decrypt failure must leave a receive-side record for this id",
+    );
+    assert!(
+        !logs.iter().any(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT)),
+        "nothing dispatches here, so nothing may announce a dispatch: {logs:?}",
+    );
 
     crate::test_utils::wait_for_outbound_tasks(&client).await;
 }
@@ -5242,7 +5274,11 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
 /// fires once, and keeps taking its level from `decrypt_fail_mode`.
 #[tokio::test]
 async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
-    let capturing = receive_log_capture_installed();
+    if log_assertions_delegated_to_child(
+        "message::tests::undecryptable_receive_branch_announces_the_dispatch_it_performs",
+    ) {
+        return;
+    }
     let client = create_test_client_for_retry_with_id("undec_log_branch").await;
     let recorder = Arc::new(EventRecorder::default());
     client.subscribe_handler(recorder.clone()).detach();
@@ -5293,22 +5329,20 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
         "the branch must dispatch exactly one UndecryptableMessage",
     );
 
-    if capturing {
-        let announcements: Vec<_> = receive_logs_for(msg_id)
-            .into_iter()
-            .filter(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT))
-            .collect();
-        assert_eq!(
-            announcements.len(),
-            1,
-            "the performed dispatch must be announced exactly once: {announcements:?}",
-        );
-        assert_eq!(
-            announcements[0].0,
-            decrypt_fail_log_level(DecryptFailMode::Show),
-            "the announcement keeps taking its level from decrypt_fail_mode",
-        );
-    }
+    let announcements: Vec<_> = receive_logs_for(msg_id)
+        .into_iter()
+        .filter(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT))
+        .collect();
+    assert_eq!(
+        announcements.len(),
+        1,
+        "the performed dispatch must be announced exactly once: {announcements:?}",
+    );
+    assert_eq!(
+        announcements[0].0,
+        decrypt_fail_log_level(DecryptFailMode::Show),
+        "the announcement keeps taking its level from decrypt_fail_mode",
+    );
 
     crate::test_utils::wait_for_outbound_tasks(&client).await;
 }
