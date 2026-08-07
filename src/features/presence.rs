@@ -155,6 +155,15 @@ impl<'a> Presence<'a> {
         }
 
         let node = self.build_subscription_node(jid).await;
+        // Re-read after the token lookup, which awaits. An `unsubscribe` landing
+        // in that window has already sent its own stanza, so subscribing now
+        // would leave the peer subscribed while we no longer track it. This
+        // narrows the window rather than closing it — `send_node` awaits too —
+        // but the lookup is the wide half and the re-read costs an uncontended
+        // lock.
+        if !self.client.is_presence_subscription_tracked(jid) {
+            return Ok(());
+        }
         self.client.send_node(node).await?;
         Ok(())
     }
@@ -536,8 +545,8 @@ mod tests {
         );
         *client.noise_socket.lock().unwrap() = Some(Arc::new(gated));
 
-        let first: Jid = "15550001111@s.whatsapp.net".parse().expect("valid jid");
-        let second: Jid = "15550002222@s.whatsapp.net".parse().expect("valid jid");
+        let first: Jid = "12025550111@s.whatsapp.net".parse().expect("valid jid");
+        let second: Jid = "12025550122@s.whatsapp.net".parse().expect("valid jid");
         client.track_presence_subscription(first.clone());
         client.track_presence_subscription(second.clone());
 
