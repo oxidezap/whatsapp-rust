@@ -946,13 +946,6 @@ pub enum Event {
     /// Newsletter live update (reaction counts changed, message updates, etc.).
     NewsletterLiveUpdate(NewsletterLiveUpdate),
 
-    /// One decrypted `<enc>` payload, emitted before it is decoded.
-    ///
-    /// Library extension — no WA Web equivalent. Gated by
-    /// `Client::acquire_decrypted_payload_forwarding()` so nothing is cloned
-    /// while unused.
-    DecryptedPayload(DecryptedPayload),
-
     /// Raw decoded stanza, emitted before router dispatch.
     /// Library extension — no WA Web equivalent (WA Web has no raw stanza observer).
     /// Gated by `Client::acquire_raw_node_forwarding()` to avoid overhead when unused.
@@ -989,6 +982,16 @@ pub enum Event {
     /// beside its relatives would renumber every variant after it and change how
     /// already-stored events decode.
     AppStateSyncFailed(AppStateSyncFailed),
+
+    /// One decrypted `<enc>` payload, emitted before it is decoded.
+    ///
+    /// Library extension — no WA Web equivalent. Gated by
+    /// `Client::acquire_decrypted_payload_forwarding()` so nothing is cloned
+    /// while unused.
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    DecryptedPayload(DecryptedPayload),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1672,6 +1675,11 @@ pub struct DecryptedPayload {
     /// The plaintext, unpadded, exactly as decoding will receive it.
     ///
     /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
+    ///
+    /// **Not serialized.** `Serialize` on an event is for diagnostics, and no
+    /// text format carries raw bytes without an encoding choice this type has
+    /// no business making. A consumer recording payloads has the `Bytes` in
+    /// hand and can frame them however its sink expects.
     #[serde(skip)]
     pub payload: Bytes,
 }

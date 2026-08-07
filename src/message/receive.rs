@@ -250,7 +250,7 @@ impl Client {
         // per enc node. `None` (the common zero-handler bot) skips the lookup.
         let custom_enc_handlers = self.custom_enc_handlers.get();
 
-        for enc_node in &all_enc_nodes {
+        for (enc_index, enc_node) in all_enc_nodes.iter().enumerate() {
             max_sender_retry_count = max_sender_retry_count.max(sender_retry_count(enc_node));
 
             // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
@@ -307,7 +307,7 @@ impl Client {
                 continue;
             }
 
-            let payload = match EncPayload::from_owned_node(node, enc_node) {
+            let payload = match EncPayload::from_owned_node(node, enc_node, enc_index) {
                 Some(p) => p,
                 None => {
                     log::warn!("Enc node {enc_type} has no content");
@@ -648,11 +648,12 @@ impl Client {
         // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
         let mut local_identity_reacted = false;
 
-        for (enc_index, payload) in payloads.into_iter().enumerate() {
+        for payload in payloads {
             let EncPayload {
                 ciphertext,
                 enc_type,
                 padding_version,
+                enc_index,
             } = payload;
             let enc_type_str = enc_type.as_wire_str();
             #[cfg(feature = "tracing")]
@@ -1255,9 +1256,10 @@ impl Client {
             .sender_key_lock(&sender_key_name)
             .await;
 
-        for (enc_index, payload) in payloads.iter().enumerate() {
+        for payload in payloads {
             let ciphertext = &payload.ciphertext[..];
             let padding_version = payload.padding_version;
+            let enc_index = payload.enc_index;
 
             log::debug!(
                 "Looking up sender key for group {} with sender address {} (from sender JID: {})",
@@ -1798,6 +1800,7 @@ mod enc_bucket_tests {
 
     fn payload(enc_type: EncType) -> EncPayload {
         EncPayload {
+            enc_index: 0,
             ciphertext: bytes::Bytes::from_static(b"ct"),
             enc_type,
             padding_version: 2,

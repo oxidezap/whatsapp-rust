@@ -236,7 +236,9 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
-    pub use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientError, RawNodeLease};
+    pub use crate::client::{
+        Client, ClientBuilder, ClientBuilderError, ClientError, DecryptedPayloadLease, RawNodeLease,
+    };
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};

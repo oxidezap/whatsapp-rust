@@ -335,7 +335,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
         .bytes(signal_message.serialized().to_vec())
         .build();
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     let outcome = client
         .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
@@ -402,8 +402,8 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
     let enc1_ref = enc1.as_node_ref();
     let enc2_ref = enc2.as_node_ref();
     let payloads: Vec<EncPayload> = vec![
-        EncPayload::from_node_ref(&enc1_ref).unwrap(),
-        EncPayload::from_node_ref(&enc2_ref).unwrap(),
+        EncPayload::from_node_ref(&enc1_ref, 0).unwrap(),
+        EncPayload::from_node_ref(&enc2_ref, 1).unwrap(),
     ];
 
     let outcome = client
@@ -489,7 +489,7 @@ async fn test_empty_session_record_treated_as_session_not_found() {
         .bytes(signal_message.serialized().to_vec())
         .build();
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     let outcome = client
         .clone()
@@ -835,7 +835,7 @@ async fn submit_and_check_session(
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         source: crate::types::message::MessageSource {
             sender: peer_jid.clone(),
@@ -1100,7 +1100,7 @@ async fn test_badmac_preserves_session() {
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         id: "BADMAC_TAMPER_MSG".to_string(),
         source: crate::types::message::MessageSource {
@@ -1260,7 +1260,7 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         id: "PROD_LOOP_REPRO_STALE".to_string(),
         source: crate::types::message::MessageSource {
@@ -2231,7 +2231,7 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
         .build();
 
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     // Call process_session_enc_batch
     // This should handle any errors gracefully without panicking
@@ -2314,7 +2314,8 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
 
     let payloads: Vec<EncPayload> = enc_nodes
         .iter()
-        .filter_map(|n| EncPayload::from_node_ref(&n.as_node_ref()))
+        .enumerate()
+        .filter_map(|(enc_index, n)| EncPayload::from_node_ref(&n.as_node_ref(), enc_index))
         .collect();
 
     // Process the batch
@@ -2385,7 +2386,7 @@ async fn test_untrusted_identity_in_group_context() {
         .build();
 
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     // Process the message
     // Should handle errors gracefully in group context
@@ -6853,6 +6854,7 @@ async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
 
     // 1-byte ciphertext is a guaranteed parse failure.
     let bad_payload = EncPayload {
+        enc_index: 0,
         ciphertext: bytes::Bytes::from_static(&[0xFF]),
         enc_type: EncType::PreKeyMessage,
         padding_version: 2,
@@ -6896,6 +6898,7 @@ async fn signal_message_parse_error_dispatches_parsing_error_nack() {
     let sender_jid: Jid = info.source.sender.clone();
 
     let bad_payload = EncPayload {
+        enc_index: 0,
         ciphertext: bytes::Bytes::from_static(&[0xFF]),
         enc_type: EncType::Message,
         padding_version: 2,
@@ -7566,7 +7569,7 @@ async fn process_session_ct(
         .bytes(bytes)
         .build();
     let enc_ref = enc.as_node_ref();
-    let payload = EncPayload::from_node_ref(&enc_ref).unwrap();
+    let payload = EncPayload::from_node_ref(&enc_ref, 0).unwrap();
     let info = Arc::new(MessageInfo {
         id: id.to_string(),
         source: crate::types::message::MessageSource {
@@ -7603,7 +7606,7 @@ fn enc_payload_from_ciphertext(ct: &CiphertextMessage) -> EncPayload {
         .attr("type", enc_type)
         .bytes(bytes)
         .build();
-    EncPayload::from_node_ref(&enc.as_node_ref()).expect("ciphertext payload")
+    EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("ciphertext payload")
 }
 
 fn skmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
@@ -7611,7 +7614,7 @@ fn skmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
         .attr("type", "skmsg")
         .bytes(bytes)
         .build();
-    EncPayload::from_node_ref(&enc.as_node_ref()).expect("skmsg payload")
+    EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("skmsg payload")
 }
 
 fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
@@ -7619,7 +7622,7 @@ fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
         .attr("type", "msmsg")
         .bytes(bytes)
         .build();
-    EncPayload::from_node_ref(&enc.as_node_ref()).expect("msmsg payload")
+    EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("msmsg payload")
 }
 
 fn group_message_info(id: &str, group: &Jid, sender: &Jid, is_from_me: bool) -> Arc<MessageInfo> {
@@ -8810,6 +8813,56 @@ async fn unavailable_message_is_transport_acked() {
     }
     let (to, _) = found.expect("unavailable message must get a transport ack");
     assert_eq!(to, "5511777776666@s.whatsapp.net");
+}
+
+#[tokio::test]
+async fn enc_index_is_the_position_in_the_stanza_not_in_its_bucket() {
+    // The common group shape: a pkmsg carrying the sender key, then the skmsg
+    // it unlocks. They land in different buckets, so anything that counted
+    // within a bucket would call both of them enc 0 — and a consumer
+    // correlating a forwarded payload back to its `<enc>` would attribute the
+    // wrong ciphertext. An enc that yields no payload at all still consumes its
+    // position, because the stanza's own numbering does not skip it.
+    let (client, _transport) = capturing_client("enc_index_buckets").await;
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@g.us")
+        .attr("participant", "5511999998888@s.whatsapp.net")
+        .attr("id", "MULTIENC1")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("enc")
+                .attr("type", "pkmsg")
+                .bytes(vec![1u8; 8])
+                .build(),
+            // Produces no payload, and still occupies slot 1.
+            NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![2u8; 8])
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .bytes(vec![3u8; 8])
+                .build(),
+        ])
+        .build();
+    let owned = node_to_arc(node);
+    let classified = client
+        .classify_incoming_message(&owned)
+        .await
+        .expect("a usable payload in each bucket");
+
+    let session: Vec<_> = classified
+        .session_payloads
+        .iter()
+        .map(|payload| payload.enc_index)
+        .collect();
+    let group: Vec<_> = classified
+        .group_payloads
+        .iter()
+        .map(|payload| payload.enc_index)
+        .collect();
+    assert_eq!(session, [0], "the pkmsg is the stanza's first enc");
+    assert_eq!(group, [2], "the skmsg is its third, not its first");
 }
 
 /// Unknown-only stanzas (e.g. msmsg) must be acked or they loop the queue.
@@ -12381,7 +12434,7 @@ async fn bench_feed(
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         source: crate::types::message::MessageSource {
             sender: peer.clone(),
@@ -12583,7 +12636,7 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         id: "INVALID_SPK_ID_MSG".to_string(),
         source: crate::types::message::MessageSource {

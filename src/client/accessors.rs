@@ -63,8 +63,9 @@ impl Client {
 
     /// Acquire decrypted-payload forwarding for one consumer.
     ///
-    /// [`Event::DecryptedPayload`] remains enabled until every acquired lease
-    /// is dropped. Until then nothing is emitted and nothing is cloned.
+    /// [`Event::DecryptedPayload`] stays enabled until every acquired lease is
+    /// dropped. While none is held nothing is emitted and nothing is cloned:
+    /// the path costs one relaxed atomic load.
     ///
     /// [`Event::DecryptedPayload`]: wacore::types::events::Event::DecryptedPayload
     pub fn acquire_decrypted_payload_forwarding(self: &Arc<Self>) -> DecryptedPayloadLease {
