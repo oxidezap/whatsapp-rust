@@ -4800,29 +4800,35 @@ async fn reconnect_cleanup_leaves_the_write_once_cells_installed() {
 async fn concurrent_first_readers_agree_on_one_instance() {
     let client = crate::test_utils::create_test_client().await;
 
-    // Without the barrier the first task can finish initializing before the
-    // last one is even spawned, which is the one interleaving this must not measure.
+    // OS threads and a blocking barrier, not tasks on a worker pool: the
+    // getters are synchronous now, so every reader can be inside `get_or_init`
+    // at once instead of at most `worker_threads` of them, and none can be
+    // spawned late enough to find the cell already warm.
     const READERS: usize = 16;
-    let start = Arc::new(tokio::sync::Barrier::new(READERS));
-
-    let readers: Vec<_> = (0..READERS)
-        .map(|_| {
-            let client = client.clone();
-            let start = start.clone();
-            tokio::spawn(async move {
-                start.wait().await;
-                (
-                    client.get_group_cache().clone(),
-                    client.get_app_state_processor().clone(),
-                )
-            })
+    let results = tokio::task::spawn_blocking(move || {
+        let start = std::sync::Barrier::new(READERS);
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..READERS)
+                .map(|_| {
+                    let client = &client;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        (
+                            client.get_group_cache().clone(),
+                            client.get_app_state_processor().clone(),
+                        )
+                    })
+                })
+                .collect();
+            readers
+                .into_iter()
+                .map(|reader| reader.join().expect("reader thread should not panic"))
+                .collect::<Vec<_>>()
         })
-        .collect();
-
-    let mut results = Vec::with_capacity(readers.len());
-    for reader in readers {
-        results.push(reader.await.expect("reader task should not panic"));
-    }
+    })
+    .await
+    .expect("blocking scope should not panic");
 
     let (first_cache, first_processor) = &results[0];
     for (cache, processor) in &results {
