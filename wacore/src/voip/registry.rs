@@ -444,7 +444,10 @@ impl CallRegistry {
     /// operation a caller needs after a failure -- and it would not undo whatever the panic left
     /// behind. Recovery is sound because the damage an unwind can do is bounded to the one call it
     /// was already failing: the map has no cross-entry invariant, entries are only ever removed
-    /// whole, and every mutation is a whole-field assignment, so nothing is left half-written.
+    /// whole, and no individual field is ever left torn. A multi-field update can still stop
+    /// partway -- `set_video_channels` writes three fields, and a superseded value panicking in
+    /// `Drop` between them leaves that call's own update incomplete -- but every entry stays
+    /// individually well-formed, and reachable, which poisoning would not have preserved.
     fn active_calls(&self) -> std::sync::MutexGuard<'_, HashMap<String, CallEntry>> {
         self.inner
             .lock()
@@ -5072,14 +5075,14 @@ mod tests {
             body();
             let _ = done_tx.send(());
         });
-        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
-        if outcome == Err(RecvTimeoutError::Timeout) {
+        if done_rx.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Timeout) {
             panic!("{name} deadlocked: the abort ran while the registry lock was held");
         }
+        // Either the body signalled or it unwound and dropped the sender; joining covers both and
+        // re-raises the payload so a failed assertion inside the body is what the suite reports.
         if let Err(payload) = worker.join() {
             std::panic::resume_unwind(payload);
         }
-        assert!(outcome.is_ok(), "{name} ended without signalling");
     }
 
     #[test]
