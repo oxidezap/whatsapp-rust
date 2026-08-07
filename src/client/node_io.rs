@@ -508,6 +508,17 @@ impl Client {
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
 
+        // An interceptor runs before the built-in pipeline so a consumer can
+        // act on a stanza this version does not model, instead of watching it
+        // get nacked. The ack still goes out below: the server is owed one
+        // either way, and withholding it would leave the stanza queued.
+        if self.has_stanza_interceptors() && self.intercept_stanza(&node) {
+            if let Some(node) = deferred_ack_node {
+                self.maybe_deferred_ack(node).await;
+            }
+            return;
+        }
+
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
         match nr.tag.as_ref() {
@@ -554,6 +565,25 @@ impl Client {
         if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }
+    }
+
+    /// Offer a stanza to the registered interceptors.
+    ///
+    /// Returns whether one took it. The first to claim the stanza wins, so an
+    /// interceptor registered earlier can shadow a later one — registration
+    /// order is the priority order.
+    fn intercept_stanza(self: &Arc<Self>, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+        for interceptor in self.stanza_interceptors() {
+            if interceptor.intercept(node).is_handled() {
+                debug!(
+                    target: "Client/Recv",
+                    "Stanza <{}> taken by an interceptor",
+                    node.tag()
+                );
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether a decrypted node must stay on the read loop instead of moving to

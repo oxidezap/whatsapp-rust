@@ -506,6 +506,9 @@ impl Client {
             saver_handle: std::sync::OnceLock::new(),
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicUsize::new(0),
+            stanza_interceptors: std::sync::Mutex::new(Vec::new()),
+            stanza_interceptor_count: AtomicUsize::new(0),
+            next_interceptor_id: AtomicU64::new(0),
             #[cfg(feature = "voip-runtime")]
             call_registry: Arc::new(wacore::voip::CallRegistry::new()),
             #[cfg(feature = "voip-runtime")]

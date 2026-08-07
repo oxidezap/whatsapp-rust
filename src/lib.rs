@@ -120,6 +120,7 @@ pub(crate) mod flush_scope;
 /// types embed it.
 pub use client::ClientError;
 pub use client::NodeFilter;
+pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
     AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
     StatsSnapshot, StorageResourceReport, TransportResourceReport,

@@ -8,6 +8,7 @@ mod device_registry;
 pub(crate) mod device_topology;
 #[cfg(feature = "client-lifecycle")]
 mod extension_lifecycle;
+pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -1412,6 +1413,12 @@ pub struct Client {
 
     /// Number of consumers currently requesting `Event::RawNode` forwarding.
     raw_node_forwarding: AtomicUsize,
+
+    /// Stanza interceptors, and their count kept alongside so the read loop can
+    /// skip the lock entirely while none are registered.
+    stanza_interceptors: std::sync::Mutex<Vec<interceptor::Registration>>,
+    stanza_interceptor_count: AtomicUsize,
+    next_interceptor_id: AtomicU64,
 
     /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
     /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the

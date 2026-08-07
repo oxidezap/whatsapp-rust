@@ -1,6 +1,7 @@
 //! Small accessors, config setters, node waiters and sync-error helpers.
 
 use super::*;
+use crate::client::interceptor::{InterceptorHandle, Registration, StanzaInterceptor};
 
 /// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
 /// otherwise be a silent, unchecked bug at call sites.
@@ -58,6 +59,68 @@ impl Client {
 
     pub(crate) fn raw_node_forwarding_enabled(&self) -> bool {
         self.raw_node_forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Register an interceptor that sees each decoded stanza before the
+    /// built-in pipeline, and may take it.
+    ///
+    /// Interceptors run in registration order; the first to return
+    /// [`Interception::Handled`] wins and the rest are skipped.
+    ///
+    /// See [`crate::client::interceptor`] for what this is for and what it
+    /// costs.
+    ///
+    /// [`Interception::Handled`]: crate::client::interceptor::Interception::Handled
+    pub fn add_stanza_interceptor(
+        self: &Arc<Self>,
+        interceptor: Arc<dyn StanzaInterceptor>,
+    ) -> InterceptorHandle {
+        let id = self.next_interceptor_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut registered = self.stanza_interceptors_guard();
+            registered.push(Registration { id, interceptor });
+            // Stored while holding the lock so a reader never sees a count that
+            // promises more than the vector holds.
+            self.stanza_interceptor_count
+                .store(registered.len(), Ordering::Release);
+        }
+        InterceptorHandle {
+            client: Arc::downgrade(self),
+            id,
+        }
+    }
+
+    pub(crate) fn remove_stanza_interceptor(&self, id: u64) {
+        let mut registered = self.stanza_interceptors_guard();
+        registered.retain(|entry| entry.id != id);
+        self.stanza_interceptor_count
+            .store(registered.len(), Ordering::Release);
+    }
+
+    /// Whether any interceptor is registered.
+    ///
+    /// One relaxed load, so the read loop pays nothing while none are.
+    pub(crate) fn has_stanza_interceptors(&self) -> bool {
+        self.stanza_interceptor_count.load(Ordering::Acquire) != 0
+    }
+
+    /// The registered interceptors, cloned out so none is called while the lock
+    /// is held — an interceptor that registered another would otherwise
+    /// deadlock.
+    pub(crate) fn stanza_interceptors(&self) -> Vec<Arc<dyn StanzaInterceptor>> {
+        self.stanza_interceptors_guard()
+            .iter()
+            .map(|entry| Arc::clone(&entry.interceptor))
+            .collect()
+    }
+
+    /// A poisoned interceptor list means one panicked while registering. The
+    /// list itself is still consistent, so recovering beats refusing every
+    /// stanza after it.
+    fn stanza_interceptors_guard(&self) -> std::sync::MutexGuard<'_, Vec<Registration>> {
+        self.stanza_interceptors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.

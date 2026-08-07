@@ -226,13 +226,13 @@ async fn test_ack_without_matching_waiter() {
 /// Round-trip a built `Node` into the raw-bytes shape `unpack()` produces
 /// from the network (marshal_ref prepends a 0x00 format byte that
 /// `OwnedNodeRef::new` does not expect).
-fn to_owned_node(node: &Node) -> wacore_binary::OwnedNodeRef {
+fn to_owned_node(node: &Node) -> OwnedNodeRef {
     wacore_binary::marshal::marshal_ref(&node.as_node_ref())
-        .and_then(|buf| wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
+        .and_then(|buf| OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
         .expect("valid node")
 }
 
-fn owned_ack_node(id: &str) -> wacore_binary::OwnedNodeRef {
+fn owned_ack_node(id: &str) -> OwnedNodeRef {
     to_owned_node(
         &NodeBuilder::new("ack")
             .attr("id", id)
@@ -1446,7 +1446,7 @@ fn test_unified_session_protocol_node() {
     info!("✅ test_unified_session_protocol_node passed");
 }
 
-fn node_to_owned_ref(node: Node) -> Arc<wacore_binary::OwnedNodeRef> {
+fn node_to_owned_ref(node: Node) -> Arc<OwnedNodeRef> {
     crate::test_utils::node_to_owned_ref(&node)
 }
 
@@ -4906,4 +4906,265 @@ async fn chatstate_dispatch_reaches_every_registered_handler() {
         1,
         "the event is built once and cloned per handler"
     );
+}
+
+// --- stanza interceptors ---------------------------------------------------
+
+use crate::client::interceptor::{Interception, StanzaInterceptor};
+use wacore_binary::OwnedNodeRef;
+
+/// Builds a client with no transport, which is enough: interception happens
+/// before anything is sent.
+async fn create_interceptor_test_client() -> Arc<Client> {
+    create_offline_sync_test_client().await
+}
+
+/// Records which stanzas it saw and claims the ones whose tag matches.
+struct Recorder {
+    claim: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl StanzaInterceptor for Recorder {
+    fn intercept(&self, node: &OwnedNodeRef) -> Interception {
+        self.seen
+            .lock()
+            .expect("recorder lock")
+            .push(node.tag().to_string());
+        if node.tag() == self.claim {
+            Interception::Handled
+        } else {
+            Interception::Pass
+        }
+    }
+}
+
+fn recorder(claim: &'static str) -> (Arc<Recorder>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    (
+        Arc::new(Recorder {
+            claim,
+            seen: Arc::clone(&seen),
+        }),
+        seen,
+    )
+}
+
+#[tokio::test]
+async fn interceptors_cost_nothing_until_one_is_registered() {
+    let client = create_interceptor_test_client().await;
+    assert!(!client.has_stanza_interceptors());
+
+    let (interceptor, _seen) = recorder("nothing");
+    let handle = client.add_stanza_interceptor(interceptor);
+    assert!(client.has_stanza_interceptors());
+
+    drop(handle);
+    assert!(
+        !client.has_stanza_interceptors(),
+        "dropping the handle unregisters it"
+    );
+}
+
+#[tokio::test]
+async fn an_interceptor_sees_every_decoded_stanza() {
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("nothing-matches");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    for tag in ["ib", "receipt", "notification"] {
+        client
+            .process_node(node_to_owned_ref(NodeBuilder::new(tag).build()))
+            .await;
+    }
+
+    assert_eq!(
+        *seen.lock().expect("recorder lock"),
+        ["ib", "receipt", "notification"]
+    );
+}
+
+/// A `<receipt>` the client dispatches, and the event that proves it did.
+fn receipt_stanza() -> Node {
+    NodeBuilder::new("receipt")
+        .attr("from", "5511999998888@s.whatsapp.net")
+        .attr("id", "RCPT-INTERCEPT")
+        .build()
+}
+
+#[tokio::test]
+async fn passing_leaves_the_stanza_to_the_client() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_interceptor_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let (interceptor, seen) = recorder("nothing-matches");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(receipt_stanza()))
+        .await;
+
+    assert_eq!(seen.lock().expect("recorder lock").len(), 1, "it ran");
+    assert!(
+        events.try_recv().is_ok(),
+        "and the built-in handler dispatched its event"
+    );
+}
+
+#[tokio::test]
+async fn claiming_a_stanza_skips_the_built_in_pipeline() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_interceptor_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let (interceptor, seen) = recorder("receipt");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(receipt_stanza()))
+        .await;
+
+    assert_eq!(seen.lock().expect("recorder lock").len(), 1);
+    assert!(
+        events.try_recv().is_err(),
+        "the built-in receipt handler must not have dispatched"
+    );
+}
+
+#[tokio::test]
+async fn interception_does_not_touch_connection_bookkeeping() {
+    // Offline-sync tracking runs before dispatch, and must keep running: it is
+    // what tells the client the drain finished. An interceptor exists to take
+    // over *handling* a stanza, not to opt out of staying connected.
+    let client = create_interceptor_test_client().await;
+    client
+        .offline_sync_metrics
+        .active
+        .store(true, Ordering::Release);
+
+    let (interceptor, seen) = recorder("ib");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    let node = NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline").attr("count", "0").build()])
+        .build();
+    client.process_node(node_to_owned_ref(node)).await;
+
+    assert_eq!(seen.lock().expect("recorder lock").len(), 1, "it ran");
+    assert!(
+        !client.offline_sync_metrics.active.load(Ordering::Acquire),
+        "offline-sync tracking still ran, claimed or not"
+    );
+}
+
+#[tokio::test]
+async fn the_first_interceptor_to_claim_a_stanza_wins() {
+    let client = create_interceptor_test_client().await;
+    let (first, first_seen) = recorder("receipt");
+    let (second, second_seen) = recorder("receipt");
+
+    let _a = client.add_stanza_interceptor(first);
+    let _b = client.add_stanza_interceptor(second);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+
+    assert_eq!(first_seen.lock().expect("lock").len(), 1);
+    assert!(
+        second_seen.lock().expect("lock").is_empty(),
+        "registration order is priority order"
+    );
+}
+
+#[tokio::test]
+async fn a_passing_interceptor_does_not_stop_the_next_one() {
+    let client = create_interceptor_test_client().await;
+    let (first, first_seen) = recorder("nothing");
+    let (second, second_seen) = recorder("receipt");
+
+    let _a = client.add_stanza_interceptor(first);
+    let _b = client.add_stanza_interceptor(second);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+
+    assert_eq!(first_seen.lock().expect("lock").len(), 1);
+    assert_eq!(second_seen.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn an_unregistered_interceptor_stops_seeing_stanzas() {
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("nothing");
+    let handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+
+    drop(handle);
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        1,
+        "no further stanzas after unregistering"
+    );
+}
+
+#[tokio::test]
+async fn a_claimed_unknown_stanza_is_not_nacked() {
+    // The reason this exists. A tag the client does not model is nacked, which
+    // tells the server this client cannot act on it. An interceptor that *can*
+    // act on it should be able to say so.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("vendor:thing");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    let node = NodeBuilder::new("vendor:thing")
+        .attr("id", "V-1")
+        .attr("from", "s.whatsapp.net")
+        .build();
+    client.process_node(node_to_owned_ref(node)).await;
+
+    assert_eq!(seen.lock().expect("lock").len(), 1, "the interceptor ran");
+    // Reaching here without the unknown-stanza path having run is the
+    // assertion: `nack_unrecognized_stanza` is only called from the fallback
+    // arm this interception skipped.
+}
+
+#[tokio::test]
+async fn a_closure_can_be_an_interceptor() {
+    let client = create_interceptor_test_client().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+
+    let _handle = client.add_stanza_interceptor(Arc::new(move |_node: &OwnedNodeRef| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Interception::Pass
+    }));
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_handle_outliving_its_client_does_not_keep_it_alive() {
+    // The handle holds a weak reference, so a forgotten one cannot pin a
+    // client — and dropping it afterwards must not panic either.
+    let handle = {
+        let client = create_interceptor_test_client().await;
+        let (interceptor, _seen) = recorder("nothing");
+        client.add_stanza_interceptor(interceptor)
+    };
+    drop(handle);
 }
