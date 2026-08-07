@@ -127,6 +127,12 @@ pub struct SqliteStore {
     /// once and deadlock on the write-lock upgrade — the exact failure this
     /// change exists to avoid.
     pub(crate) reads: Option<ReadPool>,
+    /// Whether a deferred read transaction is safe here: WAL, and not shared
+    /// cache. It is the same condition that decides [`Self::reads`], and it has
+    /// to gate the wider-write-pool snapshot too — under shared cache a read
+    /// transaction holds table locks that fail the writer with
+    /// `SQLITE_LOCKED_SHAREDCACHE`, which `busy_timeout` cannot absorb.
+    pub(crate) snapshot_safe: bool,
     pub(crate) database_path: String,
     device_id: i32,
 }
@@ -590,6 +596,7 @@ impl SqliteStore {
             pool,
             db_semaphore: Arc::new(tokio::sync::Semaphore::new(pool_size as usize)),
             reads,
+            snapshot_safe: declined.is_none(),
             database_path,
             device_id,
         })
@@ -631,7 +638,11 @@ impl SqliteStore {
         // one pooled connection is itself the snapshot: no writer can be on it,
         // including the several that skip the permit and check one out directly.
         // A transaction would only add statements to every read.
-        if self.reads.is_none() && self.pool.max_size() <= 1 {
+        // The snapshot is only worth opening where it is safe: at
+        // `pool_size = 1` the exclusive connection already gives it, and under
+        // shared cache or without WAL a read transaction would lock out the
+        // writer instead.
+        if self.reads.is_none() && (self.pool.max_size() <= 1 || !self.snapshot_safe) {
             let pool = self.pool.clone();
             return self
                 .with_semaphore(move || {
@@ -2703,8 +2714,15 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn get_all_lid_mappings(&self) -> Result<Vec<LidPnMappingEntry>> {
+        // On the write queue: the startup warm-up feeds these rows into
+        // `LidPnCache::add_guarded`, whose LID side replaces unconditionally, so
+        // a stale row read during a live learn reverts reverse resolution.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Vec<LidPnMappingEntry>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let rows: Vec<(String, String, i64, String, i64)> = lid_pn_mapping::table
                 .select((
                     lid_pn_mapping::lid,
@@ -2714,7 +2732,7 @@ impl ProtocolStore for SqliteStore {
                     lid_pn_mapping::updated_at,
                 ))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
-                .load(conn)
+                .load(&mut conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(rows
                 .into_iter()
@@ -6106,6 +6124,48 @@ mod read_routing_tests {
         );
     }
 
+    /// A shared-cache store declines reader connections because a read
+    /// transaction there holds table locks the writer cannot wait out. The
+    /// wider-write-pool snapshot has to decline for the same reason instead of
+    /// reintroducing exactly that transaction.
+    #[tokio::test]
+    async fn a_shared_cache_store_gets_no_snapshot_even_with_a_wider_write_pool() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let url = format!(
+            "file:memdb_snapshot_gate_{}_{id}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let store = SqliteStore::with_config(
+            &url,
+            SqliteStoreConfig {
+                pool_size: 2,
+                read_pool_size: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("store opens");
+
+        assert!(store.reads.is_none(), "shared cache declines reader pool");
+        assert!(
+            !store.snapshot_safe,
+            "and must decline the deferred read transaction with it"
+        );
+
+        // Still fully operational on the plain path.
+        store.create_new_device().await.expect("device row");
+        store.put_session(ADDR, b"blob").await.unwrap();
+        assert!(
+            store
+                .has_signal_state_for_user("559990000001")
+                .await
+                .unwrap()
+        );
+    }
+
     /// An uncommitted write is not a lock error and not a phantom miss: the
     /// reader sees the last committed state and returns it. This is the case
     /// the msg-secret reads were kept on the write queue for, so it has to hold
@@ -6196,7 +6256,20 @@ mod read_routing_tests {
             // of hanging the runtime.
             let sampled = tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
-                    let n = store.get_sender_key_devices(GROUP).await.unwrap().len();
+                    // Straight through read_query, not get_sender_key_devices:
+                    // that one is on the write permit now, which would serialize
+                    // the sample against the writer and hide a torn batch.
+                    let n = store
+                        .read_query(|conn| {
+                            sender_key_devices::table
+                                .filter(sender_key_devices::group_jid.eq(GROUP))
+                                .count()
+                                .get_result::<i64>(conn)
+                                .map(|n| n as usize)
+                                .map_err(|e| StoreError::Database(Box::new(e)))
+                        })
+                        .await
+                        .unwrap();
                     assert!(
                         n == 0 || n == ENTRIES,
                         "a chunked batch was observed {n}/{ENTRIES} applied"
@@ -6236,6 +6309,11 @@ mod read_routing_tests {
              cache in front on that path, so a stale miss loses the addon too",
         ),
         ("get_pn_mapping", "same as get_lid_mapping"),
+        (
+            "get_all_lid_mappings",
+            "the startup warm-up feeds these into LidPnCache::add_guarded, whose \
+             LID side replaces unconditionally, so a stale row reverts a live learn",
+        ),
         // The rest share one shape: the row is promoted into a plain in-memory
         // cache, or suppresses an action, so a stale read sticks instead of
         // being retried. `SignalStoreCache` reconciles staleness and its reads
