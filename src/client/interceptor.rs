@@ -46,10 +46,17 @@
 //!
 //! # Acknowledgement
 //!
-//! A claimed stanza is always answered. Where the client would have acked, it
-//! still acks; where it would have nacked an unmodelled stanza, the claim turns
-//! that into an ack, because someone did handle it. Answering nothing would
-//! leave the stanza in the offline queue and keep the stream recycling.
+//! A claim does not change what the server is owed. Where the client would have
+//! acked, it still acks; where it would have nacked a tag it does not model,
+//! the claim turns that into an ack, because someone did handle it — answering
+//! nothing would leave the stanza in the offline queue and keep the stream
+//! recycling. Both need `id` and `from`: without them there is nothing to
+//! address, and the client would not have answered either.
+//!
+//! A tag the client *does* model but answers some other way — a delivery
+//! `<receipt>` for a direct `<message>`, an `<iq type="result">` — is answered
+//! by nobody once claimed. A generic `<ack>` is not that answer, so the client
+//! does not send one. Claiming those means owing the reply.
 //!
 //! [`StanzaRouter::register`]: crate::handlers::router::StanzaRouter::register
 //!
@@ -120,7 +127,10 @@ impl Interception {
     }
 }
 
-/// Sees each decoded stanza before the built-in pipeline.
+/// Sees a stanza on its way to the built-in pipeline.
+///
+/// Not every decoded stanza: see the module documentation for what never
+/// reaches this point.
 ///
 /// Runs on the read loop, so it must return quickly: time spent here is time
 /// the next stanza waits. Work that can take a while belongs on a task.

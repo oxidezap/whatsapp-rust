@@ -532,17 +532,25 @@ impl Client {
             && !is_connection_critical(nr)
             && self.intercept_stanza(&node)
         {
-            // The server is owed an answer whatever happened here. Without an
-            // interceptor an unmodelled stanza would have been nacked, and
-            // `should_ack` covers only the tags this client models — so a
-            // claimed stanza outside those tags still needs an ack, or it stays
-            // in the offline queue and the stream keeps recycling.
+            // A claim does not change what the server is owed. Where this
+            // client would have acked it still acks; where it would have nacked
+            // a tag it does not model, the claim turns that into an ack,
+            // because someone did handle it — and answering nothing would leave
+            // the stanza in the offline queue with the stream recycling.
+            //
+            // A tag the client models but answers some other way — a delivery
+            // <receipt> for a direct <message>, an <iq type="result"> — gets
+            // nothing here. A generic <ack class="message"> is not that answer,
+            // and inventing one is worse than silence: whoever claimed the
+            // stanza took on the reply.
             //
             // Same identity requirement as the nack path: without `id` and
             // `from` there is nothing to address.
             let ack = deferred_ack_node.or_else(|| {
-                (nr.get_attr("id").is_some() && nr.get_attr("from").is_some())
-                    .then(|| Arc::clone(&node))
+                (!self.stanza_router.models(nr.tag.as_ref())
+                    && nr.get_attr("id").is_some()
+                    && nr.get_attr("from").is_some())
+                .then(|| Arc::clone(&node))
             });
             if let Some(node) = ack {
                 self.maybe_deferred_ack(node).await;

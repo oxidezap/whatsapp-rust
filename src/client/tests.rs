@@ -5126,7 +5126,7 @@ async fn a_claimed_unknown_stanza_is_acked_rather_than_nacked() {
     // act on it says the opposite — but it must still say something: answering
     // nothing leaves the stanza in the offline queue and keeps the stream
     // recycling.
-    let client = create_interceptor_test_client().await;
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let (interceptor, seen) = recorder("vendor:thing");
     let _handle = client.add_stanza_interceptor(interceptor);
 
@@ -5141,8 +5141,52 @@ async fn a_claimed_unknown_stanza_is_acked_rather_than_nacked() {
         "fixture must exercise the path should_ack does not cover"
     );
     client.process_node(node_to_owned_ref(node)).await;
-
     assert_eq!(seen.lock().expect("lock").len(), 1, "the interceptor ran");
+
+    // What the server actually receives, which is the whole point: an ack, and
+    // not the nack this tag would otherwise have drawn.
+    let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+    let sent = sent.get();
+    assert_eq!(sent.tag.as_ref(), "ack");
+    assert!(
+        sent.get_attr("class")
+            .is_some_and(|class| *class == "vendor:thing")
+    );
+    assert!(sent.get_attr("id").is_some_and(|id| *id == "V-1"));
+    assert_eq!(
+        transport.sent_count(),
+        1,
+        "one answer, so no nack followed the ack"
+    );
+}
+
+#[tokio::test]
+async fn claiming_a_stanza_the_client_answers_differently_sends_no_generic_ack() {
+    // A direct <message> is answered with a delivery <receipt>, an <iq> with an
+    // <iq type="result">. Neither is an <ack class="…">, so the claimed-stanza
+    // path stays quiet rather than sending the server something it did not ask
+    // for. The interceptor that took the stanza owes the reply.
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let (interceptor, seen) = recorder("message");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    let node = NodeBuilder::new("message")
+        .attr("id", "M-1")
+        .attr("from", "5511999998888@s.whatsapp.net")
+        .build();
+    assert!(
+        !client.should_ack(&node.as_node_ref()),
+        "a direct message is not ack-answered"
+    );
+    client.process_node(node_to_owned_ref(node)).await;
+
+    assert_eq!(seen.lock().expect("lock").len(), 1, "it was claimed");
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        transport.sent_count(),
+        0,
+        "no invented answer for a tag the client models"
+    );
 }
 
 #[tokio::test]
@@ -5214,7 +5258,14 @@ async fn a_handle_outliving_its_client_does_not_keep_it_alive() {
     let handle = {
         let client = create_interceptor_test_client().await;
         let (interceptor, _seen) = recorder("nothing");
-        client.add_stanza_interceptor(interceptor)
+        let owners = Arc::strong_count(&client);
+        let handle = client.add_stanza_interceptor(interceptor);
+        assert_eq!(
+            Arc::strong_count(&client),
+            owners,
+            "registering must not make the handle an owner"
+        );
+        handle
     };
     drop(handle);
 }
