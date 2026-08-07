@@ -632,21 +632,29 @@ mod tests {
         );
 
         // The case that makes it unknowable: the agent connected before we
-        // wrapped it, so its pool is already non-empty at construction. The
-        // body has to be drained, or ureq drops the connection instead of
-        // pooling it and the scenario never happens.
-        let url = spawn_keep_alive_server();
-        let response = shared
-            .get(&url)
-            .call()
-            .expect("the warm-up request must reach the fixture");
+        // wrapped it. Two requests answered over one accepted connection is the
+        // proof that the first one is sitting in the pool, and draining each
+        // body is what makes it poolable at all.
+        let (url, accepted) = spawn_keep_alive_server();
+        for _ in 0..2 {
+            let response = shared
+                .get(&url)
+                .call()
+                .expect("the warm-up request must reach the fixture");
+            assert_eq!(
+                response
+                    .into_body()
+                    .read_to_vec()
+                    .expect("draining leaves a poolable connection"),
+                b"ok"
+            );
+        }
         assert_eq!(
-            response
-                .into_body()
-                .read_to_vec()
-                .expect("draining leaves a poolable connection"),
-            b"ok"
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the second request must have reused a pooled connection"
         );
+
         assert!(
             UreqHttpClient::with_agent(shared)
                 .resource_report()
@@ -779,12 +787,16 @@ mod tests {
     }
 
     /// Answers every request with a small 200 and leaves the connection open,
-    /// so a drained response goes back into the agent's pool.
-    fn spawn_keep_alive_server() -> String {
+    /// so a drained response goes back into the agent's pool. The counter is
+    /// how a test tells a reused connection from a fresh one.
+    fn spawn_keep_alive_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
         thread::spawn(move || {
             while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 1024];
@@ -806,7 +818,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), accepted)
     }
 
     /// Accepts one connection and hangs up without answering. An owned port
