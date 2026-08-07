@@ -931,11 +931,13 @@ impl OwnedNodeRef {
     /// A refcount bump, not a copy — the yoke already retains this buffer, and
     /// [`Self::slice_bytes`] hands out views into the same allocation.
     ///
-    /// Re-encoding through [`crate::marshal`] is the alternative and a worse
-    /// one for anything that forwards a stanza onward — to another process, a
+    /// Re-encoding through [`marshal_ref`] is the alternative and a worse one
+    /// for anything that forwards a stanza onward — to another process, a
     /// recording, a replay harness. Re-encoding costs a second pass and is only
     /// faithful while the token dictionaries match the ones that decoded it;
     /// these bytes stay true whatever the dictionaries do.
+    ///
+    /// [`marshal_ref`]: crate::marshal::marshal_ref
     pub fn backing_bytes(&self) -> Bytes {
         self.inner.backing_cart().0.clone()
     }
