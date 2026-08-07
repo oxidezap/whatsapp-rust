@@ -1137,7 +1137,7 @@ impl Client {
         self.add_recent_message(&to, &request_id, &message, shared_content.clone())
             .await;
 
-        let device_store_arc = self.persistence_manager.get_device_arc().await;
+        let device_store_arc = self.persistence_manager.clone();
         let to_str = to.to_string();
         let distribution_guard = self.group_distribution_lock(&to).await;
 
@@ -1909,7 +1909,7 @@ impl Client {
             let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
             let _session_guard = session_mutex.lock().await;
 
-            let mut store_adapter = self.signal_adapter().await;
+            let mut store_adapter = self.signal_adapter();
 
             let device_snapshot = self.persistence_manager.get_device_snapshot();
             wacore::send::prepare_peer_stanza(
@@ -1981,7 +1981,7 @@ impl Client {
                     .await;
             }
 
-            let device_store_arc = self.persistence_manager.get_device_arc().await;
+            let device_store_arc = self.persistence_manager.clone();
             let to_str = to.to_string();
 
             let (own_sending_jid, _) = match group_info.addressing_mode {
@@ -2427,7 +2427,7 @@ impl Client {
             let lock_jids = self.build_session_lock_keys(dm_devices.devices()).await;
             let _session_guards = self.session_guards_for(&lock_jids).await;
 
-            let mut store_adapter = self.signal_adapter().await;
+            let mut store_adapter = self.signal_adapter();
 
             let mut stores = store_adapter.as_signal_stores();
 
@@ -4907,7 +4907,7 @@ mod tests {
             .expect("prekey bundle task")
             .expect("prekey bundle");
 
-        let mut adapter = client.signal_adapter().await;
+        let mut adapter = client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         process_prekey_bundle(
             &peer.to_protocol_address(),
@@ -5124,7 +5124,7 @@ mod tests {
             .expect("prekey bundle task")
             .expect("prekey bundle");
         {
-            let mut adapter = client.signal_adapter().await;
+            let mut adapter = client.signal_adapter();
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
             process_prekey_bundle(
                 &lid_addr.to_protocol_address(),

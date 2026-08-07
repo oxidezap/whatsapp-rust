@@ -1,6 +1,6 @@
 use crate::store::Device;
+use crate::store::persistence_manager::PersistenceManager;
 use crate::store::signal_cache::SignalStoreCache;
-use async_lock::RwLock;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
@@ -33,10 +33,23 @@ type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use std::future::{Future, ready};
 
+/// Snapshots per call instead of holding the device lock: `get_device_snapshot`
+/// is a refcount bump, so a backend round-trip no longer keeps a read guard
+/// that every later Signal read would queue behind once a write arrives.
+///
+/// Per call, not per adapter: `signed_pre_key_id` is promoted by rotation and
+/// its staged backend row is then dropped, so an adapter pinned to a
+/// pre-rotation snapshot would fail to load the very key a peer just used.
 #[derive(Clone)]
 struct SharedDevice {
-    device: Arc<RwLock<Device>>,
+    persistence_manager: Arc<PersistenceManager>,
     cache: Arc<SignalStoreCache>,
+}
+
+impl SharedDevice {
+    fn device(&self) -> Arc<Device> {
+        self.persistence_manager.get_device_snapshot()
+    }
 }
 
 #[derive(Clone)]
@@ -55,8 +68,11 @@ impl SenderKeyAdapter {
     /// Build a standalone sender-key store without constructing the full
     /// five-store [`SignalProtocolStoreAdapter`]. Used on the SKDM-processing
     /// path, which only needs the sender-key store.
-    pub fn new(device: Arc<RwLock<Device>>, cache: Arc<SignalStoreCache>) -> Self {
-        Self(SharedDevice { device, cache })
+    pub fn new(persistence_manager: Arc<PersistenceManager>, cache: Arc<SignalStoreCache>) -> Self {
+        Self(SharedDevice {
+            persistence_manager,
+            cache,
+        })
     }
 }
 
@@ -70,8 +86,11 @@ pub struct SignalProtocolStoreAdapter {
 }
 
 impl SignalProtocolStoreAdapter {
-    pub fn new(device: Arc<RwLock<Device>>, cache: Arc<SignalStoreCache>) -> Self {
-        let shared = SharedDevice { device, cache };
+    pub fn new(persistence_manager: Arc<PersistenceManager>, cache: Arc<SignalStoreCache>) -> Self {
+        let shared = SharedDevice {
+            persistence_manager,
+            cache,
+        };
         Self {
             session_store: SessionAdapter(shared.clone()),
             identity_store: IdentityAdapter(shared.clone()),
@@ -99,7 +118,7 @@ impl SessionStore for SessionAdapter {
         &self,
         address: &ProtocolAddress,
     ) -> Result<Option<SessionRecord>, SignalProtocolError> {
-        let device = self.0.device.read().await;
+        let device = self.0.device();
         self.0
             .cache
             .peek_session(address, &*device.backend)
@@ -112,7 +131,7 @@ impl SessionStore for SessionAdapter {
         &self,
         address: &ProtocolAddress,
     ) -> Result<(Option<SessionRecord>, Option<SessionCheckoutKey>), SignalProtocolError> {
-        let device = self.0.device.read().await;
+        let device = self.0.device();
         self.0
             .cache
             .checkout_session(address, &*device.backend)
@@ -184,7 +203,7 @@ impl SessionStore for SessionAdapter {
             return Box::pin(ready(answer));
         }
         Box::pin(async move {
-            let device = self.0.device.read().await;
+            let device = self.0.device();
             self.0
                 .cache
                 .has_session(address, &*device.backend)
@@ -247,15 +266,15 @@ impl IdentityAdapter {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IdentityKeyStore for IdentityAdapter {
     async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        IdentityKeyStore::get_identity_key_pair(&*device)
+        let device = self.0.device();
+        IdentityKeyStore::get_identity_key_pair(device.as_ref())
             .await
             .map_err(signal_err("get_identity_key_pair"))
     }
 
     async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        IdentityKeyStore::get_local_registration_id(&*device)
+        let device = self.0.device();
+        IdentityKeyStore::get_local_registration_id(device.as_ref())
             .await
             .map_err(signal_err("get_local_registration_id"))
     }
@@ -345,7 +364,7 @@ impl IdentityKeyStore for IdentityAdapter {
             return Box::pin(ready(parse_cached_identity(cached)));
         }
         Box::pin(async move {
-            let device = self.0.device.read().await;
+            let device = self.0.device();
             let data = self
                 .0
                 .cache
@@ -376,8 +395,8 @@ fn parse_cached_identity(
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl PreKeyStore for PreKeyAdapter {
     async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        WacorePreKeyStore::load_prekey(&*device, prekey_id.into())
+        let device = self.0.device();
+        WacorePreKeyStore::load_prekey(device.as_ref(), prekey_id.into())
             .await
             .map_err(signal_err("backend"))?
             .ok_or(SignalProtocolError::InvalidPreKeyId)
@@ -388,9 +407,9 @@ impl PreKeyStore for PreKeyAdapter {
         prekey_id: PreKeyId,
         record: &PreKeyRecord,
     ) -> Result<(), SignalProtocolError> {
-        let device = self.0.device.read().await;
+        let device = self.0.device();
         let structure = wacore_record::prekey_record_to_structure(record)?;
-        WacorePreKeyStore::store_prekey(&*device, prekey_id.into(), structure, false)
+        WacorePreKeyStore::store_prekey(device.as_ref(), prekey_id.into(), structure, false)
             .await
             .map_err(signal_err("backend"))
     }
@@ -399,7 +418,7 @@ impl PreKeyStore for PreKeyAdapter {
         // through here: message_decrypt reports the consumed prekey and the receive
         // path buffers it via buffer_consumed_prekey so the durable delete is
         // atomic with the session flush (matching WAWebSignalProtocolStoreUnifiedApi).
-        let device = self.0.device.read().await;
+        let device = self.0.device();
         device
             .backend
             .remove_prekey(prekey_id.into())
@@ -429,10 +448,20 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
         &self,
         signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        WacoreSignedPreKeyStore::load_signed_prekey(&*device, signed_prekey_id.into())
+        let id = signed_prekey_id.into();
+        let mut record = WacoreSignedPreKeyStore::load_signed_prekey(self.0.device().as_ref(), id)
             .await
-            .map_err(signal_err("backend"))?
+            .map_err(signal_err("backend"))?;
+        if record.is_none() {
+            // Rotation promotes an id into the device field and only then drops
+            // its staged row, so a snapshot taken just before the promotion
+            // resolves it in neither place. Re-read before calling it unknown:
+            // once the row is gone the field definitely holds it.
+            record = WacoreSignedPreKeyStore::load_signed_prekey(self.0.device().as_ref(), id)
+                .await
+                .map_err(signal_err("backend"))?;
+        }
+        record
             .ok_or(SignalProtocolError::InvalidSignedPreKeyId)
             .and_then(wacore_record::signed_prekey_structure_to_record)
     }
@@ -463,7 +492,7 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
     ) -> wacore::libsignal::protocol::error::Result<
         Option<wacore::libsignal::protocol::SenderKeyRecord>,
     > {
-        let device = self.0.device.read().await;
+        let device = self.0.device();
         // group_decrypt mutates the loaded record (catch-up + ratchet) and stores
         // it back, so the trait needs an owned copy. The cache keeps its `Arc`, so
         // this clones the inner record (unchanged from the prior behavior).
@@ -490,10 +519,122 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Device;
     use wacore::store::in_memory::InMemoryBackend;
 
     const PREKEY_ID: u32 = 7777;
+
+    async fn test_persistence_manager(
+        backend: Arc<dyn crate::store::Backend>,
+    ) -> Arc<PersistenceManager> {
+        Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("in-memory persistence manager"),
+        )
+    }
+
+    /// Rotation promotes the new id into the device field and only then drops
+    /// its staged backend row, so a snapshot taken before the promotion
+    /// resolves that id in neither place. This is why the adapter re-reads the
+    /// snapshot before reporting an id unknown: a fresh one resolves what a
+    /// stale one cannot, and a decrypt that raced the promotion would otherwise
+    /// reject a valid pre-key message.
+    #[tokio::test]
+    async fn a_promoted_signed_pre_key_is_only_visible_to_a_fresh_snapshot() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::store::commands::DeviceCommand;
+
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let pm = test_persistence_manager(backend).await;
+
+        let stale = pm.get_device_snapshot();
+        let promoted_id = stale.signed_pre_key_id + 1;
+
+        // Nothing staged for the new id, and it is not the snapshot's current
+        // one: the pre-promotion view cannot resolve it.
+        assert!(
+            WacoreSignedPreKeyStore::load_signed_prekey(stale.as_ref(), promoted_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "the new id must be unresolvable before promotion"
+        );
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        pm.process_command(DeviceCommand::SetSignedPreKey {
+            key_pair,
+            id: promoted_id,
+            signature: [0u8; 64],
+            rotation_ms: 0,
+        })
+        .await;
+
+        // The stale snapshot still cannot resolve it, which is exactly the
+        // failure a pinned snapshot would produce.
+        assert!(
+            WacoreSignedPreKeyStore::load_signed_prekey(stale.as_ref(), promoted_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a stale snapshot must not resolve the promoted id"
+        );
+
+        let adapter = SignalProtocolStoreAdapter::new(pm, Arc::new(SignalStoreCache::new()));
+        assert!(
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key(promoted_id.into())
+                .await
+                .is_ok(),
+            "the adapter must resolve the promoted id from a fresh snapshot"
+        );
+    }
+
+    /// The window the re-read closes is intra-call: the promotion can land
+    /// after the first snapshot is taken and before its backend lookup
+    /// resolves. Parks that lookup, promotes, then releases, so the retry is
+    /// the only thing that can produce an answer.
+    #[tokio::test]
+    async fn a_promotion_racing_a_lookup_is_resolved_by_the_retry() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::store::commands::DeviceCommand;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let pm = test_persistence_manager(backend.clone()).await;
+        let promoted_id = pm.get_device_snapshot().signed_pre_key_id + 1;
+
+        // Built before the promotion, so its first snapshot is the stale one.
+        let adapter =
+            SignalProtocolStoreAdapter::new(pm.clone(), Arc::new(SignalStoreCache::new()));
+
+        let gate = Arc::new(async_lock::Barrier::new(2));
+        backend.gate_next_signed_prekey_read(gate.clone());
+
+        let lookup = tokio::spawn(async move {
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key(promoted_id.into())
+                .await
+        });
+
+        // The first load is now parked inside the backend, holding a snapshot
+        // that predates everything below.
+        gate.wait().await;
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        pm.process_command(DeviceCommand::SetSignedPreKey {
+            key_pair,
+            id: promoted_id,
+            signature: [0u8; 64],
+            rotation_ms: 0,
+        })
+        .await;
+        gate.wait().await;
+
+        assert!(
+            lookup.await.expect("lookup task").is_ok(),
+            "the retry must resolve an id promoted mid-lookup"
+        );
+    }
 
     /// The inbound decrypt path consumes a one-time prekey and buffers it via
     /// `buffer_consumed_prekey`. It must NOT delete the prekey from the backend
@@ -508,9 +649,9 @@ mod tests {
             .await
             .unwrap();
 
-        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let device = test_persistence_manager(backend.clone()).await;
         let cache = Arc::new(SignalStoreCache::new());
-        let adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
+        let adapter = SignalProtocolStoreAdapter::new(device.clone(), cache.clone());
 
         let addr = ProtocolAddress::new("bob", 1.into());
         // The real path stores the promoted session before buffering the prekey.
@@ -544,9 +685,9 @@ mod tests {
             .await
             .unwrap();
 
-        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let device = test_persistence_manager(backend.clone()).await;
         let cache = Arc::new(SignalStoreCache::new());
-        let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
+        let mut adapter = SignalProtocolStoreAdapter::new(device.clone(), cache.clone());
 
         adapter
             .pre_key_store
@@ -560,10 +701,10 @@ mod tests {
         );
     }
 
-    fn test_adapter() -> SignalProtocolStoreAdapter {
+    async fn test_adapter() -> SignalProtocolStoreAdapter {
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
-        let device = Arc::new(RwLock::new(Device::new(backend)));
-        SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
+        let device = test_persistence_manager(backend).await;
+        SignalProtocolStoreAdapter::new(device.clone(), Arc::new(SignalStoreCache::new()))
     }
 
     struct BlockingIdentityStore {
@@ -650,9 +791,9 @@ mod tests {
             seed_durable,
         );
 
-        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let device = test_persistence_manager(backend.clone()).await;
         let mut session_store =
-            SignalProtocolStoreAdapter::new(device, cache.clone()).session_store;
+            SignalProtocolStoreAdapter::new(device.clone(), cache.clone()).session_store;
         let entered = Arc::new(async_lock::Barrier::new(2));
         let mut identity_store = BlockingIdentityStore {
             pair: identity_pair,
@@ -715,8 +856,8 @@ mod tests {
 
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
         let cache = Arc::new(SignalStoreCache::new());
-        let device = Arc::new(RwLock::new(Device::new(backend)));
-        let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
+        let device = test_persistence_manager(backend).await;
+        let mut adapter = SignalProtocolStoreAdapter::new(device.clone(), cache.clone());
         let address = ProtocolAddress::new("15550005555", 1.into());
         cache
             .put_session(&address, SessionRecord::new_fresh())
@@ -742,7 +883,7 @@ mod tests {
     #[tokio::test]
     async fn session_store_fast_paths_round_trip() {
         use wacore::libsignal::protocol::SessionStore as _;
-        let mut adapter = test_adapter();
+        let mut adapter = test_adapter().await;
         let addr = ProtocolAddress::new("15550002222", 1.into());
 
         // Cold cache: goes through the async fallback (backend consult).
@@ -782,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn identity_fast_paths_keep_change_semantics() {
         use wacore::libsignal::protocol::{IdentityKeyPair, IdentityKeyStore as _};
-        let mut adapter = test_adapter();
+        let mut adapter = test_adapter().await;
         let addr = ProtocolAddress::new("15550003333", 1.into());
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -839,15 +980,18 @@ mod tests {
 #[cfg(test)]
 mod hook_alloc_tests {
     use super::*;
-    use crate::store::Device;
     use crate::test_alloc::min_allocs;
     use wacore::libsignal::protocol::{Direction, IdentityKeyPair};
     use wacore::store::in_memory::InMemoryBackend;
 
-    fn adapter_for_test() -> SignalProtocolStoreAdapter {
+    async fn adapter_for_test() -> SignalProtocolStoreAdapter {
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
-        let device = Arc::new(RwLock::new(Device::new(backend)));
-        SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
+        let device = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("in-memory persistence manager"),
+        );
+        SignalProtocolStoreAdapter::new(device.clone(), Arc::new(SignalStoreCache::new()))
     }
 
     fn some_identity() -> IdentityKey {
@@ -858,9 +1002,9 @@ mod hook_alloc_tests {
     /// `#[async_trait]` still boxes that future once per encrypt and once per
     /// decrypt. The hook exists to skip the box, and the only way to know it
     /// does is to count.
-    #[test]
-    fn the_trusted_identity_hook_answers_without_allocating() {
-        let adapter = adapter_for_test();
+    #[tokio::test]
+    async fn the_trusted_identity_hook_answers_without_allocating() {
+        let adapter = adapter_for_test().await;
         let address = ProtocolAddress::new("bob@s.whatsapp.net", 1.into());
         let identity = some_identity();
 
@@ -885,9 +1029,9 @@ mod hook_alloc_tests {
     /// Bad path: with nothing cached for the address, the hook must decline so
     /// the caller takes the async path that can read the backend. Answering
     /// from an empty cache would report every identity as new.
-    #[test]
-    fn the_save_identity_hook_declines_when_nothing_is_cached() {
-        let mut adapter = adapter_for_test();
+    #[tokio::test]
+    async fn the_save_identity_hook_declines_when_nothing_is_cached() {
+        let mut adapter = adapter_for_test().await;
         let address = ProtocolAddress::new("never-seen@s.whatsapp.net", 1.into());
         let identity = some_identity();
 
@@ -905,7 +1049,7 @@ mod hook_alloc_tests {
     /// correctly, which is what lets the caller skip the box.
     #[tokio::test]
     async fn the_save_identity_hook_answers_once_the_entry_is_cached() {
-        let mut adapter = adapter_for_test();
+        let mut adapter = adapter_for_test().await;
         let address = ProtocolAddress::new("bob@s.whatsapp.net", 1.into());
         let first = some_identity();
         let second = some_identity();
@@ -936,9 +1080,9 @@ mod hook_alloc_tests {
     /// The session hook has the same contract: decline when the cache cannot
     /// answer, rather than reporting "no session" and forcing a needless
     /// session rebuild.
-    #[test]
-    fn the_session_hook_declines_when_the_cache_cannot_answer() {
-        let adapter = adapter_for_test();
+    #[tokio::test]
+    async fn the_session_hook_declines_when_the_cache_cannot_answer() {
+        let adapter = adapter_for_test().await;
         let address = ProtocolAddress::new("never-seen@s.whatsapp.net", 1.into());
 
         assert!(

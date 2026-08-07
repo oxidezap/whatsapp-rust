@@ -5,28 +5,25 @@ use anyhow::Context as _;
 
 impl Client {
     /// Build a [`SignalProtocolStoreAdapter`] from the current device state and signal cache.
-    pub(crate) async fn signal_adapter(
+    pub(crate) fn signal_adapter(
         &self,
     ) -> crate::store::signal_adapter::SignalProtocolStoreAdapter {
-        let device_store = self.persistence_manager.get_device_arc().await;
-        self.signal_adapter_from(device_store)
+        self.signal_adapter_from(self.persistence_manager.clone())
     }
 
     /// Build a standalone [`SenderKeyAdapter`] from the current device state and
     /// signal cache, avoiding the full five-store adapter on the SKDM path.
-    pub(crate) async fn sender_key_adapter(
-        &self,
-    ) -> crate::store::signal_adapter::SenderKeyAdapter {
+    pub(crate) fn sender_key_adapter(&self) -> crate::store::signal_adapter::SenderKeyAdapter {
         crate::store::signal_adapter::SenderKeyAdapter::new(
-            self.persistence_manager.get_device_arc().await,
+            self.persistence_manager.clone(),
             self.signal_cache.clone(),
         )
     }
 
-    /// Build a [`SignalProtocolStoreAdapter`] from a pre-fetched device arc.
+    /// Build a [`SignalProtocolStoreAdapter`] from a pre-fetched persistence handle.
     pub(crate) fn signal_adapter_from(
         &self,
-        device_store: Arc<RwLock<crate::store::Device>>,
+        device_store: Arc<PersistenceManager>,
     ) -> crate::store::signal_adapter::SignalProtocolStoreAdapter {
         crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
             device_store,

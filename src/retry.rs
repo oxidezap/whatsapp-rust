@@ -839,7 +839,7 @@ impl Client {
         let signal_address = encryption_jid.to_protocol_address();
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let session_guard = session_mutex.lock().await;
-        let mut store_adapter = self.signal_adapter().await;
+        let mut store_adapter = self.signal_adapter();
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let edit = wacore::types::message::EditAttribute::infer_from_message(&message);
 
@@ -930,7 +930,7 @@ impl Client {
         let encoded = pre_encoded
             .filter(|_| can_reuse_encoding)
             .or(encoded_fallback.as_deref());
-        let device_store = self.persistence_manager.get_device_arc().await;
+        let device_store = self.persistence_manager.clone();
         let mut store_adapter = self.signal_adapter_from(device_store);
         let mut stores = store_adapter.as_signal_stores();
         let edit = wacore::types::message::EditAttribute::infer_from_message(&message);
@@ -1420,7 +1420,7 @@ impl Client {
             identity_key.into(),
         )?;
 
-        let mut adapter = self.signal_adapter().await;
+        let mut adapter = self.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         self.install_prekey_bundle_cached(requester_jid, &bundle, &mut adapter, &mut rng)
             .await?;

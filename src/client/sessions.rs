@@ -485,7 +485,7 @@ impl Client {
             }
         }
 
-        let mut adapter = self.signal_adapter().await;
+        let mut adapter = self.signal_adapter();
         let mut rng = rand::make_rng::<StdRng>();
 
         let mut success_count = 0;
@@ -596,7 +596,7 @@ impl Client {
     /// pkmsg too, not as plain msg.
     #[cfg(feature = "voip-runtime")]
     pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
-        let device_store = self.persistence_manager.get_device_arc().await;
+        let device_store = self.persistence_manager.clone();
         let mut adapter = self.signal_adapter_from(device_store);
         let signal_addr = jid.to_protocol_address();
         wacore::send::pkmsg_would_be_emitted(&mut adapter.session_store, &signal_addr).await

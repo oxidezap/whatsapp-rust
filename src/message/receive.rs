@@ -638,7 +638,7 @@ impl Client {
         // Started after the lock so the histogram excludes lock/queue wait.
         let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
-        let mut adapter = self.signal_adapter().await;
+        let mut adapter = self.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut outcome = SessionBatchOutcome::default();
         // Buffer plaintexts to handle after the ratchet lock drops (see the drain
@@ -1229,7 +1229,7 @@ impl Client {
         if payloads.is_empty() {
             return Ok(());
         }
-        let mut adapter = self.signal_adapter().await;
+        let mut adapter = self.signal_adapter();
 
         // Always use bare sender for sender key operations. Real WA delivers
         // skmsg with bare participant but pkmsg (SKDM) with device-qualified

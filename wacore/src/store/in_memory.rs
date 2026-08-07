@@ -141,6 +141,11 @@ pub struct InMemoryBackend {
     /// flush).
     #[cfg(any(test, feature = "test-util"))]
     fail_sender_key_writes: AtomicBool,
+    /// Parks the next `load_signed_prekey` on a barrier. Test hook: lets a
+    /// harness promote a rotated key while a lookup is already in flight,
+    /// which is the window a caller's re-read exists to close.
+    #[cfg(any(test, feature = "test-util"))]
+    signed_prekey_read_gate: std::sync::Mutex<Option<Arc<async_lock::Barrier>>>,
 }
 
 impl InMemoryBackend {
@@ -157,6 +162,8 @@ impl InMemoryBackend {
             fail_session_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            signed_prekey_read_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -184,6 +191,16 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_sender_key_writes(&self, fail: bool) {
         self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Park the next `load_signed_prekey` on `gate`, which it waits on twice:
+    /// once to signal it has arrived, once to be released.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn gate_next_signed_prekey_read(&self, gate: Arc<async_lock::Barrier>) {
+        *self
+            .signed_prekey_read_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
     }
 
     /// Lets recovery tests remove only the state needed to trigger a key request.
@@ -362,6 +379,20 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn load_signed_prekey(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            // Taken, not borrowed, so the guard never crosses the await and
+            // only the first read after arming is gated.
+            let gate = self
+                .signed_prekey_read_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                gate.wait().await;
+                gate.wait().await;
+            }
+        }
         Ok(self.state.lock().await.signed_prekeys.get(&id).cloned())
     }
 
