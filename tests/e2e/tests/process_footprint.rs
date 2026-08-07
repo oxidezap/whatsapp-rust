@@ -40,25 +40,26 @@ impl std::ops::Sub for Footprint {
 }
 
 /// Reads `VmRSS` / `RssAnon` / `RssFile` from `/proc/self/status`, in KiB.
-/// Returns zeroes on a platform without procfs, which makes the deltas zero
-/// rather than nonsense.
+///
+/// Panics rather than defaulting: a zero here would turn every delta into zero
+/// and every upper-bound assertion into a pass, reporting a run that measured
+/// nothing as a successful measurement.
 fn footprint() -> Footprint {
     let mut buf = String::new();
-    if std::fs::File::open("/proc/self/status")
+    std::fs::File::open("/proc/self/status")
         .and_then(|mut f| f.read_to_string(&mut buf))
-        .is_err()
-    {
-        return Footprint::default();
-    }
+        .expect("/proc/self/status is required to measure a footprint");
     let read = |key: &str| -> i64 {
         for line in buf.lines() {
             if let Some(rest) = line.strip_prefix(key)
                 && let Some(kb) = rest.trim().strip_suffix("kB").map(str::trim)
             {
-                return kb.parse().unwrap_or(0);
+                return kb
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{key} is not a KiB count: {kb:?}"));
             }
         }
-        0
+        panic!("/proc/self/status has no {key} field")
     };
     Footprint {
         rss: read("VmRSS:"),
@@ -67,11 +68,17 @@ fn footprint() -> Footprint {
     }
 }
 
+/// Fewer than three clients leaves no steady-state tail to take a marginal
+/// from, so the assertions would pass on an empty sample.
 fn client_count() -> usize {
-    std::env::var("FOOTPRINT_CLIENTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+    let Some(raw) = std::env::var("FOOTPRINT_CLIENTS").ok() else {
+        return 16;
+    };
+    let n: usize = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("FOOTPRINT_CLIENTS is not a number: {raw:?}"));
+    assert!(n >= 3, "FOOTPRINT_CLIENTS must be at least 3, got {n}");
+    n
 }
 
 /// Logs the per-client table and the first / second / median-marginal summary.
@@ -139,9 +146,10 @@ fn marginal_anon(baseline: Footprint, steps: &[Footprint]) -> i64 {
         prev = *step;
     }
     let mut tail: Vec<i64> = deltas.into_iter().skip(2).collect();
-    if tail.is_empty() {
-        return 0;
-    }
+    assert!(
+        !tail.is_empty(),
+        "no steady-state client to take a marginal from"
+    );
     tail.sort_unstable();
     tail[tail.len() / 2]
 }
