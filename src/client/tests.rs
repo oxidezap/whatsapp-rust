@@ -5120,10 +5120,12 @@ async fn an_unregistered_interceptor_stops_seeing_stanzas() {
 }
 
 #[tokio::test]
-async fn a_claimed_unknown_stanza_is_not_nacked() {
+async fn a_claimed_unknown_stanza_is_acked_rather_than_nacked() {
     // The reason this exists. A tag the client does not model is nacked, which
     // tells the server this client cannot act on it. An interceptor that *can*
-    // act on it should be able to say so.
+    // act on it says the opposite — but it must still say something: answering
+    // nothing leaves the stanza in the offline queue and keeps the stream
+    // recycling.
     let client = create_interceptor_test_client().await;
     let (interceptor, seen) = recorder("vendor:thing");
     let _handle = client.add_stanza_interceptor(interceptor);
@@ -5132,12 +5134,60 @@ async fn a_claimed_unknown_stanza_is_not_nacked() {
         .attr("id", "V-1")
         .attr("from", "s.whatsapp.net")
         .build();
+    // `should_ack` covers only the tags the client models, so this stanza takes
+    // the claimed-stanza ack path rather than the deferred one.
+    assert!(
+        !client.should_ack(&node.as_node_ref()),
+        "fixture must exercise the path should_ack does not cover"
+    );
     client.process_node(node_to_owned_ref(node)).await;
 
     assert_eq!(seen.lock().expect("lock").len(), 1, "the interceptor ran");
-    // Reaching here without the unknown-stanza path having run is the
-    // assertion: `nack_unrecognized_stanza` is only called from the fallback
-    // arm this interception skipped.
+}
+
+#[tokio::test]
+async fn a_claimed_stanza_without_identity_is_left_alone() {
+    // An ack has nothing to address without `id` and `from`, which is the same
+    // condition the nack path checks.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("vendor:thing");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("vendor:thing").build()))
+        .await;
+
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn connection_critical_stanzas_are_never_offered_to_an_interceptor() {
+    // An interceptor exists to extend a client, not to leave it
+    // authenticated-but-unaware, never reconnecting, or waiting forever on a
+    // send that already completed. These four settle connection state, so they
+    // do not reach an interceptor at all — an interceptor that tried to claim
+    // one never gets the chance.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("claims-everything-it-sees");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    for tag in ["success", "failure", "stream:error", "ack"] {
+        client
+            .process_node(node_to_owned_ref(NodeBuilder::new(tag).build()))
+            .await;
+    }
+
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a connection-critical stanza must not reach an interceptor"
+    );
+
+    // A neighbouring tag is still offered, so the guard is a list and not a
+    // switch that turned interception off.
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("notification").build()))
+        .await;
+    assert_eq!(seen.lock().expect("lock").len(), 1);
 }
 
 #[tokio::test]

@@ -1414,9 +1414,12 @@ pub struct Client {
     /// Number of consumers currently requesting `Event::RawNode` forwarding.
     raw_node_forwarding: AtomicUsize,
 
-    /// Stanza interceptors, and their count kept alongside so the read loop can
-    /// skip the lock entirely while none are registered.
-    stanza_interceptors: std::sync::Mutex<Vec<interceptor::Registration>>,
+    /// Stanza interceptors, behind the same copy-on-write snapshot the event
+    /// bus uses: reading one costs a refcount bump, so the read loop allocates
+    /// nothing per stanza. Registering is the rare side, and pays the copy.
+    stanza_interceptors: std::sync::RwLock<Arc<Vec<interceptor::Registration>>>,
+    /// Kept alongside so the read loop can skip the lock entirely while none
+    /// are registered.
     stanza_interceptor_count: AtomicUsize,
     next_interceptor_id: AtomicU64,
 

@@ -76,14 +76,9 @@ impl Client {
         interceptor: Arc<dyn StanzaInterceptor>,
     ) -> InterceptorHandle {
         let id = self.next_interceptor_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut registered = self.stanza_interceptors_guard();
+        self.update_stanza_interceptors(|registered| {
             registered.push(Registration { id, interceptor });
-            // Stored while holding the lock so a reader never sees a count that
-            // promises more than the vector holds.
-            self.stanza_interceptor_count
-                .store(registered.len(), Ordering::Release);
-        }
+        });
         InterceptorHandle {
             client: Arc::downgrade(self),
             id,
@@ -91,36 +86,50 @@ impl Client {
     }
 
     pub(crate) fn remove_stanza_interceptor(&self, id: u64) {
-        let mut registered = self.stanza_interceptors_guard();
-        registered.retain(|entry| entry.id != id);
-        self.stanza_interceptor_count
-            .store(registered.len(), Ordering::Release);
+        self.update_stanza_interceptors(|registered| {
+            registered.retain(|entry| entry.id != id);
+        });
     }
 
     /// Whether any interceptor is registered.
     ///
-    /// One relaxed load, so the read loop pays nothing while none are.
+    /// One relaxed load, so the read loop pays nothing while none are. Relaxed
+    /// is enough because the lock behind it does the synchronising: a reader
+    /// racing a registration either sees the count in time or does not, and a
+    /// stanza that arrived before the registration finished was never that
+    /// interceptor's to see.
     pub(crate) fn has_stanza_interceptors(&self) -> bool {
-        self.stanza_interceptor_count.load(Ordering::Acquire) != 0
+        self.stanza_interceptor_count.load(Ordering::Relaxed) != 0
     }
 
-    /// The registered interceptors, cloned out so none is called while the lock
-    /// is held — an interceptor that registered another would otherwise
-    /// deadlock.
-    pub(crate) fn stanza_interceptors(&self) -> Vec<Arc<dyn StanzaInterceptor>> {
-        self.stanza_interceptors_guard()
-            .iter()
-            .map(|entry| Arc::clone(&entry.interceptor))
-            .collect()
+    /// The current interceptors.
+    ///
+    /// A refcount bump, not a copy — and the snapshot is released before any
+    /// interceptor runs, so one that registers another cannot deadlock.
+    pub(crate) fn stanza_interceptors(&self) -> Arc<Vec<Registration>> {
+        Arc::clone(
+            &self
+                .stanza_interceptors
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    /// A poisoned interceptor list means one panicked while registering. The
-    /// list itself is still consistent, so recovering beats refusing every
-    /// stanza after it.
-    fn stanza_interceptors_guard(&self) -> std::sync::MutexGuard<'_, Vec<Registration>> {
-        self.stanza_interceptors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Copy-on-write, as the event bus does it: a reader keeps whatever
+    /// snapshot it took, so registering never blocks the read loop for longer
+    /// than the swap.
+    fn update_stanza_interceptors(&self, edit: impl FnOnce(&mut Vec<Registration>)) {
+        let mut guard = self
+            .stanza_interceptors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.as_ref().clone();
+        edit(&mut next);
+        // Stored while the write lock is held, so a reader never sees a count
+        // promising more than the snapshot holds.
+        self.stanza_interceptor_count
+            .store(next.len(), Ordering::Relaxed);
+        *guard = Arc::new(next);
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.

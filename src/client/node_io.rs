@@ -55,6 +55,23 @@ fn from_jid_matches(
 
 /// The wire shape the server uses for E2EE status updates, carrying the same
 /// payload as `<message from="status@broadcast">`.
+/// Stanzas that carry connection state, which an interceptor may not claim.
+///
+/// `success` and `failure` settle authentication, `stream:error` drives
+/// shutdown and reconnection, and `ack` resolves the waiters a send is blocked
+/// on. Letting a consumer take one would not extend the client — it would leave
+/// it authenticated-but-unaware, or never reconnecting, or waiting forever on a
+/// send that already completed.
+///
+/// `zapo` protects the same two auth tags from its stanza filters, for the same
+/// reason.
+fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
+    matches!(
+        node.tag.as_ref(),
+        "success" | "failure" | "stream:error" | "ack"
+    )
+}
+
 fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
 }
@@ -510,10 +527,24 @@ impl Client {
 
         // An interceptor runs before the built-in pipeline so a consumer can
         // act on a stanza this version does not model, instead of watching it
-        // get nacked. The ack still goes out below: the server is owed one
-        // either way, and withholding it would leave the stanza queued.
-        if self.has_stanza_interceptors() && self.intercept_stanza(&node) {
-            if let Some(node) = deferred_ack_node {
+        // get nacked.
+        if self.has_stanza_interceptors()
+            && !is_connection_critical(nr)
+            && self.intercept_stanza(&node)
+        {
+            // The server is owed an answer whatever happened here. Without an
+            // interceptor an unmodelled stanza would have been nacked, and
+            // `should_ack` covers only the tags this client models — so a
+            // claimed stanza outside those tags still needs an ack, or it stays
+            // in the offline queue and the stream keeps recycling.
+            //
+            // Same identity requirement as the nack path: without `id` and
+            // `from` there is nothing to address.
+            let ack = deferred_ack_node.or_else(|| {
+                (nr.get_attr("id").is_some() && nr.get_attr("from").is_some())
+                    .then(|| Arc::clone(&node))
+            });
+            if let Some(node) = ack {
                 self.maybe_deferred_ack(node).await;
             }
             return;
@@ -573,8 +604,8 @@ impl Client {
     /// interceptor registered earlier can shadow a later one — registration
     /// order is the priority order.
     fn intercept_stanza(self: &Arc<Self>, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
-        for interceptor in self.stanza_interceptors() {
-            if interceptor.intercept(node).is_handled() {
+        for registration in self.stanza_interceptors().iter() {
+            if registration.interceptor.intercept(node).is_handled() {
                 debug!(
                     target: "Client/Recv",
                     "Stanza <{}> taken by an interceptor",

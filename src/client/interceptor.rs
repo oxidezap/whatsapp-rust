@@ -10,21 +10,46 @@
 //! [`StanzaRouter::register`] panics on a duplicate tag, so even a handler for
 //! an existing tag cannot be replaced.
 //!
-//! An interceptor is that room. It runs before dispatch, sees every decoded
-//! stanza, and either steps aside or claims the stanza — in which case the
-//! built-in pipeline is skipped and the stanza is acknowledged normally, so the
-//! server does not redeliver it.
+//! An interceptor is that room. It runs where dispatch would have, and either
+//! steps aside or claims the stanza — in which case the built-in handler is
+//! skipped and the stanza is acknowledged, so the server does not redeliver it.
 //!
-//! # What claiming does not skip
+//! # What an interceptor sees
 //!
-//! Handling, not housekeeping. Offline-sync tracking, response-waiter
-//! resolution and stream shutdown run before dispatch and keep running whether
-//! or not a stanza is claimed — they are what keeps the connection working, and
-//! an interceptor that could switch them off would be a way to break a client
-//! rather than to extend one.
+//! Stanzas that would have reached dispatch. A response the client already
+//! correlated to a pending request, a `<xmlstreamend>` that ends the stream,
+//! and the connection-critical tags below never get there, so an interceptor
+//! does not see them either.
 //!
-//! The acknowledgement is the same: a claimed stanza is acked exactly as it
-//! would have been. The server is owed one either way.
+//! To observe *everything* decoded, including those, use
+//! [`Event::RawNode`] — it is emitted before any of the early returns.
+//! The two are different tools: one watches, this one takes over.
+//!
+//! [`Event::RawNode`]: wacore::types::events::Event::RawNode
+//!
+//! # What cannot be claimed
+//!
+//! `success`, `failure`, `stream:error` and `ack` settle connection state:
+//! authentication, shutdown and reconnection, and the waiters a send blocks on.
+//! An interceptor that took one would not extend the client — it would leave it
+//! authenticated-but-unaware, or never reconnecting, or waiting forever on a
+//! send that already completed. They are never offered.
+//!
+//! Housekeeping is likewise untouched. Offline-sync tracking and
+//! response-waiter resolution run before dispatch and keep running whether or
+//! not a stanza is claimed.
+//!
+//! An `<iq>` the client answers on its own — a ping, a pairing step — *is*
+//! offered, because most `<iq>` traffic is exactly what a consumer would want
+//! to extend. Claiming one leaves the server without the reply it expects, so
+//! match narrowly.
+//!
+//! # Acknowledgement
+//!
+//! A claimed stanza is always answered. Where the client would have acked, it
+//! still acks; where it would have nacked an unmodelled stanza, the claim turns
+//! that into an ack, because someone did handle it. Answering nothing would
+//! leave the stanza in the offline queue and keep the stream recycling.
 //!
 //! [`StanzaRouter::register`]: crate::handlers::router::StanzaRouter::register
 //!
@@ -139,6 +164,7 @@ impl Drop for InterceptorHandle {
 }
 
 /// One registered interceptor.
+#[derive(Clone)]
 pub(crate) struct Registration {
     pub(crate) id: u64,
     pub(crate) interceptor: Arc<dyn StanzaInterceptor>,
