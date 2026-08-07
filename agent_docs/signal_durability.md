@@ -82,6 +82,11 @@ The predicate is intentionally global. A pending lease for one address can
 force another send to flush, but no call site can accidentally omit an address
 whose ciphertext is already part of the stanza.
 
+Each gate carries its own lock-free non-empty flag so step 4 does not take the
+store locks a flush holds across backend I/O. The flag is owned by the gate and
+republished by every mutation of it, because an over-reporting flag only costs a
+redundant flush while an under-reporting one publishes an unpersisted lease.
+
 Do not replace the batch-safe flush with a raw cache flush. During offline
 drain, inbound rows must become durable before their ratchet advances; otherwise
 a crash can turn redelivery into an acknowledged duplicate and lose the event.

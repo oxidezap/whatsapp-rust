@@ -66,6 +66,7 @@ enum Action {
     LossyClear,
     DeleteDm,
     DeleteGroup,
+    DeleteGroupDurable,
     CheckoutDuringFlush,
     RecoverGroup,
 }
@@ -89,7 +90,7 @@ impl SplitMix64 {
     }
 
     fn action(&mut self) -> Action {
-        match self.next() % 26 {
+        match self.next() % 27 {
             0 => Action::DmSend { fail_gate: true },
             1..=6 => Action::DmSend { fail_gate: false },
             7 => Action::GroupSend { fail_gate: true },
@@ -108,6 +109,7 @@ impl SplitMix64 {
             23 => Action::CheckoutDuringFlush,
             24 => Action::RecoverGroup,
             25 => Action::DmRatchet,
+            26 => Action::DeleteGroupDurable,
             _ => unreachable!(),
         }
     }
@@ -183,6 +185,11 @@ impl ChaosHarness {
                 self.cache
                     .delete_sender_key(self.group_name.cache_key())
                     .await;
+            }
+            Action::DeleteGroupDurable => {
+                self.cache
+                    .delete_sender_key_durable(&self.group_name, &self.backend)
+                    .await?;
             }
             Action::CheckoutDuringFlush => self.checkout_during_flush().await?,
             Action::RecoverGroup => self.recover_group().await?,
