@@ -56,20 +56,28 @@ const EMPTY_POOL_REPORT: HttpResourceReport = HttpResourceReport {
     inflight_bytes: None,
 };
 
-/// Latches that a request reached the wire, or at least tried to.
+/// Latches that ureq is about to be handed a request it can actually send.
 ///
-/// A bad URI or an invalid header is rejected while building the request, so no
-/// socket ever exists and the pool stays provably empty. Every other outcome,
-/// a failed connect included, leaves the pool in a state only ureq can see.
+/// Decided before dispatch rather than from the error afterwards, because the
+/// two are not the same question: a redirect to a malformed `Location` fails
+/// with the same `BadUri` as a malformed request, long after the first one
+/// reached the wire. Anything ureq refuses to build never opens a socket, so
+/// the pool stays provably empty; everything past this point is its business.
+///
+/// The two refusals: `headers_ref` reports a builder carrying a bad header name
+/// or value, and ureq rejects a URI with no host or no known scheme. Erring
+/// towards "not dispatchable" if that rule ever widens keeps the estimate a
+/// lower bound, which is the direction that stays honest.
+///
 /// Relaxed: the flag feeds an on-demand estimate, not a happens-before.
-fn note_dispatch<T>(
-    requested: &AtomicBool,
-    outcome: Result<T, ureq::Error>,
-) -> Result<T, ureq::Error> {
-    if !matches!(outcome, Err(ureq::Error::BadUri(_) | ureq::Error::Http(_))) {
+fn mark_if_dispatchable<Any>(requested: &AtomicBool, req: &ureq::RequestBuilder<Any>, url: &str) {
+    let dispatchable = req.headers_ref().is_some()
+        && ureq::http::Uri::try_from(url).is_ok_and(|uri| {
+            uri.authority().is_some() && matches!(uri.scheme_str(), Some("http" | "https"))
+        });
+    if dispatchable {
         requested.store(true, Ordering::Relaxed);
     }
-    outcome
 }
 
 impl UreqHttpClient {
@@ -204,19 +212,20 @@ impl HttpClient for UreqHttpClient {
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
-                    note_dispatch(&requested, req.call())?
+                    mark_if_dispatchable(&requested, &req, &request.url);
+                    req.call()?
                 }
                 "POST" => {
                     let mut req = status_as_response(agent.post(&request.url));
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
-                    let sent = if let Some(body) = request.body {
-                        req.send(&body[..])
+                    mark_if_dispatchable(&requested, &req, &request.url);
+                    if let Some(body) = request.body {
+                        req.send(&body[..])?
                     } else {
-                        req.send(&[])
-                    };
-                    note_dispatch(&requested, sent)?
+                        req.send(&[])?
+                    }
                 }
                 method => {
                     return Err(anyhow::anyhow!("Unsupported HTTP method: {}", method));
@@ -245,7 +254,8 @@ impl HttpClient for UreqHttpClient {
                 for (key, value) in &request.headers {
                     req = req.header(key, value);
                 }
-                note_dispatch(&self.requested, req.call())?
+                mark_if_dispatchable(&self.requested, &req, &request.url);
+                req.call()?
             }
             method => {
                 return Err(anyhow::anyhow!(
@@ -298,10 +308,8 @@ impl HttpClient for UreqHttpClient {
         let content_length = content_length.to_string();
         req = req.header("content-length", content_length.as_str());
 
-        let response = note_dispatch(
-            &self.requested,
-            req.send(ureq::SendBody::from_owned_reader(body)),
-        )?;
+        mark_if_dispatchable(&self.requested, &req, &request.url);
+        let response = req.send(ureq::SendBody::from_owned_reader(body))?;
 
         let status_code = response.status().as_u16();
         let body = read_body(response, self.max_body_bytes)?;
@@ -314,9 +322,8 @@ impl HttpClient for UreqHttpClient {
     /// ureq allocates per connection, not per agent, so an agent that has never
     /// connected holds no buffers at all: 2.8 KiB of measured RSS against the
     /// 96 KiB the cap advertises. Reporting the cap there put a quarter of a
-    /// session's estimate on memory that was not resident, and
-    /// [`wacore::stats::ResourceReport::total_estimated_bytes`] promises a lower
-    /// bound.
+    /// session's estimate on memory that was not resident, and the client's
+    /// `resource_report()` total promises a lower bound.
     fn resource_report(&self) -> Option<HttpResourceReport> {
         if !self.requested.load(Ordering::Relaxed) {
             return Some(EMPTY_POOL_REPORT);
@@ -683,6 +690,31 @@ mod tests {
         );
     }
 
+    /// A redirect to a malformed `Location` fails with the same error a
+    /// malformed request does, but the first hop already reached the wire. The
+    /// latch is decided before dispatch precisely so this case is not read as a
+    /// request that never left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redirect_to_a_bad_location_still_counts_as_dispatched() {
+        let url = spawn_status_server_with_headers(
+            302,
+            "Found",
+            &[("location", "://not-a-uri")],
+            Vec::new(),
+        );
+        let client = UreqHttpClient::new();
+        client
+            .execute(get(url))
+            .await
+            .expect_err("a redirect to a malformed location cannot be followed");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS),
+            "the first hop connected, so the pool is no longer provably empty"
+        );
+    }
+
     /// A transport failure still attempts a connection, so the estimate must
     /// switch on: what the pool holds after a failed connect is ureq's business,
     /// not something this client can rule out.
@@ -707,9 +739,22 @@ mod tests {
     /// Answers one request with `status` and `body`. The request body is drained
     /// first so a rejected upload never races a broken pipe against the response.
     fn spawn_status_server_with_body(status: u16, reason: &str, body: Vec<u8>) -> String {
+        spawn_status_server_with_headers(status, reason, &[], body)
+    }
+
+    fn spawn_status_server_with_headers(
+        status: u16,
+        reason: &str,
+        extra_headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().unwrap();
         let reason = reason.to_string();
+        let extra: String = extra_headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
         thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
@@ -736,7 +781,7 @@ mod tests {
                 }
             }
             let header = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             // Either write can fail: the client is free to hang up once it has
