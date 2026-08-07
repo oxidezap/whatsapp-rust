@@ -441,6 +441,20 @@ impl PreKeyAdapter {
     }
 }
 
+/// Diagnostic for a signed pre-key id that resolves nowhere.
+///
+/// Built here rather than inline so a test can prove the id survives into the
+/// message: `InvalidSignedPreKeyId` carries no payload, so this string is the
+/// only record of *which* id a peer asked for, and without it an incident cannot
+/// be told apart from a peer naming an id we never minted. Allocating is free in
+/// practice: an id that resolves never reaches this branch.
+fn unaddressable_signed_pre_key_warning(requested: u32, current: u32) -> String {
+    format!(
+        "signed pre-key {requested} is not addressable (current id {current}); \
+         the peer's prekey bundle predates our retention window"
+    )
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SignedPreKeyStore for SignedPreKeyAdapter {
@@ -462,7 +476,13 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
                 .map_err(signal_err("backend"))?;
         }
         record
-            .ok_or(SignalProtocolError::InvalidSignedPreKeyId)
+            .ok_or_else(|| {
+                log::warn!(
+                    "{}",
+                    unaddressable_signed_pre_key_warning(id, self.0.device().signed_pre_key_id)
+                );
+                SignalProtocolError::InvalidSignedPreKeyId
+            })
             .and_then(wacore_record::signed_prekey_structure_to_record)
     }
     async fn save_signed_pre_key(
@@ -587,6 +607,50 @@ mod tests {
                 .await
                 .is_ok(),
             "the adapter must resolve the promoted id from a fresh snapshot"
+        );
+    }
+
+    /// A production incident with this error is only actionable if the log says
+    /// which id was asked for and which one we hold: those two numbers are what
+    /// separate "the peer's bundle aged past our retention" from "the peer named
+    /// an id we never minted".
+    #[test]
+    fn the_unaddressable_warning_names_both_ids() {
+        let warning = unaddressable_signed_pre_key_warning(2, 5);
+        assert!(
+            warning.contains('2'),
+            "must name the requested id: {warning}"
+        );
+        assert!(warning.contains('5'), "must name the current id: {warning}");
+    }
+
+    /// The diagnostic is built inside `ok_or_else`, so an id that resolves must
+    /// never pay for it. Asserting the resolving path returns the record is the
+    /// observable form of "the hot path gained no work".
+    #[tokio::test]
+    async fn a_resolvable_id_never_reaches_the_diagnostic_branch() {
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let pm = test_persistence_manager(backend).await;
+        let current = pm.get_device_snapshot().signed_pre_key_id;
+        let adapter = SignalProtocolStoreAdapter::new(pm, Arc::new(SignalStoreCache::new()));
+
+        assert!(
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key(current.into())
+                .await
+                .is_ok(),
+            "the current id resolves on the first load"
+        );
+        assert!(
+            matches!(
+                adapter
+                    .signed_pre_key_store
+                    .get_signed_pre_key((current + 999).into())
+                    .await,
+                Err(SignalProtocolError::InvalidSignedPreKeyId)
+            ),
+            "an unknown id still reports InvalidSignedPreKeyId"
         );
     }
 

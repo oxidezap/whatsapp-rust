@@ -12,14 +12,22 @@ use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey, SignalProtocol
 use wacore::libsignal::store::record_helpers::new_signed_pre_key_record;
 use wacore::store::commands::DeviceCommand;
 
-/// Rotation cadence. This is the one value NOT grounded in the WA Web bundle
-/// (there it is a persisted background job with a server-tuned schedule), so
-/// treat it as a policy default that is safe to tune.
-pub(crate) const SIGNED_PRE_KEY_ROTATION_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1000; // weekly
+/// Rotation cadence, matching the interval WA Web's `ROTATE_KEY` task returns to
+/// its scheduler. Not configurable: there is no A/B property behind it, so a
+/// per-client override would only widen the API for a value the official client
+/// hardcodes. `rotate_signed_pre_key()` forces one out of band.
+pub(crate) const SIGNED_PRE_KEY_ROTATION_INTERVAL_MS: i64 = 27 * 24 * 60 * 60 * 1000;
+
+/// Retry delay after a transient (>= 500) upload rejection, capped at the
+/// cadence by [`rotation_timestamp_after_failed_upload`].
+pub(crate) const SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Total signed pre-keys kept addressable: the current key (device field) plus
-/// the RETENTION-1 most recent rotated-out keys in the backend table. Bounds
-/// the decrypt window for delayed prekey messages built against a rotated key.
+/// the RETENTION-1 most recent rotated-out keys in the backend table. With the
+/// cadence above a key stays decryptable for RETENTION * interval, and every
+/// private key past that is destroyed: WA Web never prunes, which buys interop
+/// by keeping every signed pre-key private key on disk forever, and that is the
+/// trade this bound refuses.
 pub(crate) const SIGNED_PRE_KEY_RETENTION: usize = 3;
 
 /// 24-bit ceiling, matching the one-time prekey id border. Ids advance by one
@@ -42,6 +50,33 @@ where
 pub(crate) fn should_rotate_signed_pre_key(last_rotation_ms: i64, now_ms: i64) -> bool {
     last_rotation_ms != 0
         && now_ms.saturating_sub(last_rotation_ms) >= SIGNED_PRE_KEY_ROTATION_INTERVAL_MS
+}
+
+/// Cadence timestamp to persist after a failed upload, or `None` to leave it
+/// untouched so the next connect retries immediately.
+///
+/// A rejection the server actually issued costs a round trip it will charge
+/// again on every reconnect, so it consumes the cadence; only a transient fault
+/// earns the shorter retry. An error that never reached the server (transport,
+/// encode, parse) may still have been accepted, so it stays on the per-connect
+/// retry that converges the staged key.
+pub(crate) fn rotation_timestamp_after_failed_upload(now_ms: i64, error: &IqError) -> Option<i64> {
+    let IqError::ServerError { code, .. } = error else {
+        return None;
+    };
+    let scheduled = if *code < 500 {
+        now_ms
+    } else {
+        // Expressed as a backdated cadence so the retry delay stays a property of
+        // the one timestamp `should_rotate_signed_pre_key` reads.
+        let retry_in =
+            SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS.min(SIGNED_PRE_KEY_ROTATION_INTERVAL_MS);
+        now_ms
+            .saturating_sub(SIGNED_PRE_KEY_ROTATION_INTERVAL_MS)
+            .saturating_add(retry_in)
+    };
+    // 0 is the "cadence never seeded" sentinel, which does not rotate at all.
+    Some(scheduled.max(1))
 }
 
 /// Next id = current + 1, wrapping at the 24-bit border back to 1.
@@ -97,9 +132,10 @@ impl Client {
     /// its private key, and the old id's decrypt window survives regardless. An
     /// ambiguous transport error (the server may have accepted `new_id`) leaves
     /// the staged key decryptable via the load fallback; a definitive rejection
-    /// just leaves the current key in place to retry — never advancing the
-    /// cadence or pruning the key the server still hands out. Calls are
-    /// serialized with the automatic rotation path.
+    /// leaves the current key in place, never pruning the key the server still
+    /// hands out. What a failure does to the cadence is
+    /// [`rotation_timestamp_after_failed_upload`]. Calls are serialized with the
+    /// automatic rotation path.
     pub async fn rotate_signed_pre_key(&self) -> Result<(), SignalMaintenanceError> {
         let _guard = self.signed_pre_key_rotation_lock.lock().await;
         self.rotate_signed_pre_key_inner().await
@@ -203,7 +239,7 @@ impl Client {
             .map_err(storage_err("failed to retain old signed pre-key"))?;
 
         // WA Web reads 406 = bad key, 409 = server validation fail, >=500 =
-        // transient; none advance local state or fail the automatic login path.
+        // transient; none promote the key or fail the automatic login path.
         // Deterministic rejections discard the candidate; retryable and
         // ambiguous failures retain it verbatim for the next attempt.
         let upload_result = self
@@ -249,6 +285,19 @@ impl Client {
                         "signed pre-key rotation upload failed: {error:?}; \
                          keeping the staged key, will retry on a later connect"
                     );
+                }
+                if let Some(next_rotation_ms) = rotation_timestamp_after_failed_upload(now, &error)
+                {
+                    self.persistence_manager
+                        .process_command(DeviceCommand::SetSignedPreKeyRotationBaseline(
+                            next_rotation_ms,
+                        ))
+                        .await;
+                    // A lost schedule write only costs an immediate retry, which is
+                    // exactly what not writing it at all would have done.
+                    if let Err(e) = self.persistence_manager.flush().await {
+                        log::warn!("failed to persist the signed pre-key rotation schedule: {e}");
+                    }
                 }
                 return Err(error.into());
             }
@@ -321,6 +370,85 @@ mod tests {
         ));
         // Clock skew backwards: saturating_sub yields 0, no rotation.
         assert!(!should_rotate_signed_pre_key(last, last - 1));
+    }
+
+    fn server_error(code: u16) -> IqError {
+        IqError::ServerError {
+            code,
+            text: "test".to_string(),
+            error_type: None,
+            backoff: None,
+        }
+    }
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn failed_upload_schedule_truth_table() {
+        // A verdict the server issued: it will issue the same one on every
+        // reconnect, so it consumes the cadence.
+        for code in [400, 401, 406, 409, 429, 499] {
+            assert_eq!(
+                rotation_timestamp_after_failed_upload(NOW, &server_error(code)),
+                Some(NOW),
+                "code {code} must consume the cadence"
+            );
+        }
+
+        // Transient server fault: shorter retry, expressed as a backdated
+        // cadence so `should_rotate_signed_pre_key` needs no second field.
+        let backoff_ts =
+            NOW - SIGNED_PRE_KEY_ROTATION_INTERVAL_MS + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS;
+        for code in [500, 503, 599] {
+            assert_eq!(
+                rotation_timestamp_after_failed_upload(NOW, &server_error(code)),
+                Some(backoff_ts),
+                "code {code} must schedule the server-error backoff"
+            );
+        }
+
+        // Never reached the server, or we cannot tell: retry on the next connect.
+        for error in [
+            IqError::Timeout,
+            IqError::NotConnected,
+            IqError::InternalChannelClosed,
+            IqError::UnexpectedResponseType { got: None },
+        ] {
+            assert_eq!(
+                rotation_timestamp_after_failed_upload(NOW, &error),
+                None,
+                "{error:?} must leave the cadence untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_error_backoff_defers_the_next_attempt_by_exactly_its_delay() {
+        let scheduled = rotation_timestamp_after_failed_upload(NOW, &server_error(503))
+            .expect("a 5xx schedules a retry");
+        assert!(!should_rotate_signed_pre_key(scheduled, NOW));
+        assert!(!should_rotate_signed_pre_key(
+            scheduled,
+            NOW + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS - 1
+        ));
+        assert!(should_rotate_signed_pre_key(
+            scheduled,
+            NOW + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS
+        ));
+    }
+
+    /// 0 means "cadence never seeded" and routes to the baseline path, which
+    /// does not rotate. A schedule that lands on it would disable rotation.
+    #[test]
+    fn a_scheduled_retry_is_never_the_unseeded_sentinel() {
+        for now in [0, 1, SIGNED_PRE_KEY_ROTATION_INTERVAL_MS] {
+            for code in [406, 503] {
+                assert_ne!(
+                    rotation_timestamp_after_failed_upload(now, &server_error(code)),
+                    Some(0)
+                );
+            }
+        }
     }
 
     #[test]
@@ -425,5 +553,314 @@ mod tests {
             .await
             .expect_err("an unusable staged key must abort the rotation");
         assert!(matches!(error, SignalMaintenanceError::CorruptKey(_)));
+    }
+
+    // ---- Round-trip fixtures for the upload paths ----
+
+    use std::sync::Arc;
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::node::Node;
+
+    fn iq_result(id: &str) -> Node {
+        NodeBuilder::new("iq")
+            .attr("id", id)
+            .attr("type", "result")
+            .build()
+    }
+
+    fn iq_error_response(id: &str, code: u16) -> Node {
+        NodeBuilder::new("iq")
+            .attr("id", id)
+            .attr("type", "error")
+            .children([NodeBuilder::new("error")
+                .attr("code", code.to_string())
+                .attr("text", "test-rejection")
+                .build()])
+            .build()
+    }
+
+    /// Backdate the cadence so the next `maybe_rotate_signed_pre_key()` is due.
+    async fn make_rotation_due(client: &Arc<Client>) {
+        let due = wacore::time::now_millis().saturating_sub(SIGNED_PRE_KEY_ROTATION_INTERVAL_MS);
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetSignedPreKeyRotationBaseline(due))
+            .await;
+        client
+            .persistence_manager
+            .flush()
+            .await
+            .expect("persist the due cadence");
+    }
+
+    /// Read the `<rotate>` IQ the client wrote as frame `frame` and answer it,
+    /// returning the signed pre-key id it carried.
+    async fn answer_rotation(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        frame: usize,
+        response: impl FnOnce(&str) -> Node,
+    ) -> u32 {
+        let iq = crate::test_utils::decode_sent_iq(transport, frame).await;
+        let iq = iq.get();
+        let skey = iq
+            .get_optional_child("rotate")
+            .expect("the upload is a <rotate>")
+            .get_optional_child("skey")
+            .expect("<rotate> carries an <skey>");
+        let id_bytes = skey
+            .get_optional_child("id")
+            .expect("<skey> carries an <id>")
+            .content_bytes()
+            .expect("the id is raw bytes")
+            .to_vec();
+        assert_eq!(id_bytes.len(), 3, "the wire id stays 3-byte big-endian");
+        let uploaded_id = u32::from_be_bytes([0, id_bytes[0], id_bytes[1], id_bytes[2]]);
+
+        let request_id = iq
+            .attrs()
+            .optional_string("id")
+            .expect("the IQ carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(client, &request_id, &response(&request_id)).await;
+        uploaded_id
+    }
+
+    /// Drive one full successful rotation, returning the promoted id.
+    async fn rotate_once(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        frame: usize,
+    ) -> u32 {
+        let task = {
+            let client = Arc::clone(client);
+            tokio::spawn(async move { client.rotate_signed_pre_key().await })
+        };
+        let uploaded = answer_rotation(client, transport, frame, iq_result).await;
+        task.await
+            .expect("the rotation task must not panic")
+            .expect("the rotation must succeed");
+        uploaded
+    }
+
+    /// The bug this batch exists for: 202 and 249 logins over 13 days were
+    /// observed in production, so an upload failure that leaves the cadence
+    /// untouched re-runs the whole stage/retain/upload flow on every one of
+    /// them. A transient server fault must buy a real delay instead.
+    #[tokio::test]
+    async fn a_server_error_upload_does_not_retry_on_the_next_connect() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        make_rotation_due(&client).await;
+
+        let attempt = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.maybe_rotate_signed_pre_key().await })
+        };
+        answer_rotation(&client, &transport, 0, |id| iq_error_response(id, 503)).await;
+        let error = attempt
+            .await
+            .expect("the rotation task must not panic")
+            .expect_err("a 503 must surface to the caller");
+        assert!(matches!(
+            error,
+            SignalMaintenanceError::Iq(IqError::ServerError { code: 503, .. })
+        ));
+
+        client
+            .maybe_rotate_signed_pre_key()
+            .await
+            .expect("the next connect must find the cadence not due");
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "a reconnect inside the backoff must not upload again"
+        );
+    }
+
+    /// A definitive rejection is deterministic: the server will answer the same
+    /// way on the next connect, so it consumes the cadence too. The staged key
+    /// is still dropped so the retry mints a fresh one.
+    #[tokio::test]
+    async fn a_rejected_key_is_discarded_and_still_consumes_the_cadence() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let before = client.persistence_manager.get_device_snapshot();
+        let staged_id = next_signed_pre_key_id(before.signed_pre_key_id);
+        make_rotation_due(&client).await;
+
+        let attempt = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.maybe_rotate_signed_pre_key().await })
+        };
+        answer_rotation(&client, &transport, 0, |id| iq_error_response(id, 406)).await;
+        attempt
+            .await
+            .expect("the rotation task must not panic")
+            .expect_err("a 406 must surface to the caller");
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .load_signed_prekey(staged_id)
+                .await
+                .expect("load the staged id")
+                .is_none(),
+            "a rejected candidate must not stay staged"
+        );
+        client
+            .maybe_rotate_signed_pre_key()
+            .await
+            .expect("the next connect must find the cadence not due");
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "a reconnect must not re-upload after a definitive rejection"
+        );
+    }
+
+    /// A failure that never reached the server is ambiguous: it may have been
+    /// accepted, so the staged key must be re-uploaded verbatim on the next
+    /// connect rather than sitting out the cadence.
+    #[tokio::test]
+    async fn an_ambiguous_transport_failure_retries_on_the_next_connect() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let staged_id = next_signed_pre_key_id(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .signed_pre_key_id,
+        );
+        make_rotation_due(&client).await;
+
+        let attempt = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.maybe_rotate_signed_pre_key().await })
+        };
+        // Drop the waiter without answering: the request went out and the
+        // response channel closes, which is what a dropped connection looks like.
+        let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request_id = iq
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("the IQ carries an id")
+            .into_owned();
+        crate::test_utils::poll_until("the IQ waiter to register", || {
+            client.response_waiters_guard().contains_key(&request_id)
+        })
+        .await;
+        drop(client.response_waiters_guard().remove(&request_id));
+        attempt
+            .await
+            .expect("the rotation task must not panic")
+            .expect_err("a dropped response must surface to the caller");
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .load_signed_prekey(staged_id)
+                .await
+                .expect("load the staged id")
+                .is_some(),
+            "the candidate the server may already hold must stay staged"
+        );
+        let retry = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.maybe_rotate_signed_pre_key().await })
+        };
+        let retried_id = answer_rotation(&client, &transport, 1, iq_result).await;
+        retry
+            .await
+            .expect("the retry task must not panic")
+            .expect("the retry must succeed");
+        assert_eq!(
+            retried_id, staged_id,
+            "the retry must re-upload the staged key, not a fresh one"
+        );
+    }
+
+    /// A successful rotation advances the cadence and leaves the key state
+    /// coherent: the id the server now advertises has a local private key, and
+    /// the one it replaced is still addressable.
+    #[tokio::test]
+    async fn a_successful_rotation_advances_the_cadence_and_keeps_both_keys_addressable() {
+        use wacore::libsignal::protocol::{GenericSignedPreKey, SignedPreKeyStore};
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let before = client.persistence_manager.get_device_snapshot();
+        let old_id = before.signed_pre_key_id;
+        let started = wacore::time::now_millis();
+
+        let promoted = rotate_once(&client, &transport, 0).await;
+        assert_eq!(promoted, next_signed_pre_key_id(old_id));
+
+        let after = client.persistence_manager.get_device_snapshot();
+        assert_eq!(after.signed_pre_key_id, promoted);
+        assert!(
+            after.last_signed_pre_key_rotation_ms >= started,
+            "a success must advance the cadence"
+        );
+
+        let store = client.signal_adapter().signed_pre_key_store;
+        let current = store
+            .get_signed_pre_key(promoted.into())
+            .await
+            .expect("the promoted id resolves");
+        assert_eq!(
+            current.public_key().expect("public"),
+            after.signed_pre_key.public_key,
+            "the advertised key must be the one we hold the private half of"
+        );
+        assert!(
+            current.private_key().is_ok(),
+            "the promoted record must carry its private key"
+        );
+        assert!(
+            store.get_signed_pre_key(old_id.into()).await.is_ok(),
+            "the replaced id must stay addressable"
+        );
+    }
+
+    /// Anchors `SIGNED_PRE_KEY_RETENTION` in behavior rather than opinion: after
+    /// enough rotations to fill the window, the oldest key still inside it
+    /// resolves and the one that just fell out does not. This is the symptom
+    /// from production, reproduced: a peer whose bundle names a key older than
+    /// the window gets `InvalidSignedPreKeyId`, and the id reaches a log.
+    #[tokio::test]
+    async fn the_retention_boundary_decides_which_ids_still_decrypt() {
+        use wacore::libsignal::protocol::SignedPreKeyStore;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let first_id = client
+            .persistence_manager
+            .get_device_snapshot()
+            .signed_pre_key_id;
+
+        // One rotation past the window: `first_id` is the key that just fell out.
+        let mut ids = vec![first_id];
+        for frame in 0..SIGNED_PRE_KEY_RETENTION {
+            ids.push(rotate_once(&client, &transport, frame).await);
+        }
+
+        let store = client.signal_adapter().signed_pre_key_store;
+        assert!(
+            matches!(
+                store.get_signed_pre_key(first_id.into()).await,
+                Err(SignalProtocolError::InvalidSignedPreKeyId)
+            ),
+            "the key one rotation past the window must not resolve"
+        );
+        for id in &ids[1..] {
+            assert!(
+                store.get_signed_pre_key((*id).into()).await.is_ok(),
+                "id {id} is inside the window and must still decrypt"
+            );
+        }
+        assert_eq!(
+            ids.len() - 1,
+            SIGNED_PRE_KEY_RETENTION,
+            "the window holds exactly RETENTION addressable keys"
+        );
     }
 }
