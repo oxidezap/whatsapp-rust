@@ -628,9 +628,12 @@ impl SqliteStore {
 
     async fn read_erased<T: Send + 'static>(&self, f: ReadQuery<T>) -> Result<T> {
         if self.reads.is_none() {
-            // No reader connections: the single pooled connection is what no
-            // writer can be holding while this query runs, so the snapshot
-            // comes for free and a transaction would only add statements.
+            // No reader connections: at the default `pool_size = 1` the single
+            // pooled connection is what no writer can hold while this query
+            // runs, so the snapshot is free and a transaction would only add
+            // statements. Raising `pool_size` breaks that — the writers that
+            // check out a connection without the permit could then commit
+            // mid-read — but it also deadlocks writes, so it stays unsupported.
             let pool = self.pool.clone();
             return self
                 .with_semaphore(move || {
@@ -6103,6 +6106,10 @@ mod read_routing_tests {
                     if n == ENTRIES {
                         return;
                     }
+                    // Both paths use the same blocking pool, so back-to-back
+                    // samples would compete with the writer for threads. Still
+                    // thousands of samples per batch.
+                    tokio::time::sleep(Duration::from_micros(200)).await;
                 }
             })
             .await;
@@ -6134,9 +6141,10 @@ mod read_routing_tests {
     ];
 
     /// Read-shaped methods that reach the database without going through
-    /// `read_query`, ignoring the ones excused above, plus how many were
-    /// scanned at all so the check cannot pass by matching nothing.
-    fn misrouted_reads(source: &str) -> (Vec<String>, usize) {
+    /// `read_query`: the ones with no excuse, the ones `ON_THE_WRITE_QUEUE`
+    /// excused, and how many were scanned at all so the check cannot pass by
+    /// matching nothing.
+    fn misrouted_reads(source: &str) -> (Vec<String>, Vec<String>, usize) {
         let source = source
             .split_once("\n#[cfg(test)]")
             .map(|(before, _)| before)
@@ -6144,6 +6152,7 @@ mod read_routing_tests {
 
         let mut current: Option<(&str, String)> = None;
         let mut offenders: Vec<String> = Vec::new();
+        let mut excused: Vec<String> = Vec::new();
         let mut scanned = 0usize;
         for line in source.lines() {
             if let Some((name, body)) = current.as_mut() {
@@ -6156,13 +6165,15 @@ mod read_routing_tests {
                     ]
                     .iter()
                     .any(|token| body.contains(token));
-                    if touches_db
-                        && !body.contains("read_query(")
-                        && !ON_THE_WRITE_QUEUE
+                    if touches_db && !body.contains("read_query(") {
+                        if ON_THE_WRITE_QUEUE
                             .iter()
                             .any(|(allowed, _)| allowed == name)
-                    {
-                        offenders.push((*name).to_string());
+                        {
+                            excused.push((*name).to_string());
+                        } else {
+                            offenders.push((*name).to_string());
+                        }
                     }
                     current = None;
                 } else {
@@ -6188,7 +6199,7 @@ mod read_routing_tests {
                 scanned += 1;
             }
         }
-        (offenders, scanned)
+        (offenders, excused, scanned)
     }
 
     /// A new read-only method written the old way (raw pool checkout, write
@@ -6197,7 +6208,7 @@ mod read_routing_tests {
     /// only place that can see the routing decision.
     #[test]
     fn read_shaped_methods_route_through_read_query() {
-        let (offenders, scanned) = misrouted_reads(include_str!("sqlite_store.rs"));
+        let (offenders, mut excused, scanned) = misrouted_reads(include_str!("sqlite_store.rs"));
         assert!(
             offenders.is_empty(),
             "read-only methods must call read_query (or be listed in ON_THE_WRITE_QUEUE \
@@ -6206,6 +6217,19 @@ mod read_routing_tests {
         assert!(
             scanned > 20,
             "the scan saw only {scanned} read-shaped methods"
+        );
+        // The allowlist has to be consumed in full, or an entry left behind by a
+        // later migration would silently excuse the next method of that name and
+        // its reason would be a lie.
+        let mut listed: Vec<String> = ON_THE_WRITE_QUEUE
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        listed.sort();
+        excused.sort();
+        assert_eq!(
+            excused, listed,
+            "every ON_THE_WRITE_QUEUE entry must still name a read that bypasses read_query"
         );
     }
 
@@ -6226,7 +6250,7 @@ impl SqliteStore {
 ";
         assert_eq!(
             misrouted_reads(regression),
-            (vec!["get_something_new".to_string()], 2)
+            (vec!["get_something_new".to_string()], Vec::new(), 2)
         );
     }
 }
