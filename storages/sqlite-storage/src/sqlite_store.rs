@@ -2578,9 +2578,16 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn get_lid_mapping(&self, lid: &str) -> Result<Option<LidPnMappingEntry>> {
+        // On the write queue: the alternate-namespace secret lookup resolves the
+        // peer through here with no cache in front, and a miss there is terminal
+        // for the addon. Waiting out a concurrent mapping write costs less.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let lid = lid.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Option<LidPnMappingEntry>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<(String, String, i64, String, i64)> = lid_pn_mapping::table
                 .select((
                     lid_pn_mapping::lid,
@@ -2591,7 +2598,7 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .filter(lid_pn_mapping::lid.eq(&lid))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
-                .first(conn)
+                .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row.map(
@@ -2608,9 +2615,14 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn get_pn_mapping(&self, phone: &str) -> Result<Option<LidPnMappingEntry>> {
+        // On the write queue for the same reason as get_lid_mapping.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let phone = phone.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Option<LidPnMappingEntry>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<(String, String, i64, String, i64)> = lid_pn_mapping::table
                 .select((
                     lid_pn_mapping::lid,
@@ -2622,7 +2634,7 @@ impl ProtocolStore for SqliteStore {
                 .filter(lid_pn_mapping::phone_number.eq(&phone))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
                 .order(lid_pn_mapping::updated_at.desc())
-                .first(conn)
+                .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row.map(
@@ -3596,28 +3608,12 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
-        // On the write queue for the same reason as get_msg_secret_with_ts.
-        let pool = self.pool.clone();
-        let device_id = self.device_id;
-        let chat = chat.to_string();
-        let sender = sender.to_string();
-        let msg_id = msg_id.to_string();
-        self.with_semaphore(move || -> Result<Option<Vec<u8>>> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let row: Option<Vec<u8>> = msg_secrets::table
-                .select(msg_secrets::secret)
-                .filter(msg_secrets::chat.eq(&chat))
-                .filter(msg_secrets::sender.eq(&sender))
-                .filter(msg_secrets::msg_id.eq(&msg_id))
-                .filter(msg_secrets::device_id.eq(device_id))
-                .first(&mut conn)
-                .optional()
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(row)
-        })
-        .await
+        // Same row, one column narrower: delegating keeps the query and the
+        // routing decision in one place rather than two that can drift.
+        Ok(self
+            .get_msg_secret_with_ts(chat, sender, msg_id)
+            .await?
+            .map(|(secret, _)| secret))
     }
 
     async fn get_msg_secret_with_ts(
@@ -6125,11 +6121,16 @@ mod read_routing_tests {
              and forces an unnecessary redelivery",
         ),
         (
-            "get_msg_secret",
+            "get_msg_secret_with_ts",
             "a miss is terminal for the reaction/vote/edit, so the lookup must wait \
              out a concurrent secret write rather than read the snapshot before it",
         ),
-        ("get_msg_secret_with_ts", "same as get_msg_secret"),
+        (
+            "get_lid_mapping",
+            "resolves the alternate namespace for that same secret lookup, with no \
+             cache in front on that path, so a stale miss loses the addon too",
+        ),
+        ("get_pn_mapping", "same as get_lid_mapping"),
     ];
 
     /// Read-shaped methods that reach the database without going through
