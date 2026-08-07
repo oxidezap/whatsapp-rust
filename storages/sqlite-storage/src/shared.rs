@@ -105,7 +105,7 @@ impl SharedSqlite {
 /// [`StoreError`] deliberately has no such conversion (callers choose how a
 /// database error is classified), so both travel in one enum and unwrap on the
 /// way out.
-fn read_snapshot<T>(
+pub(crate) fn read_snapshot<T>(
     conn: &mut SqliteConnection,
     f: impl FnOnce(&mut SqliteConnection) -> Result<T>,
 ) -> Result<T> {
