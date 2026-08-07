@@ -635,12 +635,25 @@ impl SqliteStore {
     }
 
     async fn read_erased<T: Send + 'static>(&self, f: ReadQuery<T>) -> Result<T> {
-        // Skip the deferred snapshot only where it is redundant or unsafe: at
-        // `pool_size = 1` with no readers the exclusive pooled connection is
-        // itself the snapshot (no writer can be on it, including the ones that
-        // skip the permit), and under shared cache or without WAL a read
-        // transaction would lock the writer out instead.
-        if self.reads.is_none() && (self.pool.max_size() <= 1 || !self.snapshot_safe) {
+        // Default profile: one pooled connection and no readers. Checking it out
+        // is both the serialization and the snapshot, so this takes no permit --
+        // adding one would serialize the `spawn_blocking` dispatch that the
+        // pool wait currently overlaps, which measured ~25% on p50.
+        if self.reads.is_none() && self.pool.max_size() <= 1 {
+            let pool = self.pool.clone();
+            return tokio::task::spawn_blocking(move || {
+                let mut conn = pool
+                    .get()
+                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
+                f(&mut conn)
+            })
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        }
+        // Wider pool, but a read transaction would take shared-cache table locks
+        // the writer cannot wait out: fall back to the permit for what ordering
+        // it can give.
+        if self.reads.is_none() && !self.snapshot_safe {
             let pool = self.pool.clone();
             return self
                 .with_semaphore(move || {
