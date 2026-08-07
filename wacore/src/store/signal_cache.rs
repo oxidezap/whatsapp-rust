@@ -2020,11 +2020,15 @@ mod sender_key_lock_tests {
         async fn remove_signed_prekey(&self, _: u32) -> StoreResult<()> {
             unreachable!()
         }
-        async fn put_sender_key(&self, _: &str, _: &[u8]) -> StoreResult<()> {
-            unreachable!()
+        /// A flush writes through here, so the payload a later read samples is
+        /// the one the flush persisted, as a real backend behaves.
+        async fn put_sender_key(&self, _: &str, record: &[u8]) -> StoreResult<()> {
+            self.set_payload(Some(record.to_vec()));
+            Ok(())
         }
         async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
-            unreachable!()
+            self.set_payload(None);
+            Ok(())
         }
     }
 
@@ -2316,6 +2320,55 @@ mod sender_key_lock_tests {
             backend.hits() - hits_before,
             1,
             "a cancelled read must not push later reads onto the retry path"
+        );
+    }
+
+    /// The keyed removal path is what the other race tests drive. `clear` and
+    /// `retain` cannot name the keys they drop, so they take a separate branch
+    /// that concedes every in-flight reader — and that is the branch where a
+    /// missing bump would let pre-write bytes be adopted as an exact reload.
+    /// Drives it through the real flush-then-`clear_after_flush` sequence.
+    #[tokio::test]
+    async fn a_write_dropped_by_clear_after_flush_is_not_replaced_by_the_stale_read() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedSenderKeyLookup::new(
+            1,
+            Some(
+                sender_key_record_with_chain(1)
+                    .serialize()
+                    .expect("serialize record"),
+            ),
+        ));
+        let name = Arc::new(SenderKeyName::from_parts(
+            "19995550019@g.us",
+            "19995550020@s.whatsapp.net:0",
+        ));
+
+        let reader = tokio::spawn({
+            let (cache, backend, name) = (cache.clone(), backend.clone(), name.clone());
+            async move { cache.get_sender_key(&name, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        // A newer chain lands, is flushed (which writes it through to the
+        // backend), and teardown then drops it from the cache — the opaque
+        // removal path, not the keyed one.
+        cache
+            .put_sender_key(&name, sender_key_record_with_chain(2))
+            .await;
+        cache.flush(&*backend).await.expect("flush");
+        cache.clear_after_flush().await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold load")
+            .expect("record present");
+        assert_eq!(
+            chain_id_of(&observed),
+            2,
+            "an unnamed removal must still reject bytes that predate the write"
         );
     }
 

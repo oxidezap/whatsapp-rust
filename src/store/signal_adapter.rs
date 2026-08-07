@@ -590,6 +590,52 @@ mod tests {
         );
     }
 
+    /// The window the re-read closes is intra-call: the promotion can land
+    /// after the first snapshot is taken and before its backend lookup
+    /// resolves. Parks that lookup, promotes, then releases, so the retry is
+    /// the only thing that can produce an answer.
+    #[tokio::test]
+    async fn a_promotion_racing_a_lookup_is_resolved_by_the_retry() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::store::commands::DeviceCommand;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let pm = test_persistence_manager(backend.clone()).await;
+        let promoted_id = pm.get_device_snapshot().signed_pre_key_id + 1;
+
+        // Built before the promotion, so its first snapshot is the stale one.
+        let adapter =
+            SignalProtocolStoreAdapter::new(pm.clone(), Arc::new(SignalStoreCache::new()));
+
+        let gate = Arc::new(async_lock::Barrier::new(2));
+        backend.gate_next_signed_prekey_read(gate.clone());
+
+        let lookup = tokio::spawn(async move {
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key(promoted_id.into())
+                .await
+        });
+
+        // The first load is now parked inside the backend, holding a snapshot
+        // that predates everything below.
+        gate.wait().await;
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        pm.process_command(DeviceCommand::SetSignedPreKey {
+            key_pair,
+            id: promoted_id,
+            signature: [0u8; 64],
+            rotation_ms: 0,
+        })
+        .await;
+        gate.wait().await;
+
+        assert!(
+            lookup.await.expect("lookup task").is_ok(),
+            "the retry must resolve an id promoted mid-lookup"
+        );
+    }
+
     /// The inbound decrypt path consumes a one-time prekey and buffers it via
     /// `buffer_consumed_prekey`. It must NOT delete the prekey from the backend
     /// synchronously: the promoted session is still volatile at that point, so an
