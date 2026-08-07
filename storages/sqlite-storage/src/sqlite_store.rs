@@ -3596,18 +3596,23 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
+        // On the write queue for the same reason as get_msg_secret_with_ts.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Option<Vec<u8>>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<Vec<u8>> = msg_secrets::table
                 .select(msg_secrets::secret)
                 .filter(msg_secrets::chat.eq(&chat))
                 .filter(msg_secrets::sender.eq(&sender))
                 .filter(msg_secrets::msg_id.eq(&msg_id))
                 .filter(msg_secrets::device_id.eq(device_id))
-                .first(conn)
+                .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row)
@@ -3621,22 +3626,26 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<(Vec<u8>, i64)>> {
-        // Never a raw pooled read: a read racing a write transaction must wait,
-        // not error out as a phantom miss. `read_query` either holds the write
-        // permit or uses a WAL reader, and the shared-cache table lock that
-        // `busy_timeout` cannot absorb only exists in the former's stores.
+        // Stays on the write queue, so a lookup racing a secret write waits for
+        // it instead of reading the snapshot before it. A miss here is terminal
+        // -- the reaction, vote or edit is dropped with no retry -- and history
+        // sync seeds secrets in one large batch straight to the backend.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Option<(Vec<u8>, i64)>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<(Vec<u8>, i64)> = msg_secrets::table
                 .select((msg_secrets::secret, msg_secrets::message_ts))
                 .filter(msg_secrets::chat.eq(&chat))
                 .filter(msg_secrets::sender.eq(&sender))
                 .filter(msg_secrets::msg_id.eq(&msg_id))
                 .filter(msg_secrets::device_id.eq(device_id))
-                .first(conn)
+                .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row)
@@ -6109,11 +6118,19 @@ mod read_routing_tests {
     /// Read-only methods left on the write queue on purpose, with the reason.
     /// Anything else matching a read-shaped name has to route through
     /// `read_query` or this test fails.
-    const ON_THE_WRITE_QUEUE: &[(&str, &str)] = &[(
-        "get_pending_inbound",
-        "retries SQLITE_BUSY on the write queue: a read error here fails closed \
-         and forces an unnecessary redelivery",
-    )];
+    const ON_THE_WRITE_QUEUE: &[(&str, &str)] = &[
+        (
+            "get_pending_inbound",
+            "retries SQLITE_BUSY on the write queue: a read error here fails closed \
+             and forces an unnecessary redelivery",
+        ),
+        (
+            "get_msg_secret",
+            "a miss is terminal for the reaction/vote/edit, so the lookup must wait \
+             out a concurrent secret write rather than read the snapshot before it",
+        ),
+        ("get_msg_secret_with_ts", "same as get_msg_secret"),
+    ];
 
     /// Read-shaped methods that reach the database without going through
     /// `read_query`, ignoring the ones excused above, plus how many were
