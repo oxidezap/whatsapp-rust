@@ -101,6 +101,9 @@ const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
 /// once per return type rather than once per call site.
 type ReadQuery<T> = Box<dyn FnOnce(&mut SqliteConnection) -> Result<T> + Send>;
 
+/// A unit of work for the write queue, erased for the same reason.
+type BlockingJob<T> = Box<dyn FnOnce() -> Result<T> + Send>;
+
 /// Reader connections and the permits that bound how many run at once.
 #[derive(Clone)]
 pub(crate) struct ReadPool {
@@ -635,39 +638,39 @@ impl SqliteStore {
     }
 
     async fn read_erased<T: Send + 'static>(&self, f: ReadQuery<T>) -> Result<T> {
-        // Default profile: one pooled connection and no readers. Checking it out
-        // is both the serialization and the snapshot, so this takes no permit --
-        // adding one would serialize the `spawn_blocking` dispatch that the
-        // pool wait currently overlaps, which measured ~25% on p50.
-        if self.reads.is_none() && self.pool.max_size() <= 1 {
-            let pool = self.pool.clone();
-            return tokio::task::spawn_blocking(move || {
-                let mut conn = pool
-                    .get()
-                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                f(&mut conn)
-            })
-            .await
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        // A deferred read transaction is what pins the snapshot, so take one
+        // wherever real concurrency sits behind it: reader connections, or a
+        // wider write pool on a database where a read transaction cannot lock
+        // the writer out. One implementation, shared with the sibling crates.
+        if self.reads.is_some() || (self.snapshot_safe && self.pool.max_size() > 1) {
+            return self.shared().read(f).await;
         }
-        // Wider pool, but a read transaction would take shared-cache table locks
-        // the writer cannot wait out: fall back to the permit for what ordering
-        // it can give.
-        if self.reads.is_none() && !self.snapshot_safe {
-            let pool = self.pool.clone();
-            return self
-                .with_semaphore(move || {
-                    let mut conn = pool
-                        .get()
-                        .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                    f(&mut conn)
-                })
-                .await;
-        }
-        // Otherwise the deferred read transaction is what pins the snapshot,
-        // whether the concurrency comes from reader connections or from a wider
-        // write pool. One implementation, shared with the sibling-crate path.
-        self.shared().read(f).await
+        // No snapshot to take here. With the default single connection, checking
+        // it out is both the serialization and the snapshot, so this takes no
+        // permit -- adding one would serialize the `spawn_blocking` dispatch that
+        // the pool wait currently overlaps, which measured ~25% on p50. With a
+        // wider pool the permit is the only ordering left.
+        let permit = if self.pool.max_size() > 1 {
+            Some(
+                self.db_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| StoreError::Database(Box::new(e)))?,
+            )
+        } else {
+            None
+        };
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            f(&mut conn)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     /// The write queue: one permit, so two writers can never deadlock on the
@@ -677,6 +680,13 @@ impl SqliteStore {
         F: FnOnce() -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        // Erased for the same reason as [`Self::read_query`]: the body carries a
+        // permit acquire and a `spawn_blocking`, and there are enough call sites
+        // that monomorphizing it per closure type costs tens of KiB of .text.
+        self.with_semaphore_erased(Box::new(f)).await
+    }
+
+    async fn with_semaphore_erased<T: Send + 'static>(&self, f: BlockingJob<T>) -> Result<T> {
         let permit = self
             .db_semaphore
             .clone()
