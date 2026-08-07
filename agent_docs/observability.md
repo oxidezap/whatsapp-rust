@@ -176,6 +176,40 @@ reliable signal and `freed`/`net` drift for buffers that outlive their poll.
 file-backed pages — useful for a process holding many small per-session DBs. WAL
 caveat: mmap covers reads of the main DB file; writes still go through the WAL.
 
+## Fixed process cost vs per-session cost
+
+A process that runs one session pays far more than a process that runs ten
+divided by ten. `tests/e2e/tests/process_footprint.rs` measures the split:
+`client_construction_footprint` (no mock server needed) for what a `Client`
+costs before it talks to anything, `session_footprint_fixed_vs_marginal` for a
+connected, paired, synced session. Both build N clients in one process
+(`FOOTPRINT_CLIENTS`, default 16) and log a per-client table plus first /
+second / median-marginal deltas.
+
+Report the marginal and the fixed number, never the average over N: the average
+is dominated by the first client and hides the very asymmetry the split exists
+to expose.
+
+Read the `anon` column. `/proc/self/status` splits RSS into `RssAnon` and
+`RssFile`, and the first client's RSS delta is overwhelmingly `RssFile`: the
+executable's own text and rodata faulted in the first time each code path runs.
+That is bounded by the binary, shared by every session in the process, backed by
+the page cache rather than by the allocator, and roughly 3.5x smaller under the
+release profile than under `dev`. Anonymous growth is the part a consumer can
+act on, and it is two orders of magnitude smaller.
+
+Two consequences for anything measured this way:
+
+- A one-off RSS jump on a path's first execution is not a leak and not
+  attributable to the session that happened to run it first. Compare against a
+  control step that does no work at all; in `dev` builds a single `println!`
+  moves `RssFile` by ~2 MiB.
+- Static tables (the binary protocol token maps, `webpki-roots`) never appear in
+  `anon` at all, and the protobuf descriptor is consumed at build time, so none
+  of them scale with sessions. The lazily built codec tables under the `voip`
+  features do: they are `OnceLock` heap, process-wide, and only materialize once
+  a call is encoded.
+
 ## Relation to the `metrics`/`tracing` features
 
 `wacore::telemetry` (cargo feature `metrics`) emits process-global counters
