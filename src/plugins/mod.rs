@@ -4560,30 +4560,51 @@ mod tests {
         for _ in 0..64 {
             let tracker = TaskTracker::new();
             let start = Arc::new(Barrier::new(5));
+            // Published by the closer the instant `close()` returns. Read
+            // BEFORE each attempt: seeing it set means close already returned,
+            // so a registration that then succeeds is a violation on its own,
+            // with no shared count to launder it.
+            let closed = Arc::new(AtomicBool::new(false));
 
             let registrars: Vec<_> = (0..4)
                 .map(|_| {
                     let tracker = Arc::clone(&tracker);
                     let start = Arc::clone(&start);
+                    let closed = Arc::clone(&closed);
                     std::thread::spawn(move || {
                         start.wait();
-                        // Hold every lease so the post-close count is the exact
-                        // number of grants rather than a survivor count.
-                        std::iter::from_fn(|| tracker.register().ok())
-                            .take(256)
-                            .collect::<Vec<_>>()
+                        let mut late = 0usize;
+                        // The leases are handed back rather than dropped here,
+                        // so the count the closer sampled stays comparable.
+                        let leases: Vec<_> = std::iter::from_fn(|| {
+                            let seen_closed = closed.load(Ordering::SeqCst);
+                            let lease = tracker.register().ok()?;
+                            if seen_closed {
+                                late += 1;
+                            }
+                            Some(lease)
+                        })
+                        .take(256)
+                        .collect();
+                        (leases, late)
                     })
                 })
                 .collect();
 
             start.wait();
             tracker.close();
+            closed.store(true, Ordering::SeqCst);
             let after_close = tracker.active();
 
-            let granted: usize = registrars
+            let results: Vec<_> = registrars
                 .into_iter()
-                .map(|t| t.join().expect("registrar thread").len())
-                .sum();
+                .map(|t| t.join().expect("registrar thread"))
+                .collect();
+            let granted: usize = results.iter().map(|(leases, _)| leases.len()).sum();
+            let late: usize = results.iter().map(|(_, late)| late).sum();
+            assert_eq!(late, 0, "register granted a lease after close() returned");
+            // Second net, for a grant that slipped in before the flag above was
+            // published: the count may not grow past the post-close sample.
             assert_eq!(
                 granted, after_close,
                 "register granted a lease after close() returned"

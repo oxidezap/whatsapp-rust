@@ -375,32 +375,51 @@ mod tests {
         for _ in 0..64 {
             let scope = Arc::new(FlushScope::new());
             let start = Arc::new(std::sync::Barrier::new(5));
+            // Published by the closer the instant `close()` returns. Read
+            // BEFORE each attempt: seeing it set means close already returned,
+            // so a grant that then succeeds is a violation on its own, with no
+            // shared count to launder it.
+            let closed = Arc::new(AtomicBool::new(false));
 
             let trackers: Vec<_> = (0..4)
                 .map(|_| {
                     let scope = Arc::clone(&scope);
                     let start = Arc::clone(&start);
+                    let closed = Arc::clone(&closed);
                     std::thread::spawn(move || {
                         start.wait();
-                        // Keep every guard alive so `pending()` after the join
-                        // is the exact number of grants, not a survivor count.
-                        std::iter::from_fn(|| scope.try_track())
-                            .take(256)
-                            .collect::<Vec<_>>()
+                        let mut late = 0usize;
+                        // The guards are handed back rather than dropped here,
+                        // so the count the closer sampled stays comparable.
+                        let guards: Vec<_> = std::iter::from_fn(|| {
+                            let seen_closed = closed.load(Ordering::SeqCst);
+                            let guard = scope.try_track()?;
+                            if seen_closed {
+                                late += 1;
+                            }
+                            Some(guard)
+                        })
+                        .take(256)
+                        .collect();
+                        (guards, late)
                     })
                 })
                 .collect();
 
             start.wait();
             scope.close();
-            // Nothing may be granted from here on, whatever the racers are
-            // still doing.
+            closed.store(true, Ordering::SeqCst);
             let after_close = scope.pending();
 
-            let granted: usize = trackers
+            let results: Vec<_> = trackers
                 .into_iter()
-                .map(|t| t.join().expect("tracker thread").len())
-                .sum();
+                .map(|t| t.join().expect("tracker thread"))
+                .collect();
+            let granted: usize = results.iter().map(|(guards, _)| guards.len()).sum();
+            let late: usize = results.iter().map(|(_, late)| late).sum();
+            assert_eq!(late, 0, "try_track granted a guard after close() returned");
+            // Second net, for a grant that slipped in before the flag above was
+            // published: the count may not grow past the post-close sample.
             assert_eq!(
                 granted, after_close,
                 "try_track granted a guard after close() returned"
