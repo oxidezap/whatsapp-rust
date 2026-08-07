@@ -930,7 +930,7 @@ impl Client {
         let encoded = pre_encoded
             .filter(|_| can_reuse_encoding)
             .or(encoded_fallback.as_deref());
-        let device_store = self.persistence_manager.get_device_snapshot();
+        let device_store = self.persistence_manager.clone();
         let mut store_adapter = self.signal_adapter_from(device_store);
         let mut stores = store_adapter.as_signal_stores();
         let edit = wacore::types::message::EditAttribute::infer_from_message(&message);

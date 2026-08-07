@@ -1137,7 +1137,7 @@ impl Client {
         self.add_recent_message(&to, &request_id, &message, shared_content.clone())
             .await;
 
-        let device_store_arc = self.persistence_manager.get_device_snapshot();
+        let device_store_arc = self.persistence_manager.clone();
         let to_str = to.to_string();
         let distribution_guard = self.group_distribution_lock(&to).await;
 
@@ -1981,7 +1981,7 @@ impl Client {
                     .await;
             }
 
-            let device_store_arc = self.persistence_manager.get_device_snapshot();
+            let device_store_arc = self.persistence_manager.clone();
             let to_str = to.to_string();
 
             let (own_sending_jid, _) = match group_info.addressing_mode {
