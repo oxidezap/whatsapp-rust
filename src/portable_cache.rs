@@ -25,9 +25,9 @@ use wacore::time::Instant;
 /// Renewal only exists to keep an in-use entry from idling out, so it does not
 /// have to be exact. Skipping it leaves the stamp at most `tti / this` behind,
 /// which can only expire an entry that much *early*, never keep an expired one
-/// alive. In exchange a key is renewed at most once per that window however hot
-/// it is, so a read-saturated cache stays on the read lock instead of
-/// serialising every lookup behind a writer.
+/// alive. In exchange a hot key leaves the read path only at a window boundary
+/// rather than on every lookup, so a read-saturated cache no longer serialises
+/// behind a writer.
 const TTI_RENEWAL_DIVISOR: u32 = 16;
 
 struct CacheEntry<V> {
@@ -427,11 +427,11 @@ where
 
         if let Some(now) = renew_at {
             let mut guard = self.inner.write().await;
-            // Look the key up again rather than re-inserting: a concurrent
-            // invalidate must not be undone, and a concurrent write may already
-            // have stamped a later access than the one observed above.
+            // Re-decide under the lock: the key may have been invalidated (the
+            // miss leaves it that way) or already refreshed by a racing renewal
+            // or insert, whose newer stamp this lookup must leave alone.
             if let Some(entry) = guard.map.get_mut(key)
-                && entry.last_accessed_at < now
+                && self.needs_tti_renewal(entry, now)
             {
                 entry.last_accessed_at = now;
             }
@@ -1164,6 +1164,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(renewed, "a lookup past the tolerance must renew the stamp");
+    }
+
+    /// A burst of lookups crossing the tolerance together all decide to renew
+    /// under their read guards. Each re-decides under the write lock, so the
+    /// ones queued behind the first find the entry already fresh and leave its
+    /// stamp alone instead of each pushing it further forward.
+    #[tokio::test]
+    async fn a_concurrent_burst_past_the_tolerance_renews_once() {
+        // 4s TTI => 250ms tolerance.
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(4))
+            .build();
+        cache.insert("k".into(), 1).await;
+
+        let stamp = |cache: PortableCache<String, u32>| async move {
+            cache
+                .inner
+                .read()
+                .await
+                .map
+                .get("k")
+                .unwrap()
+                .last_accessed_at
+        };
+        let before = stamp(cache.clone()).await;
+
+        // Idle past the tolerance without touching the cache, so the whole
+        // burst observes the same stale stamp.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache.get("k").await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), Some(1), "every lookup is still served");
+        }
+
+        let after = stamp(cache.clone()).await;
+        assert!(after > before, "the burst renewed the stale stamp");
+        // The renewal that won moved the stamp inside the tolerance, so a
+        // follow-up lookup is back on the read path rather than renewing again.
+        let settled = stamp(cache.clone()).await;
+        assert_eq!(cache.get("k").await, Some(1));
+        assert_eq!(
+            stamp(cache.clone()).await,
+            settled,
+            "a lookup right after a renewal must not restamp"
+        );
     }
 
     /// Failure case: an entry that idled past its TTI must be removed and never
