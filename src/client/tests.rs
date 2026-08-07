@@ -4800,10 +4800,17 @@ async fn reconnect_cleanup_leaves_the_write_once_cells_installed() {
 async fn concurrent_first_readers_agree_on_one_instance() {
     let client = crate::test_utils::create_test_client().await;
 
-    let readers: Vec<_> = (0..16)
+    // Without the barrier the first task can finish initializing before the
+    // last one is even spawned, which is the one interleaving this must not measure.
+    const READERS: usize = 16;
+    let start = Arc::new(tokio::sync::Barrier::new(READERS));
+
+    let readers: Vec<_> = (0..READERS)
         .map(|_| {
             let client = client.clone();
+            let start = start.clone();
             tokio::spawn(async move {
+                start.wait().await;
                 (
                     client.get_group_cache().clone(),
                     client.get_app_state_processor().clone(),
