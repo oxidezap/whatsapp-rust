@@ -1149,10 +1149,19 @@ impl DeviceStore for InMemoryBackend {
             }
         );
 
+        // `chat` and `sender` are deliberately one `Arc<str>` shared by every
+        // row of a conversation, and `sender` often aliases `chat` outright, so
+        // a per-row sum would bill one allocation once per message. Dedup by
+        // data pointer counts each exactly once.
         bytes += hb_table_bytes(&state.msg_secrets);
         rows += state.msg_secrets.len() as u64;
+        let mut counted: std::collections::HashSet<*const u8> = std::collections::HashSet::new();
         for key in state.msg_secrets.keys() {
-            bytes += key.chat.len() + key.sender.len() + key.msg_id.len();
+            for shared in [&key.chat, &key.sender, &key.msg_id] {
+                if counted.insert(shared.as_ptr()) {
+                    bytes += shared.len();
+                }
+            }
         }
 
         if state.device.is_some() {
@@ -1890,6 +1899,61 @@ mod tests {
         assert!(
             growth < payload * 2,
             "reported {growth} is implausibly far above the {payload} payload bytes"
+        );
+    }
+
+    /// Rows of one conversation share a single `chat`/`sender` allocation, so
+    /// the report must bill it once however many messages reference it. Two
+    /// backends differing only in whether that `Arc` is shared isolate the
+    /// dedup from table growth, which is identical on both sides.
+    #[tokio::test]
+    async fn shared_msg_secret_strings_are_counted_once() {
+        const ROWS: usize = 40;
+        const JID: &str = "15550000001@s.whatsapp.net";
+
+        async fn report_for(chat_for: impl Fn(usize) -> Arc<str>) -> u64 {
+            let backend = InMemoryBackend::new();
+            let rows = (0..ROWS)
+                .map(|i| MsgSecretEntry {
+                    chat: chat_for(i),
+                    sender: chat_for(i),
+                    msg_id: format!("m{i:04}").into(),
+                    secret: [9u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    expires_at: 0,
+                    message_ts: 0,
+                })
+                .collect();
+            backend.put_msg_secrets(rows).await.unwrap();
+            backend.resource_report().await.memory_bytes.unwrap()
+        }
+
+        let one_arc: Arc<str> = JID.into();
+        let shared = report_for(|_| one_arc.clone()).await;
+        // Same bytes, same row count, but one allocation per row.
+        let distinct = report_for(|_| Arc::from(JID)).await;
+
+        assert!(
+            distinct > shared,
+            "distinct allocations ({distinct}) must cost more than one shared one ({shared})"
+        );
+        // Sharing saves every copy but the one the report still counts.
+        let saved = (distinct - shared) as usize;
+        assert_eq!(saved, (2 * ROWS - 1) * JID.len());
+    }
+
+    /// The device row is a deliberate lower bound: its flat `size_of` only, with
+    /// its owned heap left unwalked. Pinned so the choice stays a decision.
+    #[tokio::test]
+    async fn the_device_row_counts_as_its_flat_size() {
+        let backend = InMemoryBackend::new();
+        let empty = backend.resource_report().await;
+        backend.create().await.unwrap();
+        let stored = backend.resource_report().await;
+
+        assert_eq!(stored.pages, Some(empty.pages.unwrap() + 1));
+        assert_eq!(
+            stored.memory_bytes.unwrap() - empty.memory_bytes.unwrap(),
+            size_of::<Device>() as u64,
         );
     }
 

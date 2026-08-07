@@ -19,22 +19,25 @@ fn env_or(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Current RSS in KiB from /proc/self/status (no page-size assumption).
-fn rss_kib() -> usize {
+/// Current RSS in KiB from /proc/self/status (no page-size assumption), or
+/// `None` where that file does not exist or carries no `VmRSS`. Absent RSS has
+/// to stay distinguishable from zero RSS: folded to 0 it would silently turn
+/// every delta into 0 and report an attribution of 0%.
+fn rss_kib() -> Option<usize> {
     let mut buf = String::new();
-    if std::fs::File::open("/proc/self/status")
+    std::fs::File::open("/proc/self/status")
         .and_then(|mut f| f.read_to_string(&mut buf))
-        .is_ok()
-    {
-        for line in buf.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:")
-                && let Some(kb_str) = rest.trim().strip_suffix("kB").map(str::trim)
-            {
-                return kb_str.parse().unwrap_or(0);
-            }
-        }
-    }
-    0
+        .ok()?;
+    buf.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?;
+        rest.trim().strip_suffix("kB")?.trim().parse().ok()
+    })
+}
+
+fn require_rss() -> anyhow::Result<usize> {
+    rss_kib().ok_or_else(|| {
+        anyhow::anyhow!("this harness measures RSS via /proc/self/status, which this host lacks")
+    })
 }
 
 struct Session {
@@ -69,7 +72,7 @@ async fn report_marginal_cost_per_session() -> anyhow::Result<()> {
     let count = env_or("SESSION_COUNT", 8);
     assert!(count >= 2, "a marginal cost needs at least two clients");
 
-    let baseline_kib = rss_kib();
+    let baseline_kib = require_rss()?;
     info!("=== PER-SESSION MEMORY: {count} clients, baseline RSS={baseline_kib}K ===");
 
     // Every client stays alive: dropping one would return its pages to the
@@ -81,7 +84,7 @@ async fn report_marginal_cost_per_session() -> anyhow::Result<()> {
     for index in 0..count {
         let client = TestClient::connect(&format!("permem_{index}")).await?;
         let report = client.client.resource_report().await;
-        let now_kib = rss_kib();
+        let now_kib = require_rss()?;
 
         sessions.push(Session {
             index,
@@ -131,19 +134,16 @@ async fn report_marginal_cost_per_session() -> anyhow::Result<()> {
         marginal_rss.saturating_sub(marginal_reported)
     );
 
-    // The report documents itself as a lower bound on retained bytes. RSS also
-    // carries allocator overhead (measured at ~1.1x live heap on glibc), so a
-    // report exceeding it means a component started inventing figures.
-    for s in marginal {
-        assert!(
-            s.reported_bytes <= s.rss_delta_bytes.saturating_mul(2),
-            "client {} reported {} B against {} B of RSS growth; \
-             total_estimated_bytes() is documented as a lower bound",
-            s.index,
-            s.reported_bytes,
-            s.rss_delta_bytes,
-        );
-    }
+    // The report documents itself as a lower bound on retained bytes, and RSS
+    // carries allocator overhead on top (~1.1x live heap on glibc), so a report
+    // above it means a component started inventing figures. Asserted on the
+    // medians, not per client: one client's delta is rounded to KiB and can be
+    // served from already-mapped pages, so a single quiet sample is normal.
+    assert!(
+        marginal_reported <= marginal_rss.saturating_mul(2),
+        "median report {marginal_reported} B against {marginal_rss} B of median RSS growth; \
+         total_estimated_bytes() is documented as a lower bound",
+    );
 
     for client in clients {
         client.disconnect().await;
