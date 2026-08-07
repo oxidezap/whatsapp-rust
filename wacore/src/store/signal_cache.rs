@@ -67,7 +67,13 @@ fn evict_clean_entries<V>(
 /// past the entries backing it. A rebuild leaves it no larger than the live key
 /// count, so the next one is that many inserts away.
 fn compact_users_if_needed<V>(cache: &mut UserIndexedCache<V>, max_entries: usize) {
-    if cache.users_len() > high_watermark(max_entries) {
+    // Both conditions matter. The watermark keeps the rebuild rare; requiring
+    // the index to exceed the live key count keeps it self-limiting, since a
+    // rebuild always lands at or below that count. Without it, a store holding
+    // more distinct users than the watermark — dirty entries that eviction
+    // cannot trim, as a run of failing flushes produces — would rebuild on
+    // every single update, under the global mutex.
+    if cache.users_len() > high_watermark(max_entries) && cache.users_len() > cache.len() {
         cache.compact_users();
     }
 }
@@ -218,10 +224,17 @@ impl<V> UserIndexedCache<V> {
         self.users.len()
     }
 
-    /// Retained bytes of the index itself, so `memory_stats` attributes the
-    /// second table rather than reporting only the primary map.
-    fn users_bytes(&self) -> usize {
-        self.users.iter().map(|user| user.len()).sum()
+    /// Retained bytes of the bookkeeping beside the primary map: the user
+    /// index, plus the removal window, whose keys outlive the entries they
+    /// name and so are owned solely here. Keeps `memory_stats` from reporting
+    /// only the map.
+    fn overhead_bytes(&self) -> usize {
+        self.users.iter().map(|user| user.len()).sum::<usize>()
+            + self
+                .recent_removals
+                .iter()
+                .map(|(_, key)| key.len() + size_of::<u64>())
+                .sum::<usize>()
     }
 
     fn get(&self, key: &str) -> Option<&V> {
@@ -1676,7 +1689,7 @@ impl SignalStoreCache {
                     }
                 })
                 .collect();
-            keys_len += s.cache.users_bytes();
+            keys_len += s.cache.overhead_bytes();
             (s.cache.len() as u64, keys_len, recs)
         };
         let session_bytes: usize = session_keys_len
@@ -1693,7 +1706,7 @@ impl SignalStoreCache {
                 .iter()
                 .map(|(k, v)| k.len() + v.as_ref().map_or(0, |b| b.len()))
                 .sum::<usize>()
-                + i.cache.users_bytes();
+                + i.cache.overhead_bytes();
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
 
@@ -1720,7 +1733,7 @@ impl SignalStoreCache {
                 .fold((0usize, 0usize), |(count, bytes), key| {
                     (count + 1, bytes + key.len())
                 });
-            keys_len += pending_only_key_bytes + sk.cache.users_bytes();
+            keys_len += pending_only_key_bytes + sk.cache.overhead_bytes();
             (
                 (sk.cache.len() + pending_only_count) as u64,
                 keys_len,
