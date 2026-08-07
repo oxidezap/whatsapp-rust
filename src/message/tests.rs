@@ -6259,9 +6259,15 @@ async fn redelivered_id_reaches_the_retry_key_bundle() {
         }
     );
 
-    let receipt = find_receipt_details(&transport.sent(), "REDELIVERED-STATUS")
-        .expect("status retry receipt");
+    let frames = transport.sent();
+    let receipt =
+        find_receipt_details(&frames, "REDELIVERED-STATUS").expect("status retry receipt");
     assert_eq!(receipt.to, "status@broadcast");
+    // The outcome says inclusion was intended; this says it reached the wire.
+    assert_eq!(
+        retry_receipt_key_bundles_for(&frames, "REDELIVERED-STATUS"),
+        vec![false, true]
+    );
 
     let after = client.persistence_manager.get_device_snapshot();
     assert_ne!(after.next_pre_key_id, before.next_pre_key_id);
@@ -6800,6 +6806,28 @@ struct SentReceipt {
     context: Option<String>,
     category: Option<String>,
     has_keys: bool,
+}
+
+/// Every retry receipt carrying `id`, in wire order, as whether it embedded a
+/// `<keys>` bundle. `find_receipt_details` stops at the first match, so it
+/// cannot describe a sequence of retries for one message.
+fn retry_receipt_key_bundles_for(frames: &[bytes::Bytes], id: &str) -> Vec<bool> {
+    let mut bundles = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let Some(buf) = decode_frame(i, frame) else {
+            continue;
+        };
+        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+            continue;
+        };
+        if node.tag.as_ref() == "receipt"
+            && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            && node.get_attr("type").is_some_and(|v| v.as_str() == "retry")
+        {
+            bundles.push(node.get_optional_child("keys").is_some());
+        }
+    }
+    bundles
 }
 
 fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt> {
