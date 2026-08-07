@@ -5154,10 +5154,14 @@ fn log_assertions_delegated_to_child(test_name: &str) -> bool {
             .env(CHILD_MARKER, "1")
             .output()
             .expect("re-running the test in its own process");
+    // libtest exits 0 for a filter that matched nothing, so accepting the exit
+    // code alone would let a stale `test_name` (after a rename, say) restore the
+    // very skip this helper exists to remove. Demand the child's own result line
+    // for the test we asked it to run.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "{test_name} failed in its own process:\n{}{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains(&format!("test {test_name} ... ok")),
+        "{test_name} did not run and pass in its own process:\n{stdout}{}",
         String::from_utf8_lossy(&output.stderr),
     );
     true
