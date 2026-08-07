@@ -448,10 +448,20 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
         &self,
         signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
-        let device = self.0.device();
-        WacoreSignedPreKeyStore::load_signed_prekey(device.as_ref(), signed_prekey_id.into())
+        let id = signed_prekey_id.into();
+        let mut record = WacoreSignedPreKeyStore::load_signed_prekey(self.0.device().as_ref(), id)
             .await
-            .map_err(signal_err("backend"))?
+            .map_err(signal_err("backend"))?;
+        if record.is_none() {
+            // Rotation promotes an id into the device field and only then drops
+            // its staged row, so a snapshot taken just before the promotion
+            // resolves it in neither place. Re-read before calling it unknown:
+            // once the row is gone the field definitely holds it.
+            record = WacoreSignedPreKeyStore::load_signed_prekey(self.0.device().as_ref(), id)
+                .await
+                .map_err(signal_err("backend"))?;
+        }
+        record
             .ok_or(SignalProtocolError::InvalidSignedPreKeyId)
             .and_then(wacore_record::signed_prekey_structure_to_record)
     }
@@ -521,6 +531,63 @@ mod tests {
                 .await
                 .expect("in-memory persistence manager"),
         )
+    }
+
+    /// Rotation promotes the new id into the device field and only then drops
+    /// its staged backend row, so a snapshot taken before the promotion
+    /// resolves that id in neither place. This is why the adapter re-reads the
+    /// snapshot before reporting an id unknown: a fresh one resolves what a
+    /// stale one cannot, and a decrypt that raced the promotion would otherwise
+    /// reject a valid pre-key message.
+    #[tokio::test]
+    async fn a_promoted_signed_pre_key_is_only_visible_to_a_fresh_snapshot() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::store::commands::DeviceCommand;
+
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let pm = test_persistence_manager(backend).await;
+
+        let stale = pm.get_device_snapshot();
+        let promoted_id = stale.signed_pre_key_id + 1;
+
+        // Nothing staged for the new id, and it is not the snapshot's current
+        // one: the pre-promotion view cannot resolve it.
+        assert!(
+            WacoreSignedPreKeyStore::load_signed_prekey(stale.as_ref(), promoted_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "the new id must be unresolvable before promotion"
+        );
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        pm.process_command(DeviceCommand::SetSignedPreKey {
+            key_pair,
+            id: promoted_id,
+            signature: [0u8; 64],
+            rotation_ms: 0,
+        })
+        .await;
+
+        // The stale snapshot still cannot resolve it, which is exactly the
+        // failure a pinned snapshot would produce.
+        assert!(
+            WacoreSignedPreKeyStore::load_signed_prekey(stale.as_ref(), promoted_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a stale snapshot must not resolve the promoted id"
+        );
+
+        let adapter = SignalProtocolStoreAdapter::new(pm, Arc::new(SignalStoreCache::new()));
+        assert!(
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key(promoted_id.into())
+                .await
+                .is_ok(),
+            "the adapter must resolve the promoted id from a fresh snapshot"
+        );
     }
 
     /// The inbound decrypt path consumes a one-time prekey and buffers it via
