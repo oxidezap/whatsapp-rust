@@ -55,3 +55,5 @@ These lines mirror WA Web's `[socket]` output, which makes a captured session an
   doFallbackHandshake continuing handshake with given server hello
 [socket] continueFullHandshakeCore client finish and deriving secrets
 ```
+
+All of them are `debug`, including the `resumeNoiseHandshake failed` line: a server that declines the IK resume is the ordinary trigger for XXfallback, not a failure of ours, and the pattern that actually completed is reported separately at `info` ("Handshake complete (IK|XX|XXfallback)"). Only a handshake that gives up carries a warning.
